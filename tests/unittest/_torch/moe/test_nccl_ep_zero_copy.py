@@ -357,6 +357,61 @@ class TestNcclEPZeroCopy(unittest.TestCase):
                 ctx.comm.destroy.assert_not_called()
                 handle.destroy.assert_not_called()
 
+    def test_shutdown_failures_quarantine_before_context_is_discarded(self) -> None:
+        for stage in ("synchronize", "group_destroy", "reservation_release"):
+            with self.subTest(stage=stage):
+                ctx = object.__new__(NcclEpContext)
+                ctx.output_tokens_buf = torch.empty(1)
+                ctx.dispatch_window = SimpleNamespace(handle=123)
+                reservation = ctx._dispatch_reservation = Mock()
+                ctx._ep_mpi_comm = Mock()
+                ctx._ep_mpi_comm.Ibarrier.return_value.Test.return_value = True
+                group = ctx.ep_group = Mock()
+                ctx.comm = Mock()
+                ctx._timeout_proxy = Mock()
+                error = RuntimeError(f"injected {stage} failure")
+                if stage == "group_destroy":
+                    group.destroy.side_effect = error
+                elif stage == "reservation_release":
+                    reservation.release.side_effect = error
+                with (
+                    patch.object(nccl_ep_utils, "_abandoned_contexts", []) as abandoned,
+                    patch.object(nccl_ep_utils, "_ep_group_cache", {"test": ctx}),
+                    patch.object(nccl_ep_utils, "_ep_group_refcounts", {"test": 1}),
+                    patch.object(nccl_ep_utils, "unregister_moe_comm_timeout_proxy"),
+                    patch.object(
+                        torch.cuda,
+                        "synchronize",
+                        side_effect=error if stage == "synchronize" else None,
+                    ),
+                ):
+                    nccl_ep_utils.release_nccl_ep_context(ctx)
+                    self.assertEqual(abandoned, [ctx])
+                    ctx.destroy()
+                    reservation.abandon.assert_called_once()
+                ctx.comm.destroy.assert_not_called()
+                if stage == "synchronize":
+                    ctx._ep_mpi_comm.Ibarrier.assert_not_called()
+                    group.destroy.assert_not_called()
+                    reservation.release.assert_not_called()
+
+    def test_shutdown_mpi_error_abandons_reservation(self) -> None:
+        from mpi4py import MPI
+
+        ctx = object.__new__(NcclEpContext)
+        ctx.output_tokens_buf = torch.empty(1)
+        ctx._dispatch_reservation = Mock()
+        ctx._ep_mpi_comm = Mock()
+        ctx._ep_mpi_comm.Ibarrier.side_effect = MPI.Exception(MPI.ERR_OTHER)
+        ctx.ep_group = None
+        with (
+            patch.object(nccl_ep_utils, "_abandoned_contexts", []),
+            patch.object(torch.cuda, "synchronize"),
+        ):
+            ctx.destroy()
+        ctx._dispatch_reservation.abandon.assert_called_once()
+        ctx._dispatch_reservation.release.assert_not_called()
+
     def test_late_rank_times_out_in_second_phase(self) -> None:
         # Model MPI's retained participation: rank 0 returns from its timeout,
         # but its outstanding phase-1 request lets rank 1 finish that phase.
@@ -452,6 +507,57 @@ class TestNcclEPZeroCopy(unittest.TestCase):
         ):
             mpi_comm.return_value.Split.return_value.allreduce.side_effect = lambda failed: failed
             yield mapping, ep, empty
+
+    def test_mpi_disabled_context_never_requests_native_pool(self) -> None:
+        interop = SimpleNamespace(get_nccl_comm_from_group=Mock())
+        with (
+            self._context_constructor_environment() as (mapping, ep, _),
+            patch("tensorrt_llm._utils.mpi_disabled", return_value=True),
+            patch.dict(sys.modules, {"nccl.ep.interop.torch": interop}),
+            patch.object(torch, "zeros", return_value=torch.zeros(1, dtype=torch.int32)),
+            patch.object(torch.distributed, "all_reduce"),
+            patch.object(torch.classes.trtllm, "NCCLWindowReservation") as reserve,
+        ):
+            mapping.moe_ep_group_pg = object()
+            ctx = NcclEpContext(mapping, 4, 4, 512, 1)
+        reserve.assert_not_called()
+        interop.get_nccl_comm_from_group.assert_called_once_with(mapping.moe_ep_group_pg)
+        self.assertFalse(ctx.window_buffers_supported)
+        self.assertIsNone(ctx._dispatch_reservation)
+        self.assertIsNone(ctx.dispatch_window)
+        self.assertIs(ctx.output_tokens_nd.tensor, ctx.output_tokens_buf)
+        self.assertNotIn("window", vars(ctx.output_tokens_nd))
+
+    def test_mpi_disabled_skips_combine_request_and_scope(self) -> None:
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=self.strategy,
+                backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+                use_dp=False,
+                calculate_num_chunks=lambda _: 1,
+                determine_communication_method=Mock(),
+            )
+        )
+        hidden = torch.empty((3, 128), dtype=torch.bfloat16)
+        scheduler._forward_single_chunk = Mock(return_value=hidden)
+        with (
+            patch("tensorrt_llm._utils.mpi_disabled", return_value=True),
+            self.allocator(None) as allocate,
+            patch(
+                "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.nccl_window_tensor_scope"
+            ) as scope,
+        ):
+            scheduler.forward(
+                hidden,
+                hidden,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=[3, 3],
+                use_dp_padding=False,
+            )
+            self.assertIsNone(self.strategy.request_combine_input(torch.bfloat16))
+        allocate.assert_not_called()
+        scope.assert_not_called()
 
     def test_context_constructor_wraps_dispatch_output_with_reserved_window(self) -> None:
         for quant in ("none", "fp8", "nvfp4", "internal_fp8"):

@@ -325,7 +325,9 @@ private:
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
-    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, cudaStream_t stream);
+    using WindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
+    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, cudaStream_t stream,
+        WindowRegisterFunc registerWindow = ncclCommWindowRegister);
 
     // Record a failed new symmetric allocation (assumes mMutex is already locked).
     void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);

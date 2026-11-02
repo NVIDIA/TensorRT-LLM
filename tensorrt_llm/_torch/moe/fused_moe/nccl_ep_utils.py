@@ -209,7 +209,8 @@ class NcclEpContext:
 
         # NCCL-EP selects direct access to registered windows
         # or staging for each operation in its default opportunistic mode.
-        self.window_buffers_supported = "zero_copy" in getattr(
+        # The TRT-LLM window pool still bootstraps its communicator through MPI.
+        self.window_buffers_supported = not mpi_disabled() and "zero_copy" in getattr(
             GroupConfig, "__dataclass_fields__", {}
         )
 
@@ -455,6 +456,8 @@ class NcclEpContext:
 
     def _abandon_shutdown(self) -> None:
         """Retain remote targets and pending rendezvous until process exit."""
+        if getattr(self, "_abandoned", False):
+            return
         self._abandoned = True
         _abandoned_contexts.append(self)
         # MPI collective requests cannot be cancelled or freed. Torch work and
@@ -477,13 +480,25 @@ class NcclEpContext:
         if getattr(self, "_shutdown_ready", False):
             return True
         self._shutdown_started = True
-        torch.cuda.synchronize(self.output_tokens_buf.device)
+        try:
+            torch.cuda.synchronize(self.output_tokens_buf.device)
+        except _NCCL_RUNTIME_ERRORS as exc:
+            self._abandon_shutdown()
+            logger.warning(
+                f"NCCL EP device drain failed: {exc}; retaining resources until process exit."
+            )
+            return False
         # A late rank can complete phase 1 using a timed-out rank's outstanding
         # request. Phase 2 excludes ranks that abandoned phase 1. Generous
         # deadlines tolerate ordinary skew. This is not fault-tolerant agreement:
         # a rank delayed past phase 2's deadline can still leave peers blocked in
         # native collective destruction. Callers must honor collective teardown.
         uses_mpi = self._ep_mpi_comm is not None
+        errors = _NCCL_RUNTIME_ERRORS
+        if uses_mpi:
+            from mpi4py import MPI
+
+            errors += (MPI.Exception,)
         if not uses_mpi:
             # Retain the exact EP process group, including on timeout. Ray's
             # singleton MPI communicator cannot rendezvous with its EP peers.
@@ -512,7 +527,7 @@ class NcclEpContext:
                     # Completed work can carry a backend error. Check it before
                     # treating this phase as proof of peer quiescence.
                     self._shutdown_request.wait()
-            except RuntimeError as exc:
+            except errors as exc:
                 self._abandon_shutdown()
                 logger.warning(
                     f"NCCL EP shutdown rendezvous phase {phase} failed: {exc}; "
@@ -523,7 +538,15 @@ class NcclEpContext:
         self._shutdown_ready = True
         return True
 
-    def destroy(self):
+    def destroy(self) -> None:
+        """Collectively retire the context, quarantining resources on cleanup failure."""
+        try:
+            self._destroy()
+        except _NCCL_RUNTIME_ERRORS:
+            self._abandon_shutdown()
+            raise
+
+    def _destroy(self) -> None:
         """Release EP group, NCCL comm, and MPI sub-comm in LIFO order.
 
         Avoids relying on Python GC ordering between the group, the comm it
@@ -535,10 +558,7 @@ class NcclEpContext:
             return
         if self.ep_group is not None:
             unregister_moe_comm_timeout_proxy(self._timeout_proxy)
-            try:
-                self.ep_group.destroy()
-            except _NCCL_RUNTIME_ERRORS as e:
-                logger.warning(f"NCCL EP group destroy error: {e}")
+            self.ep_group.destroy()
             self.ep_group = None
 
         if self.dispatch_window is not None:

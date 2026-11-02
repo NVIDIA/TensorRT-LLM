@@ -392,8 +392,9 @@ class NcclEP(Communication):
     @cached_property
     def _supports_combine_input(self) -> bool:
         from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_supports_version
+        from tensorrt_llm._utils import mpi_disabled
 
-        return nccl_ep_supports_version("0.3")
+        return not mpi_disabled() and nccl_ep_supports_version("0.3")
 
     def supports_combine_input(self, output_dtype: Optional[torch.dtype]) -> bool:
         """Only NCCL-EP 0.3 or newer can use a window for the BF16 combine input."""

@@ -1132,7 +1132,11 @@ operations/replays sharing an EP group. A graph-pool owner isolates allocations;
 it does not add execution dependencies between graph replays.
 
 A reservation miss uses the persistent unregistered dispatch buffer; NCCL-EP
-stages the incoming payload and copies it locally in stream order.
+stages the incoming payload and copies it locally in stream order. Window
+registration outcomes are agreed across ranks before insertion into the pool.
+With MPI disabled, dispatch and combine skip the window pool entirely because
+its native communicator bootstrap requires MPI; NCCL-EP uses its torch EP group
+and ordinary staged buffers instead.
 
 Combine-input leases are enabled only for NCCL-EP >= 0.3, BF16 output, and a
 backend that can write the finalized expert output into a supplied destination.
@@ -1160,7 +1164,9 @@ lifetime dependencies before using these leases.
 
 At final context teardown, local streams are synchronized and EP ranks attempt
 a bounded shutdown rendezvous before the reservation is explicitly released.
-Failure or timeout quarantines resources rather than returning them to the pool.
+Device-drain failures, cleanup failures, and rendezvous timeouts quarantine
+reservations rather than returning them to the pool. Owners must still call
+`destroy()` explicitly: omitting cleanup retains the native lifecycle assertion.
 Graphs referencing the context must be retired first. No per-iteration barrier
 is added to dispatch, combine, or replay; the optional combine request above
 still acquires a lease in eager execution and during capture. Registered storage
