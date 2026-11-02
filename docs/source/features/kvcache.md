@@ -170,9 +170,15 @@ feature's per-step cost.
 The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
 FlashInfer attention backend. It supports the standard V2 manager (dense
 models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
-backends (DSA, DeepSeek-V4), and speculative decoding except dynamic-tree
-drafting. Beam search, cold-page compression, KV connectors and context
-parallelism are not supported.
+backends (DSA, DeepSeek-V4), and the speculative decoding modes below. Beam
+search, cold-page compression, KV connectors and context parallelism are not
+supported.
+
+| Speculative decoding | Status | KV cache of the drafter layers |
+|---|---|---|
+| MTP (one-model) | Supported | Mixed-precision high and low pools, like the model's own layers |
+| EAGLE3 (one-model) and other drafters with their own architecture | Supported | Plain cache: the mixed-precision high dtype on dense backends, NVFP4 (the mixed-precision low dtype) on DSA and DeepSeek-V4 |
+| Dynamic-tree drafting | Not supported | Rejected at startup |
 
 ### SWA Endpoint Retention
 
