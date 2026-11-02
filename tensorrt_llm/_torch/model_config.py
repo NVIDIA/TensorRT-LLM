@@ -308,6 +308,13 @@ class ModelConfig(Generic[TConfig]):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    # Lossy: the model's two-shot MNNVL all-reduces fused with a residual
+    # RMSNorm exchange E4M3 (AllReduceParams.fp8_payload).
+    mnnvl_allreduce_fp8_payload: bool = False
+    # Every tensor-parallel rank holds the whole embedding table.
+    replicate_embedding: bool = False
+    # Batch sizes of the generation CUDA graphs (empty without them).
+    cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False

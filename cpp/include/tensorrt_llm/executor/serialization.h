@@ -66,11 +66,6 @@ public:
     static void serialize(AdditionalModelOutput const& additionalModelOutput, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(AdditionalModelOutput const& additionalModelOutput);
 
-    // PromptTuningConfig
-    [[nodiscard]] static PromptTuningConfig deserializePromptTuningConfig(std::istream& is);
-    static void serialize(PromptTuningConfig const& config, std::ostream& os);
-    [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
-
     // MultimodalInput
     [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
     static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);

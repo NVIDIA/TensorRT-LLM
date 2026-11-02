@@ -21,6 +21,8 @@ _PIPELINED_COMMIT_HEAD_TILES = 2048
 _TWO_STAGE_REPLAY_HEAD_TILES = 4096
 _L2_STREAMING_HEAD_TILES = 8192
 
+# Decode batch size from which the partitioned replay and one all-layer checkpoint commit are used; smaller
+# batches commit inside each layer's replay (see MambaHybridCacheManager.gdn_replay_partitioned).
 CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE = 16
 
 
@@ -761,14 +763,16 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     BK = triton.next_power_of_2(K)
     # The complete workload mapping is retained for the 4:1 shape; the
     # 2:1 fine tiling is enabled only through the measured low-batch range.
+    # Other step widths take the BV=16 tiling up to _BV16_MAX_HEAD_TILES; its
+    # outputs and committed states equal the BV=128 launch bitwise.
+    head_tiles = N * HV
     use_production_bf16_shape = (
-        T == 4
+        (T == 4 or (2 <= T and head_tiles <= _BV16_MAX_HEAD_TILES))
         and history_size <= 16
         and K == 128
         and V == 128
         and ssm_states.dtype == torch.bfloat16
     )
-    head_tiles = N * HV
     use_tuned_bf16_mapping = use_production_bf16_shape and HV == 4 * H
     use_fine_grained_mapping = use_production_bf16_shape and _supports_fine_grained_replay_tiling(
         H, HV, head_tiles

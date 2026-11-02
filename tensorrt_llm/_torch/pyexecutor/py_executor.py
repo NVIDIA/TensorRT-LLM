@@ -65,7 +65,7 @@ from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
-    transfer_window_bypass_eligible)
+    is_gen_only_no_context_benchmark, transfer_window_bypass_eligible)
 from ..disaggregation.orchestration.pp_termination import \
     DisaggPPTerminationHandler
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
@@ -493,6 +493,8 @@ class _ExecutorExecutionConfig:
     resource_governor_queue: object
     hang_detection_timeout: Optional[int]
     enable_kv_pool_rebalance: bool
+    # cache_transceiver_config.max_tokens_in_buffer was set by the user.
+    transfer_budget_is_explicit: bool = False
 
 
 class PyExecutor:
@@ -550,6 +552,7 @@ class PyExecutor:
         enable_adp_dummy_fixes: bool = False,
         enable_scheduler_aware_adp_dummy: bool = False,
         enable_non_overlap_adp_forward_intent: bool = False,
+        transfer_budget_is_explicit: bool = False,
     ) -> None:
         if kv_pool_rebalance_check_interval <= 0:
             raise ValueError(
@@ -573,6 +576,10 @@ class PyExecutor:
         # two operate on disjoint request sets. Per-request CUDA events
         # carry the encoder->decoder dependency to the eventual consumer.
         self.encoder_stream = torch.cuda.Stream()
+        # _forward_step orders the current and execution streams with these two
+        # events, re-recorded every step: a wait captures the record current at
+        # the time of the wait.
+        self._stream_ordering_events = (torch.cuda.Event(), torch.cuda.Event())
         logger.info(
             f"[PyExecutor] execution_stream initialized: {self.execution_stream}; "
             f"encoder_stream initialized: {self.encoder_stream}.")
@@ -641,6 +648,7 @@ class PyExecutor:
             resource_governor_queue=resource_governor_queue,
             hang_detection_timeout=hang_detection_timeout,
             enable_kv_pool_rebalance=enable_kv_pool_rebalance,
+            transfer_budget_is_explicit=transfer_budget_is_explicit,
         )
         self._resources_released = False
         self._closed = False
@@ -688,6 +696,7 @@ class PyExecutor:
         resource_governor_queue = self._execution_config.resource_governor_queue
         hang_detection_timeout = self._execution_config.hang_detection_timeout
         enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
+        transfer_budget_is_explicit = self._execution_config.transfer_budget_is_explicit
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
         # profile config
@@ -866,6 +875,11 @@ class PyExecutor:
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         self._is_kv_manager_v2 = isinstance(self.kv_cache_manager,
                                             KVCacheManagerV2)
+        # The KV cache manager takes Mamba snapshots inside the forward and
+        # finishes them on the execution stream right after it (_forward_step).
+        self._finish_inforward_snapshots = (
+            self._is_kv_manager_v2
+            and self.kv_cache_manager.inforward_snapshot_rows > 0)
         self.enable_joint_kv_cache_reuse = (
             self._is_kv_manager_v2
             and self.kv_cache_manager.enable_joint_kv_cache_reuse)
@@ -1047,6 +1061,19 @@ class PyExecutor:
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
         self.pp_multi_stream_sample = os.environ.get(
             "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
+        # Debug: compare each aggregated helix CP rank's schedule every
+        # iteration; see _check_helix_schedule_consistency.
+        check_requested = os.environ.get("TLLM_HELIX_AGG_CHECK_SCHEDULE",
+                                         "0") == "1"
+        self._check_helix_schedule = (check_requested
+                                      and self.dist.mapping.has_cp_helix()
+                                      and self.dist.mapping.pp_size == 1
+                                      and self.kv_cache_transceiver is None)
+        if check_requested and not self._check_helix_schedule:
+            logger.warning(
+                "TLLM_HELIX_AGG_CHECK_SCHEDULE=1 is ignored: the schedule check "
+                "only runs with aggregated helix context parallelism "
+                "and pipeline parallelism disabled.")
         self.sample_stream = torch.cuda.Stream()
         self.finish_sample_event = torch.cuda.Event()
         # Set of request IDs that are currently in flight across all micro batches
@@ -1271,19 +1298,31 @@ class PyExecutor:
         tokens_per_block = getattr(self.kv_cache_manager, "tokens_per_block",
                                    None)
         self._disagg_transfer_admission_controller = DisaggTransferAdmissionController(
-            max_tokens_in_buffer, tokens_per_block)
-        if (self.global_rank == 0
-                and self._disagg_transfer_admission_controller.enabled()
-                and transfer_window_bypass_eligible(self.kv_cache_transceiver,
-                                                    self.dist,
-                                                    self._is_kv_manager_v2)):
+            max_tokens_in_buffer, tokens_per_block, transfer_budget_is_explicit)
+        transfer_window_enabled = (
+            self._disagg_transfer_admission_controller.enabled())
+        transfer_window_bypassed = (transfer_window_enabled
+                                    and not transfer_budget_is_explicit
+                                    and transfer_window_bypass_eligible(
+                                        self.kv_cache_transceiver, self.dist,
+                                        self._is_kv_manager_v2))
+        if self.global_rank == 0 and transfer_window_bypassed:
             logger.warning_once(
                 f"[PyExecutor] Bypassing the executor transfer window "
-                f"configured by max_tokens_in_buffer={max_tokens_in_buffer} "
+                f"of the default max_tokens_in_buffer={max_tokens_in_buffer} "
                 "for asynchronous Python generation with KV cache manager "
                 "V2 and pp_size=1; "
-                "scheduler KV cache capacity admission remains active.",
+                "scheduler KV cache capacity admission remains active. "
+                "Set cache_transceiver_config.max_tokens_in_buffer to apply "
+                "a transfer window.",
                 key="disagg_transfer_window_bypass")
+        if (self.kv_cache_transceiver is not None and transfer_window_enabled
+                and not transfer_window_bypassed
+                and not is_gen_only_no_context_benchmark()):
+            # The scheduler skips the KV allocation of generation-init requests
+            # the window would defer (DisaggTransferCoordinator.admit).
+            self.scheduler.set_disagg_transfer_admission_controller(
+                self._disagg_transfer_admission_controller)
         self.is_benchmark_disagg = (self.benchmark_req_queues_size > 0
                                     and self.kv_cache_transceiver is not None)
         # True while the benchmark disagg fill phase is in progress (waiting
@@ -3149,7 +3188,7 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                token_count = item.request.num_input_tokens
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -4843,6 +4882,8 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
+        if getattr(self, "_check_helix_schedule", False):
+            self._check_helix_schedule_consistency(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -8949,6 +8990,14 @@ class PyExecutor:
                 # and the draft model will produce real tokens for next step.
                 ctx_draft_tokens = [0
                                     ] * self.model_engine.max_total_draft_tokens
+            elif (self.enable_spec_decode and len(ctx_draft_tokens)
+                  < self.model_engine.max_total_draft_tokens):
+                # A CTX with a smaller max_draft_len than this GEN: pad to the
+                # GEN's draft width; like the dummies above, the padding is
+                # rejected on verify.
+                ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
+                    self.model_engine.max_total_draft_tokens -
+                    len(ctx_draft_tokens))
             req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
@@ -9317,7 +9366,10 @@ class PyExecutor:
             # with KVCacheTransferManager's onboard/offload operations. With the
             # loop on the execution stream both waits are program order.
             if not self._loop_on_execution_stream:
-                self.execution_stream.wait_stream(torch.cuda.current_stream())
+                self._stream_ordering_events[0].record(
+                    torch.cuda.current_stream())
+                self.execution_stream.wait_event(
+                    self._stream_ordering_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -9331,11 +9383,18 @@ class PyExecutor:
                     forward_completion="record",
                 )
                 self._mark_cross_kv_projection_consumed(scheduled_requests)
+                # Ahead of the sampler event, which a KV send of these
+                # requests waits for.
+                if self._finish_inforward_snapshots:
+                    self.kv_cache_manager.finish_inforward_snapshots(
+                        scheduled_requests)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
             if not self._loop_on_execution_stream:
-                torch.cuda.current_stream().wait_stream(self.execution_stream)
+                self._stream_ordering_events[1].record(self.execution_stream)
+                torch.cuda.current_stream().wait_event(
+                    self._stream_ordering_events[1])
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
@@ -9473,9 +9532,11 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
+                # A forward that sampled greedy tokens in place of the logits
+                # returns no logits; no request of such a batch asks for them.
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
-                               batch_outputs["logits"], beam_width,
+                               batch_outputs.get("logits"), beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model())
 
@@ -10399,9 +10460,14 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
+            # A generation-only request skipped its iteration-1 response (the
+            # CTX returned the first token); without this its first streamed
+            # content waits for decoding iteration stream_interval.
+            first_gen_emit = (request.is_generation_only_request
+                              and not request.py_gen_first_emitted)
             should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or request.py_decoding_iter % self.stream_interval
-                           == 0)
+                           or first_gen_emit or
+                           request.py_decoding_iter % self.stream_interval == 0)
             # The early-emit prototype issues the (non-terminal) iter-1
             # response from `_emit_first_token_responses`; suppress it here.
             if (not emit_first_iter and request.py_decoding_iter == 1
@@ -10414,6 +10480,8 @@ class PyExecutor:
                         [request], gpu_times_cache=gpu_times_cache)
                 response = request.create_response()
                 if response:
+                    if first_gen_emit:
+                        request.py_gen_first_emitted = True
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     self._maybe_attach_ctx_usage(request, response)
@@ -10555,6 +10623,47 @@ class PyExecutor:
             if should_recompute:
                 self._pause_recompute_request(req)
 
+    def _check_helix_schedule_consistency(
+            self, scheduled_batch: ScheduledRequests) -> None:
+        """Raise unless every aggregated helix CP rank scheduled the same batch.
+
+        Each rank runs its own scheduler, so the ranks agree only while every
+        decision reads rank-invariant inputs; a divergence would otherwise show
+        up as a hang or corrupt KV in the next CP collective. Every rank raises
+        together, since each compares the same gathered summaries.
+
+        Only the non-PP executor loops run it: with pipeline parallelism the
+        first rank schedules and broadcasts the result. Set
+        TLLM_HELIX_AGG_CHECK_SCHEDULE on every rank, since a rank without it
+        skips the gather and the others wait on it.
+        """
+        summary = (
+            tuple((r.py_request_id, r.context_current_position,
+                   r.context_chunk_size, r.prompt_len, r.total_input_len_cp)
+                  for r in scheduled_batch.context_requests),
+            tuple((r.py_request_id, r.py_helix_decode_group_index)
+                  for r in scheduled_batch.generation_requests),
+            tuple(r.py_request_id for r in scheduled_batch.paused_requests),
+            tuple(r.py_request_id
+                  for r in scheduled_batch.recompute_paused_requests),
+        )
+        summaries = self.dist.cp_allgather(summary)
+        # Context requests must carry the full prompt: a per-rank slice would
+        # under-size the global ledger.
+        sliced = [
+            request_id
+            for request_id, _, _, prompt_len, total_len in summaries[0][0]
+            if prompt_len != total_len
+        ]
+        if sliced or any(s != summaries[0] for s in summaries[1:]):
+            per_rank = "\n".join(
+                f"  cp_rank {cp_rank} (ctx, gen, paused, recompute_paused): {s}"
+                for cp_rank, s in enumerate(summaries))
+            raise RuntimeError(
+                "Aggregated helix CP ranks disagree on the schedule"
+                f" (context requests without the full prompt: {sliced}):\n"
+                f"{per_rank}")
+
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.
 
@@ -10606,14 +10715,20 @@ class PyExecutor:
         scheduled_requests.added_inflight_req_ids = []
 
     def reset_prefix_cache(self):
-        self.kv_cache_manager.reset_reuse_state()
-        if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.reset_reuse_state()
-        # R3: invalidate cached routes together with the KV reuse state. Guard the
-        # engine lookup too -- minimal executors (unit tests) may have no engine.
+        # Invalidate routes after the native V2 clear returns, even when a
+        # later reset step fails. A precondition rejection keeps them intact.
         route_capture = getattr(getattr(self, "model_engine", None),
                                 "route_capture", None)
-        if route_capture is not None:
+        clear_routes_in_manager = (route_capture is not None and isinstance(
+            self.kv_cache_manager, KVCacheManagerV2))
+        if clear_routes_in_manager:
+            self.kv_cache_manager.reset_reuse_state(
+                on_cleared=route_capture.clear_shared)
+        else:
+            self.kv_cache_manager.reset_reuse_state()
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.reset_reuse_state()
+        if route_capture is not None and not clear_routes_in_manager:
             route_capture.clear_shared()
 
     def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
