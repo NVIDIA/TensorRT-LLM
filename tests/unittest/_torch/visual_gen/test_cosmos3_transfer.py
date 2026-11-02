@@ -23,6 +23,7 @@ os.environ["TRTLLM_DISABLE_COSMOS3_GUARDRAILS"] = "1"
 import pytest
 import torch
 import torch.nn as nn
+from cosmos3_fixtures import bare_resolver
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
@@ -249,6 +250,7 @@ def _make_pipeline(sampling=None):
     # __new__ skips __init__, which is where the real pipeline resolves this
     # from the transformer config; the mode-defaults tables are keyed on it.
     pipeline.family = QWEN3_RECIPE.name
+    pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
     pipeline.scheduler = StubScheduler()
     pipeline.sampling = sampling or StubSamplingPolicy()
     pipeline.safety_checker = None

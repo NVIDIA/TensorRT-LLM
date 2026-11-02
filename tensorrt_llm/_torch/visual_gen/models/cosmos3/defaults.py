@@ -14,7 +14,8 @@
 # limitations under the License.
 """The Cosmos3 tables: generation defaults per family and mode, the action and
 policy presets per embodiment domain, the prompt templates, and the schema of the
-request's extra parameters. The request resolver reads them in precedence order.
+request's extra parameters. The parameter resolver reads them as the defaults, after
+the request and the checkpoint.
 """
 
 from collections.abc import Mapping
@@ -351,21 +352,20 @@ def _validate_non_negative_frames(value: Any) -> None:
         raise ValueError(f"must be a non-negative frame count, got {value}.")
 
 
-# Text-to-image (``output_type="image"``) defaults; resolved in ``infer()``.
+# Text-to-image (``output_type="image"``) defaults.
 COSMOS3_T2I_PARAMS = {
     "height": 1024,
     "width": 1024,
     "num_inference_steps": 50,
     "guidance_scale": 7.0,
-    "flow_shift": 3.0,
     "guidance_interval": (400.0, 1000.0),
 }
 
 # Edge (Nemotron-dense backbone) is 480p-native. Video values follow the
-# model-card I2V command (T2V mirrors it — the model card documents I2V only);
-# ``flow_shift`` rides the checkpoint-declared native flow schedule. T2I values
-# are the cosmos-framework t2i mode defaults at Edge's native resolution
-# (480p at 1:1 aspect), with full-range CFG.
+# model-card I2V command (T2V mirrors it — the model card documents I2V only).
+# T2I values are the cosmos-framework t2i mode defaults at Edge's native
+# resolution (480p at 1:1 aspect), with full-range CFG. No table carries a
+# ``flow_shift``: a request that omits it runs at the checkpoint scheduler's.
 COSMOS3_EDGE_VIDEO_PARAMS = {
     "height": 480,
     "width": 832,
@@ -374,7 +374,6 @@ COSMOS3_EDGE_VIDEO_PARAMS = {
     "max_sequence_length": 4096,
     "num_frames": 121,
     "frame_rate": 24.0,
-    "flow_shift": 3.0,
 }
 
 COSMOS3_EDGE_T2I_PARAMS = {
@@ -382,7 +381,6 @@ COSMOS3_EDGE_T2I_PARAMS = {
     "width": 640,
     "num_inference_steps": 50,
     "guidance_scale": 4.0,
-    "flow_shift": 3.0,
     "guidance_interval": None,
 }
 
@@ -420,9 +418,9 @@ COSMOS3_GENERATION_DEFAULTS: Dict = {
 }
 
 # Action's table carries the sampling recipe only; the canvas, clip length and
-# frame rate resolve from the embodiment preset in the pipeline, and anything
-# missing here falls back to the family's video table inside
-# _resolve_generation_params. Same recipe for both families.
+# frame rate come from the embodiment preset, and anything missing here falls
+# back to the family's video table in the parameter resolver. Same recipe for
+# both families.
 
 
 # Families without an entry get no envelope advisory.
@@ -659,10 +657,6 @@ def get_domain_preset(
         return None
     return COSMOS3_DOMAIN_PRESETS[key]
 
-
-# Video-to-video and transfer sample on the shifted flow grid with this shift; the
-# other modes carry ``flow_shift`` in their tables above or take the checkpoint's.
-COSMOS3_V2V_FLOW_SHIFT = 10.0
 
 # Prompt format the checkpoints were trained with. The "give" typo is the training
 # text; keep it. Metadata sentences are appended to the caption the same way.

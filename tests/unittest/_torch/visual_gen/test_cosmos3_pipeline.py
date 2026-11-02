@@ -33,6 +33,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver
 from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
@@ -908,6 +909,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         calls = []
         token_calls = []
 
@@ -975,6 +977,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         rebuilt = []
 
         class StopAfterTokenize(Exception):
@@ -1034,7 +1037,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.family = QWEN3_RECIPE.name
         token_calls = []
 
@@ -1089,7 +1092,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.family = QWEN3_RECIPE.name
         calls = []
 
@@ -1142,6 +1145,7 @@ class TestCosmos3V2V:
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         rebuilt = []
 
         class FakeSampling:
@@ -1198,6 +1202,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1250,6 +1255,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1308,11 +1314,8 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
-        _assert_scheduler_config(
-            cosmos3_pipeline,
-            flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
-            use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
-        )
+        # Image mode runs at the checkpoint scheduler's shift like every other mode.
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
 
 
 @pytest.mark.integration
@@ -1633,9 +1636,10 @@ class TestCosmos3TextGuardrailBlocked:
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # ``rank`` is a read-only property that resolves to 0 with no
         # distributed init. The guardrail model is not under test, so a
         # checker that reports "unsafe" for any input drives the path

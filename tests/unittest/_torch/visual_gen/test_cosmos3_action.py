@@ -7,12 +7,16 @@ Run:
     pytest tests/unittest/_torch/visual_gen/test_cosmos3_action.py -v
 """
 
+import dataclasses
+
 import numpy as np
 import PIL.Image
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    ACTION_MODE_POLICY,
     action_reference_frame_step,
     action_reference_size,
     crop_action_latent,
@@ -37,15 +41,31 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
-    resolve_domain_action_config,
-)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import RequestParameters
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_vision,
 )
 
 pytestmark = pytest.mark.cosmos3
+
+
+def resolve_domain_action_config(checkpoint_policy=None, **given) -> dict:
+    """The action fields a request runs with, as a dict with the warnings and origins:
+    against the raw ``checkpoint.json`` policy block when one is given, else the domain
+    preset."""
+    resolver = bare_resolver("qwen3", policy=checkpoint_policy)
+    params, warnings, origins = resolver._resolve(
+        RequestParameters(
+            action_mode=ACTION_MODE_POLICY if checkpoint_policy else "action", **given
+        )
+    )
+    return {
+        **dataclasses.asdict(params),
+        "checkpoint_policy_domain_matches": params.policy_active,
+        "warnings": warnings,
+        "origins": origins,
+    }
 
 
 class TestFindClosestTargetSize:
@@ -241,7 +261,7 @@ class TestCheckpointPolicyDefaults:
             "action_fps": 15.0,
         }
 
-        cfg = resolve_domain_action_config(checkpoint_policy_defaults=policy)
+        cfg = resolve_domain_action_config(checkpoint_policy=self.METADATA)
         assert cfg["domain_name"] == "droid_lerobot"
         assert cfg["raw_action_dim"] == 8
         assert cfg["action_chunk_size"] == 32
@@ -253,10 +273,9 @@ class TestCheckpointPolicyDefaults:
         assert cfg["warnings"] == []
 
     def test_explicit_non_policy_domain_does_not_inherit_droid_width(self):
-        policy = resolve_checkpoint_policy_defaults(self.METADATA)
         cfg = resolve_domain_action_config(
             domain_name="bridge_orig_lerobot",
-            checkpoint_policy_defaults=policy,
+            checkpoint_policy=self.METADATA,
         )
         assert cfg["raw_action_dim"] == 10
         assert cfg["action_chunk_size"] == 16

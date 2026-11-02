@@ -12,24 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One precedence table for every Cosmos3 setting: request over checkpoint over default.
+"""Every Cosmos3 setting comes from one of three places, tried in this order: the
+request, the checkpoint, a default. :func:`select` is the only thing that orders
+them, and every resolved value remembers which one it came from.
 
-A rule names the sources of one setting in priority order; the first source holding a
-value wins, the next one holding a value is compared with it, and every resolved
-value remembers where it came from. The same engine serves two moments:
+:class:`ParameterResolver` owns one checkpoint's settings and serves two moments:
 
-* at load, :data:`CHECKPOINT_RULES` turn the checkpoint's files (``config.json``,
+* at load, :func:`resolve_checkpoint` reads the checkpoint's files (``config.json``,
   ``model_index.json``, ``checkpoint.json``, the component configs) into a
-  :class:`Cosmos3Config`: a Cosmos3 export carries the same facts in several files
-  written by exporters that are not kept in sync, so each rule says which file wins
-  and what a disagreement means;
-* per request, :data:`GENERATION_RULES` and :data:`ACTION_RULES` turn the caller's
-  values, the checkpoint's facts (the distilled schedule, the policy block) and the
-  per-family and per-domain tables into what the request runs with.
+  :class:`Cosmos3Config`. A Cosmos3 export carries the same fact in several files
+  written by exporters that are not kept in sync, so each setting says which file
+  wins and what a disagreement means;
+* per request, ``request()`` turns a :class:`RequestParameters` (the caller's values,
+  ``None`` = unset) into the same object with every field the mode uses filled: the
+  caller's value, else the checkpoint (the distilled schedule, the policy block), else
+  the per-family tables and the embodiment presets.
 
-In every rule the caller's value comes first, then the checkpoint, then the code's
-tables, then an explicit :class:`Default` with a reason. A setting no source provides
-and no default covers is an error, not a guess.
+A setting nothing provides is an error, not a guess.
 """
 
 from __future__ import annotations
@@ -37,69 +36,57 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from tensorrt_llm.logger import logger
 
+from .action import ACTION_MODE_POLICY
 from .defaults import (
-    COSMOS3_ACTION_PARAMS,
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_GENERATION_DEFAULTS,
     EMBODIMENT_TO_DOMAIN_ID,
     canonical_domain_preset_key,
     normalize_action_resolution,
+    resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
-_MISSING = object()
-
-
-# ------------------------------------------------------------------------------ engine
-
-
-class Conflict(Enum):
-    """What a lower-priority source holding a different value means."""
-
-    ERROR = "error"
-    WARN = "warn"
-    IGNORE = "ignore"
-
-
-@dataclass(frozen=True)
-class Default:
-    """The value used when no source declares the setting; always the last source."""
-
-    value: Any
-    why: str
-
-    @property
-    def label(self) -> str:
-        return f"default ({self.why})"
-
-    def lookup(self, ctx, name, given, values):
-        return self.value
-
-
-@dataclass(frozen=True)
-class Rule:
-    sources: tuple
-    conflict: Conflict = Conflict.IGNORE
-    """``WARN`` / ``ERROR``: a source below the winner that holds a different value is
-    reported / rejected."""
-    required: bool = True
-    """``False``: an unresolved setting is ``None`` instead of an error."""
+REQUEST = "request"
+CHECKPOINT = "checkpoint"
+DEFAULT = "default"
+WORKFLOW = "workflow"
+"""Origin of a field the kind of request fixes (transfer, video-to-video) before the
+checkpoint is consulted; only ``use_system_prompt`` has such rules."""
+UNSET = "unset"
+"""Origin of a field that none of the three provides and that may stay ``None``."""
 
 
 @dataclass(frozen=True)
 class Resolved:
     value: Any
-    source: str
+    origin: str
+    """``REQUEST``, ``CHECKPOINT``, ``DEFAULT`` or ``WORKFLOW``."""
+    where: str = ""
+    """For checkpoint settings, the file and key that held the value."""
     disagreeing: tuple[str, ...] = ()
-    """``label=value`` of the lower-priority source that held a different value."""
+    """``file:key=value`` of the checkpoint files that held a different value."""
+
+    @property
+    def source(self) -> str:
+        return f"{self.origin} ({self.where})" if self.where else self.origin
+
+
+def select(request: Any = None, checkpoint: Any = None, default: Any = None) -> Optional[Resolved]:
+    """The first of request, checkpoint, default that is set (not ``None``), tagged
+    with its origin; ``None`` when nothing is set."""
+    for origin, value in ((REQUEST, request), (CHECKPOINT, checkpoint), (DEFAULT, default)):
+        if value is not None:
+            return Resolved(value, origin)
+    return None
 
 
 def same_value(a: Any, b: Any) -> bool:
@@ -116,66 +103,25 @@ def same_value(a: Any, b: Any) -> bool:
     return a == b
 
 
-def _pick(
-    name: str, rule: Rule, ctx: Any, given: Mapping[str, Any], values: Mapping[str, Any]
-) -> tuple[Optional[Resolved], list[tuple[str, Any]]]:
-    """Walk ``rule.sources`` in order. The first source holding a value wins; the next
-    one holding a value is compared with it. A :class:`Default` is consulted only when
-    nothing above it holds a value."""
-    winner: Optional[Resolved] = None
-    disagreeing: list[tuple[str, Any]] = []
-    for source in rule.sources:
-        if winner is not None and isinstance(source, Default):
-            break
-        value = source.lookup(ctx, name, given, values)
-        if value is _MISSING:
-            continue
-        if winner is None:
-            winner = Resolved(value, source.label)
-            continue
-        if not same_value(value, winner.value):
-            disagreeing.append((source.label, value))
-        break
-    return winner, disagreeing
-
-
-def _record(winner: Resolved, disagreeing: list[tuple[str, Any]]) -> Resolved:
-    return Resolved(
-        winner.value, winner.source, tuple(f"{label}={v!r}" for label, v in disagreeing)
-    )
-
-
 # -------------------------------------------------------------------------- checkpoint
 
-CONFIG = "config.json"
-CHECKPOINT = "checkpoint.json"
-MODEL_INDEX = "model_index.json"
-TRANSFORMER = "transformer/config.json"
-SCHEDULER = "scheduler/scheduler_config.json"
-VAE = "vae/config.json"
+CONFIG_FILE = "config.json"
+CHECKPOINT_FILE = "checkpoint.json"
+MODEL_INDEX_FILE = "model_index.json"
+TRANSFORMER_FILE = "transformer/config.json"
+SCHEDULER_FILE = "scheduler/scheduler_config.json"
+VAE_FILE = "vae/config.json"
 
 
-class CheckpointFiles:
-    """The checkpoint's files, read on demand. ``pretrained_config`` stands in for
-    ``transformer/config.json`` when given; ``checkpoint_dir`` may then be ``None``."""
+class Conflict(Enum):
+    """What it means when a lower-priority checkpoint file holds a different value."""
 
-    def __init__(self, checkpoint_dir: Optional[str], pretrained_config: Any = None) -> None:
-        self._dir = checkpoint_dir
-        self._pretrained = pretrained_config
-        self._docs: dict[str, Any] = {}
+    ERROR = "error"
+    WARN = "warn"
+    IGNORE = "ignore"
 
-    def doc(self, file: str) -> Any:
-        if file == TRANSFORMER and self._pretrained is not None:
-            return self._pretrained
-        if file not in self._docs:
-            doc = None
-            if self._dir is not None:
-                path = os.path.join(self._dir, file)
-                if os.path.exists(path):
-                    with open(path) as f:
-                        doc = json.load(f)
-            self._docs[file] = doc
-        return self._docs[file]
+
+_MISSING = object()
 
 
 def _step(obj: Any, key: str) -> Any:
@@ -195,71 +141,65 @@ def _walk(doc: Any, path: str) -> Any:
     return node
 
 
-@dataclass(frozen=True)
-class Key:
-    """A dotted key path in one checkpoint file; a ``null`` there counts as absent."""
+class CheckpointFiles:
+    """The checkpoint's files, read on demand. ``pretrained_config`` stands in for
+    ``transformer/config.json`` when given; ``checkpoint_dir`` may then be ``None``."""
 
-    file: str
-    path: str
+    def __init__(self, checkpoint_dir: Optional[str], pretrained_config: Any = None) -> None:
+        self._dir = checkpoint_dir
+        self._pretrained = pretrained_config
+        self._docs: dict[str, Any] = {}
 
-    @property
-    def label(self) -> str:
-        return f"{self.file}:{self.path}"
+    def doc(self, file: str) -> Any:
+        if file == TRANSFORMER_FILE and self._pretrained is not None:
+            return self._pretrained
+        if file not in self._docs:
+            doc = None
+            if self._dir is not None:
+                path = os.path.join(self._dir, file)
+                if os.path.exists(path):
+                    with open(path) as f:
+                        doc = json.load(f)
+            self._docs[file] = doc
+        return self._docs[file]
 
-    def lookup(self, ctx: CheckpointFiles, name, given, values):
-        doc = ctx.doc(self.file)
-        value = _MISSING if doc is None else _walk(doc, self.path)
-        return _MISSING if value is None else value
+    def value(self, key: str) -> Any:
+        """The value at ``"file:dotted.path"``; a ``null`` there counts as absent."""
+        file, path = key.split(":", 1)
+        doc = self.doc(file)
+        value = _MISSING if doc is None else _walk(doc, path)
+        return None if value is _MISSING else value
 
-
-# Priority among the files: the training config (config.json), then the component
-# configs, then the export metadata and the diffusers index.
-CHECKPOINT_RULES: dict[str, Rule] = {
-    "architecture.position_embedding_type": Rule(
-        (
-            Key(TRANSFORMER, "position_embedding_type"),
-            Default("unified_3d_mrope", "exports that predate the key"),
-        )
-    ),
-    "architecture.max_position_embeddings": Rule(
-        (
-            Key(TRANSFORMER, "max_position_embeddings"),
-            Default(262144, "exports that predate the key"),
-        )
-    ),
-    "vae.temporal_compression": Rule(
-        (
-            Key(VAE, "scale_factor_temporal"),
-            Key(TRANSFORMER, "temporal_compression_factor"),
-            Default(4, "exports that predate the key"),
-        ),
-        conflict=Conflict.ERROR,
-    ),
-    "vae.spatial_compression": Rule((Key(VAE, "scale_factor_spatial"),), conflict=Conflict.ERROR),
-    "audio.temporal_compression": Rule(
-        (
-            Key(TRANSFORMER, "temporal_compression_factor_sound"),
-            Default(1, "exports that predate the key"),
-        )
-    ),
-    "prompt.use_system_prompt": Rule(
-        (
-            Key(CONFIG, "model.config.vlm_config.use_system_prompt"),
-            Key(MODEL_INDEX, "default_use_system_prompt"),
-        ),
-        conflict=Conflict.WARN,
-    ),
-    "sampling.native_flow_schedule": Rule(
-        (
-            Key(MODEL_INDEX, "use_native_flow_schedule"),
-            Default(False, "only Edge exports declare the native grid"),
-        )
-    ),
-    "sampling.fixed_sigmas": Rule(
-        (Key(SCHEDULER, "fixed_step_sampler_config.t_list"),), required=False
-    ),
-    "action.policy": Rule((Key(CHECKPOINT, "policy"),), required=False),
-}
+    def read(
+        self, name: str, *keys: str, conflict: Conflict = Conflict.IGNORE
+    ) -> Optional[Resolved]:
+        """The setting ``name`` from the first of ``keys`` that holds it, tagged
+        ``CHECKPOINT`` with the key it came from; ``None`` when no file holds it. The
+        next file holding it is compared with the winner and a disagreement is
+        rejected, logged or only recorded, as ``conflict`` says."""
+        winner: Optional[Resolved] = None
+        disagreeing: list[str] = []
+        for key in keys:
+            value = self.value(key)
+            if value is None:
+                continue
+            if winner is None:
+                winner = Resolved(value, CHECKPOINT, key)
+                continue
+            if not same_value(value, winner.value):
+                disagreeing.append(f"{key}={value!r}")
+            break
+        if winner is None:
+            return None
+        if disagreeing and conflict is not Conflict.IGNORE:
+            message = (
+                f"Cosmos3 config: {name} = {winner.value!r} from {winner.where}, but "
+                + "; ".join(disagreeing)
+            )
+            if conflict is Conflict.ERROR:
+                raise ValueError(message)
+            logger.warning(message)
+        return replace(winner, disagreeing=tuple(disagreeing))
 
 
 @dataclass(frozen=True)
@@ -272,7 +212,9 @@ class Cosmos3ArchitectureSettings:
 class Cosmos3VAESettings:
     temporal_compression: int
     """Pixel frames per latent frame after the first, which is encoded alone."""
-    spatial_compression: int
+    spatial_compression: Optional[int]
+    """``None`` when the export ships no ``vae/config.json``; a pipeline that loads the
+    VAE needs it, one that skips the VAE does not."""
 
 
 @dataclass(frozen=True)
@@ -285,6 +227,9 @@ class Cosmos3SamplingSettings:
     fixed_sigmas: Optional[tuple[float, ...]]
     """The distilled schedule (``t_list``); ``None`` on base checkpoints."""
     native_flow_schedule: bool
+    flow_shift: Optional[float]
+    """The scheduler's flow shift; ``None`` on distilled checkpoints, whose fixed
+    schedule has no shift."""
 
 
 @dataclass(frozen=True)
@@ -307,6 +252,7 @@ class Cosmos3Config:
     prompt: Cosmos3PromptSettings
     action: Cosmos3ActionSettings
     resolved: Mapping[str, Resolved]
+    """Every setting above by dotted name (``vae.temporal_compression``), with origin."""
 
     def source_of(self, name: str) -> str:
         return self.resolved[name].source
@@ -324,40 +270,80 @@ class Cosmos3Config:
         return "\n".join(lines)
 
 
-def resolve_setting(name: str, rule: Rule, files: CheckpointFiles) -> Optional[Resolved]:
-    """One checkpoint setting. A required setting nothing declares is an error naming
-    the sources; a disagreement is rejected or logged as the rule says."""
-    winner, disagreeing = _pick(name, rule, files, {}, {})
-    if winner is None:
-        if rule.required:
-            labels = ", ".join(s.label for s in rule.sources)
-            raise ValueError(f"Cosmos3 config: cannot resolve {name}; none of {labels} is set.")
-        return None
-    if disagreeing and rule.conflict is not Conflict.IGNORE:
-        message = (
-            f"Cosmos3 config: {name} = {winner.value!r} from {winner.source}, but "
-            + "; ".join(f"{label}={v!r}" for label, v in disagreeing)
-        )
-        if rule.conflict is Conflict.ERROR:
-            raise ValueError(message)
-        logger.warning(message)
-    return _record(winner, disagreeing)
+ARCHITECTURE_KEYS: dict[str, tuple[str, Any]] = {
+    "position_embedding_type": (f"{TRANSFORMER_FILE}:position_embedding_type", "unified_3d_mrope"),
+    "max_position_embeddings": (f"{TRANSFORMER_FILE}:max_position_embeddings", 262144),
+    "temporal_compression_factor": (f"{TRANSFORMER_FILE}:temporal_compression_factor", 4),
+    "temporal_compression_factor_sound": (
+        f"{TRANSFORMER_FILE}:temporal_compression_factor_sound",
+        1,
+    ),
+}
+"""The ``pretrained_config`` attributes the transformer is built from: the key in
+``transformer/config.json`` and the value for exports that predate it."""
+
+REQUIRED_SETTINGS = ("prompt.use_system_prompt",)
+"""Settings some checkpoint file must declare; nothing stands in for them."""
 
 
 def resolve_checkpoint(
     checkpoint_dir: Optional[str], pretrained_config: Any = None
 ) -> Cosmos3Config:
-    """Apply :data:`CHECKPOINT_RULES` to the checkpoint's files."""
+    """Read the checkpoint's files into a :class:`Cosmos3Config`. Raises on a required
+    setting no file declares, or on a disagreement between files that is an error."""
     files = CheckpointFiles(checkpoint_dir, pretrained_config)
     resolved: dict[str, Resolved] = {}
-    for name, rule in CHECKPOINT_RULES.items():
-        r = resolve_setting(name, rule, files)
+
+    def setting(
+        name: str, *keys: str, conflict: Conflict = Conflict.IGNORE, default: Any = None
+    ) -> None:
+        r = files.read(name, *keys, conflict=conflict) or select(default=default)
         if r is not None:
             resolved[name] = r
 
+    def transformer_setting(
+        name: str, attr: str, *before: str, conflict: Conflict = Conflict.IGNORE
+    ) -> None:
+        """A setting the transformer is built from: the files in ``before`` first, then
+        the transformer config, then the compatibility default."""
+        key, default = ARCHITECTURE_KEYS[attr]
+        setting(name, *before, key, conflict=conflict, default=default)
+
+    transformer_setting("architecture.position_embedding_type", "position_embedding_type")
+    transformer_setting("architecture.max_position_embeddings", "max_position_embeddings")
+    transformer_setting(
+        "vae.temporal_compression",
+        "temporal_compression_factor",
+        f"{VAE_FILE}:scale_factor_temporal",
+        conflict=Conflict.ERROR,
+    )
+    setting("vae.spatial_compression", f"{VAE_FILE}:scale_factor_spatial")
+    transformer_setting("audio.temporal_compression", "temporal_compression_factor_sound")
+    # The training config over the diffusers index; published exports do disagree.
+    setting(
+        "prompt.use_system_prompt",
+        f"{CONFIG_FILE}:model.config.vlm_config.use_system_prompt",
+        f"{MODEL_INDEX_FILE}:default_use_system_prompt",
+        conflict=Conflict.WARN,
+    )
+    setting(
+        "sampling.native_flow_schedule",
+        f"{MODEL_INDEX_FILE}:use_native_flow_schedule",
+        default=False,
+    )
+    setting("sampling.fixed_sigmas", f"{SCHEDULER_FILE}:fixed_step_sampler_config.t_list")
+    setting("sampling.flow_shift", f"{SCHEDULER_FILE}:flow_shift")
+    setting("action.policy", f"{CHECKPOINT_FILE}:policy")
+
+    for name in REQUIRED_SETTINGS:
+        if name not in resolved:
+            raise ValueError(
+                f"Cosmos3 config: cannot resolve {name}; no checkpoint file declares it."
+            )
+
     def get(name: str) -> Any:
-        r = resolved.get(name)
-        return None if r is None else r.value
+        item = resolved.get(name)
+        return None if item is None else item.value
 
     sigmas = get("sampling.fixed_sigmas")
     if sigmas is not None and (
@@ -368,6 +354,8 @@ def resolve_checkpoint(
             f"Cosmos3 config: fixed_step_sampler_config.t_list must decrease within (0, 1]: "
             f"{list(sigmas)}."
         )
+    spatial = get("vae.spatial_compression")
+    flow_shift = get("sampling.flow_shift")
     return Cosmos3Config(
         architecture=Cosmos3ArchitectureSettings(
             position_embedding_type=str(get("architecture.position_embedding_type")),
@@ -375,12 +363,13 @@ def resolve_checkpoint(
         ),
         vae=Cosmos3VAESettings(
             temporal_compression=int(get("vae.temporal_compression")),
-            spatial_compression=int(get("vae.spatial_compression")),
+            spatial_compression=None if spatial is None else int(spatial),
         ),
         audio=Cosmos3AudioSettings(temporal_compression=int(get("audio.temporal_compression"))),
         sampling=Cosmos3SamplingSettings(
             fixed_sigmas=None if not sigmas else tuple(float(s) for s in sigmas),
             native_flow_schedule=bool(get("sampling.native_flow_schedule")),
+            flow_shift=None if flow_shift is None else float(flow_shift),
         ),
         prompt=Cosmos3PromptSettings(use_system_prompt=bool(get("prompt.use_system_prompt"))),
         action=Cosmos3ActionSettings(policy=get("action.policy")),
@@ -388,36 +377,18 @@ def resolve_checkpoint(
     )
 
 
-ARCHITECTURE_ATTRIBUTES = {
-    "position_embedding_type": "architecture.position_embedding_type",
-    "max_position_embeddings": "architecture.max_position_embeddings",
-    "temporal_compression_factor": "vae.temporal_compression",
-    "temporal_compression_factor_sound": "audio.temporal_compression",
-}
-"""``pretrained_config`` attributes the transformer reads, and the setting each holds."""
-
-
 def fill_pretrained_config(pretrained_config: Any) -> Any:
     """Set the transformer-construction attributes of ``pretrained_config`` that the
-    export omits, from :data:`CHECKPOINT_RULES`. Idempotent; returns the config.
+    export omits (:data:`ARCHITECTURE_KEYS`). Idempotent; returns the config.
 
     Runs before the pipeline loads its components, so only ``pretrained_config``
-    itself is consulted.
-    """
+    itself is consulted."""
     files = CheckpointFiles(None, pretrained_config)
-    for attr, name in ARCHITECTURE_ATTRIBUTES.items():
-        if getattr(pretrained_config, attr, None) is not None:
-            continue
-        rule = CHECKPOINT_RULES[name]
-        transformer_only = replace(
-            rule,
-            sources=tuple(
-                s for s in rule.sources if not isinstance(s, Key) or s.file == TRANSFORMER
-            ),
-        )
-        r = resolve_setting(name, transformer_only, files)
-        if r is not None:
-            setattr(pretrained_config, attr, r.value)
+    for attr, (key, default) in ARCHITECTURE_KEYS.items():
+        if getattr(pretrained_config, attr, None) is None:
+            resolved = select(checkpoint=files.value(key), default=default)
+            assert resolved is not None  # every entry has a default
+            setattr(pretrained_config, attr, resolved.value)
     return pretrained_config
 
 
@@ -425,303 +396,80 @@ def fill_pretrained_config(pretrained_config: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class RequestContext:
-    """What a request resolves against: the checkpoint's facts and the request's mode."""
+class RequestParameters:
+    """A request's settable fields plus the facts that pick the tables. Built by the
+    caller with the values the request set (``None`` = unset);
+    :meth:`ParameterResolver.request` returns a copy with every field this mode uses
+    filled. Fields another mode owns (the action fields outside action mode, the
+    canvas inside it) stay ``None``."""
 
-    family: str
     mode: str = "video"
-    """``"video"`` or ``"image"``; ignored for the table when ``action_mode`` is set."""
+    """``"video"`` or ``"image"``; the action table is used instead when ``action_mode`` is set."""
     action_mode: Optional[str] = None
-    distilled_steps: Optional[int] = None
-    """Length of the fixed schedule on a distilled checkpoint."""
-    policy_defaults: Mapping[str, Any] = field(default_factory=dict)
-    """The normalized ``checkpoint.json`` policy block."""
-    policy_active: bool = False
-    """The policy block applies: policy mode, and the request's domain is the block's."""
-    domain_name: Optional[str] = None
-    domain_id: Optional[int] = None
-    checkpoint_use_system_prompt: bool = False
     is_v2v: bool = False
     is_transfer: bool = False
+    domain_name: Optional[str] = None
+    """The embodiment. A policy request that names none comes back with the checkpoint
+    policy block's domain; one that names another keeps its own and the block is not applied."""
+    domain_id: Optional[int] = None
 
-    @property
-    def table_mode(self) -> str:
-        return "action" if self.action_mode is not None else self.mode
+    height: Optional[int] = None
+    width: Optional[int] = None
+    num_frames: Optional[int] = None
+    frame_rate: Optional[float] = None
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    guidance_interval: Optional[tuple[float, float]] = None
+    flow_shift: Optional[float] = None
+    max_sequence_length: Optional[int] = None
+    use_system_prompt: Optional[bool] = None
+    raw_action_dim: Optional[int] = None
+    action_chunk_size: Optional[int] = None
+    action_resolution: Optional[int] = None
+    action_fps: Optional[float] = None
+    use_state: Optional[bool] = None
 
-    @property
-    def preset_key(self) -> Optional[str]:
-        return canonical_domain_preset_key(self.domain_name, self.domain_id)
-
-
-class Given:
-    """The caller's value for the field being resolved; always the first source."""
-
-    label = "request"
-
-    def lookup(self, ctx: RequestContext, name: str, given: Mapping[str, Any], values) -> Any:
-        value = given.get(name)
-        return _MISSING if value is None else value
-
-
-@dataclass(frozen=True)
-class Distilled:
-    """A fact of the distilled schedule: its step count, or the guidance it bakes in."""
-
-    what: str
-
-    @property
-    def label(self) -> str:
-        return f"checkpoint:fixed_step_sampler_config ({self.what})"
-
-    def lookup(self, ctx, name, given, values):
-        if ctx.distilled_steps is None:
-            return _MISSING
-        return ctx.distilled_steps if self.what == "steps" else DISTILLED_GUIDANCE_SCALE
+    policy_active: bool = False
+    """Set by the resolver: the checkpoint's policy block applied to this request."""
+    preset_key: Optional[str] = None
+    """Set by the resolver: the domain preset the action fields came from, if any."""
 
 
-@dataclass(frozen=True)
-class Policy:
-    """A field of the checkpoint's policy block, when the block applies to the request."""
-
-    key: str
-
-    @property
-    def label(self) -> str:
-        return f"checkpoint.json:policy.{self.key}"
-
-    def lookup(self, ctx, name, given, values):
-        if not ctx.policy_active:
-            return _MISSING
-        value = ctx.policy_defaults.get(self.key)
-        return _MISSING if value is None else value
-
-
-@dataclass(frozen=True)
-class Context:
-    """A value the request context fixes: a workflow rule (transfer never prepends the
-    system prompt, video-to-video always does) or a checkpoint fact."""
-
-    label: str
-    pick: Callable[[RequestContext], Any]
-
-    def lookup(self, ctx, name, given, values):
-        value = self.pick(ctx)
-        return _MISSING if value is None else value
-
-
-class KnownWidth:
-    """The code's table of action widths per embodiment."""
-
-    label = "embodiment table (defaults)"
-
-    def lookup(self, ctx, name, given, values):
-        width = resolve_raw_action_dim(domain_name=ctx.domain_name, domain_id=ctx.domain_id)
-        return _MISSING if width is None else width
-
-
-@dataclass(frozen=True)
-class Preset:
-    """A field of the request's domain preset."""
-
-    key: str
-
-    @property
-    def label(self) -> str:
-        return f"domain preset.{self.key}"
-
-    def lookup(self, ctx, name, given, values):
-        preset = COSMOS3_DOMAIN_PRESETS.get(ctx.preset_key) if ctx.preset_key else None
-        value = preset.get(self.key) if preset else None
-        return _MISSING if value is None else value
-
-
-@dataclass(frozen=True)
-class Table:
-    """The (family, mode) generation table; ``mode=None`` is the request's own mode."""
-
-    key: str
-    mode: Optional[str] = None
-
-    @property
-    def label(self) -> str:
-        return f"{self.mode or 'mode'} table.{self.key}"
-
-    def lookup(self, ctx, name, given, values):
-        table = COSMOS3_GENERATION_DEFAULTS.get((ctx.family, self.mode or ctx.table_mode))
-        if not table or self.key not in table:
-            return _MISSING
-        return table[self.key]  # an explicit ``None`` in a table is a value: the field is off
-
-
-@dataclass(frozen=True)
-class Derived:
-    """A value computed from fields resolved before it."""
-
-    label: str
-    compute: Callable[[Mapping[str, Any]], Any]
-
-    def lookup(self, ctx, name, given, values):
-        value = self.compute(values)
-        return _MISSING if value is None else value
-
-
-# Precedence ranks: request, then the checkpoint's facts, then the code's tables, then
-# a default. ``check_precedence`` holds every rule to this order.
-PRECEDENCE: tuple[tuple[type, ...], ...] = (
-    (Given,),
-    (Key, Distilled, Policy, Context),
-    (KnownWidth, Preset, Table, Derived),
-    (Default,),
+ACTION_FIELDS = (
+    "raw_action_dim",
+    "action_chunk_size",
+    "action_resolution",
+    "action_fps",
+    "use_state",
 )
+"""Fields only an action request resolves; ``None`` otherwise."""
+
+CANVAS_FIELDS = ("height", "width")
+"""Fields only a video or image request resolves; an action request's canvas is the
+resolution bucket (``action_resolution``), so they stay ``None`` there."""
+
+OPTIONAL_FIELDS = ("guidance_interval", "flow_shift", "raw_action_dim")
+"""Fields that may legitimately end up unset: a mode without a guidance window, a
+distilled checkpoint without a flow shift, an embodiment without a canonical action width."""
+
+ACTION_RESOLUTION_DEFAULT = 480
+"""The bucket the action models were trained at."""
 
 
-def check_precedence(rules: Mapping[str, Rule]) -> None:
-    """Raise unless every rule orders its sources request, checkpoint, tables, default."""
-    rank = {cls: i for i, group in enumerate(PRECEDENCE) for cls in group}
-    for name, rule in rules.items():
-        ranks = [rank[type(s)] for s in rule.sources]
-        if ranks != sorted(ranks):
-            raise ValueError(f"rule {name!r} breaks the request > checkpoint > default order")
+class Candidates(NamedTuple):
+    """What one field may take, by origin. ``recommended`` and ``fallback`` are both
+    defaults; a caller's value that differs from ``recommended`` (the domain preset,
+    the embodiment width) is worth a warning, one that differs from ``fallback`` (the
+    generation tables) is not."""
 
+    request: Any = None
+    checkpoint: Any = None
+    recommended: Any = None
+    fallback: Any = None
 
-GENERATION_RULES: dict[str, Rule] = {
-    "num_inference_steps": Rule(
-        (
-            Given(),
-            Distilled("steps"),
-            Policy("num_inference_steps"),
-            Table("num_inference_steps"),
-            Table("num_inference_steps", "video"),
-        )
-    ),
-    "guidance_scale": Rule(
-        (
-            Given(),
-            Distilled("guidance"),
-            Policy("guidance_scale"),
-            Table("guidance_scale"),
-            Table("guidance_scale", "video"),
-        )
-    ),
-    "guidance_interval": Rule(
-        (
-            Given(),
-            Policy("guidance_interval"),
-            Table("guidance_interval"),
-            Table("guidance_interval", "video"),
-        ),
-        required=False,
-    ),
-    "max_sequence_length": Rule(
-        (Given(), Table("max_sequence_length"), Table("max_sequence_length", "video"))
-    ),
-    "height": Rule((Given(), Table("height"), Table("height", "video"))),
-    "width": Rule((Given(), Table("width"), Table("width", "video"))),
-    "num_frames": Rule((Given(), Table("num_frames"), Table("num_frames", "video"))),
-    "frame_rate": Rule((Given(), Table("frame_rate"), Table("frame_rate", "video"))),
-    "use_system_prompt": Rule(
-        (
-            Given(),
-            Context("transfer (never)", lambda ctx: False if ctx.is_transfer else None),
-            Context("video-to-video (always)", lambda ctx: True if ctx.is_v2v else None),
-            Context("checkpoint:use_system_prompt", lambda ctx: ctx.checkpoint_use_system_prompt),
-        )
-    ),
-}
-
-ACTION_RULES: dict[str, Rule] = {
-    "raw_action_dim": Rule(
-        (Given(), Policy("raw_action_dim"), KnownWidth()),
-        conflict=Conflict.WARN,
-        required=False,
-    ),
-    "action_chunk_size": Rule(
-        (
-            Given(),
-            Policy("action_chunk_size"),
-            Preset("action_chunk_size"),
-            Default(COSMOS3_ACTION_PARAMS["action_chunk_size"], "generic action horizon"),
-        ),
-        conflict=Conflict.WARN,
-    ),
-    "action_resolution": Rule(
-        (
-            Given(),
-            Policy("action_resolution"),
-            Preset("action_resolution"),
-            Default(480, "the bucket the action models were trained at"),
-        ),
-        conflict=Conflict.WARN,
-    ),
-    "frame_rate": Rule(
-        (
-            Given(),
-            Policy("frame_rate"),
-            Preset("frame_rate"),
-            Default(COSMOS3_ACTION_PARAMS["frame_rate"], "generic action frame rate"),
-        ),
-        conflict=Conflict.WARN,
-    ),
-    "action_fps": Rule(
-        (Given(), Policy("action_fps"), Derived("frame_rate", lambda v: v["frame_rate"]))
-    ),
-    "use_state": Rule(
-        (Given(), Policy("use_state"), Default(False, "policies without a state row")),
-        conflict=Conflict.WARN,
-    ),
-    "num_frames": Rule(
-        (Derived("action_chunk_size + 1", lambda v: int(v["action_chunk_size"]) + 1),)
-    ),
-}
-
-for _rules in (CHECKPOINT_RULES, GENERATION_RULES, ACTION_RULES):
-    check_precedence(_rules)
-
-
-@dataclass
-class ResolvedRequest:
-    values: dict[str, Resolved] = field(default_factory=dict)
-    warnings: list[str] = field(default_factory=list)
-
-    def __getitem__(self, name: str) -> Any:
-        return self.values[name].value
-
-    def source_of(self, name: str) -> str:
-        return self.values[name].source
-
-
-def _resolve_request(
-    rules: Mapping[str, Rule],
-    ctx: RequestContext,
-    given: Mapping[str, Any],
-    domain_label: str,
-) -> ResolvedRequest:
-    """Request fields: a caller's value that differs from the recommendation below it is
-    reported in ``warnings`` where the rule says ``WARN``."""
-    out = ResolvedRequest()
-    plain: dict[str, Any] = {}
-    for name, rule in rules.items():
-        winner, disagreeing = _pick(name, rule, ctx, given, plain)
-        if winner is None:
-            if rule.required:
-                raise ValueError(f"Cosmos3 request: cannot resolve {name} for {domain_label}.")
-            out.values[name] = Resolved(None, "unresolved")
-            plain[name] = None
-            continue
-        if disagreeing and winner.source == Given.label and rule.conflict is Conflict.WARN:
-            out.warnings.append(
-                f"Cosmos3 {name}={winner.value} differs from recommended "
-                f"{' / '.join(str(v) for _, v in disagreeing)} for domain {domain_label}."
-            )
-        out.values[name] = _record(winner, disagreeing)
-        plain[name] = winner.value
-    return out
-
-
-def resolve_generation(ctx: RequestContext, **given: Any) -> ResolvedRequest:
-    """Resolve the generation fields in ``given`` (``None`` = unset)."""
-    rules = {name: GENERATION_RULES[name] for name in given}
-    return _resolve_request(rules, ctx, given, repr(ctx.table_mode))
+    def pick(self) -> Optional[Resolved]:
+        default = self.fallback if self.recommended is None else self.recommended
+        return select(self.request, self.checkpoint, default)
 
 
 def policy_domain(
@@ -754,99 +502,215 @@ def policy_domain(
     return domain_name, False, warnings
 
 
-def resolve_action(ctx: RequestContext, **given: Any) -> ResolvedRequest:
-    """Resolve the action fields; ``ctx.domain_name`` / ``domain_id`` already reconciled
-    with the policy block (:func:`policy_domain`)."""
-    domain_label = (
-        repr(ctx.preset_key)
-        if ctx.preset_key
-        else (f"domain_name={ctx.domain_name!r}, domain_id={ctx.domain_id!r}")
-    )
-    resolved = _resolve_request(ACTION_RULES, ctx, given, domain_label)
-    domain_requested = bool(ctx.domain_name and str(ctx.domain_name).strip()) or (
-        ctx.domain_id is not None and str(ctx.domain_id).strip() not in {"", "0"}
-    )
-    if domain_requested and ctx.preset_key is None:
-        resolved.warnings.insert(
-            0,
-            "Cosmos3 action domain preset was not found for "
-            f"domain_name={ctx.domain_name!r}, domain_id={ctx.domain_id!r}; "
-            "using generic action defaults for omitted fields.",
-        )
-    if domain_requested and resolved["raw_action_dim"] is None:
-        resolved.warnings.append(
-            "Cosmos3 has no canonical action width for "
-            f"domain_name={ctx.domain_name!r}, domain_id={ctx.domain_id!r}; "
-            "pass raw_action_dim explicitly for policy/inverse_dynamics."
-        )
-    resolved.values["action_resolution"] = Resolved(
-        normalize_action_resolution(resolved["action_resolution"]),
-        resolved.source_of("action_resolution"),
-    )
-    if resolved["raw_action_dim"] is not None and int(resolved["raw_action_dim"]) <= 0:
-        raise ValueError(
-            f"Cosmos3 raw_action_dim must be positive, got {resolved['raw_action_dim']}."
-        )
-    if int(resolved["action_chunk_size"]) <= 0:
-        raise ValueError(
-            f"Cosmos3 action_chunk_size must be positive, got {resolved['action_chunk_size']}."
-        )
-    if float(resolved["frame_rate"]) <= 0.0:
-        raise ValueError(f"Cosmos3 frame_rate must be positive, got {resolved['frame_rate']}.")
-    if float(resolved["action_fps"]) <= 0.0:
-        raise ValueError(f"Cosmos3 action_fps must be positive, got {resolved['action_fps']}.")
-    return resolved
+class ParameterResolver:
+    """The settings of one Cosmos3 checkpoint, and the per-request resolution against
+    them. Build it with :meth:`from_checkpoint`, or from a :class:`Cosmos3Config`."""
 
+    def __init__(self, family: str, config: Cosmos3Config, *, log: bool = True) -> None:
+        self.family = family
+        self._config = config
+        self._log = log
+        sigmas = config.sampling.fixed_sigmas
+        self.distilled_steps: Optional[int] = None if sigmas is None else len(sigmas)
+        self.policy_defaults: Mapping[str, Any] = resolve_checkpoint_policy_defaults(
+            config.action.policy
+        )
+        """The normalized ``checkpoint.json`` policy block; empty for non-policy checkpoints."""
 
-def resolve_domain_action_config(
-    *,
-    domain_name: str | None = None,
-    domain_id: str | int | None = None,
-    raw_action_dim: int | None = None,
-    action_chunk_size: int | None = None,
-    action_resolution: int | None = None,
-    frame_rate: float | None = None,
-    action_fps: float | None = None,
-    use_state: bool | None = None,
-    checkpoint_policy_defaults: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """The action fields a request runs with, by :data:`ACTION_RULES`: the caller's
-    value, else the checkpoint policy block when its domain is the request's, else the
-    code's width table, else the domain preset, else the generic action defaults.
-    ``num_frames`` is always ``action_chunk_size + 1``. A caller's value that differs
-    from the recommendation is reported in ``warnings``.
-    """
-    policy_defaults = dict(checkpoint_policy_defaults or {})
-    domain_name, policy_active, warnings = policy_domain(policy_defaults, domain_name, domain_id)
-    ctx = RequestContext(
-        family="",
-        action_mode="action",
-        policy_defaults=policy_defaults,
-        policy_active=policy_active,
-        domain_name=domain_name,
-        domain_id=None if domain_id is None else int(domain_id),
-    )
-    resolved = resolve_action(
-        ctx,
-        raw_action_dim=raw_action_dim,
-        action_chunk_size=action_chunk_size,
-        action_resolution=action_resolution,
-        frame_rate=frame_rate,
-        action_fps=action_fps,
-        use_state=use_state,
-    )
-    width = resolved["raw_action_dim"]
-    return {
-        "domain_name": domain_name,
-        "checkpoint_policy_domain_matches": policy_active,
-        "raw_action_dim": None if width is None else int(width),
-        "action_chunk_size": int(resolved["action_chunk_size"]),
-        "action_resolution": resolved["action_resolution"],
-        "frame_rate": float(resolved["frame_rate"]),
-        "action_fps": float(resolved["action_fps"]),
-        "use_state": bool(resolved["use_state"]),
-        "num_frames": int(resolved["num_frames"]),
-        "preset_key": ctx.preset_key,
-        "warnings": warnings + resolved.warnings,
-        "sources": {name: r.source for name, r in resolved.values.items()},
-    }
+    @classmethod
+    def from_checkpoint(
+        cls, checkpoint_dir: str, family: str, pretrained_config: Any = None, *, log: bool = True
+    ) -> "ParameterResolver":
+        """Read the checkpoint's files. Raises on a required setting nothing declares,
+        or on a disagreement between files that is an error."""
+        return cls(family, resolve_checkpoint(checkpoint_dir, pretrained_config), log=log)
+
+    def config(self) -> Cosmos3Config:
+        """The checkpoint-level settings, defaults filled where the files are silent."""
+        return self._config
+
+    def describe(self) -> str:
+        return self._config.describe()
+
+    def request(self, params: RequestParameters) -> RequestParameters:
+        """``params`` with every field this mode uses filled: the caller's value where
+        set, else the checkpoint, else the tables and defaults. ``domain_name`` and
+        ``policy_active`` come back reconciled with the policy block. Recommendations
+        the caller's values differ from are logged as warnings."""
+        resolved, warnings, origins = self._resolve(params)
+        if self._log:
+            for warning in warnings:
+                logger.warning(warning)
+            logger.debug(
+                "Cosmos3 request fields: " + ", ".join(f"{k} [{v}]" for k, v in origins.items())
+            )
+        return resolved
+
+    def _resolve(self, p: RequestParameters) -> tuple[RequestParameters, list[str], dict[str, str]]:
+        in_action = p.action_mode is not None
+        policy_active = False
+        warnings: list[str] = []
+        if in_action and p.action_mode == ACTION_MODE_POLICY and self.policy_defaults:
+            domain_name, policy_active, warnings = policy_domain(
+                self.policy_defaults, p.domain_name, p.domain_id
+            )
+            p = replace(p, domain_name=domain_name)
+        policy: Mapping[str, Any] = self.policy_defaults if policy_active else {}
+
+        mode = "action" if in_action else p.mode
+        table = COSMOS3_GENERATION_DEFAULTS.get((self.family, mode), {})
+        video_table = COSMOS3_GENERATION_DEFAULTS.get((self.family, "video"), {})
+
+        def tables(key: str) -> Any:
+            # An explicit ``None`` in the mode's table switches the field off for that
+            # mode; only a key the table does not mention falls through to the video table.
+            return table[key] if key in table else video_table.get(key)
+
+        preset_key = canonical_domain_preset_key(p.domain_name, p.domain_id) if in_action else None
+        preset: Mapping[str, Any] = COSMOS3_DOMAIN_PRESETS.get(preset_key, {}) if preset_key else {}
+        label = (
+            repr(preset_key)
+            if preset_key
+            else (
+                f"domain_name={p.domain_name!r}, domain_id={p.domain_id!r}"
+                if in_action
+                else repr(mode)
+            )
+        )
+
+        distilled_guidance = None if self.distilled_steps is None else DISTILLED_GUIDANCE_SCALE
+        candidates: dict[str, Candidates] = {
+            "num_inference_steps": Candidates(
+                p.num_inference_steps,
+                self.distilled_steps
+                if self.distilled_steps is not None
+                else policy.get("num_inference_steps"),
+                fallback=tables("num_inference_steps"),
+            ),
+            "guidance_scale": Candidates(
+                p.guidance_scale,
+                distilled_guidance
+                if distilled_guidance is not None
+                else policy.get("guidance_scale"),
+                fallback=tables("guidance_scale"),
+            ),
+            "guidance_interval": Candidates(
+                p.guidance_interval,
+                policy.get("guidance_interval"),
+                fallback=tables("guidance_interval"),
+            ),
+            "flow_shift": Candidates(p.flow_shift, self._config.sampling.flow_shift),
+            "max_sequence_length": Candidates(
+                p.max_sequence_length, fallback=tables("max_sequence_length")
+            ),
+        }
+        if in_action:
+            known_width = resolve_raw_action_dim(domain_name=p.domain_name, domain_id=p.domain_id)
+            candidates["raw_action_dim"] = Candidates(
+                p.raw_action_dim, policy.get("raw_action_dim"), known_width
+            )
+            candidates["action_chunk_size"] = Candidates(
+                p.action_chunk_size,
+                policy.get("action_chunk_size"),
+                preset.get("action_chunk_size"),
+                tables("action_chunk_size"),
+            )
+            candidates["action_resolution"] = Candidates(
+                p.action_resolution,
+                policy.get("action_resolution"),
+                preset.get("action_resolution"),
+                ACTION_RESOLUTION_DEFAULT,
+            )
+            candidates["frame_rate"] = Candidates(
+                p.frame_rate,
+                policy.get("frame_rate"),
+                preset.get("frame_rate"),
+                tables("frame_rate"),
+            )
+            frame_rate = candidates["frame_rate"].pick()
+            candidates["action_fps"] = Candidates(
+                p.action_fps,
+                policy.get("action_fps"),
+                fallback=None if frame_rate is None else frame_rate.value,
+            )
+            candidates["use_state"] = Candidates(
+                p.use_state, policy.get("use_state"), fallback=False
+            )
+            chunk = candidates["action_chunk_size"].pick()
+            candidates["num_frames"] = Candidates(
+                p.num_frames, fallback=None if chunk is None else int(chunk.value) + 1
+            )
+        else:
+            candidates["height"] = Candidates(p.height, fallback=tables("height"))
+            candidates["width"] = Candidates(p.width, fallback=tables("width"))
+            candidates["frame_rate"] = Candidates(p.frame_rate, fallback=tables("frame_rate"))
+            candidates["num_frames"] = Candidates(p.num_frames, fallback=tables("num_frames"))
+
+        picked: dict[str, Optional[Resolved]] = {name: c.pick() for name, c in candidates.items()}
+        # Transfer never prepends the system prompt and video-to-video always does. Those
+        # rules come from the kind of request, so they sit between the request and the
+        # checkpoint.
+        workflow_prompt = False if p.is_transfer else (True if p.is_v2v else None)
+        if p.use_system_prompt is None and workflow_prompt is not None:
+            picked["use_system_prompt"] = Resolved(
+                workflow_prompt, WORKFLOW, "transfer" if p.is_transfer else "video-to-video"
+            )
+        else:
+            picked["use_system_prompt"] = select(
+                p.use_system_prompt, self._config.prompt.use_system_prompt
+            )
+        unused = CANVAS_FIELDS if in_action else ACTION_FIELDS
+        picked.update({name: None for name in unused})
+
+        values: dict[str, Any] = {}
+        origins: dict[str, str] = {}
+        for name, item in picked.items():
+            if item is None:
+                if name in OPTIONAL_FIELDS or name in unused:
+                    values[name] = None
+                    origins[name] = UNSET
+                    continue
+                raise ValueError(f"Cosmos3 request: cannot resolve {name} for {label}.")
+            values[name] = item.value
+            origins[name] = item.origin
+
+        if in_action:
+            # In action mode the policy block and the presets are recommendations: a
+            # caller's value that differs from them is worth a warning.
+            for name, c in candidates.items():
+                suggestion = c.checkpoint if c.checkpoint is not None else c.recommended
+                if (
+                    suggestion is not None
+                    and origins[name] == REQUEST
+                    and not same_value(values[name], suggestion)
+                ):
+                    warnings.append(
+                        f"Cosmos3 {name}={values[name]} differs from recommended "
+                        f"{suggestion} for domain {label}."
+                    )
+            domain_requested = bool(p.domain_name and str(p.domain_name).strip()) or (
+                p.domain_id is not None and str(p.domain_id).strip() not in {"", "0"}
+            )
+            if domain_requested and preset_key is None:
+                warnings.insert(
+                    0,
+                    "Cosmos3 action domain preset was not found for "
+                    f"domain_name={p.domain_name!r}, domain_id={p.domain_id!r}; "
+                    "using generic action defaults for omitted fields.",
+                )
+            if domain_requested and values["raw_action_dim"] is None:
+                warnings.append(
+                    "Cosmos3 has no canonical action width for "
+                    f"domain_name={p.domain_name!r}, domain_id={p.domain_id!r}; "
+                    "pass raw_action_dim explicitly for policy/inverse_dynamics."
+                )
+            values["action_resolution"] = normalize_action_resolution(values["action_resolution"])
+            if values["raw_action_dim"] is not None and int(values["raw_action_dim"]) <= 0:
+                raise ValueError(
+                    f"Cosmos3 raw_action_dim must be positive, got {values['raw_action_dim']}."
+                )
+            for name in ("action_chunk_size", "frame_rate", "action_fps"):
+                if float(values[name]) <= 0.0:
+                    raise ValueError(f"Cosmos3 {name} must be positive, got {values[name]}.")
+        resolved = replace(p, policy_active=policy_active, preset_key=preset_key, **values)
+        return resolved, warnings, origins
