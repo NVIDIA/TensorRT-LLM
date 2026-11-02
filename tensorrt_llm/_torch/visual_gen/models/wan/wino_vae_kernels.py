@@ -12,17 +12,13 @@ import functools
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
-from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
-    FrameGeometry,
-    combine,
-    rms_norm_silu_rows,
-)
+from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import FrameGeometry, rms_norm_silu_rows
 
 from .wino_tables import SPATIAL_WINO
 
 
 def kernels_available() -> bool:
-    """The norm / Winograd norm / combine kernel (:mod:`jit_norm`) can run."""
+    """The norm kernel (:mod:`jit_norm`, every variant) can run."""
     return jit_norm_available()
 
 
@@ -429,7 +425,7 @@ def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
     return rows.view(m.shape[0], m.shape[2] * m.shape[3], m.shape[1])
 
 
-def wino_combine(
+def add_bias_and_residual(
     x: torch.Tensor | None,
     m: list[torch.Tensor] | None,
     bias: torch.Tensor | None,
@@ -441,12 +437,14 @@ def wino_combine(
     pad_w: int = 0,
     products_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
-    """``(combine(m) | x) + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order.
+    """``frames + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order; the
+    frames are ``x``, or the temporal Winograd products ``m`` after their output transform
+    (:func:`jit_norm.add_bias_and_residual`).
 
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
     appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``products_geometry``: the
     products carry halo rows / columns (spatially sharded decode)."""
-    return combine(
+    return jit_norm.add_bias_and_residual(
         x,
         m,
         bias.reshape(-1).contiguous() if bias is not None else None,

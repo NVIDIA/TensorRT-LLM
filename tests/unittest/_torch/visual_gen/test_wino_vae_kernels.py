@@ -64,7 +64,7 @@ def interleave_bias_reference(u: torch.Tensor, bias: torch.Tensor | None) -> tor
     return torch.stack([ub[:, :, :c], ub[:, :, c:]], dim=1).reshape(2 * t, p, c)
 
 
-def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:
+def temporal_output_transform_reference(m: list[torch.Tensor]) -> torch.Tensor:
     """``m[k] [groups, P, C]`` (``order + 2`` of them) -> bf16 frames ``[order*groups, P, C]``:
     frame j of a group is ``sum_k AT[j][k] m_k`` in index order with bf16 rounding after every
     add (the products are exact: powers of two)."""
@@ -92,11 +92,11 @@ def wino_norm_silu_reference(
     order: int = 2,
     winograd_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
-    """Eager form of the kernel, same rounding points (bf16 after every add of the combine,
+    """Eager form of the kernel, same rounding points (bf16 after every add of the output transform,
     the Winograd inputs formed in fp32 and rounded once to ``winograd_dtype``)."""
     if x is None:
         assert m is not None
-        x = wino_combine_reference(m)
+        x = temporal_output_transform_reference(m)
     s = None
     if in_bias is not None:
         x = s = x + in_bias.reshape(1, 1, -1)
@@ -559,7 +559,7 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
 @wino_op
 @pytest.mark.parametrize("order", [2, 4])
 def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
-    """Winograd inputs from the kernel, one conv2d per component filter, combine: the causal 3x3x3 conv
+    """Winograd inputs from the kernel, one conv2d per component filter, output transform: the causal 3x3x3 conv
     of the normalized frames (fp32 reference on the same 16-bit inputs)."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         TEMPORAL_WINO,
@@ -601,12 +601,13 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Frame ops: Winograd combine (+ bias + residual) and the time interleave (+ bias)
+# Frame ops: add_bias_and_residual (temporal output transform + bias + residual) and the
+# time interleave (+ bias)
 # ---------------------------------------------------------------------------
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
+    add_bias_and_residual,
     interleave_bias,
-    wino_combine,
 )
 
 frame_ops = cuda_op
@@ -616,7 +617,7 @@ frame_ops = cuda_op
 @pytest.mark.parametrize("C", [256, 160, 48])
 @pytest.mark.parametrize("source", ["x", "m2", "m2h", "m4h"])
 @pytest.mark.parametrize("extras", ["none", "bias", "residual", "bias_residual"])
-def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
+def test_add_bias_and_residual_is_bitwise(C: int, source: str, extras: str) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C)
     order = 4 if source == "m4h" else 2
     T, P = 2 * order, 7 * 11
@@ -631,15 +632,15 @@ def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
     )
     bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if "bias" in extras else None
     residual = rnd(T, P, C) if "residual" in extras else None
-    ref = x if x is not None else wino_combine_reference(m)
+    ref = x if x is not None else temporal_output_transform_reference(m)
     if bias is not None:
         ref = ref + bias.reshape(1, 1, -1)
     if residual is not None:
         ref = ref + residual
-    got = wino_combine(x, m, bias, residual, T, 7, 11)
+    got = add_bias_and_residual(x, m, bias, residual, T, 7, 11)
     assert torch.equal(got, ref)
     # zero-padded output (the downsampler's ZeroPad2d((0, 1, 0, 1))) in the same pass
-    padded = wino_combine(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
+    padded = add_bias_and_residual(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
     ref_img = F.pad(ref.view(T, 7, 11, C).permute(0, 3, 1, 2), (0, 1, 0, 1)).permute(0, 2, 3, 1)
     assert torch.equal(padded, ref_img)
 
@@ -1398,7 +1399,7 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
 @cuda_op
 @pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
 @pytest.mark.parametrize("axis", ["h", "w"])
-def test_rows_and_combine_geometry_match_plain(C: int, axis: str) -> None:
+def test_rows_and_add_bias_and_residual_geometry_match_plain(C: int, axis: str) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
 
     gen = torch.Generator(device="cuda").manual_seed(C)
@@ -1431,9 +1432,11 @@ def test_rows_and_combine_geometry_match_plain(C: int, axis: str) -> None:
     bias_c = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     res = rnd(T4, P, C)
     for pad in (0, 1):
-        ref = jit_norm.combine(None, list(m_ref), bias_c, res, T4, H, W, pad, pad)
+        ref = jit_norm.add_bias_and_residual(None, list(m_ref), bias_c, res, T4, H, W, pad, pad)
         m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
-        got = jit_norm.combine(None, m_phys, bias_c, res, T4, H, W, pad, pad, products_geometry=geo)
+        got = jit_norm.add_bias_and_residual(
+            None, m_phys, bias_c, res, T4, H, W, pad, pad, products_geometry=geo
+        )
         assert torch.equal(got, ref)
 
 

@@ -3,7 +3,7 @@
 """The Wan VAE position-walk kernel (:mod:`.kernels.norm`): call-site interface.
 
 One kernel covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input producer
-and product consumer, order 2 or 4) and the Winograd combine; its parameters (dtypes, order,
+and product consumer, order 2 or 4) and the bias / residual add; its parameters (dtypes, order,
 lane layout, mode flags) are all known at the call site. Each combination is compiled with the
 CuTe DSL on first use (cached on disk across processes) and launched on the current torch
 stream, so it is CUDA-graph safe.
@@ -517,7 +517,7 @@ def rms_norm_silu_rows(
     return out_sum, y
 
 
-def combine(
+def add_bias_and_residual(
     x: torch.Tensor | None,
     m: list[torch.Tensor] | None,
     bias: torch.Tensor | None,
@@ -529,9 +529,10 @@ def combine(
     pad_w: int = 0,
     products_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
-    """``(combine(m) | x) + bias + residual`` as
-    bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns appended, every add
-    rounded like the eager chain. ``products_geometry``: the products carry halo rows /
+    """``frames + bias + residual`` as bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero
+    rows/columns appended, every add rounded like the eager chain. The frames are ``x``, or the
+    temporal Winograd products ``m`` turned into frames first (the output transform A^T along
+    time: frame ``g*order + j`` is ``sum_k AT[j][k] m_k[g]``). ``products_geometry``: the products carry halo rows /
     columns around their ``height`` x ``width`` logical positions."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")

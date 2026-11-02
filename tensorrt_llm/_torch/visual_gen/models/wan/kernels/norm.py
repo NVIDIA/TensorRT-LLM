@@ -6,10 +6,10 @@ One thread group (``lanes`` lanes, ``k`` 16-byte vectors each) owns one spatial 
 batch-1 channels-last video (``[T, P, C]``, rows contiguous) and walks its frames in order.
 Three compile-time stages make it every norm-side kernel of WinoVae:
 
-  input   the x frames, or the temporal Winograd combine of ``order + 2`` conv products (frame
+  input   the x frames, or the temporal output transform of ``order + 2`` conv products (frame
           ``g*R + j`` is ``sum_k AT[j][k] m_k[g]``, index order), then the deferred conv bias and
           the residual; the pre-norm row goes to ``sum`` when the variant writes it.
-  middle  nothing (the combine kernel), RMSNorm, or RMSNorm + SiLU.
+  middle  nothing (the add_bias_and_residual kernel), RMSNorm, or RMSNorm + SiLU.
   output  the temporal Winograd inputs of order R (``D_k = sum_i BT[k][i] f_i`` over the group's
           R + 2 normalized frames, two of them the cache), the last two normalized frames going
           to ``y_tail`` for the next chunk; or plain rows to ``y`` (``[T, P', C]``, ``P'`` the
@@ -83,7 +83,7 @@ def _blocks_per_sm(v: Variant) -> int:
     """Resident blocks per SM the register budget is sized for (256 threads: 4 blocks give 64
     registers, 3 give 80, 2 give 128).
 
-    Row output: 4 blocks up to two vectors per lane, 3 above; the order-4 product combine at
+    Row output: 4 blocks up to two vectors per lane, 3 above; the order-4 output transform at
     160 and 320 channels holds five products per slice and spills at 80 registers, so it runs
     2 blocks; the 160-channel row walk of plain input is latency-bound at 3 and runs 4.
     Winograd output: 2 blocks for order 4 or four and more vectors per lane (the order-4 input
@@ -104,8 +104,8 @@ def _blocks_per_sm(v: Variant) -> int:
 
 
 def _slice_depth(v: Variant) -> int:
-    """Vector slices in flight ahead of the one being combined: three for four or more
-    vectors per lane, except where two measured faster: the 640-channel product combine, and
+    """Vector slices in flight ahead of the one being processed: three for four or more
+    vectors per lane, except where two measured faster: the 640-channel output transform, and
     the 1024-channel row norm with a residual (two slices plus the cross-frame prefetch of the
     next frame's first two slices hide the doubled loads better)."""
     if v.out == OUT_ROWS and v.in_wino and v.k >= 4 and v.lanes >= 16:
@@ -517,7 +517,7 @@ class VaeNormKernel:
                         elif cutlass.const_expr(not p.xf_pf):
                             self._load_slice(c, J, 0, src_in, src_res, 0)
 
-                        # Pass 1: combine, deferred bias, residual; the bf16 row stays in
+                        # Pass 1: output transform, deferred bias, residual; the bf16 row stays in
                         # registers (``yw``, packed pairs per slice) and goes to ``sum``; the sum
                         # of squares on the way.
                         ss = Float32(0.0)
@@ -743,10 +743,10 @@ class VaeNormKernel:
         return bf16_lo(pack2(x, x, False))
 
     def _slice(self, c, J: int, b: int, kk: int, ss, orow, srow, lig_f):
-        """Pass 1 on slice ``kk`` from buffer ``b``: combine (in index order; the products are
+        """Pass 1 on slice ``kk`` from buffer ``b``: output transform (in index order; the products are
         exact, so the reference rounding is one rounding per add), deferred bias, residual.
         Returns the updated sum of squares and the bf16 slice as four packed pairs, which also
-        go to ``sum`` (or, for the combine kernel, to ``y``)."""
+        go to ``sum`` (or, for the add_bias_and_residual kernel, to ``y``)."""
         p = self.p
         v = p.v
         ref = v.reference
