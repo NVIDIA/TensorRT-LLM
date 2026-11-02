@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 from test_common.serve.layering import (
     Contract,
+    ImportEdge,
     build_import_graph,
     check_contracts,
     stale_allowances,
@@ -138,18 +139,67 @@ def _under_api(module: str) -> bool:
     return module == _API_PREFIX or module.startswith(_API_PREFIX + ".")
 
 
+def _cross_package_imports(edges) -> list:
+    """Imports between endpoint packages, matched per imported name as check_contracts does.
+
+    ``from tensorrt_llm.serve import api`` names the api root package and
+    ``from tensorrt_llm.serve.api.ops import system`` names ``ops.system``: the
+    package is read off ``<module>.<name>``, not off the ``from`` module alone.
+    """
+    problems = []
+    for edge in edges:
+        if edge.type_checking or not _under_api(edge.importer):
+            continue
+        for name in edge.names or ("",):
+            target = f"{edge.imported}.{name}" if name else edge.imported
+            if not _under_api(target):
+                continue
+            if _api_package_of(target) != _api_package_of(edge.importer):
+                problems.append(
+                    f"serve/api/ packages do not import each other: {edge.importer} "
+                    f"(line {edge.lineno}) imports `{target}`. Share code through serve/_base/ "
+                    "or inject it from the composition root."
+                )
+    return problems
+
+
 def test_api_packages_do_not_import_each_other(edges):
-    problems = [
-        f"serve/api/ packages do not import each other: {edge.importer} (line {edge.lineno}) "
-        f"imports `{edge.imported}`. Share code through serve/_base/ or inject it from the "
-        "composition root."
-        for edge in edges
-        if _under_api(edge.importer)
-        and _under_api(edge.imported)
-        and not edge.type_checking
-        and _api_package_of(edge.importer) != _api_package_of(edge.imported)
-    ]
-    assert problems == []
+    assert _cross_package_imports(edges) == []
+
+
+def test_cross_package_classification_reads_the_imported_name():
+    def edge(importer, imported, names):
+        return ImportEdge(
+            importer=importer,
+            imported=imported,
+            names=names,
+            lineno=1,
+            in_function=False,
+            type_checking=False,
+        )
+
+    system = "tensorrt_llm.serve.api.ops.system.api_router"
+    # Parent-package forms resolve to the submodule they name: the same package.
+    assert _cross_package_imports([edge(system, "tensorrt_llm.serve.api.ops", ("system",))]) == []
+    assert (
+        _cross_package_imports([edge(system, "tensorrt_llm.serve.api.ops.system", ("serving",))])
+        == []
+    )
+    # The api root, a sibling package and another dialect are cross-package, whatever the form.
+    assert len(_cross_package_imports([edge(system, "tensorrt_llm.serve", ("api",))])) == 1
+    assert (
+        len(_cross_package_imports([edge(system, "tensorrt_llm.serve.api.ops", ("metrics",))])) == 1
+    )
+    anthropic = "tensorrt_llm.serve.api.anthropic.serving"
+    assert len(_cross_package_imports([edge(system, anthropic, ("AnthropicServing",))])) == 1
+    # Importers outside serve/api/ are not classified here.
+    root = "tensorrt_llm.serve.openai_server"
+    assert (
+        _cross_package_imports(
+            [edge(root, "tensorrt_llm.serve.api.ops.system.serving", ("SystemServing",))]
+        )
+        == []
+    )
 
 
 def test_api_init_imports_nothing():
