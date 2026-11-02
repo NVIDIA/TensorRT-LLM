@@ -700,7 +700,7 @@ def test_mixed_precision_public_options():
                     "dynamic_tree_max_topK": 2,
                 }
             },
-            NotImplementedError,
+            ValueError,
             "dynamic-tree",
         ),
         (
