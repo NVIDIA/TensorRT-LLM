@@ -32,6 +32,8 @@ from tensorrt_llm._torch.memory.monitor.providers.comm import (
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group
 
+pytestmark = pytest.mark.cpu_only
+
 MB = 1 << 20
 
 

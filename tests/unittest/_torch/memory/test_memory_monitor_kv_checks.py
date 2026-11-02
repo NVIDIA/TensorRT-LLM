@@ -65,6 +65,7 @@ def _manager(*stats):
     return _Manager(*stats)
 
 
+@pytest.mark.cpu_only
 class TestCheckCIsNotVacuous:
     """The reason this check exists at all."""
 
@@ -103,6 +104,7 @@ class TestCheckCIsNotVacuous:
         assert [r.passed for r in results] == [True, False]
 
 
+@pytest.mark.cpu_only
 class TestSlotsToBytes:
     def test_every_pool_in_the_group_contributes_a_slot(self):
         rows = kv_pool_group_stats(_manager(_stats(10, 2, 3, slot_sizes=(MB, 2 * MB))))
@@ -111,6 +113,7 @@ class TestSlotsToBytes:
         assert rows[0]["in_use_bytes"] == 15 * MB
 
 
+@pytest.mark.cpu_only
 class TestPhysicalVersusLogical:
     def test_capacity_is_physical_and_counts(self):
         manager = _manager(_stats(100, 60, 20))
@@ -152,6 +155,7 @@ class TestPhysicalVersusLogical:
         assert "pool_group[0]" in entries[0].owner
 
 
+@pytest.mark.cpu_only
 class TestProviderAvailability:
     def test_unavailable_without_a_manager(self):
         provider = KvCacheProvider(None)
@@ -181,6 +185,7 @@ class TestProviderAvailability:
         )
 
 
+@pytest.mark.cpu_only
 class TestInconsistentPoolKeepsCapacity:
     """free + evictable > total is what check C exists to catch."""
 
@@ -203,6 +208,7 @@ class TestInconsistentPoolKeepsCapacity:
         assert not check_kv_pool_conservation(kv_pool_group_stats(manager))[0].passed
 
 
+@pytest.mark.cpu_only
 class TestPoolRoles:
     def test_roles_have_distinct_names(self):
         a, b = _manager(_stats(10, 0, 0)), _manager(_stats(20, 0, 0))
@@ -287,6 +293,7 @@ class TestChecksRunInRealReports:
         assert any(c.name.startswith("B:") for c in snapshot.checks)
 
 
+@pytest.mark.cpu_only
 class TestKvCacheManagerV1:
     def test_reads_the_managers_allocated_bytes(self):
         class _V1:

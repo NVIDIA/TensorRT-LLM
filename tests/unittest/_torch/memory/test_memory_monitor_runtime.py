@@ -56,6 +56,7 @@ def reports(monkeypatch):
 
 
 class TestPeriodic:
+    @needs_gpu
     def test_reports_on_its_interval_and_stops(self, monkeypatch, tmp_path):
         monkeypatch.setenv(triggers.INTERVAL_VAR, "0.05")
         monkeypatch.setattr(triggers, "_attached", True)
@@ -68,6 +69,7 @@ class TestPeriodic:
         triggers.uninstall_oom_reporter()
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
 
+    @pytest.mark.cpu_only
     def test_off_unless_asked(self, monkeypatch):
         monkeypatch.delenv(triggers.INTERVAL_VAR, raising=False)
         monkeypatch.setattr(triggers, "_attached", True)
@@ -75,6 +77,7 @@ class TestPeriodic:
         assert not any(t.name == "memory-monitor-periodic" for t in threading.enumerate())
 
 
+@pytest.mark.cpu_only
 class TestErrorsFromOtherThreads:
     def test_logged_oom_is_reported_once(self, reports):
         triggers.install_oom_reporter()
@@ -129,6 +132,7 @@ class TestOnRequest:
         text = worker.get_memory_report()
         assert text and "This process uses" in text
 
+    @pytest.mark.cpu_only
     def test_llm_returns_each_workers_report(self):
         from tensorrt_llm import LLM
 
@@ -137,6 +141,7 @@ class TestOnRequest:
         assert llm.get_memory_report() == ["rank 0 report"]
         llm._collective_rpc.assert_called_once_with("get_memory_report")
 
+    @pytest.mark.cpu_only
     def test_allowed_on_a_multi_rank_mpi_executor(self):
         from tensorrt_llm.executor.proxy import _check_collective_rpc_guard
 
@@ -170,6 +175,7 @@ def test_worker_thread_allocation_is_named_after_the_running_step(monkeypatch):
     del after
 
 
+@pytest.mark.cpu_only
 def test_nested_windows_resolve_to_the_innermost():
     lookup = tagging._window_lookup([(0, 100, "outer"), (40, 60, "inner")])
     assert [lookup(t) for t in (10, 50, 70, 150)] == ["outer", "inner", "outer", None]

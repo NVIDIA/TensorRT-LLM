@@ -140,6 +140,7 @@ class TestFailedStartup:
         assert "FAILED      KV cache (free device memory before it: 3.00 GiB)" in text
 
 
+@pytest.mark.cpu_only
 class TestMemoryPlan:
     def test_within_plan(self):
         startup.record_memory_plan(non_kv_peak=10 * GIB, activation=2 * GIB)
@@ -181,6 +182,7 @@ class TestMemoryPlan:
         assert "Startup plan" not in render(_frame(), _capability())
 
 
+@pytest.mark.cpu_only
 class TestStepsOnlyInStartupReports:
     def test_listed_when_asked(self):
         startup.set_stage_advice({"model": "Model"}, {})
@@ -210,6 +212,7 @@ class TestStepsOnlyInStartupReports:
 class TestCreationStepsAreTagged:
     """Each executor creation step tags what it allocates."""
 
+    @pytest.mark.cpu_only
     def test_every_scoped_step_has_a_category(self):
         # allocation_scope accepts exactly the steps that have a metric name;
         # one without a category would report under its raw value.
@@ -265,6 +268,7 @@ class TestCreationStepsAreTagged:
             del held
 
 
+@pytest.mark.cpu_only
 class TestGroupMembers:
     def test_a_group_lists_what_it_is_made_of(self):
         frame = build_frame(
@@ -308,6 +312,7 @@ def _cuda_runtime():
 class TestResidualBreakdown:
     """Splitting the overhead row by when, and where, it appeared."""
 
+    @pytest.mark.cpu_only
     def test_parts_sum_to_the_residual(self):
         startup._first = startup.Reading(process=10 * GIB, torch=3 * GIB, known=2 * GIB)
         startup._stages.append(
@@ -324,11 +329,13 @@ class TestResidualBreakdown:
         assert parts["Model (other)"] == GIB // 2
         assert parts["since startup"] == 2 * GIB
 
+    @pytest.mark.cpu_only
     def test_freed_parts_show_as_negative_remainder(self):
         startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
         parts = dict(startup.residual_breakdown(9 * GIB))
         assert parts["released since startup"] == -GIB
 
+    @pytest.mark.cpu_only
     def test_nothing_recorded_nothing_shown(self):
         assert startup.residual_breakdown(GIB) == []
 
@@ -369,12 +376,14 @@ class TestResidualBreakdown:
         finally:
             del held
 
+    @pytest.mark.cpu_only
     def test_region_is_a_noop_when_off(self, monkeypatch):
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         with startup.region("anything"):
             pass
         assert startup._regions == []
 
+    @pytest.mark.cpu_only
     def test_overhead_row_lists_the_parts(self):
         startup._first = startup.Reading(process=10 * GIB, torch=0, known=0)
         startup._regions.append(startup.RegionSample("custom allreduce workspace", None, 2 * GIB))
@@ -387,6 +396,7 @@ class TestResidualBreakdown:
         assert "before the first startup step 10.00" in text
         assert "custom allreduce workspace 2.00" in text
 
+    @pytest.mark.cpu_only
     def test_no_breakdown_without_a_per_process_reading(self):
         # Startup parts are per process; they would not reconcile with a
         # device-wide upper bound.

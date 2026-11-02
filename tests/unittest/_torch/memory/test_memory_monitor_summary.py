@@ -19,11 +19,15 @@ if the rows did not sum to the process total, a reader would either distrust
 every number or, worse, not notice. CPU only.
 """
 
+import pytest
+
 from tensorrt_llm._torch.memory.monitor.capability import Capability
 from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
 from tensorrt_llm._torch.memory.monitor.report import render
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
 from tensorrt_llm._torch.memory.monitor.summary import GROUP_OF, Group, group_totals
+
+pytestmark = pytest.mark.cpu_only
 
 GIB = 1 << 30
 

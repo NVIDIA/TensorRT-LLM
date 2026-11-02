@@ -59,6 +59,7 @@ def _region(name):
     return [r for r in startup._regions if r.name == name]
 
 
+@pytest.mark.cpu_only
 class TestRegions:
     def test_nested_region_is_not_counted_twice(self, fake_memory):
         with startup.region("outer"):
@@ -100,6 +101,7 @@ def test_lora_device_cache_is_named(fake_memory, monkeypatch):
     assert [r.residual_taken for r in _region("LoRA device cache")] == [256 * MB]
 
 
+@pytest.mark.cpu_only
 def test_kv_transfer_buffers_are_named(fake_memory, monkeypatch):
     from tensorrt_llm._torch.pyexecutor import _util
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
@@ -154,6 +156,7 @@ def test_kv_transfer_buffers_are_named(fake_memory, monkeypatch):
     assert [r.residual_taken for r in _region("KV cache transfer buffers")] == [128 * MB]
 
 
+@pytest.mark.cpu_only
 def test_sleep_listener_reports_a_failed_wakeup(monkeypatch):
     """Rematerializing on wakeup allocates outside PyTorch; its OOM is caught
     by the listener thread, not by ``_handle_errors``."""

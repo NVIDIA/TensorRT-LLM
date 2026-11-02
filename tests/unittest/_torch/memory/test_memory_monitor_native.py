@@ -46,6 +46,7 @@ def _with_fake_ledger(monkeypatch, rows):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
 
+@pytest.mark.cpu_only
 class TestLabels:
     def test_known_labels_land_in_their_groups(self, monkeypatch):
         _with_fake_ledger(
