@@ -6,13 +6,14 @@ place.
 Covers:
 - settings from the LLM API config, the startup log, and the resident
   headroom the sequence-slot, KV index and recurrent-state pools reserve
-- victims: the longest resident request (ties: newest), and none while the
-  TPOT budget max(0, R0 / target_output_tps - 1) is 0
+- tpot_budget victims: the longest resident request (ties: newest)
 - guardrails: first token out, min run time, per-request cap, hysteresis,
   near-finished requests, per-pass and paused-count budgets
 - the window controller: warm start, one step per completion, convergence to
-  0.8 x the budget, clamps, no update before the admission target or without
-  a budget
+  0.8 x the budget, clamps, no update before the admission target
+- target_output_tps as an objective: laxity, the victim classes (laxity,
+  below target, sacrifice), the laxity-margin resume, the credit bucket, the
+  least-laxity resume lane, rank-identical inputs, the stat line
 - the at-risk test on the GEN admission queue
 - the executor pass: resume lane ahead of new admissions, forced resume, no
   starvation, identical decisions on simulated ranks
@@ -51,8 +52,10 @@ pytestmark = pytest.mark.cpu_only
 
 GEN = LlmRequestState.GENERATION_IN_PROGRESS
 LOGGER = "tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption.logger"
-# Preemption on at 40 output tokens/s per request.
-ON = GenPreemptionSettings(target_output_tps=40.0)
+# Preemption on with a 25% TPOT budget (wait victims, window controller).
+ON = GenPreemptionSettings(tpot_budget=0.25)
+# Preemption on with a 40 output tokens/s per-request objective.
+SLO = GenPreemptionSettings(target_output_tps=40.0)
 
 
 @pytest.fixture
@@ -92,15 +95,17 @@ def step(reqs, iters=1, tokens_per_iter=1):
         req.generated += iters * tokens_per_iter
 
 
-def make_preemption(max_paused=4, decode_s=20.0, target=1.0, unpaused_tps=10.0, **kwargs):
+def make_preemption(max_paused=4, decode_s=20.0, budget=0.5, unpaused_tps=10.0, **kwargs):
     """A preemption with a ``max_paused`` cap, a measured mean decode time of
     ``decode_s`` (window 0.15 x decode_s = 3 s at g = 1, max pause 7 s), a
-    measured unpaused rate well above the target (TPOT budget 900%) and no
-    minimum run unless asked."""
+    TPOT budget of 50% (or ``target_output_tps`` in ``kwargs`` instead), a
+    measured unpaused rate and no minimum run unless asked."""
     kwargs.setdefault("min_run_frac", 0.0)
     kwargs.setdefault("warmup_min_run_s", 0.0)
     kwargs.setdefault("min_remaining_tokens", 0)
-    settings = GenPreemptionSettings(target_output_tps=target, cap_frac=1.0, **kwargs)
+    if kwargs.get("target_output_tps") is None:
+        kwargs["tpot_budget"] = budget
+    settings = GenPreemptionSettings(cap_frac=1.0, **kwargs)
     p = GenPreemption(settings, max_num_active_requests=max_paused)
     p.mean_decode_s = decode_s
     p.mean_tpot_s = None if unpaused_tps is None else 1.0 / unpaused_tps
@@ -123,7 +128,7 @@ def victim_ids(p, reqs, now):
     return [r.py_request_id for r in p.victim_order(reqs)]
 
 
-def complete(p, now, decode_s, tokens, paused_s=0.0, target_ready=True):
+def complete(p, now, decode_s, tokens, paused_s=0.0, target_ready=True, sacrificed=False):
     """Account one completed request directly."""
     p._now = now
     track = _ReqTrack(
@@ -133,6 +138,7 @@ def complete(p, now, decode_s, tokens, paused_s=0.0, target_ready=True):
         first_token_gen=0,
         paused_total=paused_s,
         last_gen=tokens,
+        sacrificed=sacrificed,
     )
     p._on_left(track, target_ready)
 
@@ -153,11 +159,13 @@ class TestSettings:
     def test_from_llm_api_config(self):
         settings = GenPreemptionSettings.from_config(GenPreemptionConfig(target_output_tps=40))
         assert settings.enabled and settings.target_output_tps == 40.0
-        # TPOT budget max(0, R0 / T - 1).
-        assert settings.budget(50.0) == pytest.approx(0.25)
-        assert settings.budget(40.0) == 0.0 and settings.budget(30.0) == 0.0
-        assert settings.budget(None) == 0.0
-        assert GenPreemptionSettings().budget(50.0) == 0.0
+        assert settings.tpot_budget is None and settings.output_tps_slo
+        # Internal objective constants; no budget conversion.
+        assert (settings.slo_eps, settings.slo_credit_depth) == (0.2, 3000.0)
+        assert (settings.laxity_min_frac, settings.laxity_resume_frac) == (0.02, 0.01)
+        assert (settings.laxity_max_pauses, settings.below_target_max_pauses) == (8, 3)
+        assert settings.max_pauses == 8 and ON.max_pauses == 2
+        assert not hasattr(settings, "budget")
         # Paused cap 0.375 x max_num_active_requests, at least 1.
         assert settings.paused_cap(128) == 48 and settings.paused_cap(64) == 24
         assert settings.paused_cap(1) == 1
@@ -173,9 +181,9 @@ class TestSettings:
     def test_tpot_budget_from_llm_api_config(self):
         settings = GenPreemptionSettings.from_config(GenPreemptionConfig(tpot_budget=0.1))
         assert settings.enabled and settings.tpot_budget == 0.1
-        assert settings.target_output_tps is None
-        # A fixed budget, whatever the measured rate.
-        assert settings.budget(None) == settings.budget(5.0) == 0.1
+        assert settings.target_output_tps is None and not settings.output_tps_slo
+        assert GenPreemption(settings, 128).tpot_budget == 0.1
+        assert GenPreemption(SLO, 128).tpot_budget == 0.0
         assert resident_headroom(128, settings) == 48
 
     @pytest.mark.parametrize("target", [0.0, -1.0, float("nan")])
@@ -199,7 +207,11 @@ class TestSettings:
         with patch(LOGGER) as log:
             log_gen_preemption_settings(ON)
         msg = log.info.call_args.args[0]
-        assert "enabled" in msg and "target_output_tps=40.0" in msg
+        assert "enabled" in msg and "tpot_budget=0.25" in msg
+        with patch(LOGGER) as log:
+            log_gen_preemption_settings(SLO)
+        msg = log.info.call_args.args[0]
+        assert "target_output_tps=40.0" in msg and ">= 80% of requests" in msg
         with patch(LOGGER) as log:
             log_gen_preemption_settings(ON, "needs the auto GEN admission policy")
         assert "disabled" in log.warning.call_args.args[0]
@@ -251,20 +263,10 @@ class TestVictims:
         assert p.victim_key(reqs[0]) == (-4.0, -0)
         assert p.victim_key(reqs[1]) == (0.0, -1)
 
-    @pytest.mark.parametrize("unpaused_tps", [None, 0.5, 1.0])
-    def test_no_budget_no_victim(self, unpaused_tps):
-        # R0 not measured yet, or at or below the target: nothing to spend.
-        p = make_preemption(target=1.0, unpaused_tps=unpaused_tps)
-        reqs = [make_req(i) for i in range(3)]
-        p.observe(reqs, 0.0)
-        assert p.tpot_budget == 0.0
-        assert victim_ids(p, reqs, 1.0) == [2, 1, 0]  # eligible ...
-        assert p.select_victims(reqs, num_at_risk=3) == []  # ... but not paused
-
-    def test_budget_follows_the_measured_rate(self):
-        p = make_preemption(target=40.0, unpaused_tps=50.0)
-        assert p.unpaused_tps == pytest.approx(50.0)
-        assert p.tpot_budget == pytest.approx(0.25)
+    @pytest.mark.parametrize("unpaused_tps", [None, 0.5, 50.0])
+    def test_budget_does_not_depend_on_the_measured_rate(self, unpaused_tps):
+        p = make_preemption(budget=0.25, unpaused_tps=unpaused_tps)
+        assert p.tpot_budget == 0.25
         reqs = [make_req(i) for i in range(3)]
         p.observe(reqs, 0.0)
         assert [r.py_request_id for r in p.select_victims(reqs, 1)] == [2]
@@ -374,7 +376,8 @@ class TestGuardrails:
         line = p.stats_line()
         assert line.startswith("[gen_preempt] paused=1 resumed=1")
         assert "paused_now=0/4" in line and "mean_pause=3.00s" in line
-        assert "g=1.000 slack=3.00s decode=20.00s unpaused_tps=10.00 budget=900.00%" in line
+        assert "g=1.000 slack=3.00s decode=20.00s unpaused_tps=10.00 budget=50.00%" in line
+        assert "credit=" not in line
         assert "tpot_infl=na" in line
         assert "max_pause=7.00s min_run=0.00s" in line
         assert "paused=0 resumed=0" in p.stats_line()  # the window restarts
@@ -388,12 +391,10 @@ class TestController:
         p = GenPreemption(ON, max_num_active_requests=128)
         assert p.max_paused == 48
         assert (p.gain, p.slack_s, p.max_pause_s, p.min_run_s) == (1.0, 0.0, 10.0, 2.0)
-        assert p.unpaused_tps is None and p.tpot_budget == 0.0
-        # The first completion seeds D and R0: 30 s for 1500 tokens, 50 tokens/s
-        # against the target 40 is a 25% TPOT budget.
+        assert p.unpaused_tps is None and p.tpot_budget == 0.25
+        # The first completion seeds D and R0: 30 s for 1500 tokens.
         complete(p, 100.0, decode_s=30.0, tokens=1500)
         assert p.mean_decode_s == 30.0 and p.unpaused_tps == pytest.approx(50.0)
-        assert p.tpot_budget == pytest.approx(0.25)
         assert p.slack_s == pytest.approx(0.15 * 30.0 * p.gain)
         assert (p.max_pause_s, p.min_run_s) == pytest.approx((10.5, 2.1))
         # Running means over 500 completions.
@@ -402,7 +403,7 @@ class TestController:
 
     def test_one_step_per_completion(self):
         p = GenPreemption(ON, max_num_active_requests=128)
-        p.mean_tpot_s = 0.02  # R0 50 tokens/s: budget 25%, setpoint 20%
+        p.mean_tpot_s = 0.02  # budget 25%, setpoint 20%
         # Unpaused: inflation 0, theta += (0.2 - 0) / (0.2 x 3000).
         complete(p, 10.0, decode_s=20.0, tokens=1000)
         assert p.theta == pytest.approx(1.0 / 3000.0)
@@ -438,11 +439,11 @@ class TestController:
         assert p.theta == 0.0 and p.mean_decode_s == pytest.approx(20.0)
         assert p.window["completed"] == 100
 
-    def test_no_update_without_a_budget(self):
-        p = GenPreemption(ON, max_num_active_requests=128)
-        for i in range(100):  # 30 tokens/s < 40: budget 0
+    def test_no_controller_with_target_output_tps(self):
+        p = GenPreemption(SLO, max_num_active_requests=128)
+        for i in range(100):
             complete(p, float(i), decode_s=20.0, tokens=600, paused_s=1.0)
-        assert p.theta == 0.0 and p.tpot_budget == 0.0
+        assert p.theta == 0.0 and p.gain == 1.0 and p.tpot_budget == 0.0
 
     def test_clamps(self):
         p = GenPreemption(ON, max_num_active_requests=128)
@@ -456,8 +457,7 @@ class TestController:
     @pytest.mark.parametrize("g0", [0.25, 1.0, 2.0])
     def test_converges_to_the_setpoint(self, g0):
         """Toy plant: a completion's pause grows with the window, inflation
-        0.25 g.  R0 50 tokens/s against 40 gives budget 25%, setpoint 20%,
-        met at g* = 0.8."""
+        0.25 g.  Budget 25%, setpoint 20%, met at g* = 0.8."""
         p = GenPreemption(ON, max_num_active_requests=128)
         p.theta = math.log(g0)
         for i in range(20000):
@@ -722,8 +722,8 @@ class TestExecutorPass:
         p.observe(reqs, 100.0)
         # Request 0 finished: accounted at the pass, after X is set.
         ex.run(slack_queue(now=100.0), reqs[1:], 3)
-        # Seeds D = 10 s and R0 = 10 tokens/s (budget 900%): the first
-        # integral step of an unpaused completion is 1 / 3000.
+        # Seeds D = 10 s and R0 = 10 tokens/s: the first integral step of an
+        # unpaused completion is 1 / 3000.
         assert p.mean_decode_s == pytest.approx(10.0)
         assert p.unpaused_tps == pytest.approx(10.0)
         assert p.theta == pytest.approx(1.0 / 3000.0)
@@ -751,6 +751,274 @@ class TestExecutorPass:
             results.append((paused_ids(ex), p.theta, p.mean_decode_s))
         assert results[0] == results[1] == results[2]
         assert len(results[0][0]) == 2
+
+
+# ---------------------------------------------------------------------------
+# target_output_tps: a per-request objective with laxity victims and a credit
+# ---------------------------------------------------------------------------
+def make_slo(target=8.0, **kwargs):
+    """``target_output_tps`` = ``target`` (default 8 tokens/s), D = 20 s:
+    laxity victims need 0.4 s, resume margin 0.2 s, max pause 7 s."""
+    return make_preemption(target_output_tps=target, **kwargs)
+
+
+def slo_reqs(p, specs, t0=0.0, seconds=10.0):
+    """Requests ``(max_new_tokens, tokens/s)`` with their first token (token 1)
+    at ``t0``, observed again ``seconds`` later; returns (requests, now).
+
+    At target 8 and 10 tokens/s for 10 s the laxity is 0.025 x (max_new - 1)
+    s: 5 s at 201, 10 s at 401, 3 s at 121; at 5 tokens/s it is negative,
+    at 8.1 tokens/s and 201 it is 0.31 s (below the 0.4 s floor)."""
+    reqs = [make_req(i, generated=1, max_new_tokens=m) for i, (m, _) in enumerate(specs)]
+    now = run_for(p, reqs, t0=t0, seconds=seconds, rates=[r for _, r in specs])
+    p.observe(reqs, now)
+    return reqs, now
+
+
+def pause(p, req):
+    """Pause ``req`` as the executor would (one victim chosen by policy)."""
+    p.on_paused(req)
+
+
+class TestOutputTpsSlo:
+    def test_laxity(self):
+        p = make_slo()
+        (a,), now = slo_reqs(p, [(201, 10.0)])
+        # Deadline 0 + 200 / 8 = 25 s; finish 10 + 100 / 10 = 20 s.
+        assert p.laxity(a) == pytest.approx(5.0)
+        # A 2 s pause costs 2 s of laxity; the rate excludes the pause.
+        pause(p, a)
+        p.observe([a], now + 2.0)
+        assert p.laxity(a) == pytest.approx(3.0)
+        p.on_resumed(a)
+        assert p.laxity(a) == pytest.approx(3.0)
+        step([a], iters=10)  # 1 s at 10 tokens/s
+        p.observe([a], now + 3.0)
+        assert p.laxity(a) == pytest.approx(3.0)
+        # Below the target at 5 tokens/s: finish 10 + 150 / 5 = 40 s.
+        q = make_slo()
+        (b,), _ = slo_reqs(q, [(201, 5.0)])
+        assert q.laxity(b) == pytest.approx(-15.0)
+
+    def test_laxity_needs_first_token_and_max_tokens(self):
+        p = make_slo(unpaused_tps=None)
+        a = make_req(1, generated=1, max_new_tokens=201)
+        assert p.laxity(a) is None  # never observed
+        p.observe([a], 0.0)
+        assert p.laxity(a) is None  # no token since the first one, R0 unknown
+        p.mean_tpot_s = 0.1  # R0 = 10 tokens/s
+        assert p.laxity(a) == pytest.approx(25.0 - 20.0)
+        a.py_max_new_tokens = None
+        assert p.laxity(a) is None
+
+    def test_largest_laxity_first(self):
+        p = make_slo()
+        reqs, now = slo_reqs(p, [(201, 10.0), (401, 10.0), (121, 10.0)])
+        assert [p.laxity(r) for r in reqs] == pytest.approx([5.0, 10.0, 3.0])
+        victim = p.select_victims(reqs, 1)
+        assert [v.py_request_id for v in victim] == [1]
+        pause(p, victim[0])
+        assert [v.py_request_id for v in p.select_victims(reqs, 1)] == [0]
+        assert p.window["laxity_victims"] == 2 and p.credit == 0.0
+
+    def test_laxity_floor_then_credit(self):
+        # 0.31 s of laxity is under the 0.4 s floor: no laxity victim, and
+        # without credit no victim at all.
+        p = make_slo()
+        reqs, _ = slo_reqs(p, [(201, 8.1)])
+        assert 0.0 < p.laxity(reqs[0]) < 0.4
+        assert p.select_victims(reqs, 1) == [] and p.window["no_victim"] == 1
+        # One credit: a new sacrifice, counted once.
+        p.credit = 1.5
+        assert p.select_victims(reqs, 1) == reqs
+        assert p._tracks[0].sacrificed and p.credit == pytest.approx(0.5)
+        assert p.window["sacrificed"] == p.totals["sacrificed"] == 1
+
+    def test_below_target_before_a_new_sacrifice(self):
+        p = make_slo()
+        reqs, _ = slo_reqs(p, [(201, 8.1), (201, 5.0)])
+        assert p.laxity(reqs[1]) < 0.0
+        p.credit = 5.0
+        # The request already below the target goes first, at no credit.
+        assert p.select_victims(reqs, 1) == [reqs[1]]
+        assert p.credit == 5.0 and not p._tracks[1].sacrificed
+        assert p.window["below_target_victims"] == 1
+        # After 3 pauses it is spared; the other one is sacrificed.
+        p._tracks[1].pauses = 3
+        assert p.select_victims(reqs, 1) == [reqs[0]] and p.credit == 4.0
+
+    def test_laxity_before_below_target(self):
+        p = make_slo()
+        reqs, _ = slo_reqs(p, [(201, 5.0), (201, 10.0)])
+        assert p.select_victims(reqs, 1) == [reqs[1]]
+
+    def test_below_target_longest_resident_first(self):
+        p = make_slo()
+        old = make_req(1, generated=1, max_new_tokens=201)
+        new = make_req(7, generated=1, max_new_tokens=201)
+        p.observe([old], 0.0)
+        p.observe([old, new], 1.0)
+        step([old], iters=50)  # 5 tokens/s since t=0
+        step([new], iters=45)  # 5 tokens/s since t=1
+        p.observe([old, new], 10.0)
+        assert p.laxity(old) < 0.0 and p.laxity(new) < 0.0
+        assert p.select_victims([new, old], 1) == [old]
+
+    def test_sacrificed_stays_below_target(self):
+        # Once sacrificed, a request is a below-target victim whatever its
+        # laxity, up to 3 pauses.
+        p = make_slo(hysteresis_iters=0)
+        reqs, _ = slo_reqs(p, [(201, 8.1), (401, 10.0)])
+        p._tracks[0].sacrificed = True
+        p._tracks[1].pauses = 8  # no laxity pause left
+        assert p.select_victims(reqs, 1) == [reqs[0]]
+        assert p.window["below_target_victims"] == 1
+        p._tracks[0].pauses = 3
+        assert p.select_victims(reqs, 1) == [] and p.credit == 0.0
+
+    def test_pause_limits(self):
+        p = make_slo()
+        reqs, _ = slo_reqs(p, [(401, 10.0)])
+        p._tracks[0].pauses = 7
+        assert p.select_victims(reqs, 1) == reqs
+        p._tracks[0].pauses = 8
+        p.credit = 10.0  # nor a sacrifice
+        assert p.select_victims(reqs, 1) == []
+
+    def test_forced_resume_at_the_laxity_margin(self):
+        p = make_slo()
+        reqs, now = slo_reqs(p, [(201, 10.0), (201, 8.1)])
+        pause(p, reqs[0])  # laxity 5 s at t=10: resume at 10 + 5 - 0.2
+        assert p.resume_at(reqs[0]) == pytest.approx(14.8)
+        p.credit = 1.0
+        (s,) = p.select_victims(reqs, 1)
+        pause(p, s)  # sacrificed: only the 7 s maximum pause
+        assert p.resume_at(s) == pytest.approx(17.0)
+        p.observe(reqs, 14.79)
+        assert p.resume_candidates(0) == []
+        p.observe(reqs, 14.81)
+        assert p.resume_candidates(0) == [reqs[0]]
+        assert p.window["laxity_resumes"] == p.window["forced_resumes"] == 1
+        p.on_resumed(reqs[0])
+        # Back in with about the margin left.
+        assert p.laxity(reqs[0]) == pytest.approx(0.19)
+        p.observe(reqs, 17.0)
+        assert p.resume_candidates(0) == [s]
+        assert p.window["laxity_resumes"] == 1 and p.window["forced_resumes"] == 2
+
+    def test_resume_lane_least_laxity_first(self):
+        p = make_slo(max_paused=4)
+        reqs, _ = slo_reqs(p, [(401, 10.0), (201, 10.0), (161, 10.0), (201, 5.0)])
+        for r in reqs:
+            pause(p, r)  # paused in this order at t=10
+        # Resume at: 0 laxity 10 s -> max pause 17; 1 -> 14.8; 2 laxity 4 ->
+        # 13.8; 3 below the target -> 17 (max pause, after 0 in pause order).
+        out = p.resume_candidates(free_slots=4)
+        assert [r.py_request_id for r in out] == [2, 1, 0, 3]
+        assert [r.py_request_id for r in p.resume_candidates(free_slots=1)] == [2]
+
+    def test_tpot_budget_resume_lane_is_oldest_first(self):
+        p = make_preemption(max_paused=4)
+        reqs, _ = slo_reqs(p, [(401, 10.0), (201, 10.0)])
+        for r in reqs:
+            pause(p, r)
+        assert p.resume_candidates(free_slots=2) == reqs
+        assert p._tracks[0].laxity_resume_t is None
+
+    def test_credit_bucket(self):
+        p = GenPreemption(SLO, max_num_active_requests=128)  # target 40
+        complete(p, 10.0, decode_s=20.0, tokens=1000)  # 50 tokens/s
+        assert p.credit == pytest.approx(0.2)
+        complete(p, 11.0, decode_s=20.0, tokens=600)  # 30 tokens/s: below
+        assert p.credit == pytest.approx(-0.6)
+        # Pauses count: 1000 tokens over 20 s + 6 s paused is 38.5 tokens/s.
+        complete(p, 12.0, decode_s=20.0, tokens=1000, paused_s=6.0)
+        assert p.credit == pytest.approx(-1.4)
+        # A sacrificed request is refunded its debit at completion.
+        complete(p, 13.0, decode_s=20.0, tokens=1000, paused_s=6.0, sacrificed=True)
+        assert p.credit == pytest.approx(-1.2)
+        # Before X: no change.
+        complete(p, 14.0, decode_s=20.0, tokens=600, target_ready=False)
+        assert p.credit == pytest.approx(-1.2)
+        assert (p.totals["slo_completed"], p.totals["below_target"]) == (4, 3)
+        # Clamped to +-3000 x 0.2.
+        for i in range(4000):
+            complete(p, 20.0 + i, decode_s=20.0, tokens=1000)
+        assert p.credit == pytest.approx(600.0)
+        for i in range(2000):
+            complete(p, 5000.0 + i, decode_s=20.0, tokens=100)
+        assert p.credit == pytest.approx(-600.0)
+
+    def test_window_without_controller(self):
+        p = make_slo()
+        assert p.slack_s == pytest.approx(3.0)
+        for i in range(100):
+            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=5.0)
+        assert p.gain == 1.0 and p.slack_s == pytest.approx(0.15 * p.mean_decode_s)
+
+    def test_stats_line(self):
+        p = make_slo()
+        reqs, _ = slo_reqs(p, [(201, 10.0), (201, 5.0)])
+        pause(p, p.select_victims(reqs, 1)[0])
+        pause(p, p.select_victims(reqs, 1)[0])
+        complete(p, 11.0, decode_s=20.0, tokens=100)  # 5 tokens/s: below
+        line = p.stats_line()
+        assert "target_tps=8.00 below_target=1/1 below_target_total=1/1" in line
+        assert "credit=-0.8 laxity_victims=1 below_target_victims=1" in line
+        assert "sacrificed=0 sacrificed_total=0 mean_laxity=5.00s" in line
+        assert "laxity_resumes=0 paused_below=1" in line and "budget=" not in line
+        assert "below_target=0/0 below_target_total=1/1" in p.stats_line()
+
+    def test_executor_pass(self):
+        p = make_slo(target=8.0)
+        reqs = running(p, 4)  # 10 tokens/s since t=90
+        reqs[1].py_max_new_tokens = 8000  # the most laxity
+        ex = make_executor(p, capacity=4)
+        assert ex.run(at_risk_queue(), reqs, 4) == 3
+        assert paused_ids(ex) == {1} and p._tracks[1].laxity_resume_t is not None
+        # A slot frees: 1 is back before any admission.
+        ex.request_broadcaster.rank0_now = 101.0
+        assert ex.run(slack_queue(now=101.0), reqs[1:], 3) == 3
+        assert paused_ids(ex) == set()
+
+    def test_decisions_are_rank_identical(self):
+        """Laxity, victims, credit and resume times use only rank-identical
+        inputs (token counts, max_tokens, completions, rank 0's clock): the
+        local clock is never read."""
+        results = []
+        for rank in range(3):
+            p = make_slo(max_per_pass=3, hysteresis_iters=0)
+            reqs = [
+                make_req(i, generated=1 + i, max_new_tokens=150 + 40 * i, prompt_len=100 + i)
+                for i in range(8)
+            ]
+            ex = make_executor(p, capacity=8)
+            clock = Mock(side_effect=AssertionError("local clock read"))
+            with patch("time.monotonic", clock), patch("time.time", clock):
+                p.observe(reqs, 90.0)
+                for i, req in enumerate(reqs):
+                    step([req], iters=40 + 7 * i, tokens_per_iter=1 + i % 3)
+                p.credit = 1.0
+                ex.run(at_risk_queue(n=3), reqs, 8)
+                laxity = [p.laxity(r) for r in reqs]
+                ex.request_broadcaster.rank0_now = 103.0
+                ex.run(slack_queue(now=103.0), reqs[2:], 6)
+                complete(p, 104.0, decode_s=10.0, tokens=50)
+            results.append(
+                (
+                    paused_ids(ex),
+                    tuple(laxity),
+                    p.credit,
+                    tuple(
+                        sorted(
+                            (rid, t.sacrificed, t.laxity_resume_t, t.pauses)
+                            for rid, t in p._tracks.items()
+                        )
+                    ),
+                )
+            )
+        assert results[0] == results[1] == results[2]
+        assert p.totals["paused"] == 3
 
 
 class TestExecutorSetup:

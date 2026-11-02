@@ -32,28 +32,59 @@ Configuration (``scheduler_config.gen_preemption``, at most one of the two;
 neither leaves preemption off): ``tpot_budget`` B, the allowed mean-TPOT
 increase from pauses (0.10 = +10%), or ``target_output_tps`` T, a
 per-request output rate (output tokens/s, accepted draft tokens included, so
-1 / TPOT) to keep, which is converted to B = max(0, R0 / T - 1)
-(``GenPreemptionSettings.budget``): requests running faster than T donate
-slot time to waiters at risk of missing the TTFT target.  The budget only
-sets the pause controller's target; everything else is derived from
+1 / TPOT) used as a service-level objective.  Everything else is derived from
 measurements of completed requests (rank-identical: they are the requests
 leaving the active list, timed on rank 0's clock):
 
-* R0 = 1 / (running mean TPOT of completed requests, pauses excluded) is the
-  unpaused per-request output rate, and D their running mean decode time
-  (first token to finish, pauses excluded), both over 500 completions;
-* with a zero budget (R0 <= T, or T set and no completion yet) nothing is
-  paused;
+* D is the running mean decode time of completed requests (first token to
+  finish, pauses excluded) and R0 = 1 / their running mean TPOT (pauses
+  excluded), both over 500 completions;
+* paused cap = 0.375 x ``max_num_active_requests`` (also the pool headroom);
+* forced resume after 0.35 D, preemptible after 0.07 D of decoding;
+* 1 pause per scheduling pass.
+
+``tpot_budget``: the TPOT-budget controller (k3-disagg-sim phase 21).
+
 * at-risk window (slack against X) = g x 0.15 x D;
 * g in [0.25, 2] is an integral controller, one update per completed request
   once X is set, time constant 3000 completions, that holds the mean TPOT
   inflation from pauses (pause per output token / mean unpaused TPOT) at
   0.8 x B;
 * victims: the longest resident request first (ties: the newest), see
-  ``GenPreemption.victim_key``;
-* paused cap = 0.375 x ``max_num_active_requests`` (also the pool headroom);
-* forced resume after 0.35 D, preemptible after 0.07 D of decoding;
-* at most 2 pauses per request and 1 per scheduling pass.
+  ``GenPreemption.victim_key``; at most 2 pauses per request;
+* the resume lane takes the oldest pause first.
+
+``target_output_tps``: T as a per-request floor that at least 1 - eps of the
+requests meet (eps = 0.2, internal; k3-disagg-sim phase 24).  A request's
+deadline is its first token time + (max_tokens - 1) / T, and its laxity L is
+the deadline minus its projected finish at its own unpaused rate::
+
+    L = t_first + (max_tokens - 1) / T - (now + remaining_tokens / r),
+    r = tokens since the first token / (time since the first token - pauses)
+
+(``max_tokens - 1`` counts the tokens after the first one; on a GEN worker the
+first token arrives with the request).
+
+* at-risk window = 0.15 x D (no controller);
+* victims, in this order:
+
+  1. the largest laxity among requests with L >= 0.02 D and fewer than 8
+     pauses; such a victim is resumed when its laxity is down to 0.01 D (or
+     after 0.35 D), so it still finishes at or above T;
+  2. else a request that is already below T (L < 0, or sacrificed earlier)
+     and has fewer than 3 pauses, the longest resident first: it costs the
+     objective nothing more;
+  3. else, while the credit is at least 1, a new sacrifice: the longest
+     resident request (credit -= 1); a sacrificed or below-T victim resumes
+     only after 0.35 D or when a slot frees.
+
+* the credit is a token bucket in completions: each completion after X adds
+  eps, minus 1 if it finished below T, plus 1 if it was sacrificed (so a
+  sacrifice is counted once), clamped to +-3000 eps.  Credit saved in quiet
+  periods is spent in load waves;
+* the resume lane takes the earliest forced-resume time first, i.e. the
+  least laxity; sacrificed and below-T victims, which only have the maximum
+  pause, mostly come last.
 
 Until the first request completes the window is 0 and the forced resume /
 minimum run fall back to 10 s / 2 s; g starts at 1.
@@ -63,9 +94,10 @@ Preemption needs the ``auto`` GEN admission policy, whose target X and rank
 risk.  Every input to a decision is identical on all ranks of the
 model-parallel group (helix included): the active request list, token and
 decode-iteration counts, the waiting queue (broadcast) and rank 0's clock
-(broadcast with the request-count probe).  The controller adds only
-completions (requests leaving the active list) and their token counts, timed
-on the same clock, so it needs no collective either.
+(broadcast with the request-count probe).  The controller and the
+objective add only completions (requests leaving the active list), their
+token counts and each request's ``max_tokens``, timed on the same clock, so
+they need no collective either.
 
 Pipeline parallelism and attention DP are rejected when the LLM arguments
 are validated (and pipeline parallelism again at executor setup).
@@ -88,14 +120,15 @@ _PAUSE_EMA_ALPHA = 0.1
 class GenPreemptionSettings:
     """Target and internal parameters.
 
-    Only ``target_output_tps`` comes from the user
+    Only ``tpot_budget`` / ``target_output_tps`` come from the user
     (``scheduler_config.gen_preemption``); the rest are constants of the
     policy, fields only so that tests can construct other settings.
     """
 
     # Allowed mean-TPOT increase from pauses (0.10 = +10%).
     tpot_budget: Optional[float] = None
-    # Per-request output tokens/s to keep, converted to a TPOT budget.
+    # Per-request output tokens/s floor, a service-level objective met by at
+    # least 1 - slo_eps of the requests.
     target_output_tps: Optional[float] = None
     # At-risk window at g = 1, in mean decode times.
     slack_decode_frac: float = 0.15
@@ -126,6 +159,20 @@ class GenPreemptionSettings:
     hysteresis_iters: int = 64
     # Requests this close to max_new_tokens finish soon enough on their own.
     min_remaining_tokens: int = 32
+    # target_output_tps only.  Share of requests allowed below the target:
+    # the sacrifice credit gains slo_eps per completion (after X), loses 1 per
+    # completion below the target, and is clamped to +-slo_credit_depth x
+    # slo_eps (a token bucket in completions).
+    slo_eps: float = 0.2
+    slo_credit_depth: float = 3000.0
+    # Laxity victims need at least laxity_min_frac x D of laxity and resume
+    # when it is down to laxity_resume_frac x D.
+    laxity_min_frac: float = 0.02
+    laxity_resume_frac: float = 0.01
+    # Pauses per request: as a laxity victim (or new sacrifice), and as a
+    # request already below the target.
+    laxity_max_pauses: int = 8
+    below_target_max_pauses: int = 3
 
     def __post_init__(self):
         if self.tpot_budget is not None and self.target_output_tps is not None:
@@ -156,31 +203,44 @@ class GenPreemptionSettings:
     def enabled(self) -> bool:
         return self.tpot_budget is not None or self.target_output_tps is not None
 
-    def budget(self, unpaused_tps: Optional[float]) -> float:
-        """Allowed mean-TPOT increase from pauses: ``tpot_budget``, or for
-        ``target_output_tps`` T, max(0, R0 / T - 1) with R0 the measured
-        unpaused per-request output rate (0 until it is measured)."""
-        if self.tpot_budget is not None:
-            return self.tpot_budget
-        if self.target_output_tps is None or unpaused_tps is None:
-            return 0.0
-        return max(0.0, unpaused_tps / self.target_output_tps - 1.0)
+    @property
+    def output_tps_slo(self) -> bool:
+        """``target_output_tps`` is set: laxity victims and the sacrifice
+        credit instead of the TPOT-budget controller."""
+        return self.target_output_tps is not None
+
+    @property
+    def max_pauses(self) -> int:
+        """Pauses over a request's lifetime, any victim class."""
+        if self.output_tps_slo:
+            return max(self.laxity_max_pauses, self.below_target_max_pauses)
+        return self.max_per_request
 
     def paused_cap(self, max_num_active_requests: int) -> int:
         """Requests paused at once (at least 1)."""
         return max(1, int(round(self.cap_frac * max_num_active_requests)))
 
     def describe(self) -> str:
-        if self.tpot_budget is not None:
-            budget = f"tpot_budget={self.tpot_budget}"
+        if self.output_tps_slo:
+            policy = (
+                f"target_output_tps={self.target_output_tps} "
+                f"(floor for >= {1.0 - self.slo_eps:.0%} of requests: laxity victims "
+                f">= {self.laxity_min_frac}xD resumed at {self.laxity_resume_frac}xD, "
+                f"then below-target victims, then sacrifices on a credit of "
+                f"{self.slo_eps}/completion clamped to +-{self.slo_credit_depth:.0f}x"
+                f"{self.slo_eps}) window={self.slack_decode_frac}xD "
+                f"max_per_request={self.laxity_max_pauses} "
+                f"(below target {self.below_target_max_pauses})"
+            )
         else:
-            budget = f"target_output_tps={self.target_output_tps} (budget R0/target-1)"
+            policy = (
+                f"tpot_budget={self.tpot_budget} setpoint={self.target_frac}xbudget "
+                f"window={self.slack_decode_frac}xD x g[{self.gain_min}, {self.gain_max}] "
+                f"max_per_request={self.max_per_request}"
+            )
         return (
-            f"{budget} setpoint={self.target_frac}xbudget "
-            f"window={self.slack_decode_frac}xD x g[{self.gain_min}, {self.gain_max}] "
-            f"cap={self.cap_frac}xmax_num_active_requests "
-            f"max_pause={self.max_pause_frac}xD min_run={self.min_run_frac}xD "
-            f"max_per_request={self.max_per_request}"
+            f"{policy} cap={self.cap_frac}xmax_num_active_requests "
+            f"max_pause={self.max_pause_frac}xD min_run={self.min_run_frac}xD"
         )
 
 
@@ -236,6 +296,11 @@ class _ReqTrack:
     # observation.
     paused_total: float = 0.0
     last_gen: int = 0
+    # target_output_tps: counted against the objective once (a sacrifice),
+    # and, while paused as a laxity victim, the time its laxity is down to
+    # the resume margin (None: only the maximum pause applies).
+    sacrificed: bool = False
+    laxity_resume_t: Optional[float] = None
 
 
 class GenPreemption:
@@ -271,6 +336,10 @@ class GenPreemption:
         self.mean_tpot_s: Optional[float] = None
         self._infl_sum = 0.0
         self._infl_n = 0
+        # target_output_tps: the sacrifice credit, in completions, and the
+        # laxity of this window's laxity victims when paused.
+        self.credit = 0.0
+        self._laxity_sum = 0.0
 
     # ---- state ----
 
@@ -308,7 +377,8 @@ class GenPreemption:
 
     @property
     def tpot_budget(self) -> float:
-        return self.settings.budget(self.unpaused_tps)
+        """The TPOT budget of the controller (0 with ``target_output_tps``)."""
+        return self.settings.tpot_budget or 0.0
 
     @property
     def slack_s(self) -> float:
@@ -348,16 +418,67 @@ class GenPreemption:
             self.mean_decode_s += (decode - self.mean_decode_s) / s.ewma_n
             self.mean_tpot_s += (tpot - self.mean_tpot_s) / s.ewma_n
         self.window["completed"] += 1
-        target = s.target_frac * self.tpot_budget
-        if not target_ready or target <= 0.0:
+        if not target_ready:
             return
-        # This request's TPOT inflation from its pauses; integrate its error
-        # against the setpoint, one step per completion.
+        # This request's TPOT inflation from its pauses.
         inflation = (paused / tokens) / self.mean_tpot_s
+        if s.output_tps_slo:
+            self._infl_sum += inflation
+            self._infl_n += 1
+            self._on_left_slo(track, tokens)
+            return
+        target = s.target_frac * self.tpot_budget
+        if target <= 0.0:
+            return
+        # Integrate the inflation's error against the setpoint, one step per
+        # completion.
         theta = self.theta + (target - inflation) / (target * s.time_constant)
         self.theta = min(math.log(s.gain_max), max(math.log(s.gain_min), theta))
         self._infl_sum += inflation
         self._infl_n += 1
+
+    def _on_left_slo(self, track: _ReqTrack, tokens: int) -> None:
+        """Credit update for one completion after X: + eps, - 1 if it finished
+        below the target, + 1 back if it was sacrificed (debited when chosen),
+        clamped to +-slo_credit_depth x eps."""
+        s = self.settings
+        below = tokens / (self._now - track.first_token_t) < s.target_output_tps
+        if track.sacrificed:
+            self.credit += 1.0
+        depth = s.slo_credit_depth * s.slo_eps
+        self.credit = min(depth, max(-depth, self.credit + s.slo_eps - float(below)))
+        for counter in (self.window, self.totals):
+            counter["slo_completed"] += 1
+            counter["below_target"] += int(below)
+
+    def laxity(self, req) -> Optional[float]:
+        """``target_output_tps``: seconds this request can still be paused and
+        finish at or above the target, at its own unpaused rate::
+
+            first token time + (max_tokens - 1) / T
+              - (now + remaining tokens / unpaused rate)
+
+        Negative: projected below the target.  None without a first token,
+        ``max_tokens`` or a rate (no tokens yet and R0 unknown).  Inputs are
+        rank-identical: token counts, ``max_tokens`` and rank 0's clock.
+        """
+        track = self._tracks.get(req.py_request_id)
+        max_new = getattr(req, "py_max_new_tokens", None)
+        if track is None or track.first_token_t is None or self._now is None or max_new is None:
+            return None
+        paused = track.paused_total
+        if track.paused_t is not None:
+            paused += max(0.0, self._now - track.paused_t)
+        gen = generated_tokens(req)
+        unpaused = self._now - track.first_token_t - paused
+        tokens = gen - track.first_token_gen
+        rate = tokens / unpaused if tokens > 0 and unpaused > 0.0 else self.unpaused_tps
+        if not rate:
+            return None
+        deadline = track.first_token_t + (max_new - track.first_token_gen) / (
+            self.settings.target_output_tps
+        )
+        return deadline - (self._now + max(0, max_new - gen) / rate)
 
     def observe(
         self, active_requests: Iterable, now: Optional[float], target_ready: bool = False
@@ -396,19 +517,35 @@ class GenPreemption:
 
     # ---- resume lane ----
 
+    def resume_at(self, req) -> float:
+        """When a paused request is resumed even without a free slot: after
+        the maximum pause, or (laxity victims of ``target_output_tps``) when
+        its laxity is down to the resume margin, whichever is first."""
+        track = self._tracks[req.py_request_id]
+        t = track.paused_t + self.max_pause_s
+        if track.laxity_resume_t is not None:
+            t = min(t, track.laxity_resume_t)
+        return t
+
     def resume_candidates(self, free_slots: int) -> list:
-        """Paused requests to resume, oldest pause first: as many as there are
-        free slots, plus every one paused for ``max_pause_s`` or longer."""
+        """Paused requests to resume: as many as there are free slots, plus
+        every one due (``resume_at``).  The lane takes the oldest pause first,
+        or with ``target_output_tps`` the earliest ``resume_at`` first (the
+        least laxity; ties in pause order)."""
         out = []
-        max_pause_s = self.max_pause_s
-        for req in self._paused.values():
+        paused = list(self._paused.values())
+        if self.settings.output_tps_slo:
+            paused.sort(key=self.resume_at)
+        for req in paused:
             if len(out) < free_slots:
                 out.append(req)
                 continue
-            paused_t = self._tracks[req.py_request_id].paused_t
-            if self._now is not None and self._now - paused_t >= max_pause_s:
+            if self._now is not None and self._now >= self.resume_at(req):
                 out.append(req)
                 self.window["forced_resumes"] += 1
+                track = self._tracks[req.py_request_id]
+                if track.laxity_resume_t is not None and self._now >= track.laxity_resume_t:
+                    self.window["laxity_resumes"] += 1
         return out
 
     def on_resumed(self, req) -> None:
@@ -426,6 +563,7 @@ class GenPreemption:
                     else self.mean_pause_s + _PAUSE_EMA_ALPHA * (pause - self.mean_pause_s)
                 )
             track.paused_t = None
+            track.laxity_resume_t = None
         self.window["resumed"] += 1
         self.totals["resumed"] += 1
 
@@ -441,7 +579,7 @@ class GenPreemption:
         if req.py_decoding_iter < 1:
             return False
         track = self._tracks.get(rid)
-        if track is None or track.pauses >= s.max_per_request:
+        if track is None or track.pauses >= s.max_pauses:
             return False
         since_first_token = self._since_first_token(req)
         if since_first_token is None or since_first_token < self.min_run_s:
@@ -475,20 +613,75 @@ class GenPreemption:
     def select_victims(self, active_requests: Iterable, num_at_risk: int) -> list:
         """Up to ``num_at_risk`` victims within the per-pass and paused-count
         budgets."""
-        if self.tpot_budget <= 0.0:
-            return []  # R0 <= target (or not measured yet): no TPOT to spend
-        budget = min(num_at_risk, self.settings.max_per_pass, self.max_paused - self.num_paused)
+        s = self.settings
+        if not s.output_tps_slo and self.tpot_budget <= 0.0:
+            return []
+        budget = min(num_at_risk, s.max_per_pass, self.max_paused - self.num_paused)
         if budget <= 0:
             return []
-        victims = self.victim_order(active_requests)[:budget]
+        if s.output_tps_slo:
+            candidates = [req for req in active_requests if self.is_eligible(req)]
+            victims = []
+            while len(victims) < budget:
+                victim = self._slo_victim(candidates)
+                if victim is None:
+                    break
+                victims.append(victim)
+                candidates.remove(victim)
+        else:
+            victims = self.victim_order(active_requests)[:budget]
         if not victims:
             self.window["no_victim"] += 1
         return victims
 
+    def _slo_victim(self, candidates: list):
+        """``target_output_tps`` victim among eligible ``candidates``: the
+        largest laxity (at least 0.02 D), else the longest resident request
+        already below the target, else a new sacrifice (longest resident)
+        if the credit allows; None otherwise."""
+        s = self.settings
+        min_laxity = s.laxity_min_frac * (self.mean_decode_s or 0.0)
+        by_laxity, below, fresh = [], [], []
+        for req in candidates:
+            track = self._tracks[req.py_request_id]
+            laxity = self.laxity(req)
+            if track.sacrificed or (laxity is not None and laxity < 0.0):
+                if track.pauses < s.below_target_max_pauses:
+                    below.append(req)
+                continue
+            if track.pauses >= s.laxity_max_pauses:
+                continue
+            if laxity is not None and laxity >= min_laxity:
+                by_laxity.append((-laxity, self.victim_key(req), req))
+            fresh.append(req)
+        if by_laxity:
+            neg_laxity, _, victim = min(by_laxity, key=lambda x: x[:2])
+            self.window["laxity_victims"] += 1
+            self._laxity_sum -= neg_laxity
+            return victim
+        if below:
+            self.window["below_target_victims"] += 1
+            return min(below, key=self.victim_key)
+        if fresh and self.credit >= 1.0:
+            victim = min(fresh, key=self.victim_key)
+            self._tracks[victim.py_request_id].sacrificed = True
+            self.credit -= 1.0
+            self.window["sacrificed"] += 1
+            self.totals["sacrificed"] += 1
+            return victim
+        return None
+
     def on_paused(self, req) -> None:
         rid = req.py_request_id
-        self._paused[rid] = req
         track = self._tracks[rid]
+        if self.settings.output_tps_slo and not track.sacrificed:
+            # A laxity victim resumes when its laxity is down to the margin;
+            # one already below the target only after the maximum pause.
+            laxity = self.laxity(req)
+            if laxity is not None and laxity >= 0.0 and self._now is not None:
+                margin = self.settings.laxity_resume_frac * (self.mean_decode_s or 0.0)
+                track.laxity_resume_t = self._now + laxity - margin
+        self._paused[rid] = req
         track.pauses += 1
         track.paused_t = self._now
         self.window["paused"] += 1
@@ -510,14 +703,41 @@ class GenPreemption:
             f"mean_pause={mean_pause} total_paused={self.totals['paused']} "
             f"total_resumed={self.totals['resumed']} "
             f"g={self.gain:.3f} slack={self.slack_s:.2f}s decode={decode} "
-            f"unpaused_tps={r0} budget={100.0 * self.tpot_budget:.2f}% "
+            f"unpaused_tps={r0} "
+        )
+        if self.settings.output_tps_slo:
+            line += self._slo_stats() + " "
+        else:
+            line += f"budget={100.0 * self.tpot_budget:.2f}% "
+        line += (
             f"tpot_infl={infl} completed={w['completed']} "
             f"max_pause={self.max_pause_s:.2f}s min_run={self.min_run_s:.2f}s"
         )
         self._infl_sum = 0.0
         self._infl_n = 0
+        self._laxity_sum = 0.0
         self.window.clear()
         return line
+
+    def _slo_stats(self) -> str:
+        """``target_output_tps``: completions below the target (window /
+        total), credit, victims by class, mean laxity of the window's laxity
+        victims, laxity-margin resumes, and paused requests that are below
+        the target or sacrificed."""
+        w, t = self.window, self.totals
+        n_lax = w["laxity_victims"]
+        mean_laxity = f"{self._laxity_sum / n_lax:.2f}s" if n_lax else "na"
+        paused_below = sum(1 for rid in self._paused if self._tracks[rid].laxity_resume_t is None)
+        return (
+            f"target_tps={self.settings.target_output_tps:.2f} "
+            f"below_target={w['below_target']}/{w['slo_completed']} "
+            f"below_target_total={t['below_target']}/{t['slo_completed']} "
+            f"credit={self.credit:.1f} laxity_victims={n_lax} "
+            f"below_target_victims={w['below_target_victims']} "
+            f"sacrificed={w['sacrificed']} sacrificed_total={t['sacrificed']} "
+            f"mean_laxity={mean_laxity} laxity_resumes={w['laxity_resumes']} "
+            f"paused_below={paused_below}"
+        )
 
     @property
     def has_activity(self) -> bool:

@@ -4349,22 +4349,24 @@ class GenPreemptionConfig(StrictBaseModel):
     """GEN slot preemption on a disaggregated generation worker.
 
     When every generation slot is taken and the request the GEN admission
-    queue admits next is at risk of missing its TTFT target, the longest
-    resident decode request is paused in place (it keeps its KV cache and
-    slot) and the waiting request takes its slot. The pauses cost TPOT; set
-    at most one of the two fields to bound that cost (neither: off):
+    queue admits next is at risk of missing its TTFT target, a decode request
+    is paused in place (it keeps its KV cache and slot) and the waiting
+    request takes its slot. The pauses cost TPOT; set at most one of the two
+    fields to bound that cost (neither: off):
 
     - ``tpot_budget``: the allowed increase of the mean TPOT, as a fraction.
-    - ``target_output_tps``: a per-request output rate to keep. With R0 the
-      measured per-request output rate without pauses, the budget is
-      R0 / target_output_tps - 1, so requests running faster than the target
-      donate slot time; nothing is paused when R0 is at or below it.
+      The longest resident request is paused, and an integral controller on
+      the at-risk window holds the TPOT cost of pauses at 0.8 of the budget.
+    - ``target_output_tps``: a per-request output rate that at least ~80% of
+      requests keep (a service-level objective). Requests with slack against
+      the target (projected to finish above it even after a pause) are
+      paused first and resumed before they fall below it; a small credit,
+      earned per completion, allows sacrificing a few requests below it.
 
     The at-risk window, the number of paused requests (0.375 x
     max_num_active_requests), the maximum pause and the minimum run before a
     pause are derived online from the measured decode time of completed
-    requests, and an integral controller holds the TPOT cost of pauses at
-    0.8 of the budget.
+    requests.
 
     Needs the ``auto`` GEN admission policy
     (``TLLM_GEN_ADMISSION_TTFT_PERCENTILE``) and the KV cache manager V2
@@ -4382,10 +4384,10 @@ class GenPreemptionConfig(StrictBaseModel):
     target_output_tps: Optional[float] = Field(
         default=None,
         gt=0.0,
-        description=
-        "Per-request output rate to keep, in output tokens per second "
-        "(1 / TPOT, accepted draft tokens included); converted to a TPOT "
-        "budget from the measured unpaused rate. Mutually exclusive with "
+        description="Per-request output rate floor, in output tokens per second "
+        "(1 / TPOT, accepted draft tokens included), met by at least ~80% of "
+        "requests: requests with slack against it are paused first, and a "
+        "small credit allows sacrificing a few. Mutually exclusive with "
         "tpot_budget; with neither set, GEN slot preemption is off.",
         status="prototype")
 

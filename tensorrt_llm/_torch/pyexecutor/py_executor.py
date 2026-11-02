@@ -7267,11 +7267,13 @@ class PyExecutor:
         """Resume lane, then pausing; returns the admission count.
 
         Paused requests stay resident in ``active_requests`` but hold no
-        admission slot and are not scheduled. Free slots go to them, oldest
-        pause first, before any new admission; one paused for the maximum
-        pause resumes regardless. With no slot left and the next waiting
-        request at risk of missing the TTFT target, the policy's victims are
-        paused to free slots for it. Completions feed the window controller.
+        admission slot and are not scheduled. Free slots go to them before
+        any new admission (oldest pause first, or least laxity first with
+        target_output_tps); one that is due (maximum pause, or laxity down to
+        its margin) resumes regardless. With no slot left and the next
+        waiting request at risk of missing the TTFT target, the policy's
+        victims are paused to free slots for it. Completions feed the window
+        controller or the target_output_tps credit.
         Every input is identical on all ranks, so every rank decides the
         same.
         """
