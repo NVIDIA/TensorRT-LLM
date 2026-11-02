@@ -15,8 +15,6 @@
 """VisualGen-owned fused kernels.
 
 Kernels whose only production consumer is the VisualGen (DiT) vertical.
-Distinct from the pre-existing tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/
-tree, which is out of scope for this migration and is not touched by it.
 
 Nothing is re-exported from this file on purpose: importing one kernel must
 not drag in the others, several of which are arch-gated.

@@ -479,10 +479,17 @@ def match(
         parents = promote._git(repo, "show", "-s", "--format=%P", sha).split()
         if len(parents) != 1:
             raise Diagnostic(
-                f"Source history must be linear; commit `{sha}` has {len(parents)} parents.",
-                f"Rebase the temporary source branch onto canonical pin `{previous}` without "
-                "merge commits. Then use `scripts/vendor/manage.py` to update the lock and "
-                "vendored snapshot to the new source SHA, and push the consumer PR.",
+                f"Source history must be linear; commit `{sha}` has {len(parents)} parents. "
+                "Temporary-fork updates require a linear range for commit-by-commit upstream "
+                "attribution; containing the dev tip alone is not sufficient.",
+                "Fetch the latest canonical dev branch and rebase your temporary branch's "
+                "changes onto its tip without merge commits, or cherry-pick the intended "
+                "changes onto a fresh branch from that tip. Do not rewrite canonical history "
+                f"or assume the consumer lock pin `{previous}` is still the latest dev tip. "
+                "Test and push the source branch, then use `scripts/vendor/manage.py` to "
+                "update and verify the lock and vendored snapshot at the new source SHA. "
+                "Push the consumer PR. Editing the upstream PR list or `resolutions` alone "
+                "cannot remove a merge commit.",
             )
         source_parents[sha] = parents[0]
     resolutions = resolutions or {}
@@ -666,17 +673,7 @@ def resolve(
     cache: Path,
 ) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Fetch only Git data into a private bare cache and resolve declared PRs."""
-    if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
-        changed = (["source"] if previous.source != reviewed.source else []) + (
-            ["include"] if set(previous.include) != set(reviewed.include) else []
-        )
-        raise Diagnostic(
-            "Automatic attribution requires unchanged lock source/include selection. "
-            "Changed fields: " + ", ".join(f"`{name}`" for name in changed) + ".",
-            "Separate the selection change into a different PR. In this source-update PR, "
-            "restore the canonical `source`/`include` selection in "
-            "`3rdparty/vendor_sources.lock.yaml` and regenerate the vendor snapshot.",
-        )
+    promote._check_selection(previous, reviewed)
     cache.mkdir(parents=True, exist_ok=True)
     if not (cache / "HEAD").exists():
         promote._git(cache, "init", "--bare", "--quiet")
@@ -700,9 +697,10 @@ def resolve(
         cache, "merge-base", previous.commit, reviewed.commit, allowed_returncodes=(0, 1)
     )
     rebase_action = (
-        f"Rebase the temporary source branch {field(reviewed.branch)} onto canonical "
-        f"repository {field(previous.url)}, branch {field(previous.branch)}, SHA "
-        f"`{previous.commit}`. Then use `scripts/vendor/manage.py` to update "
+        f"Fetch canonical repository {field(previous.url)}, branch {field(previous.branch)}, "
+        f"and rebase the temporary source branch {field(reviewed.branch)} onto its latest "
+        f"tip without merge commits, not just the consumer lock's pin `{previous.commit}`. "
+        "Then use `scripts/vendor/manage.py` to update "
         "`3rdparty/vendor_sources.lock.yaml` and the vendored snapshot to the rebased SHA, "
         "and push the source branch and consumer PR. Editing metadata alone will not fix this."
     )

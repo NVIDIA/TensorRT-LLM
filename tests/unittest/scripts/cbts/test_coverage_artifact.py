@@ -17,12 +17,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -334,7 +339,6 @@ class CoverageArtifactTest(unittest.TestCase):
                     }
                 },
                 outcomes={"A10-PyTorch-1/test_x86.py::test_one": "passed"},
-                expected_workers={"A10-PyTorch-1/test_x86.py::test_one": 0},
             )
             write_leaf_database(
                 sbsa_db,
@@ -346,7 +350,6 @@ class CoverageArtifactTest(unittest.TestCase):
                     }
                 },
                 outcomes={"GH200-PyTorch-1/test_sbsa.py::test_two": "passed"},
-                expected_workers={"GH200-PyTorch-1/test_sbsa.py::test_two": 0},
             )
             urls = artifact.tarball_urls(42)
             selection = {
@@ -401,6 +404,398 @@ class CoverageArtifactTest(unittest.TestCase):
                 },
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
+
+
+# build_info.txt is read with jenkins/scripts/fetch_build_artifact.sh, which applies the read rule
+# and is tested in tests/unittest/scripts/test_fetch_build_artifact.py. These tests check how
+# artifact.py runs it and what it makes of each exit status.
+def _build_info_path(build: int) -> str:
+    return f"{artifact.ARTIFACT_BASE}/{build}/{artifact.BUILD_INFO_NAME}"
+
+
+_BUILD = 88
+_COMMIT = "a" * 40
+_BUILD_INFO = f"commit={_COMMIT}\nbranch=main\ndate=2026-10-16 00:00:00 UTC\n"
+_ARTIFACT_PATH = _build_info_path(_BUILD)
+_LAYOUT_PATH = f"llm-artifacts/LLM/main/L0_PostMerge/{_BUILD}/{artifact.BUILD_INFO_NAME}"
+_CREDENTIAL_ID = "aws-artifactory-credentials"
+_HELPER_ENVIRONMENT = ("LLM_ARTIFACTS_PRIMARY", "ARTIFACTORY_NETRC", "ARTIFACTORY_CREDENTIAL_ID")
+
+# Stands in for fetch_build_artifact.sh. It records its arguments and the environment it sees,
+# writes to stdout and stderr, and exits with HELPER_STUB_STATUS; on 0 it first writes
+# HELPER_STUB_CONTENT to <dest-file>.
+_HELPER_STUB = r"""
+import json
+import os
+import sys
+
+with open(os.environ["HELPER_STUB_LOG"], "a", encoding="utf-8") as log:
+    names = json.loads(os.environ["HELPER_STUB_ENV"])
+    log.write(
+        json.dumps({"args": sys.argv[1:], "env": {name: os.environ.get(name) for name in names}})
+        + "\n"
+    )
+print("helper stdout")
+print("helper stderr", file=sys.stderr)
+status = int(os.environ["HELPER_STUB_STATUS"])
+if status == 0:
+    with open(sys.argv[2], "w", encoding="utf-8") as dest:
+        dest.write(os.environ["HELPER_STUB_CONTENT"])
+sys.exit(status)
+"""
+
+
+class _HelperStub:
+    """Replaces the read helper that artifact.py runs, and records each call."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._log = tmp_path / "helper_calls.jsonl"
+        stub_script = tmp_path / "helper_stub.py"
+        stub_script.write_text(_HELPER_STUB, encoding="utf-8")
+        helper = tmp_path / "fetch_build_artifact.sh"
+        helper.write_text(
+            f'exec {shlex.quote(sys.executable)} -I -S {shlex.quote(str(stub_script))} "$@"\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(artifact, "_FETCH_BUILD_ARTIFACT", helper)
+        monkeypatch.setenv("HELPER_STUB_LOG", str(self._log))
+        monkeypatch.setenv("HELPER_STUB_ENV", json.dumps(_HELPER_ENVIRONMENT))
+        monkeypatch.setenv("HELPER_STUB_CONTENT", _BUILD_INFO)
+        monkeypatch.setenv("LLM_ARTIFACTS_PRIMARY", "urm")
+        monkeypatch.setenv("ARTIFACTORY_NETRC", str(tmp_path / "artifactory-netrc"))
+        monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", _CREDENTIAL_ID)
+        self._monkeypatch = monkeypatch
+        self.exits_with(0)
+
+    def exits_with(self, status: int) -> None:
+        self._monkeypatch.setenv("HELPER_STUB_STATUS", str(status))
+
+    @property
+    def calls(self) -> list[dict]:
+        if not self._log.exists():
+            return []
+        return [json.loads(line) for line in self._log.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.fixture
+def helper_stub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _HelperStub:
+    return _HelperStub(monkeypatch, tmp_path)
+
+
+def test_build_commit_reads_build_info_through_the_helper(
+    helper_stub: _HelperStub, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    assert artifact.build_commit(_BUILD) == _COMMIT
+
+    [call] = helper_stub.calls
+    artifact_path, dest = call["args"]
+    assert artifact_path == _ARTIFACT_PATH
+    assert Path(dest).name == artifact.BUILD_INFO_NAME
+    # A temporary file, removed once read.
+    assert not Path(dest).parent.exists()
+    assert call["env"] == {
+        "LLM_ARTIFACTS_PRIMARY": "urm",
+        "ARTIFACTORY_NETRC": str(tmp_path / "artifactory-netrc"),
+        "ARTIFACTORY_CREDENTIAL_ID": _CREDENTIAL_ID,
+    }
+    captured = capfd.readouterr()
+    # stdout carries the command's JSON, so the helper's stdout is dropped; its stderr is the
+    # job log's record of which location served the file, or why it could not.
+    assert captured.out == ""
+    assert "helper stderr" in captured.err
+
+
+def test_build_commit_returns_none_when_neither_location_has_build_info(
+    helper_stub: _HelperStub,
+) -> None:
+    helper_stub.exits_with(2)
+
+    assert artifact.build_commit(_BUILD) is None
+    assert len(helper_stub.calls) == 1
+
+
+def test_build_commit_returns_none_when_the_transfer_fails(
+    helper_stub: _HelperStub, capfd: pytest.CaptureFixture[str]
+) -> None:
+    helper_stub.exits_with(4)
+
+    assert artifact.build_commit(_BUILD) is None
+    # One call: the helper retries transient failures itself.
+    assert len(helper_stub.calls) == 1
+    errors = capfd.readouterr().err.splitlines()
+    assert any(
+        line.startswith("[artifact] ") and _ARTIFACT_PATH in line and "exit status 4" in line
+        for line in errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    (
+        (3, artifact.ArtifactAuthError),
+        (64, artifact.ArtifactError),
+        (127, artifact.ArtifactError),
+    ),
+    ids=("rejected", "usage-error", "other"),
+)
+def test_build_commit_raises_on_helper_failures(
+    helper_stub: _HelperStub, status: int, error: type[artifact.ArtifactError]
+) -> None:
+    helper_stub.exits_with(status)
+
+    with pytest.raises(artifact.ArtifactError) as raised:
+        artifact.build_commit(_BUILD)
+
+    assert type(raised.value) is error
+    assert _ARTIFACT_PATH in str(raised.value)
+    assert f"exit status {status}" in str(raised.value)
+    # One call: the helper retries transient failures itself.
+    assert len(helper_stub.calls) == 1
+
+
+def test_build_commit_reports_a_helper_that_cannot_start(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    empty_dir = tmp_path / "empty-path"
+    empty_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_dir))
+
+    with pytest.raises(artifact.ArtifactError) as raised:
+        artifact.build_commit(_BUILD)
+
+    assert type(raised.value) is artifact.ArtifactError
+    assert _ARTIFACT_PATH in str(raised.value)
+    assert helper_stub.calls == []
+
+
+@pytest.mark.parametrize("status", (3, 4, 64), ids=("rejected", "transfer-failed", "usage-error"))
+def test_main_reports_helper_failures_and_exits_1(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    helper_stub.exits_with(status)
+    monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
+    monkeypatch.setattr(artifact, "_exists", lambda url: True)
+
+    result = CliRunner().invoke(
+        artifact.main,
+        ["--resolve-build", "--pr-head", "b" * 40, "--build", str(_BUILD)],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    errors = [line for line in result.stderr.splitlines() if line.startswith("[artifact] ")]
+    assert any(_ARTIFACT_PATH in line and f"exit status {status}" in line for line in errors)
+
+
+def _make_builds_complete(monkeypatch: pytest.MonkeyPatch, newest: int) -> None:
+    """Make the probe find builds `newest` down to 1, each with both coverage archives."""
+    monkeypatch.setattr(artifact, "latest_build_number", lambda jenkins_base: newest)
+    monkeypatch.setattr(artifact, "_exists", lambda url: True)
+
+
+def test_probe_reads_each_build_once_and_declines_while_every_transfer_fails(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # How an outage of artifactory.nvidia.com while it is the primary location (the default) looks
+    # to the probe: every read fails in transfer, whichever location holds the file.
+    helper_stub.exits_with(4)
+    _make_builds_complete(monkeypatch, 3)
+    # Build 2 lacks its SBSA archive, so its build_info.txt is not read.
+    sbsa_archive_of_2 = artifact.tarball_url(2, artifact.ARCH_TARBALL_NAMES[1])
+    monkeypatch.setattr(artifact, "_exists", lambda url: url != sbsa_archive_of_2)
+
+    assert artifact.select_tarball("c" * 40, max_probe=3) is None
+
+    assert [call["args"][0] for call in helper_stub.calls] == [
+        _build_info_path(build) for build in (3, 1)
+    ]
+    errors = capfd.readouterr().err
+    for build in (3, 1):
+        assert f"[artifact] build {build}: commit unknown; skipped" in errors
+    assert (
+        "[artifact] no complete x86/SBSA coverage pair with a known commit in the last 3 builds "
+        "(2 skipped: commit unknown)"
+    ) in errors
+
+
+def test_probe_selects_an_older_build_when_one_transfer_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fetch(artifact_path: str) -> bytes:
+        if artifact_path == _build_info_path(3):
+            raise artifact.ArtifactTransferError(f"could not read {artifact_path} (exit status 4)")
+        return _BUILD_INFO.encode()
+
+    _make_builds_complete(monkeypatch, 3)
+    monkeypatch.setattr(artifact, "_fetch_build_artifact", fetch)
+    monkeypatch.setattr(artifact, "drift", lambda commit, base: (0, "identical"))
+    monkeypatch.setattr(artifact, "compare_distance", lambda commit: 0)
+
+    selected = artifact.select_tarball("c" * 40, max_probe=3)
+
+    assert selected is not None
+    assert selected["build"] == 2
+    assert selected["commit"] == _COMMIT
+
+
+def test_probe_stops_when_the_primary_location_rejects_a_read(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    helper_stub.exits_with(3)
+    _make_builds_complete(monkeypatch, 3)
+
+    with pytest.raises(artifact.ArtifactAuthError):
+        artifact.select_tarball("c" * 40, max_probe=3)
+
+    # Every other build's read would be rejected the same way.
+    assert len(helper_stub.calls) == 1
+
+
+def test_resolve_pin_prints_a_declined_plan_when_every_transfer_fails(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    helper_stub.exits_with(4)
+    _make_builds_complete(monkeypatch, 3)
+    monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
+    monkeypatch.setattr(artifact, "_get", lambda url, headers=None: (404, None))
+    pin_path = tmp_path / artifact.PIN_NAME
+
+    result = CliRunner().invoke(
+        artifact.main,
+        ["--resolve-pin", str(pin_path), "--pr-number", "18802", "--pr-head", "b" * 40],
+        catch_exceptions=False,
+    )
+
+    # L0_MergeRequest declines the coverage tier on this plan, as it does when the command exits 1.
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == {
+        "status": "declined",
+        "compatibility": "unknown",
+        "decline_reason": "coverage tier declined: coverage DB could not be resolved",
+        "pin_upload_required": False,
+    }
+    assert len(helper_stub.calls) == 3
+    assert not pin_path.exists()
+
+
+def test_prepare_of_the_pinned_build_exits_1_when_its_transfer_fails(
+    helper_stub: _HelperStub, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The call L0_MergeRequest makes once the PR head has a pin: only the pinned build is read.
+    helper_stub.exits_with(4)
+    monkeypatch.setattr(artifact, "merge_base", lambda head: "c" * 40)
+    monkeypatch.setattr(artifact, "_exists", lambda url: True)
+    paths_json = tmp_path / "cbts_coverage_residual.json"
+    paths_json.write_text(json.dumps(["tensorrt_llm/source.py"]))
+    prepare_dir = tmp_path / "cbts_cov"
+
+    result = CliRunner().invoke(
+        artifact.main,
+        [
+            "--prepare",
+            str(prepare_dir),
+            "--paths-json",
+            str(paths_json),
+            "--pr-head",
+            "b" * 40,
+            "--build",
+            str(_BUILD),
+            "--expected-commit",
+            _COMMIT,
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert len(helper_stub.calls) == 1
+    errors = result.stderr.splitlines()
+    assert any(_ARTIFACT_PATH in line and "exit status 4" in line for line in errors)
+    assert f"[artifact] pinned build {_BUILD}: commit unknown" in errors
+    assert not (prepare_dir / artifact.META_NAME).exists()
+
+
+class _ArtifactHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = self.server.routes.get(self.path)
+        self.send_response(404 if body is None else 200)
+        payload = b'{"errors": [{"status": 404}]}' if body is None else body
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: object) -> None:
+        """Keep access logs out of the test output."""
+
+
+class _ArtifactServer(ThreadingHTTPServer):
+    """A loopback Artifactory stand-in that answers GETs from a path map, and 404 otherwise."""
+
+    daemon_threads = True
+
+    def __init__(self, host: str, routes: dict[str, bytes]) -> None:
+        super().__init__((host, 0), _ArtifactHandler)
+        self.routes = routes
+
+    def base_url(self, repo: str) -> str:
+        host, port = self.server_address[:2]
+        return f"http://{host}:{port}/artifactory/{repo}"
+
+
+def test_build_commit_with_the_real_helper_falls_back_to_urm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+) -> None:
+    content = _BUILD_INFO.encode()
+    storage_info = {"checksums": {"sha1": hashlib.sha1(content, usedforsecurity=False).hexdigest()}}
+    urm_routes = {
+        f"/artifactory/api/storage/sw-tensorrt-generic/{_LAYOUT_PATH}": json.dumps(
+            storage_info
+        ).encode(),
+        f"/artifactory/sw-tensorrt-generic/{_LAYOUT_PATH}": content,
+    }
+    # curl matches netrc entries by host name, so each location has its own loopback address.
+    servers = []
+    try:
+        for host, routes in (("127.0.0.1", {}), ("127.0.0.2", urm_routes)):
+            servers.append(_ArtifactServer(host, routes))
+    except OSError as error:
+        for server in servers:
+            server.server_close()
+        pytest.skip(f"cannot listen on the 127.0.0.0/8 loopback range: {error}")
+    aws, urm = servers
+    for server in servers:
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+    netrc = tmp_path / "artifactory-netrc"
+    netrc.write_text("machine 127.0.0.1 login ci-reader password reader-token-value\n")
+    netrc.chmod(0o600)
+    for name in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("LLM_ARTIFACTS_PRIMARY", raising=False)
+    monkeypatch.setenv("LLM_ARTIFACTS_AWS_URL", aws.base_url("sw-tensorrt-llm-generic-local"))
+    monkeypatch.setenv("LLM_ARTIFACTS_URM_URL", urm.base_url("sw-tensorrt-generic"))
+    monkeypatch.setenv("ARTIFACTORY_NETRC", str(netrc))
+    monkeypatch.setenv("ARTIFACTORY_CREDENTIAL_ID", _CREDENTIAL_ID)
+
+    try:
+        commit = artifact.build_commit(_BUILD)
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+
+    assert commit == _COMMIT
+    captured = capfd.readouterr()
+    assert captured.out == ""
+    assert f"fetch_build_artifact: served-by=urm path={_LAYOUT_PATH}" in captured.err
+    assert "reader-token-value" not in captured.err
 
 
 if __name__ == "__main__":

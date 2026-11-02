@@ -45,7 +45,6 @@ set(EXECUTOR_TYPE_SRCS
     cacheTransceiverConfig.cpp
     decodingConfig.cpp
     dynamicBatchConfig.cpp
-    extendedRuntimePerfKnobConfig.cpp
     guidedDecodingConfig.cpp
     guidedDecodingParams.cpp
     kvCacheConfig.cpp
@@ -81,7 +80,6 @@ add_library(
   loraConfig.cpp
   mropeConfig.cpp
   multimodalInput.cpp
-  promptTuningConfig.cpp
   request.cpp
   response.cpp
   serialization.cpp
