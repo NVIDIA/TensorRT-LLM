@@ -10,8 +10,9 @@ import math
 import os
 import socket
 import tempfile
+import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -21,7 +22,6 @@ from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
-    Callable,
     ClassVar,
     Dict,
     Generic,
@@ -133,29 +133,37 @@ _SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 # `_load_video_by_cv2` for the per-format contract.
 _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
-_global_aiohttp_session_loop: asyncio.AbstractEventLoop | None = None
+# One aiohttp session per event loop. Media loading can run on multiple live
+# loops in one process. Live sessions must only be used and closed from their
+# owning loop; closed-loop entries are disposed on the next lookup.
+_aiohttp_sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+_aiohttp_sessions_lock = threading.Lock()
 
 
 async def _get_aiohttp_session() -> aiohttp.ClientSession:
     """Return the aiohttp session owned by the current event loop."""
-    global _global_aiohttp_session, _global_aiohttp_session_loop
     current_loop = asyncio.get_running_loop()
-    if (
-        _global_aiohttp_session is None
-        or _global_aiohttp_session.closed
-        or _global_aiohttp_session_loop is not current_loop
-    ):
-        previous_session = _global_aiohttp_session
-        connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
-        _global_aiohttp_session = aiohttp.ClientSession(connector=connector)
-        _global_aiohttp_session_loop = current_loop
-        if previous_session is not None and not previous_session.closed:
-            await previous_session.close()
-    return _global_aiohttp_session
+    with _aiohttp_sessions_lock:
+        stale_sessions = [
+            _aiohttp_sessions.pop(loop) for loop in list(_aiohttp_sessions) if loop.is_closed()
+        ]
+        session = _aiohttp_sessions.get(current_loop)
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
+            session = aiohttp.ClientSession(connector=connector)
+            _aiohttp_sessions[current_loop] = session
+    for stale_session in stale_sessions:
+        await stale_session.close()
+    return session
+
+
+async def _close_aiohttp_session() -> None:
+    """Close and forget the media session owned by the current event loop."""
+    current_loop = asyncio.get_running_loop()
+    with _aiohttp_sessions_lock:
+        session = _aiohttp_sessions.pop(current_loop, None)
+    if session is not None and not session.closed:
+        await session.close()
 
 
 # Maximum allowed response size and encoded video input size (200 MiB).
@@ -1144,6 +1152,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
         "media_io_executor", default=None
     )
+    _work_tracker: ClassVar[ContextVar[Optional[Callable[[asyncio.Future], None]]]] = ContextVar(
+        "media_io_work_tracker", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1162,12 +1173,19 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
     @classmethod
     @contextmanager
-    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+    def use_executor(
+        cls,
+        executor: Optional[Executor],
+        *,
+        on_submit: Optional[Callable[[asyncio.Future], None]] = None,
+    ) -> Iterator[None]:
         """Scope decode work to a server-owned executor without replacing other servers' pools."""
         token = BaseMediaIO._request_executor.set(executor)
+        tracker_token = BaseMediaIO._work_tracker.set(on_submit)
         try:
             yield
         finally:
+            BaseMediaIO._work_tracker.reset(tracker_token)
             BaseMediaIO._request_executor.reset(token)
 
     @classmethod
@@ -1256,7 +1274,13 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
         executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
-        return await loop.run_in_executor(executor, fn, *args)
+        future = loop.run_in_executor(executor, fn, *args)
+        tracker = BaseMediaIO._work_tracker.get()
+        if tracker is not None:
+            tracker(future)
+            # Cancelling the waiter must not report completion before the thread exits.
+            return await asyncio.shield(future)
+        return await future
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
@@ -1316,29 +1340,59 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
 
-    def __init__(self, **kwargs) -> None:
-        # AudioMediaIO has no configurable parameters. An explicit __init__
-        # is needed so that BaseMediaIO.create() does not crash when kwargs
-        # are present (e.g. via --media_io_kwargs or the per-request API).
+    def __init__(
+        self, decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None, **kwargs
+    ) -> None:
+        self._decoded_memory_reserver = decoded_memory_reserver
         if kwargs:
             logger.warning(
-                "AudioMediaIO received unexpected kwargs %s — audio loading "
-                "has no configurable parameters; kwargs will be ignored.",
+                "AudioMediaIO received unexpected kwargs %s; kwargs will be ignored.",
                 sorted(kwargs),
             )
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(data))
+        return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(base64.b64decode(data)))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
         # empty-scheme URLs through verbatim.
         parsed = urlparse(url)
         path = _normalize_file_uri(url) if parsed.scheme == "file" else url
-        return soundfile.read(path)
+        return self._read(path)
+
+    def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
+        if self._decoded_memory_reserver is None:
+            return soundfile.read(source)
+
+        reservation = None
+        try:
+            # Read metadata and samples from the same handle. Reserve the float64
+            # output before allocation; libsndfile's internal buffers are excluded.
+            with soundfile.SoundFile(source) as audio:
+                frames, channels = audio.frames, audio.channels
+                if frames < 0 or channels < 1:
+                    raise ValueError("invalid audio frame or channel count")
+                decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
+                reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
+                shape = (frames,) if channels == 1 else (frames, channels)
+                samples = np.empty(shape, dtype=np.float64)
+                decoded = audio.read(frames=frames, out=samples)
+                if decoded.shape != samples.shape:
+                    # Compressed headers may overestimate frames. Drop the decoder's
+                    # view before shrinking the owning allocation and its budget.
+                    decoded_shape = decoded.shape
+                    decoded = None
+                    samples.resize(decoded_shape)
+                sample_rate = audio.samplerate
+            reservation.commit(samples.nbytes)
+            return samples, sample_rate
+        finally:
+            samples = decoded = None
+            if reservation is not None:
+                reservation.release()
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):

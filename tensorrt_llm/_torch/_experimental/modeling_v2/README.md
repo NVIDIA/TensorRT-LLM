@@ -83,10 +83,6 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                      returns that class; the registry is not consulted
 ```
 
-`route` imports the target class on the branch that returns it, so a routing
-module that declines never loads modeling code, and the class a reader sees
-returned is the class that runs -- no name to look up elsewhere.
-
 ## What may decide a target
 
 A quantity may be a routing criterion only if it is known when
@@ -163,6 +159,7 @@ tests/unittest/_torch/modeling_v2/
   test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
   _validating.py                 the fixtures that interpose is_valid and arm reference
   <category>/test_modeling_v2_<entry>.py                      shared entries
+  models/<family>/test_<entry>.py                            family-owned entries
   models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
   comm/_<entry>_op_matrix.py   the collectives' rank bodies: allgather, reducescatter
                                and allreduce at 2/4/8 ranks in one node, mnnvl_allreduce
@@ -181,8 +178,10 @@ recorded once.
 Kimi K3's shared TP4×EP4 / TP16×EP1 wrappers and CuTe packages live once under
 `models/kimi_k3_vl/{ops,kernels}/`. The TP16×EP1 M1/M2 MoE engines live under
 that target's `kernels/k3_moe_engines/`; target-only wrappers live under their
-target's `ops/`. Their existing tests retain their paths under the category
-and `tests/unittest/_torch/kernels/kimi_k3/` trees so CI selectors do not change.
+target's `ops/`. K3 tests and K3-specific helpers live directly in the flat
+`tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/` directory. Test-list entries
+assign them to CPU, single-GPU, or multi-GPU stages; CBTS uses the standard
+family-path selection.
 Claims discovery covers both family-owned and target-owned entries, and import
 isolation rejects sibling-target and unrelated-family dependencies.
 

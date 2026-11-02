@@ -141,6 +141,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.model_engine = None
     executor.previous_batch = None
     executor.active_requests = []
+    executor.canceled_req_ids = []
     executor.waiting_queue = []
     executor.inflight_req_ids = set()
     executor.is_shutdown = False

@@ -61,6 +61,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ._env import scoped_env_overrides
 
 _TP_SIZE = 16
 _NUM_SAMPLES = 1319
@@ -197,10 +198,7 @@ class TestModelingV2Glm52Nvfp4Sm107Tp16(LlmapiAccuracyTestHarness):
         assert os.environ.get("INTEGRATION_TEST") != "1", "This guard requires all 1319 samples"
         monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", "1")
         monkeypatch.setenv("TLLM_EVAL_PARTIAL_SCORES_EVERY", "100")
-        for key, value in _RANK_ENV.items():
-            monkeypatch.setenv(key, value)
-
-        with LLM(_MODEL_PATH, **_engine_kwargs()) as llm:
+        with scoped_env_overrides(_RANK_ENV), LLM(_MODEL_PATH, **_engine_kwargs()) as llm:
             _assert_optimized_paths(llm, tmp_path / "optimized-path-traces")
             _request_stats(llm, 1)  # Exclude the coverage probe from corpus AL.
             evaluator = GSM8KInferenceX(
@@ -359,24 +357,30 @@ class TestModelingV2Glm52Nvfp4Sm103Tep4(LlmapiAccuracyTestHarness):
         # would be checking the synthesizer.
         modeling_v2 = dict(modeling_v2="require", env_overrides={MODELING_V2_VALIDATE_ENV: "1"})
 
-        with LLM(
-            self.MODEL_PATH,
-            kv_cache_config=self.IDENTITY_KV,
-            **modeling_v2,
-            **self.TEP4,
-            **self.BOUNDS,
-        ) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(
+                self.MODEL_PATH,
+                kv_cache_config=self.IDENTITY_KV,
+                **modeling_v2,
+                **self.TEP4,
+                **self.BOUNDS,
+            ) as llm,
+        ):
             identity = task.evaluate(llm)
 
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP1,
-            kv_cache_config=self.MTP1_KV,
-            enable_iter_perf_stats=True,
-            **modeling_v2,
-            **self.TEP4,
-            **self.BOUNDS,
-        ) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP1,
+                kv_cache_config=self.MTP1_KV,
+                enable_iter_perf_stats=True,
+                **modeling_v2,
+                **self.TEP4,
+                **self.BOUNDS,
+            ) as llm,
+        ):
             mtp1 = task.evaluate(llm)
             acceptance_length = compute_acceptance_length(llm)
 
