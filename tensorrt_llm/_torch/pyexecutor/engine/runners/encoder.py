@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunnerConfig,
     EncoderKeyType,
 )
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.utils import torch_multi_arange, with_model_extra_attrs
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
@@ -42,6 +43,8 @@ from tensorrt_llm.llmapi.llm_args import (
     ENCODER_RUNNER_MANAGED_INPUTS,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
     TorchLlmArgs,
     validate_token_encoder_bucket_config,
 )
@@ -58,7 +61,13 @@ from ..cuda_graph import (
 from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
 from ..model_call import ModelCaller
-from .interface import ModelRunner, PackedInputs, PreparedInputs, RunnerConfig
+from .interface import (
+    PackedInputs,
+    PreparedInputs,
+    RunnerConfig,
+    ScheduledInputs,
+    ScheduledModelRunner,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -528,11 +537,12 @@ class EncoderMixin:
         self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
-class EncoderRunner(EncoderMixin, ModelRunner):
-    """Run the direct EncodeOnly model contract.
+class EncoderRunner(EncoderMixin, ScheduledModelRunner):
+    """Run token encoder models through one execution core with two entry points.
 
-    This runner deliberately knows nothing about ``LlmRequest``, decoder
-    state, cross attention, or cross-KV resources.
+    ``forward`` runs scheduled requests by packing them into the view that
+    ``forward_packed`` runs for a batch its caller already packed. The runner
+    knows nothing about decoder state, cross attention, or cross-KV resources.
     """
 
     def __init__(
@@ -945,7 +955,14 @@ class EncoderRunner(EncoderMixin, ModelRunner):
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def warmup(self) -> None:
+    def warmup(self, resource_manager: ResourceManager | None = None) -> None:
+        if resource_manager is not None:
+            kv_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.KV_CACHE_MANAGER
+            )
+            assert kv_cache_manager is None, (
+                "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+            )
         AutoTuner.get()
         max_shape = (
             self._config.max_batch_size,
@@ -1099,6 +1116,47 @@ class EncoderRunner(EncoderMixin, ModelRunner):
             gather_context_logits=inputs.gather_context_logits,
         )
 
+    def forward(
+        self,
+        inputs: ScheduledInputs,
+        *,
+        resource_manager: ResourceManager,
+        is_dummy: bool = False,
+    ) -> dict[str, Any]:
+        """Execute scheduled requests by packing them for ``forward_packed``."""
+        del resource_manager, is_dummy
+        return self.forward_packed(self._pack_scheduled(inputs))
+
+    def _pack_scheduled(self, inputs: ScheduledInputs) -> PackedInputs:
+        requests = inputs.batch.context_requests
+        input_ids: list[int] = []
+        sequence_lengths: list[int] = []
+        for request in requests:
+            if request.py_multimodal_data is not None:
+                raise ValueError(
+                    "Scheduled requests to a non-generation model cannot carry multimodal inputs."
+                )
+            prompt_tokens = request.get_tokens(0)
+            input_ids.extend(prompt_tokens)
+            sequence_lengths.append(len(prompt_tokens))
+            request.py_batch_idx = request.py_seq_slot
+
+        model_inputs: dict[str, Any] = {}
+        if any(request.py_position_ids is not None for request in requests):
+            position_ids: list[int] = []
+            for request, sequence_length in zip(requests, sequence_lengths):
+                if request.py_position_ids is None:
+                    position_ids.extend(range(sequence_length))
+                else:
+                    position_ids.extend(request.py_position_ids)
+            model_inputs["position_ids"] = position_ids
+        return PackedInputs(
+            input_ids,
+            sequence_lengths,
+            model_inputs=model_inputs,
+            gather_context_logits=inputs.gather_context_logits,
+        )
+
     def _forward_step(
         self,
         inputs: dict[str, Any],
@@ -1118,3 +1176,37 @@ class EncoderRunner(EncoderMixin, ModelRunner):
         if not isinstance(outputs, dict):
             outputs = {"logits": outputs}
         return outputs
+
+
+def resolve_scheduled_encoder_args(
+    llm_args: TorchLlmArgs, *, enable_attention_dp: bool
+) -> TorchLlmArgs:
+    """Reject or drop the settings a scheduled non-generation model cannot honor."""
+    if enable_attention_dp:
+        raise ValueError(
+            "Non-generation models do not support attention DP; set enable_attention_dp=False."
+        )
+    graph_config = llm_args.cuda_graph_config
+    if isinstance(graph_config, EncodeCudaGraphConfig) and graph_config.extra_model_inputs:
+        raise ValueError(
+            "cuda_graph_config.extra_model_inputs can only be supplied through LLM.encode(); "
+            "scheduled requests to a non-generation model cannot provide them."
+        )
+    if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED:
+        return llm_args
+    update: dict[str, Any] = {"prefill_cuda_graph_backend": PrefillCudaGraphBackend.DISABLED}
+    # Choosing piecewise fills in a default TorchCompileConfig, which would compile for nothing.
+    drops_compile = llm_args.torch_compile_config == TorchCompileConfig()
+    if drops_compile:
+        update["torch_compile_config"] = None
+    logger.warning(
+        f"prefill_cuda_graph_backend={llm_args.prefill_cuda_graph_backend.value!r} is ignored "
+        "for non-generation models, which use encoder CUDA graphs "
+        "(cuda_graph_config=EncodeCudaGraphConfig(...)) instead"
+        + (
+            "; the default torch_compile_config is dropped with it, so the model runs eagerly."
+            if drops_compile
+            else "; torch_compile_config still applies, without piecewise CUDA graphs."
+        )
+    )
+    return llm_args.model_copy(update=update)

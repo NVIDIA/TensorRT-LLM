@@ -23,16 +23,20 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
+    resolve_scheduled_encoder_args,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderStage,
     EncoderStageConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs, ScheduledInputs
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
 )
 
 if TYPE_CHECKING:
@@ -606,3 +610,126 @@ def test_encoder_release_clears_owned_graph_backend(release_nccl_window_owners: 
     runner._encoder_cuda_graph_runner.clear.assert_called_once_with(
         release_nccl_window_owners=release_nccl_window_owners
     )
+
+
+def _scheduled_request(
+    seq_slot: int,
+    tokens: list[int],
+    *,
+    position_ids: list[int] | None = None,
+    multimodal_data: dict | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        get_tokens=Mock(return_value=tokens),
+        py_seq_slot=seq_slot,
+        py_position_ids=position_ids,
+        py_multimodal_data=multimodal_data,
+    )
+
+
+def _scheduled_inputs(requests: list[SimpleNamespace]) -> ScheduledInputs:
+    return ScheduledInputs(
+        batch=SimpleNamespace(context_requests=requests), gather_context_logits=True
+    )
+
+
+def test_scheduled_requests_pack_into_one_batch_with_filled_position_ids() -> None:
+    first = _scheduled_request(3, [11, 12, 13])
+    second = _scheduled_request(1, [21, 22], position_ids=[5, 6])
+
+    packed = object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([first, second]))
+
+    assert packed == PackedInputs(
+        [11, 12, 13, 21, 22],
+        [3, 2],
+        model_inputs={"position_ids": [0, 1, 2, 5, 6]},
+        gather_context_logits=True,
+    )
+    assert (first.py_batch_idx, second.py_batch_idx) == (3, 1)
+
+
+def test_scheduled_requests_reject_multimodal_inputs() -> None:
+    request = _scheduled_request(0, [1, 2], multimodal_data={"image": object()})
+
+    with pytest.raises(ValueError, match="cannot carry multimodal inputs"):
+        object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([request]))
+
+
+def test_scheduled_warmup_rejects_kv_cache_manager() -> None:
+    runner = object.__new__(EncoderRunner)
+    runner._model = SimpleNamespace(extra_attrs={})
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = object()
+
+    with pytest.raises(AssertionError, match="but a KV cache manager was allocated"):
+        runner.warmup(resource_manager)
+
+
+def test_encoder_graph_rejects_nested_outputs() -> None:
+    runner = object.__new__(EncoderRunner)
+    runner._encoder_cuda_graph_runner = SimpleNamespace(get_graph_pool=Mock(return_value=None))
+    nested = torch.nested.nested_tensor([torch.ones(2), torch.ones(3)])
+    runner._execute_encoder_cuda_graph = Mock(return_value={"logits": nested})
+    prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3], graph_key=(2, 8, 4))
+
+    with pytest.raises(ValueError, match="require dense outputs"):
+        runner._execute_prepared(prepared)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, "do not support attention DP"),
+        (
+            {
+                "cuda_graph_config": EncodeCudaGraphConfig(
+                    batch_sizes=[1],
+                    num_tokens=[8],
+                    seq_lens=[8],
+                    extra_model_inputs=[
+                        EncodeExtraInputSpec(
+                            name="token_type_ids", shape=("num_tokens",), dtype="int32"
+                        )
+                    ],
+                )
+            },
+            "can only be supplied through LLM.encode",
+        ),
+    ],
+)
+def test_scheduled_encoder_args_reject_unsupported_settings(overrides: dict, match: str) -> None:
+    llm_args = TorchLlmArgs(model="dummy", **overrides)
+
+    with pytest.raises(ValueError, match=match):
+        resolve_scheduled_encoder_args(llm_args, enable_attention_dp=not overrides)
+
+
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+def test_scheduled_encoder_args_drop_prefill_cuda_graphs(backend: str) -> None:
+    llm_args = TorchLlmArgs(model="dummy", prefill_cuda_graph_backend=backend)
+
+    with patch.object(encoder_module.logger, "warning") as warning:
+        resolved = resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False)
+
+    warning.assert_called_once()
+    assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+    assert resolved.torch_compile_config is None
+    assert llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(backend)
+
+
+def test_scheduled_encoder_args_keep_explicit_compile_config() -> None:
+    compile_config = TorchCompileConfig(max_num_streams=1)
+    llm_args = TorchLlmArgs(
+        model="dummy", prefill_cuda_graph_backend="piecewise", torch_compile_config=compile_config
+    )
+
+    resolved = resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False)
+
+    assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+    assert resolved.torch_compile_config == compile_config
+
+
+def test_scheduled_encoder_args_keep_supported_settings() -> None:
+    llm_args = TorchLlmArgs(model="dummy")
+
+    assert resolve_scheduled_encoder_args(llm_args, enable_attention_dp=False) is llm_args
