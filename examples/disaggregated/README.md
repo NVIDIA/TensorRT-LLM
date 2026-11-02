@@ -416,7 +416,7 @@ resources:
 
 ##### 2. Install or Update EFA Libraries
 
-Skip this step if the container already includes EFA Installer 1.51.0 or later. Otherwise, download the installer. The commands below preserve MPI and rdma-core, which must already be installed:
+For Ubuntu containers, skip this step if EFA Installer 1.51.0 or later is already installed. Otherwise, download the installer. The commands below preserve MPI and rdma-core, which must already be installed:
 
 ```bash
 curl -fLO https://efa-installer.amazonaws.com/aws-efa-installer-1.51.0.tar.gz
@@ -432,21 +432,13 @@ printf '%s\n' /opt/amazon/efa/lib > /etc/ld.so.conf.d/000_efa.conf
 ldconfig
 ```
 
-For Rocky Linux 8 containers, explicitly skip host configuration and the NCCL plugin:
-
-```bash
-rm -f "RPMS/ROCKYLINUX8/$(uname -m)"/dkms-*.rpm
-./efa_installer.sh --yes --skip-kmod --skip-limit-conf --no-verify \
-    --skip-mpi --skip-rdma-core --skip-plugin --disable-ngc
-printf '%s\n' /opt/amazon/efa/lib64 > /etc/ld.so.conf.d/000_efa.conf
-ldconfig
-```
-
-The DKMS RPM is excluded from the temporary installer directory because the standard RPM path selects it even with `--skip-kmod`. The EFA driver and host limits must be configured on the host.
+These commands use the Ubuntu-only `--build-ngc` mode. For non-Ubuntu environments, provision a compatible libfabric and EFA provider separately; the container build does not install the EFA runtime. The EFA driver and host limits must be configured on the host.
 
 ##### 3. Rebuild NIXL with EFA Support if Needed
 
 Skip this step if the container already includes NIXL 1.5.2 or later with a LIBFABRIC plugin compatible with the runtime libfabric. The build-time and runtime libfabric versions do not need to be identical.
+
+Otherwise, follow [Option 1: Rebuild NIXL with a Custom LIBFABRIC Installation](#option-1-rebuild-nixl-with-a-custom-libfabric-installation) above, including its build dependencies and runtime library lookup configuration.
 
 ##### 4. Configure and Launch Services
 
