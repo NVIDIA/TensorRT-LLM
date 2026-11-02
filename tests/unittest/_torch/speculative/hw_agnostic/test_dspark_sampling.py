@@ -216,6 +216,31 @@ def test_rejection_options_require_rejection_sampling(options: dict) -> None:
     TorchLlmArgs._validate_rejection_sampling_options(on)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
+    ids=["block", "temperature_only"],
+)
+def test_rejection_options_are_rejected_with_the_dynamic_tree(options: dict) -> None:
+    # The dynamic tree drafts from a softmax top-k of the raw draft logits and
+    # verifies token by token, so neither option would take effect there.
+    spec_config = types.SimpleNamespace(
+        use_rejection_sampling=True,
+        use_dynamic_tree=True,
+        rejection_sample_method="standard",
+        draft_temperature_only=False,
+    )
+    TorchLlmArgs._validate_rejection_sampling_options(
+        types.SimpleNamespace(speculative_config=spec_config)
+    )
+    for name, value in options.items():
+        setattr(spec_config, name, value)
+    with pytest.raises(ValueError, match="use_dynamic_tree=True"):
+        TorchLlmArgs._validate_rejection_sampling_options(
+            types.SimpleNamespace(speculative_config=spec_config)
+        )
+
+
 # ---------------------------------------------------------------------------
 # The ancestral chain
 # ---------------------------------------------------------------------------

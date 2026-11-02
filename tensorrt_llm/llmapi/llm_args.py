@@ -2521,7 +2521,7 @@ class DecodingBaseConfig(StrictBaseModel):
         "top-p / min-p filters, and that distribution is what verification "
         "divides by (vLLM's 'probabilistic' drafting). Outputs stay lossless "
         "either way; the setting changes the acceptance rate. Requires "
-        "use_rejection_sampling=True.")
+        "use_rejection_sampling=True; not supported with the dynamic tree.")
 
     allow_advanced_sampling: bool = Field(
         default=False,
@@ -7515,7 +7515,8 @@ class TorchLlmArgs(BaseLlmArgs):
 
         ``rejection_sample_method`` and ``draft_temperature_only`` only change
         the rejection path, so setting them while it is off is a configuration
-        mistake. Block verification is also not wired into the dynamic tree.
+        mistake. Neither is wired into the dynamic tree, whose drafts come from
+        a softmax top-k of the raw draft logits.
         """
         spec_cfg = self.speculative_config
         method = getattr(spec_cfg, "rejection_sample_method", "standard")
@@ -7529,10 +7530,14 @@ class TorchLlmArgs(BaseLlmArgs):
             if options:
                 raise ValueError(f"{' and '.join(options)} require(s) "
                                  "use_rejection_sampling=True.")
-        if method == "block" and getattr(spec_cfg, "use_dynamic_tree", False):
-            raise ValueError(
-                "rejection_sample_method='block' is not supported with "
-                "use_dynamic_tree=True.")
+        if getattr(spec_cfg, "use_dynamic_tree", False):
+            if method == "block":
+                raise ValueError(
+                    "rejection_sample_method='block' is not supported with "
+                    "use_dynamic_tree=True.")
+            if temperature_only:
+                raise ValueError("draft_temperature_only=True is not supported "
+                                 "with use_dynamic_tree=True.")
 
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
