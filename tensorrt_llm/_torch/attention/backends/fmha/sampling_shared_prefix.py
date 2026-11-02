@@ -1503,7 +1503,6 @@ def sampling_metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
         # use_spec_decoding is not tested: the model forward leaves it set after
         # every step, so it says nothing about the next one. A tree draft is
         # declined, a linear draft is the q_len > 1 path.
-        and not metadata.is_spec_decoding_enabled
         and not metadata.is_spec_dec_tree
         and not metadata.is_spec_dec_dynamic_tree
         and metadata.kv_cache_block_offsets is not None
