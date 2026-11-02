@@ -685,7 +685,9 @@ class DFlashSpecMetadata(SpecMetadata):
                         )
                         continue
                     if self.host_position_ids is None or self.seq_lens is None:
-                        continue
+                        raise RuntimeError(
+                            f"DFlash: no host positions to seed the slot of generation request {rid}"
+                        )
                     if row_starts is None:
                         row_starts = [0]
                         for seq_len in self.seq_lens:
