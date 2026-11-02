@@ -208,9 +208,9 @@ class PoolView:
             it ``None``; its head count is ``num_kv_heads``.
         num_kv_heads: Attention K/V views only. Per-rank KV-head count shared
             by every layer of the view, so views of one rank (e.g. target and
-            draft layers) may shard or replicate heads differently. ``None``
-            in tables from older builders and for views without KV heads;
-            consumers then fall back to ``AttentionInfo.kv_heads_per_rank``.
+            draft layers) may shard or replicate heads differently. Required
+            for head-sharded attention views; ``None`` for replicated and
+            recurrent-state views, which do not use attention head counts.
         ring_slot_bytes: REPLICATED views only. When set, each layer's region
             is a ring of ``bytes_per_layer // ring_slot_bytes`` token slots,
             and the token at global position ``p`` lives in slot

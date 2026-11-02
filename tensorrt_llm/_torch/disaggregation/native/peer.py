@@ -108,9 +108,7 @@ class PeerRegistrar:
             if policy.head_match(peer_ri, self_pv, peer_pv)[0]:
                 continue
             nhd_fragments_per_token += len(self_pv.buffer_entries)
-            nhd_heads.add(
-                (policy.view_kv_heads(self._ri, self_pv), policy.view_kv_heads(peer_ri, peer_pv))
-            )
+            nhd_heads.add((policy.view_kv_heads(self_pv), policy.view_kv_heads(peer_pv)))
         if nhd_fragments_per_token:
             heads_text = ", ".join(
                 f"local_kv_heads={local}, peer_kv_heads={peer}" for local, peer in sorted(nhd_heads)
@@ -212,15 +210,7 @@ class PeerRegistrar:
         return True
 
     def validate_view_head_geometry(self, peer_ri: RankInfo) -> None:
-        """Validate pool pairing and head geometry without registering the peer.
-
-        Views carry their own KV-head count. A view without one (tables from
-        older builders) falls back to the rank-wide count, which describes it
-        only while the rank's views share one head geometry. When either side
-        publishes counts, the bytes per head of both sides, taken with those
-        counts, must therefore agree; a legacy side whose views differ in head
-        geometry fails this check and has to publish per-view counts.
-        """
+        """Require matching per-view head geometry before registering the peer."""
         self_page_table = self._self_ext_cache.page_table
         peer_page_table = peer_ri.page_table
         policy = self._get_policy(CacheKind.PAGED)
@@ -230,14 +220,12 @@ class PeerRegistrar:
             if layer_group.kind != CacheKind.PAGED or self_pv.mapper_kind == MapperKind.REPLICATED:
                 continue
             peer_pv = peer_page_table.layer_groups[peer_lg].pool_views[peer_pi]
-            if self_pv.num_kv_heads is None and peer_pv.num_kv_heads is None:
-                continue
             bytes_per_head = []
-            for side, ri, lg_idx, pi, pool_view in (
-                ("local", self._ri, self_lg, self_pi, self_pv),
-                ("peer", peer_ri, peer_lg, peer_pi, peer_pv),
+            for side, lg_idx, pi, pool_view in (
+                ("local", self_lg, self_pi, self_pv),
+                ("peer", peer_lg, peer_pi, peer_pv),
             ):
-                heads = policy.view_kv_heads(ri, pool_view)
+                heads = policy.view_kv_heads(pool_view)
                 buffers = self._get_buffers_per_layer(pool_view, layer_group_id=lg_idx, pool_idx=pi)
                 layer_bytes = get_layer_byte_ranges(pool_view)[1]
                 if heads <= 0 or layer_bytes % (buffers * heads) != 0:
@@ -248,22 +236,10 @@ class PeerRegistrar:
                     )
                 bytes_per_head.append(layer_bytes // (buffers * heads))
             if bytes_per_head[0] != bytes_per_head[1]:
-                missing = [
-                    side
-                    for side, pool_view in (("local", self_pv), ("peer", peer_pv))
-                    if pool_view.num_kv_heads is None
-                ]
-                hint = (
-                    f"; the {' and '.join(missing)} view has no per-view KV-head count and "
-                    "falls back to the rank-wide one, so both peers must publish per-view "
-                    "KV-head counts"
-                    if missing
-                    else ""
-                )
                 raise ValueError(
                     "PeerRegistrar: bytes per KV head differ for view "
                     f"{sorted(self_pv.pool_role)} (local={bytes_per_head[0]}, "
-                    f"peer={bytes_per_head[1]}){hint}"
+                    f"peer={bytes_per_head[1]})"
                 )
 
     def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:

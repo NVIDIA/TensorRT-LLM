@@ -311,15 +311,11 @@ class HNDHeadMismatchMapper(RegionMapperBase):
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int,
         peer_buffers_per_layer: int,
-        self_kv_heads: Optional[int] = None,
-        peer_kv_heads: Optional[int] = None,
+        self_kv_heads: int,
+        peer_kv_heads: int,
     ):
         self._ri = self_ri
         self._peer_ri = peer_ri
-        # Head counts of the matched view pair; rank-wide values are the
-        # fallback for views from builders that do not record them.
-        self_kv_heads = self_kv_heads or self_ri.attention.kv_heads_per_rank
-        peer_kv_heads = peer_kv_heads or peer_ri.attention.kv_heads_per_rank
 
         self_tp_per_dp = self_ri.tp_size_per_dp_group
         peer_tp_per_dp = peer_ri.tp_size_per_dp_group
@@ -496,8 +492,8 @@ class NHDHeadMismatchMapper(HNDHeadMismatchMapper):
         peer_bytes_per_layer: int,
         self_buffers_per_layer: int,
         peer_buffers_per_layer: int,
-        self_kv_heads: Optional[int] = None,
-        peer_kv_heads: Optional[int] = None,
+        self_kv_heads: int,
+        peer_kv_heads: int,
     ) -> None:
         # Deliberately do not call HNDHeadMismatchMapper.__init__: its offsets
         # assume HND-contiguous heads. Initialize the three attributes consumed
@@ -510,8 +506,8 @@ class NHDHeadMismatchMapper(HNDHeadMismatchMapper):
                 f"local={self_tpb}, peer={peer_tpb}"
             )
 
-        self_heads = self_kv_heads or self_ri.attention.kv_heads_per_rank
-        peer_heads = peer_kv_heads or peer_ri.attention.kv_heads_per_rank
+        self_heads = self_kv_heads
+        peer_heads = peer_kv_heads
         if self_buffers_per_layer != peer_buffers_per_layer:
             raise ValueError(
                 "NHD buffer count per layer mismatch: "
@@ -761,10 +757,29 @@ class AttentionPolicy:
         )
 
     @staticmethod
-    def view_kv_heads(ri: RankInfo, pool_view: Optional[PoolView] = None) -> int:
-        """Per-rank KV heads of a view; the rank-wide count for legacy views."""
-        heads = getattr(pool_view, "num_kv_heads", None)
-        return heads if heads else ri.attention.kv_heads_per_rank
+    def view_kv_heads(pool_view: PoolView) -> int:
+        """Require the per-rank head count published by an attention view."""
+        heads = pool_view.num_kv_heads
+        if heads is None or heads <= 0:
+            raise ValueError(
+                "Attention pool views must publish a positive num_kv_heads; "
+                f"pool={pool_view.pool_idx}, role={sorted(pool_view.pool_role)}, "
+                f"num_kv_heads={heads}"
+            )
+        return heads
+
+    def _head_counts(
+        self,
+        peer_ri: RankInfo,
+        self_pv: Optional[PoolView],
+        peer_pv: Optional[PoolView],
+    ) -> tuple[int, int]:
+        if self_pv is None and peer_pv is None:
+            # Topology checks without a view pair use whole-rank metadata.
+            return self._ri.attention.kv_heads_per_rank, peer_ri.attention.kv_heads_per_rank
+        if self_pv is None or peer_pv is None:
+            raise ValueError("Both pool views are required for per-view head geometry")
+        return self.view_kv_heads(self_pv), self.view_kv_heads(peer_pv)
 
     def _head_factors(
         self,
@@ -774,10 +789,8 @@ class AttentionPolicy:
     ) -> tuple[int, int]:
         self_tp = self._tp_per_dp(self._ri)
         peer_tp = self._tp_per_dp(peer_ri)
-        return (
-            self.view_kv_heads(self._ri, self_pv) * self_tp,
-            self.view_kv_heads(peer_ri, peer_pv) * peer_tp,
-        )
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        return self_heads * self_tp, peer_heads * peer_tp
 
     def head_match(
         self,
@@ -792,9 +805,8 @@ class AttentionPolicy:
         factor_self, factor_peer = self._head_factors(peer_ri, self_pv, peer_pv)
         is_dup_head = factor_self != factor_peer
         # Slot layout is compatible if kv_heads_per_rank matches (same slot size).
-        head_match = self._ri.attention.is_mla or self.view_kv_heads(
-            self._ri, self_pv
-        ) == self.view_kv_heads(peer_ri, peer_pv)
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        head_match = self._ri.attention.is_mla or self_heads == peer_heads
         return head_match, is_dup_head
 
     def duplicate_head_factors(
@@ -806,7 +818,8 @@ class AttentionPolicy:
         # Head duplication only applies to attention KV.  In particular, do
         # not divide 0 / 0 for an attention-free hybrid PP stage; MambaPolicy
         # computes its TP mapping separately.
-        if self.view_kv_heads(self._ri, self_pv) == 0 or self.view_kv_heads(peer_ri, peer_pv) == 0:
+        self_heads, peer_heads = self._head_counts(peer_ri, self_pv, peer_pv)
+        if self_heads == 0 or peer_heads == 0:
             return 1, 1
         factor_self, factor_peer = self._head_factors(peer_ri, self_pv, peer_pv)
         dup_head = max(1, factor_self // factor_peer)
@@ -875,6 +888,8 @@ class AttentionPolicy:
                 peer_bytes_per_layer,
             )
 
+        if self_pv is None or peer_pv is None:
+            raise ValueError("Both pool views are required for per-view head geometry")
         head_match, _ = self.head_match(peer_ri, self_pv, peer_pv)
         if head_match:
             return IntactMapper(
@@ -895,8 +910,8 @@ class AttentionPolicy:
                 peer_bytes_per_layer=peer_bytes_per_layer,
                 self_buffers_per_layer=self_buffers_per_layer,
                 peer_buffers_per_layer=peer_buffers_per_layer,
-                self_kv_heads=self.view_kv_heads(self._ri, self_pv),
-                peer_kv_heads=self.view_kv_heads(peer_ri, peer_pv),
+                self_kv_heads=self.view_kv_heads(self_pv),
+                peer_kv_heads=self.view_kv_heads(peer_pv),
             )
 
         return HNDHeadMismatchMapper(
@@ -908,6 +923,6 @@ class AttentionPolicy:
             peer_bytes_per_layer=peer_bytes_per_layer,
             self_buffers_per_layer=self_buffers_per_layer,
             peer_buffers_per_layer=peer_buffers_per_layer,
-            self_kv_heads=self.view_kv_heads(self._ri, self_pv),
-            peer_kv_heads=self.view_kv_heads(peer_ri, peer_pv),
+            self_kv_heads=self.view_kv_heads(self_pv),
+            peer_kv_heads=self.view_kv_heads(peer_pv),
         )

@@ -257,7 +257,7 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.local_layers) == 2
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
     assert restored_lg.pool_views[0].num_kv_heads == 4
-    # Older page tables omit per-view metadata and retain the rank-wide fallback.
+    # Absent wire metadata remains absent so consumers can reject it.
     del d["layer_groups"][0]["pool_views"][0]["num_kv_heads"]
     assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
 
@@ -322,6 +322,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         get_disagg_ignored_roles=lambda: frozenset(),
         impl=impl,
         pp_layers=[0, 1],
+        layer_offsets={0: 0, 1: 1},
         num_kv_heads_per_layer=[1, 1],
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
@@ -428,33 +429,94 @@ def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
 
 
 @pytest.mark.cpu_only
-def test_v2_builder_preserves_virtual_layer_view_partition() -> None:
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize("internal_ids", [(0, 1), (0, 2), (2, 3)])
+@pytest.mark.parametrize("head_counts", [(2, 2), (2, 1)])
+def test_v2_builder_resolves_virtual_layer_heads(
+    mapper_kind: MapperKind, internal_ids: tuple[int, int], head_counts: tuple[int, int]
+) -> None:
     from enum import IntEnum
     from types import SimpleNamespace
 
     class AttentionKind(IntEnum):
         PRIMARY = 0
+        SHARED = 1
 
     attrs = {
         (layer, role): SimpleNamespace(
             life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
         )
-        for index, layer in enumerate((0, 2))
+        for index, layer in enumerate(internal_ids)
         for role_index, role in enumerate((Role.KEY, Role.VALUE))
     }
-    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: mapper_kind}, slot_bytes_list=(512,))
     manager.layer_specs = None
-    manager.impl.layer_grouping = ((0, 2),)
-    manager._layer_attn_to_layer_id = {(0, AttentionKind.PRIMARY): 0, (1, AttentionKind.PRIMARY): 2}
+    manager.impl.layer_grouping = (internal_ids,)
+    manager.pp_layers = [20, 22]
+    manager.layer_offsets = {20: 0, 22: 1}
+    manager.num_kv_heads_per_layer = list(head_counts)
+    # Storage IDs can be in-range yet name a different model layer. The
+    # later alias must retain the first model layer's cache ownership.
+    manager._layer_attn_to_layer_id = {
+        (22, AttentionKind.PRIMARY): internal_ids[0],
+        (20, AttentionKind.SHARED): internal_ids[0],
+        (20, AttentionKind.PRIMARY): internal_ids[1],
+    }
     manager.get_disagg_pool_view_partition = (
         KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
     )
 
     views = build_page_table_from_manager(manager).layer_groups[0].pool_views
 
-    assert len(views) == 1
-    assert get_unique_layers(views[0]) == {0, 2}
-    assert views[0].buffer_entries["offset"].tolist() == [0, 128, 256, 384]
+    if head_counts[0] == head_counts[1]:
+        assert len(views) == 1
+        assert get_unique_layers(views[0]) == set(internal_ids)
+        assert views[0].num_kv_heads == 2
+        assert views[0].buffer_entries["offset"].tolist() == [0, 128, 256, 384]
+    else:
+        assert len(views) == 2
+        assert [get_unique_layers(view) for view in views] == [{layer} for layer in internal_ids]
+        assert [view.num_kv_heads for view in views] == [head_counts[1], head_counts[0]]
+        assert [view.buffer_entries["offset"].tolist() for view in views] == [
+            [0, 128],
+            [256, 384],
+        ]
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_resolves_mixed_precision_twin_heads() -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+        HIGH_PRECISION = 1
+
+    attrs = {
+        (3, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (3, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(256,))
+    manager.impl.layer_grouping = ((3,),)
+    manager.impl.init_config.layers.extend(
+        [SimpleNamespace(window_size=128), SimpleNamespace(window_size=128)]
+    )
+    manager.pp_layers = [20, 22]
+    manager.layer_offsets = {20: 0, 22: 1}
+    manager.num_kv_heads_per_layer = [8, 2]
+    manager._layer_attn_to_layer_id = {
+        (20, AttentionKind.PRIMARY): 0,
+        (22, AttentionKind.PRIMARY): 1,
+        (20, AttentionKind.HIGH_PRECISION): 2,
+        (22, AttentionKind.HIGH_PRECISION): 3,
+    }
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert layer_group.kv_head_num_per_rank == 2
+    assert layer_group.sliding_window_size == 128
+    assert layer_group.local_layers[0].global_layer_id == 45
+    assert layer_group.pool_views[0].num_kv_heads == 2
 
 
 @pytest.mark.cpu_only
@@ -490,7 +552,32 @@ def test_v2_builder_accepts_replicated_virtual_layer_without_head_count() -> Non
 
 
 @pytest.mark.cpu_only
-def test_v2_builder_rejects_mixed_heads_without_view_partition():
+def test_v2_builder_accepts_replicated_only_layer_group_without_head_count() -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (2, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+        slot_bytes_list=(128,),
+    )
+    manager.impl.layer_grouping = ((2,),)
+    manager.impl.init_config.layers.append(SimpleNamespace(window_size=None))
+    manager.get_disagg_global_layer_ids = lambda _: [2]
+    manager.num_kv_heads_per_layer = []
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert layer_group.kv_head_num_per_rank == 0
+    assert len(layer_group.pool_views) == 1
+    assert layer_group.pool_views[0].mapper_kind == MapperKind.REPLICATED
+    assert layer_group.pool_views[0].num_kv_heads is None
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_splits_mixed_heads_without_view_partition() -> None:
     from types import SimpleNamespace
 
     attrs = {
@@ -502,7 +589,50 @@ def test_v2_builder_rejects_mixed_heads_without_view_partition():
     }
     manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
     manager.num_kv_heads_per_layer = [2, 1]
-    with pytest.raises(ValueError, match="different per-rank KV-head counts"):
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("head_counts", [(0, 1), (-1, 1), (1,)])
+def test_v2_builder_rejects_unresolved_or_nonpositive_heads(head_counts: tuple[int, ...]) -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.num_kv_heads_per_layer = list(head_counts)
+
+    with pytest.raises(ValueError, match="KV-head count"):
+        build_page_table_from_manager(manager)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing_owner", [False, True])
+def test_v2_builder_rejects_unresolved_virtual_layer_heads(missing_owner: bool) -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(256,))
+    manager.impl.layer_grouping = ((0,),)
+    manager.get_disagg_global_layer_ids = lambda _: [20]
+    manager._layer_attn_to_layer_id = {} if missing_owner else {(20, AttentionKind.PRIMARY): 0}
+    manager.layer_offsets = {}
+
+    with pytest.raises(ValueError, match="Cannot resolve KV-head count for internal layer 0"):
         build_page_table_from_manager(manager)
 
 
@@ -787,12 +917,15 @@ def test_v2_builder_describes_recurrent_life_cycle_from_descriptors():
     )
 
     manager = _make_fake_v2_mamba_manager()
+    manager.num_kv_heads_per_layer = [0, 0, 1]
     page_table = build_page_table_from_manager(manager)
 
     assert len(page_table.layer_groups) == 2
     recurrent, attention = page_table.layer_groups
     assert isinstance(recurrent, MambaLayerGroup)
     assert isinstance(attention, AttentionLayerGroup)
+    assert all(view.num_kv_heads is None for view in recurrent.pool_views)
+    assert attention.pool_views[0].num_kv_heads == 1
     # The recurrent group uses the shared descriptor pool group, not a
     # dedicated tensor-derived one, and keeps V2 layer numbering.
     assert recurrent.pool_group_idx == 0
