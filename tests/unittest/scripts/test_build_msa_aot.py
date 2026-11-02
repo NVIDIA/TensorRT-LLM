@@ -320,7 +320,7 @@ def test_incremental_wheel_drops_previous_fmha_artifacts(tmp_path):
     assert (new / "new.so").read_bytes() == b"new"
 
 
-@pytest.mark.parametrize("link_kind", ["package", "build_root"])
+@pytest.mark.parametrize("link_kind", ["package", "build_root", "shared_root", "shared_ancestor"])
 def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
     from setuptools.command.build_py import build_py
     from setuptools.dist import Distribution
@@ -339,11 +339,27 @@ def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
     if link_kind == "package":
         build.mkdir()
         (build / "fmha_sm100").symlink_to(source, target_is_directory=True)
-    else:
+    elif link_kind == "build_root":
         build.symlink_to(source.parent, target_is_directory=True)
+    else:
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        if link_kind == "shared_ancestor":
+            (shared / "build").mkdir()
+            link = tmp_path / "indirect"
+            link.symlink_to(shared, target_is_directory=True)
+            build = link / "build"
+            shared = shared / "build"
+        else:
+            build.symlink_to(shared, target_is_directory=True)
+        other = shared / "fmha_sm100/_aot/hash/kernel.so"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"shared")
     command_instance = namespace["MsaBuildPy"](Distribution())
     command_instance.build_lib = str(build)
     command_instance.package_dir = {"fmha_sm100": str(source)}
     with pytest.raises(RuntimeError, match="symlink|source"):
         command_instance.run()
     assert artifact.read_bytes() == b"keep"
+    if link_kind.startswith("shared"):
+        assert other.read_bytes() == b"shared"

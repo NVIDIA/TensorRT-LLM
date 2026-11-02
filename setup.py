@@ -31,11 +31,13 @@ class MsaBuildPy(build_py):
         import shutil
 
         package_dir = Path(self.build_lib) / "fmha_sm100"
-        if package_dir.is_symlink():
-            raise RuntimeError(f"Refusing to clean FMHA artifacts through symlink: {package_dir}")
-        if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
-            raise RuntimeError(f"Refusing to clean FMHA source directory: {package_dir}")
         target = package_dir / "_aot"
+        if target.exists() or target.is_symlink():
+            for directory in (package_dir, *package_dir.parents):
+                if directory.is_symlink():
+                    raise RuntimeError(f"Refusing to clean FMHA artifacts through symlink: {directory}")
+            if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
+                raise RuntimeError(f"Refusing to clean FMHA source directory: {package_dir}")
         if target.is_symlink() or target.is_file():
             target.unlink()
         elif target.is_dir():
