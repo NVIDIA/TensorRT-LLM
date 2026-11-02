@@ -148,7 +148,15 @@ def _overlay_retained_rows_kernel(
         tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
         return
     _copy_rows(
-        kv_cache_ptr, slot, scratch_ptr, scratch_row, valid, scale_ptr, APPLY_SCALE, ROW_WIDTH, BLOCK_W
+        kv_cache_ptr,
+        slot,
+        scratch_ptr,
+        scratch_row,
+        valid,
+        scale_ptr,
+        APPLY_SCALE,
+        ROW_WIDTH,
+        BLOCK_W,
     )
 
 
