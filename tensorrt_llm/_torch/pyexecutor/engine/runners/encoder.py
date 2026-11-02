@@ -58,7 +58,7 @@ from ..cuda_graph import (
 from ..input_buffers import InputBuffers
 from ..metadata import build_attention_metadata
 from ..model_call import ModelCaller
-from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerConfig
+from .interface import ModelRunner, PackedInputs, PreparedInputs, RunnerConfig
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -562,7 +562,7 @@ class EncoderMixin:
         self._encoder_cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
 
 
-class EncoderRunner(EncoderMixin, PackedModelRunner):
+class EncoderRunner(EncoderMixin, ModelRunner):
     """Run the direct EncodeOnly model contract.
 
     This runner deliberately knows nothing about ``LlmRequest``, decoder
@@ -1121,7 +1121,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self._model.extra_attrs)
-    def forward(
+    def forward_packed(
         self,
         inputs: PackedInputs,
     ) -> dict[str, Any]:
