@@ -1974,6 +1974,8 @@ def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
     assert loudest[0] < amplitude_bound, f"Linear output amplitude {loudest[0]:.3e} at {loudest[1]}"
     assert torch.isfinite(video).all() and torch.isfinite(audio).all()
     assert video.abs().max() < amplitude_bound and audio.abs().max() < amplitude_bound
+
+
 @pytest.mark.parametrize(
     "backend,capability,expected",
     [

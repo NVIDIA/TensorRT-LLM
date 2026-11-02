@@ -383,7 +383,11 @@ class MiniMaxH3Attention(Attention):
         # backend) also casts to e4m3 before the push, so the all-to-all carries 1-byte codes
         # viewed as bf16 and the receiver views them back (recv_view_dtype).
         pair = None
-        if _l8_norm_rope_tensor is not None and rotary_emb is not None and _l8_fusion_mode() != "off":
+        if (
+            _l8_norm_rope_tensor is not None
+            and rotary_emb is not None
+            and _l8_fusion_mode() != "off"
+        ):
             backend = getattr(self.attn, "inner_backend", self.attn)
             pair = "bf16"
             if (
@@ -406,7 +410,9 @@ class MiniMaxH3Attention(Attention):
                 lengths = key_padding_mask.sum(dim=1) - rank * sequence_length
                 valid_len = lengths.clamp(0, sequence_length).to(torch.int32).contiguous()
 
-        def project(linear: Linear, heads: int, norm: Optional[RMSNorm], index: int) -> torch.Tensor:
+        def project(
+            linear: Linear, heads: int, norm: Optional[RMSNorm], index: int
+        ) -> torch.Tensor:
             states = linear(hidden_states).view(batch_size, sequence_length, heads, head_dim)
             weight = norm.weight if norm is not None else None
             if pair == "fp8":

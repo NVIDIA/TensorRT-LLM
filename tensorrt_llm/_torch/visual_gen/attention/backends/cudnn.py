@@ -49,12 +49,12 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-# Lever 19 study switch (§657 box 46): write the padded-prefix attention output in place.
-_PREFIX_INPLACE = os.environ.get("H3_CUDNN_PREFIX_INPLACE", "0") == "1"
-
 from ....attention.backends.interface import PredefinedAttentionMask
 from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
+
+# Opt-in: write the padded-prefix attention output in place instead of pad + cat.
+_PREFIX_INPLACE = os.environ.get("H3_CUDNN_PREFIX_INPLACE", "0") == "1"
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -921,7 +921,9 @@ class CuDNNAttention(AttentionBackend):
                 or out.stride()[1:] != (h_q * d_v, d_v, 1)
                 or (b > 1 and out.stride(0) != s_q * h_q * d_v)
             ):
-                raise ValueError("cuDNN attention: `out` must be a packed NHD view of the problem shape.")
+                raise ValueError(
+                    "cuDNN attention: `out` must be a packed NHD view of the problem shape."
+                )
             output = out
         tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
         tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
@@ -992,7 +994,9 @@ class CuDNNAttention(AttentionBackend):
             # prefix straight into it and only the padding rows are zero-filled, instead of a
             # full-size zero-fill (F.pad) plus a full copy (torch.cat) per layer. Same cuDNN
             # plan (the problem shape and strides are unchanged), so the values are identical.
-            output = q.new_empty((len(lengths), seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype())
+            output = q.new_empty(
+                (len(lengths), seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype()
+            )
             for batch_idx, length in enumerate(lengths):
                 if length < seq_len:
                     output[batch_idx, length:].zero_()
