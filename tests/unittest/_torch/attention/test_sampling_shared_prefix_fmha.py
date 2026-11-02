@@ -1269,17 +1269,24 @@ def _fused_spec_case(
     )  # fmt: skip
 
 
-def _make_ctx(case, num_heads, head_dim, q_len):
-    """Context-kernel prefix tables of a fused-spec case (skips when the kernel is unavailable)."""
+def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
+    """Prefix-kernel tables of a fused-spec case (skips when the kernel is unavailable): the TRTLLM-Gen
+    context kernel (``ctx``) or FlashAttention-4 (``fa4``)."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix import _ctx_tables
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         CtxPrefix,
+        Fa4Prefix,
         ctx_prefix_supported,
+        fa4_prefix_supported,
     )
 
-    if not ctx_prefix_supported(head_dim, torch.bfloat16):
+    if kind == "fa4":
+        if not fa4_prefix_supported(head_dim, torch.bfloat16):
+            pytest.skip("FlashAttention-4 prefix needs SM90")
+        CtxPrefix = Fa4Prefix  # noqa: N806
+    elif not ctx_prefix_supported(head_dim, torch.bfloat16):
         pytest.skip("TRTLLM-Gen context kernel needs SM100/SM103")
     t = case["tables"]
     groups = case["groups"] + 1
@@ -1398,7 +1405,12 @@ def test_fused_spec_attention_matches_dense_and_writes_kv(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,prefix_kernel",
-    [(28, 4, 128, 2, "triton"), (28, 4, 128, 2, "ctx")],
+    [
+        (28, 4, 128, 2, "triton"),
+        (28, 4, 128, 2, "ctx"),
+        (28, 4, 128, 4, "fa4"),
+        (28, 4, 128, 9, "fa4"),
+    ],
 )
 def test_fused_attention_with_massive_activations(
     num_heads, num_kv_heads, head_dim, q_len, prefix_kernel
@@ -1419,7 +1431,11 @@ def test_fused_attention_with_massive_activations(
         pool = case["pool"]
         out = torch.empty_like(case["q"])
         ws = FusedWorkspace(case["ntok"], num_heads, head_dim, 3, device)
-        ctx = _make_ctx(case, num_heads, head_dim, q_len) if prefix_kernel == "ctx" else None
+        ctx = (
+            _make_ctx(case, num_heads, head_dim, q_len, kind=prefix_kernel)
+            if prefix_kernel != "triton"
+            else None
+        )
         _run_fused_spec(
             case, num_heads, head_dim, q_len, pool, case["q"], case["k"], case["v"], out, ws,
             ctx=ctx,
@@ -1432,6 +1448,51 @@ def test_fused_attention_with_massive_activations(
         assert (
             float((err / head_max.clamp(min=1e-3)).max()) < 2.5e-2
         )  # ~1 bf16 ulp of the head's largest value (the context kernel rounds its output once more)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
+    [
+        (28, 4, 128, 4, True, 2, True),
+        (28, 4, 128, 9, True, 2, True),
+        (20, 20, 128, 4, False, 0, False),
+    ],
+)
+def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
+    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot
+):
+    """The FlashAttention-4 prefix (SM90) + Triton tail + merge against the float64 reference, and the
+    step's K/V written at cached + j."""
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
+        FusedWorkspace,
+    )
+
+    device = torch.device("cuda")
+    for seed in range(2):
+        case = _fused_spec_case(
+            num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, seed, overshoot
+        )
+        ctx = _make_ctx(case, num_heads, head_dim, q_len, kind="fa4")
+        pool = case["pool"]
+        before = pool.clone()
+        out = torch.empty_like(case["q"])
+        ws = FusedWorkspace(case["ntok"], num_heads, head_dim, 3, device)
+        _run_fused_spec(
+            case, num_heads, head_dim, q_len, pool, case["q"], case["k"], case["v"], out, ws, ctx=ctx,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        err = (out.double() - case["ref"]).abs().amax() / case["ref"].abs().amax()
+        assert float(err) < 2e-2, f"seed {seed}: rel err {float(err)}"
+        expect = before.clone()
+        for i in range(case["rows"]):
+            b = int(case["tables"]["perm"][i])
+            for j in range(q_len):
+                pos = case["cached"][i] + j
+                page = case["own"][i][pos // case["tpb"]]
+                expect[page, 0, :, pos % case["tpb"]] = case["k"][b * q_len + j]
+                expect[page, 1, :, pos % case["tpb"]] = case["v"][b * q_len + j]
+        assert torch.equal(pool, expect)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

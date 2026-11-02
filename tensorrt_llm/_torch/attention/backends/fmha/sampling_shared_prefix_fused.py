@@ -550,10 +550,10 @@ class CtxPrefix:
         self.cum_kv = torch.zeros((num_requests + 1,), dtype=torch.int32, device=device)
         self.workspace = _ctx_workspace(device)
 
-    @staticmethod
-    def num_requests_for(num_groups: int, tokens: int, q_len: int) -> int:
+    @classmethod
+    def num_requests_for(cls, num_groups: int, tokens: int, q_len: int) -> int:
         """Upper bound of the (group, chunk) requests of a batch of ``tokens`` query tokens."""
-        chunk = max(q_len, CtxPrefix.MAX_CHUNK_QUERIES // q_len * q_len)
+        chunk = max(q_len, cls.MAX_CHUNK_QUERIES // q_len * q_len)
         return num_groups + tokens // chunk + 1
 
     def table_arrays(self):
@@ -582,6 +582,56 @@ class CtxPrefix:
             lse=self.lse,
             return_lse=True,
         )
+
+
+class Fa4Prefix(CtxPrefix):
+    """Shared-prefix attention through FlashAttention-4 (CuTe DSL) on SM90, non-causal.
+
+    The same request tables as ``CtxPrefix`` (a group cut into chunks of query tokens, each
+    a request over the group's shared pages) drive FA4's varlen paged forward. FA4 sizes its
+    grid by the request count times ``max_seqlen_q``, so chunks stay small: a chunk is at most
+    ``MAX_CHUNK_QUERIES`` query tokens. FA4's natural-log LSE is converted to the base-2 LSE
+    the merge kernel takes.
+    """
+
+    MAX_CHUNK_QUERIES = 128
+    TILE_MN = (128, 128)
+    NUM_THREADS = 384
+
+    def run(self, pool: torch.Tensor, sm_scale: float) -> None:
+        from .flash_attn4_generation import _fa4_forward
+
+        fwd = _fa4_forward()
+        _, lse = fwd(
+            self.q,
+            pool[:, 0].transpose(1, 2),
+            pool[:, 1].transpose(1, 2),
+            cu_seqlens_q=self.cum_q,
+            max_seqlen_q=self.chunk_tokens,
+            seqused_k=self.seq_lens,
+            page_table=self.block_tables,
+            softmax_scale=sm_scale,
+            causal=False,
+            tile_mn=self.TILE_MN,
+            num_threads=self.NUM_THREADS,
+            num_splits=1,
+            pack_gqa=None,
+            out=self.out,
+            return_lse=True,
+        )[:2]
+        # [heads, tokens] natural log -> [tokens, heads] base 2.
+        torch.mul(lse.transpose(0, 1), 1.4426950408889634, out=self.lse)
+
+
+def fa4_prefix_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
+    """Whether FlashAttention-4 can serve the prefix (SM90, bf16/fp16, d64/d128)."""
+    if dtype not in (torch.bfloat16, torch.float16) or head_dim not in (64, 128):
+        return False
+    if torch.cuda.get_device_capability(device) != (9, 0):
+        return False
+    from .flash_attn4_generation import _fa4_forward
+
+    return _fa4_forward() is not None
 
 
 _ctx_workspaces: dict = {}
