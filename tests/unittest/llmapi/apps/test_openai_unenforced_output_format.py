@@ -351,6 +351,7 @@ def test_harmony_responses_format_is_served_and_warned_about(served, format_warn
     assert params.guided_decoding.json is None
     tag = json.loads(params.guided_decoding.structural_tag)
     (final_channel,) = tag["format"]["tags"]
+    assert final_channel["begin"] == "<|start|>assistant<|channel|>final<|message|>"
     assert final_channel["content"]["json_schema"] == SCHEMA
     (warning,) = format_warnings()
     assert warning.startswith("Responses API: 'text.format'")
