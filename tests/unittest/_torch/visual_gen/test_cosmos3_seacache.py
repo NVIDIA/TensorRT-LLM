@@ -24,7 +24,12 @@ from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm.visual_gen.args import SeaCacheConfig, TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import (
+    CompilationConfig,
+    SeaCacheConfig,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 
 pytestmark = [
     pytest.mark.cosmos3,
@@ -50,8 +55,7 @@ class _InjectedFailure(RuntimeError):
     pass
 
 
-@pytest.fixture(scope="module")
-def seacache_pipeline() -> Generator:
+def _load_pipeline(compile_enabled: bool) -> Generator:
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     checkpoint = get_checkpoint("Cosmos3-Nano")
@@ -59,14 +63,28 @@ def seacache_pipeline() -> Generator:
         monkeypatch.delenv(TRTLLM_USE_DIFFUSER_VAE_ENV, raising=False)
         args = VisualGenArgs(
             model=checkpoint,
-            torch_compile_config=TorchCompileConfig(enable=False),
+            torch_compile_config=TorchCompileConfig(enable=compile_enabled),
+            compilation_config=CompilationConfig(
+                resolutions=[(HEIGHT, WIDTH)], num_frames=[NUM_FRAMES]
+            ),
             cache_config=SEACACHE,
         )
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load(skip_warmup=not compile_enabled)
         yield pipeline
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
+
+
+# Class-scoped so the eager and compiled pipelines are never resident at the same time.
+@pytest.fixture(scope="class")
+def seacache_pipeline() -> Generator:
+    yield from _load_pipeline(compile_enabled=False)
+
+
+@pytest.fixture(scope="class")
+def compiled_seacache_pipeline() -> Generator:
+    yield from _load_pipeline(compile_enabled=True)
 
 
 def _generate(pipeline, *, image=None, num_frames=NUM_FRAMES):
@@ -100,34 +118,11 @@ def _assert_tensors_released(pipeline) -> None:
     assert state.previous_indicator is None
 
 
-def test_requests_are_isolated(seacache_pipeline) -> None:
-    """Each request starts from a clean cache: a T2V request repeated after an I2V
-    request and an uncached single-frame request reproduces the first one exactly
-    and skips the same steps."""
-    first = _generate(seacache_pipeline)
-    first_cached = _cached_steps(seacache_pipeline)
-    image = PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
-    i2v = _generate(seacache_pipeline, image=image)
-    i2v_cached = _cached_steps(seacache_pipeline)
-    single_frame = _generate(seacache_pipeline, num_frames=1)
-    single_frame_cached = _cached_steps(seacache_pipeline)
-    again = _generate(seacache_pipeline)
-
-    _assert_video(first.video)
-    _assert_video(i2v.video)
-    _assert_tensors_released(seacache_pipeline)
-    assert first_cached == EXPECTED_CACHED_STEPS
-    assert i2v_cached == EXPECTED_CACHED_STEPS
-    assert single_frame.video.shape[1] == 1
-    assert single_frame_cached == []
-    assert _cached_steps(seacache_pipeline) == EXPECTED_CACHED_STEPS
-    assert torch.equal(first.video, again.video)
-
-
-def test_failed_request_does_not_leak_state(seacache_pipeline, monkeypatch) -> None:
-    """A request that fails part-way through denoising leaves no cache state behind."""
-    reference = _generate(seacache_pipeline)
-    accelerator = seacache_pipeline.cache_accelerator
+def _check_failed_request_recovers(pipeline, monkeypatch) -> None:
+    """A request that fails part-way through denoising leaves no cache state behind, and
+    the next request reproduces a successful reference exactly."""
+    reference = _generate(pipeline)
+    accelerator = pipeline.cache_accelerator
     controller = accelerator._controller
     original_step = controller.step
     attempted = []
@@ -140,7 +135,7 @@ def test_failed_request_does_not_leak_state(seacache_pipeline, monkeypatch) -> N
 
     monkeypatch.setattr(controller, "step", failing_step)
     with pytest.raises(_InjectedFailure):
-        _generate(seacache_pipeline)
+        _generate(pipeline)
     monkeypatch.undo()
 
     # Checked before any further request, which would overwrite this state anyway.
@@ -148,8 +143,48 @@ def test_failed_request_does_not_leak_state(seacache_pipeline, monkeypatch) -> N
     assert accelerator._step is None
     assert accelerator._last_run_step is None
     assert accelerator._call_latents is None
-    _assert_tensors_released(seacache_pipeline)
+    _assert_tensors_released(pipeline)
 
-    after = _generate(seacache_pipeline)
-    assert _cached_steps(seacache_pipeline) == EXPECTED_CACHED_STEPS
+    after = _generate(pipeline)
+    assert _cached_steps(pipeline) == EXPECTED_CACHED_STEPS
     assert torch.equal(reference.video, after.video)
+
+
+class TestEager:
+    def test_requests_are_isolated(self, seacache_pipeline) -> None:
+        """Each request starts from a clean cache: a T2V request repeated after an I2V
+        request and an uncached single-frame request reproduces the first one exactly
+        and skips the same steps."""
+        first = _generate(seacache_pipeline)
+        first_cached = _cached_steps(seacache_pipeline)
+        image = PIL.Image.new("RGB", (WIDTH, HEIGHT), color=(64, 128, 192))
+        i2v = _generate(seacache_pipeline, image=image)
+        i2v_cached = _cached_steps(seacache_pipeline)
+        single_frame = _generate(seacache_pipeline, num_frames=1)
+        single_frame_cached = _cached_steps(seacache_pipeline)
+        again = _generate(seacache_pipeline)
+
+        _assert_video(first.video)
+        _assert_video(i2v.video)
+        _assert_tensors_released(seacache_pipeline)
+        assert first_cached == EXPECTED_CACHED_STEPS
+        assert i2v_cached == EXPECTED_CACHED_STEPS
+        assert single_frame.video.shape[1] == 1
+        assert single_frame_cached == []
+        assert _cached_steps(seacache_pipeline) == EXPECTED_CACHED_STEPS
+        assert torch.equal(first.video, again.video)
+
+    def test_failed_request_does_not_leak_state(self, seacache_pipeline, monkeypatch) -> None:
+        _check_failed_request_recovers(seacache_pipeline, monkeypatch)
+
+
+class TestCompiled:
+    def test_failed_request_does_not_leak_state(
+        self, compiled_seacache_pipeline, monkeypatch
+    ) -> None:
+        """Same recovery check with torch.compile on: the computed steps run the
+        compiled generator blocks that SeaCache wraps."""
+        blocks = compiled_seacache_pipeline.transformer.gen_layers
+        assert all(isinstance(b, torch._dynamo.eval_frame.OptimizedModule) for b in blocks)
+        _check_failed_request_recovers(compiled_seacache_pipeline, monkeypatch)
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > 0
