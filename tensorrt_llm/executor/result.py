@@ -1185,6 +1185,12 @@ class GenerationResult(GenerationResultBase):
             postproc_params=generation_request.postproc_params,
         )
         self._generation_request = generation_request
+        if self.postproc_params is not None:
+            args = self.postproc_params.postproc_args
+            if args is not None and args.num_prompt_tokens is None:
+                # Postprocessing records carry the prompt count, not its tokens.
+                args.num_prompt_tokens = len(
+                    generation_request.prompt_token_ids)
         self._streaming = generation_request.streaming
         self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation

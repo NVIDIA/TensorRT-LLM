@@ -21,7 +21,9 @@ request instead of reporting a stop. CPU-only: the engine's stop-word rule is
 exercised through its host-side reference, ``meet_stop_token_criteria``.
 """
 
-from types import SimpleNamespace
+from copy import deepcopy
+from types import MethodType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -401,3 +403,92 @@ def test_length_limited_run_counts_only_generated_tokens(
         assert result._outputs[0].finish_reason == "length"
         assert result._outputs[0].token_ids == returned
         assert result.error is None
+
+
+@pytest.mark.parametrize("executor_kind", ["worker", "proxy"])
+@pytest.mark.parametrize("generated_count", [1, 20])
+def test_direct_submit_populates_prompt_count_for_postprocessing(
+    executor_kind: str, generated_count: int
+) -> None:
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+    prompt = [PAD] * 19
+    params = SamplingParams(
+        end_id=END_ID, max_tokens=generated_count, exclude_input_from_output=False
+    )
+    params._set_degenerate_token_runs([PAD], 20)
+    request = GenerationRequest(
+        prompt_token_ids=prompt,
+        sampling_params=params,
+        postproc_params=PostprocParams(postproc_args=PostprocArgs()),
+    )
+    executor = MagicMock(
+        rank=0,
+        _results={},
+        _client_id_to_request_id={},
+        _engine_dead=False,
+        _fatal_error=None,
+    )
+    executor._handle_background_error = MethodType(lambda self: None, executor)
+    executor._get_next_client_id.return_value = 11
+    executor._get_logprob_params.return_value = None
+    records = []
+
+    def dispatch(submitted: GenerationRequest) -> int:
+        records.append(
+            PostprocWorker.default_record_creator(
+                PostprocWorker.Input(
+                    rsp=SimpleNamespace(client_id=submitted.id),
+                    sampling_params=submitted.sampling_params,
+                    postproc_params=deepcopy(submitted.postproc_params),
+                    streaming=False,
+                ),
+                tokenizer=None,
+            )
+        )
+        return 42
+
+    executor._enqueue_request.side_effect = dispatch
+    executor._send_request.side_effect = dispatch
+    executor_class = BaseWorker if executor_kind == "worker" else GenerationExecutorProxy
+    executor_class.submit(executor, request)
+    (record,) = records
+    record._done = True
+    returned = prompt + [PAD] * generated_count
+    if generated_count == 20:
+        with pytest.raises(RequestError, match="degenerate"):
+            _finish(record, returned, tllm.FinishReason.LENGTH)
+    else:
+        _finish(record, returned, tllm.FinishReason.LENGTH)
+        assert record._outputs[0].finish_reason == "length"
+        assert record._outputs[0].token_ids == returned
+        assert record.error is None
+    assert record.postproc_params.postproc_args.num_prompt_tokens == len(prompt)
+
+
+@pytest.mark.parametrize("num_prompt_tokens", [0, 7])
+def test_direct_result_preserves_explicit_prompt_count(num_prompt_tokens: int) -> None:
+    request = GenerationRequest(
+        prompt_token_ids=list(PROMPT),
+        sampling_params=_params(),
+        postproc_params=PostprocParams(
+            postproc_args=PostprocArgs(num_prompt_tokens=num_prompt_tokens)
+        ),
+    ).set_id(11)
+    result = GenerationResult(request)
+    assert result.postproc_params.postproc_args.num_prompt_tokens == num_prompt_tokens
+
+
+def test_generate_async_still_sets_prompt_count() -> None:
+    from tensorrt_llm.executor.executor import GenerationExecutor
+
+    executor = MagicMock()
+    executor.submit.side_effect = lambda request: GenerationResult(request.set_id(11))
+    result = GenerationExecutor.generate_async(
+        executor,
+        prompt_token_ids=list(PROMPT),
+        sampling_params=_params(),
+        postproc_params=PostprocParams(postproc_args=PostprocArgs(num_prompt_tokens=1)),
+    )
+    assert result.postproc_params.postproc_args.num_prompt_tokens == len(PROMPT)
