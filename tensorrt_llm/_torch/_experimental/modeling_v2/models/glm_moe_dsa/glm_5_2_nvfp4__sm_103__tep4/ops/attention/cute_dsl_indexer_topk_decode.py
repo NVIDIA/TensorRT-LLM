@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -24,13 +26,23 @@ def build(
     `ValueError` when `max_columns <= top_k` or `top_k != 2048`: the kernel is
     built for rows longer than top-k only. One compile of a few seconds plus a
     `[next_n, max_columns]` fp32 scratch launch; cached per process.
+
+    Above `CLUSTER_MIN_COLUMNS` columns the handle also carries the cluster-split
+    launchers (a long row split across a cluster of CTAs), compiled and launched
+    here too; `TRTLLM_GLM52_DEC_TOPK_CLUSTER=0` keeps the one-CTA kernel only.
     """
     return _kernel.warmup_indexer_topk_decode(
         max_num_columns=int(max_columns),
         top_k=int(top_k),
         next_n=int(next_n),
         device_id=int(device_id),
+        cluster=os.environ.get("TRTLLM_GLM52_DEC_TOPK_CLUSTER", "1") != "0",
     )
+
+
+def uses_cluster(compiled: CompiledIndexerTopkDecode, rows: int) -> bool:
+    """Whether a call with `rows` logits rows launches the cluster-split kernel."""
+    return compiled.launcher_for(rows)[0] > 1
 
 
 def _ordered_key(values: torch.Tensor) -> torch.Tensor:
@@ -145,6 +157,11 @@ class CuteDslIndexerTopkDecode(OpWrapper):
             why="MTP5 at 5 sequences: contexts at and below top-k, rows with no key, ends "
             "straddling top-k inside one sequence",
             spec=dict(next_n=6, max_columns=8192, seq_lens=[1, 6, 700, 2051, 2053], width=8192),
+        ),
+        Cell(
+            why="MTP5 at 2 sequences, 160K and 64K contexts on a 172032-column engine: the "
+            "cluster split",
+            spec=dict(next_n=6, max_columns=172032, seq_lens=[163840, 65536], width=172032),
         ),
         Cell(
             why="tie groups of thousands past column 32768: the refine's column digits",

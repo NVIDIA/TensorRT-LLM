@@ -115,6 +115,13 @@ def _md(seq_lens: torch.Tensor):
     )
 
 
+class _Ours(str):
+    """A stand-in decode top-k handle: compares as its name, and takes the one-CTA launcher."""
+
+    def launcher_for(self, rows: int):
+        return 1, None
+
+
 def _core(width: int, gvr, built=()):
     """A core with only what `_indexer_decode` reads."""
     core = object.__new__(M.GlmMoeDsaTep4ModelingV2)
@@ -124,7 +131,7 @@ def _core(width: int, gvr, built=()):
     # Not `Module.__init__`-ed, so a `TopK` cannot be registered as a submodule: set it plainly.
     object.__setattr__(core, "_dec_topk_gvr", gvr)
     core._dec_topk_gvr_live = gvr is not None
-    core._ix_topk_dec_compiled = {n: f"ours{n}" for n in built}
+    core._ix_topk_dec_compiled = {n: _Ours(f"ours{n}") for n in built}
     return core
 
 

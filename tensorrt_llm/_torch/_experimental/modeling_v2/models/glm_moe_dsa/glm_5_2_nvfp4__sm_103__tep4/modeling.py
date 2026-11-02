@@ -92,6 +92,7 @@ from .ops.attention.cute_dsl_indexer_q_side_k_cache import build as build_ix_qk
 from .ops.attention.cute_dsl_indexer_q_side_k_cache import cute_dsl_indexer_q_side_k_cache
 from .ops.attention.cute_dsl_indexer_topk_decode import build as build_ix_topk_decode
 from .ops.attention.cute_dsl_indexer_topk_decode import cute_dsl_indexer_topk_decode
+from .ops.attention.cute_dsl_indexer_topk_decode import uses_cluster as ix_topk_decode_uses_cluster
 from .ops.attention.cute_dsl_indexer_topk_prefill import build as build_ix_topk_prefill
 from .ops.attention.cute_dsl_indexer_topk_prefill import cute_dsl_indexer_topk_prefill
 from .ops.attention.cute_dsl_mha_kv_gather_mxf8 import cute_dsl_mha_kv_gather_mxf8
@@ -3294,6 +3295,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 radix_aux_indices=md.radix_aux_indices, radix_aux_logits=md.radix_aux_logits,
             )  # fmt: skip
         else:
+            # `seqs * gen_p` logits rows on both scorer paths (the atom split reshapes rows only).
+            self._count("ix_topk_dec_cluster", ix_topk_decode_uses_cluster(compiled, seqs * gen_p))
             cute_dsl_indexer_topk_decode(
                 logits, kv_lens, topk_buf, top_k=self.idx_topk, next_n=gen_p, compiled=compiled
             )
