@@ -140,9 +140,6 @@ python -m pytest tests
 pre-commit run -a
 ```
 
-Live Claude context-budget checks require local account configuration and are
-opt-in: `python -m pytest tests --run-live-backends -m live_backend`.
-
 ## Workflows
 
 Ready-to-run multi-agent workflows ship as subpackages of
