@@ -420,6 +420,13 @@ class TestKimiGenericThinkingKwargs:
             ({"enable_thinking": True, "reasoning_effort": "none"}, {"thinking": True}),
             # Only a bool is a thinking setting.
             ({"enable_thinking": "false"}, {}),
+            # "none" turns thinking off even beside a native effort, which is kept.
+            (
+                {"thinking_effort": "high", "reasoning_effort": "none"},
+                {"thinking": False, "thinking_effort": "high"},
+            ),
+            # A native effort wins over the generic one.
+            ({"thinking_effort": "low", "reasoning_effort": "max"}, {"thinking_effort": "low"}),
         ],
         ids=[
             "thinking_off",
@@ -433,6 +440,8 @@ class TestKimiGenericThinkingKwargs:
             "no_effort_when_off",
             "none_keeps_thinking_on",
             "non_bool_thinking",
+            "none_beside_native_effort",
+            "native_effort_wins",
         ],
     )
     def test_generic_kwargs_map_to_the_k3_kwargs(self, generic: dict, expected: dict) -> None:

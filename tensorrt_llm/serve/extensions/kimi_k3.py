@@ -76,22 +76,18 @@ def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
 def _derive_from_reasoning_effort(kwargs: dict[str, Any], effort: object) -> None:
     """Derive the K3 ``thinking`` / ``thinking_effort`` kwargs from a reasoning effort.
 
-    A no-op when ``kwargs`` already sets an effort or turns thinking off.
-    Otherwise ``"none"`` turns thinking off unless ``kwargs`` sets it,
-    ``"low"``, ``"high"`` and ``"max"`` set the effort, and other values (e.g.
-    harmony's ``"medium"``) have no K3 equivalent and leave the template default.
+    A no-op when ``kwargs`` turns thinking off. Otherwise ``"none"`` turns
+    thinking off unless ``kwargs`` sets it, ``"low"``, ``"high"`` and ``"max"``
+    set the effort unless ``kwargs`` sets one, and other values (e.g. harmony's
+    ``"medium"``) have no K3 equivalent and leave the template default.
     """
-    if (
-        not isinstance(effort, str)
-        or "thinking_effort" in kwargs
-        or kwargs.get("thinking") is False
-    ):
+    if not isinstance(effort, str) or kwargs.get("thinking") is False:
         return
     effort = effort.lower()
     if effort == "none":
         kwargs.setdefault("thinking", False)
     elif effort in ("low", "high", "max"):
-        kwargs["thinking_effort"] = effort
+        kwargs.setdefault("thinking_effort", effort)
 
 
 def dynamic_tool_dicts(messages: Optional[List[ChatCompletionMessageParam]]) -> list[dict]:
