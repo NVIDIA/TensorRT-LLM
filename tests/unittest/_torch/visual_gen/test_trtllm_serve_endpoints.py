@@ -1653,6 +1653,91 @@ class TestImageEdit:
             "await handle.aresult(), as openai_image_generation does."
         )
 
+    @pytest.mark.threadleak(enabled=False)  # the gated result waits on a worker thread
+    @pytest.mark.asyncio
+    async def test_image_edit_waits_for_its_result_without_blocking_the_event_loop(
+        self, tmp_path, monkeypatch
+    ):
+        """While an edit waits for its result, the loop still answers other requests.
+
+        Submission returns at once here, and the handle resolves only after
+        ``/health`` has been answered. A handler that waits with the blocking
+        ``handle.result()`` (or ``generate()``) on the loop holds the loop
+        until that wait gives up, so ``/health`` is answered only afterwards.
+        """
+        gen = self._generator()
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        waiting = threading.Event()
+        health_answered = threading.Event()
+        resolved = threading.Event()
+        original = gen.generate_async
+
+        class _GatedResult:
+            """Result handle whose generation finishes once ``/health`` has answered."""
+
+            def __init__(self, inner: MockVisualGenResult):
+                self.request_id = inner.request_id
+                self._inner = inner
+
+            def __await__(self):
+                return self.aresult().__await__()
+
+            async def aresult(self, timeout=None) -> VisualGenOutput:
+                waiting.set()
+                try:
+                    await asyncio.to_thread(health_answered.wait, 5)
+                    return await self._inner.aresult()
+                finally:
+                    resolved.set()
+
+            def result(self, timeout=None) -> VisualGenOutput:
+                waiting.set()
+                try:
+                    # Self-releases so a handler that blocks the loop here
+                    # cannot hang the test.
+                    health_answered.wait(5)
+                    return self._inner.result()
+                finally:
+                    resolved.set()
+
+        def _gated_generate_async(inputs=None, params=None) -> _GatedResult:
+            return _GatedResult(original(inputs=inputs, params=params))
+
+        monkeypatch.setattr(gen, "generate_async", _gated_generate_async)
+
+        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
+        try:
+            edit_task = asyncio.create_task(
+                client.post(
+                    "/v1/images/edits",
+                    json={
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                        "response_format": "b64_json",
+                    },
+                )
+            )
+            try:
+                assert await asyncio.to_thread(waiting.wait, 5), (
+                    "the edit request never waited for its generation result"
+                )
+                health = await asyncio.wait_for(client.get("/health"), timeout=5)
+                answered_while_waiting = not resolved.is_set() and not edit_task.done()
+            finally:
+                health_answered.set()  # never leave the result wait blocked
+                resp = await edit_task
+        finally:
+            await client.aclose()
+
+        assert health.status_code == 200
+        assert resp.status_code == 200
+        assert answered_while_waiting, (
+            "GET /health was answered only after the image edit's result "
+            "resolved: openai_image_edit waits for generation on the event "
+            "loop. Await handle.aresult() instead of calling handle.result()."
+        )
+
 
 # =========================================================================
 # _normalize_image_output helper (NVBug 6064029)
