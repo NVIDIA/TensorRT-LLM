@@ -1052,7 +1052,9 @@ class MNNVLAllReduce(nn.Module):
                     buffer_size_bytes, GemmAllReduceNorm.MAX_ROWS *
                     hidden_size * mapping.tp_size * elem_size)
         workspace = get_or_scale_allreduce_mnnvl_workspace(
-            self.mapping, self.dtype, buffer_size_bytes=buffer_size_bytes,
+            self.mapping,
+            self.dtype,
+            buffer_size_bytes=buffer_size_bytes,
             transport=self.transport)
 
         # Residual RMSNorm fusions of this hidden size may run the CuTe DSL kernels

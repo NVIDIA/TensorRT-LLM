@@ -569,6 +569,21 @@ public:
             mGroupRank, {static_cast<int64_t>(mBuffer->getBufferSize() / sizeof(float))}, at::kFloat, 0);
     }
 
+    //! Return an owning tensor view of a rank's unicast workspace.
+    [[nodiscard]] at::Tensor getUCBuffer(
+        uint32_t rank, std::vector<int64_t> sizes, torch::ScalarType dtype, int64_t storageOffset)
+    {
+        TORCH_CHECK(mBuffer != nullptr, "MnnvlWorkspace::getUCBuffer: workspace is unavailable: ", mReason);
+        return mBuffer->getUCBuffer(rank, std::move(sizes), dtype, storageOffset);
+    }
+
+    //! Return an owning tensor view of the multicast workspace.
+    [[nodiscard]] at::Tensor getMCBuffer(std::vector<int64_t> sizes, torch::ScalarType dtype, int64_t storageOffset)
+    {
+        TORCH_CHECK(mBuffer != nullptr, "MnnvlWorkspace::getMCBuffer: workspace is unavailable: ", mReason);
+        return mBuffer->getMCBuffer(std::move(sizes), dtype, storageOffset);
+    }
+
 private:
     std::string mReason;
     uint32_t mGroupRank{0};

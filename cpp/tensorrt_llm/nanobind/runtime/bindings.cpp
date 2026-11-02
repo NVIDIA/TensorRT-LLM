@@ -234,6 +234,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_available", &tr::MnnvlWorkspace::isAvailable)
         .def_prop_ro("reason", &tr::MnnvlWorkspace::getReason)
         .def("get_local_buffer", &tr::MnnvlWorkspace::getLocalBuffer, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_uc_buffer", &tr::MnnvlWorkspace::getUCBuffer, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_mc_buffer", &tr::MnnvlWorkspace::getMCBuffer, nb::call_guard<nb::gil_scoped_release>())
         .def("get_workspace_size", &tr::MnnvlWorkspace::getWorkspaceSize)
         .def("checkpoint_prepare", &tensorrt_llm::runtime::MnnvlWorkspace::checkpointPrepare,
             "Internal, experimental hook; the caller must establish engine-wide quiescence before invoking it.",

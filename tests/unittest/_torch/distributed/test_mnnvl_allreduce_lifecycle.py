@@ -393,6 +393,7 @@ def test_rms_norm_without_residual_returns_single_tensor(monkeypatch) -> None:
     allreduce.mapping = mapping
     allreduce.dtype = torch.bfloat16
     allreduce.transport = ops_module.MnnvlTransport.POSIX_FD
+    allreduce.fused_norm = None
     workspace = {
         "uc_buffer": torch.zeros(48),
         "buffer_flags": torch.zeros(9, dtype=torch.uint32),
@@ -403,7 +404,8 @@ def test_rms_norm_without_residual_returns_single_tensor(monkeypatch) -> None:
     expected = torch.ones((2, 8), dtype=torch.bfloat16)
     calls = []
 
-    def fusion(*args):
+    def fusion(*args, fp8_payload):
+        assert not fp8_payload
         calls.append(args)
         return [expected]
 
