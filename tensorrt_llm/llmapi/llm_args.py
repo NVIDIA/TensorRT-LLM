@@ -7286,7 +7286,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Mixed-precision KV currently requires single-beam execution "
                 "without cold-page compression.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):
-            raise NotImplementedError(
+            raise ValueError(
                 "Mixed-precision KV does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )
