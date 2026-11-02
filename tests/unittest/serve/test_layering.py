@@ -82,6 +82,20 @@ CONTRACTS = (
             "allowance when its import goes away."
         ),
     ),
+    Contract(
+        name="serve/middleware/ depends on no server, endpoint or Responses module",
+        importers=("tensorrt_llm.serve.middleware",),
+        forbidden=(
+            "tensorrt_llm.serve.api",
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.responses_utils",
+        ),
+        fix=(
+            "Middleware is shared by both apps: pass what it needs into register_middlewares "
+            "from the composition root instead of importing a server or an endpoint package."
+        ),
+    ),
 )
 
 

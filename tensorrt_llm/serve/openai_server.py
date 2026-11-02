@@ -93,6 +93,7 @@ from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
+from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
@@ -114,7 +115,6 @@ from tensorrt_llm.serve.openai_protocol import (
     to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
-                                             PerfMetricsMiddleware,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -131,8 +131,7 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        render_conversation)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
                                                 ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+                                                ResponsesStreamingProcessor)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
@@ -926,13 +925,11 @@ class OpenAIServer(_VideoRoutesMixin):
             self._register_launcher_forwarding_routes()
             self.register_routes()
 
-        if self._collect_perf_metrics:
-            self.app.add_middleware(PerfMetricsMiddleware,
-                                    expose_headers=self._expose_perf_metrics,
-                                    writer=self._perf_metrics_writer,
-                                    adjusted_clock=self._adjusted_steady_clock)
-        self.app.add_middleware(ServerArrivalTimeMiddleware,
-                                adjusted_clock=self._adjusted_steady_clock)
+        register_middlewares(self.app,
+                             collect_perf_metrics=self._collect_perf_metrics,
+                             expose_perf_metrics=self._expose_perf_metrics,
+                             perf_metrics_writer=self._perf_metrics_writer,
+                             adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None

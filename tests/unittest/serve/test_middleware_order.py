@@ -124,7 +124,7 @@ def test_arrival_time_stays_outside_perf_metrics(name, serve_env):
 
 def test_user_middleware_is_outermost(serve_env):
     """``--middleware`` classes are applied after construction, so they end up outermost."""
-    from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
+    from tensorrt_llm.serve.middleware.user_middleware import _apply_fastapi_middlewares
 
     server = serve_env.build_openai_server(AggConfig())
     _apply_fastapi_middlewares(server.app, ["test_common.serve.fakes.UserProbeMiddleware"])
