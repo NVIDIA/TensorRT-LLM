@@ -22418,7 +22418,7 @@ class GvrRegClusKernel:
                             i = tid + cutlass.Int32(z * self.blk)
                             s_mrg[i] = s_mrg[i] + s_hoff[i]
                     cute.arch.barrier()
-                # Split exit barrier (non-hybrid 16-bit): whole rows and ASYNCR rank-path rows
+                # Split exit barrier (16-bit): whole rows and ASYNCR rank-path rows
                 # arrive below and wait at P10. Of these, BF16 push-merge rows that pulled no peer
                 # histogram over DSMEM (lifew = 0) skip the barrier.
                 if cutlass.const_expr(PUSH):
@@ -23199,10 +23199,8 @@ def get_compiled__regclus(
         nbh: Histogram bins, 512 or 1024; FP32 requires 1024.
         quadc: Largest crossing count that rank 0 ranks directly; 1024-bin builds use 96.
             None means 96 for FP32 and 384 for 16-bit.
-        hybrid: 16-bit only: rank and refine 32-bit hybrid keys.
-        oneq_enabled: With ``hybrid``: take the equal-key shortcuts.
         alignbins: 16-bit bits-domain window (one 16-bit code per bin where the K-th is
-            predicted). Needs ``hint_free`` and ``varlen``, not ``hybrid``; BF16 also needs
+            predicted). Needs ``hint_free`` and ``varlen``; BF16 also needs
             VPT >= 2.
         hint_samples: BF16 only: strided bracket samples (32 to 1024); below 1024 needs
             CS >= 16, ``hint_free`` and ``varlen``.
