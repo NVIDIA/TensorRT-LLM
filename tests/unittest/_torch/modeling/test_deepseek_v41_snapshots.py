@@ -17,7 +17,7 @@ from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderCheckpoint, encoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy, _introspection
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy, _introspection
 
 pytestmark = skip_pre_blackwell
 
@@ -72,18 +72,18 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
     with cache_case(config, sparse, dtype, [257], [0], 1, reuse=reuse) as case:
         manager = case[0].kv_cache_manager
         expected_encoder = (
-            AttentionReusePolicy.PRIVATE
+            ReusePolicy.PRIVATE
             if not reuse
-            else AttentionReusePolicy.OPTIONAL
+            else ReusePolicy.OPTIONAL
             if replay
-            else AttentionReusePolicy.REQUIRED
+            else ReusePolicy.REQUIRED
         )
         for layer in manager.impl.init_config.layers:
             owner, _, role = manager._physical_roles[layer.layer_id, layer.buffers[0].role]
             expected = (
-                AttentionReusePolicy.REQUIRED
+                ReusePolicy.REQUIRED
                 if role == CSA2CacheRole.GLOBAL
-                else AttentionReusePolicy.PRIVATE
+                else ReusePolicy.PRIVATE
                 if role == CSA2CacheRole.SWA and owner >= 5
                 else expected_encoder
             )
@@ -99,7 +99,7 @@ def test_snapshot_policy_follows_reuse_and_encoder_recovery(
                 expected_groups = {
                     manager.impl.get_layer_group_id(layer.layer_id)
                     for layer in manager.impl.init_config.layers
-                    if layer.reuse_policy == AttentionReusePolicy.OPTIONAL
+                    if layer.reuse_policy == ReusePolicy.OPTIONAL
                 }
                 assert set(manager._encoder_optional_groups) == expected_groups
             assert (

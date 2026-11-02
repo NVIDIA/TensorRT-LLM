@@ -249,8 +249,8 @@ class DSparkSpecMetadata(SpecMetadata):
             # without this, all concurrent gen requests fall through to the shared
             # scratch row below and corrupt each other's draft window at batch
             # size > 1 (GitHub #16767). Context-prefix entries are left to
-            # ``_seed_context_windows``. CUDA-graph capture dummies and real
-            # generation requests acquire a persistent slot only once; prepare()
+            # ``_seed_context_windows``. Real generation requests acquire a
+            # persistent slot only once; prepare()
             # runs before every replay, so it must never reset a live slot.
             # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
@@ -562,8 +562,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
+            # Both CUDA-graph padding variants, each with K+1 runtime widths,
+            # use ``[CUDA_GRAPH_DUMMY_REQUEST_ID - 2*(K+1) + 1,
+            # CUDA_GRAPH_DUMMY_REQUEST_ID]``, where K is the physical draft cap,
             # while real request ids start at ``max_batch_size`` and grow, so a simple
             # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
             # (0) these dummies must route to the scratch row (see ``prepare()``) and
@@ -571,7 +572,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
             from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = (
+                CUDA_GRAPH_DUMMY_REQUEST_ID - 2 * (self.max_draft_len + 1) + 1
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),

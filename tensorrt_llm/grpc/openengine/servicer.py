@@ -32,6 +32,8 @@ from .coordinator import (
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
+from .metrics import OpenEngineMetrics, RequestMetrics
+from .preparation import _decode_preparation, _prepared_decode_from_request
 from .request_mapping import (
     _load_prepared_input,
     _metadata_from_context,
@@ -88,6 +90,40 @@ class _PreprocessingWork:
         self._release(result)
 
 
+class _PreparationLease:
+    """Retain admission until cancelled executor work actually completes."""
+
+    def __init__(self, admission: asyncio.Semaphore) -> None:
+        self._admission = admission
+        self._pending = 0
+        self._closed = False
+        self._released = False
+
+    def track(self, future: asyncio.Future) -> None:
+        self._pending += 1
+        future.add_done_callback(self._completed)
+
+    def _completed(self, future: asyncio.Future) -> None:
+        if not future.cancelled():
+            future.exception()
+        self._pending -= 1
+        self._release_if_idle()
+
+    def close(self) -> None:
+        self._closed = True
+        self._release_if_idle()
+
+    def _release_if_idle(self) -> None:
+        if self._closed and not self._released and self._pending == 0:
+            self._released = True
+            self._admission.release()
+
+    async def run(self, executor: Executor | None, fn: Callable, *args: Any) -> Any:
+        future = asyncio.get_running_loop().run_in_executor(executor, copy_context().run, fn, *args)
+        self.track(future)
+        return await asyncio.shield(future)
+
+
 class _LocalRequest:
     """Abort-aware local request state spanning mapping and generation."""
 
@@ -96,6 +132,7 @@ class _LocalRequest:
         self.engine_handle: Any = None
         self.aborted = False
         self.preprocessing: _PreprocessingWork | None = None
+        self.decode_preparation: str | None = None
 
     def bind_mapping(self, task: asyncio.Task[Any]) -> None:
         self.mapping_task = task
@@ -131,12 +168,17 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         kv_transfer_backend: str = "",
         frontend: FrontendClient | None = None,
         subagent_affinity_auth_key: str | None = None,
+        metrics: OpenEngineMetrics | None = None,
         input_executor: Executor | None = None,
         media_executor: Executor | None = None,
+        max_media_preparations: int = 4,
     ) -> None:
+        if type(max_media_preparations) is not int or max_media_preparations < 1:
+            raise ValueError("max_media_preparations must be a positive integer")
         self._frontend = frontend
         self._input_executor = input_executor
         self._media_executor = media_executor
+        self._media_admission = asyncio.Semaphore(max_media_preparations)
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
@@ -147,6 +189,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self._media_capabilities = media_capabilities_for_model(llm)
         self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
+        self._metrics = metrics
 
     @property
     def supported_media_modalities(self) -> frozenset[str]:
@@ -211,6 +254,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         local_request = None
         registration = None
         reservation = None
+        request_metrics = RequestMetrics(self._metrics) if self._metrics else None
         try:
             if not request.request_id:
                 await context.abort(
@@ -227,7 +271,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 reservation = await self._frontend.reserve(request.request_id)
                 reservation.bind(local_request)
             async with aclosing(
-                self._generate(request, context, local_request, registration, reservation)
+                self._generate(
+                    request, context, local_request, registration, reservation, request_metrics
+                )
             ) as responses:
                 async for response in responses:
                     yield response
@@ -235,21 +281,44 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.ALREADY_EXISTS, str(error))
         except InvalidRequestIdError as error:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except asyncio.CancelledError as error:
+            if request_metrics is not None:
+                request_metrics.observe_exception(error)
+            raise
         except CoordinationError as error:
+            if request_metrics is not None:
+                request_metrics.observe_exception(error)
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
         finally:
-            if local_request is not None and local_request.preprocessing is not None:
-                local_request.preprocessing.abandon()
-            if registration is not None:
-                registration.release()
-            if reservation is not None:
-                try:
+            try:
+                if local_request is not None and local_request.preprocessing is not None:
+                    local_request.preprocessing.abandon()
+                if registration is not None:
+                    registration.release()
+                if reservation is not None:
                     await asyncio.shield(reservation.release())
-                except CoordinationError as error:
-                    # Cleanup still fails the serving group through FrontendClient.
-                    # Preserve cancellation or an already selected RPC error.
-                    if not context.cancelled() and context.code() in (None, grpc.StatusCode.OK):
-                        await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            except asyncio.CancelledError as error:
+                if request_metrics is not None:
+                    request_metrics.observe_exception(error)
+                raise
+            except CoordinationError as error:
+                # Cleanup still fails the serving group through FrontendClient.
+                # Preserve cancellation or an already selected RPC error.
+                if not context.cancelled() and context.code() in (None, grpc.StatusCode.OK):
+                    if request_metrics is not None:
+                        request_metrics.observe_exception(error)
+                    await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            finally:
+                if request_metrics is not None:
+                    status = context.code()
+                    remaining = context.time_remaining()
+                    if (
+                        status in (None, grpc.StatusCode.OK)
+                        and remaining is not None
+                        and remaining <= 0
+                    ):
+                        status = grpc.StatusCode.DEADLINE_EXCEEDED
+                    request_metrics.finish(status)
 
     async def _generate(
         self,
@@ -258,6 +327,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         local_request: _LocalRequest,
         registration: ActiveRequest,
         reservation: Reservation | None = None,
+        request_metrics: RequestMetrics | None = None,
     ) -> AsyncIterator[generation_pb2.GenerateResponse]:
         """Run a server-streaming OpenEngine generation request."""
         request_id = request.request_id
@@ -280,6 +350,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
             disaggregated_params = disaggregated_params_from_request(request)
+            if request_metrics is not None:
+                request_metrics.begin(disaggregated_params)
             parent_affinity_id = validate_parent_affinity(
                 self.subagent_affinity_auth_key,
                 request,
@@ -329,28 +401,79 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             )
 
             async def prepare_inputs() -> Any:
-                loop = asyncio.get_running_loop()
-                if prepared_input.media:
-                    await loop.run_in_executor(
+                if not prepared_input.media:
+                    return await _load_prepared_input(prepared_input, self._llm)
+                await self._media_admission.acquire()
+                lease = _PreparationLease(self._media_admission)
+                try:
+                    if (
+                        disaggregated_params is not None
+                        and disaggregated_params.request_type == "generation_only"
+                    ):
+                        work = local_request.preprocessing = _PreprocessingWork()
+                        reused = await lease.run(
+                            self._input_executor,
+                            work.run,
+                            partial(_prepared_decode_from_request, request, self._llm),
+                        )
+                        if reused is not None:
+                            return reused
+                    supports_token_id_mm_expansion = getattr(
+                        self._llm.input_processor, "supports_token_id_mm_expansion", False
+                    )
+                    validated_ids = await lease.run(
                         self._input_executor,
-                        copy_context().run,
-                        _validate_media_placeholders,
+                        partial(
+                            _validate_media_placeholders,
+                            add_special_tokens=(
+                                sampling_params.add_special_tokens
+                                and supports_token_id_mm_expansion
+                            ),
+                        ),
                         prepared_input,
                         self._llm,
                     )
-                with BaseMediaIO.use_executor(self._media_executor):
-                    inputs = await _load_prepared_input(prepared_input, self._llm)
-                if prepared_input.media:
+                    with BaseMediaIO.use_executor(self._media_executor, on_submit=lease.track):
+                        inputs = await _load_prepared_input(prepared_input, self._llm)
+                    if (
+                        validated_ids is not None
+                        and isinstance(prepared_input.inputs, str)
+                        and supports_token_id_mm_expansion
+                    ):
+                        inputs.pop("prompt")
+                        inputs["prompt_token_ids"] = validated_ids
                     work = local_request.preprocessing = _PreprocessingWork()
-                    return await loop.run_in_executor(
+
+                    def preprocess() -> Any:
+                        capture_decode_state = getattr(
+                            self._llm.input_processor, "capture_decode_state", None
+                        )
+                        if (
+                            disaggregated_params is not None
+                            and disaggregated_params.request_type == "context_only"
+                            and callable(capture_decode_state)
+                        ):
+                            with capture_decode_state() as capture:
+                                result = self._llm.preprocess(
+                                    inputs, sampling_params, disaggregated_params
+                                )
+                            try:
+                                local_request.decode_preparation = _decode_preparation(
+                                    request, self._llm, capture, result
+                                )
+                            except Exception:
+                                _PreprocessingWork._release(result)
+                                raise
+                            return result
+                        return self._llm.preprocess(inputs, sampling_params, disaggregated_params)
+
+                    return await lease.run(
                         self._input_executor,
-                        copy_context().run,
                         work.run,
-                        partial(
-                            self._llm.preprocess, inputs, sampling_params, disaggregated_params
-                        ),
+                        preprocess,
                     )
-                return inputs
+                finally:
+                    lease.close()
 
             mapping_task = asyncio.create_task(prepare_inputs())
             local_request.bind_mapping(mapping_task)
@@ -369,6 +492,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     raise
                 except Exception as error:
                     # Unexpected preparation failures are worker errors, not bad inputs.
+                    if request_metrics is not None:
+                        request_metrics.engine_failed()
                     logger.error(f"OpenEngine request {request_id} could not be prepared: {error}")
                     await context.abort(grpc.StatusCode.INTERNAL, str(error))
                     return
@@ -399,6 +524,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             stop_texts=_stop_texts(sampling_params),
             exclude_stop=not sampling_params.include_stop_str_in_output,
             tokenizer=self._llm.tokenizer,
+            decode_preparation=local_request.decode_preparation,
         )
 
         if local_request.aborted or (reservation is not None and reservation.aborted):
@@ -424,6 +550,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # router treat a totally broken worker as a fleet of bad clients: it
         # would not retry elsewhere, eject the engine, or alarm.
         except TypeError as error:
+            if request_metrics is not None:
+                request_metrics.engine_failed()
             logger.error(f"OpenEngine request {request_id} could not be submitted: {error}")
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
@@ -431,11 +559,15 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # cannot enumerate here; any such failure must become a clean INTERNAL
         # status for the client rather than an unhandled servicer crash.
         except Exception as error:
+            if request_metrics is not None:
+                request_metrics.engine_failed()
             logger.error(f"Failed to submit OpenEngine request {request_id}: {error}")
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
 
         local_request.bind_engine(result_handle)
+        if request_metrics is not None:
+            request_metrics.accepted()
 
         engine_terminal = False
         abort_requested = False
@@ -455,6 +587,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 )
 
         def on_stall() -> None:
+            if request_metrics is not None:
+                request_metrics.stalled()
             logger.warning(
                 f"OpenEngine request {request_id} stopped consuming responses "
                 f"for {RESPONSE_STALL_TIMEOUT_SECONDS:g} seconds"
@@ -490,6 +624,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     return
                 responses = _format_result(result, format_state)
                 for resp in responses or ():
+                    if request_metrics is not None:
+                        request_metrics.observe_response(resp)
                     watchdog.pending()
                     yield resp
                     watchdog.delivered()
@@ -508,6 +644,10 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     engine_terminal = True
                     return
                 if result.finished:
+                    if request_metrics is not None:
+                        request_metrics.complete(
+                            result, handoff_ready=bool(format_state.prefill_ready_sent)
+                        )
                     engine_terminal = True
                     return
 
@@ -516,18 +656,23 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             # internal engine abort). Surface it as an error rather than silently
             # returning a truncated result to the client.
             engine_terminal = True
-            watchdog.pending()
-            yield _engine_error_response(
+            response = _engine_error_response(
                 request_id,
                 "generation stream ended before all outputs finished",
                 result_handle,
             )
+            if request_metrics is not None:
+                request_metrics.observe_response(response)
+            watchdog.pending()
+            yield response
         except asyncio.CancelledError:
             raise
         # Broad by design: this is the RPC boundary, so any engine/processing
         # failure after acceptance must be reported to the client as an error
         # event and must still trigger abort + cleanup in the finally below.
         except Exception as error:
+            if request_metrics is not None:
+                request_metrics.engine_failed()
             logger.error(f"OpenEngine request {request_id} failed after acceptance: {error}")
             abort_request("response processing failed")
             engine_terminal = True

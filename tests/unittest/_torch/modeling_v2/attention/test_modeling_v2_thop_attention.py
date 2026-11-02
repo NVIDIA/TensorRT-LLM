@@ -631,7 +631,7 @@ class _PagedAttnEnv:
             v=None,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
             host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
@@ -699,7 +699,7 @@ class _PagedAttnEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -1118,7 +1118,7 @@ class _MultiLayerPagedAttnEnv:
                 v=None,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
                 host_total_kv_lens=torch.tensor(
@@ -1189,7 +1189,7 @@ class _MultiLayerPagedAttnEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -2546,8 +2546,10 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        the decoy changes the output, while the page holding only this call's
        own new tokens is invisible (the append lands wherever the offsets
        point and is read straight back from there).
-    3. use_paged_context_fmha=False on a context call with a cached prefix is
-       silently wrong — no exception, an answer far off the reference.
+    3. The packed path sees only the new tokens, so omitting the cached
+       prefix gives an answer far off the reference. Its KV lengths must
+       match the supplied packed rows; including the prefix would read
+       beyond the QKV buffer.
     4. context_lengths on a context row must be this call's new-token count;
        0 is far off. A larger value is not probed: the context FMHA then
        writes past the output buffer, which holds this call's new tokens
@@ -2621,7 +2623,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
     env.check_cache(0)
     env.check_unwritten_pool_zero()
 
-    # (3) the flag itself, and (4) the context length
+    # (3) packed attention without the prefix, and (4) the context length
     penv, pq = prepared()
     assert _bitwise_equal(pq, qkv), "the prepared state is not reproducible"
     _assert_far_outside(
@@ -2632,11 +2634,12 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             [0],
             MASK_CAUSAL,
             record=False,
+            seq_lens_override=[new],
             ctx_lens_override=[new],
             use_paged_context_fmha=False,
         ),
         base,
-        "cached-prefix context at use_paged_context_fmha=False",
+        "packed context without the cached prefix",
     )
     cenv, cq = prepared()
     _assert_far_outside(
@@ -2876,6 +2879,7 @@ MLA_TOKENS_PER_BLOCK = 64
 MLA_PAGE32 = 32
 MLA_MAX_SEQ_LEN = 1024
 POSITION_EMBEDDING_TYPE_YARN = 8  # PositionEmbeddingType.yarn (MLA models)
+POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX = 2  # PositionEmbeddingType.rope_gpt_neox (Kimi K3's MLA)
 # q-LoRA rank. DeepSeek-V3 down-projects q through a rank-1536 q_a_proj;
 # checkpoints with "q_lora_rank": null (deepseek-v3-lite) have no q-LoRA at
 # all and pass 0. Both are covered — see the inertness cases at the end.
@@ -3051,9 +3055,11 @@ class _MlaPagedEnv:
         pool_dtype: torch.dtype = torch.bfloat16,
         quant_mode: int = 0,
         kv_scaling_factor: Optional[float] = None,
+        position_embedding_type: int = POSITION_EMBEDDING_TYPE_YARN,
     ) -> None:
         self.num_heads = num_heads
         self.max_batch = max_batch
+        self.position_embedding_type = position_embedding_type
         self.tokens_per_block = tokens_per_block
         self.q_lora_rank = q_lora_rank
         self.max_seq_len = max_blocks_per_seq * tokens_per_block
@@ -3244,7 +3250,7 @@ class _MlaPagedEnv:
                 v=v,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(
                     kv_lens if host_past_lens is None else host_past_lens,
@@ -3287,7 +3293,7 @@ class _MlaPagedEnv:
                 mask_type=mask_type,
                 quant_mode=self.quant_mode,
                 q_scaling=self.q_scaling,
-                position_embedding_type=POSITION_EMBEDDING_TYPE_YARN,
+                position_embedding_type=self.position_embedding_type,
                 rope_dim=QK_ROPE_HEAD_DIM,
                 rope_base=self.rope_scalars.rope_base,
                 rope_scale_type=self.rope_scalars.rope_scale_type,
@@ -3316,7 +3322,7 @@ class _MlaPagedEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -3891,6 +3897,123 @@ YARN_TABLE_MIN_SEPARATION = 10.0
 # token. The checkpoint's per-layer k_scale/v_scale are both 1.0, so s = 1.0
 # is the production scale; 1.5 and 2.0 are swept beside it because the
 # scale tensors are the caller's only defence (None is read as 1.0).
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_context_bf16_page64() -> None:
+    """Kimi K3's MLA context calls (the generic path's prefill): bf16 latent
+    pool (quant_mode 0), page 64, the per-rank head counts 6 / 12 / 24 / 96
+    (TP16 / TP8 / TP4 / one rank), q_lora_rank 1536, q_scaling 1.0,
+    position_embedding_type 2 (rope_gpt_neox, what its MLA passes) and its
+    NoPE rope table -- every (cos, sin) pair (1, 0), written over the
+    backend's table -- so the in-kernel "rotation" is a copy.
+
+    1. Fresh prefill (latent_cache given): the output within the bf16 band of
+       the fp32 causal reference, the appended rows [compressed_kv | k_pe]
+       bit for bit, and no page outside the requests' written.
+    2. Cached-KV context (latent_cache=None): explicit K / V over cached
+       prefixes, bottom-right causal, within the same band; nothing mutated.
+    """
+    for heads in (6, 12, 24, 96):
+        torch.manual_seed(500 + heads)
+        env = _MlaPagedEnv(
+            num_heads=heads,
+            tokens_per_block=MLA_TOKENS_PER_BLOCK,
+            q_lora_rank=Q_LORA_RANK_DSV3,
+            q_scaling=1.0,
+            position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+        )
+        table = env.rotary_cos_sin.reshape(-1)
+        table[0::2] = 1.0
+        table[1::2] = 0.0
+
+        lens = [65, 130]  # one token into page 2, and two full pages plus two tokens
+        for rid, ln in enumerate(lens):
+            env.add_request(rid, ln)
+        q, k, v, latent = _random_context_inputs(sum(lens), heads)
+        pre = (q.clone(), k.clone(), v, latent.clone())
+        out = env.call_context([0, 1], lens, q, k, v, latent)
+        torch.testing.assert_close(out, env.context_reference(lens, *pre), rtol=RTOL, atol=ATOL)
+        for rid in (0, 1):
+            env.check_cache(rid)
+            rows = torch.cat(env.latent_rows[rid])
+            pooled = torch.cat([env.pool[p] for p in env.pages[rid]])[: rows.shape[0]]
+            assert torch.equal(pooled, rows), (
+                f"identity-rope rows not bitwise (H={heads}, request {rid})"
+            )
+        env.check_unwritten_pool_zero([0, 1])
+
+        cached_lens, new_lens = [64, 129], [7, 64]
+        kv_lens = [c + n for c, n in zip(cached_lens, new_lens)]
+        for rid, (n, total) in zip((2, 3), zip(new_lens, kv_lens)):
+            env.add_request(rid, n)
+            env.reserve_cache_pages(rid, total)
+        q2 = torch.randn(sum(new_lens), heads * QK_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        k2, packed_kv = _random_explicit_kv(sum(kv_lens), heads)
+        v2 = _v_split_view(packed_kv, heads)
+        operands = (q2.clone(), k2.clone(), v2.clone())
+        pool_before = env.pool.clone()
+        out2 = env.call_context_no_append([2, 3], new_lens, kv_lens, q2, k2, v2)
+        ref2, _ = _explicit_kv_reference(
+            q2, k2, v2, new_lens, kv_lens, MASK_CAUSAL, heads, softmax_scale=env.softmax_scale
+        )
+        torch.testing.assert_close(out2, ref2, rtol=RTOL, atol=ATOL)
+        for got, want in zip((q2, k2, v2), operands):
+            assert torch.equal(got, want)
+        assert torch.equal(env.pool, pool_before), "the no-append context call touched the pool"
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_mla_generation_bf16_page64() -> None:
+    """Kimi K3's MLA generation calls (the generic path's decode steps above
+    the fused decode kernels' bounds): latent MQA over the bf16 pool, page 64,
+    6 heads per rank (TP16 attention) and 96 (one rank), one query row per
+    request (no speculation) and 8 (DSpark's token plus 7 drafts, bottom-right
+    causal), two steps each over histories of one exact page and of 31
+    tokens. Within the bf16 band of the fp32 latent-MQA reference; the pool is
+    only read. (At 24 heads per rank, TP4, the trtllm-gen FMHA kernel
+    selection raises for these calls; the contract records it.)
+    """
+    for heads in (6, 96):
+        for p in (1, 8):
+            torch.manual_seed(700 + heads + p)
+            env = _MlaPagedEnv(
+                num_heads=heads,
+                tokens_per_block=MLA_TOKENS_PER_BLOCK,
+                q_lora_rank=Q_LORA_RANK_DSV3,
+                q_scaling=1.0,
+                position_embedding_type=POSITION_EMBEDDING_TYPE_ROPE_GPT_NEOX,
+            )
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            lens = [64, 31]
+            for rid, ln in enumerate(lens):
+                env.add_request(rid, ln)
+            q, k, v, latent = _random_context_inputs(sum(lens), heads)
+            env.call_context([0, 1], lens, q, k, v, latent)
+            for _ in range(2):
+                for rid in (0, 1):
+                    for _ in range(p):
+                        env.append_decode_latent(
+                            rid,
+                            torch.randn(LATENT_DIM, dtype=torch.bfloat16, device="cuda") * 0.5,
+                        )
+                pool_before = env.pool.clone()
+                fused_q = (
+                    torch.randn(2 * p, heads * LATENT_DIM, dtype=torch.bfloat16, device="cuda")
+                    * 0.3
+                )
+                out = env.call_generation([0, 1], fused_q, predicted_tokens_per_seq=p)
+                ref = env.generation_reference([0, 1], fused_q, predicted_tokens_per_seq=p)
+                torch.testing.assert_close(out, ref, rtol=RTOL, atol=ATOL)
+                assert _bitwise_equal(pool_before, env.pool), (
+                    f"the MLA generation call wrote to the pool (H={heads}, P={p})"
+                )
 
 
 def _fp8_mla_env(
@@ -5508,8 +5631,7 @@ def test_fp8_mla_mtp_decode_sees_a_torn_pool_h128() -> None:
 
 
 def test_mla_rejects_null_q_lora_rank() -> None:
-    """q_lora_rank must be an int on the MLA path: the C++ unwraps the
-    optional unconditionally, so None raises rather than defaulting."""
+    """The catalog requires an explicit int rank for MLA, including zero for no q-LoRA."""
     torch.manual_seed(309)
     h = MLA_NUM_HEADS_H32
     q, k, v, latent = _random_context_inputs(32, h)
@@ -5522,8 +5644,8 @@ def test_mla_rejects_null_q_lora_rank() -> None:
     env.add_request(0, 32)
     try:
         env.call_context([0], [32], q, k, v, latent)
-    except RuntimeError as exc:
-        assert "bad optional access" in str(exc), f"unexpected message: {exc}"
+    except ValueError as exc:
+        assert "q_lora_rank must be an int for MLA" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
 
@@ -6709,7 +6831,7 @@ _ENCODER_SERVING_SEGMENTS: List[List[int]] = [
     [12544, 9600],
 ]
 
-# What `workspace_` grows to across that sequence, from empty: the op sizes it
+# What `workspace` grows to across that sequence, from empty: the op sizes it
 # in place per call and never shrinks it, and the dump's largest recorded size
 # is this figure.
 _ENCODER_SERVING_WORKSPACE = 33732608
@@ -6736,7 +6858,7 @@ def _encoder_call(
         v=None,
         output=output,
         output_sf=None,
-        workspace_=workspace,
+        workspace=workspace,
         sequence_length=torch.tensor(seg_lens, dtype=torch.int32, device="cuda"),
         host_past_key_value_lengths=torch.tensor(seg_lens, dtype=torch.int32),
         host_total_kv_lens=torch.tensor([total, 0], dtype=torch.int32),
@@ -6803,7 +6925,7 @@ def _encoder_call(
         use_spec_decoding=False,
         is_spec_dec_tree=False,
         spec_decoding_generation_lengths=None,
-        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_position_offsets=None,
         spec_decoding_packed_mask=None,
         spec_decoding_bl_tree_mask_offset=None,
         spec_decoding_bl_tree_mask=None,
@@ -6929,7 +7051,7 @@ def test_encoder_no_kv_cache_cache_arguments_are_inert() -> None:
 
 
 def test_encoder_no_kv_cache_workspace_high_water() -> None:
-    """`workspace_` over the mmmu serving sequence, from empty: sized in place
+    """`workspace` over the mmmu serving sequence, from empty: sized in place
     per call, never shrunk, and topping out at the largest size the runtime
     dump records -- which a tower that preallocates it must cover."""
     workspace = torch.empty(0, dtype=torch.int8, device="cuda")
@@ -6939,9 +7061,9 @@ def test_encoder_no_kv_cache_workspace_high_water() -> None:
         qkv = torch.randn(sum(seg_lens), 48 * 72, dtype=torch.bfloat16, device="cuda")
         _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace)
         sizes.append(workspace.numel())
-    assert sizes == sorted(sizes), f"workspace_ did not grow monotonically: {sizes}"
+    assert sizes == sorted(sizes), f"workspace did not grow monotonically: {sizes}"
     assert sizes[-1] == _ENCODER_SERVING_WORKSPACE, (
-        f"workspace_ grew to {sizes[-1]} bytes over the serving shapes, expected "
+        f"workspace grew to {sizes[-1]} bytes over the serving shapes, expected "
         f"{_ENCODER_SERVING_WORKSPACE}; the sequence was {sizes}"
     )
 
