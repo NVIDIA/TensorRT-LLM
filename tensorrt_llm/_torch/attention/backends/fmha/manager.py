@@ -515,6 +515,20 @@ class FmhaManager:
         generation_fmha = None
         for fmha in self.fmha_libs:
             if fmha.is_supported(q, k, v, metadata, forward_args):
+                # A higher-priority phased library that opted in already took the
+                # generation rows of this mixed batch: let this library serve only the
+                # context requests rather than the whole batch.
+                if (
+                    context_fmha is None
+                    and generation_fmha is not None
+                    and generation_fmha.pairs_with_whole_batch_context
+                    and forward_args.attention_input_type == AttentionInputType.mixed
+                    and generation_fmha is not fmha
+                    and self._serves_context_phase(fmha, q, k, v, metadata, forward_args)
+                ):
+                    combined_fmha = CombinedFmha(attn)
+                    combined_fmha.set_fmha_impls(fmha, generation_fmha)
+                    return combined_fmha
                 return fmha
 
             if not isinstance(fmha, PhasedFmha):
@@ -556,6 +570,20 @@ class FmhaManager:
             combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
             return combined_fmha
         return None
+
+    @staticmethod
+    def _serves_context_phase(
+        fmha: Fmha,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Whether ``fmha``, which supports a whole mixed batch, can serve its context phase alone."""
+        if not (isinstance(fmha, PhasedFmha) or fmha.serves_context_only_input):
+            return False
+        return fmha.is_supported(q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT)
 
     def _select_mla(
         self,
