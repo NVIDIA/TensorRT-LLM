@@ -290,6 +290,9 @@ public:
     // teardown because destructor timing and stream identity are not rank-deterministic.
     void releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId);
 
+    // Explicitly quarantine a raw reservation until communicator teardown. Never makes it reusable.
+    void abandonReservation(ncclComm_t comm, void* ptr, uint64_t leaseId);
+
     // Get the window handle for a specific buffer pointer
     ncclWindow_t getWindow(ncclComm_t comm, void* ptr) const;
 

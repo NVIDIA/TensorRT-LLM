@@ -62,6 +62,7 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm as tllm
 import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
@@ -1348,6 +1349,75 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
     finally:
         if comm is not None:
             comm.destroy()
+
+
+def _worker_nccl_window_reservation_lifetime() -> dict:
+    """Scopes cannot release a context checkout; explicit retirement permits reuse."""
+    from mpi4py import MPI
+
+    from tensorrt_llm.bindings.internal.thop import BufferKind
+
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    like = torch.empty((2, 16, 1024), device="cuda", dtype=torch.bfloat16)
+    group = [0, 1]
+    reservation = torch.classes.trtllm.NCCLWindowReservation(like, group)
+    try:
+        # Registration may fall back on unsupported NCCL/runtime platforms.
+        # Both ranks must take the same path before entering the lifetime checks.
+        if not all(MPI.COMM_WORLD.allgather(bool(reservation.window()))):
+            return {"rank": rank, "skip_reason": "NCCL window registration is unavailable"}
+        tensor = reservation.tensor()
+        pointer = tensor.data_ptr()
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        for _ in range(3):
+            with nccl_window_tensor_scope(tensor):
+                scratch, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+                    like, int(BufferKind.NCCL_WINDOW), group
+                )
+                assert kind == int(BufferKind.NCCL_WINDOW) and handle
+                assert scratch.data_ptr() != pointer, "Scope released a live reservation"
+                tensor.fill_(rank + 1)
+        # An auxiliary-stream scope may also borrow the tensor without owning its lease.
+        auxiliary = torch.cuda.Stream()
+        auxiliary.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(auxiliary), nccl_window_tensor_scope(tensor):
+            tensor.add_(1)
+        torch.cuda.current_stream().wait_stream(auxiliary)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        reservation.release()
+        reservation.release()
+        replacement = torch.classes.trtllm.NCCLWindowReservation(like, group)
+        try:
+            assert replacement.tensor().data_ptr() == pointer, (
+                "Explicit release did not permit reuse"
+            )
+            # The peer deliberately waits for notification before entering
+            # abandonment: a hidden collective here would deadlock the test.
+            if rank == 0:
+                replacement.abandon()
+                MPI.COMM_WORLD.send(None, dest=1, tag=701)
+            else:
+                MPI.COMM_WORLD.recv(source=0, tag=701)
+                replacement.abandon()
+            replacement.abandon()
+            # Even an explicit release after abandonment cannot recycle storage.
+            replacement.release()
+            another = torch.classes.trtllm.NCCLWindowReservation(like, group)
+            try:
+                assert another.window()
+                assert another.tensor().data_ptr() != pointer, "Abandoned reservation was reused"
+            finally:
+                another.release()
+        finally:
+            replacement.release()
+        return {"rank": rank}
+    finally:
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        reservation.release()
 
 
 def _make_rank_mask_config(
@@ -3064,6 +3134,23 @@ class TestMoEComm:
         layout_info = LayoutInfo(recv_topk_idx_kind=ExpertIdKind.GLOBAL)
         assert int(layout_info._lowpp.recv_topk_idx_kind) == int(ExpertIdKind.GLOBAL)
         _run_full_test_group(mpi_pool_executor, group)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+    def test_nccl_window_reservation_lifetime(self, mpi_pool_executor: MPIPoolExecutor) -> None:
+        if torch.cuda.device_count() < 2:
+            pytest.skip("NCCL window reservation lifetime requires at least two CUDA devices")
+        try:
+            _ = torch.classes.trtllm.NCCLWindowReservation
+        except (AttributeError, RuntimeError):
+            pytest.skip("NCCL window reservation support is unavailable")
+        futures = [
+            mpi_pool_executor.submit(_worker_nccl_window_reservation_lifetime) for _ in range(2)
+        ]
+        results = [future.result() for future in futures]
+        for result in results:
+            if reason := result.get("skip_reason"):
+                pytest.skip(reason)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)

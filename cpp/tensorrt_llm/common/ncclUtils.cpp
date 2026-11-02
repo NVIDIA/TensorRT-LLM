@@ -981,10 +981,16 @@ void NCCLWindowAllocator::quarantineTensorLeaseLocked(TensorLease const& tensorL
             entry.graphPoolOwner.reset();
             entry.releaseOwnerWhenUnused = false;
         }
-        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p after a failed tensor lease scope.",
+        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p.",
             static_cast<unsigned long long>(tensorLease.leaseId), static_cast<void*>(tensorLease.comm));
         return;
     }
+}
+
+void NCCLWindowAllocator::abandonReservation(ncclComm_t comm, void* ptr, uint64_t leaseId)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    quarantineTensorLeaseLocked(TensorLease{comm, ptr, leaseId});
 }
 
 void NCCLWindowAllocator::releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId)
