@@ -185,8 +185,8 @@ def coverage_preflight(
     if not residual:
         return residual, "coverage tier skipped: no residual (all files handled by rules)"
     for path in residual:
-        if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
-            return residual, f"coverage tier declined: non-core-Python residual file: {path}"
+        if not path.endswith(".py"):
+            return residual, f"coverage tier declined: non-Python residual file: {path}"
     return residual, ""
 
 

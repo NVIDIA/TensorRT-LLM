@@ -550,9 +550,8 @@ class CoverageSelector:
     ) -> CoverageResult:
         """Resolve impact from raw source images and optional executable selection diffs."""
         for path in residual_files:
-            # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
-            if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
-                return CoverageResult(ok=False, reason=f"non-core-Python residual file: {path}")
+            if not path.endswith(".py"):
+                return CoverageResult(ok=False, reason=f"non-Python residual file: {path}")
             cf = canon(path)
             if not self.db.file_has_touch_rows(cf):
                 return CoverageResult(

@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CoverageSelector: changed core-Python files -> per-stage impacted/skippable sets."""
+"""Tests for CoverageSelector: changed Python files -> per-stage impacted/skippable sets."""
 
 from __future__ import annotations
 
@@ -22,14 +22,15 @@ import json
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Block, Stage, YAMLIndex
-from cbts.command.main import Selector, _load_pr_inputs
+from cbts.command.main import Selector, _coverage_decline_category, _load_pr_inputs, main
 from cbts.coverage.selection.selector import CoverageSelector
-from cbts.coverage.tier import apply_coverage_tier
+from cbts.coverage.tier import apply_coverage_tier, coverage_preflight
 from cbts.rules.base import PRInputs
 from cbts.rules.docs import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule
 
@@ -62,6 +63,95 @@ class _FakeDB:
 
     def untrusted_tests(self, *_args) -> set[str]:
         return set()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "conftest.py",
+        "tests/integration/defs/conftest.py",
+        "tests/test_common/llm_data.py",
+        "tests/unittest/conftest.py",
+        "examples/helper.py",
+        "scripts/helper.py",
+        "examples/tensorrt_llm/helper.py",
+    ],
+)
+def test_coverage_tier_uses_attributed_python_coverage_in_any_directory(
+    tmp_path: Path, path: str
+) -> None:
+    """A covered helper keeps its callers and allows unrelated test entries to be pruned."""
+    source = tmp_path / path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("def caller():\n    return 2\n")
+    pr = PRInputs(
+        changed_files=[path],
+        diffs={path: "@@ -1,2 +1,2 @@\n def caller():\n-    return 1\n+    return 2\n"},
+    )
+
+    class PathDB(_FakeDB):
+        def file_has_touch_rows(self, file: str) -> bool:
+            return file == path
+
+        def tests_touching_func(self, file: str, qualname: str) -> set[str]:
+            assert file == path
+            return super().tests_touching_func(file, qualname)
+
+    index = YAMLIndex()
+    index.blocks = [Block("l0_a10", 0, {}, ["test_caller", "test_unrelated"])]
+    stages = {
+        "A10-PyTorch-1": Stage(
+            name="A10-PyTorch-1",
+            yaml_stem="l0_a10",
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+    }
+
+    assert coverage_preflight(pr, [], set()) == ([path], "")
+    result, note = apply_coverage_tier(pr, [], set(), stages, index, tmp_path, PathDB())
+
+    assert result is not None, note
+    assert result.removed == {("l0_a10", 0): {"test_unrelated"}}
+    assert not result.dropped
+
+
+def test_selector_does_not_borrow_core_coverage_for_nested_package_path(tmp_path: Path) -> None:
+    """A same-named module in examples has its own DB identity."""
+    path = "examples/tensorrt_llm/helper.py"
+
+    class CoreOnlyDB(_FakeDB):
+        def file_has_touch_rows(self, file: str) -> bool:
+            return file == "tensorrt_llm/helper.py"
+
+    result = CoverageSelector(CoreOnlyDB(), tmp_path).decide([path], {})
+
+    assert not result.ok
+    assert result.reason == f"zero-touch residual file (new/uninstrumented): {path}"
+    assert not result.skippable
+
+
+@pytest.mark.parametrize("path", ["tests/helper.cu", "examples/config.json", "setup.cfg"])
+def test_coverage_tier_declines_non_python_even_with_db_rows(tmp_path: Path, path: str) -> None:
+    """DB presence cannot make the Python AST selector analyze another language."""
+    pr = PRInputs(changed_files=[path], diffs={})
+
+    residual, note = coverage_preflight(pr, [], set())
+    result = CoverageSelector(_FakeDB(), tmp_path).decide(residual, {})
+
+    assert path in note
+    assert not result.ok
+    assert result.reason == f"non-Python residual file: {path}"
+    assert _coverage_decline_category(note) == "non_python"
+
+
+def test_coverage_cli_requests_diffs_for_python_in_every_directory() -> None:
+    """Jenkins must fetch the diff before a newly eligible path reaches Tier 2."""
+    result = CliRunner().invoke(main, ["--list-needed-diffs"])
+
+    assert result.exit_code == 0, result.output
+    assert "**/*.py" in result.output.splitlines()
 
 
 @pytest.mark.parametrize(

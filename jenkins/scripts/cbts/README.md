@@ -13,7 +13,7 @@ run, based on what the PR changed. New rules are added in Python only.
 | Tier | Where | Basis |
 |---|---|---|
 | **1. Rules** | `cbts/rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
-| **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is core Python present in the touch DB. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
+| **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is Python with test-attributed records in the touch DB, regardless of its repository directory. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
 
 The touch DB is produced by the post-merge collection under
 `cbts/coverage/collection/`; see `cbts/coverage/collection/COLLECTION.md`
@@ -368,7 +368,7 @@ CBTS defers to the existing filter chain when:
   but cannot decide; e.g. testdef blast-radius cap, testlist structural
   YAML edit)
 - Combined scope is `None` (incompatible mix)
-- Tier 2 declines: a residual file is not core Python, is absent from the
+- Tier 2 declines: a residual file is not Python, lacks test-attributed records in the
   touch DB, has an unbounded import-executed change (class body, signature,
   decorator, or unsupported module statement), has no usable patch, has
   unparsable source, or has a closure change with no wider row set. A small AST
