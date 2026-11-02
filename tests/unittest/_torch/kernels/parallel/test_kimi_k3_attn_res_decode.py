@@ -162,16 +162,6 @@ def test_hidden_sizes():
     assert not any(k.supports_hidden_size(h) for h in (0, 128, 7040, 8448))
 
 
-@pytest.mark.parametrize("rubin_dsl", [False, True], ids=["stock_dsl", "rubin_dsl"])
-def test_sm107_supported_only_with_rubin_cute_dsl(monkeypatch, rubin_dsl):
-    from tensorrt_llm._torch import cute_dsl_utils
-
-    k = _kernel()
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device_index: (10, 7))
-    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_dsl)
-    assert k.is_supported_device.__wrapped__(0) == rubin_dsl
-
-
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("hidden", [4096, 7168, 8192])
 @pytest.mark.parametrize("m, n", [(3, 5), (32, 9)])

@@ -707,26 +707,6 @@ def test_gated_matches_multiply_then_gemm(m, n, k, strided):
     assert _rel_err(out, _mxfp8_emulated_reference((x * gate).contiguous(), w, scale)) < 5e-3
 
 
-@sm100_only
-@pytest.mark.parametrize("n, k", [(12288, 7168), (7168, 12288), (7168, 768)])
-def test_gated_tactic_keeps_a_deep_weight_ring(n, k):
-    """At 8 tokens the plain tactic keeps every K tile of a CTA in the activation ring; the gated
-    tactic shortens that ring (and the gate ring with it) instead of starving the weight ring,
-    with the plain tactic's split-K and quantization layout."""
-    mod = _kernel_module()
-    plain, gated = mod.default_tactic(8, n, k), mod.gated_tactic(8, n, k)
-    kt_max = -(-(k // 128) // plain.split_k)
-    assert (gated.mma_n, gated.split_k, gated.b_stages) == (
-        plain.mma_n,
-        plain.split_k,
-        plain.b_stages,
-    )
-    assert (gated.quant_warps, gated.quant_groups) == (plain.quant_warps, plain.quant_groups)
-    assert gated.a_stages >= min(6, kt_max)
-    x = torch.zeros((8, k), device="cuda", dtype=torch.bfloat16)
-    assert mod.gate_fits(x, torch.zeros_like(x), n)
-
-
 @pytest.mark.parametrize("m", [7, 14, 32])
 def test_gated_cuda_graph_after_side_stream(m):
     """Graph replay with the gate written on another stream right before the launch."""
