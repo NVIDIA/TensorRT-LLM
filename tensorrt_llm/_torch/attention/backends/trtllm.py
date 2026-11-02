@@ -698,8 +698,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if state is not None:
             state.on_update_kv_lens(self)
         view = self.mixed_precision_staging
-        if (view is not None and view.lengths is not None
-                and view.manager is self.kv_cache_manager):
+        if view is not None and view.manager is self.kv_cache_manager:
             # Keep the staging lengths in step with kv_lens_cuda.
             lengths = view.lengths
             n = lengths.shape[1]
@@ -933,7 +932,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Prepare backend state shared by draft-forward execution paths."""
         draft = self.sync_draft_mixed_precision_staging()
         if draft is not None:
-            # MTP layers of a mixed draft manager run on its own staging copy.
+            # MTP layers of a mixed-precision draft manager run on its own
+            # staging copy.
             self.swap_for_draft("mixed_precision_staging", draft)
         return None
 

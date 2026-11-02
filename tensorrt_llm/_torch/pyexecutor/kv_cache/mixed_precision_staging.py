@@ -29,7 +29,8 @@ class MixedPrecisionKVStaging:
         """Allocate the per-rank staging copy for the largest batch and longest sequence."""
         self.manager = manager
         self.buffers = buffers
-        # Buffer-pool name prefix: the target and a mixed draft manager each get their own.
+        # Prefix of this staging copy's buffer names, so the target manager and a draft manager
+        # with mixed-precision KV each get their own buffers.
         self.name = name
         self.rows = rows
         self.layout = layout
@@ -59,16 +60,7 @@ class MixedPrecisionKVStaging:
                 self.max_page_bytes, math.prod(shape[1:]) * high.element_size()
             )
         self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
-        try:
-            storage = buffers.get_buffer(
-                [self.staging_bytes], torch.uint8, f"{name}_kv_staging", True
-            )
-        except torch.OutOfMemoryError as error:
-            raise RuntimeError(
-                f"Mixed-precision KV needs a {self.staging_bytes / (1 << 30):.1f} GiB staging copy "
-                f"on this rank ({rows} requests x {self.max_seq_len} tokens); lower max_batch_size "
-                "or max_seq_len."
-            ) from error
+        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, f"{name}_kv_staging", True)
         # Zero once: the per-batch gather only writes real tokens, and attention
         # may load the padding of a request's last page before masking it.
         storage.zero_()
@@ -76,10 +68,9 @@ class MixedPrecisionKVStaging:
             layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
             for layer_idx, (shape, low, high) in pools.items()
         }
-        # Layers whose two pools share layer groups and page-index scales have identical page
-        # tables, so each batch builds one table per such pair and every layer shares it.
+        # Layers with equal keys share their page tables, so each batch builds one table per key.
         self.table_owner: Dict[int, int] = {}
-        owners: Dict[tuple, int] = {}
+        owners: dict[tuple[tuple[int, int], ...], int] = {}
         for layer_idx in self.pools:
             key = manager.mixed_precision_page_table_key(layer_idx)
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
@@ -95,6 +86,9 @@ class MixedPrecisionKVStaging:
         self.lengths: Optional[torch.Tensor] = None
         self.max_new_tokens_per_request = 0
         self.read_capacity = 0
+        # Staging-page block offsets: the TRTLLM backend fills them per batch and swaps them in
+        # for kv_cache_block_offsets while a mixed-precision layer runs.
+        self.block_offsets: Optional[torch.Tensor] = None
 
     def update(
         self,

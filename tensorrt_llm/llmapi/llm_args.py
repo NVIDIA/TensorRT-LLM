@@ -5582,7 +5582,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
-        """Keep at least one token per sequence in the mixed-precision high dtype."""
+        """Require at least one token per sequence in the mixed-precision high dtype."""
         if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
                 == self.mixed_precision_last_n == 0):
             raise ValueError(

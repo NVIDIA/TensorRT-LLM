@@ -339,21 +339,7 @@ class ManagerLayout:
 def global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
     """The global id of each internal layer id, the same under any pipeline split: the declared id;
     else for virtual layers ``model_layer * number_of_attention_types + attention_type``; else the
-    model layer. Mixed-precision KV renames the layers by one rule; see
-    ``KVCacheManagerV2.mixed_precision_transfer_ids``."""
-    internal = [int(lid) for lid in internal_ids]
-    # The dict check keeps stand-in managers (mocks) on their own naming.
-    mixed = (
-        manager.mixed_precision_transfer_ids
-        if isinstance(getattr(manager, "mixed_precision_high_layers", None), dict)
-        else None
-    )
-    ids = mixed(internal, lambda own: _own_global_layer_ids(manager, own)) if mixed else None
-    return ids if ids is not None else _own_global_layer_ids(manager, internal)
-
-
-def _own_global_layer_ids(manager: KVCacheManagerV2, internal_ids: Sequence[int]) -> list[int]:
-    """The manager's own global id of each internal layer id."""
+    model layer."""
     # One declared id per internal layer of each layer group, in order (FP4 MLA's tail layers).
     declared = _manager.declared_global_layer_ids(manager)
     if declared is not None:

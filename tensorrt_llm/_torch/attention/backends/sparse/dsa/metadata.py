@@ -391,7 +391,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return self.mixed_precision_high_block_table is not None
 
     def _fill_mixed_precision_high_block_table(
-        self, manager: "KVCacheManagerV2", layer_idx: int, high_table: torch.Tensor
+        self, manager: "KVCacheManagerV2", high_layer: int, high_table: torch.Tensor
     ) -> None:
         """Refresh a mixed-precision high page table over its full width; the rest stay -1.
 
@@ -401,7 +401,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         table = torch.full(
             (self.num_seqs, high_table.shape[1]), -1, dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        manager.fill_mixed_precision_high_page_table(self.request_ids, layer_idx, table.numpy())
+        manager._fill_page_table(high_layer, self.request_ids, table.numpy())
         high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
     def _fill_mixed_precision_high_block_tables(self) -> None:
@@ -411,8 +411,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         ):
             if high_table is not None:
                 # All layers share one mixed-precision high pool, so one table serves them all.
-                layer_idx = manager.pp_layers[next(iter(manager.mixed_precision_high_layers))]
-                self._fill_mixed_precision_high_block_table(manager, layer_idx, high_table)
+                high_layer = next(iter(manager.mixed_precision_high_layers.values()))
+                self._fill_mixed_precision_high_block_table(manager, high_layer, high_table)
 
     def prepare(self):
         self._validate_ragged_verification()
@@ -468,8 +468,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # MTP layers on the draft manager use its mixed-precision high page table; other drafters
-        # have none.
+        # MTP layers on the draft manager use its mixed-precision high page table.
         self.swap_for_draft(
             "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
         )

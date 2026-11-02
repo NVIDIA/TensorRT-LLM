@@ -2485,31 +2485,6 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
     ) == (11, expected_intercept)
 
 
-def test_v2_hybrid_mixed_precision_cost_is_the_nvfp4_history():
-    """Per token a mixed-precision hybrid cache costs its NVFP4 attention history."""
-    model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
-    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
-
-    def cost(kv_cache_config):
-        return MambaHybridCacheManagerV2.get_cache_size_per_token(
-            model_config, mapping, max_batch_size=1, kv_cache_config=kv_cache_config
-        )
-
-    plain = cost(KvCacheConfig(enable_block_reuse=False))
-    mixed = cost(
-        KvCacheConfig(
-            enable_block_reuse=False,
-            dtype="mixed_nvfp4_float16",
-            mixed_precision_first_n=32,
-            mixed_precision_last_n=32,
-        )
-    )
-    # One full-attention layer, K and V of 2 heads x 8 dims: 32 FP16 values (64 bytes) per token.
-    assert plain[0] == 64
-    assert mixed[0] == 32 // 2 + 32 // 16
-    assert mixed[1] > plain[1]
-
-
 def test_v2_hybrid_attention_bound_is_snapshot_alignment_agnostic():
     model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -4124,7 +4099,10 @@ def _mixed_precision_kv_cache_config() -> KvCacheConfig:
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
 def test_v2_hybrid_mixed_precision_appends_high_group():
-    """The attention layer's mixed-precision high layer comes after the SSM and attention layers."""
+    """The attention layer's mixed-precision high layer comes after the SSM and attention layers.
+
+    Disaggregated transfer gives it its own layer id.
+    """
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
@@ -4146,89 +4124,13 @@ def test_v2_hybrid_mixed_precision_appends_high_group():
         # The leading (sink) and trailing (window) pages are always in the mixed-precision high pool.
         assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
         assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
-    finally:
-        mgr.shutdown()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
-    reason="Mixed-precision NVFP4 KV requires Blackwell",
-)
-def test_v2_hybrid_mixed_precision_disagg_names_high_layers():
-    """Disaggregated transfer gives hybrid mixed-precision high layers collision-free ids."""
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        dtype=DataType.HALF,
-        kv_cache_config=_mixed_precision_kv_cache_config(),
-    )
-    try:
-        assert mgr.mixed_precision_high_layers == {1: 2}
-        page_table = build_page_table_from_manager(mgr)
+        # Model layer L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
         ids = {
             layer.local_layer_id: layer.global_layer_id
-            for group in page_table.layer_groups
+            for group in build_page_table_from_manager(mgr).layer_groups
             for layer in group.local_layers
         }
-        # Model layers L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
         assert ids == {0: 0, 1: 2, 2: 3}
-        # KV cache sharing names the layers the same way.
-        from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import global_layer_ids
-
-        assert global_layer_ids(mgr, [0, 1, 2]) == [0, 2, 3]
-    finally:
-        mgr.shutdown()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
-    reason="Mixed-precision NVFP4 KV requires Blackwell",
-)
-def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
-    """A pipeline rank holding only recurrent layers still names model layer L as 2L."""
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        dtype=DataType.HALF,
-        kv_cache_config=_mixed_precision_kv_cache_config(),
-        num_mamba_layers=2,
-        num_attention_layers=0,
-    )
-    try:
-        assert mgr.mixed_precision_high_layers == {}
-        page_table = build_page_table_from_manager(mgr)
-        ids = {
-            layer.local_layer_id: layer.global_layer_id
-            for group in page_table.layer_groups
-            for layer in group.local_layers
-        }
-        assert ids == {0: 0, 1: 2}
-    finally:
-        mgr.shutdown()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
-    reason="Mixed-precision NVFP4 KV requires Blackwell",
-)
-@pytest.mark.parametrize("pass_pretrained_config", [True, False])
-def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain(pass_pretrained_config):
-    """An Eagle3 layer sharing the hybrid manager keeps a plain cache; MTP layers would go mixed."""
-    from tensorrt_llm.llmapi import Eagle3DecodingConfig
-
-    build = partial(
-        _build_v2_hybrid_with_mamba_layer,
-        dtype=DataType.HALF,
-        kv_cache_config=_mixed_precision_kv_cache_config(),
-        num_draft_layers=1,
-        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
-        pretrained_config=SimpleNamespace(num_hidden_layers=2) if pass_pretrained_config else None,
-    )
-    if not pass_pretrained_config:
-        # The layer_mask alone does not tell the drafter layers apart.
-        with pytest.raises(ValueError, match="pretrained_config"):
-            build()
-        return
-    mgr = build()
-    try:
-        # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
-        assert mgr.mixed_precision_high_layers == {1: 3}
     finally:
         mgr.shutdown()
 
@@ -8050,3 +7952,58 @@ def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
         stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
     )
     assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
+    """A pipeline rank holding only recurrent layers still names model layer L as 2L."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_mamba_layers=2,
+        num_attention_layers=0,
+    )
+    try:
+        assert mgr.mixed_precision_high_layers == {}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+@pytest.mark.parametrize("pass_pretrained_config", [True, False])
+def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain(pass_pretrained_config):
+    """An Eagle3 layer in the hybrid manager keeps a normal KV cache, unlike an MTP layer."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    build = partial(
+        _build_v2_hybrid_with_mamba_layer,
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_draft_layers=1,
+        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2) if pass_pretrained_config else None,
+    )
+    if not pass_pretrained_config:
+        # The layer_mask alone does not tell the drafter layers apart.
+        with pytest.raises(ValueError, match="pretrained_config"):
+            build()
+        return
+    mgr = build()
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
+        assert mgr.mixed_precision_high_layers == {1: 3}
+    finally:
+        mgr.shutdown()

@@ -1916,9 +1916,9 @@ def test_receive_without_context_session_fails_after_sweep(schedule_style):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("mismatch", [None, (False, True), (True, False), "mixed_precision_kv"])
+@pytest.mark.parametrize("replay_flags", [None, (False, True), (True, False)])
 def test_incompatible_peer_fails_only_affected_requests(
-    mismatch: tuple[bool, bool] | str | None,
+    replay_flags: tuple[bool, bool] | None,
 ) -> None:
     """An incompatible context peer must fail only the requests targeting it.
 
@@ -1946,14 +1946,6 @@ def test_incompatible_peer_fails_only_affected_requests(
     bad_endpoint = setup_bad["ctx_info_endpoint"]
     expected_error = "synthetic recurrent-state mismatch"
     expected_validate_calls = 1
-    replay_flags = mismatch if isinstance(mismatch, tuple) else None
-    if mismatch == "mixed_precision_kv":
-        # The generation side rejects a context peer without mixed precision itself.
-        layout = ["DataType.NVFP4", "DataType.FP8", 128, 128]
-        gen_tw._rank_info.mixed_precision_kv = layout
-        setup_good["ctx_transfer_workers"][0]._rank_info.mixed_precision_kv = layout
-        expected_error = "mixed-precision KV"
-        expected_validate_calls = 0
     if replay_flags is not None:
         local_replay, peer_replay = replay_flags
         gen_tw._rank_info.bounded_replay_on_generation = local_replay

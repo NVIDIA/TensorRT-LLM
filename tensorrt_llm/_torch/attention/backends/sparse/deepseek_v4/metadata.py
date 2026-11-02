@@ -311,11 +311,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         manager = self.kv_cache_manager
         if manager.mixed_precision_high_layers:
             self._mixed_precision_high_table_layers = {}
-            for local in manager.mixed_precision_high_layers:
-                layer_idx = manager.pp_layers[local]
-                self._mixed_precision_high_table_layers.setdefault(
-                    manager._compress_ratios[layer_idx], layer_idx
-                )
+            for local, high_layer in manager.mixed_precision_high_layers.items():
+                ratio = manager._compress_ratios[manager.pp_layers[local]]
+                self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
             self.mixed_precision_high_block_table = {
                 compress_ratio: self.get_empty(
                     self.cuda_graph_buffers,

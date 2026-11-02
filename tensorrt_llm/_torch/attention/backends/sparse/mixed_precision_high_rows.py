@@ -18,8 +18,6 @@ if TYPE_CHECKING:
     from .deepseek_v4.compressor import Compressor
     from .dsa.metadata import DSAtrtllmAttentionMetadata
 
-    MixedPrecisionHighRowsOwner = TrtllmAttention | Compressor
-
 
 @triton.jit
 def _store_mixed_precision_high_rows_kernel(
@@ -88,7 +86,7 @@ def _copy_rows(
     ROW_WIDTH: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """Copy mixed-precision high pool rows ``slot`` to scratch rows ``scratch_row`` (FP8)."""
+    """Copy mixed-precision high pool rows `slot` to scratch rows `scratch_row` (FP8)."""
     src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
     dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
     if APPLY_SCALE:
@@ -130,27 +128,22 @@ def _overlay_mixed_precision_high_rows_kernel(
     BLOCK_W: tl.constexpr,
 ):
     """Per (query row, BLOCK_K tokens): copy rows the mixed-precision high pool holds."""
-    query = tl.program_id(0)
+    query = tl.program_id(0).to(tl.int64)
     ks = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
     in_row = ks < topk
     request = tl.load(request_ptr + query)
-    position = tl.load(topk_ptr + query.to(tl.int64) * topk_stride + ks, mask=in_row, other=-1)
-    scratch_row = tl.load(
-        compact_ptr + query.to(tl.int64) * compact_stride + ks, mask=in_row, other=-1
-    )
+    position = tl.load(topk_ptr + query * topk_stride + ks, mask=in_row, other=-1)
+    scratch_row = tl.load(compact_ptr + query * compact_stride + ks, mask=in_row, other=-1)
     # Padded entries of the index tensors hold stale values; bound them like the backends do.
     block = position // tokens_per_block
-    valid = in_row & (position >= 0) & (block < max_blocks)
+    valid = (position >= 0) & (block < max_blocks) & (request >= 0) & (request < num_requests)
     valid = valid & (scratch_row >= 0) & (scratch_row < scratch_rows)
-    valid = valid & (request >= 0) & (request < num_requests)
     page = tl.load(block_table_ptr + request * block_table_stride + block, mask=valid, other=-1)
     valid = valid & (page >= 0) & (page < num_blocks)
     slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
     if DEDUP:
-        # Context scratch rows are shared by every query that selected the token: record the
-        # row's mixed-precision high pool slot (same value from every pair, no atomics); a per-row
-        # pass copies it once.
-        # Most pairs find the row already recorded and skip the store.
+        # Context scratch rows are shared by every query that selected the token: record the row's
+        # high pool slot (same value from every pair, no atomics); a per-row pass copies it once.
         record = (claim_epoch.to(tl.int64) << 32) | slot
         current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
         tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
@@ -199,65 +192,70 @@ def _copy_recorded_rows_kernel(
     )
 
 
-def _mixed_precision_high_block_table(
-    metadata: "DSAtrtllmAttentionMetadata", owner: "MixedPrecisionHighRowsOwner"
-) -> torch.Tensor | None:
-    """Mixed-precision high page table ``owner`` uses (one per compression ratio on DeepSeek-V4)."""
+def _mixed_precision_high_pool(
+    metadata: "DSAtrtllmAttentionMetadata", owner: "TrtllmAttention | Compressor"
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """`owner`'s mixed-precision high pool `[num_blocks, tokens_per_block, row]` and page table.
+
+    Both are None when `owner` has no mixed-precision high pool.
+    """
     table = metadata.mixed_precision_high_block_table
     if isinstance(table, dict):
+        # DeepSeek-V4: one page table per compression ratio.
         table = table.get(owner.compress_ratio)
-    return table
-
-
-def _mixed_precision_high_kv_cache(
-    metadata: "DSAtrtllmAttentionMetadata", owner: "MixedPrecisionHighRowsOwner"
-) -> torch.Tensor | None:
-    """``owner``'s mixed-precision high pool as ``[num_blocks, tokens_per_block, row]``, or None."""
-    if _mixed_precision_high_block_table(metadata, owner) is None:
-        return None
+    if table is None:
+        return None, None
     manager = metadata.kv_cache_manager
     local = manager.layer_offsets[owner.layer_idx]
     if local not in manager.mixed_precision_high_layers:
         # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
-        return None
+        return None, None
     # [blocks, kv_factor, tokens, heads, width] with one head and no value half.
     pool = manager._get_mixed_precision_buffers(local, "NHD", "high")
-    return pool.view(pool.shape[0], pool.shape[2], -1)
-
-
-def _block_size(row_width: int) -> int:
-    return max(16, triton.next_power_of_2(row_width))
+    return pool.view(pool.shape[0], pool.shape[2], -1), table
 
 
 def store_mixed_precision_high_rows(
+    attention: "TrtllmAttention",
     metadata: "DSAtrtllmAttentionMetadata",
-    owner: "MixedPrecisionHighRowsOwner",
-    rows: torch.Tensor,
-    requests: torch.Tensor,
-    positions: torch.Tensor,
-    scale: torch.Tensor | None = None,
-    rotary_cos_sin: torch.Tensor | None = None,
-    rope_dim: int = 0,
+    latent_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    is_generation: bool,
 ) -> None:
-    """Store ``rows`` ``[num_tokens, row_width]`` in ``owner``'s mixed-precision high pool.
+    """Store this phase's tokens in the mixed-precision high pool where it holds their pages.
 
-    FP8 pools store ``row * scale``.
+    FP8 pools store `row * scale`. Context: the append kernel has already rotated k_pe and written
+    it back into `latent_cache`. Generation: the fused kernel rotates k_pe only inside the kernel,
+    so the store rotates it too.
 
-    ``requests`` and ``positions`` are ``[num_tokens]`` int32. With ``rotary_cos_sin``
-    (``[positions, rope_dim, 2]`` float32) the trailing ``rope_dim`` of every row is rotated first.
+    Args:
+        attention: Attention layer whose mixed-precision high pool receives the rows.
+        metadata: Attention metadata of the batch.
+        latent_cache: `[num_tokens, kv_lora_rank + qk_rope_head_dim]` compressed KV and k_pe in
+            the activation dtype: the batch's tokens, context first, or only the generation ones.
+        position_ids: int32 positions of the batch, context tokens first, in any shape that
+            flattens to one dimension; a context token's position is its KV position.
+        is_generation: Whether to store the generation tokens instead of the context tokens.
     """
-    kv_cache = _mixed_precision_high_kv_cache(metadata, owner)
+    num_ctx = metadata.num_ctx_tokens
+    num_rows = latent_cache.shape[0] if is_generation else num_ctx
+    if num_rows == 0:
+        return
+    assert position_ids is not None, "positions are required"
+    positions = position_ids.reshape(-1)
+    # Generation tokens are the trailing positions whichever slice the caller passes.
+    positions = positions[-num_rows:] if is_generation else positions[:num_ctx]
+    first = num_ctx if is_generation else 0
+    kv_cache, block_table = _mixed_precision_high_pool(metadata, attention)
     if kv_cache is None:
         return
-    rows = rows.reshape(rows.shape[0], -1)
-    if rows.shape[0] == 0:
-        return
-    if not rows.is_contiguous():
-        rows = rows.contiguous()
+    rows = latent_cache[:num_rows].flatten(1).contiguous()
     row_width = kv_cache.shape[-1]
     assert rows.shape[1] == row_width, (rows.shape, row_width)
-    block_table = _mixed_precision_high_block_table(metadata, owner)
+    scale = attention.kv_scale_orig_quant
     apply_scale = scale is not None and kv_cache.dtype == torch.float8_e4m3fn
+    rope_dim = attention.mla_params.qk_rope_head_dim if is_generation else 0
+    rotary_cos_sin = attention.rotary_cos_sin if is_generation else None
     rotate = rotary_cos_sin is not None
     if rotate:
         # (cos, sin) per pair and position; the first rope_dim // 2 pairs are used.
@@ -265,7 +263,7 @@ def store_mixed_precision_high_rows(
         assert rotary_cos_sin.stride(1) == 2 and rotary_cos_sin.stride(2) == 1
     _store_mixed_precision_high_rows_kernel[(rows.shape[0],)](
         rows,
-        requests,
+        metadata.req_idx_per_token[first : first + num_rows],
         positions,
         block_table,
         block_table.stride(0),
@@ -281,56 +279,9 @@ def store_mixed_precision_high_rows(
         ROTATE=rotate,
         ROW_WIDTH=row_width,
         ROPE_DIM=rope_dim,
-        BLOCK_SIZE=_block_size(row_width),
+        BLOCK_SIZE=max(16, triton.next_power_of_2(row_width)),
         # Separate roundings like the append kernel; FMA contraction would flip FP8 bits.
         enable_fp_fusion=False,
-    )
-
-
-def store_mixed_precision_high_context_rows(
-    attention: "TrtllmAttention",
-    metadata: "DSAtrtllmAttentionMetadata",
-    latent_cache: torch.Tensor,
-    position_ids: torch.Tensor,
-) -> None:
-    """Context phase: the append kernel wrote the rotated k_pe back into ``latent_cache``."""
-    num_ctx = metadata.num_ctx_tokens
-    if num_ctx == 0:
-        return
-    # position_ids spans [ctx..., gen...]; a context token's position is its KV position.
-    store_mixed_precision_high_rows(
-        metadata,
-        attention,
-        latent_cache[:num_ctx],
-        metadata.req_idx_per_token[:num_ctx],
-        position_ids.reshape(-1)[:num_ctx],
-        attention.kv_scale_orig_quant,
-    )
-
-
-def store_mixed_precision_high_generation_rows(
-    attention: "TrtllmAttention",
-    metadata: "DSAtrtllmAttentionMetadata",
-    latent_cache: torch.Tensor,
-    position_ids: torch.Tensor,
-) -> None:
-    """Generation: the fused kernel rotates k_pe in-kernel only, so the store rotates it as well."""
-    num_rows = latent_cache.shape[0]
-    if num_rows == 0:
-        return
-    assert position_ids is not None, "generation positions are required"
-    # Generation tokens are the trailing positions whichever slice the caller passes.
-    positions = position_ids.reshape(-1)[-num_rows:]
-    num_ctx = metadata.num_ctx_tokens
-    store_mixed_precision_high_rows(
-        metadata,
-        attention,
-        latent_cache,
-        metadata.req_idx_per_token[num_ctx : num_ctx + num_rows],
-        positions,
-        attention.kv_scale_orig_quant,
-        attention.rotary_cos_sin,
-        attention.mla_params.qk_rope_head_dim,
     )
 
 
@@ -341,7 +292,6 @@ def _mixed_precision_high_compressed_row_mask_kernel(
     block_table_stride,
     max_blocks,
     tokens_per_block,
-    num_comp_tokens_ptr,
     cu_new_comp_kv_ptr,
     start_pos_ptr,
     compressed_mask_ptr,
@@ -369,44 +319,9 @@ def _mixed_precision_high_compressed_row_mask_kernel(
     # Blocks past the table's width are pages the mixed-precision high pool never held.
     in_table = in_range & (position >= 0) & (block < max_blocks)
     page = tl.load(block_table_ptr + request * block_table_stride + block, mask=in_table, other=-1)
+    # compressed_mask already limits every request to its new compressed rows.
     selected = tl.load(compressed_mask_ptr + rows, mask=in_range, other=0) != 0
-    keep = selected & (local < tl.load(num_comp_tokens_ptr + request)) & in_table & (page >= 0)
-    tl.store(out_ptr + rows, keep, mask=in_range)
-
-
-def _mixed_precision_high_compressed_row_mask(
-    block_table: torch.Tensor,
-    tokens_per_block: int,
-    num_comp_tokens: torch.Tensor,
-    cu_new_comp_kv: torch.Tensor,
-    start_pos: torch.Tensor,
-    compressed_mask: torch.Tensor,
-    batch_size: int,
-    total_rows: int,
-) -> torch.Tensor:
-    """``compressed_mask`` narrowed to rows whose page the mixed-precision high pool holds.
-
-    The native scatter addresses pages straight from the table it is given and does not
-    understand -1, so rows of pages the mixed-precision high pool released are masked out.
-    """
-    mask = torch.empty(total_rows, dtype=torch.bool, device=block_table.device)
-    block = 256
-    _mixed_precision_high_compressed_row_mask_kernel[(triton.cdiv(total_rows, block),)](
-        mask,
-        block_table,
-        block_table.stride(0),
-        block_table.shape[1],
-        tokens_per_block,
-        num_comp_tokens,
-        cu_new_comp_kv,
-        start_pos,
-        compressed_mask,
-        batch_size,
-        total_rows,
-        SEARCH_STEPS=max(1, batch_size.bit_length()),
-        BLOCK=block,
-    )
-    return mask
+    tl.store(out_ptr + rows, selected & in_table & (page >= 0), mask=in_range)
 
 
 def store_mixed_precision_high_compressed_rows(
@@ -420,31 +335,51 @@ def store_mixed_precision_high_compressed_rows(
     compressed_mask: torch.Tensor,
     batch_size: int,
 ) -> None:
-    """DeepSeek-V4: run the compressor scatter again, into the mixed-precision high pool."""
+    """DeepSeek-V4: run the compressor scatter again, into the mixed-precision high pool.
+
+    Args:
+        compressor: Main (non-indexer) compressor of a layer with a mixed-precision high pool.
+        metadata: Attention metadata of the batch.
+        kv_comp: `[total_rows, head_dim]` compressed KV rows before RMSNorm and RoPE, in the
+            activation dtype.
+        position_ids: `[total_rows]` int32 positions of the compressed rows.
+        num_comp_tokens: `[batch_size]` int32 new compressed rows of each request.
+        cu_new_comp_kv: int32 offsets of each request's rows in `kv_comp`; at least
+            `batch_size + 1` entries.
+        start_pos: `[batch_size]` int32 compressed rows each request had cached before this step.
+        compressed_mask: `[total_rows]` bool rows the native scatter writes.
+        batch_size: Number of requests in the batch.
+    """
     from .deepseek_v4.compressor import KVCacheDtype
 
-    kv_cache = _mixed_precision_high_kv_cache(metadata, compressor)
+    kv_cache, block_table = _mixed_precision_high_pool(metadata, compressor)
     total_rows = kv_comp.shape[0]
     if kv_cache is None or total_rows == 0 or batch_size == 0:
         return
-    block_table = _mixed_precision_high_block_table(metadata, compressor)
     tokens_per_block = kv_cache.shape[1]
-    mask = _mixed_precision_high_compressed_row_mask(
+    # Narrow compressed_mask to rows whose page the mixed-precision high pool holds: the native
+    # scatter addresses pages straight from the table it is given and does not understand -1.
+    mask = torch.empty(total_rows, dtype=torch.bool, device=block_table.device)
+    _mixed_precision_high_compressed_row_mask_kernel[(triton.cdiv(total_rows, 256),)](
+        mask,
         block_table,
+        block_table.stride(0),
+        block_table.shape[1],
         tokens_per_block,
-        num_comp_tokens,
         cu_new_comp_kv,
         start_pos,
         compressed_mask,
         batch_size,
         total_rows,
+        SEARCH_STEPS=max(1, batch_size.bit_length()),
+        BLOCK=256,
     )
     cache_dtype = (
         KVCacheDtype.FP8_PERTENSOR if kv_cache.dtype == torch.float8_e4m3fn else KVCacheDtype.NONE
     )
     torch.ops.trtllm.compressor_postprocess_scatter(
         kv_comp,
-        None,
+        None,  # kv_out
         compressor.norm.weight,
         compressor.norm.variance_epsilon,
         compressor.rotary_emb.rotary_cos_sin,
@@ -452,7 +387,7 @@ def store_mixed_precision_high_compressed_rows(
         compressor.nope_head_dim,
         compressor.rope_head_dim,
         kv_cache,
-        None,
+        None,  # kv_cache_scale
         num_comp_tokens,
         cu_new_comp_kv,
         start_pos,
@@ -460,24 +395,27 @@ def store_mixed_precision_high_compressed_rows(
         mask,
         tokens_per_block,
         int(cache_dtype),
-        1.0,
-        0,
+        1.0,  # nvfp4_global_scale (unused: the mixed-precision high pool is not NVFP4)
+        0,  # nvfp4_residual_dim (must be 0: the pool is not NVFP4)
         compressor.rotate_activation,
-        None,
-        None,
+        None,  # quant_output
+        None,  # scale_output
     )
 
 
 _OVERLAY_BLOCK_K = 64
-# Per-device scratch-row records for context overlays, and the epoch of the last overlay.
+# Per-device scratch-row records (`epoch << 32 | mixed-precision high pool slot`) for context
+# overlays, and the epoch of the last overlay. Epochs start at 1, so zeroed records never match.
 _overlay_claims: dict[torch.device, tuple[torch.Tensor, int]] = {}
 
 
 def _overlay_claim(device: torch.device, rows: int) -> tuple[torch.Tensor, int]:
-    """Per-row records covering ``rows`` scratch rows and a fresh epoch (no per-call clearing)."""
+    """Per-row records covering `rows` scratch rows and a fresh epoch (no per-call clearing)."""
     claims, epoch = _overlay_claims.get(device, (None, 0))
     epoch += 1
+    # Restart before the epoch outgrows int32: it fills the upper half of an int64 record.
     if claims is None or claims.numel() < rows or epoch >= 2**31 - 1:
+        # At least 64K rows, so that smaller batches reuse the buffer.
         claims = torch.zeros(max(rows, 1 << 16), dtype=torch.int64, device=device)
         epoch = 1
     _overlay_claims[device] = (claims, epoch)
@@ -493,13 +431,22 @@ def overlay_mixed_precision_high_rows(
     scratch: torch.Tensor,
     shared_rows: bool = False,
 ) -> None:
-    """After the gather: copy mixed-precision high pool rows over the FP8 ``scratch`` rows.
+    """After the gather: copy mixed-precision high pool rows over the FP8 `scratch` rows.
 
-    ``topk_indices`` / ``compact_indices``: ``[num_rows, topk]`` int32 selected positions and the
-    scratch row the gather used (-1 = none); ``requests``: ``[num_rows]`` int32 batch rows.
-    ``shared_rows``: the context gather deduplicates, so many pairs point at one scratch row.
+    Args:
+        attention: Attention layer whose mixed-precision high pool supplies the rows.
+        metadata: Attention metadata of the batch.
+        topk_indices: `[num_rows, topk]` int32 KV positions each query token selected, -1 for
+            none; contiguous in the last dimension.
+        requests: `[num_rows]` int32 batch index of each query token's request.
+        compact_indices: `[num_rows, topk]` int32 scratch row the gather used for each selected
+            position, -1 for none; contiguous in the last dimension.
+        scratch: `torch.float8_e4m3fn` gather output, read as rows of the mixed-precision high
+            pool's row width.
+        shared_rows: Whether many (query token, top-k entry) pairs may point at one scratch row,
+            as after the deduplicating context gather.
     """
-    kv_cache = _mixed_precision_high_kv_cache(metadata, attention)
+    kv_cache, block_table = _mixed_precision_high_pool(metadata, attention)
     if kv_cache is None:
         return
     num_rows, topk = topk_indices.shape
@@ -508,10 +455,10 @@ def overlay_mixed_precision_high_rows(
     assert topk_indices.stride(1) == 1 and compact_indices.stride(1) == 1
     row_width = kv_cache.shape[-1]
     scratch_rows = scratch.numel() // row_width
-    block_table = _mixed_precision_high_block_table(metadata, attention)
     apply_scale = kv_cache.dtype != scratch.dtype
     # A captured graph would replay one epoch; there every pair copies its row instead.
     dedup = shared_rows and not torch.cuda.is_current_stream_capturing()
+    # Without deduplication the kernel never reads the records; the page table is a placeholder.
     claims, epoch = _overlay_claim(scratch.device, scratch_rows) if dedup else (block_table, 0)
     _overlay_mixed_precision_high_rows_kernel[(num_rows, triton.cdiv(topk, _OVERLAY_BLOCK_K))](
         topk_indices,

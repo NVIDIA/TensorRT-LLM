@@ -202,9 +202,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
     unquantized_mixed_precision_high_dtype = mapped_pyt_quant is None
+    sparse_attention_config = model_config.sparse_attention_config
     if (pyt_kv_cache_dtype.startswith("mixed_")
-            and getattr(model_config.sparse_attention_config, "algorithm",
-                        None) in ("dsa", "deepseek_v4")):
+            and sparse_attention_config is not None
+            and sparse_attention_config.algorithm in ("dsa", "deepseek_v4")):
         # These backends keep the history in their own pool, in the mixed-precision low
         # format; a drafter inherits this KV dtype from the model, as for every KV dtype.
         # TODO: keep drafters that are not MTP in the mixed-precision high dtype on every backend.

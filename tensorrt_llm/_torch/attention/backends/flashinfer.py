@@ -794,8 +794,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv = None
             self.num_contexts = target.num_contexts
             self._uses_full_draft_page_table = False
-            # Reuse the target's staging copy of a mixed draft manager, which overlap
-            # speculation corrects together with the target's.
+            # Reuse the target's staging copy of a mixed-precision draft manager.
             self.mixed_precision_staging = target.draft_mixed_precision_staging
             self.draft_mixed_precision_staging = None
             self.prepare()
@@ -936,8 +935,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         token_offsets = runtime_offsets.repeat_interleave(tokens_per_generation)
         self._positions[token_slice].add_(token_offsets, alpha=direction)
         view = self.mixed_precision_staging
-        if (view is not None and view.lengths is not None
-                and view.manager is self.kv_cache_manager):
+        if view is not None and view.manager is self.kv_cache_manager:
             # Keep the staging lengths in step with the KV lengths.
             view.lengths[:, row_slice].add_(runtime_offsets, alpha=direction)
 
