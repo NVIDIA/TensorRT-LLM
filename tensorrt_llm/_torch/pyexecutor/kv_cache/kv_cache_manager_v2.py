@@ -2080,6 +2080,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self._mirror_uses_draft_view = not (
             is_draft and spec_config is not None and spec_config.spec_dec_mode.is_external_drafter()
         )
+        # DFlash and DSpark drafters store a chunk at its target position
+        # (DFlashWorker._ctx_store_start).
+        self._is_dflash_draft = (
+            is_draft
+            and spec_config is not None
+            and (spec_config.spec_dec_mode.is_dflash() or spec_config.spec_dec_mode.is_dspark())
+        )
         # Mirror V1: expose max_draft_len so the native disagg AuxBuffer
         # (_make_aux_buffer's getattr fallback) is sized for MTP/spec decoding.
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
@@ -6182,10 +6189,7 @@ class KVCacheManagerV2(BaseResourceManager):
                             kv_cache.history_length,
                             req.context_current_position + req.context_chunk_size,
                         )
-                    elif (
-                        kv_cache.capacity >= req.context_current_position
-                        or self.draft_slot_trail_tokens > 0
-                    ):
+                    elif kv_cache.capacity >= req.context_current_position or self._is_dflash_draft:
                         # The chunk start is history for a mirror that already
                         # holds [0, chunk start): sliding-window layers keep
                         # pages only from history + 1 - window (AttnLifeCycle::
