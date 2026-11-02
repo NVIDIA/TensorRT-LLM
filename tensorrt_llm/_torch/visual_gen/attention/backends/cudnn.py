@@ -990,7 +990,7 @@ class CuDNNAttention(AttentionBackend):
         lengths = self._padding_prefix_lengths(key_padding_mask)
         seq_len = q.shape[1]
         if _PREFIX_INPLACE:
-            # Lever 19 (§657 box 46): one padded output buffer; cuDNN writes each item's valid
+            # In-place prefix write: one padded output buffer; cuDNN writes each item's valid
             # prefix straight into it and only the padding rows are zero-filled, instead of a
             # full-size zero-fill (F.pad) plus a full copy (torch.cat) per layer. Same cuDNN
             # plan (the problem shape and strides are unchanged), so the values are identical.

@@ -52,7 +52,7 @@ from .fused_fp8_qk import fusion_mode, set_reduce_group, static_descale
 
 MINIMAX_H3_MODALITY_NUM = 3
 
-try:  # lever 8 overlay (fused_fp8_qk.py): per-tensor norm + RoPE (+ FP8 cast) for the async Ulysses path
+try:  # fused_fp8_qk.py: per-tensor norm + RoPE (+ FP8 cast) for the async Ulysses path
     from .fused_fp8_qk import fusion_mode as _l8_fusion_mode
     from .fused_fp8_qk import norm_rope_tensor as _l8_norm_rope_tensor
     from .fused_fp8_qk import set_reduce_group as _l8_set_reduce_group
@@ -347,7 +347,7 @@ class MiniMaxH3Attention(Attention):
                 return False
         cos, sin = rotary_emb
         rot = cos.shape[-1]
-        # The NVFP4 producer fusion (lever 9) hands an Fp4QuantizedTensor (codes + scales):
+        # The NVFP4 producer fusion hands an Fp4QuantizedTensor (codes + scales):
         # read device, rank and sequence length from the codes; the projection output is BF16
         # either way.
         codes = getattr(hidden_states, "fp4_tensor", None)
@@ -378,7 +378,7 @@ class MiniMaxH3Attention(Attention):
         batch_size, sequence_length = hidden_states.shape[:2]
         head_dim = self.head_dim
 
-        # Pairing with the lever 8 per-tensor norm + RoPE kernel when its overlay is present:
+        # Pairing with the fused per-tensor norm + RoPE kernel when it is available:
         # "bf16" fuses norm and RoPE per projection; "fp8" (H3_L13_PAIR=fp8, FP8 attention
         # backend) also casts to e4m3 before the push, so the all-to-all carries 1-byte codes
         # viewed as bf16 and the receiver views them back (recv_view_dtype).

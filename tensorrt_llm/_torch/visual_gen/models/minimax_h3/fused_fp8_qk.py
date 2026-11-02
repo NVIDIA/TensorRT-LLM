@@ -713,7 +713,7 @@ def norm_rope_tensor(
     static_descale: Optional[torch.Tensor] = None,
     valid_len: Optional[torch.Tensor] = None,
 ):
-    """Per-tensor entry point for the async Ulysses path (lever 13, ¶14969).
+    """Per-tensor entry point for the async Ulysses path.
 
     ``norm_rope_tensor(q, norm_q.weight, cos, sin, eps)`` -> BF16 ``[B, S, H, D]``;
     ``norm_rope_tensor(q, norm_q.weight, cos, sin, eps, fp8=True)`` -> ``(q_fp8, descale[1])``;
