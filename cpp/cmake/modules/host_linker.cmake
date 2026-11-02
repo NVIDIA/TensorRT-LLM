@@ -13,7 +13,7 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-option(USE_LLD "Use LLVM lld for host linking (Linux, GCC/Clang)" OFF)
+option(USE_LLD "Use LLVM lld for host linking (Linux, GCC/Clang)" ON)
 if(USE_LLD)
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_CXX_COMPILER_ID
                                                MATCHES "^(GNU|Clang)$")

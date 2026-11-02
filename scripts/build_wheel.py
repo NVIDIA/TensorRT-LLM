@@ -966,7 +966,7 @@ def main(*,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
-         use_lld: bool = False,
+         use_lld: bool = True,
          out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
@@ -1769,10 +1769,15 @@ def add_arguments(parser: ArgumentParser):
                         help="Use ccache compiler driver for faster rebuilds")
     parser.add_argument(
         "--use_lld",
+        default=True,
         action="store_true",
         help=
-        "Use the LLVM lld host linker (Linux, GCC/Clang; requires ld.lld on PATH)"
+        "Use the LLVM lld host linker (default; Linux, GCC/Clang; requires ld.lld on PATH)"
     )
+    parser.add_argument("--no_lld",
+                        dest="use_lld",
+                        action="store_false",
+                        help="Use the toolchain's default host linker")
     parser.add_argument(
         "--use-3rdparty-cache",
         default=False,

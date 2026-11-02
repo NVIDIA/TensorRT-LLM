@@ -92,15 +92,15 @@ built.
 | `--build_type RelWithDebInfo` | Build with debug info (default: `Release`) |
 | `-j <N>` | Number of parallel compile jobs (default: number of available CPUs) |
 | `--fast_build` | Skip compiling some kernels to speed up compilation -- for development only |
-| `--use_lld` | Use the LLVM lld host linker on Linux with GCC or Clang |
+| `--no_lld` | Disable the default LLVM lld host linker and use the toolchain's default linker |
 
-To use lld, install it in the build environment (for example, `apt-get install lld`
-on Ubuntu) and pass `--use_lld` to `scripts/build_wheel.py`. Direct CMake builds
-can use `-DUSE_LLD=ON`. Configuration checks that the compiler can select lld
+Builds use lld by default on Linux with GCC or Clang. Install it in the build
+environment (for example, `apt-get install lld` on Ubuntu). Pass `--no_lld` to
+`scripts/build_wheel.py`, or `-DUSE_LLD=OFF` to CMake, to use the toolchain's
+default linker instead. Configuration checks that the compiler can select lld
 with `-fuse-ld=lld`. The option applies to host linking for executables, shared
 libraries, and Python extension modules; CUDA device linking continues to use
-nvlink. Omit `--use_lld` on a subsequent wheel build to return to the toolchain's
-default linker.
+nvlink. The `--use_lld` flag remains available to explicitly enable lld.
 
 ### Building from a checkout on a network filesystem
 
