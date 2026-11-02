@@ -2297,12 +2297,19 @@ class PyExecutor:
                     release_model_owned_graphs=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
+            self._release_model_communications()
         self._closed = True
         # The snapshot above keeps the model owners reachable for the outer
         # worker's collective terminal cleanup.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
+
+    def _release_model_communications(self) -> None:
+        """Release strategy-owned resources after graph teardown and device drain."""
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None:
+                engine.release_communication_resources()
 
     def _release_execution_resources(self,
                                      *,
@@ -2399,6 +2406,8 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if release_model_owned_graphs:
+            self._release_model_communications()
         if self.kv_cache_transceiver is not None:
             self.kv_cache_transceiver.shutdown()
         if self.resource_manager is not None:

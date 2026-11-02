@@ -34,7 +34,6 @@ subsequent dispatches call ``handle.update(topk_idx, ...)`` to rebind routing.
 CUDA-graph capture is supported once the handle exists.
 """
 
-from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import torch
@@ -166,6 +165,8 @@ class NcclEP(Communication):
                 external_fp8=self.use_external_fp8,
                 external_nvfp4=self.use_external_nvfp4,
             )
+        if getattr(self._ctx, "_shutdown_started", False):
+            raise RuntimeError("NCCL EP context is shutting down and cannot submit more work.")
         return self._ctx
 
     def _setup_handle(self, ctx, topk_nd, stream):
@@ -209,9 +210,7 @@ class NcclEP(Communication):
         ``recv_rank_counter[r]`` for source rank r have recv_slots = -1
         (sentinel), naturally skipped by the MoE backend.
         """
-        from nccl.ep import DispatchInputs, DispatchOutputs, Tensor
-
-        from tensorrt_llm.bindings.internal.thop import BufferKind
+        from nccl.ep import DispatchInputs, Tensor
 
         ctx = self._get_context()
 
@@ -301,30 +300,8 @@ class NcclEP(Communication):
         )
         topk_nd = Tensor(topk_idx_dev)
         dispatch_outputs = ctx.dispatch_outputs
-        window_tokens = None
-        # CUDA graph capture requires stable context-owned output addresses.
-        # Eager dispatch keeps the operation-scoped NCCL-window allocation.
-        if ctx.zerocopy_enabled and not torch.cuda.is_current_stream_capturing():
-            window_tokens, actual_kind, window_handle = (
-                torch.ops.trtllm.allocate_output_with_nccl_window(
-                    ctx.output_tokens_buf,
-                    int(BufferKind.NCCL_WINDOW),
-                    self.mapping.moe_ep_group,
-                )
-            )
-            if actual_kind == int(BufferKind.NCCL_WINDOW) and window_handle:
-                # The TRT-LLM pool owns this already-registered raw ncclWindow_t.
-                window = SimpleNamespace(handle=window_handle)
-                dispatch_outputs = DispatchOutputs(
-                    tokens=Tensor(window_tokens, window=window, window_offset=0),
-                    topk_weights=ctx.recv_topk_weights_nd,
-                    topk_idx=ctx.recv_topk_idx_nd,
-                    scales=ctx.scales_nd,
-                )
-            else:
-                # The allocator returned a distinct ordinary tensor. Dispatch
-                # still targets the persistent descriptor, so return it below.
-                window_tokens = None
+        # Every receive-buffer consumer must precede combine. Calls and graph
+        # replays sharing this EP context must remain serialized.
 
         handle = self._setup_handle(ctx, topk_nd, stream)
         inputs = DispatchInputs(
@@ -346,7 +323,6 @@ class NcclEP(Communication):
             "num_tokens": num_tokens,
             "topk_nd": topk_nd,
             "topk_idx_dev": topk_idx_dev,
-            "window_tokens": window_tokens,
         }
 
         # Match NVLinkOneSided's contract: token_selected_slots in
@@ -372,7 +348,7 @@ class NcclEP(Communication):
         # LL rank-major contract; downstream MoE pipeline expects 2D --
         # flatten via view. Restore routing weights to their input dtype for
         # downstream MoE backends; NCCL-EP transports them as FP32.
-        output_tokens = window_tokens if window_tokens is not None else ctx.output_tokens_buf
+        output_tokens = ctx.output_tokens_buf
         if self.use_external_fp8:
             output_tokens = output_tokens.view(torch.float8_e4m3fn)
         elif self.use_external_nvfp4:
@@ -421,6 +397,8 @@ class NcclEP(Communication):
         )
 
         ctx = self._ctx
+        if getattr(ctx, "_shutdown_started", False):
+            raise RuntimeError("NCCL EP context is shutting down and cannot submit more work.")
         if ctx is None:
             raise RuntimeError("NcclEP.combine called before dispatch.")
         state = self._dispatch_state
@@ -496,12 +474,23 @@ class NcclEP(Communication):
         self._dispatch_state = {}
         return combine_output
 
+    def release_executor_resources(self) -> None:
+        self.destroy()
+
     def destroy(self):
         """Release per-instance NCCL EP resources (handle).
 
         NcclEpContext is shared across instances and released through a
         refcounted cache.
         """
+        if self._ctx is not None and not self._ctx._prepare_shutdown():
+            # Retain per-instance descriptors as well as the shared context.
+            # No native handle may be freed while a peer can still access it.
+            if not hasattr(self._ctx, "_abandoned_instances"):
+                self._ctx._abandoned_instances = []
+            if not any(instance is self for instance in self._ctx._abandoned_instances):
+                self._ctx._abandoned_instances.append(self)
+            return
         if self._handle is not None:
             try:
                 self._handle.destroy()

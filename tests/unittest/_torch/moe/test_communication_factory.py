@@ -406,10 +406,10 @@ def test_nccl_ep_downgrades_unsupported_low_precision_combine(
     assert not strategy.use_low_precision_combine
 
 
-def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
+def test_nccl_ep_dispatch_returns_context_fallback_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """A rejected NCCL window must not replace the buffer written by dispatch."""
+    """Dispatch returns the context buffer when no receive window is available."""
 
     class FakeTensor:
         def __init__(self, tensor, **_):
@@ -440,7 +440,7 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
         topk_idx_dtype=torch.int32,
         kernel_resets_recv_topk_idx=True,
         kernel_writes_global_ids=True,
-        zerocopy_enabled=True,
+        window_buffers_supported=True,
         dispatch_outputs=SimpleNamespace(tokens=object()),
         layout=object(),
         dispatch_layout_info=object(),
@@ -458,13 +458,6 @@ def test_nccl_ep_window_refusal_returns_persistent_dispatch_buffer(
     monkeypatch.setattr(comm, "_get_context", lambda: context)
     monkeypatch.setattr(comm, "_setup_handle", lambda *_: FakeHandle())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    fallback_tokens = torch.zeros_like(persistent_tokens)
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "allocate_output_with_nccl_window",
-        lambda *_: (fallback_tokens, 0, 0),
-    )
-
     recv_hs, *_ = comm.dispatch(
         torch.zeros(1, 4, dtype=torch.bfloat16),
         None,

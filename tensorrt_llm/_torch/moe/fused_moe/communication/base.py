@@ -170,6 +170,12 @@ class Communication(ABC):
         """
         return False
 
+    def release_executor_resources(self) -> None:
+        """Release opted-in resources after graphs and GPU work are drained on all ranks.
+
+        Strategies with a separate lifecycle owner retain their existing cleanup path.
+        """
+
     def prepare_dispatch(
         self,
         token_selected_slots: torch.Tensor,  # [local_num_tokens, top_k]
