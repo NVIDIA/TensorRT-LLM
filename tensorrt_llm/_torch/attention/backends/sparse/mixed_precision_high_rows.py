@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Mixed-precision high layers for sparse MLA backends that keep the history in an NVFP4 pool.
+"""Mixed-precision high pool for sparse MLA backends that keep the history in an NVFP4 pool.
 
-Each new token is also written to its layer's mixed-precision high layer. After the top-k
-gather, rows the high layer still holds overwrite the dequantized rows in the FP8 scratch.
-High page table entry: page >= 0 if the token is in the high pool, else -1.
+Each new token is also written to the mixed-precision high pool. After the top-k gather, rows
+the mixed-precision high pool still holds overwrite the dequantized rows in the FP8 scratch.
+Mixed-precision high page table: a page index if the token is held there, else -1.
 """
 
 from typing import TYPE_CHECKING
@@ -42,7 +42,7 @@ def _store_mixed_precision_high_rows_kernel(
     ROPE_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """One program per token: store its row in the high pool if its page is held."""
+    """One program per token: store its row in the mixed-precision high pool if its page is held."""
     token = tl.program_id(0)
     request = tl.load(request_ptr + token)
     position = tl.load(position_ptr + token)
@@ -88,7 +88,7 @@ def _copy_rows(
     ROW_WIDTH: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """Copy high-pool rows ``slot`` to scratch rows ``scratch_row`` where ``valid``, scaled to FP8."""
+    """Copy mixed-precision high pool rows ``slot`` to scratch rows ``scratch_row`` (FP8)."""
     src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
     dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
     if APPLY_SCALE:
@@ -129,7 +129,7 @@ def _overlay_mixed_precision_high_rows_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """One program per (query row, BLOCK_K selected tokens): copy the rows the high layer holds."""
+    """Per (query row, BLOCK_K tokens): copy rows the mixed-precision high pool holds."""
     query = tl.program_id(0)
     ks = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
     in_row = ks < topk
@@ -148,7 +148,8 @@ def _overlay_mixed_precision_high_rows_kernel(
     slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
     if DEDUP:
         # Context scratch rows are shared by every query that selected the token: record the
-        # row's high-pool slot (same value from every pair, no atomics); a per-row pass copies it once.
+        # row's mixed-precision high pool slot (same value from every pair, no atomics); a per-row
+        # pass copies it once.
         # Most pairs find the row already recorded and skip the store.
         record = (claim_epoch.to(tl.int64) << 32) | slot
         current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
@@ -181,7 +182,7 @@ def _copy_recorded_rows_kernel(
     BLOCK_R: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """One program per BLOCK_R scratch rows: copy the high-pool row recorded this call."""
+    """One program per BLOCK_R scratch rows: copy the mixed-precision high pool row recorded now."""
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     recorded = tl.load(claim_ptr + rows, mask=rows < scratch_rows, other=0)
     valid = (rows < scratch_rows) & ((recorded >> 32) == claim_epoch.to(tl.int64))
@@ -211,13 +212,13 @@ def _mixed_precision_high_block_table(
 def _mixed_precision_high_kv_cache(
     metadata: "DSAtrtllmAttentionMetadata", owner: "MixedPrecisionHighRowsOwner"
 ) -> torch.Tensor | None:
-    """``[num_blocks, tokens_per_block, row]`` view of ``owner``'s high pool, else None."""
+    """``owner``'s mixed-precision high pool as ``[num_blocks, tokens_per_block, row]``, or None."""
     if _mixed_precision_high_block_table(metadata, owner) is None:
         return None
     manager = metadata.kv_cache_manager
     local = manager.layer_offsets[owner.layer_idx]
     if local not in manager.mixed_precision_high_layers:
-        # No high layer (e.g. an Eagle3 drafter layer): a plain cache.
+        # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
         return None
     # [blocks, kv_factor, tokens, heads, width] with one head and no value half.
     pool = manager._get_mixed_precision_buffers(local, "NHD", "high")
@@ -238,7 +239,9 @@ def store_mixed_precision_high_rows(
     rotary_cos_sin: torch.Tensor | None = None,
     rope_dim: int = 0,
 ) -> None:
-    """Store ``rows`` ``[num_tokens, row_width]`` in ``owner``'s high pool (FP8: ``row * scale``).
+    """Store ``rows`` ``[num_tokens, row_width]`` in ``owner``'s mixed-precision high pool.
+
+    FP8 pools store ``row * scale``.
 
     ``requests`` and ``positions`` are ``[num_tokens]`` int32. With ``rotary_cos_sin``
     (``[positions, rope_dim, 2]`` float32) the trailing ``rope_dim`` of every row is rotated first.
@@ -363,7 +366,7 @@ def _mixed_precision_high_compressed_row_mask_kernel(
     local = rows - tl.load(cu_new_comp_kv_ptr + request)
     position = tl.load(start_pos_ptr + request) + local
     block = position // tokens_per_block
-    # Blocks past the table's width are pages the high layer never held.
+    # Blocks past the table's width are pages the mixed-precision high pool never held.
     in_table = in_range & (position >= 0) & (block < max_blocks)
     page = tl.load(block_table_ptr + request * block_table_stride + block, mask=in_table, other=-1)
     selected = tl.load(compressed_mask_ptr + rows, mask=in_range, other=0) != 0
@@ -381,10 +384,10 @@ def _mixed_precision_high_compressed_row_mask(
     batch_size: int,
     total_rows: int,
 ) -> torch.Tensor:
-    """``compressed_mask`` narrowed to the rows whose page the high layer holds.
+    """``compressed_mask`` narrowed to rows whose page the mixed-precision high pool holds.
 
     The native scatter addresses pages straight from the table it is given and does not
-    understand -1, so the rows of pages the high layer released must be masked out.
+    understand -1, so rows of pages the mixed-precision high pool released are masked out.
     """
     mask = torch.empty(total_rows, dtype=torch.bool, device=block_table.device)
     block = 256
@@ -417,7 +420,7 @@ def store_mixed_precision_high_compressed_rows(
     compressed_mask: torch.Tensor,
     batch_size: int,
 ) -> None:
-    """DeepSeek-V4: run the compressor scatter again, into the high layer."""
+    """DeepSeek-V4: run the compressor scatter again, into the mixed-precision high pool."""
     from .deepseek_v4.compressor import KVCacheDtype
 
     kv_cache = _mixed_precision_high_kv_cache(metadata, compressor)
@@ -490,7 +493,7 @@ def overlay_mixed_precision_high_rows(
     scratch: torch.Tensor,
     shared_rows: bool = False,
 ) -> None:
-    """After the gather: overwrite the dequantized FP8 ``scratch`` rows with high-pool rows.
+    """After the gather: copy mixed-precision high pool rows over the FP8 ``scratch`` rows.
 
     ``topk_indices`` / ``compact_indices``: ``[num_rows, topk]`` int32 selected positions and the
     scratch row the gather used (-1 = none); ``requests``: ``[num_rows]`` int32 batch rows.

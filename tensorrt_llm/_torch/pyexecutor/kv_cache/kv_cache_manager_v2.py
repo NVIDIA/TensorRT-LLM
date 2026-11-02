@@ -3972,9 +3972,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         return replace(config, layers=layers)
 
-    # Mixed-precision KV: each full-attention layer keeps its history in a mixed-precision low pool
-    # and a native SWA+sink layer group keeps every sequence's first_n/last_n tokens at the
-    # attention dtype. Attention reads a staging copy prepared by the attention metadata.
+    # Mixed-precision KV: each full-attention layer keeps its history in a mixed-precision low
+    # pool and every sequence's first_n/last_n tokens in a mixed-precision high pool at the
+    # attention dtype. The manager builds the mixed-precision high pool as a native SWA+sink
+    # layer group.
+    # Attention reads a staging copy prepared by the attention metadata.
 
     def _init_mixed_precision(
         self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
@@ -4004,7 +4006,8 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
         self.mixed_precision_low_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
         self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
-        # A dense manager keeps its pool in mixed.high and builds the low pool itself.
+        # A dense manager keeps its own pool in the mixed-precision high dtype and builds the
+        # mixed-precision low pool itself.
         if not self._mixed_precision_native_pool and dtype != self.mixed_precision_high_dtype:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the first/last tokens in "
@@ -4057,7 +4060,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
-        """Rows per high-layer page; a page always covers tokens_per_block tokens."""
+        """Rows per mixed-precision high layer page; a page covers tokens_per_block tokens."""
         return self.tokens_per_block
 
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -4101,8 +4104,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if not self.mixed_precision_high_layers:
             return config
-        # Disaggregated transfer derives collision-free ids for the high layers from this
-        # (model layer, kind) mapping; a manager with its own mapping keeps it unchanged.
+        # Disaggregated transfer derives collision-free ids for the mixed-precision high layers
+        # from this (model layer, kind) mapping; a manager with its own mapping keeps it unchanged.
         if getattr(self, "_layer_attn_to_layer_id", None) is None:
             self._layer_attn_to_layer_id = {
                 (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
@@ -4186,7 +4189,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def fill_mixed_precision_high_page_table(
         self, request_ids: list[int], layer_idx: int, out: np.ndarray
     ) -> None:
-        """Write the ``(batch, pages)`` page table of ``layer_idx``'s high layer."""
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s mixed-precision high layer."""
         self._fill_page_table(
             self.mixed_precision_high_layers[self.layer_offsets[layer_idx]], request_ids, out
         )

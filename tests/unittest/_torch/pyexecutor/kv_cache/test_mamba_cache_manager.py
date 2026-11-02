@@ -4098,7 +4098,7 @@ def test_v2_hybrid_mixed_precision_appends_high_group():
         kv_cache_config=_mixed_precision_kv_cache_config(),
     )
     try:
-        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its high layer.
+        # Layer 0: recurrent state, layer 1: attention, layer 2: its mixed-precision high layer.
         assert mgr.mixed_precision_high_layers == {1: 2}
         assert not mgr._is_local_mamba_layer(2)
         assert mgr.get_buffers(0) is None
@@ -4123,7 +4123,7 @@ def test_v2_hybrid_mixed_precision_appends_high_group():
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
 def test_v2_hybrid_mixed_precision_disagg_names_high_layers():
-    """Disaggregated transfer gives a hybrid manager's high layers collision-free ids."""
+    """Disaggregated transfer gives hybrid mixed-precision high layers collision-free ids."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),

@@ -711,7 +711,7 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
 def test_draft_forward_hides_mixed_precision_high_rows(backend):
-    """A draft forward on a manager without high layers turns the high-layer writes and reads off."""
+    """A draft manager without a mixed-precision high pool skips its writes and reads."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
@@ -784,7 +784,7 @@ def test_dsa_mixed_precision_high_tables_refresh_full_width():
 
 @pytest.mark.cpu_only
 def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
-    """MTP layers on a mixed DSA draft manager read its own high page table during the draft forward."""
+    """A mixed DSA draft manager's MTP layers read its own mixed-precision high page table."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
@@ -823,7 +823,7 @@ def test_draft_forward_swaps_in_draft_staging():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_mixed_precision_high_compressed_row_mask_matches_reference():
-    """DeepSeek-V4: the high-layer scatter only writes rows whose page the high layer holds.
+    """DeepSeek-V4: the scatter only writes rows whose page the mixed-precision high pool holds.
 
     Many requests with padding rows, released pages and pages past the table width.
     """
@@ -862,14 +862,15 @@ def test_mixed_precision_high_compressed_row_mask_matches_reference():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_store_mixed_precision_high_context_rows_uses_context_positions():
-    """DSA context: each row lands at its position_ids entry if the high layer holds that page."""
+    """DSA context: rows land at position_ids if the mixed-precision high pool has the page."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
         store_mixed_precision_high_context_rows,
     )
 
     tokens_per_block, width, num_ctx = 4, 576, 10
     pool = torch.zeros((4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
-    # Request 0 resumes at position 6; request 1 starts at 0 and its high layer released page 0.
+    # Request 0 resumes at position 6; request 1 starts at 0 and the mixed-precision high pool
+    # released its page 0.
     table = torch.tensor([[-1, 2, 0, -1], [-1, 3, -1, -1]], dtype=torch.int32, device="cuda")
     ctx_positions = [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
     # position_ids spans [ctx..., gen...]; the generation tail must not be stored here.
@@ -950,7 +951,7 @@ def test_store_mixed_precision_high_generation_rows_rotates_k_pe():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("shared_rows", [False, True])
 def test_overlay_mixed_precision_high_rows_copies_held_rows(shared_rows):
-    """The overlay replaces exactly the scratch rows whose token the high layer holds.
+    """The overlay replaces exactly the scratch rows whose token the mixed-precision high pool has.
 
     Two calls in a row: the context overlay's row records from the first call must not leak
     into the second, which releases pages the first one held.
@@ -1018,7 +1019,7 @@ def test_mixed_precision_high_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_bfloat16")
     assert model_config.quant_config.kv_cache_quant_algo is None
-    # Sparse MLA models map the pool to NVFP4, but the high dtype must still match.
+    # Sparse MLA models map the pool to NVFP4, but the mixed-precision high dtype must still match.
     sparse = SimpleNamespace(
         quant_config=QuantConfig(),
         quant_config_dict=None,

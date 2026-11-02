@@ -387,7 +387,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def has_mixed_precision_high_rows(self) -> bool:
-        """Mixed-precision KV is on and this backend writes and reads the high layers."""
+        """Whether this backend writes and reads a mixed-precision high pool."""
         return self.mixed_precision_high_block_table is not None
 
     def _fill_mixed_precision_high_block_table(
@@ -410,7 +410,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             (self.draft_kv_cache_manager, self.draft_mixed_precision_high_block_table),
         ):
             if high_table is not None:
-                # All high layers share one pool and page scale, so one table serves them all.
+                # All layers share one mixed-precision high pool, so one table serves them all.
                 layer_idx = manager.pp_layers[next(iter(manager.mixed_precision_high_layers))]
                 self._fill_mixed_precision_high_block_table(manager, layer_idx, high_table)
 
@@ -467,7 +467,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # MTP layers on the draft manager use its high page table; other drafters have none.
+        # MTP layers on the draft manager use its mixed-precision high page table; other drafters
+        # have none.
         self.swap_for_draft(
             "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
         )

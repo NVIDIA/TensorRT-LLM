@@ -244,7 +244,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # An unquantized high dtype has to be the model dtype; KVCacheManagerV2
+    # An unquantized mixed-precision high dtype has to be the model dtype; KVCacheManagerV2
     # would otherwise reject it after the weights are loaded.
     if unquantized_mixed_precision_high_dtype:
         mixed_precision_high_dtype = str_dtype_to_torch(

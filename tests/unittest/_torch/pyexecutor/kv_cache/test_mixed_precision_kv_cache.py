@@ -130,7 +130,8 @@ def test_mixed_precision_preserves_native_and_shared_kv_storage(make_manager):
         ),
         **options,
     )
-    # Layer groups: full attention (low), sliding window, first/last tokens (high).
+    # Layer groups: full attention (mixed-precision low), sliding window, first/last tokens
+    # (mixed-precision high).
     mixed = make_manager(
         config=mixed_config(max_attention_window=windows, pool_ratio=[0.25, 0.5, 0.25]),
         **options,
@@ -205,7 +206,7 @@ def test_automatic_pool_sizing_covers_mixed_precision_high_group(make_manager, e
         f"high {high_pages} pages / {high_bytes >> 20} MiB"
     )
     # Every resident request needs 6 history pages but only the sink page and
-    # the 66-token window (2-3 pages) in the high group. High pages are
+    # the 66-token window (2-3 pages) in the mixed-precision high group. Those pages are
     # BF16 and 3.2x larger than NVFP4 history pages, so compare page counts.
     assert low_pages >= 64 * 6
     assert high_pages >= 64 * 2
@@ -383,7 +384,7 @@ def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, high_dtype):
 
 
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):
-    """A separate one-model MTP draft manager adds high layers for its own layers, like the target."""
+    """A separate MTP draft manager adds mixed-precision high layers like the target."""
     from types import SimpleNamespace
 
     from tensorrt_llm.llmapi import MTPDecodingConfig
@@ -467,7 +468,7 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
 
 
 def test_deepseek_v4_mixed_disagg_names_every_layer():
-    """Disaggregated transfer gives the DeepSeek-V4 high layers their own layer ids."""
+    """Disaggregated transfer gives DeepSeek-V4 mixed-precision high layers their own layer ids."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
@@ -502,7 +503,8 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         pretrained_config=SimpleNamespace(num_hidden_layers=4),
     )
     try:
-        # Each of the three compressed layers has a high layer, registered as MIXED_PRECISION_HIGH.
+        # Each compressed layer has a mixed-precision high layer, registered as
+        # MIXED_PRECISION_HIGH.
         assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
         mixed_high = DeepseekV4AttentionType.MIXED_PRECISION_HIGH
         for local, high_layer in manager.mixed_precision_high_layers.items():
@@ -518,7 +520,7 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         assert len(ids) == len(set(ids))
         num_types = max(member.value for member in DeepseekV4AttentionType) + 1
         assert {layer * num_types + mixed_high.value for layer in (1, 2, 3)} <= set(ids)
-        # A peer with the same layout pairs every pool, the high layers' included.
+        # A peer with the same layout pairs every pool, mixed-precision high pools included.
         registrar = PeerRegistrar(rank, KVRegionExtractorV1(rank.page_table))
         peer = RankInfo.from_bytes(rank.to_bytes())
         peer.instance_name = "decode"
@@ -534,7 +536,7 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
 
 
 def test_deepseek_v4_mtp_layer_stays_native():
-    """DeepSeek-V4's MTP layer has only a sliding window, so it gets no high layer."""
+    """DeepSeek-V4's MTP layer is sliding-window only, so it gets no mixed-precision high layer."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
@@ -566,7 +568,8 @@ def test_deepseek_v4_mtp_layer_stays_native():
     )
     try:
         assert manager.pp_layers == [0, 1, 2, 3, 4]
-        # Only the compressed layers (ratio 4 or 128) get a high layer; MTP layer 4 does not.
+        # Only compressed layers (ratio 4 or 128) get a mixed-precision high layer; MTP layer 4
+        # does not.
         assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
     finally:
         manager.shutdown()
