@@ -4275,7 +4275,13 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         layer_specs = getattr(self, "layer_specs", None)
         if layer_specs is None:
-            return None
+            # Virtual storage IDs may not index the model-layer head list.
+            local_layer_id = int(layer_id)
+            if hasattr(self, "_layer_attn_to_layer_id") or not (
+                0 <= local_layer_id < len(self.num_kv_heads_per_layer)
+            ):
+                return None
+            return KVCacheLayerOwner.TARGET.value, self.num_kv_heads_per_layer[local_layer_id]
         layer = layer_specs[int(layer_id)]
         return layer.owner.value, layer.num_kv_heads
 

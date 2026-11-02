@@ -368,10 +368,12 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
         pytest.param(("target", "draft"), (2, 2), 2, id="mixed-owners-uniform-heads"),
         pytest.param(("target", "draft"), (2, 1), 2, id="mixed-owners-mixed-heads"),
         pytest.param(("draft", "draft"), (2, 1), 2, id="draft-mixed-heads"),
+        pytest.param(None, (2, 2), 1, id="no-layer-specs-uniform-heads"),
+        pytest.param(None, (2, 1), 2, id="no-layer-specs-mixed-heads"),
     ],
 )
 def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
-    owners: tuple[str, str], head_counts: tuple[int, int], expected_num_views: int
+    owners: tuple[str, str] | None, head_counts: tuple[int, int], expected_num_views: int
 ) -> None:
     from types import SimpleNamespace
 
@@ -392,17 +394,19 @@ def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
         attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(4 * buffer_size,)
     )
     manager.num_kv_heads_per_layer = list(head_counts)
-    manager.layer_specs = tuple(
-        KVCacheLayerSpec(
-            global_layer_id=layer,
-            owner=KVCacheLayerOwner(owners[layer]),
-            dtype=DataType.HALF,
-            num_kv_heads=heads,
-            head_dim=128 // heads,
-            buffer_roles=(Role.KEY, Role.VALUE),
+    manager.layer_specs = None
+    if owners is not None:
+        manager.layer_specs = tuple(
+            KVCacheLayerSpec(
+                global_layer_id=layer,
+                owner=KVCacheLayerOwner(owners[layer]),
+                dtype=DataType.HALF,
+                num_kv_heads=heads,
+                head_dim=128 // heads,
+                buffer_roles=(Role.KEY, Role.VALUE),
+            )
+            for layer, heads in enumerate(head_counts)
         )
-        for layer, heads in enumerate(head_counts)
-    )
     manager.get_disagg_pool_view_partition = (
         KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
     )
@@ -421,6 +425,68 @@ def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
     else:
         assert views[0].num_kv_heads == 2
         assert get_unique_layers(views[0]) == {0, 1}
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_preserves_virtual_layer_view_partition() -> None:
+    from enum import IntEnum
+    from types import SimpleNamespace
+
+    class AttentionKind(IntEnum):
+        PRIMARY = 0
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate((0, 2))
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.layer_specs = None
+    manager.impl.layer_grouping = ((0, 2),)
+    manager._layer_attn_to_layer_id = {(0, AttentionKind.PRIMARY): 0, (1, AttentionKind.PRIMARY): 2}
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == 1
+    assert get_unique_layers(views[0]) == {0, 2}
+    assert views[0].buffer_entries["offset"].tolist() == [0, 128, 256, 384]
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_accepts_replicated_virtual_layer_without_head_count() -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (2, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+        slot_bytes_list=(384,),
+    )
+    manager.layer_specs = None
+    manager.impl.layer_grouping = ((0, 2),)
+    manager.get_disagg_global_layer_ids = lambda _: [0, 2]
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == 2
+    assert get_unique_layers(views[0]) == {0}
+    assert views[0].num_kv_heads == 1
+    assert get_unique_layers(views[1]) == {2}
+    assert views[1].mapper_kind == MapperKind.REPLICATED
+    assert views[1].num_kv_heads is None
+    assert views[1].buffer_entries["offset"].tolist() == [256]
 
 
 @pytest.mark.cpu_only
