@@ -490,6 +490,69 @@ def test_per_view_heads_select_correct_transfer_bytes(mapper_kind):
     assert pair.dst.memory.bytes_per_region == pair.src.memory.bytes_per_region
 
 
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize(
+    "view_idx,peer_tp_rank,src_head_idx",
+    [
+        (0, 0, 0),
+        (0, 1, 2),
+        (0, 2, 4),
+        (0, 3, 6),
+        (1, 0, 0),
+        (1, 1, 0),
+        (1, 2, 1),
+        (1, 3, 1),
+    ],
+)
+def test_per_view_heads_select_correct_transfer_bytes_with_larger_gen_tp(
+    mapper_kind: MapperKind, view_idx: int, peer_tp_rank: int, src_head_idx: int
+) -> None:
+    # TP1 -> TP4: the eight-head view sends two heads per receiver; the
+    # two-head view sends head 0 to ranks 0/1 and head 1 to ranks 2/3.
+    self_ri = make_rankinfo(
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=4,
+        tp_rank=peer_tp_rank,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, (0, view_idx), (0, view_idx))
+    src_heads = [8, 2][view_idx]
+    dst_heads = [2, 1][view_idx]
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=16 * src_heads)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=16 * dst_heads)),
+    )
+
+    if mapper_kind == MapperKind.NHD:
+        assert isinstance(mapper, NHDHeadMismatchMapper)
+        # Four bytes per token/head, with a fragment for each K/V token.
+        expected_src_ptrs = [1000 + 4 * src_head_idx + 4 * src_heads * i for i in range(4)]
+        expected_dst_ptrs = [2000 + 4 * dst_heads * i for i in range(4)]
+        expected_fragment_bytes = 4 * dst_heads
+    else:
+        assert isinstance(mapper, HNDHeadMismatchMapper)
+        # Eight bytes per head across both tokens, with one fragment per K/V.
+        expected_src_ptrs = [1000 + 8 * src_head_idx, 1000 + 8 * src_heads + 8 * src_head_idx]
+        expected_dst_ptrs = [2000, 2000 + 8 * dst_heads]
+        expected_fragment_bytes = 8 * dst_heads
+    assert pair.src.memory.ptrs.tolist() == expected_src_ptrs
+    assert pair.dst.memory.ptrs.tolist() == expected_dst_ptrs
+    assert pair.src.memory.bytes_per_region == expected_fragment_bytes
+    assert pair.dst.memory.bytes_per_region == expected_fragment_bytes
+
+
 def test_per_view_head_duplication_elects_senders_independently():
     peer_ri = make_rankinfo(
         instance_name="peer",
