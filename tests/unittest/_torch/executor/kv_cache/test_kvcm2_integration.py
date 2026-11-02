@@ -1453,8 +1453,13 @@ def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) ->
     )
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     status = _KVCacheManagerInitStatus.ABORT if peer_failed else _KVCacheManagerInitStatus.OK
+    dist = Mock()
+    dist.allreduce.side_effect = lambda value, op: value
 
-    with patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync:
+    with (
+        patch.object(Distributed, "get", return_value=dist),
+        patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync,
+    ):
         config = KvCacheConfig(
             max_gpu_total_bytes=16 << 20, host_cache_size=0, enable_block_reuse=False
         )
