@@ -886,6 +886,10 @@ class FinalizeIpcWorkspace:
         waits for this rank's device and then closes this rank's mappings of
         peer memory. It never frees this rank's own buffer, which peers may
         still map; that stays allocated until the process exits.
+
+        The model never calls `close()`: the workspace lives as long as the
+        process serving the model, so a process that builds the model several
+        times keeps one 8 MiB buffer per build until it exits.
         """
         if self._closed:
             return

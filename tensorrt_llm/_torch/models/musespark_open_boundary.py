@@ -61,14 +61,13 @@ if _HAS_CUTE_DSL:
     class _ClusterBoundaryKernel:
         def __init__(
             self,
-            m: int,
             cluster: int,
             threads: int,
             gain: bool,
             post_eps: float,
             pre_eps: float,
         ):
-            self.m, self.cluster, self.threads, self.gain = m, cluster, threads, gain
+            self.cluster, self.threads, self.gain = cluster, threads, gain
             self.post_eps, self.pre_eps = float(post_eps), float(pre_eps)
             self.iters = 8192 // (cluster * threads * 8)
             self.warps = threads // 32
@@ -85,10 +84,11 @@ if _HAS_CUTE_DSL:
             weight: cute.Pointer,
             output: cute.Pointer,
             next_output: cute.Pointer,
+            tokens: Int32,
             stream: cuda.CUstream,
         ):
             self.kernel(branch, residual, gain, alpha, beta, weight, output, next_output).launch(
-                grid=[self.m * self.cluster, 1, 1],
+                grid=[tokens * self.cluster, 1, 1],
                 block=[self.threads, 1, 1],
                 cluster=[self.cluster, 1, 1],
                 smem=self.slots * 4 * 4 * 2 + 16,
@@ -232,20 +232,28 @@ if _HAS_CUTE_DSL:
         cutlass.BFloat16,
     )
 
-    @functools.lru_cache(maxsize=128)
+    def _cluster_size(tokens: int) -> int:
+        """CTAs per token: fewer tokens spread each one over more CTAs."""
+        return 16 if tokens == 1 else (8 if tokens <= 8 else 4)
+
+    # The token count is a launch argument, so only the three cluster sizes,
+    # the gain and the two epsilons select a compilation. The executor's warmup
+    # runs each CUDA graph batch size eagerly before capturing it, so a capture
+    # never compiles.
+    @functools.lru_cache(maxsize=32)
     def _compile_boundary(
-        tokens: int, has_gain: bool, post_eps: float, pre_eps: float, device_index: int
+        cluster: int, has_gain: bool, post_eps: float, pre_eps: float, device_index: int
     ):
-        cluster = 16 if tokens == 1 else (8 if tokens <= 8 else 4)
         threads = min(256, 8192 // (cluster * 8))
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
-                _ClusterBoundaryKernel(tokens, cluster, threads, has_gain, post_eps, pre_eps),
+                _ClusterBoundaryKernel(cluster, threads, has_gain, post_eps, pre_eps),
                 *[
                     make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
                     for dtype in _DTYPES
                 ],
+                Int32(1),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -316,12 +324,17 @@ def cluster_boundary(
         raise ValueError("Unsupported cluster boundary inputs, device, or alignment")
     gain_arg = next_weight if gain is None else gain
     updated, normalized = torch.empty_like(residual), torch.empty_like(branch)
+    tokens = residual.shape[0]
     compiled = _compile_boundary(
-        residual.shape[0], gain is not None, post_eps, pre_eps, residual.device.index
+        _cluster_size(tokens), gain is not None, post_eps, pre_eps, residual.device.index
     )
     args = (branch, residual, gain_arg, alpha, beta, next_weight, updated, normalized)
     # Resolve the stream per call: a CUDA graph captures on a different stream
     # from the eager call that filled the compilation cache.
     stream = cuda.CUstream(torch.cuda.current_stream(residual.device).cuda_stream)
-    compiled(*[make_ptr(dtype, tensor.data_ptr()) for dtype, tensor in zip(_DTYPES, args)], stream)
+    compiled(
+        *[make_ptr(dtype, tensor.data_ptr()) for dtype, tensor in zip(_DTYPES, args)],
+        tokens,
+        stream,
+    )
     return updated, normalized

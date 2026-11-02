@@ -1157,6 +1157,11 @@ def _build_finalize_allreduce_workspace(mapping: Mapping) -> Optional["FinalizeI
     other's memory or the ranks disagree. That is a property of the
     deployment, so it degrades to the unfused path instead of failing model
     construction.
+
+    It is also the first TP collective in the model's constructor: every rank
+    must reach it. A rank that fails earlier in the constructor leaves its
+    peers blocked here until the launcher stops them, instead of failing with
+    the same error.
     """
     from .musespark_open_finalize_ar import HAS_CUTEDSL, FinalizeIpcWorkspace
 
