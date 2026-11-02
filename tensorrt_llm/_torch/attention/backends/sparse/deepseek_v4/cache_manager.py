@@ -1080,6 +1080,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         config = super()._add_mixed_precision_layers(config)
         if self.high_layers:
             self._num_manager_layers = len(config.layers)
+            # Disaggregated transfer names every layer through this map.
+            for local, twin in self.high_layers.items():
+                self._layer_attn_to_layer_id[
+                    self.pp_layers[local], DeepseekV4AttentionType.RETAINED
+                ] = LayerId(twin)
         return config
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -2097,6 +2102,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         buffers_handled = set()
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            if attn == DeepseekV4AttentionType.RETAINED:
+                # The base manager owns the twins' buffers.
+                continue
             buffer_key = (layer_id, attn.role)
             if buffer_key in buffers_handled:
                 continue
@@ -2136,6 +2144,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # buffers -- the clobber case the per-buffer key exists to avoid.
         buffers_per_layer: Dict[int, set] = defaultdict(set)
         for layer, attn in self._layer_attn_to_layer_id:
+            if attn == DeepseekV4AttentionType.RETAINED:
+                continue
             buffers_per_layer[layer].add((self._layer_attn_to_layer_id[(layer, attn)], attn.role))
         multi = sum(1 for bufs in buffers_per_layer.values() if len(bufs) > 1)
         return (
@@ -2155,6 +2165,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # Handle each attention buffer from start to end to traverse the whole
         # KV cache. Multiple attention buffers can now share one cache layer.
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            if attn == DeepseekV4AttentionType.RETAINED:
+                continue
             buffers = [((layer_id, attn.role), self.get_buffers(layer, attn))]
             if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
                 buffers.append(

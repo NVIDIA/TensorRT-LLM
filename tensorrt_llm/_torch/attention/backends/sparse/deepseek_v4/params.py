@@ -28,6 +28,10 @@ class DeepseekV4AttentionType(Enum):
     COMPRESS = 5
     INDEXER_COMPRESS = 6
 
+    # Mixed-precision KV: the retained-token twin of a COMPRESS cache. The base manager owns
+    # its buffers; the entry gives disaggregated transfer a layer id for it.
+    RETAINED = 7
+
     @property
     def role(self) -> DataRole:
         return DataRole(f"deepseek_v4_{self.name.lower()}")
@@ -80,6 +84,9 @@ def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4Atten
         return is_sparse
     if attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return is_sparse
+    if attn_type == DeepseekV4AttentionType.RETAINED:
+        # Not a cache of the model's own layout.
+        return False
     raise ValueError(f"Unsupported DeepSeek-V4 attention type: {attn_type}")
 
 

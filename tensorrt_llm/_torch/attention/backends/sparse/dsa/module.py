@@ -92,7 +92,7 @@ def forward_context_sparse_attn(
         )
         # The append kernel wrote the pool; write the retained-token twin.
         if attn_metadata.has_mixed_precision_retained_rows:
-            store_retained_context_rows(self.mqa, attn_metadata, latent_cache)
+            store_retained_context_rows(self.mqa, attn_metadata, latent_cache, position_ids)
         return self.forward_absorption_context(
             q,
             compressed_kv,

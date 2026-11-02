@@ -7408,7 +7408,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if self.max_beam_width != 1:
             raise ValueError(f"{feature} requires single-beam execution.")
         if getattr(self.speculative_config, "use_dynamic_tree", False):
-            raise NotImplementedError(
+            raise ValueError(
                 f"{feature} does not support dynamic-tree speculative "
                 "decoding, which moves accepted KV rows inside the cache pools."
             )

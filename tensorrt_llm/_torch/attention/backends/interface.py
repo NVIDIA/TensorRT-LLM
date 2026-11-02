@@ -215,7 +215,7 @@ class AttentionMetadata:
     mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
         init=False, default=None, repr=False, compare=False)
     # The same for the MTP layers of a separate draft manager; swapped in for draft forwards.
-    draft_mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
+    draft_mixed_precision_staging: "MixedPrecisionKVStaging | None" = field(
         init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -378,8 +378,10 @@ class AttentionMetadata:
                 self.draft_mixed_precision_staging, draft, "draft_mixed",
                 layout, tokens_per_block)
 
-    def _refresh_mixed_precision_kv(self, view, manager, name: str, layout: str,
-                                    tokens_per_block: int):
+    def _refresh_mixed_precision_kv(
+            self, view: "MixedPrecisionKVStaging | None",
+            manager: KVCacheManagerV2, name: str, layout: str,
+            tokens_per_block: int) -> "MixedPrecisionKVStaging":
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 

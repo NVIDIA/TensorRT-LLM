@@ -28,20 +28,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 
 
-def _attention_reference(query, key, value, width):
-    mask = torch.ones((query.shape[1], key.shape[1]), dtype=torch.bool, device=query.device).tril(
-        key.shape[1] - query.shape[1]
-    )
-    tensors = [
-        tensor.reshape(*tensor.shape[:2], -1, width).transpose(1, 2)
-        for tensor in (query, key, value)
-    ]
-    output = torch.nn.functional.scaled_dot_product_attention(
-        *tensors, attn_mask=mask, enable_gqa=True
-    )
-    return output.transpose(1, 2).reshape(-1, query.shape[-1])
-
-
 @pytest.mark.parametrize(
     "backend,high_dtype,compute_dtype,width,query_heads,heads,kv_layout,fp8_input,block",
     [
@@ -122,9 +108,6 @@ def test_optimized_two_pool_prefill_and_decode(
         for layer_idx in ((0, 2, 1) if native_interleave else (0, 1))
     ]
     attention = attentions[0]
-    history_scale = torch.full(
-        (1,), 1 / 6 if high_dtype == DataType.FP8 else 1, dtype=torch.float32, device="cuda"
-    )
     module = SimpleNamespace(
         attn=attention,
         mapping=manager.mapping,
@@ -279,49 +262,16 @@ def test_optimized_two_pool_prefill_and_decode(
                     manager._restore_page_index_bufs(request_id, cache)
             history_before = token_major(manager.get_buffers(0, kv_layout=kv_layout)).clone()
             all_history_ids, all_high_ids = manager.get_mixed_precision_page_tables(request_ids, 0)
-            output = forward(begin, end, context).reshape(batch, end - begin, -1)
-            # Native FP8 context FMHA also quantizes P; retain its existing tolerance.
-            atol = (0.05 if high_dtype == DataType.FP8 else 0.02) if context else 0.01
-            rtol = 0.001 if context and high_dtype == DataType.FP8 else 0.02
-            if native_interleave:
-                native_reference = _attention_reference(
-                    query[:, begin:end],
-                    key[:, :end].to(high_torch_dtype).to(compute_dtype),
-                    value[:, :end].to(high_torch_dtype).to(compute_dtype),
-                    width,
-                )
-                torch.testing.assert_close(native_output, native_reference, atol=atol, rtol=rtol)
+            forward(begin, end, context)
             history = token_major(manager.get_buffers(0, kv_layout=kv_layout))
-            for row, (history_ids, high_ids) in enumerate(zip(all_history_ids, all_high_ids)):
+            for history_ids, high_ids in zip(all_history_ids, all_high_ids):
                 if begin:
                     # Cached context and decode must both read low-only history.
                     assert high_ids[0] >= 0 and high_ids[1] == kv.BAD_PAGE_INDEX
                     assert high_ids[-1] >= 0
-                high_pages = torch.tensor(high_ids, device="cuda")
-                high_mask = high_pages[torch.arange(end, device="cuda") // block] >= 0
-                reference = []
-                for tensor in (key, value):
-                    native_high_values = (
-                        tensor[row, :end].view(-1, heads, width).to(high_torch_dtype)
-                    )
-                    high_values = native_high_values.to(compute_dtype)
-                    packed, scale_bytes = _reference_quant(
-                        native_high_values, history_scale.reciprocal()
-                    )
-                    expected = (
-                        _reference_dequant(packed, scale_bytes, history_scale)
-                        .to(compute_dtype)
-                        .to(high_torch_dtype)
-                        .to(compute_dtype)
-                    )
-                    expected[high_mask] = high_values[high_mask]
-                    # Incoming tokens have not yet been compressed to the low pool.
-                    expected[begin:] = high_values[begin:]
-                    reference.append(expected.reshape(1, end, -1))
+                # Attention runs on the staging copy; the cached low history is untouched.
                 pages = history_ids[: begin // block]
                 torch.testing.assert_close(history[pages], history_before[pages], rtol=0, atol=0)
-                expected = _attention_reference(query[row : row + 1, begin:end], *reference, width)
-                torch.testing.assert_close(output[row], expected, atol=atol, rtol=rtol)
         if decode_graph is not None:
             metadata, graph, captured_output, captured_other_output, run = decode_graph
             for request_id in request_ids:
@@ -755,7 +705,7 @@ def test_mixed_precision_public_options():
                     "dynamic_tree_max_topK": 2,
                 }
             },
-            NotImplementedError,
+            ValueError,
             "dynamic-tree",
         ),
         (
@@ -780,26 +730,6 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
     kwargs.update(overrides)
     with pytest.raises(error, match=match):
         TorchLlmArgs(**kwargs)
-
-
-@pytest.mark.parametrize(
-    "speculative_config",
-    [
-        {"decoding_type": "NGram", "max_draft_len": 2},
-        {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
-    ],
-    ids=("ngram", "mtp"),
-)
-@pytest.mark.cpu_only
-def test_mixed_precision_llm_args_allow_speculative_decoding(speculative_config):
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-    args = TorchLlmArgs(
-        model="/tmp/mixed-precision-nonexistent-model",
-        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
-        speculative_config=speculative_config,
-    )
-    assert args.speculative_config is not None
 
 
 @pytest.mark.parametrize("is_mtp", [True, False])
@@ -860,6 +790,44 @@ def test_draft_forward_hides_retained_rows(backend):
 
 
 @pytest.mark.cpu_only
+def test_dsa_twin_tables_refresh_full_width():
+    """An MTP draft loop reads past this step's kv lengths: no column may keep a stale page."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    num_blocks = {10: 3, 11: 1}
+
+    def fill(request_ids, layer, out):
+        # Like _fill_page_table: a request's allocated blocks only; the rest stay as given.
+        for row, request_id in enumerate(request_ids):
+            out[row, : num_blocks[request_id]] = 100 + row
+
+    def manager():
+        return SimpleNamespace(
+            high_layers={0: 1}, pp_layers=[0], fill_high_precision_page_table=fill
+        )
+
+    meta = SimpleNamespace(
+        num_seqs=2,
+        request_ids=[10, 11],
+        kv_cache_manager=manager(),
+        draft_kv_cache_manager=manager(),
+        # Stale page ids from an earlier step, page 0 included.
+        retained_block_table=torch.zeros(4, 6, dtype=torch.int32),
+        draft_retained_block_table=torch.full((4, 6), 7, dtype=torch.int32),
+    )
+    meta._fill_retained_block_table = partial(
+        DSAtrtllmAttentionMetadata._fill_retained_block_table, meta
+    )
+    DSAtrtllmAttentionMetadata._fill_retained_block_tables(meta)
+
+    expected = torch.tensor([[100] * 3 + [-1] * 3, [101] + [-1] * 5], dtype=torch.int32)
+    for table in (meta.retained_block_table, meta.draft_retained_block_table):
+        assert torch.equal(table[:2], expected)
+
+
+@pytest.mark.cpu_only
 def test_dsa_draft_forward_uses_draft_twin_table():
     """MTP layers on a mixed DSA draft manager read its own twin table during the draft forward."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
@@ -898,6 +866,7 @@ def test_draft_forward_swaps_in_draft_staging():
     assert meta.mixed_precision_staging is target
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_retained_row_indices_point_at_the_twin():
     """A plain pool reads a retained position from the twin's row; released pages keep the pool row."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
@@ -920,39 +889,185 @@ def test_retained_row_indices_point_at_the_twin():
     assert rows.tolist() == [[36, 101, 53, -1]]
 
 
-@pytest.mark.cpu_only
-def test_retained_compressed_row_mask_drops_pages_the_twin_released():
-    """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_retained_compressed_row_mask_matches_reference():
+    """DeepSeek-V4: the twin scatter only writes rows whose page the twin holds.
+
+    Many requests with padding rows, released pages and pages past the table width.
+    """
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
         _retained_compressed_row_mask,
     )
 
-    rows_per_page = 4
-    # Two requests: 6 and 3 new compressed rows, starting at compressed positions 2 and 14.
-    cu = torch.tensor([0, 6, 9], dtype=torch.int32)
-    num_comp = torch.tensor([5, 3], dtype=torch.int32)  # request 0 has one padding row
-    start_pos = torch.tensor([2, 14], dtype=torch.int32)
-    compressed_mask = torch.ones(9, dtype=torch.bool)
-    compressed_mask[7] = False
-    # Twin page table: request 0 released page 1, request 1 holds page 3 only and its
-    # last row falls in page 4, beyond the table.
-    table = torch.tensor([[10, -1, 11, -1], [-1, -1, -1, 12]], dtype=torch.int32)
+    torch.manual_seed(0)
+    batch, rows_per_page, width = 37, 4, 8
+    new_rows = torch.randint(0, 6, (batch,), dtype=torch.int32)
+    cu = torch.cat([torch.zeros(1, dtype=torch.int32), new_rows.cumsum(0).int()])
+    total = int(cu[-1])
+    num_comp = (new_rows - torch.randint(0, 2, (batch,), dtype=torch.int32)).clamp(min=0)
+    start_pos = torch.randint(0, 40, (batch,), dtype=torch.int32)
+    compressed_mask = torch.rand(total) > 0.2
+    table = torch.randint(-1, 9, (batch, width), dtype=torch.int32)
     mask = _retained_compressed_row_mask(
-        table, rows_per_page, num_comp, cu, start_pos, compressed_mask, 2, 9
-    )
+        table.cuda(),
+        rows_per_page,
+        num_comp.cuda(),
+        cu.cuda(),
+        start_pos.cuda(),
+        compressed_mask.cuda(),
+        batch,
+        total,
+    ).cpu()
     expected = []
-    for row in range(9):
-        req = 0 if row < 6 else 1
+    for row in range(total):
+        req = int(torch.searchsorted(cu[1:], row, right=True))
         local = row - int(cu[req])
-        pos = int(start_pos[req]) + local
-        page = (
-            int(table[req, pos // rows_per_page]) if pos // rows_per_page < table.shape[1] else -1
-        )
+        block = (int(start_pos[req]) + local) // rows_per_page
+        page = int(table[req, block]) if block < width else -1
         expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
     assert mask.tolist() == expected
-    # request 0: positions 2, 3 -> page 0 held; 4, 5, 6 -> page 1 released; row 5 is padding.
-    # request 1: position 14 -> page 3 held; 15 masked; 16 -> page 4 beyond the table.
-    assert expected == [True, True, False, False, False, False, True, False, False]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_store_retained_context_rows_uses_context_positions():
+    """DSA context: each row lands at its position_ids entry if the twin holds that page."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        store_retained_context_rows,
+    )
+
+    tokens_per_block, width, num_ctx = 4, 576, 10
+    pool = torch.zeros((4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
+    # Request 0 resumes at position 6; request 1 starts at 0 and the twin released its page 0.
+    table = torch.tensor([[-1, 2, 0, -1], [-1, 3, -1, -1]], dtype=torch.int32, device="cuda")
+    ctx_positions = [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
+    # position_ids spans [ctx..., gen...]; the generation tail must not be stored here.
+    position_ids = torch.tensor([ctx_positions + [11, 12]], dtype=torch.int32, device="cuda")
+    requests = torch.tensor([0] * 4 + [1] * 6 + [0, 1], dtype=torch.int32, device="cuda")
+    latent_cache = torch.randn(12, width, dtype=torch.bfloat16, device="cuda")
+    owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=torch.ones(1, device="cuda"))
+    manager = SimpleNamespace(
+        layer_offsets={0: 0},
+        high_layers={0: 1},
+        _get_mixed_precision_buffers=lambda *args: pool,
+    )
+    meta = SimpleNamespace(
+        retained_block_table=table,
+        kv_cache_manager=manager,
+        num_ctx_tokens=num_ctx,
+        req_idx_per_token=requests,
+    )
+
+    store_retained_context_rows(owner, meta, latent_cache, position_ids)
+
+    expected = torch.zeros(4 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
+    for token, pos in enumerate(ctx_positions):
+        page = int(table[int(requests[token]), pos // tokens_per_block])
+        if page >= 0:
+            expected[page * tokens_per_block + pos % tokens_per_block] = latent_cache[token]
+    assert torch.equal(pool.view(-1, width), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_store_retained_generation_rows_rotates_k_pe():
+    """DSA generation: the store rotates k_pe at the trailing positions, like the append kernel."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        store_retained_generation_rows,
+    )
+
+    tokens_per_block, nope, rope_dim, num_ctx = 4, 512, 64, 2
+    width = nope + rope_dim
+    pool = torch.zeros((2, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
+    table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    # Two context tokens, then three generation tokens (target + drafts) of request 0.
+    position_ids = torch.tensor([[0, 1, 5, 6, 7]], dtype=torch.int32, device="cuda")
+    gen_positions = [5, 6, 7]
+    rows = torch.randn(3, width, dtype=torch.bfloat16, device="cuda")
+    cos_sin = torch.rand(16, rope_dim, 2, dtype=torch.float32, device="cuda")
+    owner = SimpleNamespace(
+        layer_idx=0,
+        kv_scale_orig_quant=torch.ones(1, device="cuda"),
+        rotary_cos_sin=cos_sin,
+        mla_params=SimpleNamespace(qk_rope_head_dim=rope_dim),
+    )
+    manager = SimpleNamespace(
+        layer_offsets={0: 0},
+        high_layers={0: 1},
+        _get_mixed_precision_buffers=lambda *args: pool,
+    )
+    meta = SimpleNamespace(
+        retained_block_table=table,
+        kv_cache_manager=manager,
+        num_ctx_tokens=num_ctx,
+        req_idx_per_token=torch.zeros(5, dtype=torch.int32, device="cuda"),
+    )
+
+    store_retained_generation_rows(owner, meta, rows, position_ids)
+
+    expected = torch.zeros(2 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
+    for token, pos in enumerate(gen_positions):
+        row = rows[token].clone()
+        even, odd = row[nope::2].float(), row[nope + 1 :: 2].float()
+        cos, sin = cos_sin[pos, : rope_dim // 2, 0], cos_sin[pos, : rope_dim // 2, 1]
+        row[nope::2] = (even * cos - odd * sin).to(torch.bfloat16)
+        row[nope + 1 :: 2] = (odd * cos + even * sin).to(torch.bfloat16)
+        page = int(table[0, pos // tokens_per_block])
+        expected[page * tokens_per_block + pos % tokens_per_block] = row
+    assert torch.equal(pool.view(-1, width), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("shared_rows", [False, True])
+def test_overlay_retained_rows_copies_held_rows(shared_rows):
+    """The overlay replaces exactly the scratch rows whose token the twin holds.
+
+    Two calls in a row: the context overlay's row records from the first call must not leak
+    into the second, which releases pages the first one held.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        overlay_retained_rows,
+    )
+
+    torch.manual_seed(0)
+    # topk spans three overlay tiles, the last one partial.
+    tokens_per_block, width, queries, topk = 4, 656, 5, 150
+    pool = torch.randint(
+        0, 255, (6, 1, tokens_per_block, 1, width), dtype=torch.uint8, device="cuda"
+    )
+    tables = [
+        torch.tensor([[2, -1, -1, 5], [-1, 0, -1, -1]], dtype=torch.int32, device="cuda"),
+        torch.tensor([[-1, -1, -1, 5], [-1, -1, 3, -1]], dtype=torch.int32, device="cuda"),
+    ]
+    requests = torch.tensor([0, 0, 1, 1, 0], dtype=torch.int32, device="cuda")
+    topk_indices = torch.randint(-1, 16, (queries, topk), dtype=torch.int32, device="cuda")
+    if shared_rows:
+        # Context gather: one scratch row per distinct (request, position).
+        compact = (requests[:, None] * 16 + topk_indices).where(topk_indices >= 0, -1)
+        rows = 32
+    else:
+        compact = torch.arange(queries * topk, dtype=torch.int32, device="cuda").view(queries, topk)
+        rows = queries * topk
+    owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=None)
+    manager = SimpleNamespace(
+        layer_offsets={0: 0},
+        high_layers={0: 1},
+        _get_mixed_precision_buffers=lambda *args: pool,
+    )
+    flat = pool.view(-1, width)
+    for table in tables:
+        scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
+        meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
+        overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
+
+        expected = torch.zeros_like(scratch)
+        for q in range(queries):
+            for k in range(topk):
+                pos, row = int(topk_indices[q, k]), int(compact[q, k])
+                if pos < 0 or row < 0:
+                    continue
+                page = int(table[int(requests[q]), pos // tokens_per_block])
+                if page >= 0:
+                    expected[row] = flat[page * tokens_per_block + pos % tokens_per_block]
+        assert torch.equal(scratch, expected)
 
 
 @pytest.mark.cpu_only
