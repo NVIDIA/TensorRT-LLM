@@ -2674,6 +2674,55 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         draft.shutdown()
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
+    monkeypatch: pytest.MonkeyPatch, is_disagg: bool
+) -> None:
+    """A worker that numbers drafter slots from 0 (the Kimi K3 workers) binds a
+    sliding-window draft pool, but not on a disaggregated worker, whose every
+    generation slot starts past position 0."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    spec = DFlashDecodingConfig(
+        max_draft_len=3, speculative_model="draft", attention_backend="TRTLLM", mask_token_id=0
+    )
+    draft, _, _ = _disagg_draft_fixture(spec, 65536, 512, 256)
+    draft.is_disagg = is_disagg
+    try:
+        worker = DFlashWorker(spec, Mapping())
+        worker._ctx_reads_rebased_view = False
+        draft_model = _PoolBoundDFlashDraftModel(2, 1, 64, 8)
+        worker.set_draft_model(draft_model)
+        num_pools = getattr(draft, "num_attention_op_pools", draft.num_pools)
+        offsets = torch.zeros(
+            (num_pools, 2, 2, draft.max_blocks_per_seq), dtype=torch.int32, device="cuda"
+        )
+        attn_metadata = SimpleNamespace(max_seq_len=1 << 17, draft_kv_cache_block_offsets=offsets)
+
+        def bind() -> None:
+            """Bind the drafter's ctx cache to the draft pool."""
+            worker._lazy_init_ctx_buffers(
+                draft_model,
+                SimpleNamespace(max_num_requests=2),
+                attn_metadata,
+                draft_kv_cache_manager=draft,
+            )
+
+        if is_disagg:
+            with pytest.raises(ValueError, match="numbers drafter slots from 0"):
+                bind()
+        else:
+            bind()
+            assert worker._ctx_block_tables is not None and worker._ctx_pool_windowed
+    finally:
+        draft.shutdown()
+
+
 @pytest.mark.parametrize("lag", [2, 7, 31, 127])
 def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
     monkeypatch: pytest.MonkeyPatch, lag: int

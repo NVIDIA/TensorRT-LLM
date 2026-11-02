@@ -809,6 +809,9 @@ class DFlashWorker(SpecWorkerBase):
     # preparation that reads _ctx_block_tables directly sets it False and
     # numbers every slot from 0.
     _ctx_reads_rebased_view = True
+    # Whether the bound draft pool releases pages behind a sliding window.
+    # Set in _lazy_init_ctx_buffers.
+    _ctx_pool_windowed = False
 
     def __init__(
         self,
@@ -1504,6 +1507,22 @@ class DFlashWorker(SpecWorkerBase):
                 # keeps a page below its windows (kv_cache_manager_v2's
                 # draft_slot_trail_tokens; a V1 pool does not).
                 windows = getattr(draft_kv_cache_manager, "max_attention_window_vec", None)
+                max_seq_len = getattr(draft_kv_cache_manager, "max_seq_len", None)
+                self._ctx_pool_windowed = any(
+                    window is not None and (max_seq_len is None or window < max_seq_len)
+                    for window in windows or ()
+                )
+                if (
+                    not self._ctx_reads_rebased_view
+                    and self._ctx_pool_windowed
+                    and getattr(draft_kv_cache_manager, "is_disagg", False)
+                ):
+                    # A disaggregated generation worker seeds every slot past
+                    # position 0 (_seed_generation_slot).
+                    raise ValueError(
+                        f"{type(self).__name__} numbers drafter slots from 0 and cannot serve a "
+                        "disaggregated worker with a sliding-window draft KV pool."
+                    )
                 self._ctx_seed_page_aligned = dflash_windows_span_a_page(windows, page_size) and (
                     all(window is None for window in windows or ())
                     or getattr(draft_kv_cache_manager, "draft_slot_trail_tokens", 0) >= page_size
@@ -1583,6 +1602,18 @@ class DFlashWorker(SpecWorkerBase):
             and (self._ctx_reuse_addressable or self._ctx_reads_rebased_view)
         ):
             return first_pos
+        if (
+            cur == 0
+            and first_pos > 0
+            and self._ctx_block_tables is not None
+            and self._ctx_pool_windowed
+        ):
+            # The manager has released this request's pages below its window,
+            # so a slot numbered from 0 would write entries without a page.
+            raise RuntimeError(
+                f"{type(self).__name__} numbers drafter slots from 0 and cannot store a context "
+                f"chunk at position {first_pos} on a sliding-window draft KV pool."
+            )
         return cur
 
     def _ctx_base_for_store(self, cur: int, start: int) -> Optional[int]:
