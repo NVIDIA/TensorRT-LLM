@@ -24,8 +24,12 @@ import asyncio
 
 import pytest
 
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+)
 from tensorrt_llm.inputs.utils import MultimodalDataTracker
-from tensorrt_llm.serve.chat_utils import parse_chat_message_content
+from tensorrt_llm.serve.chat_utils import parse_chat_message_content, parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
@@ -863,3 +867,75 @@ def test_image_request_reaches_the_chat_messages(image_part):
             ],
         }
     ]
+
+
+# An image returned inside a tool output
+# ---------------------------------------------------------------------------
+
+_VISION_MODEL_TYPE = "test_responses_tool_output_vlm"
+
+
+@pytest.fixture
+def vision_model_type():
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        _VISION_MODEL_TYPE, MultimodalPlaceholderMetadata(placeholder_map={"image": "<image>"})
+    )
+    yield _VISION_MODEL_TYPE
+    MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(_VISION_MODEL_TYPE)
+
+
+def _image_tool_turn(call_type):
+    """A tool that shows the model an image returns it inside the tool output, as Codex does."""
+    image = {"type": "input_image", "image_url": _IMAGE_URL}
+    if call_type == "function_call":
+        call = {"name": "view_image", "arguments": '{"path": "plot.png"}'}
+    else:
+        call = {"name": "view_image", "input": "plot.png"}
+        # The custom tool output's image part type requires a detail level.
+        image["detail"] = "auto"
+    return {
+        "input": [
+            _message_item("user", "Show me the plot."),
+            {"type": call_type, "call_id": "call_1", **call},
+            {
+                "type": f"{call_type}_output",
+                "call_id": "call_1",
+                "output": [{"type": "input_text", "text": "plot.png"}, image],
+            },
+        ]
+    }
+
+
+def _parse_for(model_type, messages):
+    """The conversation the chat template is given for ``model_type``."""
+    config = type("_StubConfig", (), {"model_type": model_type})()
+    conversation, mm_coroutine, placeholder_counts, _ = parse_chat_messages_coroutines(
+        messages, config, None
+    )
+    mm_coroutine.close()
+    return conversation, placeholder_counts
+
+
+@pytest.mark.parametrize("call_type", ["function_call", "custom_tool_call"])
+def test_a_tool_output_image_reaches_a_text_only_model_as_a_note(call_type):
+    """The client sends the tool output again with every later request of the conversation."""
+    conversation, placeholder_counts = _parse_for(
+        "glm_moe_dsa", _messages(_image_tool_turn(call_type))
+    )
+    assert conversation[-1] == {
+        "role": "tool",
+        "content": "plot.png\n[image omitted: this model accepts text only]",
+        "media": [],
+        "tool_call_id": "call_1",
+    }
+    assert placeholder_counts[-1] == {}
+
+
+@pytest.mark.parametrize("call_type", ["function_call", "custom_tool_call"])
+def test_a_tool_output_image_reaches_a_vision_model_as_an_image(call_type, vision_model_type):
+    conversation, placeholder_counts = _parse_for(
+        vision_model_type, _messages(_image_tool_turn(call_type))
+    )
+    assert [media["modality"] for media in conversation[-1]["media"]] == ["image"]
+    assert "omitted" not in conversation[-1]["content"]
+    assert placeholder_counts[-1] == {"<image>": 1}
