@@ -49,13 +49,9 @@ def test_wheel_build_is_gated_by_platform_and_architecture(system, requested, sk
     assert builder.should_build(system, requested, skip_wheel) is expected
 
 
-def test_native_uses_cmake_detection_and_falls_back_like_cmake(tmp_path):
-    detector = tmp_path / "detect_cuda_arch"
-    detector.write_text("#!/bin/sh\nprintf 103\n")
-    detector.chmod(0o755)
-    assert builder.resolve_requested_architectures("native", tmp_path) == "103"
-    detector.unlink()
-    assert builder.resolve_requested_architectures("native", tmp_path) == "all"
+def test_native_requires_architectures_recorded_by_cmake(tmp_path):
+    with pytest.raises(ValueError, match="reconfigure"):
+        builder.resolve_requested_architectures("native", tmp_path)
     assert builder.resolve_requested_architectures("100", tmp_path) == "100"
 
 
@@ -65,6 +61,32 @@ def test_final_cmake_architecture_overrides_cli(tmp_path, requested, configured)
         f"CMAKE_CUDA_ARCHITECTURES:STRING={configured}\n"
     )
     assert builder.resolve_requested_architectures(requested, tmp_path) == configured
+
+
+def test_native_uses_architectures_recorded_when_cmake_configured(tmp_path):
+    (tmp_path / "CMakeCache.txt").write_text("CMAKE_CUDA_ARCHITECTURES:STRING=native\n")
+    (tmp_path / "trtllm_cuda_architectures.txt").write_text("103")
+    detector = tmp_path / "detect_cuda_arch"
+    detector.write_text("#!/bin/sh\nprintf 90\n")
+    detector.chmod(0o755)
+    assert builder.resolve_requested_architectures("native", tmp_path) == "103"
+
+
+def test_cmake_records_resolved_architectures(tmp_path):
+    module = _SCRIPT.parents[1] / "cpp/cmake/modules/cuda_configuration.cmake"
+    (tmp_path / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "project(msa_arch NONE)\n"
+        "set(CMAKE_CUDA_COMPILER_VERSION 12.9)\n"
+        "set(CMAKE_CUDA_ARCHITECTURES 103)\n"
+        f'include("{module}")\n'
+        "setup_cuda_architectures()\n"
+    )
+    build = tmp_path / "build"
+    subprocess.run(["cmake", "-S", str(tmp_path), "-B", str(build)], check=True,
+                   capture_output=True, text=True)
+    assert (build / "trtllm_cuda_architectures.txt").read_text() == "103"
+    assert builder.resolve_requested_architectures("90", build) == "103"
 
 
 def test_cli_skips_non_blackwell_without_nvcc(tmp_path):

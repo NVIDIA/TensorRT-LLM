@@ -20,6 +20,12 @@ from pathlib import Path
 
 
 def resolve_requested_architectures(requested, build_dir):
+    recorded = Path(build_dir) / "trtllm_cuda_architectures.txt"
+    if recorded.is_file():
+        architectures = recorded.read_text().strip()
+        if not architectures:
+            raise ValueError("CMake recorded an empty CUDA architecture list; reconfigure the build")
+        return architectures
     cache = Path(build_dir) / "CMakeCache.txt"
     if cache.is_file():
         match = re.search(r"(?m)^CMAKE_CUDA_ARCHITECTURES:[A-Z_]+=(.*)$", cache.read_text())
@@ -27,12 +33,7 @@ def resolve_requested_architectures(requested, build_dir):
             requested = match.group(1).strip() or "all"
     if requested != "native":
         return requested
-    try:
-        result = subprocess.run([str(Path(build_dir) / "detect_cuda_arch")],
-                                check=True, capture_output=True, text=True)
-        return result.stdout.strip() or "all"
-    except (OSError, subprocess.CalledProcessError):
-        return "all"
+    raise ValueError("native CUDA architectures were not recorded; reconfigure the build")
 
 
 def should_build(system, requested, skip_wheel):
