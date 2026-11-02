@@ -1582,8 +1582,9 @@ class DFlashWorker(SpecWorkerBase):
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
 
-    def _ctx_store_start(self, cur: int, first_pos: int) -> int:
-        """Position at which a context chunk's drafter K/V is stored.
+    def _ctx_store_start(self, cur: int, first_pos: int) -> Optional[int]:
+        """Position at which a context chunk's drafter K/V is stored, or None
+        when this worker cannot store it.
 
         ``cur`` is the slot's stored length, ``first_pos`` the chunk's first
         target position. They differ only when the target skipped
@@ -1596,7 +1597,8 @@ class DFlashWorker(SpecWorkerBase):
         an unpaired pool when the worker reads the rebased view, which hides
         the empty prefix. Otherwise (the private arena, or an unpaired pool
         read from position 0) every request numbers from 0, where the tail is
-        all the context there is.
+        all the context there is -- except on a sliding-window pool more than
+        its trailing page past position 0 (None).
         """
         if (
             cur == 0
@@ -1615,10 +1617,7 @@ class DFlashWorker(SpecWorkerBase):
             # first_pos, and the manager keeps pages only from the absolute
             # position less the window and trail: past the trail, the slot's
             # window reaches entries without a page once the request outgrows it.
-            raise RuntimeError(
-                f"{type(self).__name__} numbers drafter slots from 0 and cannot store a context "
-                f"chunk at position {first_pos} on a sliding-window draft KV pool."
-            )
+            return None
         return cur
 
     def _ctx_base_for_store(self, cur: int, start: int) -> Optional[int]:
@@ -1953,6 +1952,20 @@ class DFlashWorker(SpecWorkerBase):
             # (precompute_context_kv is per-token in (hidden, p)); an unpaired
             # one does not, so the slot reads from a base above it.
             start = self._ctx_store_start(cur, first_pos)
+            if start is None:
+                # Request-level, like the overflow below: the slot is released
+                # rather than failing the batch's forward.
+                logger.warning(
+                    f"DFlash: {type(self).__name__} numbers drafter slots from 0 and cannot store "
+                    f"the context chunk at position {first_pos} of request {req_id} on a "
+                    "sliding-window draft KV pool; skipping its context store."
+                )
+                self._req_to_slot.pop(req_id, None)
+                self._req_ctx_pos.pop(req_id, None)
+                ctx_len_updates[slot] = 0
+                self._free_slots.append(slot)
+                offset += slen
+                continue
             base = self._ctx_base_for_store(cur, start)
             if base is not None:
                 ctx_base_updates[slot] = base

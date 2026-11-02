@@ -6,6 +6,9 @@ TRTLLM borrows the managed paged pool. VANILLA and FA4 own private context
 buffers and must not allocate a redundant manager or be gated on its capacity.
 """
 
+from types import SimpleNamespace
+from typing import Optional
+
 import pytest
 
 from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
@@ -87,16 +90,17 @@ def test_dflash_ctx_store_start_follows_the_pool_numbering(
 
 
 @pytest.mark.parametrize(
-    ("cur", "first_pos", "raises"),
-    [(0, 8192, True), (0, 65, True), (0, 64, False), (0, 0, False), (4096, 4096, False)],
+    ("cur", "first_pos", "expected"),
+    [(0, 8192, None), (0, 65, None), (0, 64, 0), (0, 0, 0), (4096, 4096, 4096)],
 )
-def test_slot_from_zero_refuses_a_chunk_past_zero_on_a_windowed_pool(
-    cur: int, first_pos: int, raises: bool
+def test_slot_from_zero_cannot_store_a_chunk_past_the_trail_on_a_windowed_pool(
+    cur: int, first_pos: int, expected: Optional[int]
 ) -> None:
     """A worker that numbers slots from 0 (the Kimi K3 workers) on an unpaired
-    sliding-window pool with a 64-token trail cannot store a chunk whose slot
-    starts more than the trail past 0: the manager releases the pages that slot
-    would address. Within the trail every entry stays on a page it holds."""
+    sliding-window pool with a 64-token trail has no store start for a chunk
+    whose slot starts more than the trail past 0: the manager releases the
+    pages that slot would address. Within the trail every entry stays on a page
+    it holds."""
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     worker = object.__new__(DFlashWorker)
@@ -105,11 +109,67 @@ def test_slot_from_zero_refuses_a_chunk_past_zero_on_a_windowed_pool(
     worker._ctx_reads_rebased_view = False
     worker._ctx_pool_windowed = True
     worker._ctx_pool_trail = 64
-    if raises:
-        with pytest.raises(RuntimeError, match="numbers drafter slots from 0"):
-            worker._ctx_store_start(cur, first_pos)
-    else:
-        assert worker._ctx_store_start(cur, first_pos) == cur
+    assert worker._ctx_store_start(cur, first_pos) == expected
+
+
+def test_slot_from_zero_skips_a_context_store_past_the_trail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Kimi K3 style worker whose request lost its slot mid-prompt skips that
+    chunk's context store and releases the slot, with a warning, instead of
+    failing the batch."""
+    import collections
+
+    import torch
+
+    from tensorrt_llm._torch.speculative import dflash
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_block_tables = object()
+    worker._ctx_block_counts = torch.tensor([300])
+    worker._ctx_page_size = 64
+    worker._max_ctx = 1 << 17
+    worker._ctx_reuse_addressable = False
+    worker._ctx_reads_rebased_view = False
+    worker._ctx_pool_windowed = True
+    worker._ctx_pool_trail = 64
+    worker._req_ctx_pos = {}
+    worker._req_to_slot = {}
+    worker._free_slots = collections.deque([2])
+    worker._ctx_len_host = [0, 0, 0]
+    worker._ctx_base_host = [0, 0, 0]
+    worker._ctx_len = torch.zeros(3, dtype=torch.long)
+    worker._ctx_base_pages = torch.zeros(3, dtype=torch.long)
+    warnings = []
+    monkeypatch.setattr(dflash.logger, "warning", warnings.append)
+
+    slen, first_pos = 4, 8192
+    draft_model = SimpleNamespace(
+        fc=object(), hidden_norm=object(), project_target_hidden=lambda hs: hs
+    )
+    spec_metadata = SimpleNamespace(
+        get_hidden_states=lambda n: torch.zeros(n, 8),
+        host_position_ids=torch.arange(first_pos, first_pos + slen),
+        request_ids=[7],
+    )
+    attn_metadata = SimpleNamespace(
+        num_ctx_tokens=slen, num_contexts=1, _seq_lens=torch.tensor([slen])
+    )
+    worker._store_prefill_context(
+        draft_model,
+        spec_metadata,
+        attn_metadata,
+        torch.arange(first_pos, first_pos + slen),
+        slen,
+    )
+
+    assert 7 not in worker._req_to_slot and 7 not in worker._req_ctx_pos
+    assert list(worker._free_slots) == [2]
+    assert worker._ctx_len_host[2] == 0 and worker._ctx_len.tolist()[2] == 0
+    assert len(warnings) == 1
+    assert "skipping its context store" in warnings[0]
+    assert "drafts nothing" not in warnings[0]
 
 
 @pytest.mark.parametrize(
