@@ -67,10 +67,46 @@ REFERENCE_PATH = pathlib.Path(__file__).parent / "references" / "trtllm_serve_cl
 # the reference YAML must gain a section for it, or this file's tests fail.
 GATED_SUBCOMMANDS = tuple(serve_cmd.main.commands)
 
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 
-def _load_reference() -> dict[str, Any]:
-    with open(REFERENCE_PATH) as f:
-        return yaml.safe_load(f)
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a repeated mapping key instead of keeping its last value.
+
+    With plain ``yaml.safe_load`` a second ``serve:`` section or a repeated
+    option entry silently replaces the first, so the gate would compare
+    against whichever copy came last.
+    """
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._checked_mappings: set[yaml.MappingNode] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # SafeLoader flattens merge sources before constructing them. Check each
+        # mapping's own keys once, so an explicit override of a merged key stays legal.
+        if node in self._checked_mappings:
+            return
+        self._checked_mappings.add(node)
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            # Merge keys and (unhashable) non-scalar keys are left to SafeLoader.
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == _YAML_MERGE_TAG:
+                continue
+            key = self.construct_object(key_node)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        super().flatten_mapping(node)
+
+
+def _load_reference(path: pathlib.Path = REFERENCE_PATH) -> dict[str, Any]:
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
 
 
 def _live_surface() -> dict[str, dict[str, dict[str, Any]]]:
@@ -288,3 +324,41 @@ class TestServeCLIStability:
 
         if demotions:
             pytest.fail("Forbidden stability demotions:\n" + "\n".join(demotions))
+
+
+@pytest.mark.parametrize(
+    "text, duplicate",
+    [
+        pytest.param(
+            "commands:\n  serve:\n    options: {}\n  serve:\n    options: {}\n",
+            "serve",
+            id="subcommand-section",
+        ),
+        pytest.param(
+            "commands:\n  serve:\n    options:\n"
+            "      port: {status: stable}\n      port: {status: beta}\n",
+            "port",
+            id="option-entry",
+        ),
+    ],
+)
+def test_reference_with_a_duplicate_key_fails_to_load(tmp_path, text, duplicate):
+    """A repeated section or option fails to load instead of collapsing into one."""
+    path = tmp_path / "trtllm_serve_cli.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(yaml.constructor.ConstructorError, match=f"duplicate key '{duplicate}'"):
+        _load_reference(path)
+
+
+def test_reference_may_override_a_merged_key(tmp_path):
+    """Keys pulled in through a YAML merge (``<<``) are not duplicates of the mapping's own."""
+    path = tmp_path / "trtllm_serve_cli.yaml"
+    path.write_text(
+        "base: &base {status: beta, type: int}\n"
+        "derived: &derived {<<: *base, status: stable}\n"
+        "nested: {<<: *derived}\n",
+        encoding="utf-8",
+    )
+    reference = _load_reference(path)
+    assert reference["derived"] == {"status": "stable", "type": "int"}
+    assert reference["nested"] == {"status": "stable", "type": "int"}
