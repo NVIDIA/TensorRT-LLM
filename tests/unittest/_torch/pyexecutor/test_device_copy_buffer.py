@@ -203,3 +203,36 @@ def test_forced_writer_keeps_a_shared_alias_cache_coherent(monkeypatch) -> None:
     metadata.update(_host([1, 2]))
     assert storage.tolist() == [1, 2]
     assert writes == [[1, 2], [1, 2], [9, 2], [1, 2]]
+
+
+def test_specialized_copy_records_host_inputs_and_layout_key() -> None:
+    buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.int32))
+    host = _host([1, 2, 3, 4]).view(2, 2)
+    key = ((7, 9), 1, 2, 8)
+    assert not buffer.matches(host, key=key, exact=True)
+    buffer.record(host, key=key)
+    assert buffer.matches(host, key=key, exact=True)
+    assert not buffer.matches(host, key=((9, 7), 1, 2, 8), exact=True)
+    assert not buffer.matches(host.flatten(), key=key, exact=True)
+    assert not buffer.matches(host.to(torch.int64), key=key, exact=True)
+    host[0, 0] = 99
+    assert not buffer.matches(host, key=key, exact=True)
+
+
+def test_invalidation_discards_a_recorded_copy() -> None:
+    buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.int32))
+    host = _host([1, 2])
+    buffer.record(host)
+    assert buffer.matches(host)
+    buffer.invalidate()
+    assert not buffer.matches(host)
+    buffer.update(host)
+    assert buffer.tensor.tolist() == [1, 2, 0, 0]
+
+
+def test_new_layout_does_not_retain_the_previous_prefix_tail() -> None:
+    buffer = DeviceCopyBuffer(torch.zeros(4, dtype=torch.int32))
+    buffer.record(_host([1, 2, 3, 4]), key="first")
+    buffer.record(_host([1, 2]), key="second")
+    assert buffer.matches(_host([1, 2]), key="second")
+    assert not buffer.matches(_host([1, 2, 3, 4]), key="second")

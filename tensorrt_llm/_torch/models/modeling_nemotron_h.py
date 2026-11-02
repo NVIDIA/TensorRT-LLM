@@ -53,7 +53,7 @@ from .modeling_utils import (DecoderModel, moe_experts_quant_config,
                              register_auto_model)
 
 
-class NemotronHPuzzleConfig(PretrainedConfig):
+class NemotronHPuzzleConfig(NemotronHConfig):
     model_type = "nemotron_h_puzzle"
 
 
