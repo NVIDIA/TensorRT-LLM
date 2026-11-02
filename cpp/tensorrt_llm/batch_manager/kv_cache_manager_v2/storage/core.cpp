@@ -382,8 +382,7 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
-HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options,
-    std::optional<int> numaNode)
+HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options)
     : SlotPoolBase(slotSize)
     , mCommitUnit(hostMemSizeGranularity())
     // registerUnit = slotSize: every copy here is a whole slot and the driver rejects
@@ -393,8 +392,10 @@ HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, H
     // waitForFill = false: the owning pool group blocks per allocation on only the range
     // it hands out, so serving can start before the whole tier is committed.
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
-          HostMemBackingOptions{.registerUnit = slotSize, .allowRemoteNumaFallback = options.allowRemoteNumaFallback},
-          /*waitForFill=*/false, numaNode)
+          HostMemBackingOptions{.registerUnit = slotSize,
+              .allowRemoteNumaFallback = options.allowRemoteNumaFallback,
+              .numaNode = options.numaNode},
+          /*waitForFill=*/false)
 {
 }
 
@@ -688,7 +689,7 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
 // ---------------------------------------------------------------------------
 
 HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
-    HostMemBackingOptions const& options, std::optional<int> numaNode)
+    HostMemBackingOptions const& options)
     : PoolGroupBase(numSlots)
 {
     TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "HostPoolGroup: slotSizeList must not be empty");
@@ -704,7 +705,7 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
         // sum past groupVmSize: this is address space, which costs nothing until committed.
         auto const poolVmSize
             = roundUp(static_cast<size_t>(static_cast<double>(groupVmSize) * sizeRatio), hostMemSizeGranularity());
-        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options, numaNode));
+        mPools.push_back(std::make_unique<HostSlotPool>(sz, numSlots, poolVmSize, options));
     }
 }
 
@@ -778,7 +779,7 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
 
 HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota,
-    HostMemBackingOptions const& options, std::optional<int> numaNode)
+    HostMemBackingOptions const& options)
     : mOptions(options)
     // Resolved once here so the bound the pools reserve against is the same one
     // a later resize is checked against. Quotas are quantized to the commit
@@ -792,7 +793,7 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
         mPoolGroups.push_back(std::make_unique<HostPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, mOptions, numaNode));
+            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, mOptions));
     }
 }
 
@@ -834,8 +835,7 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)
             {
-                return std::make_unique<HostCacheLevelStorage>(
-                    slotDescList, slotCountList, cfg.maxQuota, options, cfg.numaNode);
+                return std::make_unique<HostCacheLevelStorage>(slotDescList, slotCountList, cfg.maxQuota, options);
             }
             else
             {

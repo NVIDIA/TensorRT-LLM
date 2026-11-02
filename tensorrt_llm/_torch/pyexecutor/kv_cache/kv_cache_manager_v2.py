@@ -2604,7 +2604,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"KV cache manager v2 host tier bound to NUMA node {host_tier_numa_node}"
                 )
             cache_tiers.append(
-                HostCacheTierConfig(quota=int(host_quota), numa_node=host_tier_numa_node)
+                HostCacheTierConfig(
+                    quota=int(host_quota),
+                    allow_remote_numa_fallback=host_tier_numa_node is None,
+                    numa_node=host_tier_numa_node,
+                )
             )
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:

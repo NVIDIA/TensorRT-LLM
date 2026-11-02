@@ -80,8 +80,8 @@ struct HostCacheTierConfig
     //! failing, and so would not be the strictness that was asked for.
     bool allowRemoteNumaFallback = true;
 
-    //! Binds the tier's host memory strictly (MPOL_BIND) to this node instead of the GPU's; unset
-    //! keeps the policy above. Last, so positional initializers of the fields above stay valid.
+    //! The node the tier's host memory goes to instead of the GPU's; the policy is still
+    //! allowRemoteNumaFallback's. Last, so positional initializers of the fields above stay valid.
     std::optional<int> numaNode;
 
     [[nodiscard]] CacheTier tier() const noexcept
