@@ -16,6 +16,22 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper
 
+#: The Beam dense block's norms at its three fresh-context lengths: the four 5120-wide
+#: sandwich norms, and the per-head q and k norms, which normalize every 128-wide head of
+#: a token as its own row -- 48 q rows and 8 k rows per token.
+_BEAM_DENSE_BLOCK = tuple(
+    Cell(
+        why=f"beam dense {name}, {tokens} tokens: {rows} rows of {width}",
+        spec=dict(shape=(rows, width), dtype=torch.bfloat16, eps=1e-6),
+    )
+    for tokens in (1, 17, 129)
+    for name, rows, width in (
+        ("sandwich norm", tokens, 5120),
+        ("q_norm", tokens * 48, 128),
+        ("k_norm", tokens * 8, 128),
+    )
+)
+
 
 class FlashinferRmsnorm(OpWrapper):
     """`x / sqrt(mean(x^2, -1) + eps) * weight`, one op call, new tensor out.
@@ -31,7 +47,8 @@ class FlashinferRmsnorm(OpWrapper):
     # only on its residual stream; deepseek reaches it there and on the two
     # lora ranks its MLA projects through, which is why the narrow cells are
     # here at all -- a 512-wide row is one 128-bit vector per lane and takes a
-    # different path through the kernel than a 7168-wide one.
+    # different path through the kernel than a 7168-wide one. The Beam dense
+    # block adds 5120-wide rows and, for its per-head q/k norms, 128-wide ones.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, gpt-oss-120b hidden 2880",
@@ -53,6 +70,7 @@ class FlashinferRmsnorm(OpWrapper):
             why="deepseek kv_lora rank 512, the narrowest row any target asks for",
             spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
         ),
+        *_BEAM_DENSE_BLOCK,
     )
 
     note = """
