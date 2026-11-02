@@ -264,3 +264,6 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+
+  # Beam baseline diagnostic checks (no checkpoints or GPU).
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
