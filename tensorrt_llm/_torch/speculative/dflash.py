@@ -1429,12 +1429,55 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        self._report_prefix_reuse(cache_manager)
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
+        )
+
+    def _report_prefix_reuse(self, target_cache_manager) -> None:
+        """Report how this drafter's context is served on KV-cache prefix hits.
+
+        A prefix hit skips the target forward for the reused prompt, and the
+        drafter builds its context K/V from that forward. Only a draft pool
+        paired with the target's block reuse (``_ctx_reuse_addressable``) hands
+        the reused prefix's drafter K/V back; anywhere else the target has to
+        recompute the part of the prompt the drafter attends to
+        (``context_recompute_tail``), or a cache-hit request drafts from only
+        the uncached tail of its prompt.
+        """
+        if self._ctx_reuse_addressable or not getattr(
+            target_cache_manager, "enable_block_reuse", False
+        ):
+            return
+        tail = getattr(target_cache_manager, "_spec_recompute_tail", 0)
+        if tail:
+            logger.info(
+                f"DFlash: prefix-cache hits recompute a {tail}-token prompt tail for the "
+                "drafter (context_recompute_tail; -1 = whole prompt)."
+            )
+            return
+        # The target skips the reused prefix, so _store_prefill_context only
+        # ever sees the uncached tail; nothing else reports the loss.
+        requested = getattr(self.spec_config, "context_recompute_tail", 0)
+        if requested:
+            why = (
+                f"the KV cache manager disabled context_recompute_tail={requested} "
+                "(see its warning for why)"
+            )
+        else:
+            why = (
+                "context_recompute_tail is 0 (set it to the drafter's attention "
+                "window -- null resolves it -- or -1 to recompute on hits)"
+            )
+        logger.warning(
+            "DFlash: KV-cache block reuse is on, but the drafter's context K/V are "
+            f"not kept where a prefix-cache hit can hand them back, and {why}: a "
+            "cache-hit request drafts from only the uncached tail of its prompt, so "
+            "acceptance drops on every hit."
         )
 
     def _ctx_paged_index_args(self):
