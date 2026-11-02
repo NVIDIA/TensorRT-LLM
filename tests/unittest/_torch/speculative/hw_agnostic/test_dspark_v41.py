@@ -311,7 +311,7 @@ def test_v41_three_stages_carry_lagged_pre_into_final_head(batched):
         seen.append(pre_mix.clone())
         return hidden + 1, mixes[index]
 
-    model._forward_stage = MethodType(fake_stage, model)
+    model._forward_stage_legacy = MethodType(fake_stage, model)
     model.forward_embed = Mock(return_value=(initial, torch.zeros(1, 3), torch.zeros(1, 2)))
     model._dspark_freqs_table = Mock(return_value=torch.empty(0))
     call = model.forward_batched if batched else model.forward
@@ -360,9 +360,9 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
         model_config=SimpleNamespace(mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)),
     )
     monkeypatch.setattr(
-        modeling_dspark, "dspark_attention_forward", Mock(return_value=attention_output)
+        modeling_dspark, "_dspark_attention_forward_legacy", Mock(return_value=attention_output)
     )
-    result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage(
+    result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage_legacy(
         model,
         stage,
         hidden,

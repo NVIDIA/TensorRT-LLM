@@ -160,6 +160,8 @@ def dflash_trtllm_windowed_block_attention(
         out: [B * blk, Hq, D] output.
     """
     B, block_size, num_heads, head_dim = query.shape
+    # The decode and future-block merge must see the precision stored in the cache.
+    query = query.to(layer_cache.dtype)
     window_left, window_right = window_size
     merge_future = not causal and window_left >= 0
     decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
@@ -190,7 +192,13 @@ def dflash_trtllm_windowed_block_attention(
         lse = decoded[1] * TRTLLM_GEN_LSE_LN2
         out.copy_(
             dflash_merge_future_block_attention(
-                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
+                out,
+                lse,
+                query,
+                block_key.to(layer_cache.dtype),
+                block_value.to(layer_cache.dtype),
+                head_dim**-0.5,
+                window_right,
             )
         )
 
@@ -198,7 +206,8 @@ def dflash_trtllm_windowed_block_attention(
 def declares_lilicorr(config: PretrainedConfig) -> bool:
     """Whether the checkpoint requires the LiLiCorr candidate scorer."""
     return is_lilicorr_checkpoint(
-        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
+        getattr(config, "architectures", None),
+        getattr(config, "dflash_config", None) or {},
     )
 
 
@@ -265,7 +274,8 @@ def dflash2_score_edges(
     top_k = candidate_ids.shape[-1]
     successors = successor_codebook[candidate_ids].float()
     predecessor_ids = torch.cat(
-        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]), dim=1
+        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]),
+        dim=1,
     )
     predecessors = predecessor_codebook[predecessor_ids].float()
     return unary_logits.float()[:, :, None] + torch.einsum(
@@ -352,7 +362,11 @@ class DFlash2BlockConv(nn.Module):
         self.kernel_projection.weight.data.copy_(kernel_projection_weight)
 
     def _convolve(
-        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int, block_size: int
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        side: int,
+        block_size: int,
     ) -> torch.Tensor:
         return dflash2_grouped_conv(
             hidden_states, delta, self.base_kernel[side], block_size, self.group_size
@@ -595,7 +609,6 @@ class DFlashForCausalLM(nn.Module):
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
-        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
@@ -965,7 +978,10 @@ class DFlashForCausalLM(nn.Module):
         # Laguna DFlash checkpoints may ship a fused self_attn.qkv_proj; the draft
         # loader expects split q/k/v (a fused key is silently dropped otherwise).
         if any(k.endswith("self_attn.qkv_proj.weight") for k in weights):
-            for attr in ("num_attention_heads_per_layer", "num_key_value_heads_per_layer"):
+            for attr in (
+                "num_attention_heads_per_layer",
+                "num_key_value_heads_per_layer",
+            ):
                 per_layer = getattr(self.config, attr, None)
                 if per_layer is not None and len(set(per_layer)) > 1:
                     raise ValueError(
@@ -975,7 +991,9 @@ class DFlashForCausalLM(nn.Module):
                         "is required for this checkpoint."
                     )
             head_dim = getattr(
-                self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads
+                self.config,
+                "head_dim",
+                self.config.hidden_size // self.config.num_attention_heads,
             )
             num_kv_heads = getattr(
                 self.config, "num_key_value_heads", self.config.num_attention_heads
@@ -1066,7 +1084,11 @@ class DFlashForCausalLM(nn.Module):
             )
             weight = weight[:, self._fc_input_slice]
         self.fc = nn.Linear(
-            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
+            weight.shape[1],
+            weight.shape[0],
+            bias=False,
+            device="cuda",
+            dtype=weight.dtype,
         )
         self.fc.weight.data.copy_(weight)
 
@@ -1091,7 +1113,10 @@ class DFlashForCausalLM(nn.Module):
         attention_convs = nn.ModuleList()
         mlp_convs = nn.ModuleList()
         for layer_idx in range(len(self.model.layers)):
-            for name, convs in (("attention_conv", attention_convs), ("mlp_conv", mlp_convs)):
+            for name, convs in (
+                ("attention_conv", attention_convs),
+                ("mlp_conv", mlp_convs),
+            ):
                 prefix = f"layers.{layer_idx}.{name}."
                 convs.append(
                     DFlash2BlockConv(
@@ -1540,16 +1565,21 @@ class DFlashForCausalLM(nn.Module):
         head_dim: int,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
-        workspace_bytes = trtllm_gen_ops.get_workspace_size(
-            dtype=dtype,
-            num_tokens=max_batch_size * block_size,
-            num_gen_tokens=max_batch_size * block_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_dim,
-            max_num_requests=max_batch_size,
-            rotary_embedding_dim=0,
-            fp8_context_fmha=False,
+        workspace_bytes = max(
+            trtllm_gen_ops.get_workspace_size(
+                dtype=dtype,
+                num_tokens=max_batch_size * block_size,
+                num_gen_tokens=max_batch_size * block_size,
+                num_heads=heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                max_num_requests=max_batch_size,
+                rotary_embedding_dim=0,
+                fp8_context_fmha=False,
+            )
+            # A non-causal block runs as one decode request whose query heads
+            # are the block's queries times the attention heads.
+            for heads in (num_heads, num_heads * block_size)
         )
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1582,7 +1612,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads, max_batch_size, sm_count
+            num_heads * block_size, max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
@@ -1764,6 +1794,14 @@ class DFlashForCausalLM(nn.Module):
                 .reshape(-1)
                 .contiguous()
             )
+            # An FP8 cache takes the block's K/V through direct page writes
+            # (the same rows and kv positions the append addresses).
+            fp8_cache = ctx_kv_cache[0].dtype == torch.float8_e4m3fn
+            if fp8_cache:
+                append_rows = append_batch_indices.long()
+                append_pos_long = append_positions.long()
+                fp8_pages = block_tables[append_rows, append_pos_long // page_size].long()
+                fp8_offsets = append_pos_long % page_size
         else:  # VANILLA
             # Slot and column that each block K/V row occupies
             self._prepare_dflash_index_buffers(
@@ -1882,29 +1920,47 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
-                trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    batch_indices=append_batch_indices,
-                    positions=append_positions,
-                    paged_kv_cache=layer_cache,
-                    kv_indices=kv_indices,
-                    kv_indptr=kv_indptr,
-                    kv_last_page_len=kv_last_page_len,
-                    kv_layout="HND",
-                )
+                if fp8_cache:
+                    cache_bytes = layer_cache.view(torch.uint8)
+                    cache_bytes[fp8_pages, 0, :, fp8_offsets] = (
+                        k_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                        .to(layer_cache.dtype)
+                        .view(torch.uint8)
+                    )
+                    cache_bytes[fp8_pages, 1, :, fp8_offsets] = (
+                        v_noise_bshd.reshape(-1, num_kv_heads_per_rank, head_dim)
+                        .to(layer_cache.dtype)
+                        .view(torch.uint8)
+                    )
+                else:
+                    trtllm_gen_ops.append_paged_kv_cache(
+                        append_key=k_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        append_value=v_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        batch_indices=append_batch_indices,
+                        positions=append_positions,
+                        paged_kv_cache=layer_cache,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        kv_last_page_len=kv_last_page_len,
+                        kv_layout="HND",
+                    )
                 out = torch.empty_like(Q_bshd)
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
+                if fp8_cache:
+                    # TRTLLM-Gen reads an FP8 cache with FP8 queries (the
+                    # context kernels have no BF16-query variant); scales stay
+                    # 1, matching the K/V writes.
+                    q_flat = q_flat.to(layer_cache.dtype)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
                 if causal or window_left >= 0:
                     dflash_trtllm_windowed_block_attention(
                         trtllm_gen_ops,
-                        Q_bshd,
+                        q_flat.view_as(Q_bshd),
                         k_noise_bshd,
                         v_noise_bshd,
                         layer_cache,
@@ -1916,6 +1972,48 @@ class DFlashForCausalLM(nn.Module):
                         self._dflash_trtllm_gen_workspace,
                         self._dflash_trtllm_gen_counters,
                         out_flat,
+                    )
+                elif window_left == -1:
+                    # Every block query attends the same keys (the history and
+                    # the whole block), so the block runs as one decode request
+                    # with block_size * num_heads query heads. Query (j, head
+                    # g * group + r) becomes head (g, j, r): the GQA group
+                    # grows to block_size * group and the decode kernel, which
+                    # also splits a long history across CTAs, reads each
+                    # history once.
+                    group = num_heads_per_rank // num_kv_heads_per_rank
+                    q_folded = q_flat.reshape(
+                        B, block_size, num_kv_heads_per_rank, group, head_dim
+                    ).permute(0, 2, 1, 3, 4)
+                    q_folded = q_folded.reshape(B, -1, head_dim)
+                    out_folded = q_folded.new_empty(q_folded.shape, dtype=out.dtype)
+                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                        query=q_folded,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_left,
+                        out=out_folded,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        backend="trtllm-gen",
+                        q_len_per_req=1,
+                        max_q_len=None,
+                        cum_seq_lens_q=None,
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        bmm1_scale_log2=None,
+                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                    out_flat.view(B, block_size, num_kv_heads_per_rank, group, head_dim).copy_(
+                        out_folded.view(
+                            B, num_kv_heads_per_rank, block_size, group, head_dim
+                        ).permute(0, 2, 1, 3, 4)
                     )
                 else:
                     cum_seq_lens_q = torch.arange(
@@ -2156,7 +2254,11 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         for k in aux_keys:
             w = weights.pop(k)
             norm = nn.RMSNorm(
-                w.shape[0], eps=eps, device="cuda", elementwise_affine=True, dtype=w.dtype
+                w.shape[0],
+                eps=eps,
+                device="cuda",
+                elementwise_affine=True,
+                dtype=w.dtype,
             )
             norm.weight.data.copy_(w)
             norms.append(norm)

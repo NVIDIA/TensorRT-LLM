@@ -11,9 +11,12 @@ import torch
 
 from ..._utils import get_sm_version
 from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
+    DSparkConcatFP8QuantKernel,
+    DSparkRMSNormFP8QuantKernel,
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
+    DSparkRMSNormRoPEPageWriteKernel,
 )
 
 _DSV4_DSPARK_HEAD_DIM = 512
@@ -24,11 +27,13 @@ _DSV4_DSPARK_BLOCK_SIZES = (5, 6)
 _DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
+    107: "sm_107",
 }
-# The RMSNorm/RoPE kernels are plain SIMT CuTe kernels with no architecture-specific
-# instructions, so they run on more GPUs than the DSV4 DSpark attention kernel gated
-# by _DSV4_DSPARK_ARCH_BY_SM.
+# RMSNorm/RoPE support is checked independently of attention allocator selection.
 _DSPARK_RMSNORM_ROPE_SM_VERSIONS = frozenset((100, 103, 107))
+
+
+_dspark_fp8_input_compile_allowed = False
 
 
 @functools.cache
@@ -350,7 +355,7 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 
 @functools.cache
-def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float):
+def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
@@ -591,8 +596,12 @@ def cute_dsl_dspark_rmsnorm_rope_draft_block(
     eps: float,
 ) -> torch.Tensor:
     """Prepare a zero-padded draft block after validating the fused contract."""
+    _validate_dspark_preparation(x, weight, freqs)
     block_size = x.shape[1]
-    compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps)
+    if block_size not in (5, 6):
+        raise ValueError("DSpark draft block size must be 5 or 6")
+    with torch.cuda.device(x.device):
+        compiled = _compile_dspark_rmsnorm_rope_draft_block(block_size, eps, x.device.index)
     output = x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
     compiled(
         x.view(-1, _DSV4_DSPARK_HEAD_DIM),
@@ -612,3 +621,329 @@ def _(
 ) -> torch.Tensor:
     del weight, freqs, eps
     return x.new_empty((x.shape[0], _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE, _DSV4_DSPARK_HEAD_DIM))
+
+
+def _validate_dspark_preparation(
+    x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor
+) -> None:
+    if (
+        x.ndim != 3
+        or x.shape[-1] != _DSV4_DSPARK_HEAD_DIM
+        or x.dtype != torch.bfloat16
+        or weight.dtype != x.dtype
+        or weight.shape != (_DSV4_DSPARK_HEAD_DIM,)
+        or freqs.dtype != torch.float32
+        or freqs.shape != (x.shape[0] * x.shape[1], _DSV4_DSPARK_ROPE_DIM // 2, 2)
+        or not all(
+            t.is_cuda and t.device == x.device and t.is_contiguous() for t in (x, weight, freqs)
+        )
+    ):
+        raise ValueError(
+            "DSpark preparation requires contiguous BF16 [batch, tokens, 512] inputs, "
+            "BF16 [512] weights and FP32 [batch * tokens, 32, 2] frequencies"
+        )
+
+
+@functools.cache
+def _compile_dspark_rmsnorm_rope_page_write(page_size: int, eps: float, device: int):
+    # Device identity scopes compilation to the active CUDA target.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "DSpark RMSNorm/RoPE page-write must be warmed up before CUDA graph capture"
+        )
+    rows = cute.sym_int()
+    pages = cute.sym_int()
+    x_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
+    )
+    freqs_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
+        stride_order=(2, 1, 0),
+    )
+    cache_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (pages, page_size, _DSV4_DSPARK_HEAD_DIM),
+        stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
+    )
+    tables_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (rows, cute.sym_int()), stride=(cute.sym_int64(), 1)
+    )
+    start_pos_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (rows,), stride_order=(0,)
+    )
+    capacities_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int64, (rows,), stride_order=(0,)
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkRMSNormRoPEPageWriteKernel(
+        _DSV4_DSPARK_HEAD_DIM,
+        _DSV4_DSPARK_ROPE_DIM,
+        eps,
+        page_size,
+    )
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
+        freqs_fake,
+        cache_fake,
+        tables_fake,
+        start_pos_fake,
+        capacities_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_rmsnorm_rope_page_write",
+    mutates_args=("kv_cache",),
+    device_types="cuda",
+)
+def cute_dsl_dspark_rmsnorm_rope_page_write(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    start_pos: torch.Tensor,
+    capacities: torch.Tensor,
+    eps: float,
+) -> None:
+    """Normalize/rotate [batch, 1, 512] KV into pages; zero capacities mask dummy rows."""
+    _validate_dspark_preparation(x, weight, freqs)
+    batch = x.shape[0]
+    if (
+        x.shape[1] != 1
+        or kv_cache.ndim != 3
+        or kv_cache.shape[1] not in (16, 32, 64, 128, 256)
+        or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM
+        or kv_cache.dtype != x.dtype
+        or kv_cache.stride(1) != _DSV4_DSPARK_HEAD_DIM
+        or kv_cache.stride(2) != 1
+        or block_tables.ndim != 2
+        or block_tables.shape[0] != batch
+        or block_tables.dtype != torch.int32
+        or block_tables.stride(1) != 1
+        or not all(
+            t.is_cuda and t.device == x.device
+            for t in (kv_cache, block_tables, start_pos, capacities)
+        )
+        or not all(
+            t.shape == (batch,) and t.dtype == torch.int64 and t.is_contiguous()
+            for t in (start_pos, capacities)
+        )
+    ):
+        raise ValueError(
+            "DSpark page write requires BF16 pages with contiguous tokens, INT32 "
+            "page-table rows and contiguous INT64 positions/capacities on x's device"
+        )
+    with torch.cuda.device(x.device):
+        compiled = _compile_dspark_rmsnorm_rope_page_write(kv_cache.shape[1], eps, x.device.index)
+        compiled(
+            x.view(batch, _DSV4_DSPARK_HEAD_DIM),
+            weight,
+            freqs,
+            kv_cache,
+            block_tables,
+            start_pos,
+            capacities,
+        )
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_page_write")
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    start_pos: torch.Tensor,
+    capacities: torch.Tensor,
+    eps: float,
+) -> None:
+    return None
+
+
+def _r128c4_scale_numel(rows: int, hidden_dim: int) -> int:
+    return ((rows + 127) // 128 * 128) * (hidden_dim // 32)
+
+
+def precompile_dspark_fp8_input_fusions(
+    qkv_hidden_dim: int | None,
+    q_lora_rank: int | None,
+    eps: float,
+) -> None:
+    """Precompile dynamic-row DSpark FP8 input producers during model init."""
+    global _dspark_fp8_input_compile_allowed
+    if get_sm_version() != 107:
+        return
+    if _dspark_fp8_input_compile_allowed:
+        raise RuntimeError("DSpark FP8 input precompile is already in progress")
+
+    _dspark_fp8_input_compile_allowed = True
+    try:
+        if qkv_hidden_dim is not None:
+            _compile_dspark_concat_fp8_quant(qkv_hidden_dim)
+        if q_lora_rank is not None:
+            _compile_dspark_rmsnorm_fp8_quant(q_lora_rank, eps)
+    finally:
+        _dspark_fp8_input_compile_allowed = False
+
+
+@functools.cache
+def _compile_dspark_rmsnorm_fp8_quant(hidden_dim: int, eps: float):
+    if not _dspark_fp8_input_compile_allowed:
+        raise RuntimeError(
+            "DSpark RMSNorm/FP8 quant kernel was not precompiled during worker initialization"
+        )
+
+    rows = cute.sym_int()
+    scale_elems = cute.sym_int()
+    x_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (rows, hidden_dim),
+        stride=(cute.sym_int64(), 1),
+    )
+    weight_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16, (hidden_dim,), stride_order=(0,)
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float8E4M3FN, (rows, hidden_dim), stride_order=(1, 0)
+    )
+    scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkRMSNormFP8QuantKernel(hidden_dim, eps)
+    return cute.compile(
+        kernel,
+        x_fake,
+        weight_fake,
+        output_fake,
+        scale_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@functools.cache
+def _compile_dspark_concat_fp8_quant(hidden_dim: int):
+    if not _dspark_fp8_input_compile_allowed:
+        raise RuntimeError(
+            "DSpark concat/FP8 quant kernel was not precompiled during worker initialization"
+        )
+
+    first_rows = cute.sym_int()
+    second_rows = cute.sym_int()
+    output_rows = cute.sym_int()
+    scale_elems = cute.sym_int()
+    first_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (first_rows, hidden_dim),
+        stride=(cute.sym_int64(), 1),
+    )
+    second_fake = cute.runtime.make_fake_tensor(
+        cutlass.BFloat16,
+        (second_rows, hidden_dim),
+        stride=(cute.sym_int64(), 1),
+    )
+    output_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float8E4M3FN, (output_rows, hidden_dim), stride_order=(1, 0)
+    )
+    scale_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float8E8M0FNU, (scale_elems,), stride_order=(0,)
+    )
+    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    kernel = DSparkConcatFP8QuantKernel(hidden_dim)
+    return cute.compile(
+        kernel,
+        first_fake,
+        second_fake,
+        output_fake,
+        scale_fake,
+        stream_fake,
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_rmsnorm_fp8_quant",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cute_dsl_dspark_rmsnorm_fp8_quant(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce a prequantized MXFP8 Linear input after model-init precompile."""
+    hidden_dim = x.shape[-1]
+    x_flat = x.view(-1, hidden_dim)
+    output = x.new_empty(x_flat.shape, dtype=torch.float8_e4m3fn)
+    output_scale = x.new_empty(
+        (_r128c4_scale_numel(x_flat.shape[0], hidden_dim),), dtype=torch.uint8
+    )
+    compiled = _compile_dspark_rmsnorm_fp8_quant(hidden_dim, eps)
+    compiled(
+        x_flat,
+        weight,
+        output,
+        output_scale.view(torch.float8_e8m0fnu),
+    )
+    return output, output_scale
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_fp8_quant")
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, eps
+    rows = x.numel() // x.shape[-1]
+    return (
+        x.new_empty((rows, x.shape[-1]), dtype=torch.float8_e4m3fn),
+        x.new_empty((_r128c4_scale_numel(rows, x.shape[-1]),), dtype=torch.uint8),
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::cute_dsl_dspark_concat_fp8_quant",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cute_dsl_dspark_concat_fp8_quant(
+    first: torch.Tensor,
+    second: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate row ranges into one prequantized MXFP8 Linear input."""
+    rows = first.shape[0] + second.shape[0]
+    hidden_dim = first.shape[1]
+    output = first.new_empty((rows, hidden_dim), dtype=torch.float8_e4m3fn)
+    output_scale = first.new_empty((_r128c4_scale_numel(rows, hidden_dim),), dtype=torch.uint8)
+    compiled = _compile_dspark_concat_fp8_quant(hidden_dim)
+    compiled(
+        first,
+        second,
+        output,
+        output_scale.view(torch.float8_e8m0fnu),
+    )
+    return output, output_scale
+
+
+@torch.library.register_fake("trtllm::cute_dsl_dspark_concat_fp8_quant")
+def _(
+    first: torch.Tensor,
+    second: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows = first.shape[0] + second.shape[0]
+    hidden_dim = first.shape[1]
+    return (
+        first.new_empty((rows, hidden_dim), dtype=torch.float8_e4m3fn),
+        first.new_empty((_r128c4_scale_numel(rows, hidden_dim),), dtype=torch.uint8),
+    )

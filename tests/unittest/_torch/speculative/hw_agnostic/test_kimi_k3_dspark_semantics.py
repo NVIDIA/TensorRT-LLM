@@ -60,6 +60,13 @@ needs_absorbed_mla = pytest.mark.skipif(
     reason="paged absorbed-MLA decode needs an SM100-family GPU",
 )
 
+# The TRTLLM-Gen paged attention the DFlash drafter uses ships for the same
+# SM100 family.
+needs_trtllm_gen = pytest.mark.skipif(
+    not _has_absorbed_mla_kernel(),
+    reason="TRTLLM-Gen paged block decode needs an SM100-family GPU",
+)
+
 # ---------------------------------------------------------------------------
 # Reference: line-for-line port of DeepSpec VanillaMarkov
 # (deepspec/modeling/dspark/markov_head.py) at temperature 0.
@@ -825,6 +832,86 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     )
     diff = (out - expected).abs().max().item()
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
+
+
+def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+    """Block decode through the TRTLLM paged cache, one request per history.
+
+    Pages are shuffled across requests, so only the block tables decide which
+    history each request reads.
+    """
+    dev = "cuda"
+    blk = TINY["block_size"]
+    lengths = [ctx.shape[0] for ctx in captured]
+    history = []
+    for ctx in captured:
+        proj = drafter.project_target_hidden(ctx.to(dev, torch.bfloat16))
+        history.append(drafter.precompute_context_kv(proj, torch.arange(ctx.shape[0], device=dev)))
+    # [N, layers, kv heads, head dim]; the drafter sizes its fused K/V lazily.
+    num_layers, nkv, hd = history[0][0].shape[1:]
+    pages_per_req = max((n + blk + page_size - 1) // page_size for n in lengths)
+    num_pages = len(lengths) * pages_per_req
+    order = torch.randperm(num_pages, generator=torch.Generator().manual_seed(3))
+    page_table = order.view(len(lengths), pages_per_req).to(dev, torch.int32)
+    caches = [
+        torch.zeros(num_pages, 2, nkv, page_size, hd, dtype=torch.bfloat16, device=dev)
+        for _ in range(num_layers)
+    ]
+    for row, (k, v) in enumerate(history):
+        positions = torch.arange(lengths[row], device=dev)
+        pages = page_table[row, positions // page_size].long()
+        offsets = positions % page_size
+        for layer, cache in enumerate(caches):
+            cache[pages, 0, :, offsets] = k[:, layer]
+            cache[pages, 1, :, offsets] = v[:, layer]
+    caches = [cache.to(cache_dtype) for cache in caches]
+    out = drafter.dflash_forward(
+        noise_embedding=torch.stack(noise_embed).to(dev, torch.bfloat16),
+        query_positions=torch.stack([torch.arange(n, n + blk) for n in lengths]).to(dev),
+        num_ctx_per_req=torch.tensor(lengths, device=dev),
+        ctx_k_cache=None,
+        ctx_v_cache=None,
+        ctx_cache_batch_idx=torch.arange(len(lengths), device=dev),
+        ctx_kv_cache=caches,
+        ctx_page_table=page_table,
+    )
+    return out.float().cpu().view(len(lengths), blk, -1)
+
+
+@needs_trtllm_gen
+@pytest.mark.parametrize(
+    "cache_dtype,tolerance",
+    [(torch.bfloat16, 0.02), (torch.float8_e4m3fn, 0.05)],
+    ids=["bf16", "fp8"],
+)
+def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype, tolerance):
+    """The TRTLLM non-causal block attention over a paged BF16 or FP8 cache
+    matches the eager reference for requests with different history lengths.
+
+    Each block query runs as its own one-token decode request over its
+    parent's pages, so a wrong table, length or block write shows up here.
+    An FP8 cache also takes the block's K/V and queries in FP8.
+    """
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    g = torch.Generator().manual_seed(44)
+    lengths = (CTX_LEN, 70)
+    captured = [
+        torch.randn(n, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5 for n in lengths
+    ]
+    noise_embed = [
+        torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5 for _ in lengths
+    ]
+
+    out = _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype)
+
+    for row in range(len(lengths)):
+        expected = _reference_block_decode(
+            weights, captured[row].to(torch.bfloat16), noise_embed[row].to(torch.bfloat16), False
+        )
+        expected = expected.float()
+        rel_err = ((out[row] - expected).norm() / expected.norm()).item()
+        assert rel_err < tolerance, f"request {row}: relative error {rel_err}"
 
 
 # ---------------------------------------------------------------------------

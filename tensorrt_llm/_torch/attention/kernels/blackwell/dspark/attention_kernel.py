@@ -37,9 +37,10 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, Int32, T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 try:
@@ -50,14 +51,14 @@ except ImportError:
     cutlass_memory = utils
 
 
-"""DSpark rolling-window MQA attention for NVIDIA Blackwell-family GPUs.
+"""DSpark paged MQA attention for NVIDIA Blackwell-family GPUs.
 
 A TMA + tcgen05 tensor-core warp-specialized persistent kernel that fuses the
 Q*K^T matmul, attention-sink online softmax, P*V matmul, and the inverse-RoPE
 epilogue into a single launch. KV arrives as two paged streams (the 128-row
-rolling window and the draft block's own rows); see
+context window and the draft block's own rows); see
 ``attention.py`` for the supported DSpark contract and
-``tests/unittest/_torch/speculative/test_dspark_cute_dsl_attention.py`` for
+``tests/unittest/_torch/speculative/test_dspark_paged_attention.py`` for
 validation coverage.
 
 The split-KV/LSE/variable-sequence machinery of the generic attention kernel and its
@@ -66,6 +67,73 @@ added here.
 """
 
 LOG2_E = 1.4426950408889634074
+
+
+@dsl_user_op
+def _store_global_b64(gmem_ptr, value_lo: Int32, value_hi: Int32, *, loc=None, ip=None) -> None:
+    gmem_addr = gmem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            gmem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value_lo).ir_value(loc=loc, ip=ip),
+            Int32(value_hi).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n  .reg .b64 packed;\n  mov.b64 packed, {$1, $2};\n  st.global.u64 [$0], packed;\n}",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _load_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=False,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_shared_b128(
+    smem_ptr,
+    value0: Int32,
+    value1: Int32,
+    value2: Int32,
+    value3: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    llvm.inline_asm(
+        None,
+        [
+            smem_addr.ir_value(loc=loc, ip=ip),
+            Int32(value0).ir_value(loc=loc, ip=ip),
+            Int32(value1).ir_value(loc=loc, ip=ip),
+            Int32(value2).ir_value(loc=loc, ip=ip),
+            Int32(value3).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 class DSparkAttentionKernel:
@@ -116,7 +184,6 @@ class DSparkAttentionKernel:
         # normally match them, but a specialization may use a wider logical
         # span so one OOB-zero-filling TMA replaces many tiny page copies.
         self.tma_page_size_draft = page_size_draft
-        self.tma_page_size_win = page_size_win
         self.fixed_cache_seq_len = None
         self.attn_sink_is_scaled = True
         # Fixed two-stream specializations can receive the initialized-row
@@ -223,8 +290,10 @@ class DSparkAttentionKernel:
         c_latent_draft: cute.Tensor,
         page_table_win: cute.Tensor,
         o: cute.Tensor,
+        o_scale: Optional[cute.Tensor],
         cache_seqs: Optional[cute.Tensor],
         window_valid_lens: Optional[cute.Tensor],
+        capacities: cute.Tensor,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
@@ -236,7 +305,7 @@ class DSparkAttentionKernel:
         KV is split into two streams concatenated along the seq_len_k dimension:
           - Sliding-window: first `mma_qk_tiler[1]` rows (default 128).
           - Draft-block:     remaining rows.
-        The rolling-window stream uses a runtime page-table slot. The draft
+        The context stream uses the request's physical page table. The draft
         block is stored contiguously, one physical block per request.
         """
 
@@ -244,7 +313,7 @@ class DSparkAttentionKernel:
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent_draft.element_type
         self.v_dtype = c_latent_draft.element_type
-        self.o_dtype = o.element_type
+        self.o_dtype = cutlass.BFloat16
 
         # check type consistency
         if cutlass.const_expr(
@@ -260,8 +329,18 @@ class DSparkAttentionKernel:
             raise ValueError("c_latent_draft must have leading dimension 1")
         if cutlass.const_expr(c_latent_win.stride[1] != 1):
             raise ValueError("c_latent_win must have leading dimension 1")
-        if cutlass.const_expr(o.stride[1] != 1):
-            raise ValueError("o must have leading dimension 1")
+        if cutlass.const_expr(self.output_groups is None):
+            if cutlass.const_expr(o.element_type is not cutlass.BFloat16 or o.stride[1] != 1):
+                raise ValueError("o must be leading-dimension-1 BF16")
+        else:
+            if cutlass.const_expr(
+                o.element_type is not cutlass.Float8E4M3FN
+                or o_scale is None
+                or o_scale.element_type is not cutlass.Float32
+                or o.stride[2] != 1
+                or o_scale.stride[2] != 1
+            ):
+                raise ValueError("quantized o must be contiguous FP8 with contiguous FP32 scales")
 
         c_latent_draft_transpose_layout = cute.select(c_latent_draft.layout, mode=[1, 0, 2])
         c_latent_draft_transpose = cute.make_tensor(
@@ -325,7 +404,6 @@ class DSparkAttentionKernel:
         )
         cta_kv_m = qk_tiled_mma.op.shape_mnk[0] // qk_tiled_mma.thr_id.shape
         kc_page_tile_size_draft = min(self.tma_page_size_draft, cta_kv_m)
-        kc_page_tile_size_win = min(self.tma_page_size_win, cta_kv_m)
 
         kc_smem_layout_for_tma_base = sm100_utils.make_smem_layout(
             OperandMajorMode.K,
@@ -336,8 +414,9 @@ class DSparkAttentionKernel:
         kc_smem_layout_for_tma_draft = cute.tiled_divide(
             kc_smem_layout_for_tma_base, (kc_page_tile_size_draft, self.mma_qk_tiler[2])
         )
-        kc_smem_layout_for_tma_win = cute.tiled_divide(
-            kc_smem_layout_for_tma_base, (kc_page_tile_size_win, self.mma_qk_tiler[2])
+        kc_smem_layout_for_tma_win = tuple(
+            cute.tiled_divide(kc_smem_layout_for_tma_base, (rows, self.mma_qk_tiler[2]))
+            for rows in self.history_tile_sizes
         )
 
         p_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -357,7 +436,6 @@ class DSparkAttentionKernel:
             self.load_kv_stage,
         )
         vc_page_tile_size_draft = min(self.tma_page_size_draft, self.mma_pv_tiler[2])
-        vc_page_tile_size_win = min(self.tma_page_size_win, self.mma_pv_tiler[2])
         vc_smem_layout_for_tma_base = sm100_utils.make_smem_layout(
             OperandMajorMode.MN,
             (self.mma_pv_tiler[1] // pv_tiled_mma.thr_id.shape, self.mma_pv_tiler[2]),
@@ -369,9 +447,9 @@ class DSparkAttentionKernel:
             vc_smem_layout_for_tma_base,
             (vc_pv_n, vc_page_tile_size_draft),
         )
-        vc_smem_layout_for_tma_win = cute.tiled_divide(
-            vc_smem_layout_for_tma_base,
-            (vc_pv_n, vc_page_tile_size_win),
+        vc_smem_layout_for_tma_win = tuple(
+            cute.tiled_divide(vc_smem_layout_for_tma_base, (vc_pv_n, rows))
+            for rows in self.history_tile_sizes
         )
         # TMA load for Q latent
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -396,16 +474,19 @@ class DSparkAttentionKernel:
             is_k_load=True,
             page_size=self.tma_page_size_draft,
         )
-        kc_smem_layout_win = cute.select(kc_smem_layout_for_tma_win, mode=[0])
-        tma_atom_c_latent_win, tma_tensor_c_latent_win = self.make_paged_tiled_tma_atom(
-            tma_load_op,
-            c_latent_win,
-            kc_smem_layout_win,
-            (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
-            qk_tiled_mma,
-            is_k_load=True,
-            page_size=self.tma_page_size_win,
-        )
+        tma_atom_c_latent_win, tma_tensor_c_latent_win = (), ()
+        for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+            atom, tensor = self.make_paged_tiled_tma_atom(
+                tma_load_op,
+                c_latent_win,
+                cute.select(kc_smem_layout_for_tma_win[tile], mode=[0]),
+                (self.mma_qk_tiler[1], self.mma_qk_tiler[2]),
+                qk_tiled_mma,
+                is_k_load=True,
+                page_size=self.history_tile_sizes[tile],
+            )
+            tma_atom_c_latent_win += (atom,)
+            tma_tensor_c_latent_win += (tensor,)
         # TMA load for window and draft-block V
         vc_smem_layout_draft = cute.select(vc_smem_layout_for_tma_draft, mode=[0])
         tma_atom_c_latent_transpose_draft, tma_tensor_c_latent_transpose_draft = (
@@ -419,18 +500,19 @@ class DSparkAttentionKernel:
                 page_size=self.tma_page_size_draft,
             )
         )
-        vc_smem_layout_win = cute.select(vc_smem_layout_for_tma_win, mode=[0])
-        tma_atom_c_latent_transpose_win, tma_tensor_c_latent_transpose_win = (
-            self.make_paged_tiled_tma_atom(
+        tma_atom_c_latent_transpose_win, tma_tensor_c_latent_transpose_win = (), ()
+        for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+            atom, tensor = self.make_paged_tiled_tma_atom(
                 tma_load_op,
                 c_latent_win_transpose,
-                vc_smem_layout_win,
+                cute.select(vc_smem_layout_for_tma_win[tile], mode=[0]),
                 (self.mma_pv_tiler[1], self.mma_pv_tiler[2]),
                 pv_tiled_mma,
                 is_k_load=False,
-                page_size=self.tma_page_size_win,
+                page_size=self.history_tile_sizes[tile],
             )
-        )
+            tma_atom_c_latent_transpose_win += (atom,)
+            tma_tensor_c_latent_transpose_win += (tensor,)
 
         q_latent_copy_size = (
             cute.size_in_bytes(self.q_dtype, q_latent_smem_layout)
@@ -450,7 +532,7 @@ class DSparkAttentionKernel:
         self.tma_copy_kc_bytes = kc_copy_size
 
         tile_sched_params, grid = self._compute_grid(
-            o, self.cluster_shape_mnk, self.max_active_clusters
+            q_latent, self.cluster_shape_mnk, self.max_active_clusters
         )
 
         @cute.struct
@@ -475,6 +557,17 @@ class DSparkAttentionKernel:
             epilogue_smem_exchange: cute.struct.MemRange[
                 self.acc_dtype, self.num_compute_warps * self.threads_per_warp
             ]
+            fp8_epilogue_scratch: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    (
+                        self.num_compute_warps * self.threads_per_warp * 32
+                        if self.output_groups is not None
+                        else 1
+                    ),
+                ],
+                128,
+            ]
             smem_q_latent: cute.struct.Align[
                 cute.struct.MemRange[self.q_dtype, cute.cosize(q_latent_smem_layout_staged)],
                 1024,
@@ -487,7 +580,7 @@ class DSparkAttentionKernel:
                 cute.struct.MemRange[self.q_dtype, cute.cosize(p_smem_layout_staged)],
                 1024,
             ]
-            smem_page_table: cute.struct.MemRange[cutlass.Int32, self.load_pt_stage]
+            smem_page_table: cute.struct.MemRange[cutlass.Int32, 128 * self.load_pt_stage]
 
         required_smem_bytes = AttentionKernelSharedStorage.__sizeof__()
         available_smem_bytes = cutlass_memory.get_smem_capacity_in_bytes(self.arch_str)
@@ -513,8 +606,10 @@ class DSparkAttentionKernel:
             tma_tensor_c_latent_transpose_draft,
             page_table_win,
             o,
+            o_scale,
             cache_seqs,
             window_valid_lens,
+            capacities,
             softmax_scale_log2,
             output_scale,
             attn_sink_unscaled,
@@ -578,18 +673,20 @@ class DSparkAttentionKernel:
         tiled_mma_pv: cute.TiledMma,
         tma_atom_q_latent: Optional[cute.CopyAtom],
         mQL: cute.Tensor,
-        tma_atom_c_latent_win: Optional[cute.CopyAtom],
-        mCL_win: cute.Tensor,
+        tma_atom_c_latent_win: tuple,
+        mCL_win: tuple,
         tma_atom_c_latent_draft: Optional[cute.CopyAtom],
         mCL_draft: cute.Tensor,
-        tma_atom_c_latent_transpose_win: Optional[cute.CopyAtom],
-        mCLT_win: cute.Tensor,
+        tma_atom_c_latent_transpose_win: tuple,
+        mCLT_win: tuple,
         tma_atom_c_latent_transpose_draft: Optional[cute.CopyAtom],
         mCLT_draft: cute.Tensor,
         mPT_win: cute.Tensor,
         mO: Optional[cute.Tensor],
+        mOScale: Optional[cute.Tensor],
         cache_seqs: cute.Tensor,
         window_valid_lens: cute.Tensor,
+        capacities: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         attn_sink_unscaled: cute.Tensor,
@@ -598,9 +695,9 @@ class DSparkAttentionKernel:
         kc_smem_layout_staged: cute.ComposedLayout,
         p_smem_layout_staged: cute.ComposedLayout,
         vc_smem_layout_staged: cute.ComposedLayout,
-        kc_smem_layout_for_tma_win: cute.ComposedLayout,
+        kc_smem_layout_for_tma_win: tuple,
         kc_smem_layout_for_tma_draft: cute.ComposedLayout,
-        vc_smem_layout_for_tma_win: cute.ComposedLayout,
+        vc_smem_layout_for_tma_win: tuple,
         vc_smem_layout_for_tma_draft: cute.ComposedLayout,
         cta_layout_vmnk: cute.Layout,
         tile_sched_params,
@@ -624,9 +721,11 @@ class DSparkAttentionKernel:
         # Prefetch tma descriptor
         if warp_idx == self.mma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_q_latent)
-            cpasync.prefetch_descriptor(tma_atom_c_latent_win)
+            for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+                cpasync.prefetch_descriptor(tma_atom_c_latent_win[tile])
             cpasync.prefetch_descriptor(tma_atom_c_latent_draft)
-            cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_win)
+            for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+                cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_win[tile])
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_draft)
 
         # Alloc
@@ -679,10 +778,10 @@ class DSparkAttentionKernel:
         sKC = storage.smem_kc.get_tensor(
             kc_smem_layout_staged.outer, swizzle=kc_smem_layout_staged.inner
         )
-        # Two TMA-views over the same physical SMEM, one per page-size
-        sKC_for_tma_win = storage.smem_kc.get_tensor(
-            kc_smem_layout_for_tma_win.outer,
-            swizzle=kc_smem_layout_for_tma_win.inner,
+        # TMA tile views share the unchanged physical K/V SMEM layout.
+        sKC_for_tma_win = tuple(
+            storage.smem_kc.get_tensor(layout.outer, swizzle=layout.inner)
+            for layout in kc_smem_layout_for_tma_win
         )
         sKC_for_tma_draft = storage.smem_kc.get_tensor(
             kc_smem_layout_for_tma_draft.outer,
@@ -692,13 +791,15 @@ class DSparkAttentionKernel:
         # reuse smem
         sVC_ptr = cute.recast_ptr(sKC.iterator, vc_smem_layout_staged.inner)
         sVC = cute.make_tensor(sVC_ptr, vc_smem_layout_staged.outer)
-        sVC_for_tma_win = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma_win.outer)
+        sVC_for_tma_win = tuple(
+            cute.make_tensor(sVC_ptr, layout.outer) for layout in vc_smem_layout_for_tma_win
+        )
         sVC_for_tma_draft = cute.make_tensor(sVC_ptr, vc_smem_layout_for_tma_draft.outer)
         # (MMA, MMA_H, MMA_K)
         sP = storage.smem_p.get_tensor(
             p_smem_layout_staged.outer, swizzle=p_smem_layout_staged.inner
         )
-        sPT = storage.smem_page_table.get_tensor(cute.make_layout((1, self.load_pt_stage)))
+        sPT = storage.smem_page_table.get_tensor(cute.make_layout((128, self.load_pt_stage)))
         # (compute_threads,)
         softmax_smem_exchange = storage.softmax_smem_exchange.get_tensor(
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
@@ -706,6 +807,14 @@ class DSparkAttentionKernel:
         epilogue_smem_exchange = storage.epilogue_smem_exchange.get_tensor(
             cute.make_layout(self.num_compute_warps * self.threads_per_warp)
         )
+        fp8_epilogue_scratch = None
+        if cutlass.const_expr(self.output_groups is not None):
+            fp8_epilogue_scratch = storage.fp8_epilogue_scratch.get_tensor(
+                cute.make_layout(
+                    (self.num_compute_warps, self.threads_per_warp, 32),
+                    stride=(self.threads_per_warp * 32, 32, 1),
+                )
+            )
 
         #
         # Cluster wait before tensor memory alloc
@@ -733,6 +842,9 @@ class DSparkAttentionKernel:
                     blk_coord=blk_coord,
                     load_pt_pipeline=load_pt_pipeline,
                     mPT_win=mPT_win,
+                    positions=cache_seqs,
+                    valid_lengths=window_valid_lens,
+                    capacities=capacities,
                     sPT=sPT,
                     tidx=tidx,
                 )
@@ -765,6 +877,8 @@ class DSparkAttentionKernel:
                 # Construct fixed common/tma_qk/tma_pv params for load_tma
                 tma_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
+                    position=cutlass.Int32(cache_seqs[blk_coord[2]]),
+                    window_end=cutlass.Int32(cache_seqs[blk_coord[2]]) % 128,
                     load_q_pipeline=load_q_pipeline,
                     load_kv_pipeline=load_kv_pipeline,
                     sPT=sPT,
@@ -923,9 +1037,11 @@ class DSparkAttentionKernel:
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     smem_exchange=softmax_smem_exchange,
-                    mO=mO,
+                    mO=mQL if cutlass.const_expr(self.output_groups is not None) else mO,
                     K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
-                    window_valid_len=self.get_window_valid_len(window_valid_lens, blk_coord[2]),
+                    window_valid_len=self.get_window_valid_len(
+                        window_valid_lens, capacities, cache_seqs, blk_coord[2]
+                    ),
                     window_end_pos=self.get_window_end_pos(cache_seqs, blk_coord[2]),
                     L=mCL_draft.shape[1],
                     tmem_ptr=tmem_ptr,
@@ -976,7 +1092,7 @@ class DSparkAttentionKernel:
                 compute_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
                     smem_exchange=epilogue_smem_exchange,
-                    mO=mO,
+                    mO=mQL if cutlass.const_expr(self.output_groups is not None) else mO,
                     K=self.get_cache_seq_len(cache_seqs, blk_coord[2]),
                     L=mCL_draft.shape[1],
                     H=mQL.shape[0],
@@ -990,6 +1106,9 @@ class DSparkAttentionKernel:
                     output_scale=output_scale,
                     softmax_scale_log2=softmax_scale_log2,
                     mFreqs=inverse_rope_freqs,
+                    mOQuant=mO,
+                    mOScale=mOScale,
+                    sOQuant=fp8_epilogue_scratch,
                 )
                 p_cor_consumer_state, mma_o_consumer_state = self.correction(
                     compute_common_params,
@@ -1013,15 +1132,18 @@ class DSparkAttentionKernel:
 
     @cute.jit
     def get_window_valid_len(
-        self, window_valid_lens: Optional[cute.Tensor], batch_idx: cutlass.Int32
+        self,
+        window_valid_lens: cute.Tensor,
+        capacities: cute.Tensor,
+        positions: cute.Tensor,
+        batch_idx: cutlass.Int32,
     ) -> cutlass.Int32:
-        """Return the number of initialized rows in the window stream."""
-        if cutlass.const_expr(self.window_valid_len_from_tensor):
-            return min(
-                max(cutlass.Int32(window_valid_lens[batch_idx]), cutlass.Int32(0)),
-                cutlass.Int32(self.tma_page_size_win),
-            )
-        return cutlass.Int32(self.tma_page_size_win)
+        """Return the initialized context length, excluding synthetic requests."""
+        length = min(
+            max(cutlass.Int32(window_valid_lens[batch_idx]), 0),
+            min(128, cutlass.Int32(positions[batch_idx])),
+        )
+        return length if capacities[batch_idx] > 0 else cutlass.Int32(0)
 
     @cute.jit
     def get_window_end_pos(
@@ -1048,8 +1170,8 @@ class DSparkAttentionKernel:
         )
         if cutlass.const_expr(self.window_valid_len_from_tensor):
             age = (
-                window_end_pos - local_col + cutlass.Int32(self.tma_page_size_win)
-            ) % cutlass.Int32(self.tma_page_size_win)
+                window_end_pos - 1 - local_col + cutlass.Int32(self.page_size_win)
+            ) % cutlass.Int32(self.page_size_win)
             valid = valid and (k_index != 0 or cute.elem_less(age, window_valid_len))
         return valid
 
@@ -1059,34 +1181,29 @@ class DSparkAttentionKernel:
         common_params: SimpleNamespace,
         load_pt_producer_state: pipeline.PipelineState,
     ) -> pipeline.PipelineState:
-        """Stage the rolling-window slot followed by the implicit draft-block slot."""
-        mPT_win = common_params.mPT_win[None, common_params.blk_coord[2]]
-        tidx = common_params.tidx % self.threads_per_warp
+        """Stage physical pages for each context row, then the draft block."""
+        batch = common_params.blk_coord[2]
+        lane = common_params.tidx % self.threads_per_warp
+        end = cutlass.Int32(common_params.positions[batch])
+        length = cutlass.Int32(common_params.valid_lengths[batch])
+        capacity = cutlass.Int32(common_params.capacities[batch])
         load_pt_pipeline = common_params.load_pt_pipeline
-        atom_async_copy = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.ALWAYS),
-            cutlass.Int32,
-            num_bits_per_copy=cutlass.Int32.width,
-        )
-        mPT_win_for_copy = cute.flat_divide(mPT_win, (1,))
-        sPT_for_copy = cute.flat_divide(common_params.sPT, (1,))
-
         load_pt_pipeline.producer_acquire(load_pt_producer_state)
-        if tidx == 0:
-            cute.copy(
-                atom_async_copy,
-                mPT_win_for_copy[None, 0],
-                sPT_for_copy[None, 0, load_pt_producer_state.index],
-            )
+        for i in cutlass.range_constexpr(4):
+            row = lane + i * 32
+            position = end - 1 - (end - 1 - row + 128) % 128
+            page = cutlass.Int32(-1)
+            if position >= max(0, end - length) and position < capacity:
+                page = common_params.mPT_win[position // self.history_page_size, batch]
+            common_params.sPT[row, load_pt_producer_state.index] = page
         load_pt_pipeline.producer_commit(load_pt_producer_state)
         load_pt_producer_state.advance()
 
         load_pt_pipeline.producer_acquire(load_pt_producer_state)
-        if tidx == 0:
-            sPT_for_copy[None, 0, load_pt_producer_state.index].fill(common_params.blk_coord[2])
+        if lane == 0:
+            common_params.sPT[0, load_pt_producer_state.index] = batch
         load_pt_pipeline.producer_commit(load_pt_producer_state)
         load_pt_producer_state.advance()
-
         return load_pt_producer_state
 
     @cute.jit
@@ -1117,21 +1234,6 @@ class DSparkAttentionKernel:
 
         cta_kv_m = qk_params.tiled_mma_qk.op.shape_mnk[0] // qk_params.tiled_mma_qk.thr_id.shape
 
-        # === K partition for window stream ===
-        cta_m_win = min(cta_kv_m, self.tma_page_size_win)
-        page_tile_size_k_win = min(self.tma_page_size_win, cta_m_win)
-        gCL_win = cute.tiled_divide(qk_params.mCL_win, (page_tile_size_k_win, self.mma_qk_tiler[2]))
-        tSgCL_win = (
-            gCL_win[
-                None,
-                common_params.blk_coord[0] % qk_params.tiled_mma_qk.thr_id.shape,
-                None,
-                None,
-            ]
-            if cta_m_win < self.tma_page_size_win
-            else gCL_win[None, 0, None, None]
-        )
-
         # === K partition for draft-block stream ===
         cta_m_draft = min(cta_kv_m, self.tma_page_size_draft)
         page_tile_size_k_draft = min(self.tma_page_size_draft, cta_m_draft)
@@ -1158,13 +1260,20 @@ class DSparkAttentionKernel:
             cute.group_modes(tSgQL, 0, 3),
         )
 
-        tKCsKC_win, tCLgCL_win = cpasync.tma_partition(
-            qk_params.tma_atom_c_latent_win,
-            0,
-            cute.make_layout(1),
-            qk_params.sKC_win,
-            tSgCL_win,
-        )
+        tKCsKC_win, tCLgCL_win = (), ()
+        for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+            gCL_win = cute.tiled_divide(
+                qk_params.mCL_win[tile], (self.history_tile_sizes[tile], self.mma_qk_tiler[2])
+            )
+            smem, gmem = cpasync.tma_partition(
+                qk_params.tma_atom_c_latent_win[tile],
+                0,
+                cute.make_layout(1),
+                qk_params.sKC_win[tile],
+                gCL_win,
+            )
+            tKCsKC_win += (smem,)
+            tCLgCL_win += (gmem,)
         tKCsKC_draft, tCLgCL_draft = cpasync.tma_partition(
             qk_params.tma_atom_c_latent_draft,
             0,
@@ -1178,14 +1287,25 @@ class DSparkAttentionKernel:
         ]
 
         # === V partition for window stream ===
-        page_tile_size_v_win = min(self.tma_page_size_win, self.mma_pv_tiler[2])
-        gCLT_win = cute.flat_divide(v_params.mCLT_win, (self.mma_pv_tiler[1], page_tile_size_v_win))
         cta_n = self.mma_pv_tiler[1] // v_params.tiled_mma_pv.thr_id.shape
-        gCLT_win = cute.logical_divide(gCLT_win, (cta_n,))[
-            (None, common_params.blk_coord[0]), None, None, None, None
-        ]
-        tOgCLT_win = cute.tiled_divide(gCLT_win, (cta_n, page_tile_size_v_win))
-        tOgCLT_win = tOgCLT_win[None, 0, 0, None, None, None]
+        tVCsVC_win, tCLTgCLT_win = (), ()
+        for tile in cutlass.range_constexpr(len(self.history_tile_sizes)):
+            rows = self.history_tile_sizes[tile]
+            gCLT_win = cute.flat_divide(v_params.mCLT_win[tile], (self.mma_pv_tiler[1], rows))
+            gCLT_win = cute.logical_divide(gCLT_win, (cta_n,))[
+                (None, common_params.blk_coord[0]), None, None, None, None
+            ]
+            tOgCLT_win = cute.tiled_divide(gCLT_win, (cta_n, rows))
+            tOgCLT_win = tOgCLT_win[None, 0, 0, None, None, None]
+            smem, gmem = cpasync.tma_partition(
+                v_params.tma_atom_c_latent_transpose_win[tile],
+                0,
+                cute.make_layout(1),
+                v_params.sVC_win[tile],
+                tOgCLT_win,
+            )
+            tVCsVC_win += (smem,)
+            tCLTgCLT_win += (gmem,)
 
         # === V partition for draft-block stream ===
         page_tile_size_v_draft = min(self.tma_page_size_draft, self.mma_pv_tiler[2])
@@ -1198,13 +1318,6 @@ class DSparkAttentionKernel:
         tOgCLT_draft = cute.tiled_divide(gCLT_draft, (cta_n, page_tile_size_v_draft))
         tOgCLT_draft = tOgCLT_draft[None, 0, 0, None, None, None]
 
-        tVCsVC_win, tCLTgCLT_win = cpasync.tma_partition(
-            v_params.tma_atom_c_latent_transpose_win,
-            0,
-            cute.make_layout(1),
-            v_params.sVC_win,
-            tOgCLT_win,
-        )
         tVCsVC_draft, tCLTgCLT_draft = cpasync.tma_partition(
             v_params.tma_atom_c_latent_transpose_draft,
             0,
@@ -1270,6 +1383,75 @@ class DSparkAttentionKernel:
         )
 
     @cute.jit
+    def load_history(
+        self,
+        common_params: SimpleNamespace,
+        page_table_stage: cutlass.Int32,
+        atoms: tuple,
+        gmem: tuple,
+        smem: tuple,
+        row_base: cutlass.Int32,
+        head_tile: cutlass.Int32,
+        kv_stage: cutlass.Int32,
+        tma_bar_ptr: cute.Pointer,
+        is_k_load: cutlass.Constexpr,
+        tile: cutlass.Constexpr = None,
+        start_row: cutlass.Int32 = 0,
+    ) -> None:
+        """Fill a history tile, subdividing only at page or validity boundaries."""
+        if cutlass.const_expr(tile is None):
+            tile = len(self.history_tile_sizes) - 1
+            extent = 64
+        else:
+            extent = self.history_tile_sizes[tile + 1]
+        rows = self.history_tile_sizes[tile]
+        for row in cutlass.range(start_row, start_row + extent, rows):
+            context_row = row_base + row
+            page = common_params.sPT[context_row, page_table_stage]
+            legal = cutlass.Boolean(True)
+            if cutlass.const_expr(rows > 1):
+                legal = (
+                    (page >= 0)
+                    & (
+                        (common_params.window_end <= context_row)
+                        | (common_params.window_end >= context_row + rows)
+                    )
+                    & (page == common_params.sPT[context_row + rows - 1, page_table_stage])
+                )
+            if legal:
+                # Recover the absolute position represented by this cyclic row.
+                # A 256-token page contains two distinct 128-token window cycles.
+                position = (
+                    common_params.position
+                    - 1
+                    - (common_params.position - 1 - context_row + 128) % 128
+                )
+                offset = position % self.history_page_size // rows
+                if cutlass.const_expr(is_k_load):
+                    src = gmem[tile][None, offset, head_tile, page]
+                    dst = smem[tile][None, row // rows, 0, kv_stage]
+                else:
+                    src = gmem[tile][None, head_tile, offset, page]
+                    dst = smem[tile][None, 0, row // rows, kv_stage]
+                cute.copy(atoms[tile], src, dst, tma_bar_ptr=tma_bar_ptr)
+            else:
+                if cutlass.const_expr(tile > 0):
+                    self.load_history(
+                        common_params,
+                        page_table_stage,
+                        atoms,
+                        gmem,
+                        smem,
+                        row_base,
+                        head_tile,
+                        kv_stage,
+                        tma_bar_ptr,
+                        is_k_load,
+                        tile=tile - 1,
+                        start_row=row,
+                    )
+
+    @cute.jit
     def load_tma_qk_one_k_tile(
         self,
         common_params: SimpleNamespace,
@@ -1307,11 +1489,17 @@ class DSparkAttentionKernel:
             tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
             load_kv_pipeline.producer_acquire(load_kv_producer_state)
             if cutlass.const_expr(is_window):
-                cute.copy(
+                self.load_history(
+                    common_params,
+                    page_table_stage,
                     qk_params.tma_atom_c_latent_win,
-                    qk_params.tCLgCL_win[None, i, k_idx],
-                    qk_params.tKCsKC_win[None, 0, 0, load_kv_producer_state.index],
-                    tma_bar_ptr=tma_bar_ptr,
+                    qk_params.tCLgCL_win,
+                    qk_params.tKCsKC_win,
+                    common_params.blk_coord[0] % 2 * 64,
+                    i,
+                    load_kv_producer_state.index,
+                    tma_bar_ptr,
+                    is_k_load=True,
                 )
             else:
                 cute.copy(
@@ -1336,8 +1524,6 @@ class DSparkAttentionKernel:
         """Issue V TMA copies for one compile-time-selected stream."""
         page_table_stage = load_pt_release_state.index
         k_idx = common_params.sPT[0, page_table_stage]
-        common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
-        load_pt_release_state.advance()
 
         load_kv_pipeline = common_params.load_kv_pipeline
         # Pre-init tma_bar_ptr so its type is established before the loop
@@ -1348,11 +1534,17 @@ class DSparkAttentionKernel:
                 tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
                 load_kv_pipeline.producer_acquire(load_kv_producer_state)
                 if cutlass.const_expr(is_window):
-                    cute.copy(
+                    self.load_history(
+                        common_params,
+                        page_table_stage,
                         v_params.tma_atom_c_latent_transpose_win,
-                        v_params.tCLTgCLT_win[None, j, i, k_idx],
-                        v_params.tVCsVC_win[None, 0, 0, load_kv_producer_state.index],
-                        tma_bar_ptr=tma_bar_ptr,
+                        v_params.tCLTgCLT_win,
+                        v_params.tVCsVC_win,
+                        i * self.mma_pv_tiler[2],
+                        j,
+                        load_kv_producer_state.index,
+                        tma_bar_ptr,
+                        is_k_load=False,
                     )
                 else:
                     cute.copy(
@@ -1363,6 +1555,8 @@ class DSparkAttentionKernel:
                     )
 
                 load_kv_producer_state.advance()
+        common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
+        load_pt_release_state.advance()
         return load_kv_producer_state, load_pt_release_state
 
     @cute.jit
@@ -1637,7 +1831,14 @@ class DSparkAttentionKernel:
         tTR_tS_for_sink = tmem_thr_copy.partition_D(cS)
         local_row = tTR_tS_for_sink[0][0]
         head_idx = common_params.blk_coord[0] * cta_qk_tiler[0] + local_row
-        my_sink = common_params.attn_sink_unscaled[head_idx]
+        my_sink = self.acc_dtype(0)
+        # TMA zero-fills query rows outside the head dimension. The matching
+        # sink loads must also be masked for a partially occupied head tile.
+        if cutlass.const_expr(cute.size(common_params.attn_sink_unscaled) < self.mma_qk_tiler[0]):
+            if head_idx < cute.size(common_params.attn_sink_unscaled):
+                my_sink = common_params.attn_sink_unscaled[head_idx]
+        else:
+            my_sink = common_params.attn_sink_unscaled[head_idx]
         if cutlass.const_expr(self.attn_sink_is_scaled):
             my_sink = my_sink * LOG2_E / softmax_params.softmax_scale_log2
 
@@ -1872,7 +2073,10 @@ class DSparkAttentionKernel:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        elif cutlass.const_expr(
+            (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
+            or (arch >= Arch.sm_107 and arch <= Arch.sm_107f)
+        ):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
@@ -2096,8 +2300,12 @@ class DSparkAttentionKernel:
                 common_params.blk_coord[2],
             ),
         )
+        # Keep both CTA head tiles in the coordinate layout, including when
+        # only the first 64 heads are stored. A unit head-tile mode has zero
+        # stride and would otherwise alias the second CTA to the first.
+        output_coord_shape = (self.mma_pv_tiler[0], *common_params.mO.shape[1:])
         cO = cute.local_tile(
-            cute.make_identity_tensor(common_params.mO.shape),
+            cute.make_identity_tensor(output_coord_shape),
             cta_pv_tiler_mn,
             (
                 common_params.blk_coord[0],
@@ -2266,12 +2474,102 @@ class DSparkAttentionKernel:
                         tR2G_rO_src[i] = (re * cos + im * sin).to(self.o_dtype)
                         tR2G_rO_src[i + 1] = (im * cos - re * sin).to(self.o_dtype)
 
+            if cutlass.const_expr(self.output_groups is not None and cute.size(tR2G_rO_src) != 128):
+                raise ValueError("DSpark FP8 output requires one 128-value block per thread")
+
             if cute.elem_less(tTR_cO[0][0], common_params.H):
-                cute.autovec_copy(
-                    tR2G_rO_src,
-                    tR2G_rO_dst,
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
+                if cutlass.const_expr(self.output_groups is None):
+                    cute.autovec_copy(
+                        tR2G_rO_src,
+                        tR2G_rO_dst,
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
+                else:
+                    # Each correction thread owns one complete 1x128 quant
+                    # block. Use eight independent chains so the amax is not
+                    # serialized behind 128 dependent fmax instructions.
+                    partial_absmax = cute.make_rmem_tensor((8,), cutlass.Float32)
+                    for i in cutlass.range_constexpr(8):
+                        partial_absmax[i] = cutlass.Float32(0.0)
+                    for i in cutlass.range_constexpr(0, cute.size(tR2G_rO_src), 8):
+                        for lane in cutlass.range_constexpr(8):
+                            value = cutlass.Float32(tR2G_rO_src[i + lane])
+                            partial_absmax[lane] = cute.arch.fmax(
+                                partial_absmax[lane],
+                                cute.arch.fmax(value, -value),
+                            )
+                    for i in cutlass.range_constexpr(4):
+                        partial_absmax[i] = cute.arch.fmax(partial_absmax[i], partial_absmax[i + 4])
+                    for i in cutlass.range_constexpr(2):
+                        partial_absmax[i] = cute.arch.fmax(partial_absmax[i], partial_absmax[i + 2])
+                    block_absmax = cute.arch.fmax(partial_absmax[0], partial_absmax[1])
+                    block_absmax = cute.arch.fmax(block_absmax, cutlass.Float32(1e-10))
+                    quant_scale = cutlass.Float32(448.0) / block_absmax
+
+                    head = tTR_cO[0][0]
+                    group_size = self.num_heads // self.output_groups
+                    group = head // group_size
+                    row = common_params.blk_coord[2] * self.seq_len_q + common_params.blk_coord[1]
+                    scale_block = ((head % group_size) * self.latent_dim + tTR_cO[0][1]) // 128
+                    epilogue_params.mOScale[group, scale_block, row] = (
+                        cutlass.Float32(1.0) / quant_scale
+                    )
+                    quantized = cute.make_rmem_tensor(
+                        (cute.size(tR2G_rO_src),), cutlass.Float8E4M3FN
+                    )
+                    for i in cutlass.range(
+                        cute.size(tR2G_rO_src), vectorize=True, unroll_full=True
+                    ):
+                        quantized[i] = (cutlass.Float32(tR2G_rO_src[i]) * quant_scale).to(
+                            cutlass.Float8E4M3FN
+                        )
+                    packed_output = cute.recast_tensor(quantized, cutlass.Int32)
+                    lane_idx = tidx % self.threads_per_warp
+                    epilogue_warp_idx = tidx // self.threads_per_warp
+                    scratch_row = cute.domain_offset(
+                        (epilogue_warp_idx, lane_idx, 0), epilogue_params.sOQuant
+                    ).iterator
+                    for i in cutlass.range_constexpr(0, 32, 4):
+                        _store_shared_b128(
+                            scratch_row + i,
+                            packed_output[i],
+                            packed_output[i + 1],
+                            packed_output[i + 2],
+                            packed_output[i + 3],
+                        )
+
+                    # Four adjacent lanes cooperatively drain one scratch row,
+                    # producing fully coalesced 32-byte global sectors.
+                    cute.arch.sync_warp()
+                    row_group_idx = lane_idx // 4
+                    row_lane_idx = lane_idx % 4
+                    warp_head_base = head - lane_idx
+                    for row_batch_idx in cutlass.range_constexpr(4):
+                        output_row = row_batch_idx * 8 + row_group_idx
+                        output_head = warp_head_base + output_row
+                        output_group = output_head // group_size
+                        output_group_k = (output_head % group_size) * self.latent_dim + tTR_cO[0][1]
+                        source_row = cute.domain_offset(
+                            (epilogue_warp_idx, output_row, 0),
+                            epilogue_params.sOQuant,
+                        ).iterator
+                        for segment_idx in cutlass.range_constexpr(4):
+                            word_offset = segment_idx * 8 + row_lane_idx * 2
+                            value_lo = _load_shared_b32(source_row + word_offset)
+                            value_hi = _load_shared_b32(source_row + word_offset + 1)
+                            _store_global_b64(
+                                cute.domain_offset(
+                                    (
+                                        output_group,
+                                        row,
+                                        output_group_k + segment_idx * 32 + row_lane_idx * 8,
+                                    ),
+                                    epilogue_params.mOQuant,
+                                ).iterator,
+                                value_lo,
+                                value_hi,
+                            )
+                    cute.arch.sync_warp()
 
         cute.arch.fence_view_async_tmem_load()
         common_params.mma_o_pipeline.consumer_release(mma_o_consumer_state)
