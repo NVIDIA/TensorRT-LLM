@@ -245,9 +245,13 @@ class GenPreemption:
         return t if r.laxity_resume_t is None else min(t, r.laxity_resume_t)
 
     def _resume(self, free_slots: int) -> int:
-        """Resume into the free slots, earliest due first, and every request
-        that is due regardless; returns the number resumed."""
-        due_order = sorted(self._paused.items(), key=lambda e: self._resume_at(self._reqs[e[0]]))
+        """Resume into the free slots, earliest due first (sacrificed requests
+        last), and every request that is due regardless; returns the number
+        resumed."""
+        due_order = sorted(
+            self._paused.items(),
+            key=lambda e: (self._reqs[e[0]].sacrificed, self._resume_at(self._reqs[e[0]])),
+        )
         n = 0
         for rid, req in due_order:
             r = self._reqs[rid]
@@ -375,8 +379,8 @@ def _unsupported(ex) -> Optional[str]:
         return "needs the KV cache manager V2 scheduler"
     if not ex._gen_admission.needs_clock:
         return "needs the auto GEN admission policy (0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99)"
-    if ex.enable_attention_dp or ex.dist.has_pp:
-        return "not supported with attention DP or pipeline parallelism"
+    if ex.enable_attention_dp:
+        return "not supported with attention DP"
     from ..resource_manager import ResourceManagerType
 
     # Every pool with one entry per resident request must hold the paused ones.
@@ -399,6 +403,8 @@ def create_gen_preemption(executor, settings: Optional[GenPreemptionSettings]):
     """The executor's GenPreemption, or None (off, or unsupported: a warning)."""
     if settings is None or not settings.enabled:
         return None
+    if executor.dist.has_pp:
+        raise ValueError("GEN slot preemption is not supported with pipeline parallelism")
     reason = _unsupported(executor)
     if executor.dist.rank == 0:
         if reason is None:

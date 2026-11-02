@@ -395,6 +395,19 @@ class TestOutputTpsSlo:
         p._now = 17.0
         assert p._resume(0) == 2 and p.stats["forced"] == 2
 
+    def test_sacrificed_resume_last(self):
+        p = make_slo(max_paused=4)
+        reqs, now = slo_reqs(p, [(201, 5.0), (2001, 10.0)])
+        p._reqs[0].sacrificed = True
+        p._pause(reqs[0])  # due at 17 (max pause)
+        p.observe(reqs, now + 2.0)
+        p._pause(reqs[1])  # due at 19 (max pause; laxity 50 s)
+        assert p._resume_at(p._reqs[0]) < p._resume_at(p._reqs[1])
+        p.observe(reqs, now + 3.0)
+        assert p._resume(1) == 1 and p.paused_ids == {0}  # sacrificed last
+        p.observe(reqs, now + 7.0)
+        assert p._resume(0) == 1 and p.stats["forced"] == 1  # still forced at the max pause
+
     def test_credit_bucket(self):
         p = GenPreemption(SLO, max_num_active_requests=128)
         complete(p, 10.0, decode_s=20.0, tokens=1000)  # 50 tokens/s
@@ -481,7 +494,6 @@ class TestCreate:
             ({"scheduler": object()}, "V2 scheduler"),
             ({"_gen_admission": GenAdmissionConfig(ttft_percentile=100.0)}, "auto GEN admission"),
             ({"enable_attention_dp": True}, "attention DP"),
-            ({"dist": SimpleNamespace(has_pp=True, rank=0)}, "pipeline parallelism"),
             ({"max_num_active_requests": 129}, "sequence slot pool holds 176"),
             ({"draft_kv_cache_manager": Mock(spec=[], max_admissible_sequences=175)}, "175"),
         ],
@@ -490,6 +502,11 @@ class TestCreate:
         with patch.object(gen_preemption, "logger") as log:
             assert create_gen_preemption(self._executor(**overrides), SLO) is None
         assert needle in log.warning.call_args.args[0] and not log.info.called
+
+    def test_pipeline_parallelism_raises(self):
+        ex = self._executor(dist=SimpleNamespace(has_pp=True, rank=0))
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            create_gen_preemption(ex, SLO)
 
 
 def _drafter(kind, num_slots=4):
