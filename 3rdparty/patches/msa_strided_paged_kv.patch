@@ -4085,7 +4085,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..478a23a 100644
+index fa63a02..653a2ff 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4289,7 +4289,17 @@ index fa63a02..478a23a 100644
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -244,6 +361,7 @@ class FMHAVariantManager:
+@@ -236,6 +353,9 @@ class _VariantWrapper:
+         return self._fn(*args)
+ 
+ 
++_AOT_UNSPECIFIED = object()
++
++
+ class FMHAVariantManager:
+     """Manages FMHA variant kernels. Loads from all_variants.so or per-variant .so."""
+ 
+@@ -244,6 +364,7 @@ class FMHAVariantManager:
          self._lock = threading.Lock()
          self._all_module = None
          self._all_module_checked = False
@@ -4297,7 +4307,7 @@ index fa63a02..478a23a 100644
          self._inst_template = None
          self._run_template = None
  
-@@ -254,12 +372,21 @@ class FMHAVariantManager:
+@@ -254,12 +375,21 @@ class FMHAVariantManager:
              with open(_FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja") as f:
                  self._run_template = jinja2.Template(f.read())
  
@@ -4305,8 +4315,8 @@ index fa63a02..478a23a 100644
 -        if not self._all_module_checked:
 -            self._all_module_checked = True
 -            if _ALL_VARIANTS_SO.exists():
-+    def _ensure_all_module(self, packaged=None):
-+        if packaged is None:
++    def _ensure_all_module(self, packaged=_AOT_UNSPECIFIED):
++        if packaged is _AOT_UNSPECIFIED:
 +            packaged = _aot_module_path("variants")
 +        use_packaged = packaged is not None
 +        if not self._all_module_checked or self._all_module_packaged != use_packaged:
@@ -4324,7 +4334,7 @@ index fa63a02..478a23a 100644
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -267,26 +394,29 @@ class FMHAVariantManager:
+@@ -267,26 +397,29 @@ class FMHAVariantManager:
              dtype_code, qo_tile_size, single_wg,
              sparse_mode, page_size, split_kv, pack_factor)
  
@@ -4361,7 +4371,7 @@ index fa63a02..478a23a 100644
  
              # Try per-variant .so
              cache_dir = CACHE_BASE / variant_name
-@@ -301,8 +431,8 @@ class FMHAVariantManager:
+@@ -301,8 +434,8 @@ class FMHAVariantManager:
                  fn = getattr(module, fn_name)
              finally:
                  _release_file_lock(lock_fd)
@@ -4372,7 +4382,7 @@ index fa63a02..478a23a 100644
  
      def _compile_only(self, variant_name, params):
          """Compile a variant without loading. Safe to call from subprocesses."""
-@@ -391,7 +521,7 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
+@@ -391,7 +524,7 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
  # Plan kernel JIT (also needs sm_100a, can't be statically compiled)
  # ============================================================================
  
@@ -4381,7 +4391,7 @@ index fa63a02..478a23a 100644
  _plan_lock = threading.Lock()
  
  
-@@ -453,8 +583,11 @@ def _compile_plan_only():
+@@ -453,8 +586,11 @@ def _compile_plan_only():
      _do_compile_plan()
  
  
@@ -4394,7 +4404,7 @@ index fa63a02..478a23a 100644
      lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
      try:
          _do_compile_plan()
-@@ -467,22 +600,22 @@ def _compile_plan_module():
+@@ -467,22 +603,22 @@ def _compile_plan_module():
  
  def get_plan_fn():
      """Get the plan function. JIT compiles on first call."""
@@ -4425,7 +4435,7 @@ index fa63a02..478a23a 100644
  _sparse_topk_lock = threading.Lock()
  
  
-@@ -546,29 +679,34 @@ build {so_path}: nvcc_link {obj}
+@@ -546,29 +682,34 @@ build {so_path}: nvcc_link {obj}
  
  def get_sparse_topk_module():
      """Get the sparse_topk_select module. JIT compiles on first call."""
@@ -4468,7 +4478,7 @@ index fa63a02..478a23a 100644
  _reduction_lock = threading.Lock()
  
  
-@@ -631,19 +769,24 @@ build {so_path}: nvcc_link {obj}
+@@ -631,19 +772,24 @@ build {so_path}: nvcc_link {obj}
  
  def get_reduction_module():
      """Get the split-KV reduction module. JIT compiles on first call."""

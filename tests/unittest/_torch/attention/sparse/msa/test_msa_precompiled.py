@@ -312,6 +312,37 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
 
 
+def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(jit_package, monkeypatch):
+    jit, package, _, _ = jit_package
+    artifact_dir = _stage_artifacts(jit, package)
+    manager = jit.FMHAVariantManager()
+    calls = iter([RuntimeError("device not ready"), "sm_103a"])
+
+    def device_arch():
+        value = next(calls)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def load_module(path):
+        kind = "packaged" if Path(path).parent == artifact_dir else "jit"
+        return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda: kind})
+
+    def compile_fixture(name, _params):
+        path = jit.CACHE_BASE / name / f"{name}.so"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"JIT fixture")
+
+    monkeypatch.setattr(jit, "_aot_gpu_arch", device_arch)
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
+    monkeypatch.setattr(manager, "_compile_only", compile_fixture)
+    args = (jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert manager.get_variant(*args).run() == "jit"
+    assert manager.get_variant(*args).run() == "packaged"
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    assert manager.get_variant(*args).run() == "jit"
+
+
 @pytest.mark.parametrize("corruption", ["missing_manifest", "invalid_json", "unsafe_path", "duplicate_variant"])
 def test_corrupt_packaged_manifest_is_rejected(jit_package, corruption):
     jit, package, _, _ = jit_package
