@@ -21,7 +21,6 @@ import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, List,
                     Optional, Sequence, Tuple, TypeVar)
 
@@ -995,7 +994,7 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
-    def _get_mxfp8_moe_quant_config(
+    def _get_minimax_m3_mxfp8_moe_quant_config(
             hf_quant_config: Dict[str, Any]) -> Optional[QuantConfig]:
         """Return the routed-expert recipe declared next to an MXFP8 recipe.
 
@@ -1041,30 +1040,24 @@ class ModelConfig(Generic[TConfig]):
         Returns ``(quant_config, layer_quant_config)``; a checkpoint without the
         expert recipe is returned unchanged with no per-layer map.
         """
+        # Local imports: both modules import model_config at load time.
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import \
             get_sparse_layer_ids
+        from tensorrt_llm._torch.models.modeling_minimaxm3 import (
+            get_moe_layer_ids, get_text_config)
         hf_quant_config = getattr(pretrained_config, "quantization_config",
                                   None)
         if (quant_config is None or quant_config.quant_algo != QuantAlgo.MXFP8
                 or not isinstance(hf_quant_config, dict)):
             return quant_config, None
-        experts_quant_config = ModelConfig._get_mxfp8_moe_quant_config(
+        experts_quant_config = ModelConfig._get_minimax_m3_mxfp8_moe_quant_config(
             hf_quant_config)
         if experts_quant_config is None:
             return quant_config, None
 
-        text_config = getattr(pretrained_config, "text_config",
-                              None) or pretrained_config
-        if isinstance(text_config, dict):
-            text_config = SimpleNamespace(**text_config)
+        text_config = get_text_config(pretrained_config)
         num_layers = int(text_config.num_hidden_layers)
-        moe_layer_freq = getattr(text_config, "moe_layer_freq", None)
-        if moe_layer_freq is None:
-            moe_layer_freq = [1] * num_layers
-        if len(moe_layer_freq) != num_layers:
-            raise ValueError(
-                f"moe_layer_freq length {len(moe_layer_freq)} does not match "
-                f"num_hidden_layers {num_layers}")
+        _, moe_layer_ids = get_moe_layer_ids(text_config)
         _, sparse_layer_ids = get_sparse_layer_ids(text_config)
         has_shared_experts = int(
             getattr(text_config, "n_shared_experts", 0) or 0) > 0
@@ -1107,7 +1100,7 @@ class ModelConfig(Generic[TConfig]):
                     f"{prefix}.self_attn.{proj}": base_quant_config
                     for proj in ("index_q_proj", "index_k_proj")
                 })
-            if int(moe_layer_freq[layer_idx]) != 0:
+            if layer_idx in moe_layer_ids:
                 if has_shared_experts:
                     entries.update({
                         f"{prefix}.block_sparse_moe.shared_experts.{proj}":

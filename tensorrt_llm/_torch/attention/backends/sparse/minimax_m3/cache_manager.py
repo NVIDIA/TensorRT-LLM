@@ -523,7 +523,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         if self.dtype != DataType.NVFP4 or has_index_k:
             cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         else:
-            # Existing NVFP4 dense-target / shared-Eagle FP8 cache calculation.
+            # NVFP4 dense-target / shared-Eagle FP8 cache calculation.
             if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
                 return 0
             if data_role == Role.ALL:

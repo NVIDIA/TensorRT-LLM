@@ -1499,7 +1499,7 @@ def test_uniform_mxfp8_and_bf16_configs_are_unchanged() -> None:
 
 
 @pytest.mark.cpu_only
-def test_modelopt_mixed_precision_map_is_normalized_as_before() -> None:
+def test_modelopt_mixed_precision_map_is_normalized() -> None:
     base_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     expert_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     global_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
