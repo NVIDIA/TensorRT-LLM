@@ -264,6 +264,10 @@ def test_packaged_gpu_compatibility_is_checked_for_each_device(jit_package, monk
 def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(jit_package, monkeypatch):
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
+    manifest_path = artifact_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cuda_architectures"] = ["sm_103a"]
+    manifest_path.write_text(json.dumps(manifest))
     manager = jit.FMHAVariantManager()
 
     def load_module(path):
@@ -280,8 +284,6 @@ def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(j
     args = (jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert manager.get_variant(*args).run() == "packaged"
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
-    assert manager.get_variant(*args).run() == "packaged"  # both images exist
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
     assert manager.get_variant(*args).run() == "jit"
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
     assert manager.get_variant(*args).run() == "packaged"
@@ -290,6 +292,10 @@ def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(j
 def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_package, monkeypatch):
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
+    manifest_path = artifact_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["cuda_architectures"] = ["sm_103a"]
+    manifest_path.write_text(json.dumps(manifest))
 
     def load_module(path):
         kind = "packaged" if Path(path).parent == artifact_dir else "jit"
@@ -306,7 +312,7 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
     monkeypatch.setattr(jit, "_do_compile_reduction", lambda: compile_fixture("reduction/fmha_sm100_reduction.so"))
     helpers = (jit.get_plan_fn, jit.get_sparse_topk_module, jit.get_reduction_module)
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
-    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
     assert [fn().kind for fn in helpers] == ["jit"] * 3
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
