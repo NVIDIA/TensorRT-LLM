@@ -1341,6 +1341,57 @@ class Glm5NextIndexer(nn.Module):
         return packed, out[:, 2 * hd :]
 
 
+class _MtpIndexShare:
+    """An MTP draft chain's pool selection, made on step 0 and reused by the later steps.
+
+    The checkpoint's ``index_share_for_mtp_iteration``: on step 0 the indexer scores and selects as usual and each
+    request's selection at its drafting row (a context's last row, a generation request's last accepted one) is kept;
+    step ``d >= 1`` skips the indexer's query projection, scoring and top-k, and attends to that selection plus every
+    position appended since (``tail_extra=d``: the step's visible length is step 0's plus ``d``). With at most
+    ``select_k`` complete pools step 0 selects all of them, so the attended set equals a fresh selection.
+    """
+
+    def __init__(self, select_k: int) -> None:
+        self.select_k = select_k
+        self.selection: torch.Tensor | None = None
+        self.step = -1
+        self.num_contexts = 0
+        self.context_rows: torch.Tensor | None = None
+        self.generation_rows: torch.Tensor | None = None
+
+    def begin(
+        self,
+        max_requests: int,
+        num_contexts: int,
+        context_rows: torch.Tensor,
+        generation_rows: torch.Tensor,
+    ) -> None:
+        """Step 0 of a chain: keep the selection at ``context_rows`` (rows of the context part) and
+        ``generation_rows`` (rows of the verify part), in request order."""
+        if self.selection is None or self.selection.shape[0] < max_requests:
+            # Allocated once, at the first (eager) step: graph replays write into this buffer.
+            self.selection = torch.empty(
+                max_requests, self.select_k, dtype=torch.int32, device=context_rows.device
+            )
+        self.step = 0
+        self.num_contexts = num_contexts
+        self.context_rows = context_rows
+        self.generation_rows = generation_rows
+
+    def end(self) -> None:
+        self.step = -1
+        self.context_rows = self.generation_rows = None
+
+    def keep(self, selected: torch.Tensor, input_type: AttentionInputType) -> None:
+        """Step 0: copy the drafting rows' selection out of this call's ``selected``."""
+        nc = self.num_contexts
+        if input_type == AttentionInputType.context_only:
+            self.selection[:nc].copy_(selected[self.context_rows])
+        else:
+            rows = self.generation_rows
+            self.selection[nc : nc + rows.shape[0]].copy_(selected[rows])
+
+
 class Glm5NextSparseAttention(nn.Module):
     """NoPE sparse MLA with a pool-compressed indexer.
 
@@ -1441,6 +1492,8 @@ class Glm5NextSparseAttention(nn.Module):
         self.indexer = Glm5NextIndexer(
             config, layer_idx, mapping=mapping, model_config=model_config
         )
+        # Set on the MTP layer's attention when the checkpoint shares the indexer selection across draft steps.
+        self.mtp_index_share: _MtpIndexShare | None = None
 
         # The production sparse-MLA backend, selected through the standard
         # dispatch (`get_attention_backend(attn_backend, sparse_params)` via
@@ -1567,11 +1620,18 @@ class Glm5NextSparseAttention(nn.Module):
         """
         indexer = self.indexer
         rows = q_resid.shape[0]
-        q_index = indexer.wq_b(q_resid).view(rows, indexer.n_heads, indexer.head_dim)
         # Generation rows read their visible length from the metadata unless
         # each request contributes several rows (context or verification).
         plain_decode = request_ids is None and rows_per_request == 1
         kv_lens = None if plain_decode else visible
+        share = self.mtp_index_share
+        if share is not None and share.step > 0:
+            # A later MTP draft step: step 0's selection, the tail widened by the positions appended since.
+            topk_rows = self.attn_backend.expand_selection(
+                share.selection[:rows], metadata, kv_lens=kv_lens, tail_extra=share.step
+            )
+            return self._attend(query, topk_rows, metadata, input_type, reduce)
+        q_index = indexer.wq_b(q_resid).view(rows, indexer.n_heads, indexer.head_dim)
         num_cand = (
             (visible // indexer.index_kpool).to(torch.int32)
             if num_candidates is None
@@ -1610,12 +1670,25 @@ class Glm5NextSparseAttention(nn.Module):
             )
             # Release this call's scores before the next call allocates its own.
             del scores
+        if share is not None and share.step == 0:
+            share.keep(selected, input_type)
         topk_rows = self.attn_backend.expand_selection(
             selected,
             metadata,
             kv_lens=kv_lens,
             request_ids=request_ids,
         )
+        return self._attend(query, topk_rows, metadata, input_type, reduce)
+
+    def _attend(
+        self,
+        query: torch.Tensor,
+        topk_rows: torch.Tensor,
+        metadata: AttentionMetadata,
+        input_type: AttentionInputType,
+        reduce: bool,
+    ) -> torch.Tensor:
+        """Sparse MLA over the selected latent rows, then the output projection."""
         out_latent = self.attn_backend.forward(
             self.absorb_query(query),
             None,
@@ -2483,6 +2556,13 @@ class Glm5NextMTP(nn.Module):
             aux_stream=aux_stream_dict.get(AuxStreamType.MoeShared) if aux_stream_dict else None,
         )
         self.shared_head = Glm5NextMTPHead(config, model_config, dtype)
+        # The draft chain's shared indexer selection (None: every step selects its own).
+        self.index_share = (
+            _MtpIndexShare(self.self_attn.indexer.select_k)
+            if getattr(config, "index_share_for_mtp_iteration", False)
+            else None
+        )
+        self.self_attn.mtp_index_share = self.index_share
 
     def forward(
         self,
@@ -2867,9 +2947,44 @@ class Glm5NextMtpStep:
             + num_ctx_tokens
         )
         step0_rows = torch.cat([last_rows[:num_contexts], gen_rows], dim=0)
+        share = getattr(mtp_layer, "index_share", None) if draft_len > 1 else None
+        if share is not None:
+            share.begin(
+                attn_metadata.max_num_requests,
+                num_contexts,
+                last_rows[:num_contexts],
+                gen_rows - num_ctx_tokens,
+            )
+        try:
+            return self._draft_steps(
+                draft_model, mtp_layer, spec_metadata, attn_metadata, share, step_ids, step_positions,
+                step_hidden, step0_rows, num_contexts, batch_size, draft_len, num_accepted_tokens,
+            )  # fmt: skip
+        finally:
+            if share is not None:
+                share.end()
 
+    def _draft_steps(
+        self,
+        draft_model: Glm5NextDraftModel,
+        mtp_layer: nn.Module,
+        spec_metadata: Any,
+        attn_metadata: AttentionMetadata,
+        share: _MtpIndexShare | None,
+        step_ids: torch.Tensor,
+        step_positions: torch.Tensor,
+        step_hidden: torch.Tensor,
+        step0_rows: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        draft_len: int,
+        num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """The ``K`` MTP steps of :meth:`_draft` from its step-0 inputs."""
         drafts = []
         for step in range(draft_len):
+            if share is not None:
+                share.step = step
             # Step 0's attention runs on the verify layout (it writes the MTP layer's KV of every row); its MoE, head
             # norm and draft head only on each request's drafting row. Every later step feeds one row per request.
             # Either way the MoE sees one row per request.

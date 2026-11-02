@@ -576,13 +576,15 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         *,
         kv_lens: torch.Tensor | None = None,
         request_ids: torch.Tensor | None = None,
+        tail_extra: int = 0,
     ) -> torch.Tensor:
         """Selected pools ``[N, select_k]`` -> latent row ids for the kernel.
 
         Expands each valid pool into its members, appends the always-visible
         tail, pads with ``-1`` to :attr:`GlmKpoolSparseParams.kernel_output_width`
         and translates positions to latent-cache row ids in one kernel. Same
-        row addressing as :meth:`score_pools`.
+        row addressing as :meth:`score_pools`. ``tail_extra``: see
+        :func:`kpool_expand`.
         """
         state = self._cache_state(metadata)
         tables, gen_lens = self._rows(state, request_ids)
@@ -597,6 +599,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             kpool=self.sparse_params.index_kpool,
             out_width=self.sparse_params.kernel_output_width,
             request_ids=request_ids,
+            tail_extra=tail_extra,
         )
 
     # -- sparse core ----------------------------------------------------------

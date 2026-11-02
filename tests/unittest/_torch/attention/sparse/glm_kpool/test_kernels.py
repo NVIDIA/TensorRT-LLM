@@ -997,3 +997,48 @@ def test_compact_sparse_rows_tail_and_empty_rows(width):
         assert torch.equal(packed[row], expected)
         assert int(lengths[row]) == max(values.numel(), 1)
         assert bool(nonempty[row]) == (values.numel() > 0)
+
+
+@pytest.mark.parametrize("tail_extra", [0, 1, 2, 3])
+def test_kpool_expand_tail_extra(tail_extra):
+    """``tail_extra`` (an MTP draft step reusing step 0's selection): the tail starts at the pool holding position
+    ``kv_len - 1 - tail_extra`` and runs to ``kv_len``, so pools completed since the selection stay visible; members of
+    the selected pools are expanded as without it, and everything else is ``-1``."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    n, pages, slots, select_k = 9, 6, 64, 8
+    tables = _paged_tables(n, pages, slots, gen)
+    kv_lens = torch.randint(1, pages * TPB, (n,), generator=gen, device="cuda", dtype=torch.int32)
+    selected = torch.randint(-1, 12, (n, select_k), generator=gen, device="cuda", dtype=torch.int32)
+    base_row, rows_per_slot, out_width = 2, TPB + 4, 64
+    got = kpool_expand(
+        selected,
+        kv_lens,
+        tables,
+        TPB,
+        base_row=base_row,
+        rows_per_slot=rows_per_slot,
+        kpool=KPOOL,
+        out_width=out_width,
+        tail_extra=tail_extra,
+    ).cpu()
+
+    def row_id(b, p):
+        return base_row + int(tables[b, p // TPB]) * rows_per_slot + p % TPB
+
+    for b in range(n):
+        kv = int(kv_lens[b])
+        want = [-1] * out_width
+        for i, j in enumerate(selected[b].tolist()):
+            if 0 <= j < kv // KPOOL:
+                for m in range(KPOOL):
+                    want[i * KPOOL + m] = row_id(b, j * KPOOL + m)
+        tail_start = max(kv - tail_extra, 0) // KPOOL * KPOOL
+        for t, p in enumerate(range(tail_start, kv)):
+            want[select_k * KPOOL + t] = row_id(b, p)
+        assert got[b].tolist() == want, b
+
+    with pytest.raises(ValueError, match="out_width"):
+        kpool_expand(
+            selected, kv_lens, tables, TPB, base_row=0, rows_per_slot=TPB, kpool=KPOOL,
+            out_width=select_k * KPOOL + KPOOL - 1 + tail_extra - 1, tail_extra=tail_extra,
+        )  # fmt: skip
