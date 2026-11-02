@@ -46,6 +46,12 @@ Name files and symbols here, never line numbers.
   re-exports public names only, lists them in `__all__` (or `_LAZY_NAMES` in
   `commands/serve.py`), warns once with `FutureWarning`, and has its rows in
   `tests/unittest/serve/test_shim_identity.py`.
+- `OpenAIDisaggServer` (`serve/openai_disagg_server.py`) is subclassed outside the repository
+  (NeMo-RL). Keep its constructor `(config, req_timeout_secs=..., coordinator_url=None)`,
+  `self.app` with every route registered when `__init__` returns,
+  `__call__(host, port, sockets=None)`, `_wrap_entry_point`, `_handle_exception` and
+  `_perf_metrics_collector.http_exceptions`, or agree the change with the NeMo-RL owners
+  first. Check: `tests/unittest/disaggregated/test_disagg_server_contract.py`.
 - `mock.patch("old.module.name")` does not follow moved code. Grep the tests for every moved
   name, including `monkeypatch.setattr(module, "name", ...)` and dotted paths split across lines.
 
