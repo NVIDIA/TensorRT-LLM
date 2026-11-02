@@ -62,6 +62,35 @@ def select_cuda_architectures(requested, supported):
     return wanted
 
 
+def probe_cuda_architectures(nvcc, candidates):
+    """Compile tiny kernels: nvcc's architecture list omits a/f suffixes."""
+    supported = set()
+    with tempfile.TemporaryDirectory(prefix="trtllm-msa-arch-probe-") as directory:
+        source = Path(directory) / "probe.cu"
+        source.write_text("__global__ void trtllm_msa_arch_probe() {}\n")
+        for arch in candidates:
+            command = [
+                str(nvcc),
+                f"-arch={arch}",
+                "-c",
+                str(source),
+                "-o",
+                str(Path(directory) / "probe.o"),
+            ]
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 0:
+                supported.add(arch)
+            elif re.search(
+                r"unsupported gpu architecture|not defined for option", result.stderr, re.IGNORECASE
+            ):
+                continue
+            else:
+                raise subprocess.CalledProcessError(
+                    result.returncode, command, result.stdout, result.stderr
+                )
+    return supported
+
+
 def validate_artifacts(files, variant_names):
     """Require every generated entry point, including auxiliary kernels."""
     required = {
@@ -155,10 +184,9 @@ def _worker(package, warmup, architectures, jobs):
 
 def build(package, warmup, requested, nvcc, jobs):
     package, warmup, nvcc = Path(package).resolve(), Path(warmup).resolve(), Path(nvcc).resolve()
-    output = subprocess.run(
-        [str(nvcc), "--list-gpu-code"], check=True, capture_output=True, text=True
-    ).stdout
-    architectures = select_cuda_architectures(requested, output.split())
+    candidates = select_cuda_architectures(requested, {"sm_100a", "sm_103a", "sm_100f"})
+    supported = probe_cuda_architectures(nvcc, candidates)
+    architectures = select_cuda_architectures(requested, supported)
     if not architectures:
         return
     version = subprocess.run(

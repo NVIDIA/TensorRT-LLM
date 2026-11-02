@@ -40,6 +40,30 @@ def test_requested_unsupported_sm_fails_instead_of_silent_fallback():
         builder.select_cuda_architectures("103", {"sm_100a"})
 
 
+def test_nvcc_probe_detects_architecture_specific_targets(tmp_path):
+    nvcc = tmp_path / "nvcc"
+    nvcc.write_text("""#!/usr/bin/env python3
+import sys
+if "-arch=sm_100f" in sys.argv:
+    print("nvcc fatal: Unsupported gpu architecture 'compute_100f'", file=sys.stderr)
+    raise SystemExit(1)
+assert "-c" in sys.argv
+""")
+    nvcc.chmod(0o755)
+    assert builder.probe_cuda_architectures(nvcc, ["sm_100a", "sm_103a", "sm_100f"]) == {
+        "sm_100a",
+        "sm_103a",
+    }
+
+
+def test_nvcc_probe_does_not_hide_compiler_failure(tmp_path):
+    nvcc = tmp_path / "nvcc"
+    nvcc.write_text('#!/bin/sh\necho "host compiler failed" >&2\nexit 1\n')
+    nvcc.chmod(0o755)
+    with pytest.raises(subprocess.CalledProcessError, match="nvcc"):
+        builder.probe_cuda_architectures(nvcc, ["sm_103a"])
+
+
 @pytest.mark.parametrize(
     ("system", "requested", "skip_wheel", "expected"),
     [
@@ -248,6 +272,8 @@ if "--list-gpu-code" in args:
     raise SystemExit
 if "--version" in args:
     print("CUDA release 12.9")
+    raise SystemExit
+if any(arg.endswith("/probe.cu") for arg in args):
     raise SystemExit
 out = args[args.index("-o") + 1]
 if "-c" in args:
