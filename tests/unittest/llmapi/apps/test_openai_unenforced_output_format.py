@@ -20,6 +20,7 @@ completions), ``text.format`` (Responses) or ``output_config.format``
 server says so in a warning, once per route.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -348,6 +349,8 @@ def test_harmony_responses_format_is_served_and_warned_about(served, format_warn
     (params,) = served.engine_calls
     # As on Harmony chat, gpt-oss carries the schema in a structural tag on its final channel.
     assert params.guided_decoding.json is None
-    assert '"answer"' in str(params.guided_decoding.structural_tag)
+    tag = json.loads(params.guided_decoding.structural_tag)
+    (final_channel,) = tag["format"]["tags"]
+    assert final_channel["content"]["json_schema"] == SCHEMA
     (warning,) = format_warnings()
     assert warning.startswith("Responses API: 'text.format'")
