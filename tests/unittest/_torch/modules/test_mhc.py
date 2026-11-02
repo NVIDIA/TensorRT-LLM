@@ -1412,6 +1412,33 @@ def test_mhc_fused_hc_allocates_minimal_scratch(
     assert tuple(tuple(tensor.shape) for tensor in scratch) == expected_shapes
 
 
+@pytest.mark.parametrize(
+    "B,expected_shapes",
+    [
+        (600, ((8, 600, 24), (8, 600), (1,))),
+        (1500, ((4, 1500, 24), (4, 1500), (1,))),
+        (3000, ((2, 3000, 24), (2, 3000), (1,))),
+        (5000, ((5000, 24), (5000,), (1,))),
+    ],
+)
+def test_mhc_fused_hc_mma_scratch_follows_split_heuristic(
+    B: int, expected_shapes: tuple[tuple[int, ...], ...]
+) -> None:
+    """With num_k_splits=0 the half-MMA scratch holds one partial per heuristic split."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    scratch = mhc_cuda._alloc_fused_hc_scratch(
+        backend="fused_half_mma",
+        B=B,
+        n=4,
+        num_k_splits=0,
+        tile_m=1,
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(tuple(tensor.shape) for tensor in scratch) == expected_shapes
+
+
 def test_mhc_fused_hc_preserves_chained_inputs():
     """A fused-HC call must not overwrite state returned by the previous call."""
     runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=7168, hc_mult=4, seed=61)

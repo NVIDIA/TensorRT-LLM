@@ -249,6 +249,7 @@ def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fa
         DeepseekV4TrtllmAttentionMetadata._compute_gen_compressed_position_ids, mask
     )
     original_storage = metadata.batch_size_cuda.data_ptr()
+    original_gen_storage = metadata.gen_position_params_cuda.data_ptr()
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,
         attn_metadata=metadata,
@@ -262,6 +263,7 @@ def test_ragged_compressor_warmup_calls_current_metadata_helpers(monkeypatch, fa
     else:
         DecoderMetadata._warmup_dspark_ragged_compressor_metadata(engine)
     assert metadata.batch_size_cuda.data_ptr() == original_storage
+    assert metadata.gen_position_params_cuda.data_ptr() == original_gen_storage
     assert metadata.batch_size_cuda.tolist() == [17]
     assert metadata.gen_position_params_cuda.tolist() == [3, 2, 1]
     for ratio, token_count in ((1, 42), (4, 14)):
