@@ -12,10 +12,12 @@ from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
 from tensorrt_llm._torch.moe.fused_moe.communication.base import Communication
-from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
+from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP, NcclEPWindow
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import NcclEpContext
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
@@ -24,6 +26,9 @@ pytestmark = pytest.mark.cpu_only
 
 class TestNcclEPZeroCopy(unittest.TestCase):
     def setUp(self) -> None:
+        version = patch.object(nccl_ep_utils, "get_nccl_ep_version", return_value=Version("0.3"))
+        version.start()
+        self.addCleanup(version.stop)
         strategy = object.__new__(NcclEP)
         strategy.ep_size = 2
         strategy.ep_rank = 0
@@ -646,3 +651,252 @@ class TestNcclEPZeroCopy(unittest.TestCase):
                 self.assertEqual(
                     result.dtype, torch.uint8 if quant == "nvfp4" else torch.float8_e4m3fn
                 )
+
+    def test_combine_only_attaches_window_to_exact_destination(self) -> None:
+        pooled = torch.empty((8, 128), dtype=torch.bfloat16)
+        for tensor, windowed in (
+            (pooled, True),
+            (pooled.view(2, 4, 128), True),
+            (pooled.clone(), False),
+            (pooled.t().contiguous().t(), False),
+            (pooled.to(torch.float32), False),
+        ):
+            with self.subTest(shape=tensor.shape, windowed=windowed):
+                self.strategy._dispatch_state = {"num_tokens": 3}
+                window = NcclEPWindow(
+                    123, pooled.data_ptr(), pooled.numel(), pooled.dtype, pooled.device
+                )
+                with patch.dict(sys.modules, {"nccl.ep": self.ep}):
+                    self.strategy.combine(tensor, window=window)
+                desc = self.strategy._handle.combine.call_args.args[0].tokens
+                self.assertEqual(hasattr(desc, "window"), windowed)
+                if windowed:
+                    self.assertEqual(desc.window.handle, 123)
+                    self.assertEqual(desc.window_offset, 0)
+                self.assertEqual(self.strategy._dispatch_state, {})
+
+    def test_combine_ignores_invalid_window_metadata(self) -> None:
+        tensor = torch.empty((8, 128), dtype=torch.bfloat16)
+        window = NcclEPWindow(123, tensor.data_ptr(), tensor.numel(), tensor.dtype, tensor.device)
+        for invalid in (
+            window._replace(handle=0),
+            window._replace(numel=tensor.numel() - 1),
+            window._replace(device=torch.device("meta")),
+        ):
+            with self.subTest(window=invalid):
+                self.strategy._dispatch_state = {"num_tokens": 3}
+                with patch.dict(sys.modules, {"nccl.ep": self.ep}):
+                    self.strategy.combine(tensor, window=invalid)
+                desc = self.strategy._handle.combine.call_args.args[0].tokens
+                self.assertFalse(hasattr(desc, "window"))
+
+    def test_combine_window_is_optional(self) -> None:
+        with patch.dict(sys.modules, {"nccl.ep": self.ep}):
+            self.strategy.combine(torch.empty((8, 128), dtype=torch.bfloat16))
+        desc = self.strategy._handle.combine.call_args.args[0].tokens
+        self.assertFalse(hasattr(desc, "window"))
+
+    def test_combine_accepts_caller_window_without_helper(self) -> None:
+        tensor = torch.empty((8, 128), dtype=torch.bfloat16)
+        window = NcclEPWindow(456, tensor.data_ptr(), tensor.numel(), tensor.dtype, tensor.device)
+        with patch.dict(sys.modules, {"nccl.ep": self.ep}):
+            self.strategy.combine(tensor, window=window)
+        desc = self.strategy._handle.combine.call_args.args[0].tokens
+        self.assertIs(desc.window, window)
+
+    def test_scheduler_scopes_combine_input_and_preserves_anchor(self) -> None:
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=self.strategy,
+                backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+                use_dp=False,
+                calculate_num_chunks=lambda _: 1,
+                determine_communication_method=Mock(),
+            )
+        )
+        hidden = torch.empty((3, 128), dtype=torch.bfloat16)
+        output = torch.empty_like(hidden)
+        logits = torch.empty((3, 32))
+        scope_context = MagicMock()
+        scope = scope_context.__enter__.return_value
+        scope.escape.side_effect = lambda value: value
+        order = Mock()
+        order.attach_mock(scope_context.__enter__, "enter")
+        scheduler._forward_single_chunk = Mock(return_value=output)
+        order.attach_mock(scheduler._forward_single_chunk, "compute")
+        order.attach_mock(scope.escape, "escape")
+        order.attach_mock(scope_context.__exit__, "exit")
+        with patch(
+            "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.nccl_window_tensor_scope",
+            return_value=scope_context,
+        ) as make_scope:
+            result = scheduler.forward(
+                hidden,
+                logits,
+                do_finalize=True,
+                output_dtype=torch.bfloat16,
+                all_rank_num_tokens=[3, 3],
+                use_dp_padding=False,
+            )
+        make_scope.assert_called_once_with(logits)
+        self.assertIs(result, output)
+        self.assertEqual(
+            [entry[0] for entry in order.mock_calls],
+            ["enter", "escape", "compute", "escape", "exit"],
+        )
+        self.assertEqual(scope.escape.call_args_list, [call(logits), call(output)])
+        scope_context.__exit__.assert_called_once_with(None, None, None)
+
+    def test_combine_input_version_guard(self) -> None:
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=self.strategy,
+                use_dp=False,
+                calculate_num_chunks=lambda _: 1,
+                determine_communication_method=Mock(),
+                backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+            )
+        )
+        hidden = torch.empty((3, 128), dtype=torch.bfloat16)
+        logits = torch.empty((3, 32))
+        pooled = torch.empty((8, 128), dtype=torch.bfloat16)
+        scheduler._forward_single_chunk = Mock(return_value=hidden)
+        for version in (None, "0.2", "0.2.9", "0.3rc1", "0.3", "0.4"):
+            with self.subTest(version=version):
+                self.strategy.__dict__.pop("_supports_combine_input", None)
+                parsed = Version(version) if version else None
+                supported = parsed is not None and parsed >= Version("0.3")
+                with (
+                    patch.object(nccl_ep_utils, "get_nccl_ep_version", return_value=parsed),
+                    self.allocator(pooled) as allocate,
+                    patch(
+                        "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.nccl_window_tensor_scope"
+                    ) as make_scope,
+                ):
+                    scheduler.forward(
+                        hidden,
+                        logits,
+                        do_finalize=True,
+                        output_dtype=torch.bfloat16,
+                        all_rank_num_tokens=[3, 3],
+                        use_dp_padding=False,
+                    )
+                    result = scheduler._request_combine_input(torch.bfloat16, True)
+                self.assertEqual(make_scope.call_count, int(supported))
+                self.assertEqual(allocate.call_count, int(supported))
+                if supported:
+                    self.assertIs(result[0], pooled)
+                else:
+                    self.assertIsNone(result)
+
+    def test_scheduler_uses_declared_combine_input_capability(self) -> None:
+        pooled = torch.empty((8, 128), dtype=torch.bfloat16)
+        window = object()
+        request = Mock(return_value=(pooled, window))
+        scheduler = ExternalCommMoEScheduler(
+            SimpleNamespace(
+                comm=SimpleNamespace(
+                    supports_combine_input=lambda _: True, request_combine_input=request
+                ),
+                backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+            )
+        )
+        self.assertEqual(scheduler._request_combine_input(torch.bfloat16, True), (pooled, window))
+        request.assert_called_once_with(torch.bfloat16)
+        scheduler.moe.comm = SimpleNamespace(supports_combine_input=lambda _: False)
+        self.assertIsNone(scheduler._request_combine_input(torch.bfloat16, True))
+
+    def test_scheduler_skips_scope_when_combine_input_is_disabled(self) -> None:
+        hidden = torch.empty((3, 128))
+        for enabled, finalized, backend_support in (
+            (False, True, True),
+            (True, False, True),
+            (True, True, False),
+        ):
+            with self.subTest(
+                enabled=enabled, finalized=finalized, backend_support=backend_support
+            ):
+                comm = Mock(spec=Communication)
+                comm.supports_combine_input.return_value = enabled
+                scheduler = ExternalCommMoEScheduler(
+                    SimpleNamespace(
+                        comm=comm,
+                        use_dp=False,
+                        calculate_num_chunks=lambda _: 1,
+                        determine_communication_method=Mock(),
+                        backend=SimpleNamespace(
+                            supports_moe_output_in_alltoall_workspace=lambda: backend_support
+                        ),
+                    )
+                )
+                scheduler._forward_single_chunk = Mock(return_value=hidden)
+                with patch(
+                    "tensorrt_llm._torch.moe.fused_moe.moe_scheduler.nccl_window_tensor_scope"
+                ) as scope:
+                    scheduler.forward(
+                        hidden,
+                        hidden,
+                        do_finalize=finalized,
+                        output_dtype=torch.bfloat16,
+                        all_rank_num_tokens=[3, 3],
+                        use_dp_padding=False,
+                    )
+                    self.assertIsNone(scheduler._request_combine_input(torch.bfloat16, finalized))
+                scope.assert_not_called()
+                comm.request_combine_input.assert_not_called()
+
+    def test_default_combine_input_capability(self) -> None:
+        comm = Mock(spec=Communication)
+        self.assertFalse(Communication.supports_combine_input(comm, torch.bfloat16))
+        self.assertIsNone(Communication.request_combine_input(comm, torch.bfloat16))
+
+    def test_scheduler_allocates_destination_only_when_supported(self) -> None:
+        pooled = torch.empty((8, 128), dtype=torch.bfloat16)
+        scheduler = object.__new__(ExternalCommMoEScheduler)
+        for supported in (False, True):
+            for finalize in (False, True):
+                for kind, handle in ((self.window_kind, 123), (0, 0)):
+                    with self.subTest(supported=supported, finalize=finalize, kind=kind):
+                        scheduler.moe = SimpleNamespace(
+                            comm=self.strategy,
+                            enable_alltoall=True,
+                            backend=SimpleNamespace(
+                                supports_moe_output_in_alltoall_workspace=lambda: supported
+                            ),
+                        )
+                        with self.allocator(pooled, kind, handle) as allocate:
+                            combine_input = scheduler._request_combine_input(
+                                torch.bfloat16, finalize
+                            )
+                            plan = scheduler._build_comm_plan(
+                                [3, 3], torch.bfloat16, finalize, combine_input=combine_input
+                            )
+                        expected = supported and finalize
+                        self.assertEqual(allocate.call_count, int(expected))
+                        if expected and handle:
+                            self.assertIs(plan.moe_output, pooled)
+                            self.assertEqual(plan.combine_window.handle, handle)
+                        else:
+                            self.assertIsNone(plan.moe_output)
+                            self.assertIsNone(plan.combine_window)
+                        self.assertNotIn("combine_window", self.strategy._dispatch_state)
+                        self.assertFalse(plan.payload_in_workspace)
+
+    def test_scheduler_skips_pool_for_unsupported_windows_or_output_dtype(self) -> None:
+        scheduler = object.__new__(ExternalCommMoEScheduler)
+        scheduler.moe = SimpleNamespace(
+            comm=self.strategy,
+            enable_alltoall=True,
+            backend=SimpleNamespace(supports_moe_output_in_alltoall_workspace=lambda: True),
+        )
+        for supported, dtype in ((False, torch.bfloat16), (True, torch.float32)):
+            with self.subTest(supported=supported, dtype=dtype):
+                self.strategy._ctx.window_buffers_supported = supported
+                with self.allocator(None) as allocate:
+                    combine_input = scheduler._request_combine_input(dtype, True)
+                    plan = scheduler._build_comm_plan(
+                        [3, 3], dtype, True, combine_input=combine_input
+                    )
+                allocate.assert_not_called()
+                self.assertIsNone(plan.moe_output)
+                self.assertIsNone(plan.combine_window)

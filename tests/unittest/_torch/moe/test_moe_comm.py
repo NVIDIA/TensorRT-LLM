@@ -1337,17 +1337,36 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 ).item()
             )
 
-        def roundtrip() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        def roundtrip() -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool, bool
+        ]:
             with nccl_window_tensor_scope(hidden_states):
                 tokens, scales = quantized_input()
                 recv_hs, recv_sf, recv_slots, recv_scales = comm.dispatch(
                     tokens, scales, static_routes, weights, all_rank_num_tokens
                 )
                 dispatch_windowed = comm._ctx.dispatch_window is not None
-                destination = torch.empty(
-                    (comm.max_recv_tokens, comm.hidden_size),
-                    device=recv_hs.device,
-                    dtype=torch.bfloat16,
+                from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEPWindow
+                from tensorrt_llm.bindings.internal.thop import BufferKind
+
+                destination, kind, handle = torch.ops.trtllm.allocate_output_with_nccl_window(
+                    recv_hs,
+                    int(BufferKind.NCCL_WINDOW),
+                    comm.mapping.moe_ep_group,
+                    [comm.max_recv_tokens, comm.hidden_size],
+                    torch.bfloat16,
+                )
+                combine_windowed = kind == int(BufferKind.NCCL_WINDOW) and bool(handle)
+                window = (
+                    NcclEPWindow(
+                        handle,
+                        destination.data_ptr(),
+                        destination.numel(),
+                        destination.dtype,
+                        destination.device,
+                    )
+                    if combine_windowed
+                    else None
                 )
                 # A minimal expert writes directly into the supplied destination.
                 decoded = _to_bf16(recv_hs, recv_sf, global_scale, config.quant_mode)
@@ -1356,30 +1375,33 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
                 observed_hs = decoded.clone()
                 observed_slots = recv_slots.clone()
                 observed_scales = recv_scales.clone()
-                combined = comm.combine(destination)
+                combined = comm.combine(destination, window=window)
             return (
                 observed_hs,
                 observed_slots,
                 observed_scales,
                 combined,
                 dispatch_windowed,
+                combine_windowed,
             )
 
-        # Initialize dispatch storage and the handle before graph capture.
+        # Warm both directions and release their leases before graph capture.
         eager = roundtrip()
         torch.cuda.synchronize()
         assert combine_matches(eager[3], 1.0)
         if comm._ctx.window_buffers_supported:
-            assert eager[4], "Eager execution missed registered windows"
+            assert eager[4] and eager[5], "Eager execution missed registered windows"
         pool = torch.cuda.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
         try:
             with nccl_window_graph_capture(graph, pool):
-                recv_hs, recv_slots, recv_scales, combined, dispatch_windowed = roundtrip()
+                recv_hs, recv_slots, recv_scales, combined, dispatch_windowed, combine_windowed = (
+                    roundtrip()
+                )
             torch.cuda.synchronize()
             assert recv_scales.dtype == routing_dtype
             if comm._ctx.window_buffers_supported:
-                assert dispatch_windowed, "Capture missed prewarmed windows"
+                assert dispatch_windowed and combine_windowed, "Capture missed prewarmed windows"
 
             def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
                 graph.replay()
@@ -1402,16 +1424,17 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: tor
             weights.fill_(0.25)
             peer_result = replay_and_check(peer_rank, 0.25)
 
-            # Both graphs share the fixed dispatch destination and replay serially.
+            # The first graph retains its windows. Warm another scoped roundtrip
+            # so an independent graph owner can claim its own registered buffers.
             roundtrip()
             torch.cuda.synchronize()
             second_pool = torch.cuda.graph_pool_handle()
             second_graph = torch.cuda.CUDAGraph()
             try:
                 with nccl_window_graph_capture(second_graph, second_pool):
-                    _, _, _, second_combined, dispatch_windowed = roundtrip()
+                    _, _, _, second_combined, dispatch_windowed, combine_windowed = roundtrip()
                 if comm._ctx.window_buffers_supported:
-                    assert dispatch_windowed, "Second capture missed windows"
+                    assert dispatch_windowed and combine_windowed, "Second capture missed windows"
                 for weight in (0.5, 0.25):
                     weights.fill_(weight)
                     second_graph.replay()
@@ -1505,6 +1528,7 @@ def _worker_nccl_window_reservation_lifetime() -> dict:
 
 def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
     """Queue skewed reuse without host barriers or device sync between iterations."""
+    from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEPWindow
     from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
     from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
     from tensorrt_llm._torch.nccl_window_graph import (
@@ -1535,7 +1559,7 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
         observed_recv = torch.empty(
             (config.all_num_tokens[peer], config.hidden_size), device="cuda", dtype=torch.bfloat16
         )
-        generic_ptrs, dispatch_ptrs = [], []
+        generic_ptrs, dispatch_ptrs, combine_ptrs = [], [], []
         max_tokens = max(config.all_num_tokens)
 
         def run_experts(ctx: MoERunContext, workspace: torch.Tensor | None) -> torch.Tensor:
@@ -1547,8 +1571,13 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
                 torch.cuda._sleep(50_000_000)
             peer_rows = slice(peer * max_tokens, peer * max_tokens + config.all_num_tokens[peer])
             observed_recv.copy_(received[peer_rows])
-            assert ctx.comm_plan.moe_output is None
-            expert_output = torch.empty_like(received)
+            expert_output = ctx.comm_plan.moe_output
+            if uses_combine_input:
+                assert ctx.comm_plan.combine_window is not None
+            else:
+                assert ctx.comm_plan.combine_window is None
+                assert expert_output is None
+                expert_output = torch.empty_like(received)
             expert_output.zero_()
             expert_output[peer_rows].copy_(observed_recv)
             return expert_output
@@ -1590,6 +1619,27 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
             _load_balancer_done_set_cpu_stage=lambda *_: None,
         )
         scheduler = ExternalCommMoEScheduler(moe)
+        request_input = comm.request_combine_input
+        uses_combine_input = comm.supports_combine_input(torch.bfloat16)
+
+        def tracked_request(output_dtype: torch.dtype | None) -> tuple[torch.Tensor, NcclEPWindow]:
+            combine_input = request_input(output_dtype)
+            assert combine_input is not None
+            combine_ptrs.append(combine_input[0].data_ptr())
+            return combine_input
+
+        if uses_combine_input:
+            comm.request_combine_input = tracked_request
+        dispatch = comm.dispatch
+
+        def checked_dispatch(
+            *args: object, **kwargs: object
+        ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+            if uses_combine_input:
+                assert len(combine_ptrs) == len(dispatch_ptrs) + 1, "Lease must precede dispatch"
+            return dispatch(*args, **kwargs)
+
+        comm.dispatch = checked_dispatch
 
         def roundtrip() -> torch.Tensor:
             # This ordinary pool user has no peer-completion protocol. Its delayed
@@ -1618,6 +1668,7 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
         torch.cuda.synchronize()
         generic_ptrs.clear()
         dispatch_ptrs.clear()
+        combine_ptrs.clear()
         if capture:
             graph = torch.cuda.CUDAGraph()
             pool = torch.cuda.graph_pool_handle()
@@ -1648,6 +1699,11 @@ def _worker_nccl_ep_window_reuse(config: CommTestConfig, capture: bool) -> dict:
             assert torch.equal(combined, hidden), (
                 "Combine result corrupted during pooled window reuse"
             )
+        if uses_combine_input:
+            assert len(set(combine_ptrs)) == 1, "Test must force combine window reuse"
+            assert generic_ptrs == combine_ptrs, "Combine must reuse the delayed consumer window"
+        else:
+            assert not combine_ptrs
         assert generic_ptrs[0] != dispatch_ptrs[0], "Dispatch borrowed the general-purpose window"
         return {"rank": rank, "capture": capture}
     finally:

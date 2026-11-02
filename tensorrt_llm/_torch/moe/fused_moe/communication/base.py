@@ -25,11 +25,14 @@ Key Design: Communication dispatch can happen BEFORE or AFTER quantization
 
 from abc import ABC, abstractmethod
 from collections.abc import Hashable
-from typing import List, Optional, Protocol, Tuple, runtime_checkable
+from typing import TYPE_CHECKING, List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from .nccl_ep import NcclEPWindow
 
 
 @runtime_checkable
@@ -169,6 +172,16 @@ class Communication(ABC):
         either side of dispatch.
         """
         return False
+
+    def supports_combine_input(self, output_dtype: Optional[torch.dtype]) -> bool:
+        """Whether the scheduler should scope and request a combine-input lease."""
+        return False
+
+    def request_combine_input(
+        self, output_dtype: Optional[torch.dtype]
+    ) -> Optional[Tuple[torch.Tensor, "NcclEPWindow"]]:
+        """Request a destination before dispatch; the caller holds its lease through combine."""
+        return None
 
     def release_executor_resources(self) -> None:
         """Release opted-in resources after graphs and GPU work are drained on all ranks.

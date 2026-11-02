@@ -122,7 +122,8 @@ comprehensive early-validation layer for every incompatible feature.
 
 ```text
 [EPLB start_wait_gpu] → routing → [EPLB done_wait_gpu + update_statistic + route]
-  → [comm.prepare_dispatch (NVLink2-sided)] → quantize/dispatch (adaptive order)
+  → [comm.prepare_dispatch (NVLink2-sided)] → [comm.request_combine_input]
+  → quantize/dispatch (adaptive order)
   → backend.run_moe → [EPLB start_set_cpu] → [unfinalized_combine_fn]
   → comm.combine → [EPLB done_set_cpu]
 
@@ -246,6 +247,12 @@ Still on old path (standalone, with embedded communication):
 `CommunicationFactory` (`communication_factory.py`) picks a strategy at runtime
 from hardware and configuration; `FUSED_COMM` backends skip it. `base.py` holds
 the `Communication` ABC.
+
+`supports_combine_input(output_dtype)` declares whether a strategy requests a
+leased expert-output destination. The scheduler uses one predicate combining
+this capability, backend output support, and finalization to select both the
+lease scope and `request_combine_input(output_dtype)` call before dispatch.
+The default capability is false and the default request returns `None`.
 
 At terminal shutdown, `ModelEngine.release_communication_resources()` discovers
 `Communication` instances and calls `release_executor_resources()` once per
@@ -1127,16 +1134,36 @@ it does not add execution dependencies between graph replays.
 A reservation miss uses the persistent unregistered dispatch buffer; NCCL-EP
 stages the incoming payload and copies it locally in stream order.
 
-On an NCCL-EP version bump, audit the actual LL dispatch/combine peer completion
-protocol and rerun `test_nccl_ep_window_reuse_with_delayed_consumer` in eager
-and graph modes, with balanced and empty-rank traffic. Also rerun
+Combine-input leases are enabled only for NCCL-EP >= 0.3, BF16 output, and a
+backend that can write the finalized expert output into a supplied destination.
+When enabled, the scheduler opens a temporary lease scope around the external
+MoE forward and requests a destination before each chunk's dispatch, including
+during graph capture. Expert compute first writes it after dispatch. Both the
+borrowed `router_logits` anchor and the final output escape the scope; the
+combine-input lease ends on the current stream, subject to the pool's stream
+and graph-owner restrictions. Replay uses captured addresses and makes no
+Python-side pool request.
+
+The reviewed LL implementation in `nccl-extensions` af42925a stages combine:
+`nccl_ep.cc` sets `params.inData = x_data` and `params.zeroCopy = false`. It
+reads the combine input locally before sending to internal staging. Local
+stream ordering therefore protects reuse of that input; dispatch's count
+exchange is not the reason this staged path is safe. Versions below 0.3 or
+with an unknown version skip the combine lease and its scope entirely.
+The 0.3 enablement gate is not an ordering proof for a different implementation.
+On an NCCL-EP version bump, audit the actual LL combine window access and peer
+completion protocol and rerun `test_nccl_ep_window_reuse_with_delayed_consumer`
+in eager and graph modes, with balanced and empty-rank traffic. Also rerun
 `test_nccl_window_reservation_lifetime` and the CPU zero-copy contract tests.
+A path that accesses peer input windows must prove the required cross-rank
+lifetime dependencies before using these leases.
 
 At final context teardown, local streams are synchronized and EP ranks attempt
 a bounded shutdown rendezvous before the reservation is explicitly released.
 Failure or timeout quarantines resources rather than returning them to the pool.
 Graphs referencing the context must be retired first. No per-iteration barrier
-or pool acquisition is added to dispatch, combine, or replay. Registered storage
+is added to dispatch, combine, or replay; the optional combine request above
+still acquires a lease in eager execution and during capture. Registered storage
 remains owned by the pool; the context neither registers nor deregisters it.
 Fixed receive addresses also avoid rotation when a backend binds its outputs
 at handle creation.
