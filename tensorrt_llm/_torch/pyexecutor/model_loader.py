@@ -56,7 +56,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -121,6 +121,19 @@ _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
     rope_types=frozenset({"mrope"}),
     rope_fusion=frozenset({False}),
 )
+
+# TorchLlmArgs fields that only the model classes listing them in
+# `model_specific_llm_args` implement.
+_MODEL_SPECIFIC_LLM_ARGS = ("replicate_embedding",
+                            "mnnvl_allreduce_fp8_payload")
+
+
+def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
+                                       model_cls: type) -> None:
+    supported = getattr(model_cls, "model_specific_llm_args", frozenset())
+    for name in _MODEL_SPECIFIC_LLM_ARGS:
+        if getattr(llm_args, name) and name not in supported:
+            raise ValueError(f"{name} is not supported by {model_cls.__name__}")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -262,22 +275,24 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
+    mapping = model_config.mapping
+    if mapping.cp_size != 1 and not mapping.has_cp_helix():
+        raise ValueError(
+            "FP4 MLA supports context parallelism only through Helix.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        # HP/V-scale side pools are not switched by draft_kv_cache_context.
-        # Set this before models and workers consult the shared predicate.
-        spec_config._allow_separate_draft_kv_cache = False
+        spec_dec_mode = spec_config.spec_dec_mode
+        # A standalone drafter (DFlash, DSpark) keeps its layers in its own
+        # BF16 draft pool, outside the FP4 MLA layout. Without that pool it
+        # falls back to a context arena that is dense in max_seq_len.
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            # HP/V-scale side pools are not switched by draft_kv_cache_context.
+            # Set this before models and workers consult the shared predicate.
+            spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -945,6 +960,8 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        if model_cls is not None:
+            _reject_unsupported_model_llm_args(llm_args, model_cls)
         original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
@@ -1068,7 +1085,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1593,7 +1610,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
@@ -2116,6 +2133,12 @@ class ModelLoader:
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
+            mnnvl_allreduce_fp8_payload=self.llm_args.
+            mnnvl_allreduce_fp8_payload,
+            replicate_embedding=self.llm_args.replicate_embedding,
+            cuda_graph_batch_sizes=tuple(
+                self.llm_args.cuda_graph_config.batch_sizes or
+                ()) if self.llm_args.cuda_graph_config else (),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,

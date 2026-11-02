@@ -15,7 +15,7 @@ class KdaPostConv(OpWrapper):
     L2-normalized along the head dim, v is copied as is.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

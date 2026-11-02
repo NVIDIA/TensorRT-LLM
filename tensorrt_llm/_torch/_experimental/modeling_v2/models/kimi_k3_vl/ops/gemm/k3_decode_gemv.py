@@ -18,7 +18,7 @@ class K3DecodeGemv(OpWrapper):
     """Return ``x @ weight^T`` as a new bf16 ``[M, N]`` tensor (fp32 accumulation, one bf16 rounding) in one
     k3_decode_gemv call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="KDA o_proj, short K resident in one CTA per weight tile",
