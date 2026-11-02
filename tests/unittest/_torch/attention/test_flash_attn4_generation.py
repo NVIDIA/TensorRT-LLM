@@ -193,12 +193,15 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     tpb, rows, width = 32, 13, 8
     gen = torch.Generator(device=device).manual_seed(0)
     kv_lens = torch.tensor(
-        [q_len - 1 if q_len > 1 else 1] + [int(x) for x in torch.randint(q_len, width * tpb, (rows - 1,))],
+        [q_len - 1 if q_len > 1 else 1]
+        + [int(x) for x in torch.randint(q_len, width * tpb, (rows - 1,))],
         dtype=torch.int32,
         device=device,
     )
     page_table = torch.randperm(rows * width, device=device).view(rows, width).to(torch.int32)
-    pool = torch.randn(rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device).bfloat16()
+    pool = torch.randn(
+        rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device
+    ).bfloat16()
     cols = (num_heads + 2 * num_kv_heads) * head_dim
     qkv = torch.randn(rows * q_len, cols + 64, generator=gen, device=device).bfloat16()[:, :cols]
     cos_sin = torch.randn(width * tpb, rotary_dim, generator=gen, device=device)
@@ -222,8 +225,14 @@ def test_rope_write_kv_paged_matches_rope_then_write(
 
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,massive",
-    [(28, 4, 128, 1, False), (28, 4, 128, 4, False), (28, 4, 128, 9, False), (20, 20, 128, 9, False),
-     (16, 8, 64, 4, False), (28, 4, 128, 9, True)],
+    [
+        (28, 4, 128, 1, False),
+        (28, 4, 128, 4, False),
+        (28, 4, 128, 9, False),
+        (20, 20, 128, 9, False),
+        (16, 8, 64, 4, False),
+        (28, 4, 128, 9, True),
+    ],
 )
 @pytest.mark.parametrize("splits", [2, 5, 16])
 @pytest.mark.parametrize("min_split_tokens", [1, 512])
@@ -245,7 +254,9 @@ def test_fa4_paged_generation_split_matches_dense(
     for seed in range(2):
         case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=5, seed=seed, massive=massive)
         ref = _reference(case, num_heads, num_kv_heads, head_dim, q_len)
-        write_kv_paged(case["pool"], case["k"], case["v"], case["page_table"], case["kv_lens"], q_len)
+        write_kv_paged(
+            case["pool"], case["k"], case["v"], case["page_table"], case["kv_lens"], q_len
+        )
         tables = split_tables(case["page_table"], case["kv_lens"], q_len, splits, case["tpb"])
         out = torch.empty_like(case["q"])
         fa4_paged_generation_split(
@@ -290,10 +301,14 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     num_heads, num_kv_heads, head_dim, tpb, rows, width = 28, 4, 128, 32, 7, 6
     gen = torch.Generator(device=device).manual_seed(1)
     shared_tokens = 4 * tpb
-    page_lens = torch.randint(q_len, width * tpb, (rows,), generator=gen, device=device).to(torch.int32)
+    page_lens = torch.randint(q_len, width * tpb, (rows,), generator=gen, device=device).to(
+        torch.int32
+    )
     kv_lens = page_lens + shared_tokens
     tail_table = torch.randperm(rows * width, device=device).view(rows, width).to(torch.int32)
-    pool = torch.randn(rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device).bfloat16()
+    pool = torch.randn(
+        rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device
+    ).bfloat16()
     cols = (num_heads + 2 * num_kv_heads) * head_dim
     qkv = torch.randn(rows * q_len, cols, generator=gen, device=device).bfloat16()
     cos_sin = torch.randn(width * tpb + shared_tokens, head_dim, generator=gen, device=device)
@@ -301,8 +316,9 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     rope_qkv_inplace(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
                      head_dim=head_dim, rotary_dim=head_dim, q_len=q_len)  # fmt: skip
     q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
-    write_kv_paged(ref_pool, ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim),
-                   ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim), tail_table, page_lens, q_len)  # fmt: skip
+    ref_k = ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim)
+    ref_v = ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim)
+    write_kv_paged(ref_pool, ref_k, ref_v, tail_table, page_lens, q_len)
     rope_write_kv_paged(qkv, cos_sin, pool, tail_table, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
                         head_dim=head_dim, rotary_dim=head_dim, q_len=q_len, page_lens=page_lens)  # fmt: skip
     torch.cuda.synchronize()

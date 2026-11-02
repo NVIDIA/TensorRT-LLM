@@ -129,10 +129,18 @@ def _prefix_programs(
                 n_ok = offs_n < tok_hi
                 page = tl.load(pidx_ptr + p0 + offs_n // TPB, mask=n_ok, other=0).to(tl.int64)
                 base = pool_ptr + page * pool_ps + h * pool_hs + (offs_n % TPB) * pool_ss
-                k = tl.load(base[:, None] + dims[None, :], mask=n_ok[:, None], other=0.0,
-                             eviction_policy="evict_last")
-                v = tl.load(base[:, None] + pool_kvs + dims[None, :], mask=n_ok[:, None], other=0.0,
-                             eviction_policy="evict_last")
+                k = tl.load(
+                    base[:, None] + dims[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                    eviction_policy="evict_last",
+                )
+                v = tl.load(
+                    base[:, None] + pool_kvs + dims[None, :],
+                    mask=n_ok[:, None],
+                    other=0.0,
+                    eviction_policy="evict_last",
+                )
                 scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
                 scores = tl.where(n_ok[None, :], scores, _NEG)
                 m_new = tl.maximum(m_i, tl.max(scores, 1))
@@ -840,7 +848,14 @@ class Fa4Tail:
             from .flash_attn4_generation import fa4_paged_generation_split
 
             fa4_paged_generation_split(
-                pool, q, self.out, self.split_tables, self.q_len, self.splits, sm_scale, lse=self.lse
+                pool,
+                q,
+                self.out,
+                self.split_tables,
+                self.q_len,
+                self.splits,
+                sm_scale,
+                lse=self.lse,
             )
             return
         _fa4_forward()(
@@ -1084,6 +1099,7 @@ def fused_sampling_attention(
     # SM90 (H100) tuning: evict_last is already in the kernel; bump warps/stages.
     if sm90_tune and q.device.type == "cuda":
         import torch
+
         cc = torch.cuda.get_device_capability(q.device)
         if cc == (9, 0):  # SM90
             num_warps = max(num_warps, 8)
