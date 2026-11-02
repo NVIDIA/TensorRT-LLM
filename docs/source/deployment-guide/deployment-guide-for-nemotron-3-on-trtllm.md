@@ -209,6 +209,21 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
     **Recommendation**: Set this to cover the range of batch sizes you expect in production.
 
+#### `kv_cache_config.mamba_state_config` (multi-turn chat with block reuse)
+
+* **Description:** Nemotron v3 models are hybrid Mamba models, so a cached prefix can be reused only up to the last position where a Mamba state snapshot was kept (see [Mamba Snapshot Boundaries](../features/kvcache.md#mamba-snapshot-boundaries)). With periodic snapshots off (the default) and no explicit boundaries, follow-up chat turns do not reuse the previous turn's prompt. The Nemotron 3.5 Super VL chat template renders the previous turn's generation prompt `<think>\n` as `<think></think>` in the next request, so that request diverges from the cached prompt one token before its end and a snapshot exactly at the prompt end (offset `0`) does not match either.
+* **Recommendation:** For chat and agent workloads with `enable_block_reuse: true`, keep a snapshot one token before each prompt end. A second, earlier offset gives requests that branch a little earlier somewhere to resume from:
+
+  ```yaml
+  kv_cache_config:
+    enable_block_reuse: true
+    use_kv_cache_manager_v2: true
+    mamba_state_config:
+      additional_snapshot_offsets_from_end: [1, 576]
+  ```
+
+  On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 (one DGX Spark), `[1]` alone made follow-up turns reuse the cached prompt instead of re-reading it, and `[1, 576]` cut time to first token on a 100K-token prompt with a cached prefix from 31-33 s to 18.6 s. Check the per-request `num_reused_blocks` metric to confirm reuse on your workload.
+
 See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the YAML configuration file.
 
 ## Testing API Endpoint
