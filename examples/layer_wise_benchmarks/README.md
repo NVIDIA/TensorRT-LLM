@@ -106,21 +106,48 @@ NP=2 ./mpi_launch.sh ./run.sh config_gen.yaml --model Qwen/Qwen3-Next-80B-A3B-In
 # --moe-backend must be TRTLLM: the SiTU routed experts support only TRTLLM and
 # MEGAMOE_DEEPGEMM, the config files default to CUTLASS, and of those two only TRTLLM is in
 # the balance-method whitelist -- MEGAMOE_DEEPGEMM additionally needs
-# --balance-method NotModified. GEN also builds a prefill runner, so
-# --moe-backend-for-prefill must be set to match.
+# --balance-method NotModified.
 # The attn-residual snapshot stack grows one entry every attn_res_block_size (12) layers and
 # is seeded from layer_indices[0], so a slice at 0,1,2,3 measures a cheaper attn_res than one
 # at 48,49,50,51.
 NP=4 ./mpi_launch.sh ./run.sh config_ctx.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --seq-len-q 1
 
 # Run Kimi K3 with 3 draft tokens per step (seq_len_q = 1 + 3). --spec-max-draft-len makes
 # the cache manager allocate the KDA multi-token verify buffers; without it the run stops
 # with an error. No sampler exists here, so no draft is ever accepted.
-NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --batch-size 32 --seq-len-q 4 --spec-max-draft-len 3
+NP=4 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --batch-size 32 --seq-len-q 4 --spec-max-draft-len 3
 
 # Run Kimi K3 at the serving parallelism (DEP16, see examples/kimi_k3/eval_extra_llm_options.yaml)
-NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --moe-backend-for-prefill TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
+NP=16 ./mpi_launch.sh ./run.sh config_gen.yaml --model $K3 --layer-indices 4,5,6,7 --tokens-per-block 64 --moe-backend TRTLLM --seq-len-q 1 --moe-max-num-tokens 33024 --use-low-precision-moe-combine
+
+# Run DeepSeek-V4 with MegaMoE, $DSV4 being a local checkpoint directory, as three arms:
+# load balancer off, per-layer dynamic EPLB (num_slots = experts + helper slots per rank * EP,
+# here 384 + 3 * 8), and perfectly balanced routing with the load balancer off (the upper
+# bound for any MoE load balancer). MEGAMOE_CUTEDSL is not in the balance-method whitelist,
+# so the arms use --balance-method NotModified. DeepSeek-V4 needs --tokens-per-block 128 or
+# 256, and --max-seq-len above 256 (an assert in its sparse-attention top-k); 512 is tested.
+# MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 selects the FP4 combine. A slice may start mid-model
+# (here 7,8).
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified --moe-load-balancer eplb_per_layer_dynamic.yaml
+NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 -x ENABLE_PERFECT_ROUTER=expert_ids ./run.sh config_ctx.yaml --model $DSV4 --layer-indices 7,8 --tokens-per-block 128 --batch-size 64 --seq-len-q 128 --max-seq-len 512 --moe-backend MEGAMOE_CUTEDSL --balance-method NotModified
+# with eplb_per_layer_dynamic.yaml holding:
+#   mode: per_layer_dynamic
+#   num_slots: 408
+# Per-layer dynamic EPLB runs without CUDA graphs only, and online standard EPLB is not
+# supported on a layer slice; the runner rejects both.
+# To replay the routing of an end-to-end run, add --replay-file-path (see "Performance
+# alignment" below) to the first two arms only. Both arms record and replay expert IDs, so
+# one recording, for example made with the load balancer off, drives both. Replay overrides
+# the expert IDs that ENABLE_PERFECT_ROUTER=expert_ids substitutes, so run the third arm
+# without it; run.py rejects that combination. Replay with MEGAMOE_CUTEDSL and the CTX
+# phase is untested.
+# Without replay every timed iteration reruns the same inputs, so the per-layer dynamic arm
+# plans the same placement each time: after warmup its helper slots already hold the planned
+# experts and the copies are skipped. That arm then times HALO-Q and the plan sync with
+# almost no helper copies, a best case. Run this arm with replay to include the copies;
+# compare the per-layer dynamic and balanced arms end to end.
 
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
@@ -392,9 +419,9 @@ Limitations:
 
 ## Troubleshooting
 
-1. Error `fp8 blockscale gemm only support Hopper` on Blackwell.
+1. Error `no MoE implementation can serve this layer` or `fp8 blockscale gemm only support Hopper` on Blackwell.
 
-   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) and `--moe-backend-for-prefill DEEPGEMM` options.
+   The default MoE backend "CUTLASS" does not support FP8 weights. Please choose the same MoE backend as your end-to-end config. A typical solution is to add the `--moe-backend DEEPGEMM` (or `TRTLLM`, `CUTEDSL`) option. The prefill runner that GEN builds to fill the KV cache needs no option: `--moe-backend-for-prefill` defaults to `AUTO`, which resolves a backend for the checkpoint and GPU.
 
 2. Error `huggingface_hub.errors.HfHubHTTPError: 429 Client Error: Too Many Requests for url: https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4-v2/resolve/main/config.json`.
 
@@ -421,3 +448,7 @@ Limitations:
    - `Mamba Cache (kda-replay) is allocated` — only with `--spec-max-draft-len`; without it the legacy per-step verify buffers are used instead
 
    For reference, Kimi K3 on 4 GPUs (DEP4, one GB200 node) with `--layer-indices 4,5,6,7` and `--load-format DUMMY` runs ~60 ms per CTX iteration at `--batch-size 1 --seq-len-q 8193`, and ~4.2 ms per GEN iteration at `--batch-size 32 --seq-len-q 4 --seq-len-kv-cache 8193 --spec-max-draft-len 3`.
+
+7. Error `DeepseekV4CacheManager requires tokens_per_block in [128, 256]` or `add_dummy_requests could not allocate KV cache` with DeepSeek-V4.
+
+   The DeepSeek-V4 cache manager only takes 128- or 256-token blocks, while the config files set `tokens_per_block: 32`. It also splits the KV cache budget across several pools, so it needs 3x the default headroom to register every dummy request. Add `--tokens-per-block 128 --kv-pool-headroom 3`.

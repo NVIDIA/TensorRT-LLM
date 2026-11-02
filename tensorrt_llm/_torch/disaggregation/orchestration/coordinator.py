@@ -135,7 +135,7 @@ class DisaggTransferCoordinator:
     # -- loop head -----------------------------------------------------------
 
     @nvtx_range("handle_errors_synced")
-    def handle_errors_synced(self) -> None:
+    def handle_errors_synced(self) -> bool:
         """Rank-safe disagg cache error and poison handler.
 
         Called from the top of every executor iteration. Buffer poison is
@@ -144,6 +144,11 @@ class DisaggTransferCoordinator:
         vote on failed request IDs and fail matching local replicas together;
         otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
         deadlocks or leaves peer replicas running.
+
+        Returns:
+            Whether ADP peers must flush buffered responses before an idle
+            request fetch. The decision is uniform across the TP group,
+            including ranks without a local failed request.
         """
         pending_ids = self.take_pending_context_failures()
         pending_requests = (
@@ -164,12 +169,12 @@ class DisaggTransferCoordinator:
                 self._effects.fail_fatal(
                     "Disagg KV cache transfer buffer is poisoned; process restart is required"
                 )
-                return
+                return False
 
         if not (self._enable_attention_dp and self._dist.world_size != 1):
             if pending_requests:
                 self._check_transfer_errors("context requests")
-            return
+            return False
 
         local_error_requests = [
             req
@@ -189,7 +194,7 @@ class DisaggTransferCoordinator:
         blocked_error_ids = {rid for vote in all_votes for rid in vote["blocked_ids"]}
         ready_error_ids = voted_error_ids - blocked_error_ids
         if not ready_error_ids:
-            return
+            return False
         local_voted_error_requests = [
             req for req in self._registry.active_requests() if self._vote_id(req) in ready_error_ids
         ]
@@ -202,6 +207,7 @@ class DisaggTransferCoordinator:
         self._effects.fail_requests(
             "Disagg KV cache transfer error", local_voted_error_requests, charge_budget=False
         )
+        return True
 
     @nvtx_range("prepare_context_schedulable")
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
@@ -364,11 +370,15 @@ class DisaggTransferCoordinator:
 
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
+        controller = self._admission_controller
         return (
-            self._admission_controller is not None
-            and self._admission_controller.enabled()
-            and not transfer_window_bypass_eligible(
-                self._transceiver, self._dist, self._is_kv_manager_v2
+            controller is not None
+            and controller.enabled()
+            and (
+                controller.budget_is_explicit
+                or not transfer_window_bypass_eligible(
+                    self._transceiver, self._dist, self._is_kv_manager_v2
+                )
             )
         )
 
@@ -407,6 +417,8 @@ class DisaggTransferCoordinator:
                     req,
                     fences.get(req.py_request_id),
                 )
+            # Admission is rank-uniform: report before any rank starts one.
+            self._report_deferred_gen_receives()
             self._publish_ready_gen_receives()
             # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
             # every admitted request ends in the same state on every rank and
@@ -501,6 +513,17 @@ class DisaggTransferCoordinator:
             self._transceiver.request_and_receive_async(req)
             published.append(req)
         self._stamp_gen_transfer_start(published)
+        self._report_deferred_gen_receives()
+
+    def _report_deferred_gen_receives(self) -> None:
+        """Tell the transceiver how many admitted receives wait for publication.
+
+        Every rank admits the same receives, but each publishes them as its own
+        readiness events complete. The transceiver's idle-poll skip must see a
+        waiting receive from admission on: if a peer starts it first, the peer
+        resumes the status collectives while this rank would still skip them.
+        """
+        self._transceiver.set_gen_deferred_receives(len(self._unpublished_gen_receives))
 
     def _stamp_gen_transfer_start(self, requests: List[LlmRequest]) -> None:
         """Start the transfer-timeout clock of each receive now in flight."""
@@ -954,8 +977,8 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
             force_terminate_ctx_for_partial_reuse=False,
         )
 
-    def handle_errors_synced(self) -> None:
-        return None
+    def handle_errors_synced(self) -> bool:
+        return False
 
     def admit(self, fitting_gen_init: List[LlmRequest]) -> Tuple[List[LlmRequest], bool]:
         return fitting_gen_init, False

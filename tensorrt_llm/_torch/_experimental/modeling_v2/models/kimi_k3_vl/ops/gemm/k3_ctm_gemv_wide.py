@@ -16,7 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 class K3CtmGemvWide(OpWrapper):
     """Return `x @ weight.T` in bf16 (columns >= `sig_col0` as sigmoid) or fp32, in one call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="KDA q/k/v/g/f_a/b, final output block has eight rows",

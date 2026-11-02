@@ -195,8 +195,8 @@ BlockKey Hasher::digest() const
 // genMultimodalCacheKeyTokens
 // ---------------------------------------------------------------------------
 
-std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
-    int idOffset, std::vector<uint8_t> const& multiModalDataDigest, int numTokens, int tokenOffset)
+std::vector<TokenIdExt> genMultimodalCacheKeyTokens(int idOffset, std::vector<uint8_t> const& multiModalDataDigest,
+    int numTokens, int tokenOffset, std::optional<std::string> uuid)
 {
     TLLM_CHECK(numTokens > 0);
     TLLM_CHECK(tokenOffset >= 0);
@@ -209,7 +209,7 @@ std::vector<TokenIdExt> genMultimodalCacheKeyTokens(
         {
             Digest digest;
             std::memcpy(digest.data(), multiModalDataDigest.data(), kDIGEST_LEN);
-            result.emplace_back(digest);
+            result.emplace_back(digest, std::move(uuid));
         }
         else
         {
@@ -337,13 +337,13 @@ Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode)
     {
         if (prevNode->type() == Type::kBLOCK)
         {
-            mLastTokenDigest = static_cast<Block const*>(prevNode)->getLastTokenDigest();
+            mLastMmItemContext = static_cast<Block const*>(prevNode)->getLastMmItemContext();
         }
         for (auto iter = tokens.rbegin(); iter != tokens.rend(); ++iter)
         {
             if (iter->isDigest())
             {
-                mLastTokenDigest = std::make_shared<Digest const>(iter->digest());
+                mLastMmItemContext = iter->sharedMmItemContext();
                 break;
             }
         }
@@ -490,7 +490,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && alc->requiresPrefixCoverage()
+    if (alc && requiresPrefixCoverage(*alc)
         && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
@@ -899,7 +899,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
-            if (!attn->requiresPrefixCoverage())
+            if (!requiresPrefixCoverage(*attn))
             {
                 continue;
             }
@@ -973,7 +973,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    auto const ssmLcId = mLifeCycles.requiredSsmLifeCycleId();
     // Page requirements depend on the final endpoint. Back off before pruning
     // so SWA coverage and recurrent snapshots are validated at that endpoint.
     if (backoff > 0)
@@ -1015,6 +1015,10 @@ void BlockRadixTree::clear()
     TLLM_CHECK_DEBUG(mRoots.size() == mPendingRootErases.size());
     mRoots.clear();
     mPendingRootErases.clear();
+    if (mEventSink)
+    {
+        mEventSink->addAllBlocksCleared();
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -115,6 +115,20 @@ class TestConfigAndFactory:
         assert not cfg.supports_speculative_decoding()
         initialize.assert_called_once_with()
 
+        # The selector limit applies to both single-request and batch execution.
+        # Reject unsupported budgets before calibration I/O, while accepting the boundary.
+        with mock.patch.object(TriAttentionCompressionManager, "_load_calibration") as load:
+            with pytest.raises(ValueError, match="budget must be at most 16384"):
+                TriAttentionCompressionManager(
+                    _make_tri_config(budget=16385), pretrained_config=pretrained_config
+                )
+            load.assert_not_called()
+            supported = TriAttentionCompressionManager(
+                _make_tri_config(budget=16384), pretrained_config=pretrained_config
+            )
+            assert supported.budget == 16384
+            load.assert_called_once_with()
+
 
 class TestTriAttentionCompressionManager:
     def test_loads_flat_pt(self, flat_calibration_pt):
