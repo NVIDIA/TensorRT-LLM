@@ -20,9 +20,8 @@ import signal
 import socket
 import traceback
 import uuid
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from typing import AsyncIterator, Callable, Optional
 
 import aiohttp
 import uvicorn
