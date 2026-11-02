@@ -619,11 +619,16 @@ def _make_decode_cluster_topk_class():
             """Exact top-k of the SMEM candidate list (``s_cand_count[0]`` entries) into
             ``s_output``.
 
-            One 2048-bin histogram over the list's own key range (``key - kmin``, shifted so
-            the range fits), the threshold bin for ``top_k``, the lower bins emitted, the
-            threshold bin compacted to the list front and resolved by the rank sort (or,
-            above ``refine_cutoff``, the radix refine). The list's keys span the top few
-            percent of the row, so the threshold bin holds a handful of columns.
+            Rounds of a 2048-bin equal-width histogram over a key window ``[lo, lo + 2048 <<
+            shift)``: the first window is the list's own key range; each round emits the bins
+            below the threshold bin for ``top_k - found``, compacts the threshold bin to the
+            list front and, while it holds more than ``refine_cutoff`` entries, narrows the
+            window to that bin (``shift`` drops by 11 bits, so at most three rounds reach
+            single keys). The survivors take the rank sort (ties to the lower column), or the
+            column-digit radix refine above ``refine_cutoff`` bit-identical keys. One window
+            over [kmin, kmax] alone is too coarse on served logits: with the k-th score
+            negative and positive outliers in the list, the ordered keys span the sign
+            boundary and most of the list falls into one bin.
             """
 
             num_threads = cutlass.const_expr(self.num_threads_per_cta)
@@ -638,50 +643,66 @@ def _make_decode_cluster_topk_class():
             shift = cutlass.Uint32(0)
             while (span >> shift) >= cutlass.Uint32(num_bins):
                 shift = shift + cutlass.Uint32(1)
+            lo = kmin
             stage_vals = cute.make_rmem_tensor(cute.make_layout((slots,)), cutlass.Float32)
             stage_cols = cute.make_rmem_tensor(cute.make_layout((slots,)), cutlass.Int32)
             stage_bins = cute.make_rmem_tensor(cute.make_layout((slots,)), cutlass.Int32)
-            for s in cutlass.range_constexpr(slots):
-                i = tidx + cutlass.Int32(s * num_threads)
-                value = s_cand_vals[i]
-                stage_vals[s] = value
-                stage_cols[s] = s_cand_idx[i]
-                stage_bins[s] = cutlass.Int32((self.to_ordered(value) - kmin) >> shift)
-            # Every thread has read the key-range scratch (inside s_histogram).
-            cute.arch.barrier()
-            hist_idx = tidx
-            while hist_idx < cutlass.Int32(num_bins):
-                s_histogram[hist_idx] = cutlass.Int32(0)
-                hist_idx = hist_idx + cutlass.Int32(num_threads)
-            if tidx == 0:
-                s_cand_count[1] = cutlass.Int32(0)
-            cute.arch.barrier()
-            for s in cutlass.range_constexpr(slots):
-                i = tidx + cutlass.Int32(s * num_threads)
-                self.histogram_add(s_histogram, stage_bins[s], i < count)
-            cute.arch.barrier()
-            self.find_threshold_bin(
-                s_histogram, s_warp_sums, s_threshold_bin, s_final_bin_size, s_found_threshold,
-                cutlass.Int32(top_k) - s_found_topk[0], tidx,
-            )  # fmt: skip
-            threshold_bin = s_threshold_bin[0]
-            for s in cutlass.range_constexpr(slots):
-                i = tidx + cutlass.Int32(s * num_threads)
-                valid = i < count
-                below = valid & (stage_bins[s] < threshold_bin)
-                pos = self.warp_append(s_found_topk, cutlass.Int32(0), below)
-                if below:
-                    s_output[pos] = stage_cols[s]
-                keep = valid & (stage_bins[s] == threshold_bin)
-                pos = self.warp_append(s_cand_count, cutlass.Int32(1), keep)
-                if keep:
-                    s_cand_vals[pos] = stage_vals[s]
-                    s_cand_idx[pos] = stage_cols[s]
-            cute.arch.barrier()
-            if tidx == 0:
-                s_cand_count[0] = s_cand_count[1]
-            cute.arch.barrier()
-            if s_cand_count[0] <= cutlass.Int32(cutoff):
+            go = cutlass.Boolean(True)
+            while go:
+                for s in cutlass.range_constexpr(slots):
+                    i = tidx + cutlass.Int32(s * num_threads)
+                    value = s_cand_vals[i]
+                    stage_vals[s] = value
+                    stage_cols[s] = s_cand_idx[i]
+                    bin_idx = cutlass.Int32(0)
+                    if i < count:
+                        bin_idx = cutlass.Int32((self.to_ordered(value) - lo) >> shift)
+                    stage_bins[s] = bin_idx
+                # Every thread has read the list (and, first round, the key-range scratch
+                # inside s_histogram).
+                cute.arch.barrier()
+                hist_idx = tidx
+                while hist_idx < cutlass.Int32(num_bins):
+                    s_histogram[hist_idx] = cutlass.Int32(0)
+                    hist_idx = hist_idx + cutlass.Int32(num_threads)
+                if tidx == 0:
+                    s_cand_count[1] = cutlass.Int32(0)
+                cute.arch.barrier()
+                for s in cutlass.range_constexpr(slots):
+                    i = tidx + cutlass.Int32(s * num_threads)
+                    self.histogram_add(s_histogram, stage_bins[s], i < count)
+                cute.arch.barrier()
+                self.find_threshold_bin(
+                    s_histogram, s_warp_sums, s_threshold_bin, s_final_bin_size,
+                    s_found_threshold, cutlass.Int32(top_k) - s_found_topk[0], tidx,
+                )  # fmt: skip
+                threshold_bin = s_threshold_bin[0]
+                for s in cutlass.range_constexpr(slots):
+                    i = tidx + cutlass.Int32(s * num_threads)
+                    valid = i < count
+                    below = valid & (stage_bins[s] < threshold_bin)
+                    pos = self.warp_append(s_found_topk, cutlass.Int32(0), below)
+                    if below:
+                        s_output[pos] = stage_cols[s]
+                    keep = valid & (stage_bins[s] == threshold_bin)
+                    pos = self.warp_append(s_cand_count, cutlass.Int32(1), keep)
+                    if keep:
+                        s_cand_vals[pos] = stage_vals[s]
+                        s_cand_idx[pos] = stage_cols[s]
+                cute.arch.barrier()
+                if tidx == 0:
+                    s_cand_count[0] = s_cand_count[1]
+                cute.arch.barrier()
+                count = s_cand_count[0]
+                if (count <= cutlass.Int32(cutoff)) | (shift == cutlass.Uint32(0)):
+                    go = cutlass.Boolean(False)
+                else:
+                    lo = lo + (cutlass.Uint32(threshold_bin) << shift)
+                    if shift > cutlass.Uint32(11):
+                        shift = shift - cutlass.Uint32(11)
+                    else:
+                        shift = cutlass.Uint32(0)
+            if count <= cutlass.Int32(cutoff):
                 self.sort_final_candidates(
                     s_output, s_cand_vals, s_cand_idx, s_cand_count, s_sort_keys, s_found_topk,
                     tidx,

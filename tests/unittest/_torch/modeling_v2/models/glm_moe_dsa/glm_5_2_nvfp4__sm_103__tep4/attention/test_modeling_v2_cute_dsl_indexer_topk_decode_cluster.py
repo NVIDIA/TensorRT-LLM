@@ -46,6 +46,12 @@ def _logits(kind: str, ends: list[int], seed: int, pad: int = 256) -> torch.Tens
             vals = torch.randperm(end, generator=g, device="cuda").float()
         elif kind == "randn":
             vals = torch.randn(end, generator=g, device="cuda")
+        elif kind == "outliers":
+            # The served indexer's shape: the k-th score negative, a few hundred positive
+            # outliers; one key window over the candidates would span the sign boundary.
+            vals = torch.randn(end, generator=g, device="cuda") * 8 - 60
+            hot = torch.randint(0, end, (300,), generator=g, device="cuda")
+            vals[hot] = torch.rand(300, generator=g, device="cuda") * 90
         elif kind == "fp16":
             # Many exact ties near the k-th value.
             vals = torch.randn(end, generator=g, device="cuda").half().float()
@@ -80,6 +86,7 @@ CASES = [
     (2, [kernel._CLUSTER_SPLIT_MIN + 2, 2049], "distinct"),
     (6, [20001, 1000], "randn"),
     (6, [163840, 131071], "randn"),
+    (6, [163840, 65536], "outliers"),
     (1, [WIDTH], "distinct"),
     (4, [70000, 2050, 17000], "fp16"),
     (2, [200001, 99999], "fp16"),
