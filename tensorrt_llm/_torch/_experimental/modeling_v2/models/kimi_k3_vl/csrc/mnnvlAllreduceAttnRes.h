@@ -17,8 +17,9 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::kimiK3Mnnvl
 {
@@ -34,8 +35,9 @@ struct AttnResEpilogueParams
     int numCandidates;
 };
 
-void oneshotAllreduceAttnResOp(mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
+void oneshotAllreduceAttnResOp(
+    ::tensorrt_llm::kernels::mnnvl::AllReduceFusionParams const& params, AttnResEpilogueParams const& epilogue);
 
 }
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

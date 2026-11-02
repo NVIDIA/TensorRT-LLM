@@ -39,10 +39,13 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# Callers import MoeLoadBalancerConfig from this module.
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          KvCacheConfig,
+                                          MoeLoadBalancerConfigType,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -286,7 +289,7 @@ class ModelConfig(Generic[TConfig]):
     _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
                                                            repr=False,
                                                            compare=False)
-    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfigType] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
@@ -305,6 +308,13 @@ class ModelConfig(Generic[TConfig]):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    # Lossy: the model's two-shot MNNVL all-reduces fused with a residual
+    # RMSNorm exchange E4M3 (AllReduceParams.fp8_payload).
+    mnnvl_allreduce_fp8_payload: bool = False
+    # Every tensor-parallel rank holds the whole embedding table.
+    replicate_embedding: bool = False
+    # Batch sizes of the generation CUDA graphs (empty without them).
+    cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False

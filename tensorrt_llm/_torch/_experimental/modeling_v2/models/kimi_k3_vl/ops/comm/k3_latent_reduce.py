@@ -23,7 +23,7 @@ class K3LatentReduce(OpWrapper):
     every rank pushed into it since the previous reduce. Empties the words it read and advances ``exchange`` by one
     call: every rank pushes, then reduces, the same token count on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{tokens} decode tokens, {kind} partials: {reason}",
