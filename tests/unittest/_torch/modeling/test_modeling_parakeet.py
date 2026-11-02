@@ -14,7 +14,11 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_parakeet import ParakeetExtractor, ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_parakeet import (
+    ParakeetExtractor,
+    ProjectedParakeet,
+    _subsampling_output_length,
+)
 
 
 def _make_extractor_config(**overrides):
@@ -101,17 +105,32 @@ class TestParakeetExtractor:
     @pytest.mark.threadleak(enabled=False)
     def test_call_returns_expected_keys(self):
         ext = _make_extractor()
-        audios = [np.random.randn(16000).astype(np.float32)]
+        audios = [
+            np.zeros(length, dtype=np.float32) for length in (16000, ext._clip_target_samples + 1)
+        ]
         result = ext(audios)
         assert "input_audio_features" in result
         assert "feature_attention_mask" in result
         assert "audio_num_clips" in result
+        assert "audio_output_lengths" in result
         assert result["input_audio_features"].ndim == 3
-        assert result["input_audio_features"].shape[0] == 1
+        assert result["input_audio_features"].shape[0] == sum(result["audio_num_clips"].tolist())
         assert result["input_audio_features"].shape[2] == ext.config.feature_size
         assert result["feature_attention_mask"].shape == result["input_audio_features"].shape[:2]
-        assert result["audio_num_clips"].shape == (1,)
-        assert result["audio_num_clips"].item() >= 1
+        assert result["audio_num_clips"].shape == (2,)
+        assert result["audio_num_clips"].tolist() == [1, 2]
+        assert result["audio_num_clips"].device.type == "cpu"
+        assert result["audio_output_lengths"].device.type == "cpu"
+        expected_lengths = _subsampling_output_length(
+            result["feature_attention_mask"].sum(dim=1),
+            ext.config.subsampling_factor,
+            ext.config.subsampling_conv_kernel_size,
+            ext.config.subsampling_conv_stride,
+        )
+        torch.testing.assert_close(result["audio_output_lengths"], expected_lengths)
+        assert result["audio_output_lengths"].sum().item() == sum(
+            ext.audio_token_count(len(audio)) for audio in audios
+        )
 
     def test_call_accepts_stereo_audio(self):
         ext = _make_extractor()

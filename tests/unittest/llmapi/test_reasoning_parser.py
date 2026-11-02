@@ -548,7 +548,7 @@ def test_resolved_mode_overrides_whatever_the_caller_sent(
 
 @pytest.mark.parametrize("parser", [
     "deepseek-r1", "deepseek_v4", "deepseek_v41", "qwen3", "qwen3_5",
-    "minimax_m2", "minimax_m3", "gemma4", "kimi_k2", "kimi_k25"
+    "minimax_m2", "gemma4", "kimi_k2", "kimi_k25"
 ])
 def test_resolve_prefilled_thinking_requires_opt_in(parser: str) -> None:
     """Parsers that have not opted in must never be resolved from the prompt.
@@ -1343,6 +1343,30 @@ _GLM_CASES = [
      "<tool_call>exec" + _ARGS, "Done."),
     ("glm47", None, "Plan.<tool_call>exec" + _ARGS, "<tool_call>exec" + _ARGS,
      "Plan."),
+    # A block a call ended still owes `</think>`: the first one outside a call
+    # is dropped, wherever it stands.
+    ("glm", None, "Plan.<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call>", "Plan."),
+    ("glm", None, "Plan.<tool_call>f</tool_call>\n</think>\nDone.",
+     "<tool_call>f</tool_call>\n\nDone.", "Plan."),
+    ("glm", None, "P<tool_call>a</tool_call><tool_call>b</tool_call></think>c",
+     "<tool_call>a</tool_call><tool_call>b</tool_call>c", "P"),
+    ("glm", None, "P<tool_call>a</tool_call>More.</think><tool_call>b",
+     "<tool_call>a</tool_call>More.<tool_call>b", "P"),
+    ("glm47", None, "Plan.<tool_call>exec" + _ARGS + "</think>",
+     "<tool_call>exec" + _ARGS, "Plan."),
+    ("glm45", None, "<think>plan<tool_call>f</tool_call></think>Done.",
+     "<tool_call>f</tool_call>Done.", "plan"),
+    # Only one is owed, a call cut off keeps its text, and a block closed by
+    # `</think>` owes nothing.
+    ("glm", None, "P<tool_call>a</tool_call></think></think>",
+     "<tool_call>a</tool_call></think>", "P"),
+    ("glm", None, "P<tool_call>f<arg_value>a</think>b",
+     "<tool_call>f<arg_value>a</think>b", "P"),
+    ("glm", None, "p</think><tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", "p"),
+    ("glm47", _OFF, "<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", ""),
     # With thinking off the template closed the block in the prompt.
     ("glm47", _OFF, "Paris.", "Paris.", ""),
     ("glm_moe_dsa", _OFF, "</think>Paris.</think><tool_call>f",
@@ -1401,6 +1425,23 @@ def test_glm_streaming_matches_parse_on_random_text(key: str) -> None:
         chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
         expected = (whole.content, whole.reasoning_content)
         assert _glm_stream(key, None, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("key", ["glm", "glm45", "glm47", "glm_moe_dsa"])
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("<|assistant|><think>", True),
+        ("<|assistant|></think>", False),
+        ("<|assistant|><think></think>", False),
+        ("<|assistant|>\n<think></think>", False),
+        # GLM-4.5/4.6 with thinking on: the model opens the block itself.
+        ("<|assistant|>", None),
+    ])
+def test_glm_mode_is_read_off_the_prompt(key: str, tail: str,
+                                         expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        key, "<|user|>hi" + tail) is expected
 
 
 def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
@@ -1505,6 +1546,15 @@ def _m3_parser(kwargs: dict | None):
         ({
             "thinking": True
         }, f"{M3_START}a{M3_END}b", "b", "a"),
+        # The mode resolved from the rendered prompt wins over `thinking_mode`.
+        ({
+            "thinking_mode": "enabled",
+            "enable_thinking": False
+        }, f"{M3_START}a{M3_END}b", "b", "a"),
+        ({
+            "thinking_mode": "disabled",
+            "enable_thinking": True
+        }, f"a{M3_END}b", "b", "a"),
     ])
 def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
                                      content: str,
@@ -1512,6 +1562,34 @@ def test_minimax_m3_reasoning_parser(kwargs: dict | None, text: str,
     result = _m3_parser(kwargs).parse(text)
     assert result.content == content
     assert result.reasoning_content == reasoning_content
+
+
+# The official template: ``bos_token ~ role``, ``eos_token`` after each
+# message, and ``]~b]ai`` as the generation prompt.
+M3_HEADER = "]~b]ai\n"
+M3_PROMPT = f"]~b]user\nhi[e~[\n{M3_HEADER}"
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        (f"{M3_PROMPT}{M3_START}", True),
+        (f"{M3_PROMPT}{M3_END}", False),
+        # Adaptive: nothing after the header, so the output starts outside
+        # reasoning even though a prior turn rendered its own tags.
+        (M3_PROMPT, False),
+        (f"]~b]ai\n{M3_START}a{M3_END}b[e~[\n]~b]user\nmore[e~[\n{M3_HEADER}",
+         False),
+        # Prefilled text after the opening tag is not adaptive; the tail carries
+        # no mode it can read, so `thinking_mode` decides.
+        (f"{M3_PROMPT}{M3_START}Let me think.", None),
+        # A custom template that ends elsewhere is left unresolved as before.
+        ("<user>hi</user>\n<assistant>", None),
+    ])
+def test_minimax_m3_resolves_the_prompt_tail(prompt: str,
+                                             expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        "minimax_m3", prompt) is expected
 
 
 def _m3_stream(kwargs: dict | None, chunks: list[str]) -> tuple[str, str]:

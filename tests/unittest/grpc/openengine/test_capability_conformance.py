@@ -22,7 +22,8 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")')
+pytest.importorskip("grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.73.1,<2")')
+pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 
 import torch  # noqa: E402
 from conftest import AbortError, FakeServicerContext  # noqa: E402

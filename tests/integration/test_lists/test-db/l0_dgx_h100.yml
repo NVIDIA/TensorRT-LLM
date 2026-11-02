@@ -17,6 +17,12 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[True]
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
@@ -99,6 +105,7 @@ l0_dgx_h100:
   # TP x PP, attention-DP over CP) always skip with "need 4 GPUs, have 2". Name
   # the file here so those compositions actually run.
   - unittest/_torch/multi_gpu/test_kv_pool_rebalance_tp.py
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_nccl_symmetric_unregistered_small_input
   # Exercise VisualGen worker-failure containment with live CUDA allocations
   # spread across four local processes.
   - unittest/_torch/visual_gen/test_executor_lifecycle_multi_gpu.py::test_sigkill_one_worker_contains_real_multi_gpu_group
