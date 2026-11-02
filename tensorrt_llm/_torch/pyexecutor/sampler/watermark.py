@@ -194,7 +194,9 @@ class WatermarkHandler:
                 # generated elsewhere, or be resumed after a preemption) and, with "all", the
                 # positions of the prompt too. Only the most recent `ring_size` count; the context
                 # of the next position is recorded when it commits.
-                prompt_len = getattr(request, "py_orig_prompt_len", None)
+                # `orig_prompt_len` is the length of the prompt as submitted; after a recompute
+                # preemption the request's prompt grows to include its output so far.
+                prompt_len = getattr(request, "orig_prompt_len", None)
                 if prompt_len is None:
                     prompt_len = len(all_tokens)
                 start = 0 if self._all else max(prompt_len - width, 0)
@@ -292,9 +294,16 @@ class WatermarkHandler:
             filled = torch.clamp(count, max=self._ring_size)
             ring = self._ring.index_select(0, slots)[:, : self._ring_size]
             seen = ring.unsqueeze(1) == seeds.unsqueeze(2)
-            seen &= self._ring_arange.view(1, 1, -1) < filled.view(-1, 1, 1)
+            # Position j of the window sees the last `ring_size` contexts: the j oldest ring
+            # entries have expired by then.
+            age = (count.view(-1, 1, 1) - 1 - self._ring_arange.view(1, 1, -1)) % self._ring_size
+            positions = torch.arange(num_positions, device=age.device).view(1, -1, 1)
+            seen &= (self._ring_arange.view(1, 1, -1) < filled.view(-1, 1, 1)) & (
+                age <= self._ring_size - 1 - positions
+            )
             same = seeds.unsqueeze(2) == seeds.unsqueeze(1)
-            earlier = torch.tril(same, diagonal=-1).any(dim=2)
+            distance = positions.view(1, -1, 1) - positions.view(1, 1, -1)
+            earlier = (torch.tril(same, diagonal=-1) & (distance <= self._ring_size)).any(dim=2)
             active = active & ~(seen.any(dim=2) | earlier)
         skip = None
         if self._all:
@@ -347,8 +356,17 @@ class WatermarkHandler:
             filled = torch.clamp(self._count.index_select(0, slots), max=self._ring_size)
             ring = self._ring.index_select(0, slots)[:, : self._ring_size]
             seen = ring == seeds.unsqueeze(1)
-            seen &= self._ring_arange.unsqueeze(0) < filled.unsqueeze(1)
-            earlier = (prior_seeds == seeds.unsqueeze(1)).any(dim=1)
+            recorded = self._count.index_select(0, slots)
+            num_prior = prior_drafts.shape[1]
+            # The draft is position `num_prior` of the step: that many oldest entries have expired.
+            age = (recorded.unsqueeze(1) - 1 - self._ring_arange.unsqueeze(0)) % self._ring_size
+            seen &= (self._ring_arange.unsqueeze(0) < filled.unsqueeze(1)) & (
+                age <= self._ring_size - 1 - num_prior
+            )
+            prior_distance = num_prior - torch.arange(num_prior, device=seeds.device)
+            earlier = (
+                (prior_seeds == seeds.unsqueeze(1)) & (prior_distance <= self._ring_size)
+            ).any(dim=1)
             active = active & ~(seen.any(dim=1) | earlier)
         if self._all:
             active = active & (self._skip.index_select(0, slots) <= prior_drafts.shape[1])

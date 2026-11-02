@@ -665,8 +665,6 @@ class SpecMetadata:
     # [max_num_requests] bool, rewritten every step: the requests whose tokens carry a
     # watermark in it (sampling, not greedy, not opted out, and sampling a token this step).
     watermark_enabled: Optional[torch.Tensor] = None
-    # Host-side "some request of this step carries a watermark" (reading the tensor would sync).
-    watermark_any_enabled: bool = False
     # Dual-key watermarking with rejection sampling: the drafts of the current step (target
     # vocabulary ids) and the seeds they were drawn with, so that the next draft token
     # continues from the right context. Shape [max_num_requests, max_draft_len], int64.
@@ -1147,7 +1145,6 @@ class SpecMetadata:
             samples_a_token(r) and handler.is_enabled(r.py_seq_slot)
             for r in requests
         ]
-        self.watermark_any_enabled = any(flags)
         flags += [False] * (self.watermark_enabled.shape[0] - len(flags))
         self.watermark_enabled.copy_(torch.tensor(flags,
                                                   dtype=torch.bool,
@@ -3711,22 +3708,18 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             sampled_tokens: [num_tokens] - Sampled token ids
         """
+        # A watermarked sample must be committed to the slot's context state by whoever accepts the
+        # tokens, which callers of this method do not do. Reject the configuration here, at the
+        # first forward (warmup or CUDA-graph capture): a per-request check would run once, at
+        # capture, and a later watermarked request would replay the captured unwatermarked sampler.
+        if spec_metadata.watermark_handler is not None:
+            raise NotImplementedError(
+                "this model's speculative sampling path does not support text watermarking: "
+                "remove watermark_config")
         if isinstance(logits, VocabShardedLogits):
             return logits.select_tokens(spec_metadata)
-        # A watermarked sample must be committed to the slot's context state by whoever
-        # accepts the tokens; callers of this method do not, so they cannot serve a request
-        # that carries a watermark. Opted-out and greedy requests are sampled normally.
-        if (spec_metadata.watermark_handler is not None
-                and spec_metadata.watermark_any_enabled):
-            raise NotImplementedError(
-                "this sampling path does not support text watermarking: disable "
-                "watermark_config or set watermarking=False on the requests")
         sampled_tokens, _ = self._sample_tokens_and_watermark_plans(
-            logits,
-            spec_metadata,
-            num_contexts,
-            batch_size,
-            use_watermark=False)
+            logits, spec_metadata, num_contexts, batch_size)
         return sampled_tokens
 
     def _sample_tokens_and_watermark_plans(
@@ -3736,7 +3729,6 @@ class SpecWorkerBase(nn.Module, ABC):
         num_contexts: int,
         batch_size: int,
         draft_tokens: Optional[torch.Tensor] = None,
-        use_watermark: bool = True,
     ):
         """``_sample_tokens_for_batch`` that also applies the watermark.
 
@@ -3748,7 +3740,7 @@ class SpecWorkerBase(nn.Module, ABC):
         watermark_plans = None
         if isinstance(logits, VocabShardedLogits):
             # A sampled, watermarked row needs the whole distribution, not this rank's shard.
-            if (use_watermark and spec_metadata.watermark_handler is not None
+            if (spec_metadata.watermark_handler is not None
                     and not spec_metadata.is_all_greedy_sample):
                 logits = logits.gather()
             else:
@@ -3764,7 +3756,7 @@ class SpecWorkerBase(nn.Module, ABC):
             if spec_metadata.sharded_target_logits:
                 # Temperature-only batch: the logits are this rank's
                 # vocabulary shard.
-                return self._sample_sharded_temperature(logits, temperatures)
+                return self._sample_sharded_temperature(logits, temperatures), None
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
             min_ps = spec_metadata.min_ps[:num_tokens]
@@ -3781,7 +3773,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 min_ps,
                 seed=seed,
                 offset=offset)
-            if use_watermark and spec_metadata.watermark_handler is not None:
+            if spec_metadata.watermark_handler is not None:
                 # Rows of watermarked requests replace the ordinary draw by the keyed
                 # Gumbel-max draw over the same filtered distribution.
                 watermark_plans = self._plan_watermark(spec_metadata,

@@ -106,18 +106,23 @@ def _plan_kernel(
         # The first generated tokens of a request stay unwatermarked.
         active = active & (position >= tl.load(skip_ptr + slot))
     if DEDUPE:
-        filled = tl.minimum(tl.load(count_ptr + slot), ring_size)
+        recorded = tl.load(count_ptr + slot)
+        filled = tl.minimum(recorded, ring_size)
         ring_row = ring_ptr + slot * stride_ring
         seen = tl.zeros([BLOCK_RING], dtype=tl.int32)
         for start in range(0, ring_size, BLOCK_RING):
             offsets = start + tl.arange(0, BLOCK_RING)
             values = tl.load(ring_row + offsets, mask=offsets < filled, other=0)
-            seen |= ((values == seed_signed) & (offsets < filled)).to(tl.int32)
+            # Position `position` of the window sees the last `ring_size` contexts, so the
+            # `position` oldest entries of the ring have expired by then.
+            age = (recorded - 1 - offsets) % ring_size
+            visible = (offsets < filled) & (age <= ring_size - 1 - position)
+            seen |= ((values == seed_signed) & visible).to(tl.int32)
         repeated = tl.max(seen, axis=0) != 0
         # A context equal to the context of an earlier position of the same window.
         for earlier in range(0, position):
             other = _context_seed(tail_row, drafts_row, earlier, key, WIDTH, K)
-            repeated = repeated | (other == seed)
+            repeated = repeated | ((other == seed) & (position - earlier <= ring_size))
         active = active & (~repeated)
     tl.store(active_ptr + out, active.to(tl.int8))
 
