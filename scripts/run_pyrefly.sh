@@ -8,7 +8,7 @@
 # Rebased checks include non-ignored untracked product Python files.
 # Paths from tool.pyrefly.project-excludes and symbols from
 # tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
-# scripts/pyrefly_exclusion.py. This hook is advisory and always returns success;
+# scripts/pyrefly_exclusion.py. Checks are advisory unless --strict is supplied;
 # the filtered diagnostic report is written to pyrefly_final_report.json and
 # up to eight diagnostics are printed to stdout when the check finishes.
 # Changed-file checks default to HEAD. Pass --full-project to scan all product
@@ -25,10 +25,15 @@ REBASE_UPSTREAM=0
 DIFF_BASE="${PYREFLY_INTERNAL_DIFF_BASE:-}"
 DIFF_FILTER=1
 PATH_MODULE_FILTER=1
+STRICT=0
 while (( $# > 0 )); do
     case "$1" in
         --full-project)
             FULL_PROJECT=1
+            shift
+            ;;
+        --strict)
+            STRICT=1
             shift
             ;;
         --rebase-upstream)
@@ -41,6 +46,7 @@ Run Pyrefly on changed product Python files, or the whole project.
 
 Options:
   --full-project           Check all product Python files.
+  --strict                 Fail on remaining diagnostics or check failures.
   --rebase-upstream        Rebase a new worktree from the current branch or HEAD
                            on upstream main, report its diff, and check changed files.
   --no-diff-filter         Keep diagnostics from all lines in changed files.
@@ -132,8 +138,11 @@ handle_rebase_exit() {
         fi
         python3 "$WORKFLOW_SCRIPT" record-rebase-failure \
             "$report_path" "$status" "${BASH_COMMAND:-unknown command}" || true
-        printf 'WARNING: advisory rebase-upstream check failed (exit status %s); see report: %s\n' \
+        printf 'WARNING: rebase-upstream check failed (exit status %s); see report: %s\n' \
             "$status" "$report_path" >&2
+    fi
+    if (( STRICT )); then
+        exit "$status"
     fi
     exit 0
 }
@@ -286,8 +295,13 @@ run_rebased_check() {
         "$check_report" "$source_branch" "$upstream_source" "$main_sha" \
         "$rebased_head" "$worktree_path" "$diff_report" "$DIFF_FILTER" \
         "$PATH_MODULE_FILTER" "${check_files[@]+"${check_files[@]}"}"
+    local check_status=0
+    if (( STRICT )); then
+        python3 "$WORKFLOW_SCRIPT" report-status "$check_report" || check_status=$?
+    fi
     cleanup_rebase_resources
     printf 'Temporary worktree and branch removed after the check.\n'
+    return "$check_status"
 }
 
 if (( REBASE_UPSTREAM )); then
@@ -307,6 +321,9 @@ cleanup() {
     print_report_summary
     printf 'Pyrefly check status: %s\n' "$status" >&3 || true
     trap - EXIT
+    if (( STRICT )); then
+        exit "$status"
+    fi
     exit 0
 }
 
@@ -416,4 +433,8 @@ if [[ -n "$DIFF_BASE" ]]; then
     FINAL_REPORT="$DIFF_FILTERED_OUTPUT"
 fi
 cp "$FINAL_REPORT" "$REPORT_FILE"
+if (( STRICT )); then
+    python3 "$WORKFLOW_SCRIPT" report-status "$REPORT_FILE"
+    exit 0
+fi
 exit "$PYREFLY_STATUS"

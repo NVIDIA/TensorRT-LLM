@@ -191,8 +191,11 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
 Run changed-file Python static checks with `scripts/run_pyrefly.sh`, or pass
-`--full-project` to scan all product Python files. The `[tool.pyrefly]` section in
-`pyproject.toml` defines the product roots, diagnostics, exclusions, and baseline.
+`--full-project` to scan all product Python files. Jenkins uses `--rebase-upstream`
+to check changed lines against fetched upstream main with path/module and symbol
+exclusions. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]` section in
+`pyproject.toml` defines the product roots, diagnostics, and native exclusions;
+`[tool.pyrefly-exclusions]` defines additional symbol exclusions for the wrapper.
 Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
 PyTorch, generated bindings, and configured third-party libraries.
 
