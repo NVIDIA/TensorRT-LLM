@@ -404,14 +404,14 @@ def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
     """A target pool_ratio sizes the target; the mixed MTP draft manager still builds."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.pyexecutor._util import _drop_mixed_draft_pool_ratio
+    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
     config = mixed_config(pool_ratio=[0.75, 0.25], max_tokens=None, max_gpu_total_bytes=128 << 20)
     target = make_manager(config=config, num_layers=2)
     assert target.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx([0.75, 0.25])
     draft_config = config.model_copy()
-    _drop_mixed_draft_pool_ratio(draft_config)
+    _fit_draft_pool_ratio(draft_config)
     draft = make_manager(
         config=draft_config,
         num_layers=1,
