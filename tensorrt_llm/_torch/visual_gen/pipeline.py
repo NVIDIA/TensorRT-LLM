@@ -404,6 +404,34 @@ class BasePipeline(nn.Module):
         return {}
 
     @property
+    def supported_samplers(self) -> Tuple[str, ...]:
+        """Samplers a request can select through ``extra_params["sampler"]``.
+
+        The first entry is the default. An empty tuple means the pipeline runs
+        one fixed sampler and does not accept the key.
+        """
+        return ()
+
+    def sampler_param_specs(self) -> Dict[str, ExtraParamSchema]:
+        """The ``extra_params["sampler"]`` spec for :attr:`supported_samplers`.
+
+        Pipelines that offer a choice merge this into ``extra_param_specs`` so
+        every model exposes sampler selection under the same key and rules.
+        """
+        if not self.supported_samplers:
+            return {}
+        choices = ", ".join(repr(name) for name in self.supported_samplers)
+        default = self.supported_samplers[0]
+        return {
+            "sampler": ExtraParamSchema(
+                type=f"Literal[{choices}]",
+                default=default,
+                description=f"Denoising sampler (default {default!r}). 'heun' is second order "
+                "and adds a transformer evaluation to every step but the last.",
+            )
+        }
+
+    @property
     def ref_slot_specs(self) -> Dict[str, RefSlotSpec]:
         """Reference slots this pipeline accepts.
 

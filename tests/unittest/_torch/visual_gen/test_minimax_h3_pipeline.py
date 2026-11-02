@@ -1473,7 +1473,7 @@ def test_h3_workflow_reference_slots(workflow: str) -> None:
         assert "reference_order" in pipeline.extra_param_specs
     else:
         assert set(slots) == {"image_reference"}
-        assert not pipeline.extra_param_specs
+        assert set(pipeline.extra_param_specs) == {"sampler"}
 
 
 @pytest.mark.parametrize(
