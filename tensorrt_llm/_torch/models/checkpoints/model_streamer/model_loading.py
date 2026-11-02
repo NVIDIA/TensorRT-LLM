@@ -79,8 +79,16 @@ class ModelStreamerMetricNames(StrEnum):
     MODEL_STREAMER_RANK_TENSORS = "model_streamer_rank_tensors"
 
 
-def get_weight_source_map(checkpoint_dir: str) -> dict[str, str]:
+def get_weight_source_map(
+    checkpoint_dir: str, metadata_dir: Optional[str] = None
+) -> dict[str, str]:
     """Map each tensor name in a safetensors checkpoint to the file that holds it.
+
+    Args:
+        checkpoint_dir: Local checkpoint directory, or an object-storage URI
+            such as ``s3://bucket/model``.
+        metadata_dir: Local copy of the checkpoint's non-weight files. Required
+            for an object-storage URI, where it supplies the index file.
 
     Example return:
         {
@@ -88,7 +96,16 @@ def get_weight_source_map(checkpoint_dir: str) -> dict[str, str]:
             "lm_head.weight": "/ckpt/model-00002-of-00002.safetensors",
             ...
         }
+
+    Raises:
+        FileNotFoundError: If an object-storage checkpoint has no
+            ``model.safetensors.index.json``, or lacks a file that the index names.
     """
+    # Imported here: tensorrt_llm.llmapi imports the model code that imports this module.
+    from tensorrt_llm.llmapi.object_storage import is_object_storage_uri
+
+    if is_object_storage_uri(checkpoint_dir):
+        return _get_object_storage_weight_source_map(checkpoint_dir, metadata_dir)
     directory = Path(checkpoint_dir)
     index = directory / "model.safetensors.index.json"
     if index.is_file():
@@ -110,6 +127,43 @@ def get_weight_source_map(checkpoint_dir: str) -> dict[str, str]:
     if not paths or any(not os.path.isfile(path) for path in paths):
         raise FileNotFoundError(f"No complete safetensors checkpoint in {checkpoint_dir}")
     return weight_source_file_map
+
+
+def _get_object_storage_weight_source_map(uri: str, metadata_dir: Optional[str]) -> dict[str, str]:
+    """Map each tensor name to the object-storage URI of the file that holds it.
+
+    Model Streamer reads the tensors from the bucket, so only the index file
+    is read locally. The files are listed in the bucket to catch an index that
+    names a file the bucket lacks. Without an index, finding the tensor names
+    would need a read of every file header in the bucket.
+    """
+    if metadata_dir is None:
+        raise ValueError(f"A local metadata directory is required to stream from {uri}")
+    index = Path(metadata_dir) / "model.safetensors.index.json"
+    if not index.is_file():
+        raise FileNotFoundError(
+            f"checkpoint_io_policy='model_streamer' needs model.safetensors.index.json "
+            f"in {uri}, to find the file of each tensor"
+        )
+    with index.open() as index_file:
+        weight_map: dict[str, str] = json.load(index_file)["weight_map"]
+    if not weight_map:
+        raise FileNotFoundError(f"The safetensors index of {uri} lists no tensors")
+
+    try:
+        from runai_model_streamer import list_safetensors
+    except ImportError as error:
+        raise ImportError(
+            "Loading a model from object storage requires runai-model-streamer"
+        ) from error
+    listed = {name.rsplit("/", 1)[-1] for name in list_safetensors(uri)}
+    missing = sorted(set(weight_map.values()) - listed)
+    if missing:
+        raise FileNotFoundError(
+            f"{uri} lacks files that its safetensors index names: {missing[:10]}"
+        )
+    prefix = uri.rstrip("/") + "/"
+    return {key: prefix + name for key, name in weight_map.items()}
 
 
 def gather_tensor_names_from_rank_to_node(
@@ -393,7 +447,12 @@ def check_model_streamer_support(model: nn.Module) -> None:
 
 
 def load_weights_with_model_streamer(
-    model: nn.Module, checkpoint_dir: str, *, rank: int, world_size: int
+    model: nn.Module,
+    checkpoint_dir: str,
+    *,
+    rank: int,
+    world_size: int,
+    metadata_dir: Optional[str] = None,
 ) -> None:
     """Stream the checkpoint tensors that ``model`` needs into it with Model Streamer.
 
@@ -404,16 +463,19 @@ def load_weights_with_model_streamer(
 
     Args:
         model: model with CUDA memory, to fill
-        checkpoint_dir: checkpoint directory of the target model
+        checkpoint_dir: checkpoint directory of the target model, or its
+            object-storage URI
         rank: rank of this process, ``Mapping.rank``
         world_size: number of ranks, ``Mapping.world_size``
+        metadata_dir: local copy of the non-weight files of an object-storage
+            checkpoint; see `get_weight_source_map()`
     """
     parameter = next(iter(model.parameters()), None)
     if parameter is not None and parameter.device.type == "cuda":
         # Model Streamer writes to the current CUDA device, so make it the
         # device that holds the model's weights.
         torch.cuda.set_device(parameter.device)
-    weight_source_file_map: dict[str, str] = get_weight_source_map(checkpoint_dir)
+    weight_source_file_map: dict[str, str] = get_weight_source_map(checkpoint_dir, metadata_dir)
     plan: ModelStreamerPlan = model.plan_model_streamer_load(set(weight_source_file_map))
     streaming_metrics = run_model_streamer(
         plan, weight_source_file_map, rank=rank, world_size=world_size

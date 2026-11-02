@@ -34,6 +34,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
+from ...llmapi.object_storage import is_object_storage_uri
 from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
@@ -853,14 +854,20 @@ def load_model_from_auto_load_format(
     weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
         model, model_config)
     if llm_args.checkpoint_io_policy == CheckpointIOPolicy.MODEL_STREAMER:
+        # A model on object storage streams from its URI. checkpoint_dir is then
+        # the local copy of its config and tokenizer files, not of the weights.
+        object_storage_uri = (llm_args.model if is_object_storage_uri(
+            llm_args.model) else None)
         with timing_metric(
                 ModelLoaderMetricNames.WEIGHT_POPULATION_SECONDS.value,
                 metrics):
             model_streamer_loading.load_weights_with_model_streamer(
                 model,
-                weights_checkpoint_dir,
+                object_storage_uri or weights_checkpoint_dir,
                 rank=mapping.rank,
-                world_size=mapping.world_size)
+                world_size=mapping.world_size,
+                metadata_dir=(weights_checkpoint_dir
+                              if object_storage_uri else None))
         weights_preloaded = True
     else:
         # Generic loaders ignore source_identity; MXCheckpointLoader pops it.

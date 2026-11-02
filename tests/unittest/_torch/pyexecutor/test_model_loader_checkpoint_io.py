@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 import socket
 import sys
 from contextlib import contextmanager, nullcontext
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any, Iterator
 from unittest.mock import MagicMock
 
@@ -295,7 +297,9 @@ def test_model_streamer_streams_planned_tensors_into_model(
     mapped_dirs = []
     streamed = []
 
-    def get_weight_source_map(checkpoint_dir: str) -> dict[str, str]:
+    def get_weight_source_map(
+        checkpoint_dir: str, metadata_dir: str | None = None
+    ) -> dict[str, str]:
         mapped_dirs.append(checkpoint_dir)
         return weight_map
 
@@ -336,7 +340,7 @@ def test_model_streamer_streams_target_and_reads_draft_with_checkpoint_loader(
     monkeypatch.setattr(
         model_streamer_loading,
         "load_weights_with_model_streamer",
-        lambda model, checkpoint_dir, *, rank, world_size: streamed.append(
+        lambda model, checkpoint_dir, *, rank, world_size, metadata_dir=None: streamed.append(
             (model, checkpoint_dir, rank, world_size)
         ),
     )
@@ -350,7 +354,9 @@ def test_model_streamer_streams_target_and_reads_draft_with_checkpoint_loader(
         model_config=object(),
         model=model,
         mapping=Mapping(world_size=4, tp_size=4, rank=3),
-        llm_args=SimpleNamespace(checkpoint_io_policy=CheckpointIOPolicy.MODEL_STREAMER),
+        llm_args=SimpleNamespace(
+            model="/checkpoint", checkpoint_io_policy=CheckpointIOPolicy.MODEL_STREAMER
+        ),
         spec_config=SimpleNamespace(needs_separate_draft_weights=True, speculative_model="/draft"),
         source_identity=None,
         qualification=None,
@@ -367,9 +373,166 @@ def test_model_streamer_streams_target_and_reads_draft_with_checkpoint_loader(
     assert "checkpoint_preparation_seconds" not in metrics
 
 
+def test_object_storage_target_streams_while_a_local_draft_uses_the_checkpoint_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = []
+    checkpoint_loader = _SessionCheckpointLoader(events, target_weight_mapper=object())
+    _record_weight_copies(monkeypatch, events)
+    streamed = []
+    monkeypatch.setattr(
+        model_streamer_loading,
+        "load_weights_with_model_streamer",
+        lambda model, checkpoint_dir, *, rank, world_size, metadata_dir=None: streamed.append(
+            (checkpoint_dir, metadata_dir)
+        ),
+    )
+    model = SimpleNamespace(load_weights=object(), load_draft_weights=object(), draft_config=None)
+
+    load_model_from_auto_load_format(
+        checkpoint_loader,
+        "/metadata",
+        config=_model_config(),
+        model_config=object(),
+        model=model,
+        mapping=Mapping(),
+        llm_args=SimpleNamespace(
+            model="s3://bucket/ckpt", checkpoint_io_policy=CheckpointIOPolicy.MODEL_STREAMER
+        ),
+        spec_config=SimpleNamespace(needs_separate_draft_weights=True, speculative_model="/draft"),
+        source_identity=None,
+        qualification=None,
+        metrics={},
+    )
+
+    # The target streams from the bucket; only the local draft is read by the loader.
+    assert streamed == [("s3://bucket/ckpt", "/metadata")]
+    assert events == ["mapper_init", "session_enter:/draft", "materialize", "session_exit:/draft"]
+
+
 def test_model_streamer_rejects_models_that_cannot_stream() -> None:
     with pytest.raises(ValueError, match="object does not support .* plan_model_streamer_load"):
         check_model_streamer_support(object())
+
+
+def _fake_runai_streamer(monkeypatch: pytest.MonkeyPatch, bucket_files: list[str]) -> None:
+    """Install a `runai_model_streamer` whose bucket holds ``bucket_files``."""
+    module = ModuleType("runai_model_streamer")
+    module.list_safetensors = lambda uri: [f"{uri.rstrip('/')}/{name}" for name in bucket_files]
+    monkeypatch.setitem(sys.modules, "runai_model_streamer", module)
+
+
+def _write_safetensors_index(directory: Path, weight_map: dict[str, str]) -> None:
+    (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+
+
+def test_object_storage_weight_source_map_points_at_the_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_safetensors_index(
+        tmp_path, {"embed": "model-1.safetensors", "head": "model-2.safetensors"}
+    )
+    _fake_runai_streamer(monkeypatch, ["model-1.safetensors", "model-2.safetensors"])
+
+    source_map = model_streamer_loading.get_weight_source_map("s3://bucket/ckpt/", str(tmp_path))
+
+    # The URI keeps its "//": it is never turned into a Path.
+    assert source_map == {
+        "embed": "s3://bucket/ckpt/model-1.safetensors",
+        "head": "s3://bucket/ckpt/model-2.safetensors",
+    }
+
+
+def test_object_storage_weight_source_map_needs_the_index_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_runai_streamer(monkeypatch, ["model.safetensors"])
+
+    with pytest.raises(FileNotFoundError, match=r"needs model\.safetensors\.index\.json"):
+        model_streamer_loading.get_weight_source_map("s3://bucket/ckpt", str(tmp_path))
+
+
+def test_object_storage_weight_source_map_needs_a_metadata_dir() -> None:
+    with pytest.raises(ValueError, match="local metadata directory"):
+        model_streamer_loading.get_weight_source_map("s3://bucket/ckpt")
+
+
+def test_object_storage_weight_source_map_rejects_files_missing_from_the_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_safetensors_index(
+        tmp_path, {"embed": "model-1.safetensors", "head": "model-2.safetensors"}
+    )
+    _fake_runai_streamer(monkeypatch, ["model-1.safetensors"])
+
+    with pytest.raises(FileNotFoundError, match=r"model-2\.safetensors"):
+        model_streamer_loading.get_weight_source_map("s3://bucket/ckpt", str(tmp_path))
+
+
+def test_model_streamer_maps_object_storage_checkpoint_with_local_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mapped = []
+
+    def get_weight_source_map(checkpoint_dir: str, metadata_dir: str | None = None):
+        mapped.append((checkpoint_dir, metadata_dir))
+        return {"weight": "s3://bucket/ckpt/model.safetensors"}
+
+    monkeypatch.setattr(model_streamer_loading, "get_weight_source_map", get_weight_source_map)
+    monkeypatch.setattr(
+        model_streamer_loading,
+        "run_model_streamer",
+        lambda plan, weights, *, rank, world_size: {},
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    load_weights_with_model_streamer(
+        _StreamingModel(), "s3://bucket/ckpt", rank=0, world_size=1, metadata_dir="/metadata"
+    )
+
+    assert mapped == [("s3://bucket/ckpt", "/metadata")]
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        # A local model streams from its own directory.
+        ("/checkpoint", ("/checkpoint", None)),
+        # An object-storage model streams from its URI. The checkpoint directory
+        # of the load is the local copy of its config and tokenizer files.
+        ("s3://bucket/ckpt", ("s3://bucket/ckpt", "/checkpoint")),
+    ],
+)
+def test_model_loader_streams_object_storage_uri_not_the_metadata_dir(
+    monkeypatch: pytest.MonkeyPatch, model_name: str, expected: tuple[str, str | None]
+) -> None:
+    streamed = []
+    monkeypatch.setattr(
+        model_streamer_loading,
+        "load_weights_with_model_streamer",
+        lambda model, checkpoint_dir, *, rank, world_size, metadata_dir=None: streamed.append(
+            (checkpoint_dir, metadata_dir)
+        ),
+    )
+    model = SimpleNamespace(load_weights=object(), load_draft_weights=object(), draft_config=None)
+
+    load_model_from_auto_load_format(
+        _SessionCheckpointLoader([]),
+        "/checkpoint",
+        config=_model_config(),
+        model_config=object(),
+        model=model,
+        mapping=Mapping(),
+        llm_args=SimpleNamespace(
+            model=model_name, checkpoint_io_policy=CheckpointIOPolicy.MODEL_STREAMER
+        ),
+        spec_config=None,
+        source_identity=None,
+        qualification=None,
+        metrics={},
+    )
+
+    assert streamed == [expected]
 
 
 @pytest.mark.parametrize(
@@ -424,6 +587,7 @@ def _model_streamer_load(
     )
     loader = ModelLoader(
         llm_args=SimpleNamespace(
+            model="/checkpoint",
             load_format=LoadFormat.AUTO,
             lm_head_output_dtype="auto",
             checkpoint_io_policy=CheckpointIOPolicy.MODEL_STREAMER,
@@ -458,7 +622,7 @@ def _model_streamer_load(
     monkeypatch.setattr(
         model_streamer_loading,
         "get_weight_source_map",
-        lambda _: {"weight": "/checkpoint/model.safetensors"},
+        lambda *_: {"weight": "/checkpoint/model.safetensors"},
     )
     streamed = []
 
