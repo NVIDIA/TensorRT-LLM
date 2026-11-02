@@ -610,11 +610,13 @@ def check_and_rerun(
             rerun_xml_files.append(xml_file)
 
         if rc != 0:
-            if not os.path.exists(xml_file):
-                print(f"The {rerun_tag} tests crashed during rerun attempt (no XML produced).")
-                raise RuntimeError(f"Rerun crashed for {rerun_tag}, no XML produced")
-            print(f"The {rerun_tag} tests still failed after rerun attempt.")
             is_rerun_failed = True
+            if not os.path.exists(xml_file):
+                # Stop rerunning, but still return the XMLs of the earlier attempts
+                # so they are merged into the stage results.
+                print(f"The {rerun_tag} tests crashed during rerun attempt (no XML produced).")
+                break
+            print(f"The {rerun_tag} tests still failed after rerun attempt.")
 
     return is_rerun_failed, rerun_xml_files
 
@@ -660,21 +662,17 @@ def run_regular_tests(
             f"RERUN — checking failed regular tests for stage [{stage_name}]",
             char="-",
         )
-        try:
-            is_rerun_failed, rerun_xmls = check_and_rerun(
-                result_xml,
-                pytest_cmd,
-                working_dir,
-                output_dir,
-                "regular",
-                fail_signatures,
-                regular_list,
-            )
-            all_xml_files.extend(rerun_xmls)
-            return is_rerun_failed, all_xml_files
-        except RuntimeError as e:
-            print(f"Regular tests rerun crashed: {e}")
-            return True, all_xml_files
+        is_rerun_failed, rerun_xmls = check_and_rerun(
+            result_xml,
+            pytest_cmd,
+            working_dir,
+            output_dir,
+            "regular",
+            fail_signatures,
+            regular_list,
+        )
+        all_xml_files.extend(rerun_xmls)
+        return is_rerun_failed, all_xml_files
 
     print_phase_summary("REGULAR TESTS", regular_count, 0, elapsed)
     return False, all_xml_files
@@ -740,32 +738,25 @@ def run_isolated_tests(
                 f"RERUN — isolated test {i + 1}/{len(isolate_tests)}: {test_name}",
                 char="-",
             )
-            try:
-                is_rerun_failed, rerun_xmls = check_and_rerun(
-                    xml_path,
-                    isolated_cmd,
-                    working_dir,
-                    output_dir,
-                    f"isolated_{i}",
-                    fail_signatures,
-                    single_test_file,
-                )
-                all_xml_files.extend(rerun_xmls)
-                if is_rerun_failed:
-                    print(f"Isolated test {i + 1} ({test_name}) failed after rerun attempt")
-                    rerun_failed = True
-                    iso_failed += 1
-                elif Path(output_dir, "rerun", f"isolated_{i}", "rerun_0.txt").exists():
-                    print(
-                        f"Isolated test {i + 1} ({test_name}) failed and was not eligible for rerun"
-                    )
-                    iso_failed += 1
-                else:
-                    iso_passed += 1
-            except RuntimeError as e:
-                print(f"Isolated test {i + 1} ({test_name}) rerun crashed: {e}")
+            is_rerun_failed, rerun_xmls = check_and_rerun(
+                xml_path,
+                isolated_cmd,
+                working_dir,
+                output_dir,
+                f"isolated_{i}",
+                fail_signatures,
+                single_test_file,
+            )
+            all_xml_files.extend(rerun_xmls)
+            if is_rerun_failed:
+                print(f"Isolated test {i + 1} ({test_name}) failed after rerun attempt")
                 rerun_failed = True
                 iso_failed += 1
+            elif Path(output_dir, "rerun", f"isolated_{i}", "rerun_0.txt").exists():
+                print(f"Isolated test {i + 1} ({test_name}) failed and was not eligible for rerun")
+                iso_failed += 1
+            else:
+                iso_passed += 1
         else:
             iso_passed += 1
 

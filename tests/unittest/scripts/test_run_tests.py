@@ -189,6 +189,41 @@ class CheckAndRerunTest(unittest.TestCase):
         self.assertFalse(is_rerun_failed)
         self.assertEqual(len(xmls), 1)
 
+    def test_crashed_rerun_keeps_the_earlier_attempt_xml(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        output_dir = Path(tmp.name)
+        rerun_dir = output_dir / "rerun" / "regular"
+
+        def fake_generate(rerun_dir, *args):
+            Path(rerun_dir, "rerun_1.txt").write_text("unittest/slow.py\n")
+            Path(rerun_dir, "rerun_2.txt").write_text("unittest/fast.py\n")
+
+        def fake_run_pytest(cmd, working_dir, tail_lines=0):
+            # The first attempt fails with an XML; the second crashes without one.
+            if "rerun_1.txt" in cmd:
+                Path(rerun_dir, "rerun_results_1.xml").write_text("<testsuites/>")
+            return 1, 1.0, []
+
+        with (
+            mock.patch.object(
+                run_tests.test_rerun, "generate_rerun_tests_list", side_effect=fake_generate
+            ),
+            mock.patch.object(run_tests, "run_pytest", side_effect=fake_run_pytest),
+        ):
+            is_rerun_failed, xmls = run_tests.check_and_rerun(
+                str(output_dir / "results.xml"),
+                "pytest",
+                str(output_dir),
+                str(output_dir),
+                "regular",
+                [],
+                str(output_dir / "regular.txt"),
+            )
+
+        self.assertTrue(is_rerun_failed)
+        self.assertEqual(xmls, [str(rerun_dir / "rerun_results_1.xml")])
+
 
 class CountXmlResultsTest(unittest.TestCase):
     def test_counts_passed_and_failed_excluding_skipped(self) -> None:

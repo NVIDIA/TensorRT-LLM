@@ -180,7 +180,7 @@ if [ "${useRunTests:-false}" = "true" ]; then
     if [ -n "${testDurationsPath:-}" ]; then
         runTestsArgs+=(--durations-path "$testDurationsPath")
     fi
-    if [ "$perfMode" = "true" ]; then
+    if [ "${perfMode:-false}" = "true" ]; then
         runTestsArgs+=(--perf-mode)
     fi
     for target in ${pytestTargets:-}; do

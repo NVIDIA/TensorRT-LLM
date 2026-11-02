@@ -5438,8 +5438,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             ]) {
                 sh "env | sort"
 
-                // Build fail signatures list for rerun eligibility
-                def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
+                // Signatures can contain single quotes (e.g. 'cicc' died), so escape them.
+                def failSignaturesArg = "'" + trtllm_utils.getFailSignaturesList().join(",").replace("'", "'\\''") + "'"
 
                 // Sentinel that the watcher polls to know run_tests.py has exited
                 // (success or failure). Lives outside ${stageName}/ so the
@@ -5488,7 +5488,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 --stage-name ${stageName} \\
                                 --output-dir ${WORKSPACE}/${stageName} \\
                                 --working-dir ${llmSrc}/tests/integration/defs \\
-                                --fail-signatures '${failSignaturesList}' \\
+                                --fail-signatures ${failSignaturesArg} \\
                                 ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
                             rc=\$?
 
