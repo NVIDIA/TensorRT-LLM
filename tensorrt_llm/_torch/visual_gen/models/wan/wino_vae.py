@@ -153,10 +153,13 @@ _CONV_OUT_MAX_IN_FRAMES = 3
 # Storage type of the temporal Winograd inputs and conv products between the norm kernels:
 # three more mantissa bits than bf16 for the transformed values (required by F(4,3)).
 _WINOGRAD_DTYPE = torch.float16
-# Spatial Winograd tiles of the portable path: F(4x4, 3x3) for frame pairs, F(2x2, 3x3) for
-# single frames with a causal history (the three temporal taps summed in the GEMM).
+# m of the portable spatial Winograd F(m x m, 3x3).
+# Layers with 2 or 4 frames per chunk (up1, up2), after the temporal Winograd: one input frame
+# per GEMM.
 _SPATIAL_TILE = 4
-_SPATIAL_SINGLE_TILE = 2
+# Layers with 1 frame per chunk (mid, up0), from the second chunk on: the new frame and its two
+# history frames stacked along the GEMM's K axis, so one GEMM sums the causal 3x3x3 conv.
+_SPATIAL_TILE_STACKED_K = 2
 
 
 def temporal_order_for(frames: int) -> int:
@@ -658,7 +661,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         if (
             frames == 1
             and self.shard is None
-            and self.spatial_eligible(buf.shape[3], buf.shape[4], _SPATIAL_SINGLE_TILE)
+            and self.spatial_eligible(buf.shape[3], buf.shape[4], _SPATIAL_TILE_STACKED_K)
         ):
             y = self._forward_spatial_taps(
                 [frames_view(buf[:, :, pos - 2 : pos + 1])], 0, buf.shape[3], buf.shape[4], bias
@@ -784,11 +787,11 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         w: int,
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        """One output frame by spatial Winograd alone from the taps' input frames in their own
+        """One output frame by spatial Winograd alone from three input frames in their own
         buffers (``[n, H*W, C]`` each, oldest first, ``zero_front`` zero frames before them):
-        the new frame alone (zero history) or the causal history and the new frame."""
+        the causal history and the new frame, stacked along the GEMM's K axis."""
         n_taps = zero_front + sum(t.shape[0] for t in taps)
-        tile = _SPATIAL_TILE if n_taps == 1 else _SPATIAL_SINGLE_TILE
+        tile = _SPATIAL_TILE_STACKED_K
         u = self._derived_weight(
             ("taps", n_taps, tile),
             lambda: winograd_spatial_taps_weights(self.weight, tile, n_taps),
@@ -966,7 +969,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
             and x.shape[0] == 1
             and self._unit_stride
             and (cache_x is None or cache_x.shape[2] <= 2)
-            and self.spatial_eligible(x.shape[3], x.shape[4], _SPATIAL_SINGLE_TILE)
+            and self.spatial_eligible(x.shape[3], x.shape[4], _SPATIAL_TILE_STACKED_K)
         )
 
     def _single_frame_spatial(
