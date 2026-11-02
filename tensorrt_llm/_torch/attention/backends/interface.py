@@ -362,8 +362,11 @@ class AttentionMetadata:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        mixed_precision_high_layers = getattr(self.kv_cache_manager, "mixed_precision_high_layers", None)
-        return isinstance(mixed_precision_high_layers, dict) and bool(mixed_precision_high_layers)
+        mixed_precision_high_layers = getattr(self.kv_cache_manager,
+                                              "mixed_precision_high_layers",
+                                              None)
+        return isinstance(mixed_precision_high_layers,
+                          dict) and bool(mixed_precision_high_layers)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
@@ -372,8 +375,11 @@ class AttentionMetadata:
             self.mixed_precision_staging, self.kv_cache_manager, "mixed",
             layout, tokens_per_block)
         draft = self.draft_kv_cache_manager
-        mixed_precision_high_layers = getattr(draft, "mixed_precision_high_layers", None)
-        if isinstance(mixed_precision_high_layers, dict) and mixed_precision_high_layers:
+        mixed_precision_high_layers = getattr(draft,
+                                              "mixed_precision_high_layers",
+                                              None)
+        if isinstance(mixed_precision_high_layers,
+                      dict) and mixed_precision_high_layers:
             self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
                 self.draft_mixed_precision_staging, draft, "draft_mixed",
                 layout, tokens_per_block)

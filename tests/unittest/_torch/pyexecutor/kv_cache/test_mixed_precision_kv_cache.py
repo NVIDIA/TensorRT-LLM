@@ -506,7 +506,9 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
         mixed_high = DeepseekV4AttentionType.MIXED_PRECISION_HIGH
         for local, high_layer in manager.mixed_precision_high_layers.items():
-            assert manager._layer_attn_to_layer_id[manager.pp_layers[local], mixed_high] == high_layer
+            assert (
+                manager._layer_attn_to_layer_id[manager.pp_layers[local], mixed_high] == high_layer
+            )
         rank = RankInfo.from_kv_cache_manager("dsv4_mixed", manager, device_id=0)
         ids = [
             layer.global_layer_id
@@ -523,7 +525,8 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         mapping = registrar.get_pool_mapping(peer)
         assert all(source == destination for source, destination in mapping.items())
         high_layer_groups = {
-            int(manager.impl.get_layer_group_id(t)) for t in manager.mixed_precision_high_layers.values()
+            int(manager.impl.get_layer_group_id(t))
+            for t in manager.mixed_precision_high_layers.values()
         }
         assert high_layer_groups <= {group for group, _ in mapping}
     finally:

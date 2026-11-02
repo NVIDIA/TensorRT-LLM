@@ -540,7 +540,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         for the mixed-precision high layer of layer ``L``.
         """
         layout_policy = self._attention_cache_layout_policy
-        high_layer_owner = {high_layer: local for local, high_layer in self.mixed_precision_high_layers.items()}
+        high_layer_owner = {
+            high_layer: local for local, high_layer in self.mixed_precision_high_layers.items()
+        }
         result = []
         for layer_id in self.impl.layer_grouping[layer_group_id]:
             internal_layer = int(layer_id)

@@ -468,7 +468,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
         # MTP layers on the draft manager use its high page table; other drafters have none.
-        self.swap_for_draft("mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table)
+        self.swap_for_draft(
+            "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
+        )
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.
