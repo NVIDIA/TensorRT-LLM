@@ -166,7 +166,9 @@ def _built(available: bool, what: str) -> pytest.MarkDecorator:
 
 def _require_sm100() -> None:
     """Blackwell is a hardware gate (skip); the CuTe DSL import on Blackwell is not (fail)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_wino_available
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
+        sm100_wino_available,
+    )
 
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("sm100 kernels need Blackwell")
@@ -605,9 +607,11 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
 # time interleave (+ bias)
 # ---------------------------------------------------------------------------
 
+from tensorrt_llm._torch.visual_gen.models.wan.kernels.frame_ops import (  # noqa: E402
+    interleave_bias,
+)
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     add_bias_and_residual,
-    interleave_bias,
 )
 
 frame_ops = cuda_op
@@ -660,8 +664,8 @@ def test_interleave_bias_is_bitwise(C: int, with_bias: bool) -> None:
     assert torch.equal(interleave_bias(u, bias), interleave_bias_reference(u, bias))
 
 
+from tensorrt_llm._torch.visual_gen.models.wan.kernels.frame_ops import avg_down_add  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import AvgDown3D  # noqa: E402
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import avg_down_add  # noqa: E402
 
 
 @frame_ops
@@ -1014,11 +1018,11 @@ def test_spatial_winograd_conv_frame_dtypes(
 def test_spatial_winograd_sm100_matches_reference(
     cin_cout_hw_pairs: tuple[int, int, int, int, int],
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        sm100_spatial_filters,
-        wino_spatial_conv_sm100,
-        winograd_weights,
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
+        spatial_filters,
+        wino_spatial_conv,
     )
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import winograd_weights
 
     _require_sm100()
     torch.manual_seed(3)
@@ -1036,18 +1040,18 @@ def test_spatial_winograd_sm100_matches_reference(
             for k in range(4)
         ]
     )
-    got = wino_spatial_conv_sm100(d, sm100_spatial_filters(g), h, w).float()
+    got = wino_spatial_conv(d, spatial_filters(g), h, w).float()
     rel = ((got - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
 
 
 @spatial_op
 def test_spatial_winograd_sm100_fp16_six_components() -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        sm100_spatial_filters,
-        wino_spatial_conv_sm100,
-        winograd_weights,
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
+        spatial_filters,
+        wino_spatial_conv,
     )
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import winograd_weights
 
     _require_sm100()
     torch.manual_seed(6)
@@ -1065,7 +1069,7 @@ def test_spatial_winograd_sm100_fp16_six_components() -> None:
             for k in range(6)
         ]
     )
-    got = wino_spatial_conv_sm100(d, sm100_spatial_filters(g), h, w)
+    got = wino_spatial_conv(d, spatial_filters(g), h, w)
     assert got.dtype == torch.float16
     rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
@@ -1073,7 +1077,7 @@ def test_spatial_winograd_sm100_fp16_six_components() -> None:
 
 def _sm100_tile_v(x: torch.Tensor, n: int, th: int, tw: int, c0: int, c1: int) -> torch.Tensor:
     """V[:, tile (n, th, tw), c0:c1] of the F(4x4, 3x3) input transform in fp32."""
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms as wino
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_tables import SPATIAL_WINO
 
     _, h, w, _ = x.shape
     d = torch.zeros(6, 6, c1 - c0, dtype=torch.float32, device=x.device)
@@ -1082,7 +1086,7 @@ def _sm100_tile_v(x: torch.Tensor, n: int, th: int, tw: int, c0: int, c1: int) -
             hh, ww = 4 * th - 1 + a, 4 * tw - 1 + b
             if 0 <= hh < h and 0 <= ww < w:
                 d[a, b] = x[n, hh, ww, c0:c1].float()
-    bt = torch.tensor(wino.WINO[4]["BT"], dtype=torch.float32, device=x.device)
+    bt = torch.tensor(SPATIAL_WINO[4]["BT"], dtype=torch.float32, device=x.device)
     return torch.einsum("ia,abc,jb->ijc", bt, d, bt).reshape(36, c1 - c0)
 
 
@@ -1108,7 +1112,7 @@ def test_spatial_winograd_sm100_in_xform_above_2_31_elements() -> None:
     v = torch.empty(36, tiles, c, dtype=torch.float16, device="cuda")
     assert x.numel() > 2**31 and v.numel() > 2**31
     args = (from_dlpack(x, assumed_align=16), from_dlpack(v, assumed_align=16))
-    fn = cute.compile(wino.in_xform, *args, n, h, w, c, 4, 4, 0, make_fake_stream())
+    fn = cute.compile(wino.in_xform, *args, n, h, w, c, make_fake_stream())
     fn(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
     torch.cuda.synchronize()
     for fn_, th_, tw_ in (
@@ -1139,6 +1143,7 @@ def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
     from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms as wino
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_tables import SPATIAL_WINO
 
     n, h, w, c = 3, 1080, 1920, 512
     th, tw = -(-h // 4), w // 4
@@ -1147,10 +1152,10 @@ def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     m = torch.randn(36, tiles, c, device="cuda", generator=g).to(torch.float16)
     y = torch.full((n, h, w, c), float("nan"), dtype=torch.float16, device="cuda")
     args = (from_dlpack(m, assumed_align=16), from_dlpack(y, assumed_align=16))
-    fn = cute.compile(wino.out_xform, *args, n, h, w, c, 4, 4, 0, make_fake_stream())
+    fn = cute.compile(wino.out_xform, *args, n, h, w, c, make_fake_stream())
     fn(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
     torch.cuda.synchronize()
-    at = torch.tensor(wino.WINO[4]["AT"], dtype=torch.float32, device="cuda")
+    at = torch.tensor(SPATIAL_WINO[4]["AT"], dtype=torch.float32, device="cuda")
     for fn_, th_, tw_ in ((0, 0, 0), (2, th - 1, tw - 1), (2, 0, 0), (1, th // 2, tw // 2)):
         t = (fn_ * th + th_) * tw + tw_
         mt = m[:, t, :].float().view(6, 6, c)
@@ -1208,18 +1213,18 @@ def test_spatial_winograd_fused_matches_reference(
     dtype: torch.dtype, cin_comps: tuple[int, int]
 ) -> None:
     """The fused F(2,3)-horizontal / direct-vertical 256-channel conv against fp32 conv2d."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        sm100_fused_eligible,
-        sm100_fused_filters,
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
+        fused_eligible,
+        fused_filters,
         wino_spatial_conv_fused,
-        winograd_weights,
     )
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import winograd_weights
 
     _require_sm100()
     torch.manual_seed(5)
     cin, comps = cin_comps
     cout, h, w, pairs = 256, 16, 64, 2
-    assert sm100_fused_eligible(cin, cout, h, w)
+    assert fused_eligible(cin, cout, h, w)
     order = comps - 2
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
     d = torch.randn(comps, pairs, h * w, cin, device="cuda").to(dtype)
@@ -1232,7 +1237,7 @@ def test_spatial_winograd_fused_matches_reference(
             for k in range(comps)
         ]
     )
-    got = wino_spatial_conv_fused(d, sm100_fused_filters(winograd_weights(weight, order)), h, w)
+    got = wino_spatial_conv_fused(d, fused_filters(winograd_weights(weight, order)), h, w)
     assert got.dtype == dtype and got.shape == (comps, pairs, h * w, cout)
     rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
@@ -1241,11 +1246,11 @@ def test_spatial_winograd_fused_matches_reference(
 def test_sm100_fused_needs_two_cin_chunks() -> None:
     """The fused conv's MMA schedule peels a first and a last 32-channel chunk per pass, so
     Cin = 32 (one chunk) is outside its contract and must fall to the unfused path."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import sm100_fused_eligible
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import fused_eligible
 
-    assert not sm100_fused_eligible(32, 256, 8, 32)
-    assert sm100_fused_eligible(64, 256, 8, 32)
-    assert not sm100_fused_eligible(96, 128, 8, 32)
+    assert not fused_eligible(32, 256, 8, 32)
+    assert fused_eligible(64, 256, 8, 32)
+    assert not fused_eligible(96, 128, 8, 32)
 
 
 frame_ops_op = cuda_op
@@ -1255,8 +1260,8 @@ frame_ops_op = cuda_op
 @pytest.mark.parametrize("patch", [1, 2])
 @pytest.mark.parametrize("shape", [(3, 5, 7, 3), (4, 6, 10, 3), (2, 3, 4, 5)])
 def test_unpatchify_clamp_into_matches_eager(patch: int, shape: tuple[int, int, int, int]) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.frame_ops import unpatchify_clamp_into
     from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import unpatchify
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import unpatchify_clamp_into
 
     t, h, w, c = shape
     torch.manual_seed(4)

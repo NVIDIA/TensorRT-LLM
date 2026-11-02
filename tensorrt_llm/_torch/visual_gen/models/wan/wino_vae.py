@@ -35,6 +35,8 @@ from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDis
 
 from .cudnn_conv import conv_frontend, cudnn_frontend_available
 from .jit_norm import FrameGeometry
+from .kernels.blackwell import spatial as sm100_spatial
+from .kernels.blackwell.spatial import sm100_wino_available
 from .wan_vae import (
     CACHE_T,
     DupUp3D,
@@ -63,28 +65,18 @@ from .wino_vae_kernels import (
     add_bias_and_residual,
     add_rms_norm_silu,
     apply_in_bias,
-    avg_down_add,
     frames_to_video,
     frames_view,
     images_to_pairs,
-    interleave_bias,
     kernels_available,
     pack_upsample_weights,
     pairs_to_images,
     rms_norm_silu,
     rms_norm_silu_supported,
-    sm100_fused_eligible,
-    sm100_fused_filters,
-    sm100_spatial_eligible,
-    sm100_spatial_filters,
-    sm100_wino_available,
-    unpatchify_clamp_into,
     upsample_gather,
     upsample_gather_supported,
     wino_norm_silu,
     wino_spatial_conv_cublas,
-    wino_spatial_conv_fused,
-    wino_spatial_conv_sm100,
     wino_spatial_conv_taps,
     winograd_spatial_taps_weights,
     winograd_spatial_weights,
@@ -455,13 +447,13 @@ class WinoVaeRMSNorm(WanRMSNorm):
 _SPATIAL_KERNELS = {
     # Blackwell: the fused F(2,3)-horizontal / direct-vertical 256-output-channel conv.
     "fused": (
-        lambda conv, order: sm100_fused_filters(conv._winograd_weights(order)),
-        wino_spatial_conv_fused,
+        lambda conv, order: sm100_spatial.fused_filters(conv._winograd_weights(order)),
+        sm100_spatial.wino_spatial_conv_fused,
     ),
     # Blackwell: the F(4x4, 3x3) CuTe DSL pipeline.
     "sm100": (
-        lambda conv, order: sm100_spatial_filters(conv._winograd_weights(order)),
-        wino_spatial_conv_sm100,
+        lambda conv, order: sm100_spatial.spatial_filters(conv._winograd_weights(order)),
+        sm100_spatial.wino_spatial_conv,
     ),
     # Any GPU: CuTe DSL transform kernels and cuBLAS batched GEMMs.
     "cublas": (
@@ -829,11 +821,11 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
                 w = max(self.shard.output_extents(w))
         sm100 = sm100_wino_available()
         cin, cout = self.in_channels, self.out_channels
-        if self.spatial_winograd and sm100 and sm100_fused_eligible(cin, cout, h, w):
+        if self.spatial_winograd and sm100 and sm100_spatial.fused_eligible(cin, cout, h, w):
             return "fused"
         if (
             sm100
-            and sm100_spatial_eligible(cin, cout, w)
+            and sm100_spatial.spatial_eligible(cin, cout, w)
             and self.spatial_eligible(h, w, kernel="sm100")
         ):
             return "sm100"
@@ -1155,6 +1147,8 @@ class WinoVaeResample(WanResample):
 
         if fuse_interleave:
             # Interleave the two channel halves along time and add the time conv's bias.
+            from .kernels.frame_ops import interleave_bias
+
             u = frames_view(_channels_last_3d_if_needed(x))
             return frames_to_video(interleave_bias(u, self.time_conv.bias), height, width)
         x = x.reshape(batch_size, 2, channels, frames, height, width)
@@ -1606,6 +1600,8 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
         bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
         dup = self.avg_shortcut
         if kernels_available() and x.shape[0] == 1:
+            from .kernels.frame_ops import avg_down_add
+
             residual = _channels_last_3d_if_needed(residual)
             t_in = residual.shape[2]
             pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
@@ -2102,6 +2098,8 @@ class WinoVae(WanVAE):
                 out_chunk = _channels_last_3d_if_needed(out_chunk)
                 if out is None:
                     out = self._video_for(out_chunk, num_frame)
+                from .kernels.frame_ops import unpatchify_clamp_into
+
                 unpatchify_clamp_into(out_chunk, out, frames_done, self.config.patch_size)
                 frames_done += out_chunk.shape[2]
             else:

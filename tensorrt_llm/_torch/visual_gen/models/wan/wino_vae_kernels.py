@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kernel wrappers for WinoVae: the CuTe DSL norm kernel (:mod:`jit_norm`, :mod:`kernels.norm`),
-the compiled ``trtllm::vae_*`` ops and the sm100 CuTe DSL pipeline. Each wrapper states its
-layout, dtype and shape preconditions; choosing a fallback when they do not hold is the
-caller's job (``can_*`` / ``*_available`` predicates), not the wrapper's."""
+the compiled ``trtllm::vae_*`` ops and the portable spatial Winograd conv. Each wrapper states
+its layout, dtype and shape preconditions; choosing a fallback when they do not hold is the
+caller's job (``can_*`` / ``*_available`` predicates), not the wrapper's. The frame operations
+(:mod:`kernels.frame_ops`) and the Blackwell spatial Winograd (:mod:`kernels.blackwell.spatial`)
+are called directly."""
 
 from __future__ import annotations
 
@@ -305,67 +307,6 @@ def jit_norm_available() -> bool:
     return torch.cuda.is_available()
 
 
-@functools.lru_cache(maxsize=None)
-def sm100_wino_available() -> bool:
-    """The Blackwell spatial-Winograd kernels: sm100 and ``nvidia-cutlass-dsl`` installed."""
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
-        sm100_wino_available,
-    )
-
-    return sm100_wino_available()
-
-
-def sm100_spatial_eligible(cin: int, cout: int, width: int) -> bool:
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import spatial_eligible
-
-    return spatial_eligible(cin, cout) and width % 4 == 0
-
-
-def sm100_spatial_filters(g: list[torch.Tensor]) -> torch.Tensor:
-    """Transformed filters for :func:`wino_spatial_conv_sm100` from the component filters
-    ``g[k] [Cout, Cin, 3, 3]`` (:func:`winograd_weights`)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import spatial_filters
-
-    return spatial_filters(g)
-
-
-def sm100_fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import fused_eligible
-
-    return fused_eligible(cin, cout, height, width)
-
-
-def sm100_fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import fused_filters
-
-    return fused_filters(g)
-
-
-def wino_spatial_conv_fused(
-    d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int
-) -> torch.Tensor:
-    """Same contract as :func:`wino_spatial_conv_cublas` for the 256-output-channel convs: the
-    fused F(2,3)-horizontal / direct-vertical kernel (CuTe DSL, sm100), filters from
-    :func:`sm100_fused_filters`."""
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
-        wino_spatial_conv_fused as conv,
-    )
-
-    return conv(d, filters, height, width)
-
-
-def wino_spatial_conv_sm100(
-    d: torch.Tensor, u: torch.Tensor, height: int, width: int
-) -> torch.Tensor:
-    """Same contract as :func:`wino_spatial_conv_cublas` with ``u`` from
-    :func:`sm100_spatial_filters`: the Blackwell F(4x4, 3x3) pipeline (CuTe DSL, sm100)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
-        wino_spatial_conv as conv,
-    )
-
-    return conv(d, u, height, width)
-
-
 def wino_spatial_conv_cublas(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
@@ -385,15 +326,6 @@ def wino_spatial_conv_cublas(
     out = torch.empty((comps * pairs, height, width, u.shape[2]), dtype=d.dtype, device=d.device)
     wino_spatial_out(m, out, comps, 0, tile_rows, tile)
     return out.view(comps, pairs, positions, u.shape[2])
-
-
-def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, patch: int) -> None:
-    """Write ``clamp(unpatchify(chunk), -1, 1)`` into ``out[:, :, frame0:frame0 + t]``: ``chunk``
-    ``[1, C*patch*patch, t, H, W]`` and ``out`` ``[1, C, T, H*patch, W*patch]``, both channels-last
-    bf16. Same element mapping as :func:`wan_vae.unpatchify`."""
-    from .kernels.frame_ops import unpatchify_clamp_into as kernel
-
-    kernel(chunk, out, frame0, patch)
 
 
 def frames_view(x: torch.Tensor) -> torch.Tensor:
@@ -456,34 +388,6 @@ def add_bias_and_residual(
         pad_w,
         products_geometry=products_geometry,
     )
-
-
-def avg_down_add(
-    x: torch.Tensor,
-    r: torch.Tensor,
-    out_height: int,
-    out_width: int,
-    in_width: int,
-    factor_t: int,
-    factor_s: int,
-    group_size: int,
-    pad_t: int,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``;
-    ``bias`` is the downsample conv's bias when that conv ran without it."""
-    from .kernels.frame_ops import avg_down_add as kernel
-
-    return kernel(
-        x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t, bias
-    )
-
-
-def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
-    from .kernels.frame_ops import interleave_bias as kernel
-
-    return kernel(u, bias)
 
 
 def wino_norm_silu(
