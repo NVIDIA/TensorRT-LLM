@@ -3267,7 +3267,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx, data_role=Role.ALL)
             )
             attention_windows.append(self.max_attention_window_vec[local_layer_idx])
-        return layer_sizes, attention_windows
+        high_sizes, high_windows = self._mixed_precision_high_layer_components()
+        return layer_sizes + high_sizes, attention_windows + high_windows
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
@@ -4084,6 +4085,29 @@ class KVCacheManagerV2(BaseResourceManager):
         """Rows per mixed-precision high layer page; a page covers tokens_per_block tokens."""
         return self.tokens_per_block
 
+    def _mixed_precision_high_page_bytes(self, local_layer_idx: int) -> int:
+        """Bytes of one K (or V) page of a mixed-precision high layer."""
+        return get_size_in_bytes(
+            self._mixed_precision_rows_per_page(local_layer_idx)
+            * self.num_kv_heads_per_layer[local_layer_idx]
+            * self.head_dim_per_layer[local_layer_idx],
+            self.mixed_precision_high_dtype,
+        )
+
+    def _mixed_precision_high_layer_components(self) -> tuple[List[int], List[int]]:
+        """Bytes per token and window of each mixed-precision high layer, for quota sizing.
+
+        Like the static cost model, the window counts the first and last tokens together.
+        """
+        if self.mixed_precision_low_dtype is None:
+            return [], []
+        sizes = [
+            self._mixed_precision_high_page_bytes(local) * self.kv_factor // self.tokens_per_block
+            for local in range(self.num_local_layers)
+            if self._is_mixed_precision_layer(local)
+        ]
+        return sizes, [self.first_n + self.last_n + 1] * len(sizes)
+
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Append the mixed-precision high layer group for every mixed-precision layer."""
         if self.mixed_precision_low_dtype is None:
@@ -4105,12 +4129,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for local in range(self.num_local_layers):
             if not self._is_mixed_precision_layer(local):
                 continue
-            page_bytes = get_size_in_bytes(
-                self._mixed_precision_rows_per_page(local)
-                * self.num_kv_heads_per_layer[local]
-                * self.head_dim_per_layer[local],
-                self.mixed_precision_high_dtype,
-            )
+            page_bytes = self._mixed_precision_high_page_bytes(local)
             self.mixed_precision_high_layers[local] = len(layers)
             layers.append(
                 AttentionLayerConfig(
@@ -4124,7 +4143,8 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         # A configured pool_ratio must now cover the appended mixed-precision high
-        # group as well; the runtime rejects a mismatched length.
+        # group as well, unless that group has no sink and the window of a sliding
+        # group and so joins it; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
 
     def mixed_precision_transfer_ids(
@@ -7672,7 +7692,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ),
             )
             mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-            if mixed is not None and not cls._mixed_precision_native_pool:
+            if isinstance(mixed, MixedPrecisionKV) and not cls._mixed_precision_native_pool:
                 layer_sizes, attention_windows = _mixed_precision_cost_components(
                     layer_sizes, attention_windows, mixed
                 )
@@ -7832,6 +7852,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # ``covered_windows`` are the windows ``get_cache_size_per_token``
         # charges as fixed per-request retention in the affine intercept; keep
         # them in lockstep with its accounting (reuse backoff included).
+        backoff = 0
         if (
             kv_cache_config is not None
             and kv_cache_config.enable_block_reuse
@@ -7896,6 +7917,15 @@ class KVCacheManagerV2(BaseResourceManager):
             sink_blocks = math.ceil(sink_tokens / tokens_per_block)
             return min((sink_blocks + window_blocks) * tokens_per_block, full_tokens)
 
+        # As in get_cache_size_per_token, a mixed-precision layer is its NVFP4 history plus a
+        # first/last-token window that the affine intercept funds.
+        mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
+        if (
+            not isinstance(mixed, MixedPrecisionKV)
+            or layer_specs is not None
+            or cls._mixed_precision_native_pool
+        ):
+            mixed = None
         entries = []
         for layer_idx, (layer_size, retained_window, covered_window) in enumerate(
             zip(layer_sizes, retained_windows, covered_windows)
@@ -7907,6 +7937,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 if covered_window is not None and 0 < covered_window < max_seq_len
                 else 0
             )
+            runtime_window = covered_window if is_draft else retained_window
+            if mixed is not None and (runtime_window is None or runtime_window >= max_seq_len):
+                sizes, windows = _mixed_precision_cost_components([layer_size], [None], mixed)
+                high = window_tokens(
+                    _extend_swa_windows_for_reuse(windows[1:], backoff, max_seq_len)[0], 0
+                )
+                entries += [(sizes[0], retained, covered), (sizes[1], high, high)]
+                continue
             entries.append((layer_size, retained, covered))
         return entries, full_tokens
 

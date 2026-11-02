@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     GPU_LEVEL,
     KVCacheManagerV2,
+    _estimate_cache_size_components,
     _fill_kv_pages,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
@@ -992,6 +993,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
+        high_context, high_generation, high_request = self._mixed_precision_high_cache_sizes()
+        context_swa_size_per_token += high_context
+        generation_swa_size_per_token += high_generation
+        generation_swa_size_per_request += high_request
         max_context_tokens = (
             self._max_num_tokens if self._max_num_tokens is not None else max_tokens
         )
@@ -1046,6 +1051,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             indexer_k_dtype=self._indexer_k_dtype,
             use_fp8_ds_mla=self.use_fp8_ds_mla,
         )
+        high_context, high_generation, high_request = self._mixed_precision_high_cache_sizes()
+        context_swa_size_per_token += high_context
+        generation_swa_size_per_token += high_generation
+        generation_swa_size_per_request += high_request
         padding = self._get_extra_quota_padding()
         size_per_batch = self.max_batch_size * generation_swa_size_per_request + padding
         if quota < size_per_batch:
@@ -1075,6 +1084,19 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
         # A compressed page holds tokens_per_block // ratio rows.
         return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
+
+    def _mixed_precision_high_cache_sizes(self) -> Tuple[int, int, int]:
+        """Context and generation bytes per token, and bytes per request, of the high layers."""
+        sizes, windows = self._mixed_precision_high_layer_components()
+        if not sizes:
+            return 0, 0, 0
+        return _estimate_cache_size_components(
+            sizes,
+            windows,
+            self.tokens_per_block,
+            scratch=self.enable_swa_scratch_reuse,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+        )
 
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         config = super()._add_mixed_precision_layers(config)

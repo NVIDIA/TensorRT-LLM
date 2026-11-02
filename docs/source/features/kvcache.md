@@ -107,7 +107,8 @@ pools are sized independently. The derived list is logged at startup. Set
 `max_attention_window` explicitly to override the derivation; a single entry
 restores one full-context pool for every layer. With derived windows,
 `pool_ratio` must carry one entry per layer group (two for such a model, three
-with mixed-precision KV, whose mixed-precision high group comes last). If a
+with mixed-precision KV, whose mixed-precision high group comes last, unless it
+joins the sliding-window group as described below). If a
 configured `pool_ratio` does not match the derived group count, the manager
 logs a warning and keeps the single-window default, so existing configurations
 continue to run.
@@ -154,7 +155,12 @@ Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
 the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
 The mixed-precision high pools form one extra layer group after the model's own,
 so a `pool_ratio` must carry one more entry than the model has layer groups, with
-the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
+the mixed-precision high group last; leave it unset to size all groups automatically.
+The one exception: with `mixed_precision_first_n` set to 0 and
+`mixed_precision_last_n` + 1 equal to the window a sliding-window layer retains
+(its sliding window, plus the draft lookahead with one-model speculative decoding
+and block reuse), the mixed-precision high layers join that sliding-window group
+and add no entry. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
 Before a mixed-precision layer runs, the attention metadata gathers the two

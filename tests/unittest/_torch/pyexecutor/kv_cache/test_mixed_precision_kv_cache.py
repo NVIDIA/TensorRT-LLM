@@ -168,6 +168,16 @@ def test_pool_ratio_must_cover_mixed_precision_high_group(make_manager):
         make_manager(config=mixed_config(pool_ratio=[1.0]))
 
 
+def test_max_tokens_quota_pays_for_the_mixed_precision_high_pool(make_manager):
+    """An explicit max_tokens buys the NVFP4 history and the first/last-token pages beside it."""
+    manager = make_manager()
+    high = manager.get_buffers(0, mixed_precision_pool="high")
+    high_bytes_per_token = high[0].numel() * high.element_size() // manager.tokens_per_block
+    sizes, windows = manager._get_runtime_cache_size_layer_components()
+    assert sizes == [manager.get_layer_bytes_per_token(0, Role.ALL), high_bytes_per_token]
+    assert windows == [None, manager.first_n + manager.last_n + 1]
+
+
 @pytest.mark.parametrize("ratio", ([0.6, 0.4], [0.75, 0.25]))
 def test_explicit_pool_ratio_orders_mixed_precision_high_group_last(make_manager, ratio):
     # A byte budget, so the ratio is not distorted by the max_tokens cap.
@@ -412,13 +422,40 @@ def test_mixed_precision_cost_is_the_nvfp4_history(high_dtype):
     assert plain_slope == 2 * 256 * (1 if high_dtype == DataType.FP8 else 2)
     assert mixed_fixed > plain_fixed
 
+    # With sliding layers the split weighs per-request spend instead: a mixed layer spends its
+    # NVFP4 history, and the fixed cost funds its first/last-token window like a configured one.
+    model.pretrained_config.layer_types = ["sliding_attention", "full_attention"]
+    model.pretrained_config.sliding_window = 128
+
+    def per_request(kv_cache_config):
+        return KVCacheManagerV2._get_per_request_layer_tokens(
+            model,
+            Mapping(),
+            tokens_per_block=64,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=4096,
+        )
+
+    (sliding, full), full_tokens = per_request(
+        KvCacheConfig(max_tokens=65536, enable_block_reuse=False)
+    )
+    mixed, _ = per_request(mixed_config(high_dtype, enable_block_reuse=False))
+    high = mixed[2][1]
+    assert full[1:] == (full_tokens, 0) and sliding[1] < full_tokens
+    assert mixed == [sliding, (256 // 2 + 256 // 16, full_tokens, 0), (full[0], high, high)]
+
 
 @pytest.mark.cpu_only
 def test_derived_windows_count_the_mixed_precision_high_group():
-    """With derived sliding/full windows, mixed precision adds the high group to pool_ratio."""
+    """With derived sliding/full windows, mixed precision adds the high group to pool_ratio.
+
+    High layers with no sink and a sliding layer's retained window join that group instead.
+    """
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.pyexecutor._util import _derive_v2_layer_type_attention_windows
+    from tensorrt_llm._torch.speculative import draft_prompt_lookahead
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     model = SimpleNamespace(
         pretrained_config=SimpleNamespace(
@@ -426,16 +463,28 @@ def test_derived_windows_count_the_mixed_precision_high_group():
             layer_types=["sliding_attention", "full_attention"],
             sliding_window=128,
             num_hidden_layers=2,
-        )
+        ),
+        spec_config=None,
     )
 
-    def derive(pool_ratio):
+    def derive(pool_ratio, **overrides):
         return _derive_v2_layer_type_attention_windows(
-            mixed_config(pool_ratio=pool_ratio), KVCacheManagerV2, model, 4096
+            mixed_config(pool_ratio=pool_ratio, **overrides), KVCacheManagerV2, model, 4096
         )
 
-    assert derive([0.5, 0.3, 0.2]) == [128, 4096]
-    assert derive([0.5, 0.5]) is None
+    two, three = [0.5, 0.5], [0.5, 0.3, 0.2]
+    assert derive(three) == [128, 4096]
+    assert derive(two) is None
+    joined = dict(mixed_precision_first_n=0, mixed_precision_last_n=127)
+    assert derive(two, **joined) == [128, 4096]
+    assert derive(three, **joined) is None
+    # Under block reuse the manager widens sliding windows by the draft lookahead.
+    model.spec_config = MTPDecodingConfig(max_draft_len=2, use_mtp_vanilla=True)
+    lookahead = draft_prompt_lookahead(model.spec_config)
+    assert lookahead > 0
+    widened = dict(mixed_precision_first_n=0, mixed_precision_last_n=127 + lookahead)
+    assert derive(two, **widened) == [128, 4096]
+    assert derive(three, **widened, enable_block_reuse=False) == [128, 4096]
 
 
 def test_mixed_precision_rejects_custom_managers():
@@ -582,6 +631,63 @@ def test_target_manager_beside_a_separate_eagle3_drafter_builds(backend):
         manager.shutdown()
 
 
+def test_dsa_prepare_fills_the_mixed_precision_high_page_table():
+    """DSA prepare() writes each request's high-pool pages to the GPU page table, -1 elsewhere."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import (
+        DSACacheManagerV2,
+        DSAtrtllmAttentionMetadata,
+    )
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    # index_topk below the request lengths, so prepare() does not skip the indexer.
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128, index_topk=256)
+    manager = DSACacheManagerV2(
+        mixed_config(
+            DataType.FP8,
+            mixed_precision_first_n=64,
+            mixed_precision_last_n=64,
+            pool_ratio=None,
+            enable_block_reuse=False,
+        ),
+        CacheType.SELFKONLY,
+        num_layers=1,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.NVFP4,
+        sparse_attention_config=sparse_config,
+    )
+    try:
+        # Two decode requests with 299 and 289 cached tokens, each writing one new token.
+        request_ids, cached = [0, 1], [299, 289]
+        assert manager.add_dummy_requests(request_ids, [n + 1 for n in cached], is_gen=True)
+        metadata = DSAtrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            kv_cache_manager=manager,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
+            seq_lens=torch.tensor([1, 1], dtype=torch.int),
+            num_contexts=0,
+            request_ids=request_ids,
+            prompt_lens=cached,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+        )
+        metadata.prepare()
+        table = metadata.mixed_precision_high_block_table.cpu()
+        expected = torch.full_like(table, -1)
+        manager.fill_mixed_precision_high_page_table(request_ids, 0, expected.numpy())
+        assert table.tolist() == expected.tolist()
+        # The high pool keeps page 0 (first 64 tokens) and pages 3-4 (last 64 and the new one).
+        held = [[i for i, page in enumerate(row) if page != -1] for row in table.tolist()]
+        assert held == [[0, 3, 4]] * 2
+    finally:
+        manager.shutdown()
+
+
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):
     """A separate MTP draft manager adds mixed-precision high layers like the target."""
     from types import SimpleNamespace
@@ -667,7 +773,10 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
 
 
 def test_deepseek_v4_mixed_disagg_names_every_layer():
-    """Disaggregated transfer gives DeepSeek-V4 mixed-precision high layers their own layer ids."""
+    """Disaggregated transfer gives DeepSeek-V4 mixed-precision high layers their own layer ids.
+
+    Its own max_tokens quota conversion also pays for them.
+    """
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
@@ -741,6 +850,9 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
             for t in manager.mixed_precision_high_layers.values()
         }
         assert high_layer_groups <= {group for group, _ in mapping}
+        quota = manager._get_quota_from_max_tokens(65536)
+        assert quota > plain._get_quota_from_max_tokens(65536)
+        assert manager._get_max_tokens_from_quota(quota) == pytest.approx(65536, abs=1)
     finally:
         manager.shutdown()
         plain.shutdown()

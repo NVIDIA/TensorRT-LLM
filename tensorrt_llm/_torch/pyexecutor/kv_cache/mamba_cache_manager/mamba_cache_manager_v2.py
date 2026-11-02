@@ -61,7 +61,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MixedPrecisionKV
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -491,7 +491,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 attention_page_bytes_override = attention_intercept // max_resident_sequences
 
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-        if mixed is not None and attention_slope_override is None:
+        if isinstance(mixed, MixedPrecisionKV) and attention_slope_override is None:
             # Mixed-precision attention layers hold an NVFP4 history plus the first/last tokens.
             _, _, local_attention_layers = _get_local_mamba_cache_layout(
                 model_config,
