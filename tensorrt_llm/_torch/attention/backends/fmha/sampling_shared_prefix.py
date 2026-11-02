@@ -1409,6 +1409,32 @@ FUSED_PREFIX_SPLITS = _int_env("TLLM_SAMPLING_SHARED_PREFIX_SPLITS", 0)
 from the grid size (``default_prefix_splits``)."""
 FUSED_TAIL_SPLITS = 1
 CTX_TAIL_SPLITS = 1
+CTX_TAIL_MAX_SPLITS = 8
+CTX_TAIL_SPLITS_ENV = "TLLM_SAMPLING_SHARED_PREFIX_CTX_TAIL_SPLITS"
+"""Split-K of the private pages on the context-kernel path: 0 (default) picks it from the grid
+(``ctx_tail_splits``), a positive value fixes it."""
+
+
+def ctx_tail_splits(num_requests: int, num_kv_heads: int, num_sms: int) -> int:
+    """Splits of each row's private pages on the context-kernel path, fixed at capture.
+
+    One (row, KV head) program streams a row's private pages. At 120 rows x 4 KV heads that is
+    ~3.6 programs per SM and one split is best (``CTX_TAIL_SPLITS``), but a batch of a few rows
+    leaves most SMs idle: on H100 (Qwen2.5-7B, K=3, 4 padded rows, 16 programs) the tail launch
+    took 36 us per layer against 18 us for FlashAttention-4 over the whole row. Split only a grid that
+    fills less than half the SMs, up to one wave, capped at ``CTX_TAIL_MAX_SPLITS``: splitting a grid of
+    one to two waves (2 splits at 16-60 rows) measured 5-8% slower tail+merge per step, splitting 1-15
+    rows 30-60% faster.
+    """
+    fixed = _int_env(CTX_TAIL_SPLITS_ENV, 0)
+    if fixed > 0:
+        return fixed
+    programs = max(num_requests * num_kv_heads, 1)
+    if 2 * programs > num_sms:
+        return CTX_TAIL_SPLITS
+    return max(CTX_TAIL_SPLITS, min(CTX_TAIL_MAX_SPLITS, -(-num_sms // programs)))
+
+
 CTX_TAIL_BLOCK = 128
 CTX_TAIL_WARPS = 4
 """Tail launch of the context-kernel path, which runs alone (the prefix launch is a separate, faster
@@ -2505,7 +2531,11 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             if ctx is not None:
                 prefix_splits = 0
                 tail_kwargs = dict(
-                    tail_splits=CTX_TAIL_SPLITS,
+                    tail_splits=ctx_tail_splits(
+                        rows // q_len,
+                        num_kv_heads,
+                        torch.cuda.get_device_properties(qkv.device).multi_processor_count,
+                    ),
                     block_nt=CTX_TAIL_BLOCK,
                     tail_num_warps=CTX_TAIL_WARPS,
                     ctx=ctx,

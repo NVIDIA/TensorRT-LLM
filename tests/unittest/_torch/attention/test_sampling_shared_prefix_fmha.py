@@ -1311,7 +1311,8 @@ def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
 
 
 def _run_fused_spec(
-    case, num_heads, head_dim, q_len, pool, q, k, v, out, workspace, group_grid=None, ctx=None
+    case, num_heads, head_dim, q_len, pool, q, k, v, out, workspace, group_grid=None, ctx=None,
+    tail_splits=1,
 ):
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         fused_sampling_attention,
@@ -1342,7 +1343,7 @@ def _run_fused_spec(
         tail_last_page_len=d["last"], write_page=d["zeros"], write_slot=d["zeros"],
         sm_scale=1.0 / math.sqrt(head_dim), num_groups=case["groups"] + 1,
         max_group_rows=case["per_group"], workspace=workspace, q_len=q_len,
-        prefix_splits=2, tail_splits=1, group_grid=group_grid, ctx=ctx,
+        prefix_splits=2, tail_splits=tail_splits, group_grid=group_grid, ctx=ctx,
     )  # fmt: skip
 
 
@@ -1450,8 +1451,9 @@ def test_fused_attention_with_massive_activations(
     "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
     [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False)],
 )
+@pytest.mark.parametrize("tail_splits", [1, 3, 8])
 def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
-    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot
+    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, tail_splits
 ):
     """The FlashAttention-4 prefix (SM90) + Triton tail + merge against the float64 reference, and the
     step's K/V written at cached + j."""
@@ -1468,9 +1470,10 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
         pool = case["pool"]
         before = pool.clone()
         out = torch.empty_like(case["q"])
-        ws = FusedWorkspace(case["ntok"], num_heads, head_dim, 3, device)
+        ws = FusedWorkspace(case["ntok"], num_heads, head_dim, max(3, tail_splits), device)
         _run_fused_spec(
             case, num_heads, head_dim, q_len, pool, case["q"], case["k"], case["v"], out, ws, ctx=ctx,
+            tail_splits=tail_splits,
         )  # fmt: skip
         torch.cuda.synchronize()
         err = (out.double() - case["ref"]).abs().amax() / case["ref"].abs().amax()
@@ -1622,3 +1625,19 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
     )
     assert off is not None and on is not None, "no speculative-decoding stats reported"
     assert abs(on - off) <= 0.05 * off, (on, off)
+
+
+def test_ctx_tail_splits_cover_the_sms(monkeypatch):
+    """Split-K of the private pages on the context-kernel path: one split for wide batches (as
+    measured best), more for the few-row batches at the end of a generation, capped."""
+    from tensorrt_llm._torch.attention.backends.fmha import sampling_shared_prefix as lib
+
+    monkeypatch.delenv(lib.CTX_TAIL_SPLITS_ENV, raising=False)
+    assert lib.ctx_tail_splits(120, 4, 132) == 1
+    assert lib.ctx_tail_splits(60, 4, 132) == 1
+    assert lib.ctx_tail_splits(24, 4, 132) == 1  # 96 programs: more than half a wave
+    assert lib.ctx_tail_splits(16, 4, 132) == 3
+    assert lib.ctx_tail_splits(4, 4, 132) == lib.CTX_TAIL_MAX_SPLITS
+    assert lib.ctx_tail_splits(128, 20, 148) == 1
+    monkeypatch.setenv(lib.CTX_TAIL_SPLITS_ENV, "3")
+    assert lib.ctx_tail_splits(120, 4, 132) == 3
