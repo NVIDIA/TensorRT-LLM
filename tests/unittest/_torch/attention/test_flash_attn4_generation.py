@@ -226,16 +226,22 @@ def test_rope_write_kv_paged_matches_rope_then_write(
      (16, 8, 64, 4, False), (28, 4, 128, 9, True)],
 )
 @pytest.mark.parametrize("splits", [2, 5, 16])
-def test_fa4_paged_generation_split_matches_dense(num_heads, num_kv_heads, head_dim, q_len, massive, splits):
+@pytest.mark.parametrize("min_split_tokens", [1, 512])
+def test_fa4_paged_generation_split_matches_dense(
+    num_heads, num_kv_heads, head_dim, q_len, massive, splits, min_split_tokens, monkeypatch
+):
     """Split-KV generation (non-causal chunks of the cached pages + causal last part, merged) against the
     float64 reference, including rows whose cache is shorter than the split count (empty chunks) and rows
-    with nothing cached before the page of their first step token."""
+    with nothing cached before the page of their first step token; chunks of at least one page or of at
+    least the default minimum length."""
+    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_generation as fa4_gen
     from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
         fa4_paged_generation_split,
         split_tables,
         write_kv_paged,
     )
 
+    monkeypatch.setattr(fa4_gen, "MIN_SPLIT_TOKENS", min_split_tokens)
     for seed in range(2):
         case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=5, seed=seed, massive=massive)
         ref = _reference(case, num_heads, num_kv_heads, head_dim, q_len)

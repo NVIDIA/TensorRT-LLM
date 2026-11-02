@@ -1537,18 +1537,24 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
      (20, 20, 128, 9, True, 2, False)],
 )
 @pytest.mark.parametrize("massive", [False, True])
-@pytest.mark.parametrize("prefix_splits,tail_splits", [(1, 1), (3, 1), (8, 1), (1, 4), (8, 16)])
+@pytest.mark.parametrize(
+    "prefix_splits,tail_splits,min_split_tokens",
+    [(1, 1, 512), (3, 1, 32), (8, 1, 32), (1, 4, 32), (8, 16, 32), (8, 16, 512)],
+)
 def test_fused_spec_attention_with_fa4_prefix_and_tail_matches_dense_and_writes_kv(
     num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive,
-    prefix_splits, tail_splits,
+    prefix_splits, tail_splits, min_split_tokens, monkeypatch,
 ):
     """FlashAttention-4 for the shared pages (whole, or split into runs, some empty: 4 shared pages
     split 8 ways) and the private pages (SM90) + their merge against the float64 reference (also
     with massive activations), and the step's K/V written at cached + j."""
+    from tensorrt_llm._torch.attention.backends.fmha import flash_attn4_generation as fa4_gen
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         FusedWorkspace,
     )
 
+    # One page (32 tokens) per run/chunk at least: the 4 shared pages really split.
+    monkeypatch.setattr(fa4_gen, "MIN_SPLIT_TOKENS", min_split_tokens)
     device = torch.device("cuda")
     for seed in range(2):
         case = _fused_spec_case(
