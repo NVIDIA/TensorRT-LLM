@@ -15,12 +15,16 @@
 
 import asyncio
 import itertools
+from multiprocessing import Event
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.bench.benchmark.utils import asynchronous, processes
 from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 
@@ -477,3 +481,135 @@ async def test_async_benchmark_duration():
     # and finish before the deadline, which is why the CLI rejects that
     # combination.
     assert 1 <= len(stats.requests) < 3
+
+
+def _iteration_manager():
+    llm = MagicMock(spec=LLM)
+    llm.args = MagicMock()
+    llm.args.parallel_config = MagicMock()
+    llm.args.parallel_config.world_size = 1
+    return LlmManager(llm=llm, outbox=asyncio.Queue(), streaming=False, concurrency=1)
+
+
+@pytest.mark.asyncio
+async def test_iteration_worker_keeps_socket_setup_error():
+    # Before the fix, the finally block called send_json on a None socket and
+    # replaced this error with an AttributeError.
+    context = MagicMock()
+    context.socket.side_effect = RuntimeError("socket setup failed")
+    with mock.patch.object(asynchronous.Context, "instance", return_value=context):
+        with pytest.raises(RuntimeError, match="socket setup failed"):
+            await _iteration_manager().iteration_worker("ipc://unused")
+    context.term.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_iteration_worker_sends_sentinel_before_close():
+    manager = _iteration_manager()
+    manager.request_seen.set()
+    manager._stop.set()
+
+    async def no_stats(_timeout):
+        return
+        yield
+
+    manager.llm.get_stats_async = no_stats
+    calls = []
+
+    async def send_json(msg):
+        await asyncio.sleep(0)
+        calls.append(("send_json", msg))
+
+    socket = MagicMock()
+    socket.send_json = send_json
+    socket.close.side_effect = lambda: calls.append(("close", None))
+    context = MagicMock()
+    context.socket.return_value = socket
+    with mock.patch.object(asynchronous.Context, "instance", return_value=context):
+        await manager.iteration_worker("ipc://unused")
+    assert calls == [("send_json", {"end": True}), ("close", None)]
+
+
+@pytest.mark.asyncio
+async def test_iteration_worker_closes_socket_when_sentinel_send_fails():
+    manager = _iteration_manager()
+    manager.request_seen.set()
+    manager._stop.set()
+
+    async def no_stats(_timeout):
+        return
+        yield
+
+    manager.llm.get_stats_async = no_stats
+    socket = MagicMock()
+
+    async def failing_send(_msg):
+        raise RuntimeError("send failed")
+
+    socket.send_json = failing_send
+    context = MagicMock()
+    context.socket.return_value = socket
+    with mock.patch.object(asynchronous.Context, "instance", return_value=context):
+        await manager.iteration_worker("ipc://unused")
+    socket.close.assert_called_once()
+    context.term.assert_called_once()
+
+
+def _run_writer(socket, tmp_path, stop):
+    context = MagicMock()
+    context.socket.return_value = socket
+    with mock.patch.object(processes, "Context", return_value=context):
+        IterationWriter.run("ipc://unused", tmp_path / "iter.log", stop)
+    socket.close.assert_called_once()
+    context.term.assert_called_once()
+    return (tmp_path / "iter.log").read_text().splitlines()
+
+
+def _polls(stop, *results):
+    """poll() side effect: return each result in turn, then fail the test.
+
+    A result of None means "time out and signal shutdown". Running out of
+    results means the writer ignored stop_event, so fail instead of hanging.
+    """
+    remaining = list(results)
+
+    def poll(timeout):
+        assert remaining, "writer kept polling after stop_event was set"
+        result = remaining.pop(0)
+        if result is None:
+            stop.set()
+            return 0
+        return result
+
+    return poll
+
+
+def test_iteration_writer_logs_until_end_sentinel(tmp_path):
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 1, 1, 1)
+    socket.recv_json.side_effect = [{"iter": 1}, {"iter": 2}, {"end": True}]
+    assert _run_writer(socket, tmp_path, stop) == ["{'iter': 1}", "{'iter': 2}"]
+
+
+def test_iteration_writer_exits_when_no_message_arrives(tmp_path):
+    # The sender never connected, so no end sentinel will come. An empty poll
+    # alone must not end the loop; once stop_event is set the writer returns.
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 0, None)
+    assert _run_writer(socket, tmp_path, stop) == []
+    assert socket.poll.call_count == 2
+    socket.recv_json.assert_not_called()
+
+
+def test_iteration_writer_exits_when_end_sentinel_is_lost(tmp_path):
+    # The sender's final send failed after some stats were delivered: the
+    # writer must not block in recv_json() waiting for a sentinel that never
+    # comes.
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 1, 0, None)
+    socket.recv_json.side_effect = [{"iter": 1}]
+    assert _run_writer(socket, tmp_path, stop) == ["{'iter': 1}"]
+    assert socket.poll.call_count == 3

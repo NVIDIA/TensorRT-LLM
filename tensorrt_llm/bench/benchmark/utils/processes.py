@@ -146,15 +146,18 @@ class IterationWriter:
                 f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
-                # Receive the first message from the socket
-                message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received initial message")
-                # Continue receiving messages until the stop event is set or an
-                # "end" message is received
-                while not stop_event.is_set() and "end" not in message:
-                    f.write(f"{message}\n")
+                # Receive until the "end" sentinel or until stop_event is set.
+                # Poll with a timeout instead of blocking in recv_json(): if the
+                # sender never connected or its final send failed, no sentinel
+                # arrives and capture() would wait forever in process.join().
+                while not stop_event.is_set():
+                    if not socket.poll(timeout=100):
+                        continue
                     message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received end message")
+                    if "end" in message:
+                        logger.debug("Iteration logging: Received end message")
+                        break
+                    f.write(f"{message}\n")
         except KeyboardInterrupt:
             # Handle keyboard interrupt by continuing to receive
             # messages until "None" is received. LlmManager will
