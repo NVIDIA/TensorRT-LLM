@@ -12,12 +12,14 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDA_GRAPH_DUMMY_REQUEST_ID,
     ADPShapeAgreement,
     CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
     DSparkCUDAGraphRunner,
     KeyType,
     cuda_graph_dummy_request_id,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
+from tensorrt_llm.mapping import Mapping
 
 
 class _Batch:
@@ -202,7 +204,7 @@ def test_decoder_selects_confidence_graph_subclass_only_when_enabled(
     monkeypatch, confidence_enabled
 ):
     monkeypatch.setattr(graph_module, "get_memory_buffers", lambda: None)
-    config = SimpleNamespace(
+    config = CUDAGraphRunnerConfig(
         use_cuda_graph=False,
         cuda_graph_padding_enabled=True,
         cuda_graph_batch_sizes=[1, 4],
@@ -213,7 +215,13 @@ def test_decoder_selects_confidence_graph_subclass_only_when_enabled(
         is_encoder_decoder=False,
         enable_encoder_decoder_mixed_cuda_graph=False,
         enable_in_graph_sampling=False,
-        cuda_graph_mem_pool=None,
+        max_num_tokens=16,
+        use_mrope=False,
+        original_max_total_draft_tokens=0,
+        enable_attention_dp=False,
+        batch_size=4,
+        mapping=Mapping(),
+        dist=None,
         dynamic_draft_len_mapping=None,
     )
     registered = []

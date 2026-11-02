@@ -36,8 +36,13 @@ T = TypeVar("T")
 
 # Environment that MpiPoolSession forwards from the parent to its workers.
 _FORWARDED_ENV_PREFIXES = ("TRTLLM", "TLLM")
-_FORWARDED_ENV_NAMES = (*_UNIFIED_CACHE_ENV_VARS, "FLASHINFER_CUBIN_DIR",
-                        "MASTER_ADDR", "MASTER_PORT")
+_FORWARDED_ENV_NAMES = (
+    *_UNIFIED_CACHE_ENV_VARS,
+    "FLASHINFER_CUBIN_DIR",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    # MPI may use an environment snapshot from MPI_Init.
+    "CUDA_SCALE_LAUNCH_QUEUES")
 
 
 def _is_forwarded_env(name: str) -> bool:

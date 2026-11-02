@@ -296,7 +296,12 @@ def _worker_accept_check(rank, tp, mnnvl):
     target = torch.argmax(full.float(), dim=-1)[num_ctx:].view(num_gens, draft_len + 1)
     draft = target[:, :draft_len].clone().to(torch.int32)
     draft[1::2, 2] = (draft[1::2, 2] + 1) % vocab
-    md = SimpleNamespace(is_all_greedy_sample=True, is_cuda_graph=False, is_ragged_verify=False)
+    md = SimpleNamespace(
+        is_all_greedy_sample=True,
+        is_cuda_graph=False,
+        is_ragged_verify=False,
+        sharded_target_logits=False,
+    )
     worker = _Worker()
     batch = num_ctx + num_gens
     ref = worker._sample_and_accept_draft_tokens_base(full.float(), draft, num_ctx, batch, md)

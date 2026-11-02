@@ -19,9 +19,11 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Iterator, List, Mapping,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -47,7 +49,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -191,6 +193,42 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    # Set by `_init_tokenization_cache`; None (no cache) for a processor that
+    # never calls it.
+    _prefix_token_cache: Optional[PrefixTokenCache] = None
+    _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
+
+    _decode_state_capture: ClassVar[ContextVar] = ContextVar(
+        "multimodal_decode_state_capture", default=None)
+
+    @contextmanager
+    def capture_decode_state(self) -> Iterator[Dict[str, Any]]:
+        """Collect portable decode metadata before tensor transport exports."""
+        capture = {}
+        token = self._decode_state_capture.set((self, capture))
+        try:
+            yield capture
+        finally:
+            self._decode_state_capture.reset(token)
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return portable model metadata, or None when preparation cannot be reused."""
+        return None
+
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        """Restore metadata, validating positions through max_length tokens if set."""
+        raise ValueError(
+            "This processor does not support prepared decode inputs")
+
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return per-modality decode defaults, below server and request overrides."""
+        return {}
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],
@@ -230,10 +268,18 @@ class BaseMultimodalInputProcessor(ABC):
                                     if enable_tokenization_cache else None)
 
     def _encode_with_tokenization_cache(
-            self, prompt: str,
-            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        self,
+        prompt: str,
+        sampling_params: Optional[SamplingParams],
+        adds_no_special_tokens: bool = False,
+    ) -> Optional[List[int]]:
+        """Cached ids of `prompt`, or None to tokenize it in full.
+
+        `adds_no_special_tokens`: the caller verified that its tokenizer adds no
+        special tokens, so `add_special_tokens=True` does not change the ids.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens and not adds_no_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(
@@ -344,11 +390,24 @@ class BaseMultimodalInputProcessor(ABC):
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
             if self.supports_token_id_mm_expansion:
-                return self.call_with_token_ids(inputs, sampling_params)
+                result = self.call_with_token_ids(inputs, sampling_params)
+                return self._capture_prepared_decode(result)
             # Fast path not supported by this VLM — detokenize and fall through
             # to the text-prompt path.
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self.call_with_text_prompt(inputs, sampling_params)
+        return self._capture_prepared_decode(
+            self.call_with_text_prompt(inputs, sampling_params))
+
+    def _capture_prepared_decode(
+        self, result: Tuple[List[int], Optional[ExtraProcessedInputs]]
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        capture = self._decode_state_capture.get()
+        if capture is not None and capture[0] is self and result[1] is not None:
+            state = self.export_decode_state(result[1].get(
+                "multimodal_data", {}))
+            if state is not None:
+                capture[1].update(prompt_token_ids=list(result[0]), state=state)
+        return result
 
     @abstractmethod
     def call_with_text_prompt(
@@ -1167,6 +1226,12 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            elif enable_tokenization_cache:
+                logger.warning_once(
+                    f"enable_tokenization_cache is ignored: "
+                    f"{input_processor_cls.__name__} does not support the "
+                    "prefix tokenization cache.",
+                    key="tokenization_cache_unsupported_processor")
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
