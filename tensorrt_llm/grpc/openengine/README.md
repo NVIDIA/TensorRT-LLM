@@ -93,6 +93,29 @@ Gemma4 excludes audio without `audio_config` and images/video without
 initialized audio extractor, and Whisper declares audio only. Registered custom
 processors must declare the property to advertise media support.
 
+### Media preparation
+
+Image inputs are accepted when the loaded processor advertises image support.
+The prompt must follow that processor's placeholder policy. Media decoding and
+preprocessing use separate worker pools. Set
+`TRTLLM_OPENENGINE_MEDIA_PREPARATION_LIMIT` to a positive integer to bound the
+number of requests admitted before decoding (default: 4, per frontend process).
+Cancellation retains admission until outstanding worker threads finish. This
+does not bound encoded requests waiting for admission or engine KV-cache memory.
+
+Compatible token-ID processors reuse prompt-validation tokens. Other processors
+retain their text-prompt path. For Qwen vision models, context workers also attach
+versioned prepared prompt, position, and multimodal cache-identity metadata to
+`KvSessionRef.attributes_struct` as a bounded JSON string. A matching decode
+worker can reuse it without fetching or preparing the media again. Missing or
+unknown-version metadata uses the ordinary preparation path. The handoff contains
+bounded CPU metadata, not cross-process tensor handles; encoder disaggregation
+is a separate feature.
+
+Both workers must use matching model/tokenizer revisions and processor settings.
+Input, model, and processor-setting fingerprints detect mismatches; they do not
+authenticate caller-provided metadata or verify model weights.
+
 ### Disaggregated serving
 
 A context worker returns its handoff as a `PrefillReady` event carrying a
