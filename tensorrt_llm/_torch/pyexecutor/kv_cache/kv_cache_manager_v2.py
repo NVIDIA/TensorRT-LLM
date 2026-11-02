@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
@@ -1826,6 +1827,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Staging rows per batch for recurrent-state snapshots taken inside the
+    # forward (MambaHybridCacheManagerV2); 0 = none.
+    inforward_snapshot_rows: int = 0
     # Block width of a drafter whose layers share this manager, else 0.
     _shared_draft_block_width: int = 0
 
@@ -2067,6 +2071,34 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"(got pp_size={mapping.pp_size}). Set "
                     "pipeline_parallel_size=1 or enable_attention_dp=False."
                 )
+            if kv_cache_config.enable_kv_pool_rebalance:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support KV pool rebalance with "
+                    "helix context parallelism: a rebalance changes pool sizes "
+                    "on each rank independently of the cross-rank quota agreed "
+                    "at construction. Set "
+                    "kv_cache_config.enable_kv_pool_rebalance=False."
+                )
+            if not is_disagg:
+                if (kv_cache_config.host_cache_size or 0) > 0 or (
+                    kv_cache_config.disk_cache_size or 0
+                ) > 0:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support cache tiers below "
+                        "GPU with aggregated helix context parallelism: "
+                        "suspending to a lower tier is not validated to make "
+                        "the same decisions on every CP rank. Set "
+                        "kv_cache_config.host_cache_size=0 and "
+                        "kv_cache_config.disk_cache_size=0."
+                    )
+                if kv_connector_manager is not None:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support a KV cache "
+                        "connector with aggregated helix context parallelism: "
+                        "its loads, saves and deferred preemptions are not "
+                        "validated to make the same decisions on every CP "
+                        "rank. Unset kv_connector_config."
+                    )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_cuda_graph_batch_size = max_cuda_graph_batch_size
@@ -2318,7 +2350,16 @@ class KVCacheManagerV2(BaseResourceManager):
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
-        if connector_registers_pages and kv_cache_config.host_cache_size is None:
+        if self._has_cp_helix and not is_disagg:
+            # Aggregated helix runs GPU-only (lower tiers are rejected above),
+            # so pool pressure is relieved by preemption, as in the connector
+            # case.
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: aggregated helix runs "
+                "GPU-only and relieves KV pressure by recompute pause."
+            )
+        elif connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -2431,7 +2472,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        if not has_host_cache_tier:
+        # Aggregated helix runs GPU-only but its CP ranks still need a common
+        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # waiting in the first collective.
+        sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
+        if not sync_init_status:
             candidate = self._allocate_cache_pools(
                 config,
                 event_manager=event_sink,
@@ -4738,8 +4783,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft,
+                # or a CTX with a smaller max_draft_len) up to
+                # max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _helix_local_len(self, global_len: int) -> int:
@@ -8224,6 +8272,41 @@ class KVCacheManagerV2(BaseResourceManager):
             stream=stream,
         )
 
+    # Trailing blocks of a request that a decode step can change at an unchanged block count: a step appends at
+    # most one block and the rewind of its rejected drafts frees at most one, so only the last block can come back
+    # on another page; two cover any step of fewer than two blocks' tokens.
+    _BLOCK_TABLE_KEY_TAIL_BLOCKS = 2
+
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
+        copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
+        the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
+        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        finite attention window freeing earlier blocks, other beams)."""
+        if (
+            self.enable_swa_scratch_reuse
+            or self.enable_block_reuse
+            or self.max_beam_width > 1
+            or any(
+                window is not None and window < self.max_seq_len
+                for window in self.max_attention_window_vec
+            )
+            or self._use_per_layer_page_tables
+            or self.sparse_metadata_batch is not None
+        ):
+            return None
+        host = self.host_kv_cache_block_offsets.numpy()
+        keys = []
+        for request_id in request_ids:
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None:
+                return None
+            num_blocks = int(kv_cache.num_blocks)
+            row = self.index_mapper.get_index(request_id) * self.max_beam_width
+            first = max(0, num_blocks - self._BLOCK_TABLE_KEY_TAIL_BLOCKS)
+            keys.append((num_blocks, host[:, row, 0, first:num_blocks].tobytes()))
+        return tuple(keys)
+
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> str | None:
         """Return the string namespace shared by creation, prefetch and probes."""
@@ -8385,9 +8468,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 success = False
         return success
 
-    def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+    def reset_reuse_state(
+        self,
+        *,
+        on_cleared: Optional[Callable[[], None]] = None,
+    ):
+        try:
+            self.impl.clear_reusable_blocks()
+            if on_cleared is not None:
+                on_cleared()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # The sidecar consumes the per-rank streaming publisher. Flush it
+            # even while inference is paused, without starting a buffered ADP gather.
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.flush_iteration_events()

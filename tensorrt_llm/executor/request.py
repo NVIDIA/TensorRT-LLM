@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -64,7 +80,7 @@ class LoRARequest:
 @dataclass(slots=True)
 class PromptAdapterRequest:
     """
-    Request for a Prompt adapter.
+    Deprecated compatibility container for unsupported prompt adapters.
     """
     prompt_adapter_name: str
     prompt_adapter_id: int
@@ -114,6 +130,13 @@ class GenerationRequest:
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
+        if prompt_adapter_request is not None:
+            warnings.warn(
+                "prompt_adapter_request is deprecated and will be removed in a future release. "
+                "Prompt adapters are unsupported; omit this argument or pass None.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):

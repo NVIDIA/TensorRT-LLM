@@ -33,6 +33,7 @@ l0_h100:
   - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
+  - unittest/others/test_import_cuda_context.py
   - unittest/others/test_lora_manager.py
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
@@ -123,7 +124,6 @@ l0_h100:
   - unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
-  - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_sync_transfer_timing.py
   - unittest/disaggregated/test_kv_transfer.py
   - unittest/disaggregated/test_kv_transfer_mp.py
@@ -275,6 +275,7 @@ l0_h100:
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_postproc_workers.py
+    - unittest/_torch/ray_orchestrator/single_gpu/test_kv_cache_reset_events.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part1"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part2"

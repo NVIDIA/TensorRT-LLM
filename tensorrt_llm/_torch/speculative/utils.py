@@ -339,7 +339,8 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       max_seq_len=262144,
-                      num_seq_slots=None):
+                      num_seq_slots=None,
+                      temperature_only_graphs=False):
     metadata = _build_spec_metadata(spec_config,
                                     model_config,
                                     max_num_requests,
@@ -360,6 +361,7 @@ def get_spec_metadata(spec_config,
         metadata.advanced_sampling_mode = spec_config.advanced_sampling_mode
         if num_seq_slots is not None:
             metadata.num_seq_slots = num_seq_slots
+        metadata.temperature_only_graphs = temperature_only_graphs
     return metadata
 
 
@@ -724,7 +726,14 @@ def update_spec_config_from_draft_model_config(spec_config,
 def get_spec_worker(spec_config,
                     model_config,
                     mapping,
-                    use_separate_draft_kv_cache: bool = False):
+                    use_separate_draft_kv_cache: bool = False,
+                    key_exchange=None,
+                    spec_decode_fast_paths: bool = False):
+    """The one-engine worker of spec_config. key_exchange: the TP key
+    exchange (ll_exchange.TPKeyExchange) the linear Eagle3 / MTP-Eagle
+    worker samples vocabulary-sharded logits with, or None.
+    spec_decode_fast_paths: the model takes the one-engine speculative fast
+    paths (SpecDecOneEngineForCausalLM.spec_decode_fast_paths)."""
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
         return MTPWorker(spec_config,
@@ -740,7 +749,9 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config,
                               model_config,
                               use_separate_draft_kv_cache,
-                              mapping=mapping)
+                              mapping=mapping,
+                              key_exchange=key_exchange,
+                              spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
@@ -748,7 +759,9 @@ def get_spec_worker(spec_config,
         return Eagle3OneModelWorker(
             spec_config,
             mapping=mapping,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            key_exchange=key_exchange,
+            spec_decode_fast_paths=spec_decode_fast_paths)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_dflash():

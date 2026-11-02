@@ -15,8 +15,10 @@ import torch
 from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
+from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
+    CUDAGraphRunnerConfig,
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
     KeyType,
@@ -24,8 +26,15 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import SeqLenAwareSparseAttentionConfig
+from tensorrt_llm.bindings import SamplingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
+    SeqLenAwareSparseAttentionConfig,
+)
+from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -459,6 +468,110 @@ def test_encoder_decoder_fixed_slots_restore_source_order() -> None:
     restored_output = runner.restore_encoder_decoder_output(key, fixed_slot_output, inputs)
     expected_output = torch.cat((fixed_slot_output[511:512], fixed_slot_output[:400]))
     torch.testing.assert_close(restored_output, expected_output)
+
+
+def _decoder_runner(
+    *,
+    short_long_seq_len_threshold: int | None = None,
+    sparse_attention_config: BaseSparseAttentionConfig | None = None,
+    private_metadata_buffers: bool = False,
+) -> CUDAGraphRunner:
+    """A generation-graph runner with capture disabled, so it allocates no device buffers."""
+    config = CUDAGraphRunnerConfig(
+        use_cuda_graph=False,
+        cuda_graph_padding_enabled=False,
+        cuda_graph_batch_sizes=[1, 2],
+        max_cuda_graph_batch_size=2,
+        batch_size=2,
+        max_beam_width=1,
+        max_num_tokens=2,
+        use_mrope=False,
+        spec_config=None,
+        enable_attention_dp=False,
+        original_max_total_draft_tokens=0,
+        is_encoder_decoder=False,
+        mapping=Mapping(),
+        dist=None,
+        sparse_attention_config=sparse_attention_config,
+        short_long_seq_len_threshold=short_long_seq_len_threshold,
+        private_metadata_buffers=private_metadata_buffers,
+    )
+    return CUDAGraphRunner(config)
+
+
+def _dsa_config(skip_indexer_for_short_seqs: bool) -> DeepSeekSparseAttentionConfig:
+    return DeepSeekSparseAttentionConfig(
+        index_topk=512, skip_indexer_for_short_seqs=skip_indexer_for_short_seqs
+    )
+
+
+def test_short_long_threshold_from_the_runner_config_wins() -> None:
+    runner = _decoder_runner(
+        short_long_seq_len_threshold=2_048, sparse_attention_config=_dsa_config(True)
+    )
+
+    assert runner.short_long_seq_len_threshold == 2_048
+
+
+def test_short_long_threshold_is_derived_from_a_sparse_config_that_asks_for_the_split() -> None:
+    runner = _decoder_runner(sparse_attention_config=_dsa_config(True))
+
+    assert runner.short_long_seq_len_threshold == 512
+
+
+@pytest.mark.parametrize(
+    "sparse_attention_config",
+    [None, _dsa_config(False)],
+    ids=["dense", "dsa_without_split"],
+)
+def test_short_long_threshold_is_none_for_a_single_graph_family(sparse_attention_config) -> None:
+    runner = _decoder_runner(sparse_attention_config=sparse_attention_config)
+
+    assert runner.short_long_seq_len_threshold is None
+
+
+def test_graph_metadata_uses_the_process_buffer_pool_by_default() -> None:
+    assert _decoder_runner().cuda_graph_meta_buffers is get_memory_buffers()
+
+
+def test_private_metadata_buffers_give_each_runner_its_own_pool() -> None:
+    first = _decoder_runner(private_metadata_buffers=True)
+    second = _decoder_runner(private_metadata_buffers=True)
+
+    assert first.cuda_graph_meta_buffers is not get_memory_buffers()
+    assert first.cuda_graph_meta_buffers is not second.cuda_graph_meta_buffers
+
+
+def _generation_batch(*num_tokens: int) -> ScheduledRequests:
+    batch = ScheduledRequests()
+    batch.generation_requests = [
+        LlmRequest(
+            request_id=request_id,
+            max_new_tokens=4,
+            input_tokens=list(range(tokens)),
+            sampling_config=SamplingConfig(),
+            seq_slot=request_id,
+            is_streaming=False,
+        )
+        for request_id, tokens in enumerate(num_tokens)
+    ]
+    return batch
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "short"),
+    [((100,), True), ((100, 2_048), True), ((100, 2_049), False), ((4_000,), False)],
+)
+def test_seq_len_mode_splits_at_the_configured_threshold(num_tokens, short) -> None:
+    runner = _decoder_runner(short_long_seq_len_threshold=2_048)
+
+    assert runner._get_seq_len_mode(_generation_batch(*num_tokens)) is short
+
+
+def test_seq_len_mode_is_long_without_a_threshold() -> None:
+    runner = _decoder_runner()
+
+    assert runner._get_seq_len_mode(_generation_batch(1)) is False
 
 
 class SparseGraphKeyTestCase(unittest.TestCase):

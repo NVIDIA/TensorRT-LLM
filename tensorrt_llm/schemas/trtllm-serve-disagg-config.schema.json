@@ -424,7 +424,8 @@
       "properties": {
         "agent_bounce_buffer_enable": {
           "default": false,
-          "description": "Run the KV-cache bounce in the C++ transfer agent instead of the Python transceiver, using one shared kv_cache_bounce_size_mb buffer (use a power of two). Set this identically on context and generation; kv_cache_bounce_size_mb matters only when its usable capacity (rounded down to a power of two) is below max_chunk_size; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL. By default only writes with many small descriptors (>= 1024, <= 16 KiB average, i.e. head-mismatch layouts) take the path; head-matched layouts (MLA, symmetric TP) stay on standard NIXL unless agent_bounce_params relaxes the gate. Requires the Python (v2) transceiver; see the disaggregated-serving docs.",
+          "description": "DEPRECATED: no-op kept so existing configs still parse; it will be removed in a future release. kv_cache_bounce_size_mb > 0 alone enables the C++ transfer-agent bounce buffer, and 0 disables it.",
+          "status": "deprecated",
           "title": "Agent Bounce Buffer Enable",
           "type": "boolean"
         },
@@ -441,7 +442,7 @@
             }
           ],
           "default": null,
-          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires agent_bounce_buffer_enable. request_timeout_ms and the effective max_chunk_size (after the arena clamp) must match between context and generation. max_average_descriptor_size=0 stops outbound routing only (arena, handshake and inbound scatter stay active); set agent_bounce_buffer_enable=False to turn the feature off.",
+          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires kv_cache_bounce_size_mb > 0. request_timeout_ms and the effective chunk size (max_chunk_size, capped by the buffer size) must match between context and generation. max_average_descriptor_size=0 stops this worker from sending through the buffer, but it still allocates the buffer and receives bounced writes; set kv_cache_bounce_size_mb=0 to turn the feature off.",
           "title": "Agent Bounce Params"
         },
         "backend": {
@@ -466,13 +467,13 @@
         },
         "enable_pipelined_transfer": {
           "default": false,
-          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent bounce selected by agent_bounce_buffer_enable is allowed) or Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
+          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
           "title": "Enable Pipelined Transfer",
           "type": "boolean"
         },
         "kv_cache_bounce_size_mb": {
           "default": 0,
-          "description": "Capacity in MiB of the native-disagg KV-cache bounce buffer, which coalesces a request's scattered per-block KV for a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. By default two buffers of this size are allocated (one for send, one for recv); with agent_bounce_buffer_enable a single shared buffer is allocated instead and the size should be a power of two (256/512/1024). Requires the Python (v2) transceiver (transceiver_runtime); the C++ transceiver does not support bounce and ignores this field.",
+          "description": "Size in MiB of the KV-cache bounce buffer in the C++ NIXL transfer agent; 0 (default) turns it off and KV fragments are written directly with standard NIXL. A positive value allocates one buffer of this size per rank, shared by send and receive. Use a power of two such as 256, 512 or 1024; for other values only the largest power of two that fits is used. For an eligible write, the sender gathers the fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. By default a write is eligible only with >= 1024 descriptors averaging <= 16 KiB (typical when context and generation split attention heads differently); agent_bounce_params changes that. Set it on both context and generation servers; if either side has 0, the pair uses standard NIXL. If either side's buffer is smaller than max_chunk_size (32 MiB by default), both sides must use the same size, or the pair uses standard NIXL. Requires the Python (v2) transceiver with the C++ NIXL agent; on a build without bounce support (libzmq) a positive value fails at startup. The C++ transceiver and the pure-Python NIXL agent ignore it with a warning.",
           "minimum": 0,
           "title": "Kv Cache Bounce Size Mb",
           "type": "integer"
@@ -627,6 +628,15 @@
         "FORCE_CHUNK"
       ],
       "title": "ContextChunkingPolicy",
+      "type": "string"
+    },
+    "ContextSchedulingPolicy": {
+      "description": "Order in which the scheduler admits pending context requests.",
+      "enum": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "title": "ContextSchedulingPolicy",
       "type": "string"
     },
     "CpConfig": {
@@ -2464,6 +2474,13 @@
           "title": "Mm Encoder Only",
           "type": "boolean"
         },
+        "mnnvl_allreduce_fp8_payload": {
+          "default": false,
+          "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+          "status": "prototype",
+          "title": "Mnnvl Allreduce Fp8 Payload",
+          "type": "boolean"
+        },
         "model": {
           "anyOf": [
             {
@@ -2851,6 +2868,13 @@
           "description": "The request reordering policy to use.",
           "status": "prototype"
         },
+        "replicate_embedding": {
+          "default": false,
+          "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+          "status": "prototype",
+          "title": "Replicate Embedding",
+          "type": "boolean"
+        },
         "request_stats_max_iterations": {
           "anyOf": [
             {
@@ -2908,6 +2932,21 @@
           "$ref": "#/$defs/SchedulerConfig",
           "description": "Scheduler config.",
           "status": "prototype"
+        },
+        "serve_frontend_affinity_port_stride": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+          "status": "prototype",
+          "title": "Serve Frontend Affinity Port Stride"
         },
         "skip_tokenizer_init": {
           "default": false,
@@ -5104,6 +5143,28 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "draft_lm_head_dtype": {
+          "default": "auto",
+          "description": "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "mxfp8"
+          ],
+          "status": "prototype",
+          "title": "Draft Lm Head Dtype",
+          "type": "string"
+        },
+        "draft_moe_dtype": {
+          "default": "auto",
+          "description": "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "Draft Moe Dtype",
+          "type": "string"
         },
         "dynamic_tree_max_topK": {
           "anyOf": [
@@ -7505,6 +7566,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_scheduling_policy": {
+          "$ref": "#/$defs/ContextSchedulingPolicy",
+          "default": "fcfs",
+          "description": "Order in which pending context requests are admitted: 'fcfs' (arrival order) or 'shortest_uncached_first' (fewest prompt tokens not covered by reusable KV cache first, which lowers TTFT under load at the cost of fairness). Only the KV cache manager V2 scheduler supports 'shortest_uncached_first'.",
+          "status": "prototype"
+        },
+        "context_starvation_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With context_scheduling_policy='shortest_uncached_first', chunked prefill and a max_num_tokens budget: a context request pending for more than this many scheduler iterations takes up to a quarter of max_num_tokens of each iteration's budget ahead of the shortest-first order, oldest first. None disables it.",
+          "status": "prototype",
+          "title": "Context Starvation Iterations"
+        },
         "dynamic_batch_config": {
           "anyOf": [
             {
@@ -8904,6 +8986,13 @@
       "title": "Mm Encoder Only",
       "type": "boolean"
     },
+    "mnnvl_allreduce_fp8_payload": {
+      "default": false,
+      "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+      "status": "prototype",
+      "title": "Mnnvl Allreduce Fp8 Payload",
+      "type": "boolean"
+    },
     "model": {
       "anyOf": [
         {
@@ -9322,6 +9411,13 @@
       "description": "The request reordering policy to use.",
       "status": "prototype"
     },
+    "replicate_embedding": {
+      "default": false,
+      "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+      "status": "prototype",
+      "title": "Replicate Embedding",
+      "type": "boolean"
+    },
     "request_stats_max_iterations": {
       "anyOf": [
         {
@@ -9375,6 +9471,21 @@
       "$ref": "#/$defs/SchedulerConfig",
       "description": "Scheduler config.",
       "status": "prototype"
+    },
+    "serve_frontend_affinity_port_stride": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+      "status": "prototype",
+      "title": "Serve Frontend Affinity Port Stride"
     },
     "server_keep_alive_timeout": {
       "default": 10,
