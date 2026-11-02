@@ -916,39 +916,35 @@ private:
     // The trtllm-gen generator queries `nvcc --version` at GenCfg::nvccPath, which defaults to
     // /usr/local/cuda/bin/nvcc. Point it at the toolkit the environment selects -- CUDA_HOME, then CUDA_PATH, then the
     // first nvcc on PATH -- as the DeepGEMM JIT does. Empty when none is found: the default is kept.
-    static std::string const& getNvccPath()
+    static std::string getNvccPath()
     {
-        static std::string const nvccPath = []() -> std::string
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        for (char const* var : {"CUDA_HOME", "CUDA_PATH"})
         {
-            namespace fs = std::filesystem;
-            std::error_code ec;
-            for (char const* var : {"CUDA_HOME", "CUDA_PATH"})
+            char const* root = std::getenv(var);
+            if (root != nullptr && root[0] != '\0')
             {
-                char const* root = std::getenv(var);
-                if (root != nullptr && root[0] != '\0')
+                fs::path const candidate = fs::path(root) / "bin" / "nvcc";
+                if (fs::is_regular_file(candidate, ec))
                 {
-                    fs::path const candidate = fs::path(root) / "bin" / "nvcc";
-                    if (fs::is_regular_file(candidate, ec))
-                    {
-                        return candidate.string();
-                    }
+                    return candidate.string();
                 }
             }
-            if (char const* pathEnv = std::getenv("PATH"))
+        }
+        if (char const* pathEnv = std::getenv("PATH"))
+        {
+            std::istringstream dirs(pathEnv);
+            std::string dir;
+            while (std::getline(dirs, dir, ':'))
             {
-                std::istringstream dirs(pathEnv);
-                std::string dir;
-                while (std::getline(dirs, dir, ':'))
+                if (!dir.empty() && fs::is_regular_file(fs::path(dir) / "nvcc", ec))
                 {
-                    if (!dir.empty() && fs::is_regular_file(fs::path(dir) / "nvcc", ec))
-                    {
-                        return (fs::path(dir) / "nvcc").string();
-                    }
+                    return (fs::path(dir) / "nvcc").string();
                 }
             }
-            return {};
-        }();
-        return nvccPath;
+        }
+        return {};
     }
 
     std::string const& getExecPath() const
@@ -1408,7 +1404,7 @@ private:
         }
 
         // Without it the generator runs /usr/local/cuda/bin/nvcc and fails where the toolkit lives elsewhere (#20515).
-        if (auto const& nvccPath = getNvccPath(); !nvccPath.empty())
+        if (auto const nvccPath = getNvccPath(); !nvccPath.empty())
         {
             sstream << "\"nvccPath\": \"";
             for (char const c : nvccPath)
