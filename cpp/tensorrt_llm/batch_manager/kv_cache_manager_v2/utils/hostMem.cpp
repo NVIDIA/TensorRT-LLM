@@ -95,14 +95,9 @@ void resizeFile(int fd, size_t newSize)
 
 bool hostUseThp()
 {
-    // Off unless asked for. MADV_HUGEPAGE opts a region's faults into direct
-    // compaction wherever /sys/kernel/mm/transparent_hugepage/defrag is
-    // "madvise" or "always". On a node whose free memory has fragmented below
-    // the 2 MiB order that costs far more than the huge pages save, and
-    // fragmentation accumulates with uptime, so the penalty grows while the
-    // benefit does not.
+    // Enable transparent huge pages by default. Set TLLM_KV_CACHE_MANAGER_V2_THP=0 to opt out.
     char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_THP");
-    return value != nullptr && std::string_view(value) == "1";
+    return value == nullptr || std::string_view(value) == "1";
 }
 
 size_t hostTotalMemory()
