@@ -215,7 +215,7 @@ def _get_nvcc_flags(cache, fmha=True):
     nvcc = root / "cuda toolkit/bin/nvcc"
     nvcc.parent.mkdir(parents=True)
     nvcc.write_text(f'''#!/usr/bin/env python3
-import subprocess,sys
+import os,subprocess,sys
 args = sys.argv[1:]
 if "--list-gpu-code" in args:
     print("sm_103a")
@@ -225,6 +225,8 @@ if "--version" in args:
     raise SystemExit
 out = args[args.index("-o") + 1]
 if "-c" in args:
+    # Relative object paths keep the 700-input aggregate link below ARG_MAX.
+    assert not os.path.isabs(out), out
     assert {('-I' + str(csrc / 'include'))!r} in args, args
     subprocess.run(["cc", "-x", "c", "-c", "-o", out, "-"], input="", text=True, check=True)
 else:
