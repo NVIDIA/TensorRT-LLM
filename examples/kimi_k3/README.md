@@ -187,7 +187,8 @@ disable_mm_encoder: true
 
 The streamer reads only tensors needed by the ranks on each node and uses
 node-local distributed loading when multiple ranks share a node. Its current
-scope is local Hugging Face safetensors checkpoints for the text Kimi K3 model.
+scope is Hugging Face safetensors checkpoints, on local disk or in object
+storage, for the text Kimi K3 model.
 Set `disable_mm_encoder: true` with either I/O policy to load only the
 language model from a multimodal Kimi K3 checkpoint and serve text requests.
 
@@ -195,6 +196,38 @@ This experimental option requires a complete checkpoint. For multi-rank MPI
 launches, it initializes a PyTorch distributed group when needed. Rank 0
 selects a fresh rendezvous address and shares it through MPI; inherited
 `MASTER_ADDR` and `MASTER_PORT` values are not used.
+
+#### Load the checkpoint from object storage
+
+With `checkpoint_io_policy: model_streamer`, `--model` can be an `s3://`,
+`gs://` or `az://` URI. The weights stream from the bucket and are never copied
+to local disk. TRT-LLM copies only the other files (config, tokenizer and remote
+code) to a cache directory on each node, because Hugging Face loaders read them
+from local disk.
+
+```bash
+trtllm-serve s3://my-bucket/kimi-k3 --config config.yaml
+```
+
+The checkpoint must contain `model.safetensors.index.json`. A draft model
+(`speculative_model`) and LoRA adapters cannot be loaded from object storage.
+Any other `checkpoint_io_policy` with an object-storage `model` is an error.
+
+Credentials come from the environment of every serving rank, as for Model
+Streamer itself. For S3, set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+(and `AWS_ENDPOINT_URL` for an S3-compatible store). See the Run:ai Model
+Streamer documentation for the Google Cloud and Azure variables.
+
+The metadata cache is in `$TRTLLM_CACHE_DIR/object_storage/<hash of the URI>`,
+or in `~/.cache/tensorrt_llm/object_storage/<hash of the URI>` when
+`TRTLLM_CACHE_DIR` is not set. It must be on a disk local to the node. Do not
+share it between nodes over NFS or another network file system, and set
+`TRTLLM_CACHE_DIR` if your home directory is on one. TRT-LLM logs a warning when
+it detects this.
+
+A complete cache is not downloaded again, even when the files in the bucket
+change. To refresh it, launch with `TRTLLM_OBJECT_STORAGE_FORCE_PULL=1`, or
+delete the cache directory.
 
 ## Troubleshooting
 

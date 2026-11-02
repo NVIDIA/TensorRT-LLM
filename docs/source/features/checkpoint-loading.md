@@ -397,6 +397,51 @@ started.
 like communication error, it could fall back to `native`.
 - `fallback_reason`: why loading switched to native I/O.
 
+### Loading from Object Storage
+
+With `checkpoint_io_policy="model_streamer"`, `model` can be an `s3://`, `gs://`
+or `az://` URI. Run:ai Model Streamer streams the weight tensors from the bucket
+into the model, and the weights are never copied to local disk. Model Streamer
+loading currently supports Kimi K3 only.
+
+Hugging Face loaders read the config, tokenizer and remote-code files from a
+local directory. TRT-LLM therefore copies every file except the weights
+(`*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `*.tensors`) and other formats that
+hold a whole model (`*.gguf`, `*.onnx`, `*.onnx_data`, `*.h5`, `*.msgpack`,
+`*.ckpt`, `*.npz`, `*.ot`) to a metadata cache directory on each node, before it
+builds the config and the tokenizer. Config and tokenizer loading use that copy.
+Weight loading keeps the original URI.
+
+- The checkpoint must contain `model.safetensors.index.json`. TRT-LLM reads it
+  to find the file of each tensor, and raises an error if it is missing.
+- Any other `checkpoint_io_policy` with an object-storage `model` is an error.
+  TRT-LLM does not switch policy on its own.
+- The copy happens before TRT-LLM checks that the model supports Model Streamer.
+  A model other than Kimi K3 copies its non-weight files and is then rejected.
+- `tokenizer` can also be an object-storage URI. Each URI is copied separately.
+- A draft model (`speculative_model`) and LoRA adapters cannot be on object
+  storage.
+- Credentials come from the environment of every rank, as for Model Streamer,
+  for example `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_ENDPOINT_URL`
+  for S3.
+
+The metadata cache is in `$TRTLLM_CACHE_DIR/object_storage/<hash of the URI>`,
+or in `~/.cache/tensorrt_llm/object_storage/<hash of the URI>` when
+`TRTLLM_CACHE_DIR` is not set. The directory name is a hash of the URI, so every
+rank and node derives the same path. A `.runai_complete` marker file records a
+finished download. A process that finds it does not download again, and a
+download that was interrupted leaves no marker, so the next process downloads
+again. Processes on one node that start together wait for the first one to
+finish.
+
+- The cache must be on a disk local to the node. The lock that coordinates
+  concurrent downloads is not reliable across hosts, so do not share the
+  directory between nodes over NFS or another network file system. TRT-LLM logs
+  a warning if it detects one.
+- A complete cache is not refreshed when the bucket changes. Launch with
+  `TRTLLM_OBJECT_STORAGE_FORCE_PULL=1` to download it again once, or delete the
+  directory.
+
 ### Load Time Telemetry in CI
 
 We added telemetry in CI to measure non-natice checkpoint I/O policies improve server
