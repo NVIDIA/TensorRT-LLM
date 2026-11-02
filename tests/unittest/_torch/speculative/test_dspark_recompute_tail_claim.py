@@ -16,11 +16,11 @@
 
 The target KV cache manager reads the tail off the spec config, so a cache-hit
 request recomputes the prompt tail a standalone DSpark drafter needs in its
-context.
+context, whether or not a draft pool is paired with the target's block reuse.
 """
 
 import gc
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Iterator
 
 import pytest
@@ -53,8 +53,10 @@ MAX_SEQ_LEN = 256
 
 
 @contextmanager
-def real_manager(tail: int) -> Iterator[KVCacheManagerV2]:
-    """A V2 target manager with block reuse under a standalone DSpark spec config."""
+def real_manager(
+    tail: int, *, is_draft: bool = False, joint: bool = False
+) -> Iterator[KVCacheManagerV2]:
+    """A V2 manager with block reuse under a standalone DSpark spec config."""
     torch.cuda.init()
     gc.collect()
     torch.cuda.empty_cache()
@@ -77,6 +79,8 @@ def real_manager(tail: int) -> Iterator[KVCacheManagerV2]:
         spec_config=DSparkDecodingConfig(
             max_draft_len=4, speculative_model="draft", context_recompute_tail=tail
         ),
+        is_draft=is_draft,
+        joint_kv_cache_reuse=joint,
     )
     try:
         yield manager
@@ -101,23 +105,27 @@ def make_request(request_id: int) -> LlmRequest:
 
 
 def prefill(
-    manager: KVCacheManagerV2, scheduler: KVCacheV2Scheduler, request: LlmRequest
+    managers: tuple[KVCacheManagerV2, ...], scheduler: KVCacheV2Scheduler, request: LlmRequest
 ) -> list[int]:
-    """Run one request's context phase and return the start of each chunk."""
+    """Run one request's context phase through every pool and return each chunk's start."""
     chunk_starts = []
     while request.context_remaining_length > 0:
         output = scheduler.schedule_request([request], set())
         assert [r.py_request_id for r in output.context_requests] == [request.py_request_id]
         batch = ScheduledRequests()
         batch.append_context_request(request)
-        manager.prepare_resources(batch)
+        for manager in managers:
+            manager.prepare_resources(batch)
         chunk_starts.append(request.context_current_position)
         request.move_to_next_context_chunk()
-        manager.update_context_resources(batch)
-    manager.free_resources(request)
+        for manager in managers:
+            manager.update_context_resources(batch)
+    for manager in managers:
+        manager.free_resources(request)
     return chunk_starts
 
 
+@pytest.mark.parametrize("paired", [False, True], ids=["unpaired", "paired"])
 @pytest.mark.parametrize(
     "tail, second_start",
     [
@@ -127,13 +135,19 @@ def prefill(
         (-1, 0),  # a full re-prefill
     ],
 )
-def test_a_dspark_tail_caps_the_reuse_claim(tail: int, second_start: int) -> None:
-    with real_manager(tail) as manager:
+def test_a_dspark_tail_caps_the_reuse_claim(tail: int, second_start: int, paired: bool) -> None:
+    with ExitStack() as stack:
+        target = stack.enter_context(real_manager(tail, joint=paired))
+        draft = (
+            stack.enter_context(real_manager(tail, is_draft=True, joint=True)) if paired else None
+        )
+        managers = (target, draft) if paired else (target,)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=4,
             max_num_tokens=MAX_SEQ_LEN,
-            kv_cache_manager=manager,
+            kv_cache_manager=target,
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            draft_kv_cache_manager=draft,
         )
-        assert prefill(manager, scheduler, make_request(1)) == [0]
-        assert prefill(manager, scheduler, make_request(2)) == [second_start]
+        assert prefill(managers, scheduler, make_request(1)) == [0]
+        assert prefill(managers, scheduler, make_request(2)) == [second_start]
