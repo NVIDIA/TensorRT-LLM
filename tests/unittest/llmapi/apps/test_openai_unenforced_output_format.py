@@ -65,6 +65,13 @@ FORMATS = {
     "responses": {"text": {"format": {"type": "json_schema", "name": "answer", "schema": SCHEMA}}},
     "messages": {"output_config": {"format": {"type": "json_schema", "schema": SCHEMA}}},
 }
+# The chat route rejects a format combined with a forced (named) tool call.
+NAMED_TOOL_CHOICE = {
+    "tools": [{"type": "function", "function": {"name": "lookup", "parameters": SCHEMA}}],
+    "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+}
+# Rejected by the stub server, which has no reasoning parser.
+THINKING_BUDGET = {"thinking_token_budget": 16}
 
 
 class _ModelConfig:
@@ -264,7 +271,30 @@ def test_server_with_a_backend_logs_nothing(served, format_warnings, route, back
     assert format_warnings() == []
 
 
-def test_harmony_chat_format_is_served_and_warned_about(served, format_warnings, monkeypatch):
+@pytest.mark.parametrize(
+    "route, rejected",
+    [
+        pytest.param("chat", NAMED_TOOL_CHOICE, id="chat-named-tool-choice"),
+        pytest.param("chat", THINKING_BUDGET, id="chat-thinking-budget"),
+        pytest.param("completions", THINKING_BUDGET, id="completions-thinking-budget"),
+    ],
+)
+def test_rejected_request_leaves_the_warning_to_a_served_one(
+    served, format_warnings, route, rejected
+):
+    path, body = REQUESTS[route]
+    response = served.client.post(path, json={"model": MODEL, **body, **FORMATS[route], **rejected})
+    assert response.status_code == 400, response.text
+    assert format_warnings() == []
+
+    _post(served, route)
+
+    (warning,) = format_warnings()
+    assert "accepted but not enforced" in warning
+
+
+def _harmony_client(served, monkeypatch):
+    """A client of the stub server's chat route in Harmony (gpt-oss) mode."""
     server = served.server
     server.use_harmony = True
     server.harmony_adapter = SimpleNamespace(get_stop_tokens=lambda: [7])
@@ -273,9 +303,31 @@ def test_harmony_chat_format_is_served_and_warned_about(served, format_warnings,
     )
     app = FastAPI()
     app.add_api_route("/v1/chat/completions", server.chat_harmony, methods=["POST"])
+    return TestClient(app)
 
+
+def test_harmony_rejected_request_leaves_the_warning_to_a_served_one(
+    served, format_warnings, monkeypatch
+):
+    client = _harmony_client(served, monkeypatch)
     path, body = REQUESTS["chat"]
-    response = TestClient(app).post(path, json={"model": MODEL, **body, **FORMATS["chat"]})
+    body = {"model": MODEL, **body, **FORMATS["chat"]}
+
+    response = client.post(path, json={**body, **THINKING_BUDGET})
+    assert response.status_code == 400, response.text
+    assert format_warnings() == []
+
+    response = client.post(path, json=body)
+    assert response.status_code == 200, response.text
+    (warning,) = format_warnings()
+    assert warning.startswith("Chat Completions API: 'response_format'")
+
+
+def test_harmony_chat_format_is_served_and_warned_about(served, format_warnings, monkeypatch):
+    path, body = REQUESTS["chat"]
+    response = _harmony_client(served, monkeypatch).post(
+        path, json={"model": MODEL, **body, **FORMATS["chat"]}
+    )
 
     assert response.status_code == 200, response.text
     (params,) = served.engine_calls

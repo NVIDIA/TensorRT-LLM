@@ -2160,7 +2160,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
-            self._warn_if_output_format_unenforced(sampling_params, "chat")
             if required_tool_grammar:
                 _validate_required_tool_grammar_request(
                     request,
@@ -2260,6 +2259,10 @@ class OpenAIServer(_VideoRoutesMixin):
                         status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
+            # After the checks above, which reject some requests that carry a
+            # format, and before the tool handling below sets a guided decoding
+            # mode of its own.
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
             reasoning_parser_name = self.generator.args.reasoning_parser
             # Message-level (dynamic) tools are a model extension (Kimi API);
             # only models whose extension declares them render them, so other
@@ -3114,13 +3117,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
-            self._warn_if_output_format_unenforced(sampling_params,
-                                                   "completions")
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 tokenizer=self.tokenizer,
             )
+            self._warn_if_output_format_unenforced(sampling_params,
+                                                   "completions")
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
@@ -3290,11 +3293,11 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 reasoning_parser="gpt_oss")
-            self._warn_if_output_format_unenforced(sampling_params, "chat")
             if sampling_params.thinking_token_budget is not None:
                 raise ValueError(
                     "thinking_token_budget is not supported by the Harmony "
                     "GPT-OSS serving path; use reasoning_effort instead")
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             # The server-level effective flag already enables engine metrics
             # for header or JSONL output.
