@@ -168,3 +168,53 @@ def test_fa4_paged_generation_graph_replay_matches_eager():
         torch.cuda.synchronize()
         assert torch.equal(out, eager_out)
         assert torch.equal(pool, eager_pool)
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,rotary_dim,q_len",
+    [(28, 4, 128, 128, 4), (28, 4, 128, 128, 9), (20, 20, 128, 128, 1), (16, 2, 128, 64, 4)],
+)
+@pytest.mark.parametrize("rope", [True, False])
+def test_rope_write_kv_paged_matches_rope_then_write(
+    num_heads, num_kv_heads, head_dim, rotary_dim, q_len, rope
+):
+    """The fused launch leaves the pool as ``rope_qkv_inplace`` + ``write_kv_paged`` do and the Q heads
+    rotated in place the same way (partial rotary, rows whose first tokens fall before
+    position 0 write nothing for them)."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        rope_write_kv_paged,
+        write_kv_paged,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_kernels import (
+        rope_qkv_inplace,
+    )
+
+    device = torch.device("cuda")
+    tpb, rows, width = 32, 13, 8
+    gen = torch.Generator(device=device).manual_seed(0)
+    kv_lens = torch.tensor(
+        [q_len - 1 if q_len > 1 else 1] + [int(x) for x in torch.randint(q_len, width * tpb, (rows - 1,))],
+        dtype=torch.int32,
+        device=device,
+    )
+    page_table = torch.randperm(rows * width, device=device).view(rows, width).to(torch.int32)
+    pool = torch.randn(rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device).bfloat16()
+    cols = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv = torch.randn(rows * q_len, cols + 64, generator=gen, device=device).bfloat16()[:, :cols]
+    cos_sin = torch.randn(width * tpb, rotary_dim, generator=gen, device=device)
+    ref_qkv, ref_pool = qkv.clone(), pool.clone()
+    if rope:
+        rope_qkv_inplace(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                         head_dim=head_dim, rotary_dim=rotary_dim, q_len=q_len)  # fmt: skip
+    q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
+    k = ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim)
+    v = ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim)
+    write_kv_paged(ref_pool, k, v, page_table, kv_lens, q_len)
+    rope_write_kv_paged(qkv, cos_sin if rope else None, pool, page_table, kv_lens, num_heads=num_heads,
+                        num_kv_heads=num_kv_heads, head_dim=head_dim, rotary_dim=rotary_dim, q_len=q_len)  # fmt: skip
+    torch.cuda.synchronize()
+    # V and the rotated Q bit for bit; the rotated K within one bf16 rounding step (the two kernels
+    # may contract the rotation's multiply-adds differently).
+    assert torch.equal(pool[:, 1], ref_pool[:, 1])
+    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=0)
+    assert torch.equal(qkv[:, :q_size], ref_qkv[:, :q_size])
