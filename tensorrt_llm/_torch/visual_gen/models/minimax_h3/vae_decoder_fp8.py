@@ -80,6 +80,6 @@ def convert_decoder_linears_fp8(decoder: nn.Module) -> int:
                     setattr(parent, name, Fp8Linear(child))
                     replaced += 1
     logger.info(
-        f"MiniMax-H3 VAE decoder: {replaced} Linears converted to FP8 per-tensor (lever 14)"
+        f"MiniMax-H3 VAE decoder: {replaced} Linears converted to FP8 per-tensor"
     )
     return replaced

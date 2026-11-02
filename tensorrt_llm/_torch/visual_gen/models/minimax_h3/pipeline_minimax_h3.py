@@ -47,7 +47,7 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
-from .lever14_vae_fp8 import convert_decoder_linears_fp8
+from .vae_decoder_fp8 import convert_decoder_linears_fp8
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -81,19 +81,16 @@ from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
 
-# Lever 14 (§657 box 33): everything outside the transformer steps.
-#   H3_L14_SCHED=1    schedule-only, bit-identical: the per-step velocity check is reduced on
-#                     device and read back once after the loop (one host sync per generation
-#                     instead of two per step), the per-step row-timestep plan moves to the
-#                     device in one transfer, and the audio decode runs on a side stream
-#                     overlapped with the video decode.
-#   H3_L14_VAE_FP8=1  format change (gated): the VAE ViT decoder's Linears run as FP8
-#                     per-tensor GEMMs (lever14_vae_fp8.py).
-#   H3_L14_VAE_TILE=HxW[xO]  format change (gated): VAE decoder spatial tile geometry in pixels
-#                     (tile height x width x minimum overlap, default overlap 32; the shipped
-#                     geometry is 256x256x64). Fewer, larger tiles cut the 1.88x pixel overlap
-#                     of the 256-px tiling on a 544x960 frame; the decoder's RoPE is normalised
-#                     per tile, so this changes the decoded pixels.
+# Opt-in switches for the work outside the transformer steps.
+#   H3_L14_SCHED=1    schedule only, bit-identical: the per-step velocity check is reduced on
+#                     device and read back once after the loop, the per-step row-timestep plan
+#                     moves to the device in one transfer, and the audio decode runs on a side
+#                     stream overlapped with the video decode.
+#   H3_L14_VAE_FP8=1  the VAE ViT decoder's Linears run as FP8 per-tensor GEMMs
+#                     (vae_decoder_fp8.py); changes the decoded pixels.
+#   H3_L14_VAE_TILE=HxW[xO]  VAE decoder spatial tile geometry in pixels (tile height x width x
+#                     minimum overlap, default overlap 32; the default geometry is 256x256x64).
+#                     The decoder's RoPE is normalised per tile, so this changes the decoded pixels.
 _L14_SCHED = os.environ.get("H3_L14_SCHED") == "1"
 _L14_VAE_FP8 = os.environ.get("H3_L14_VAE_FP8") == "1"
 _L14_VAE_TILE = os.environ.get("H3_L14_VAE_TILE", "")
@@ -197,7 +194,7 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
 
 
 def _denoise_check_flags(velocity: torch.Tensor) -> torch.Tensor:
-    """Device-side ``[finite, nonzero]`` for the deferred velocity check (lever 14, no host sync)."""
+    """Device-side ``[finite, nonzero]`` for the deferred velocity check (no host sync)."""
     return torch.stack([torch.isfinite(velocity).all(), velocity.any()])
 
 
@@ -626,7 +623,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                     tile_sample_min_overlap_width=tile[2],
                 )
                 logger.info(
-                    f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]} (lever 14)"
+                    f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]}"
                 )
             _prepare_vae_decoder(self.vae)
             if _L14_VAE_FP8:
@@ -1171,7 +1168,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         Same rank rule as ``BasePipeline.decode_latents`` (parallel-VAE ranks or rank 0 decode,
         the others return ``None``); the audio decoder's kernels are unchanged, so the result is
-        bit-identical to the serial path (lever 14).
+        bit-identical to the serial path.
         """
         if self._parallel_vae_enabled:
             decode_ranks = set(self.pipeline_config.visual_gen_mapping.vae_ranks)
