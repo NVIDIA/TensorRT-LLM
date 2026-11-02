@@ -57,9 +57,10 @@ _RANK_STRIPED_IO_POLICY = "rank_striped_read_ahead"
 _SUPPORTED_IO_POLICIES = (_NATIVE_IO_POLICY, _RANK_STRIPED_IO_POLICY)
 _SUPPORTED_REQUESTED_IO_POLICIES = (_AUTO_IO_POLICY, ) + _SUPPORTED_IO_POLICIES
 # Model families whose checkpoints are too large to materialize in host RAM;
-# their models stream rank-local slices out of the lazy mmapped handles.
+# their models stream rank-local slices out of the lazy mmapped handles. The
+# gate reads the raw config.json, so it names the checkpoint's own model_type.
 _LAZY_SAFETENSORS_MODEL_TYPES = ("kimi_k3", "kimi_linear", "glm5_next",
-                                 "glm5_next_text")
+                                 "glm5_next_text", "muse_spark")
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
 # via TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES.
@@ -367,9 +368,9 @@ class HfWeightLoader(BaseWeightLoader):
         into host RAM.
 
         The listed model families ship checkpoints too large to materialize
-        in host RAM (Kimi K3 is about 1.5 TB), and their models stream
-        rank-local slices (expert-parallel expert ranges) out of the lazy
-        handles during `load_weights`.
+        in host RAM (several hundred GiB to well over a TB; Kimi K3 is about
+        1.5 TB), and their models stream rank-local slices (expert-parallel
+        expert ranges) out of the lazy handles during `load_weights`.
         """
         config_path = os.path.join(checkpoint_dir, "config.json")
         if not os.path.isfile(config_path):
@@ -857,9 +858,11 @@ class HfWeightLoader(BaseWeightLoader):
         setup_error = None
         try:
             plan = build_local_plan(file_sizes, local_rank, local_size)
-            session = RankStripedReadAheadSession(active_communicator,
-                                                  node_communicator,
-                                                  plan).start()
+            session = RankStripedReadAheadSession(
+                active_communicator,
+                node_communicator,
+                plan,
+                checkpoint_bytes=checkpoint_bytes).start()
         except Exception as error:
             setup_error = error
         coordinated_setup_error = coordinate_error(active_communicator,

@@ -123,6 +123,7 @@ def generate_serve_schema() -> dict:
     from tensorrt_llm.llmapi.llm_args import (
         SERVE_CONFIG_ALIASES,
         MoeLoadBalancerConfig,
+        MoePerLayerDynamicLoadBalancerConfig,
         TorchLlmArgs,
     )
 
@@ -141,10 +142,17 @@ def generate_serve_schema() -> dict:
     )
     # Serving treats null as unset before constructing the non-optional telemetry model.
     properties["telemetry_config"] = _nullable(properties["telemetry_config"])
-    # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer().
-    schema["$defs"]["MoeConfig"]["properties"]["load_balancer"] = {
-        "anyOf": [_schema_for(MoeLoadBalancerConfig, schema), {"type": ["string", "null"]}]
-    }
+    # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer(): a mapping
+    # without mode is standard EPLB, so only the per-layer dynamic form requires it.
+    standard, per_layer_dynamic = (
+        {"$ref": f"#/$defs/{model.__name__}"}
+        for model in (MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig)
+    )
+    schema["$defs"]["MoeConfig"]["properties"]["load_balancer"]["anyOf"] = [
+        standard,
+        {**per_layer_dynamic, "required": ["mode"]},
+        {"type": ["string", "null"]},
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

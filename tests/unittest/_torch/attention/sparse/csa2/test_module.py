@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from pydantic import TypeAdapter
 from torch import nn
+from utils.util import skip_blackwell_geforce
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
@@ -496,7 +497,9 @@ def test_ratio2_module_partial_groups(monkeypatch, module_cache, overlap):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
+@pytest.mark.parametrize(
+    "implementation", [pytest.param("flash_mla", marks=skip_blackwell_geforce), "flashinfer"]
+)
 def test_module_composed_flash_helper(monkeypatch, module_cache, implementation):
     _check_ratio2_module_partial_groups(monkeypatch, module_cache, False, implementation)
 

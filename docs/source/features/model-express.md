@@ -30,12 +30,23 @@ profiles:
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `qwen3_5-for-conditional-generation-bf16-complete-v1` | `Qwen3_5VLModel` | `Qwen3_5ForConditionalGeneration` / `qwen3_5` | Complete model | 1 | `trtllm-qwen3_5-dense-vl-complete-layout-v1` | Single-node dense BF16 vision-language model with its vision encoder, unquantized weights and KV cache, TRTLLM attention, fused QK-norm/M-RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
-from the resolved config before model construction, and any runtime constraints
+from the resolved config before model construction, the transfer scope that
+`ModelLoader` derives from the constructed root, and any runtime constraints
 declared by the profile. An unregistered subclass, config alias, or undeclared
 runtime variant does not inherit support. It falls back to the standard Hugging
 Face checkpoint path before any P2P transfer starts.
+
+The Scope column names the part of the model that one transfer carries. A
+text-only root transfers the target model. A multimodal root transfers the
+complete model when it owns its multimodal encoder, which is the aggregated
+serving case. With `disable_mm_encoder`, or in multimodal encoder/prefill
+disaggregation (`TLLM_MULTIMODAL_DISAGGREGATED=1`), the root holds only its
+language model; that scope is not qualified, so those workers fall back.
+Encoder-only workers (`mm_encoder_only`) build the vision-encoder root, which is
+not registered, and fall back too.
 
 The Qwen2 identity includes Qwen2 and Qwen2.5 dense checkpoints that resolve to
 the exact `Qwen2ForCausalLM` / `qwen2` pair and satisfy the constraints above.
@@ -80,6 +91,21 @@ even though no transferred weight of a default-RoPE checkpoint depends on the
 value. Until the model code stops recording it, run both sides with the same
 `max_seq_len`.
 
+The Qwen3.5 dense vision-language identity covers Hugging Face-format
+checkpoints that resolve to the exact `Qwen3_5ForConditionalGeneration` /
+`qwen3_5` pair, served with the vision encoder in the same instance.
+Qwen3.5-9B is the qualified canary and the only checkpoint that the
+donor/receiver rows cover. Checkpoints with tied embeddings, such as
+Qwen3.5-0.8B, 2B, and 4B, quantized checkpoints such as the FP8 and NVFP4
+variants, the Qwen3.5 MoE vision-language root, the text-only
+`Qwen3_5ForCausalLM` root, and the Qwen3-VL roots do not match this profile.
+The root sizes its M-RoPE buffers by `max_num_tokens` (and the PP size), and
+`SourceIdentity` hashes every realized buffer shape, so a donor and a receiver
+must use the same `max_num_tokens` to share weights. The vision configuration
+is bound by the checkpoint artifact identity and the realized vision parameter
+shapes rather than by the model fingerprint, which hashes the text
+configuration.
+
 TensorRT LLM applies two independent compatibility gates:
 
 - The qualification profile records that a model/config/lifecycle combination
@@ -114,6 +140,13 @@ until they are qualified separately. The profiles do not constrain MoE-only
 backend and mapping settings because these dense roots do not consume them.
 `SourceIdentity` still requires donor and receiver configurations to match.
 
+The Qwen3.5 dense vision-language profile carries the vision encoder together
+with the language model and realizes interleaved M-RoPE (`rope_type=mrope`),
+applied by the fused QK-norm/RoPE kernel (`rope_fusion=False`). A YaRN
+`rope_parameters` entry also realizes `mrope`, so the RoPE constraint alone does
+not exclude it; the transferred tensor layout is the same, and `SourceIdentity`
+still requires donor and receiver configurations to match.
+
 ### Adding a Model Family
 
 Support for another model family requires a focused qualification change:
@@ -128,7 +161,11 @@ Support for another model family requires a focused qualification change:
 3. Add an exact qualification profile only after the reusable harness in
    `tests/unittest/utils/post_transform_qualification.py` proves tensor,
    alias, transform-guard, derived-state, and deterministic output
-   equivalence. Include an unregistered-root negative control.
+   equivalence. Include an unregistered-root negative control. Set the
+   case's `prepare_producer` so the producer runs the family's real
+   `load_weights()`; without it the harness cannot see state that only the
+   load path or the weight mapper sets, which a staged receiver never
+   computes.
 4. Cover compatible transfer, source-identity mismatch, unsupported layout or
    protocol/ABI, no-disk staged reception, and unqualified-profile fallback.
    Keep target-plus-draft loading disabled unless that combination has its own
@@ -138,6 +175,10 @@ Support for another model family requires a focused qualification change:
    Compare deterministic output token IDs with the standard Hugging Face load
    path, and require the per-rank weight manifests to match (see the
    qualification test below), before documenting the family as supported.
+6. For a multimodal root, audit the encoder's hooks and load path as well, and
+   register the scope that was qualified. `ModelLoader` derives the scope from
+   parameter ownership: the complete model when the root owns parameters
+   outside its language model, and the language model otherwise.
 
 ### Qualification Test
 
@@ -151,6 +192,11 @@ fallback cannot accidentally satisfy the test.
 Each role generates eight fixed prompts for exactly 32 greedy tokens
 (`end_id=-1`, so no sequence stops early), and the test requires exact
 token-ID equality of the donor and the receiver against the HF baseline.
+Vision-language rows use an image probe instead of token-ID prompts: each of
+`seashore.png` and `inpaint.png` from `LLM_MODELS_ROOT/multimodals/test_data`
+is asked the same four questions, so every role also runs the vision encoder
+and M-RoPE positions, with the same 32-token greedy equality and the same
+engine limits for all roles.
 
 **Weight manifests.** Every rank also writes a SHA-256 manifest of all
 registered parameters and buffers
@@ -197,12 +243,13 @@ durations.
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
-checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
+checkpoint path. The Qwen2, Qwen3, Mistral, Phi3, and Qwen3.5 profile rows use
 `qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`,
-`mistral-bf16-tp1` / `mistral-bf16-tp2`, and `phi3-bf16-tp1` /
-`phi3-bf16-tp2`, with optional model path overrides in
-`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, `TRTLLM_MX_MISTRAL_MODEL`,
-and `TRTLLM_MX_PHI3_MODEL`.
+`mistral-bf16-tp1` / `mistral-bf16-tp2`, `phi3-bf16-tp1` /
+`phi3-bf16-tp2`, and `qwen3_5-bf16-tp1` / `qwen3_5-bf16-tp2`, with optional
+model path overrides in `TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`,
+`TRTLLM_MX_MISTRAL_MODEL`, `TRTLLM_MX_PHI3_MODEL`, and
+`TRTLLM_MX_QWEN3_5_MODEL`.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -269,8 +316,10 @@ A canary needs a bare BF16 reference for its task that was measured on the
 PyTorch backend. The Qwen3 GSM8K entry is the one gated by
 `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
 so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
-Qwen2, or Mistral checkpoint has such a reference today, so those families are
-covered by their smoke rows until one is added.
+Qwen2, Mistral, Phi3, or Qwen3.5 checkpoint has such a reference today, so
+those families are covered by their smoke rows until one is added. A Qwen3.5
+canary must also size its donor exactly like its receiver, because
+`SourceIdentity` binds `max_num_tokens` for that root.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
@@ -420,10 +469,10 @@ path.
 ## Notes and Limitations
 
 - Post-transform MX reception is currently limited to the exact Llama,
-  Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, and Phi3 dense profiles
-  above. Other roots and variants that do not match the documented identity and
-  runtime envelope safely fall back to Hugging Face loading until explicitly
-  qualified.
+  Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, Phi3 dense, and Qwen3.5
+  dense vision-language profiles above. Other roots and variants that do not
+  match the documented identity and runtime envelope safely fall back to
+  Hugging Face loading until explicitly qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
   (`mistral_common` model type), sliding-window or Ministral `layer_types`
   variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
@@ -431,6 +480,10 @@ path.
 - Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
   tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
   multimodal roots are not qualified and use the Hugging Face fallback.
+- Qwen3.5 vision-language checkpoints fall back when they run with speculative
+  decoding (MTP or DFlash), without a local vision encoder (`disable_mm_encoder`
+  or multimodal encoder/prefill disaggregation), as encoder-only workers, with
+  tied embeddings, or with quantized weights.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

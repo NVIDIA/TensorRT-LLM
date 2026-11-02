@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 # Dynamic UMMA N for fused fc1+fc2 swap-AB MegaMoE kernel.
 #
 # Emits the block-scaled UMMA instruction as literal PTX text (via
@@ -34,12 +31,15 @@
 
 from typing import Optional
 
+import cutlass
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import dsl_user_op, Int32, Boolean
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import builtin, llvm
-from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
+from cutlass._mlir.dialects import builtin
+from cutlass._mlir.dialects import llvm
 
 from .....quant_def import QuantKind
+
 
 # =============================================================================
 # Alignment policy (single source of truth)
@@ -223,20 +223,10 @@ def _tcgen05_mma_block_scaled(
     """
     assert cta_group in (1, 2), f"cta_group must be 1 or 2, got {cta_group}"
     assert umma_kind in ("mxf4nvf4", "mxf4", "mxf8f6f4"), f"Unsupported UMMA kind {umma_kind!r}"
-    assert scale_vec_suffix in ("", ".block16", ".block32"), (
-        f"Unsupported suffix {scale_vec_suffix!r}"
-    )
+    assert scale_vec_suffix in ("", ".block16", ".block32"), f"Unsupported suffix {scale_vec_suffix!r}"
     llvm.inline_asm(
         None,
-        [
-            d_tmem_i32,
-            a_desc_i64,
-            b_desc_i64,
-            idesc_i32,
-            enable_input_d_i32,
-            sfa_tmem_i32,
-            sfb_tmem_i32,
-        ],
+        [d_tmem_i32, a_desc_i64, b_desc_i64, idesc_i32, enable_input_d_i32, sfa_tmem_i32, sfb_tmem_i32],
         "{\n\t"
         ".reg .pred p;\n\t"
         "setp.ne.b32 p, $4, 0;\n\t"
