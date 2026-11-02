@@ -136,9 +136,9 @@ if IS_FLASHINFER_AVAILABLE:
         Fa4Prefix,
         Fa4Tail,
         FusedWorkspace,
-        fa4_prefix_splits,
         ctx_prefix_supported,
         default_prefix_splits,
+        fa4_prefix_splits,
         fa4_prefix_supported,
         fused_sampling_attention,
     )
@@ -2530,6 +2530,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         # spec steps on SM90 regardless of TLLM_SAMPLING_SHARED_PREFIX_FUSED setting.
         if not fused and q_len > 1 and graph is not None:
             import torch as _torch
+
             cc = _torch.cuda.get_device_capability(qkv.device)
             if cc == (9, 0):
                 fused = True

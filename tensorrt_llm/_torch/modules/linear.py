@@ -3618,7 +3618,6 @@ linear layers, the LM head) at the shapes of the generation CUDA graphs, with Py
 cuBLASLt's heuristic picks one algorithm per shape; at some token counts it is far from the best
 one (H100, Qwen2.5-7B MLP down projection at 576 tokens: 174 us heuristic, 113 us tuned)."""
 
-
 CUDA_GRAPH_GEMM_TUNING_FILE_ENV = "TLLM_CUDA_GRAPH_GEMM_TUNING_FILE"
 """Optional TunableOp results file (one per device, the ordinal is appended): read before tuning,
 so known shapes are not tuned again, and written at exit."""
