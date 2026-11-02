@@ -425,9 +425,12 @@ def _gather_q_kernel(
     D: tl.constexpr,
     QL: tl.constexpr,
     HAS_PERM: tl.constexpr,
+    SPLITS: tl.constexpr = 1,
 ):
-    # Grouped token t = position * QL + j reads the batch row perm[position].
+    # Grouped token t = position * QL + j reads the batch row perm[position]; it is written
+    # SPLITS times, copy s at token s * ntok + t (ntok = the grid size).
     t = tl.program_id(0)
+    ntok = tl.num_programs(0)
     pos = t // QL
     j = t % QL
     if HAS_PERM:
@@ -439,7 +442,9 @@ def _gather_q_kernel(
     mask = (heads < H)[:, None]
     src = q_ptr + (row * QL + j) * q_sb + heads[:, None] * q_sh + dims[None, :]
     dst = out_ptr + t.to(tl.int64) * (H * D) + heads[:, None] * D + dims[None, :]
-    tl.store(dst, tl.load(src, mask=mask, other=0.0), mask=mask)
+    x = tl.load(src, mask=mask, other=0.0)
+    for split in tl.static_range(SPLITS):
+        tl.store(dst + split * ntok.to(tl.int64) * (H * D), x, mask=mask)
 
 
 @triton.jit
@@ -598,11 +603,15 @@ class Fa4Prefix(CtxPrefix):
     TILE_MN = (128, 128)
     NUM_THREADS = 384
 
-    def __init__(self, tokens: int, num_heads: int, *args, **kwargs):
-        super().__init__(tokens, num_heads, *args, **kwargs)
-        # FA4's own LSE layout: [heads, tokens], natural log.
+    def __init__(self, tokens: int, num_heads: int, *args, splits: int = 1, **kwargs):
+        # ``splits`` > 1 (with ``Fa4Tail`` only): the queries are replicated ``splits`` times and
+        # copy ``s`` attends the ``s``-th run of the group's pages (``_ctx_tables``).
+        super().__init__(tokens * splits, num_heads, *args, **kwargs)
+        self.splits = splits
+        self.tokens = tokens
+        # FA4's own LSE layout: [heads, splits * tokens], natural log.
         self.lse_nat = torch.empty(
-            (num_heads, tokens), dtype=torch.float32, device=self.lse.device
+            (num_heads, tokens * splits), dtype=torch.float32, device=self.lse.device
         )
 
     def run(self, pool: torch.Tensor, sm_scale: float, base2_lse: bool = True) -> None:
@@ -685,10 +694,12 @@ def _merge_fa4_tail_kernel(
     QL: tl.constexpr,
     HAS_PERM: tl.constexpr,
     HAS_EMPTY: tl.constexpr,
+    PREFIX_SPLITS: tl.constexpr = 1,
 ):
-    # One program per grouped token t: the prefix state (normalized output, grouped order,
-    # LSE [heads, tokens]) joins the tail state (normalized output, batch order, LSE
-    # [rows, heads, QL]); both LSEs are FA4's natural log.
+    # One program per grouped token t: the prefix states (normalized outputs, grouped order,
+    # copy s of token t at s * ntok + t, LSE [heads, PREFIX_SPLITS * ntok]) join the tail
+    # state (normalized output, batch order, LSE [rows, heads, QL]); all LSEs are FA4's
+    # natural log (an empty prefix split has LSE -inf).
     LOG2E: tl.constexpr = 1.4426950408889634
     t = tl.program_id(0)
     pos = t // QL
@@ -701,24 +712,39 @@ def _merge_fa4_tail_kernel(
     heads = tl.arange(0, HP)
     h_ok = heads < H
     dims = tl.arange(0, D)
-    lse_p = tl.load(pre_lse_ptr + heads * ntok + t, mask=h_ok, other=_NEG) * LOG2E
+    stride_l: tl.constexpr = PREFIX_SPLITS
+    empty = False
     if HAS_EMPTY:
-        lse_p = tl.where(tl.load(pempty_ptr + pos) != 0, _NEG, lse_p)
+        empty = tl.load(pempty_ptr + pos) != 0
     lse_t = tl.load(tail_lse_ptr + (row * H + heads) * QL + j, mask=h_ok, other=_NEG) * LOG2E
-    peak = tl.maximum(lse_p, lse_t)
-    w_p = tl.exp2(lse_p - peak)
+    peak = lse_t
+    for sp in tl.static_range(PREFIX_SPLITS):
+        lse_p = tl.load(
+            pre_lse_ptr + heads * (stride_l * ntok) + sp * ntok + t, mask=h_ok, other=_NEG
+        )
+        lse_p = tl.where(empty, _NEG, tl.maximum(lse_p * LOG2E, _NEG))
+        peak = tl.maximum(peak, lse_p)
     w_t = tl.exp2(lse_t - peak)
-    pre = tl.load(
-        pre_out_ptr + (t.to(tl.int64) * H + heads[:, None]) * D + dims[None, :],
-        mask=h_ok[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    tail = tl.load(
+    l_tot = w_t
+    res = w_t[:, None] * tl.load(
         tail_out_ptr + (tok * H + heads[:, None]) * D + dims[None, :],
         mask=h_ok[:, None],
         other=0.0,
     ).to(tl.float32)
-    res = (w_p[:, None] * pre + w_t[:, None] * tail) / (w_p + w_t)[:, None]
+    for sp in tl.static_range(PREFIX_SPLITS):
+        lse_p = tl.load(
+            pre_lse_ptr + heads * (stride_l * ntok) + sp * ntok + t, mask=h_ok, other=_NEG
+        )
+        lse_p = tl.where(empty, _NEG, tl.maximum(lse_p * LOG2E, _NEG))
+        w_p = tl.exp2(lse_p - peak)
+        pre = tl.load(
+            pre_out_ptr + ((sp * ntok + t).to(tl.int64) * H + heads[:, None]) * D + dims[None, :],
+            mask=h_ok[:, None] & (w_p > 0)[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        l_tot += w_p
+        res += w_p[:, None] * pre
+    res = res / l_tot[:, None]
     tl.store(
         out_ptr + tok * out_sb + heads[:, None] * D + dims[None, :],
         res.to(out_ptr.dtype.element_ty),
@@ -738,10 +764,21 @@ class Fa4Tail:
     """
 
     def __init__(
-        self, rows: int, q_len: int, num_heads: int, head_dim: int, max_pages: int, dtype, device
+        self,
+        rows: int,
+        q_len: int,
+        num_heads: int,
+        head_dim: int,
+        max_pages: int,
+        dtype,
+        device,
+        splits: int = 1,
     ):
+        # ``splits`` > 1: the private pages are attended split-KV (``fa4_paged_generation_split``).
         self.rows = rows
         self.q_len = q_len
+        self.splits = splits
+        self.split_tables = None
         self.table = torch.zeros((rows, max_pages), dtype=torch.int32, device=device)
         self.tail_lens = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.out = torch.empty((rows * q_len, num_heads, head_dim), dtype=dtype, device=device)
@@ -773,10 +810,22 @@ class Fa4Tail:
             shared_pages, kv_lens, self.table, self.table.stride(0), self.tail_lens,
             width, page_div, TPB=tokens_per_block, BLOCK=block, HAS_PERM=perm is not None,
         )  # fmt: skip
+        if self.splits > 1:
+            from .flash_attn4_generation import split_tables
+
+            self.split_tables = split_tables(
+                self.table, self.tail_lens, self.q_len, self.splits, tokens_per_block
+            )
 
     def run(
-        self, pool: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
+        self,
+        pool: torch.Tensor,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        sm_scale: float,
     ) -> None:
+        """Attend the private pages; ``k`` None: the step's K/V is already in them."""
         from .flash_attn4_generation import (
             FA4_NUM_THREADS,
             FA4_TILE_MN,
@@ -785,7 +834,15 @@ class Fa4Tail:
         )
 
         tokens, num_heads, head_dim = q.shape
-        write_kv_paged(pool, k, v, self.table, self.tail_lens, self.q_len)
+        if k is not None:
+            write_kv_paged(pool, k, v, self.table, self.tail_lens, self.q_len)
+        if self.splits > 1:
+            from .flash_attn4_generation import fa4_paged_generation_split
+
+            fa4_paged_generation_split(
+                pool, q, self.out, self.split_tables, self.q_len, self.splits, sm_scale, lse=self.lse
+            )
+            return
         _fa4_forward()(
             q.view(self.rows, self.q_len, num_heads, head_dim),
             pool[:, 0].transpose(1, 2),
@@ -802,6 +859,29 @@ class Fa4Tail:
             return_lse=True,
             lse=self.lse,
         )
+
+
+FA4_PREFIX_MAX_SPLITS = 8
+
+
+def fa4_prefix_splits(
+    rows: int, q_len: int, num_heads: int, num_kv_heads: int, num_sms: int
+) -> int:
+    """KV splits of the FA4 prefix call of a captured batch size.
+
+    The prefix call launches about one CTA per (request, KV head, 128-row tile of the
+    request's packed GQA queries) and walks the group's whole prompt in it; a batch of a few
+    rows (a single group) then runs a handful of CTAs: on H100 (Qwen2.5-7B, K=8, 4 rows,
+    4k-token prompt) 8 CTAs. When the rows' query tiles fill less than half the SMs, the
+    group's pages are cut into up to one wave's worth of runs (at most
+    ``FA4_PREFIX_MAX_SPLITS``), each attended by a copy of the queries.
+    """
+    gqa = max(num_heads // max(num_kv_heads, 1), 1)
+    tiles = max(1, -(-(rows * q_len * gqa) // Fa4Prefix.TILE_MN[0]))
+    ctas = tiles * (num_kv_heads if gqa > 1 else num_heads)
+    if 2 * ctas > num_sms:
+        return 1
+    return max(1, min(FA4_PREFIX_MAX_SPLITS, -(-num_sms // ctas)))
 
 
 def fa4_prefix_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
@@ -960,6 +1040,7 @@ def fused_sampling_attention(
     sm90_tune: bool = True,  # apply SM90-specific tuning (evict_last already in kernel)
     ctx: Optional[CtxPrefix] = None,
     fa4_tail: Optional[Fa4Tail] = None,
+    fa4_tail_kv_written: bool = False,
 ) -> None:
     """One layer: persist the step's K/V, attend prefix + tail, write ``out`` (batch order).
 
@@ -994,6 +1075,7 @@ def fused_sampling_attention(
         fa4_tail: with an ``Fa4Prefix`` ``ctx``, serve the private pages through FlashAttention-4
             (see ``Fa4Tail``; its tables must be built for this step) instead of the Triton tail
             launch; the tail arguments and the workspace are then unused.
+            ``fa4_tail_kv_written``: the step's K/V is already in the private pages.
     """
     ntok, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
@@ -1042,21 +1124,24 @@ def fused_sampling_attention(
         )  # fmt: skip
 
     if ctx is not None:
+        prefix_splits_ctx = getattr(ctx, "splits", 1)
+        assert prefix_splits_ctx == 1 or fa4_tail is not None
         _gather_q_kernel[(ntok,)](
             q, q.stride(0), q.stride(1), perm if perm is not None else write_page, ctx.q,
             H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, QL=q_len,
-            HAS_PERM=perm is not None, num_warps=4,
+            HAS_PERM=perm is not None, SPLITS=prefix_splits_ctx, num_warps=4,
         )  # fmt: skip
         if fa4_tail is not None:
             assert isinstance(ctx, Fa4Prefix)
             ctx.run(pool, sm_scale, base2_lse=False)
-            fa4_tail.run(pool, q, k, v, sm_scale)
+            fa4_tail.run(pool, q, None if fa4_tail_kv_written else k, v, sm_scale)
             _merge_fa4_tail_kernel[(ntok,)](
                 ctx.out, ctx.lse_nat, fa4_tail.out, fa4_tail.lse,
                 perm if perm is not None else write_page,
                 prefix_empty if prefix_empty is not None else write_page, out, out.stride(0), ntok,
                 H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, QL=q_len,
-                HAS_PERM=perm is not None, HAS_EMPTY=prefix_empty is not None, num_warps=4,
+                HAS_PERM=perm is not None, HAS_EMPTY=prefix_empty is not None,
+                PREFIX_SPLITS=prefix_splits_ctx, num_warps=4,
             )  # fmt: skip
             return
         ctx.run(pool, sm_scale)
