@@ -755,7 +755,9 @@ def test_dsa_mixed_precision_high_tables_refresh_full_width():
 
     def manager():
         return SimpleNamespace(
-            mixed_precision_high_layers={0: 1}, pp_layers=[0], fill_mixed_precision_high_page_table=fill
+            mixed_precision_high_layers={0: 1},
+            pp_layers=[0],
+            fill_mixed_precision_high_page_table=fill,
         )
 
     meta = SimpleNamespace(
@@ -773,7 +775,10 @@ def test_dsa_mixed_precision_high_tables_refresh_full_width():
     DSAtrtllmAttentionMetadata._fill_mixed_precision_high_block_tables(meta)
 
     expected = torch.tensor([[100] * 3 + [-1] * 3, [101] + [-1] * 5], dtype=torch.int32)
-    for table in (meta.mixed_precision_high_block_table, meta.draft_mixed_precision_high_block_table):
+    for table in (
+        meta.mixed_precision_high_block_table,
+        meta.draft_mixed_precision_high_block_table,
+    ):
         assert torch.equal(table[:2], expected)
 
 
@@ -983,7 +988,9 @@ def test_overlay_mixed_precision_high_rows_copies_held_rows(shared_rows):
     for table in tables:
         scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
         meta = SimpleNamespace(mixed_precision_high_block_table=table, kv_cache_manager=manager)
-        overlay_mixed_precision_high_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
+        overlay_mixed_precision_high_rows(
+            owner, meta, topk_indices, requests, compact, scratch, shared_rows
+        )
 
         expected = torch.zeros_like(scratch)
         for q in range(queries):

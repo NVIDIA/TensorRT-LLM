@@ -540,7 +540,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
             # Any mixed-precision high layer of this ratio shares the pool.
             self._fill_mixed_precision_high_block_table(
-                self.kv_cache_manager, self._mixed_precision_high_table_layers[compress_ratio], high_table
+                self.kv_cache_manager,
+                self._mixed_precision_high_table_layers[compress_ratio],
+                high_table,
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):

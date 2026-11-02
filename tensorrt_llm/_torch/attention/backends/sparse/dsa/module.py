@@ -88,7 +88,9 @@ def forward_context_sparse_attn(
         )
         # The append kernel wrote the NVFP4 pool; also write the FP8 high layer.
         if attn_metadata.has_mixed_precision_high_rows:
-            store_mixed_precision_high_context_rows(self.mqa, attn_metadata, latent_cache, position_ids)
+            store_mixed_precision_high_context_rows(
+                self.mqa, attn_metadata, latent_cache, position_ids
+            )
         return self.forward_absorption_context(
             q,
             compressed_kv,

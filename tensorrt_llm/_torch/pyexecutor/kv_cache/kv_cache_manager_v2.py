@@ -4129,7 +4129,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 // self.num_kv_heads_per_layer[layer_offset]
             )
         else:
-            layer, dtype = self.mixed_precision_high_layers[layer_offset], self.mixed_precision_high_dtype
+            layer, dtype = (
+                self.mixed_precision_high_layers[layer_offset],
+                self.mixed_precision_high_dtype,
+            )
             width = self.head_dim_per_layer[layer_offset]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
@@ -4184,7 +4187,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self, request_ids: list[int], layer_idx: int, out: np.ndarray
     ) -> None:
         """Write the ``(batch, pages)`` page table of ``layer_idx``'s high layer."""
-        self._fill_page_table(self.mixed_precision_high_layers[self.layer_offsets[layer_idx]], request_ids, out)
+        self._fill_page_table(
+            self.mixed_precision_high_layers[self.layer_offsets[layer_idx]], request_ids, out
+        )
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
