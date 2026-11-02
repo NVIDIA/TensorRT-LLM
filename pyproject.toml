@@ -841,6 +841,7 @@ max-args = 10
 # Keep the existing diagnostic scope while adopting Pyrefly's error names.
 preset = "off"
 project-includes = ["tensorrt_llm"]
+# Shared by Pyrefly project checks and the changed-file/report filters.
 project-excludes = [
     "tensorrt_llm/_torch/kernels/**",
     "tensorrt_llm/_torch/visual_gen/kernels/**",
@@ -854,6 +855,7 @@ search-path = ["."]
 python-version = "3.10"
 check-unannotated-defs = true
 infer-return-types = "never"
+# Missing-module exclusions belong here; name/alias exceptions are in tool.pyrefly-exclusions.
 ignore-missing-imports = [
     "torch.*",
     "tensorrt_llm.bindings",
@@ -873,24 +875,25 @@ ignore-missing-imports = [
     "cute.*",
     "cuda",
     "cuda.*",
-    "tensorrt_llm.deep_gemm*",
-    "tensorrt_llm.deep_ep*",
-    "tensorrt_llm.flash_mla*",
-    "tensorrt_llm.tensorrt_llm_transfer_agent_binding*",
-    "fast_hadamard_transform*",
-    "fmha_sm100*",
+    "tensorrt_llm.deep_gemm.*",
+    "tensorrt_llm.deep_ep.*",
+    "tensorrt_llm.flash_mla.*",
+    "tensorrt_llm.flash_mla_cpp_tllm.*",
+    "tensorrt_llm.tensorrt_llm_transfer_agent_binding.*",
+    "fast_hadamard_transform.*",
+    "fmha_sm100.*",
     "ray",
     "ray.*",
-    "transformer_engine_torch*",
-    "gpu_memory_service*",
-    "deep_gemm*",
-    "cosmos_guardrail*",
-    "torchaudio*",
-    "av*",
-    "cv2*",
+    "transformer_engine_torch.*",
+    "gpu_memory_service.*",
+    "deep_gemm.*",
+    "cosmos_guardrail.*",
+    "torchaudio.*",
+    "av.*",
+    "cv2.*",
     "smg_grpc_proto",
     "smg_grpc_proto.*",
-    "transformers_modules*",
+    "transformers_modules.*",
 ]
 replace-imports-with-any = [
     "etcd3",
@@ -907,24 +910,25 @@ replace-imports-with-any = [
     "cute.*",
     "cuda",
     "cuda.*",
-    "tensorrt_llm.deep_gemm*",
-    "tensorrt_llm.deep_ep*",
-    "tensorrt_llm.flash_mla*",
-    "tensorrt_llm.tensorrt_llm_transfer_agent_binding*",
-    "fast_hadamard_transform*",
-    "fmha_sm100*",
+    "tensorrt_llm.deep_gemm.*",
+    "tensorrt_llm.deep_ep.*",
+    "tensorrt_llm.flash_mla.*",
+    "tensorrt_llm.flash_mla_cpp_tllm.*",
+    "tensorrt_llm.tensorrt_llm_transfer_agent_binding.*",
+    "fast_hadamard_transform.*",
+    "fmha_sm100.*",
     "ray",
     "ray.*",
-    "transformer_engine_torch*",
-    "gpu_memory_service*",
-    "deep_gemm*",
-    "cosmos_guardrail*",
-    "torchaudio*",
-    "av*",
-    "cv2*",
+    "transformer_engine_torch.*",
+    "gpu_memory_service.*",
+    "deep_gemm.*",
+    "cosmos_guardrail.*",
+    "torchaudio.*",
+    "av.*",
+    "cv2.*",
     "smg_grpc_proto",
     "smg_grpc_proto.*",
-    "transformers_modules*",
+    "transformers_modules.*",
 ]
 
 [tool.pyrefly.errors]
@@ -936,3 +940,31 @@ bad-argument-count = "error"
 missing-argument = "error"
 unexpected-keyword = "error"
 unexpected-positional-argument = "error"
+
+# Custom report-filter settings read by scripts/pyrefly_exclusion.py, not Pyrefly.
+[tool.pyrefly-exclusions]
+symbols = [
+    "etcd3.MultiEndpointEtcd3Client",
+    "etcd3.Lease",
+    "tl.*",
+    "PreTrainedConfig",
+    "CSA2TrtllmMetadata",
+    "MoEImplBase",
+    "ir.*",
+    "BaseResourceManager",
+    "TrtllmAttentionMetadata",
+    "BaseWeightMapper",
+    "BaseMoeRoutingMethod",
+    "SpecMetadata",
+    "ParakeetEncoderConfig",
+    "AttentionMetadata",
+    "ctm.Constexpr",
+    "ctm.GridConstant",
+    "cutlass.Constexpr",
+    "cute.Pointer",
+    "cuda.CUstream",
+    "cutlass.GridConstant",
+    "cutlass.cute.*",
+    "cuda.bindings.driver.CUstream",
+    "cute.Coord",
+]

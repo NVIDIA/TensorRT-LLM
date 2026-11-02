@@ -6,7 +6,8 @@
 # --full-project. Add --rebase-upstream to check the current branch (or HEAD
 # when detached) in a new worktree rebased on upstream main and emit its diff.
 # Rebased checks include non-ignored untracked product Python files.
-# Excluded paths and third-party symbols are removed from the JSON report by
+# Paths from tool.pyrefly.project-excludes and symbols from
+# tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
 # scripts/pyrefly_exclusion.py. This hook is advisory and always returns success;
 # the filtered diagnostic report is written to pyrefly_final_report.json and
 # up to eight diagnostics are printed to stdout when the check finishes.
@@ -78,7 +79,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 EXCLUSION_SCRIPT="$SCRIPT_DIR/pyrefly_exclusion.py"
-EXCLUSIONS_CONFIG="$SCRIPT_DIR/pyrefly_exclusion.json"
+EXCLUSIONS_CONFIG="$PROJECT_DIR/pyproject.toml"
 WORKFLOW_SCRIPT="$SCRIPT_DIR/pyrefly_workflow.py"
 REPORT_FILE="${PYREFLY_REPORT_PATH:-$PROJECT_DIR/pyrefly_final_report.json}"
 PYREFLY_OUTPUT=""
