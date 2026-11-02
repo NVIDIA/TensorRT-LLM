@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+__extra_import_path__ = ["~/jenkins/scripts/cbts"]
 from cbts.blocks import Stage, YAMLIndex, compute_stage_test_counts, write_filtered_test_db
 from cbts.command.main import _load_pr_inputs
 from cbts.rules.base import PRInputs, RuleResult
