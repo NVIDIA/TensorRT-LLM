@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
 )
+from tensorrt_llm._torch.attention.backends.sparse.hooks import has_sparse_mla_hooks
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm.mapping import Mapping
 
@@ -64,17 +65,18 @@ def build_attention_metadata(
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
     sparse_attention_config = model_config.sparse_attention_config
+    sparse_mla = has_sparse_mla_hooks(getattr(sparse_attention_config, "algorithm", None))
     if enable_context_mla_with_cached_kv is None:
         # Dense owner-only Helix prefill needs append indptrs even without cached tokens.
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
             attention_runtime_features.cache_reuse
             or attention_runtime_features.chunked_prefill
-            or (sparse_attention_config is None and mapping.has_cp_helix())
+            or (not sparse_mla and mapping.has_cp_helix())
         )
     elif (
         enable_context_mla_with_cached_kv is False
         and is_mla(pretrained_config)
-        and sparse_attention_config is None
+        and not sparse_mla
         and mapping.has_cp_helix()
     ):
         raise ValueError(

@@ -235,10 +235,11 @@ def test_build_attention_metadata_explicit_disable(
         constructor.assert_called_once()
 
 
+@pytest.mark.parametrize("sparse_algorithm", [None, "skip_softmax"])
 @pytest.mark.parametrize("override", [None, True])
 @pytest.mark.parametrize("rank", [0, 1])
 def test_build_attention_metadata_helix_mla_preparation_lifecycle(
-    monkeypatch: pytest.MonkeyPatch, override: bool | None, rank: int
+    monkeypatch: pytest.MonkeyPatch, override: bool | None, rank: int, sparse_algorithm: str | None
 ) -> None:
     """Run real allocation/preparation logic with only CUDA storage replaced."""
     monkeypatch.setattr(
@@ -267,7 +268,13 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
     )
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
-        sparse_attention_config=None,
+        sparse_attention_config=(
+            SimpleNamespace(
+                algorithm=sparse_algorithm, to_sparse_metadata_params=Mock(return_value=None)
+            )
+            if sparse_algorithm is not None
+            else None
+        ),
         enable_flash_mla=False,
     )
     metadata = build_attention_metadata(
@@ -288,7 +295,6 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
         kv_cache_manager=manager,
         enable_context_mla_with_cached_kv=override,
     )
-    assert metadata.enable_context_mla_with_cached_kv is True
     # Fresh mixed batch, decode-only, then changed fresh context on the same object.
     for lengths, num_contexts, cached in [
         ([17, 3, 1], 2, [0, 0, 9]),
@@ -324,6 +330,28 @@ def test_build_attention_metadata_helix_mla_preparation_lifecycle(
                 assert indptr.dtype == torch.int64
                 assert indptr[:3].tolist() == expected_indptr
     assert manager.copy_batch_block_offsets.call_count == 3
+
+
+def test_build_attention_metadata_dense_sparse_config_rejects_explicit_disable() -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        sparse_attention_config=SimpleNamespace(algorithm="skip_softmax"),
+        enable_flash_mla=False,
+    )
+    constructor = Mock()
+    with pytest.raises(ValueError, match="Helix MLA requires enable_context_mla_with_cached_kv"):
+        build_attention_metadata(
+            model_config,
+            max_batch_size=4,
+            max_num_tokens=16,
+            max_beam_width=1,
+            attention_backend=SimpleNamespace(Metadata=constructor),
+            attention_runtime_features=AttentionRuntimeFeatures(),
+            mapping=Mapping(world_size=2, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            cache_indirection=None,
+            enable_context_mla_with_cached_kv=False,
+        )
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize(

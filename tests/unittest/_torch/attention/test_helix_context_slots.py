@@ -16,6 +16,7 @@ pytestmark = pytest.mark.cpu_only
 def _metadata(cp_size: int, rank: int, page: int) -> SimpleNamespace:
     lengths = [1, 65, 2, 63, 0, 3, 67, 65]
     return SimpleNamespace(
+        enable_context_mla_with_cached_kv=True,
         num_contexts=len(lengths),
         num_ctx_tokens=sum(lengths),
         seq_lens=torch.tensor(lengths + [1, 2], dtype=torch.int32),
@@ -66,7 +67,9 @@ def test_helix_context_slots(cp_size: int, page: int) -> None:
     )
 
 
-@pytest.mark.parametrize("phase", ["decode", "no_cache", "no_manager", "legacy_manager", "no_cp"])
+@pytest.mark.parametrize(
+    "phase", ["decode", "no_cache", "no_manager", "legacy_manager", "no_cp", "disabled"]
+)
 def test_helix_context_slots_reset(phase: str) -> None:
     metadata = _metadata(2, 0, 64)
     metadata.helix_context_local_slots = torch.tensor([123], dtype=torch.int32)
@@ -79,13 +82,15 @@ def test_helix_context_slots_reset(phase: str) -> None:
         metadata.kv_cache_manager = None
     elif phase == "legacy_manager":
         metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=64)
+    elif phase == "disabled":
+        metadata.enable_context_mla_with_cached_kv = False
     else:
         metadata.kv_cache_manager.mapping = Mapping()
     TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
     assert metadata.helix_context_local_slots is None
 
 
-@pytest.mark.parametrize("phase", ["decode", "no_cp"])
+@pytest.mark.parametrize("phase", ["decode", "no_cp", "disabled"])
 def test_helix_context_slots_metadata_reuse(phase: str) -> None:
     """The host planner clears and recomputes slots on the same metadata object."""
     cp_size, rank, page = 2, 1, 16
@@ -118,8 +123,10 @@ def test_helix_context_slots_metadata_reuse(phase: str) -> None:
         metadata.num_ctx_tokens = 0
         metadata.seq_lens = torch.tensor([1, 2], dtype=torch.int32)
         cached = cached[-2:]
-    else:
+    elif phase == "no_cp":
         metadata.kv_cache_manager.mapping = Mapping()
+    else:
+        metadata.enable_context_mla_with_cached_kv = False
     TrtllmAttentionMetadata._prepare_helix_context_slots(metadata, cached)
     assert metadata.helix_context_local_slots is None
     torch.testing.assert_close(metadata.helix_position_offsets, positions)
@@ -130,4 +137,5 @@ def test_helix_context_slots_metadata_reuse(phase: str) -> None:
     metadata.num_ctx_tokens = sum(lengths)
     metadata.seq_lens = torch.tensor(lengths + [1, 2], dtype=torch.int32)
     metadata.kv_cache_manager.mapping = mapping
+    metadata.enable_context_mla_with_cached_kv = True
     check_slots(torch.tensor([15, 16, 33, 5, 7], dtype=torch.int32))
