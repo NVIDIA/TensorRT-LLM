@@ -72,7 +72,7 @@ HALO_R_PREFIX_STRIDE = 384
 #: The relay copy accepts at most this many weight planes.
 HALO_R_MAX_PLANES = 8
 #: The relay splits a weight plane into slices of this size.
-HALO_R_RELAY_SLICE_BYTES = 8192
+HALO_R_RELAY_SLICE_BYTES = 32768
 #: Diagnostic counters: launches, receiver copies and receiver skips.
 HALO_R_COUNTERS = 3
 #: READY cells are uint64.

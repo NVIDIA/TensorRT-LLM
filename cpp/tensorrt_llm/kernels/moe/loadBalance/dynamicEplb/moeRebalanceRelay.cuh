@@ -47,9 +47,10 @@ namespace kernels
 namespace
 {
 
-//! Issuer warps per CTA and ring slots per issuer warp: each issuer keeps up to three loads in flight.
-constexpr int kRelayMaxIssuers = 6;
-constexpr int kRelaySlotsPerIssuer = 4;
+//! Issuer warps per CTA and ring slots per issuer: each issuer keeps up to two loads in flight. An issuer completes
+//! about one slice per round trip whatever the slice size, so the SM's rate grows with the slice (kRelaySliceBytes).
+constexpr int kRelayMaxIssuers = 2;
+constexpr int kRelaySlotsPerIssuer = 3;
 constexpr std::uint64_t kRelayBulkAlignment = 16;
 constexpr std::uint64_t kRelayWordAlignment = 4;
 //! Back-off between polls of a slot's load barrier.

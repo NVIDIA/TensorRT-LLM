@@ -41,8 +41,8 @@ namespace kernels
 namespace halo_r
 {
 
-//! One relay slice: one bulk copy into one shared-memory slot, the slice size of the TMA copy.
-constexpr unsigned long long kRelaySliceBytes = 8192ULL;
+//! One relay slice: one bulk copy into one shared-memory slot.
+constexpr unsigned long long kRelaySliceBytes = 32768ULL;
 //! Weight planes per expert bundle the relay accepts.
 constexpr int kRelayMaxPlanes = 8;
 
