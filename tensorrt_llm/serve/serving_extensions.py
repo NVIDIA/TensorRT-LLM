@@ -87,8 +87,15 @@ class ServingExtension:
         return False
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
-        """Dump one request tool into the dict handed to the chat template."""
-        return tool.model_dump()
+        """Dump one request tool into the dict handed to the chat template.
+
+        An optional field the client left unset or ``null`` (``strict``,
+        ``description``, ``parameters``) is omitted rather than dumped as
+        ``null``, which a template that prints tools as JSON would show the
+        model. Every other field, such as a ``strict`` the client set, is kept,
+        and ``parameters`` is passed through as sent.
+        """
+        return tool.model_dump(exclude_none=True)
 
     def dynamic_tools(self, messages) -> List[Dict[str, Any]]:
         """Tool declarations carried on messages rather than on the request."""

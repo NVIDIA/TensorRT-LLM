@@ -36,9 +36,10 @@ class DeepseekV41ServingExtension(ServingExtension):
         beside ``function``. It shows the tool as ``<namespace>::<name>``, the
         name the model was trained to call it by, and puts the namespace
         description in front of the tool's own. A tool without a namespace is
-        dumped exactly as on the generic path.
+        dumped exactly as on the generic path. Like that path, the namespaced
+        form leaves out a description the tool or its namespace did not declare.
         """
-        dumped = tool.model_dump()
+        dumped = super().serialize_tool(tool)
         if not isinstance(tool, NamespacedFunctionToolParam):
             return dumped
         if "::" in tool.namespace or "::" in tool.declared_name:
@@ -46,12 +47,15 @@ class DeepseekV41ServingExtension(ServingExtension):
             return dumped
         function = dumped["function"]
         function["name"] = tool.declared_name
-        function["description"] = tool.declared_description
+        if tool.declared_description is None:
+            function.pop("description", None)
+        else:
+            function["description"] = tool.declared_description
+        namespace = {"name": tool.namespace}
+        if tool.namespace_description is not None:
+            namespace["description"] = tool.namespace_description
         return {
             "type": dumped["type"],
-            "namespace": {
-                "name": tool.namespace,
-                "description": tool.namespace_description,
-            },
+            "namespace": namespace,
             "function": function,
         }

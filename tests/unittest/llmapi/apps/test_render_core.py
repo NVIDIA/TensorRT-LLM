@@ -93,13 +93,21 @@ class TestRenderChat:
         assert result.token_ids == ids
         assert result.prefix_applied is False
 
-    def test_tools_reach_the_template(self, tokenizer) -> None:
-        request = chat_request(tools=[WEATHER_TOOL])
-        text, ids = _expected_ids(tokenizer, request, tools=[t.model_dump() for t in request.tools])
+    @pytest.mark.parametrize("strict", [None, True], ids=["no_strict", "strict"])
+    def test_tools_reach_the_template_as_the_client_declared_them(self, tokenizer, strict) -> None:
+        tool = copy.deepcopy(WEATHER_TOOL)
+        if strict is not None:
+            tool["function"]["strict"] = strict
+        request = chat_request(tools=[tool])
+        text, ids = _expected_ids(tokenizer, request, tools=[tool])
 
         result = render_chat(request, resources(tokenizer))
 
-        assert "get_weather" in result.text  # the real template prints the tool schema
+        # The real template prints each tool as JSON: no field the client left out
+        # shows up as null, and one it set is printed.
+        assert "get_weather" in result.text
+        assert ('"strict"' in result.text) is (strict is not None)
+        assert result.text == text
         assert result.token_ids == ids
 
     def test_tokenize_false_leaves_only_the_text(self, tokenizer) -> None:
@@ -580,7 +588,8 @@ class TestRenderConversation:
                     conversation=conversation,
                     mm_placeholder_counts=counts,
                     add_generation_prompt=True,
-                    tools=[tool.model_dump() for tool in request.tools],
+                    # Serialized as the chat route serializes them.
+                    tools=[res.extension.serialize_tool(tool) for tool in request.tools],
                     tokenize=True,
                 ),
                 mm_coroutine,

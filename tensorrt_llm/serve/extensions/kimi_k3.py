@@ -132,14 +132,6 @@ class KimiK3ServingExtension(ServingExtension):
         """K3 enforces ``tool_choice="required"`` through its template."""
         return True
 
-    def serialize_tool(self, tool) -> Dict[str, Any]:
-        """Drop pydantic-injected null defaults (strict, description, parameters).
-
-        They would otherwise leak into the rendered tool-declaration JSON and
-        skew prompt-token parity with the reference renderer.
-        """
-        return tool.model_dump(exclude_none=True)
-
     def dynamic_tools(self, messages: Optional[List[ChatCompletionMessageParam]]) -> List[dict]:
         """Message-level (dynamic) tools are a Kimi API extension."""
         return dynamic_tool_dicts(messages)
