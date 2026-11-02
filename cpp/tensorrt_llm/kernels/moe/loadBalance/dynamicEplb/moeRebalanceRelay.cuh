@@ -17,8 +17,8 @@
 
 // HALO-R relay copy, the third phase of the fused HALO-R kernel (moeRebalanceHaloR.cu). Unicast data path: every slice
 // is loaded once from its owner with a bulk copy into shared memory and stored with bulk copies into the helper slot of
-// every receiver (moeRebalanceRelayWork.h). Lane 0 of each issuer warp pipelines two banks of shared-memory slots: the
-// loads of one bank overlap the stores of the other, and a bank is reused only after its stores have read it. Slices
+// every receiver (moeRebalanceRelayWork.h). Lane 0 of each issuer warp runs a ring of shared-memory slots: its loads
+// run ahead of its stores, and a slot is reloaded as soon as the stores of its previous slice have read it. Slices
 // whose addresses or size are not 16-byte aligned are copied with plain stores.
 //
 // The relay reuses the dynamic shared memory of the scheduler role, which every CTA has finished before it starts.
@@ -47,14 +47,9 @@ namespace kernels
 namespace
 {
 
-//! Issuer warps per CTA and slots per issuer warp: two banks of one slot, so one slice loads while the other stores.
-//! Each SM's pull throughput is capped, so past about nine loads in flight per SM more loads only add latency.
-//! Measured on pull-only plans, 9 issuers with two slots each copy about 30% more per CTA than 6 issuers with four
-//! slots, and 13 issuers with two slots copy less.
-constexpr int kRelayMaxIssuers = 9;
-constexpr int kRelaySlotsPerIssuer = 2;
-//! Slices per bank batch; it sizes the per-lane batch bookkeeping.
-constexpr int kRelayMaxBatch = kRelaySlotsPerIssuer / 2;
+//! Issuer warps per CTA and ring slots per issuer warp: each issuer keeps up to three loads in flight.
+constexpr int kRelayMaxIssuers = 6;
+constexpr int kRelaySlotsPerIssuer = 4;
 constexpr std::uint64_t kRelayBulkAlignment = 16;
 constexpr std::uint64_t kRelayWordAlignment = 4;
 //! Back-off between polls of a slot's load barrier.
@@ -237,11 +232,12 @@ __device__ __forceinline__ void relayIssuerDone(MoeRebalanceHaloRParams const&, 
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
 
-//! Lane 0 of one issuer warp: copy every work item dealt to this warp.
+//! Lane 0 of one issuer warp: copy every work item dealt to this warp. Item n uses slot n mod `slots`. Loads run up to
+//! `slots - 1` items ahead of the stores: once item n's stores are issued, the slot of item n - 1 is refilled as soon
+//! as its stores have read it (with one slot, item n's own slot once its stores have read it).
 __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& work, unsigned char* buffer,
     RelaySlotControl* control, int slots, int issuers, int warp)
 {
-    static_assert(kRelayMaxBatch == 1, "each bulk group holds one slice of one broadcast");
     RelayCompletion completion{};
     for (int s = 0; s < slots; ++s)
     {
@@ -252,19 +248,88 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
     int const* experts = halo_r::planField(p.plan, halo_r::PlanField::kExpert);
-    int const banks = slots >= 2 ? 2 : 1;
-    int const bankSlots = slots / banks;
-    int const batchLimit = bankSlots < kRelayMaxBatch ? bankSlots : kRelayMaxBatch;
     long long const total = work.prefix[work.entries];
     long long const stride = static_cast<long long>(gridDim.x) * issuers;
-    long long item = static_cast<long long>(blockIdx.x) * issuers + warp;
-    bool pending[2] = {false, false};
-    for (int bank = 0; item < total; bank = (bank + 1) % banks)
+    long long const first = static_cast<long long>(blockIdx.x) * issuers + warp;
+    long long const items = total > first ? (total - first + stride - 1) / stride : 0;
+    int const lag = slots > 1 ? 1 : 0;
+    int entryOf[kRelaySlotsPerIssuer];
+    std::uint64_t sourceOf[kRelaySlotsPerIssuer];
+    std::uint64_t offsetOf[kRelaySlotsPerIssuer];
+    unsigned bytesOf[kRelaySlotsPerIssuer];
+    int planeOf[kRelaySlotsPerIssuer];
+    bool bulkOf[kRelaySlotsPerIssuer];
+    // Item n into slot s: a bulk load, or nothing yet for a slice the bulk copy cannot take (copied in its turn).
+    auto load = [&](long long n, int s)
     {
-        if (pending[bank])
+        long long k;
+        int const entry = halo_r::relayLocateItem(work.prefix, work.entries, first + n * stride, &k);
+        long long const slice = halo_r::relaySliceOf(k, work.destinations[entry], work.index[entry]);
+        int plane = 0;
+        unsigned long long offset = 0;
+        unsigned long long bytes = 0;
+        halo_r::relayLocateSlice(work.planeBytes, p.planes, slice, &plane, &offset, &bytes);
+        int const b = work.broadcast[entry];
+        unsigned const mask = work.need[entry];
+        std::uint64_t const source = p.sourceTable[static_cast<std::size_t>(experts[b]) * p.planes + plane] + offset;
+        bool aligned = ((source | bytes) % kRelayBulkAlignment) == 0;
+        for (int d = 0; d < p.ep && aligned; ++d)
         {
-            // The bank's shared-memory slots may be refilled once its stores have read them.
-            if (banks == 2 && pending[bank ^ 1])
+            if ((mask >> d) & 1U)
+            {
+                aligned = (relayDestination(p, work, b, d, plane, offset) % kRelayBulkAlignment) == 0;
+            }
+        }
+        entryOf[s] = entry;
+        sourceOf[s] = source;
+        offsetOf[s] = offset;
+        bytesOf[s] = static_cast<unsigned>(bytes);
+        planeOf[s] = plane;
+        bulkOf[s] = aligned;
+        if (aligned)
+        {
+            relayLoad(buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, &control[s], source,
+                static_cast<unsigned>(bytes));
+        }
+    };
+    for (int s = 0; s < slots && s < items; ++s)
+    {
+        load(s, s);
+    }
+    for (long long n = 0; n < items; ++n)
+    {
+        int const s = static_cast<int>(n % slots);
+        int const b = work.broadcast[entryOf[s]];
+        unsigned const mask = work.need[entryOf[s]];
+        if (bulkOf[s])
+        {
+            relayAwait(&control[s]);
+            for (int d = 0; d < p.ep; ++d)
+            {
+                if ((mask >> d) & 1U)
+                {
+                    relayStore(relayDestination(p, work, b, d, planeOf[s], offsetOf[s]),
+                        buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, bytesOf[s]);
+                }
+            }
+            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+            relayGroupCommitted(p, completion, b, mask, bytesOf[s]);
+        }
+        else
+        {
+            for (int d = 0; d < p.ep; ++d)
+            {
+                if ((mask >> d) & 1U)
+                {
+                    relayScalarCopy(relayDestination(p, work, b, d, planeOf[s], offsetOf[s]), sourceOf[s], bytesOf[s]);
+                }
+            }
+            relayStoresIssued(p, completion, b, mask, bytesOf[s]);
+        }
+        if (n >= lag && n - lag + slots < items)
+        {
+            // Every group but this item's (when it has one) has read its slot, so item n - lag's slot is free.
+            if (lag && bulkOf[s])
             {
                 asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");
             }
@@ -272,75 +337,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
             {
                 asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
             }
-            pending[bank] = false;
-        }
-        int entryOf[kRelayMaxBatch];
-        std::uint64_t offsetOf[kRelayMaxBatch];
-        unsigned bytesOf[kRelayMaxBatch];
-        int planeOf[kRelayMaxBatch];
-        int count = 0;
-        for (; count < batchLimit && item < total; item += stride)
-        {
-            long long k;
-            int const entry = halo_r::relayLocateItem(work.prefix, work.entries, item, &k);
-            long long const slice = halo_r::relaySliceOf(k, work.destinations[entry], work.index[entry]);
-            int plane = 0;
-            unsigned long long offset = 0;
-            unsigned long long bytes = 0;
-            halo_r::relayLocateSlice(work.planeBytes, p.planes, slice, &plane, &offset, &bytes);
-            int const b = work.broadcast[entry];
-            unsigned const mask = work.need[entry];
-            std::uint64_t const source
-                = p.sourceTable[static_cast<std::size_t>(experts[b]) * p.planes + plane] + offset;
-            bool aligned = ((source | bytes) % kRelayBulkAlignment) == 0;
-            for (int d = 0; d < p.ep && aligned; ++d)
-            {
-                if ((mask >> d) & 1U)
-                {
-                    aligned = (relayDestination(p, work, b, d, plane, offset) % kRelayBulkAlignment) == 0;
-                }
-            }
-            if (!aligned)
-            {
-                for (int d = 0; d < p.ep; ++d)
-                {
-                    if ((mask >> d) & 1U)
-                    {
-                        relayScalarCopy(relayDestination(p, work, b, d, plane, offset), source, bytes);
-                    }
-                }
-                relayStoresIssued(p, completion, b, mask, bytes);
-                continue;
-            }
-            int const s = bank * bankSlots + count;
-            relayLoad(buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, &control[s], source,
-                static_cast<unsigned>(bytes));
-            entryOf[count] = entry;
-            offsetOf[count] = offset;
-            bytesOf[count] = static_cast<unsigned>(bytes);
-            planeOf[count] = plane;
-            ++count;
-        }
-        for (int c = 0; c < count; ++c)
-        {
-            int const s = bank * bankSlots + c;
-            relayAwait(&control[s]);
-            int const b = work.broadcast[entryOf[c]];
-            unsigned const mask = work.need[entryOf[c]];
-            for (int d = 0; d < p.ep; ++d)
-            {
-                if ((mask >> d) & 1U)
-                {
-                    relayStore(relayDestination(p, work, b, d, planeOf[c], offsetOf[c]),
-                        buffer + static_cast<std::size_t>(s) * halo_r::kRelaySliceBytes, bytesOf[c]);
-                }
-            }
-        }
-        if (count)
-        {
-            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-            pending[bank] = true;
-            relayGroupCommitted(p, completion, work.broadcast[entryOf[0]], work.need[entryOf[0]], bytesOf[0]);
+            load(n - lag + slots, static_cast<int>((n - lag) % slots));
         }
     }
     relayIssuerDone(p, completion);
