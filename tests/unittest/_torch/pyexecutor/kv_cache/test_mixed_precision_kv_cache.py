@@ -480,6 +480,47 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         manager.shutdown()
 
 
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_dsa_drafter_layer_in_target_manager(drafter):
+    """Drafter layers in the DSA manager: MTP gets a twin, Eagle3 keeps the native NVFP4 page.
+
+    The drafter's model inherits the target's NVFP4 KV dtype, so an Eagle3 layer must stay a
+    plain NVFP4 layer for its writes to match its pages.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    manager = DSACacheManagerV2(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.NVFP4,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+        spec_config=spec_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        assert manager.pp_layers == [0, 1, 2]
+        assert sorted(manager.high_layers) == ([0, 1, 2] if drafter == "mtp" else [0, 1])
+        assert manager._get_layer_dtype_by_local_id(2) == DataType.NVFP4
+    finally:
+        manager.shutdown()
+
+
 def test_deepseek_v4_mtp_layer_stays_native():
     """DeepSeek-V4's MTP layer has only a sliding window, so it gets no twin."""
     from types import SimpleNamespace
