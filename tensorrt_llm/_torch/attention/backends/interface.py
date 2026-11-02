@@ -362,8 +362,8 @@ class AttentionMetadata:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        mixed_precision_high_layers = getattr(self.kv_cache_manager, "mixed_precision_high_layers", None)
+        return isinstance(mixed_precision_high_layers, dict) and bool(mixed_precision_high_layers)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
@@ -372,8 +372,8 @@ class AttentionMetadata:
             self.mixed_precision_staging, self.kv_cache_manager, "mixed",
             layout, tokens_per_block)
         draft = self.draft_kv_cache_manager
-        high_layers = getattr(draft, "high_layers", None)
-        if isinstance(high_layers, dict) and high_layers:
+        mixed_precision_high_layers = getattr(draft, "mixed_precision_high_layers", None)
+        if isinstance(mixed_precision_high_layers, dict) and mixed_precision_high_layers:
             self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
                 self.draft_mixed_precision_staging, draft, "draft_mixed",
                 layout, tokens_per_block)
@@ -424,7 +424,7 @@ class AttentionMetadata:
         staging = self.mixed_precision_staging
         if (staging is None or layer_idx not in staging.pools
                 or staging.manager is not self.kv_cache_manager):
-            # A layer without a twin, or of a manager not swapped in: no staging.
+            # No staging for a layer without a high layer or of a manager not in use.
             return None
         return staging
 

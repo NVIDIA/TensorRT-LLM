@@ -199,7 +199,7 @@ class _MixedPrecisionLayerKind(IntEnum):
     """Which of a mixed-precision layer's two pools a runtime layer id refers to."""
 
     PRIMARY = 0
-    HIGH_PRECISION = 1
+    HIGH = 1
 
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
@@ -1791,13 +1791,13 @@ class KVCacheManagerV2(BaseResourceManager):
     inforward_snapshot_rows: int = 0
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
-    low_precision_dtype: Optional[DataType] = None
-    high_layers: dict[int, int] = {}
-    high_precision_dtype: DataType | None = None
+    mixed_precision_low_dtype: Optional[DataType] = None
+    mixed_precision_high_layers: dict[int, int] = {}
+    mixed_precision_high_dtype: DataType | None = None
     # Inherited by per-model subclasses; the base's own applies to the base only.
     _supports_mixed_precision_kv = True
-    # True when the manager's own pool already holds the history in the low-precision format;
-    # the base then appends only the twins.
+    # True when the manager's own pool already holds the history in the mixed-precision low format;
+    # the base then appends only the mixed-precision high layers.
     _mixed_precision_native_pool = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -1912,7 +1912,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._first_spec_layer_id: int | None = None
         if (
             spec_config is not None
-            and self.low_precision_dtype is not None
+            and self.mixed_precision_low_dtype is not None
             and not spec_config.spec_dec_mode.is_mtp_one_model()
         ):
             from tensorrt_llm._torch.speculative import get_num_spec_layers
@@ -2961,8 +2961,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """Select block scales for a role and local layer in the pool mapping."""
         if self._get_layer_dtype_by_local_id(layer_id) != DataType.NVFP4 or role_a != Role.KEY:
             return None
-        # Retained-token twins hold plain rows without block scales.
-        if int(layer_id) in self.high_layers.values():
+        # Mixed-precision high layers hold plain rows without block scales.
+        if int(layer_id) in self.mixed_precision_high_layers.values():
             return None
         return Role.KEY_BLOCK_SCALE
 
@@ -3972,7 +3972,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
         return replace(config, layers=layers)
 
-    # Mixed-precision KV: each full-attention layer keeps its history in a low-precision pool
+    # Mixed-precision KV: each full-attention layer keeps its history in a mixed-precision low pool
     # and a native SWA+sink layer group keeps every sequence's first_n/last_n tokens at the
     # attention dtype. Attention reads a staging copy prepared by the attention metadata.
 
@@ -3980,10 +3980,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self, kv_cache_config: KvCacheConfig, pretrained_config, max_seq_len: int, dtype: DataType
     ) -> None:
         """Record the mixed-precision layout requested through kv_cache_config.dtype."""
-        # Local layer id -> layer id of its retained-token (high-precision) twin.
-        self.high_layers: dict[int, int] = {}
-        self.low_precision_dtype: Optional[DataType] = None
-        self.high_precision_dtype: DataType | None = None
+        # Local layer id -> layer id of its mixed-precision high layer.
+        self.mixed_precision_high_layers: dict[int, int] = {}
+        self.mixed_precision_low_dtype: Optional[DataType] = None
+        self.mixed_precision_high_dtype: DataType | None = None
         self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
@@ -4002,12 +4002,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self.first_n, self.last_n = mixed.first_n, mixed.last_n
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision NVFP4 KV requires Blackwell")
-        self.low_precision_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
-        self.high_precision_dtype = str_dtype_to_binding(mixed.high)
+        self.mixed_precision_low_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
+        self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
         # A dense manager keeps its pool in mixed.high and builds the low pool itself.
-        if not self._mixed_precision_native_pool and dtype != self.high_precision_dtype:
+        if not self._mixed_precision_native_pool and dtype != self.mixed_precision_high_dtype:
             raise ValueError(
-                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the retained tokens in "
+                f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the first/last tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
             )
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
@@ -4032,10 +4032,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return False
 
     def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
-        """Whether this local layer stores its history in the low-precision pool."""
+        """Whether this local layer stores its history in the mixed-precision low pool."""
         layer_id = self.pp_layers[local_layer_idx]
         return (
-            self.low_precision_dtype is not None
+            self.mixed_precision_low_dtype is not None
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
             and layer_id not in self._shared_kv_layers
@@ -4043,7 +4043,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
-        """Bytes per token of the low-precision pool, scales included."""
+        """Bytes per token of the mixed-precision low pool, scales included."""
         from ...attention.kernels.blackwell.mixed_precision_kv import (
             get_mixed_precision_kv_row_bytes,
         )
@@ -4051,18 +4051,18 @@ class KVCacheManagerV2(BaseResourceManager):
         return (
             self.num_kv_heads_per_layer[local_layer_idx]
             * get_mixed_precision_kv_row_bytes(
-                self.low_precision_dtype, self.head_dim_per_layer[local_layer_idx]
+                self.mixed_precision_low_dtype, self.head_dim_per_layer[local_layer_idx]
             )
             * (self.kv_factor if data_role == Role.ALL else 1)
         )
 
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
-        """Rows per page of a retained-token twin; a page always covers tokens_per_block tokens."""
+        """Rows per high-layer page; a page always covers tokens_per_block tokens."""
         return self.tokens_per_block
 
     def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Append the retained-token layer group for every mixed-precision layer."""
-        if self.low_precision_dtype is None:
+        """Append the mixed-precision high layer group for every mixed-precision layer."""
+        if self.mixed_precision_low_dtype is None:
             return config
         if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
             raise NotImplementedError(
@@ -4085,9 +4085,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._mixed_precision_rows_per_page(local)
                 * self.num_kv_heads_per_layer[local]
                 * self.head_dim_per_layer[local],
-                self.high_precision_dtype,
+                self.mixed_precision_high_dtype,
             )
-            self.high_layers[local] = len(layers)
+            self.mixed_precision_high_layers[local] = len(layers)
             layers.append(
                 AttentionLayerConfig(
                     layer_id=LayerId(len(layers)),
@@ -4099,9 +4099,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
-        if not self.high_layers:
+        if not self.mixed_precision_high_layers:
             return config
-        # Disaggregated transfer derives collision-free layer ids for the twins from this
+        # Disaggregated transfer derives collision-free ids for the high layers from this
         # (model layer, kind) mapping; a manager with its own mapping keeps it unchanged.
         if getattr(self, "_layer_attn_to_layer_id", None) is None:
             self._layer_attn_to_layer_id = {
@@ -4110,11 +4110,11 @@ class KVCacheManagerV2(BaseResourceManager):
             }
             self._layer_attn_to_layer_id.update(
                 {
-                    (self.pp_layers[local], _MixedPrecisionLayerKind.HIGH_PRECISION): LayerId(twin)
-                    for local, twin in self.high_layers.items()
+                    (self.pp_layers[local], _MixedPrecisionLayerKind.HIGH): LayerId(high_layer)
+                    for local, high_layer in self.mixed_precision_high_layers.items()
                 }
             )
-        # A configured pool_ratio must now cover the appended retained-token
+        # A configured pool_ratio must now cover the appended mixed-precision high
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
 
@@ -4129,7 +4129,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 // self.num_kv_heads_per_layer[layer_offset]
             )
         else:
-            layer, dtype = self.high_layers[layer_offset], self.high_precision_dtype
+            layer, dtype = self.mixed_precision_high_layers[layer_offset], self.mixed_precision_high_dtype
             width = self.head_dim_per_layer[layer_offset]
         address = self.impl.get_mem_pool_base_address(layer, Role.KEY, PageIndexMode.SHARED)
         shape = [
@@ -4154,7 +4154,7 @@ class KVCacheManagerV2(BaseResourceManager):
         are. Each table is one gather from the zero-copy host page-index table.
         """
         local = self.layer_offsets[layer_idx]
-        for role, layer in enumerate((local, self.high_layers[local])):
+        for role, layer in enumerate((local, self.mixed_precision_high_layers[local])):
             self._fill_page_table(layer, request_ids, out[role])
 
     def _fill_page_table(self, layer: int, request_ids: list[int], out: np.ndarray) -> None:
@@ -4180,11 +4180,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # Entries past a request's blocks are left as they are.
         np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
 
-    def fill_high_precision_page_table(
+    def fill_mixed_precision_high_page_table(
         self, request_ids: list[int], layer_idx: int, out: np.ndarray
     ) -> None:
-        """Write the ``(batch, pages)`` page table of ``layer_idx``'s high-precision twin."""
-        self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)
+        """Write the ``(batch, pages)`` page table of ``layer_idx``'s high layer."""
+        self._fill_page_table(self.mixed_precision_high_layers[self.layer_offsets[layer_idx]], request_ids, out)
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
@@ -4197,10 +4197,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_typical_seq_len(self, kv_cache_config: KvCacheConfig) -> int | None:
         """Return the typical sequence length that sizes the pools when no ratio is given."""
-        if kv_cache_config.avg_seq_len is not None or self.low_precision_dtype is None:
+        if kv_cache_config.avg_seq_len is not None or self.mixed_precision_low_dtype is None:
             return kv_cache_config.avg_seq_len
         # Without a typical step the backend sizes the pools for one 2048-token
-        # request, which hands the retained-token group a share it never uses.
+        # request, which hands the mixed-precision high group a share it never uses.
         typical_seq_len = max(1, self.max_seq_len // 2)
         logger.warning_once(
             "kv_cache_config.avg_seq_len is not set; sizing the mixed-precision KV pools for "
@@ -4441,7 +4441,7 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> Optional[torch.Tensor]:
         """Return a zero-copy KV view; its slot dimension may be strided."""
         layer_offset = self.layer_offsets[layer_idx]
-        if layer_offset in self.high_layers:
+        if layer_offset in self.mixed_precision_high_layers:
             return self._get_mixed_precision_buffers(layer_offset, kv_layout, mixed_precision_pool)
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
         layer_kv_factor = self._get_layer_kv_factor_by_local_id(layer_offset)

@@ -79,8 +79,8 @@ def pool_pages(manager, layer_idx=0):
 @pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16, DataType.HALF))
 def test_extra_pool_uses_existing_dtype_layout(make_manager, dtype):
     manager = make_manager(dtype=dtype)
-    assert manager.low_precision_dtype == DataType.NVFP4
-    assert manager.high_layers == {0: 1}
+    assert manager.mixed_precision_low_dtype == DataType.NVFP4
+    assert manager.mixed_precision_high_layers == {0: 1}
     assert manager.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx([5 / 6, 1 / 6])
     for pool, storage_dtype, width in (
         ("low", torch.uint8, 40),
@@ -96,8 +96,8 @@ def test_extra_pool_uses_existing_dtype_layout(make_manager, dtype):
 
 def test_plain_dtype_keeps_native_manager(make_manager):
     manager = make_manager(config=KvCacheConfig(max_tokens=65536, enable_block_reuse=True))
-    assert manager.low_precision_dtype is None
-    assert manager.high_layers == {}
+    assert manager.mixed_precision_low_dtype is None
+    assert manager.mixed_precision_high_layers == {}
     assert len(manager.kv_cache_manager_py_config.layers) == 1
     assert manager.get_buffers(0).dtype == torch.bfloat16
 
@@ -130,19 +130,19 @@ def test_mixed_precision_preserves_native_and_shared_kv_storage(make_manager):
         ),
         **options,
     )
-    # Layer groups: full attention (low), sliding window, retained tokens (high).
+    # Layer groups: full attention (low), sliding window, first/last tokens (high).
     mixed = make_manager(
         config=mixed_config(max_attention_window=windows, pool_ratio=[0.25, 0.5, 0.25]),
         **options,
     )
     # Layer 3 feeds the shared KV layer 4 and stays native, like the SWA layer 1.
-    assert mixed.high_layers == {0: 4}
+    assert mixed.mixed_precision_high_layers == {0: 4}
     for layer in (1, 2, 3):
         original = native.kv_cache_manager_py_config.layers[layer]
-        retained = mixed.kv_cache_manager_py_config.layers[layer]
-        assert retained.sliding_window_size == original.sliding_window_size
-        assert retained.reuse_policy == original.reuse_policy
-        assert [(b.role, b.size) for b in retained.buffers] == [
+        high = mixed.kv_cache_manager_py_config.layers[layer]
+        assert high.sliding_window_size == original.sliding_window_size
+        assert high.reuse_policy == original.reuse_policy
+        assert [(b.role, b.size) for b in high.buffers] == [
             (b.role, b.size) for b in original.buffers
         ]
         assert mixed.get_buffers(layer).dtype == native.get_buffers(layer).dtype
@@ -161,14 +161,14 @@ def test_mixed_precision_keeps_kv_quota(make_manager):
     assert mixed.kv_cache_manager_py_config.cache_tiers[0].quota == budget
 
 
-def test_pool_ratio_must_cover_retained_group(make_manager):
-    # The runtime counts the appended retained-token group as a layer group.
+def test_pool_ratio_must_cover_mixed_precision_high_group(make_manager):
+    # The runtime counts the appended mixed-precision high group as a layer group.
     with pytest.raises(ValueError, match="layer groups"):
         make_manager(config=mixed_config(pool_ratio=[1.0]))
 
 
 @pytest.mark.parametrize("ratio", ([0.6, 0.4], [0.75, 0.25]))
-def test_explicit_pool_ratio_orders_retained_group_last(make_manager, ratio):
+def test_explicit_pool_ratio_orders_mixed_precision_high_group_last(make_manager, ratio):
     # A byte budget, so the ratio is not distorted by the max_tokens cap.
     manager = make_manager(
         config=mixed_config(pool_ratio=ratio, max_tokens=None, max_gpu_total_bytes=128 << 20)
@@ -186,7 +186,7 @@ def test_explicit_pool_ratio_orders_retained_group_last(make_manager, ratio):
 
 
 @pytest.mark.parametrize("estimating", (False, True), ids=("final", "estimate"))
-def test_automatic_pool_sizing_covers_retained_group(make_manager, estimating):
+def test_automatic_pool_sizing_covers_mixed_precision_high_group(make_manager, estimating):
     # A budget large enough that the typical workload, not the allocation
     # floors, decides the split: 64 resident 768-token requests.
     manager = make_manager(
@@ -205,7 +205,7 @@ def test_automatic_pool_sizing_covers_retained_group(make_manager, estimating):
         f"high {high_pages} pages / {high_bytes >> 20} MiB"
     )
     # Every resident request needs 6 history pages but only the sink page and
-    # the 66-token window (2-3 pages) in the retained group. Retained pages are
+    # the 66-token window (2-3 pages) in the high group. High pages are
     # BF16 and 3.2x larger than NVFP4 history pages, so compare page counts.
     assert low_pages >= 64 * 6
     assert high_pages >= 64 * 2
@@ -233,7 +233,7 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
     native = manager.impl
     stream = torch.cuda.current_stream().cuda_stream
     tokens = list(range(640))
-    high_group = native.get_layer_group_id(manager.high_layers[0])
+    high_group = native.get_layer_group_id(manager.mixed_precision_high_layers[0])
     with closing(native.create_kv_cache(None, [])) as source:
         assert source.resume(stream) and source.resize(len(tokens))
         source.commit(tokens)
@@ -289,7 +289,7 @@ def test_mixed_precision_rejects_custom_managers():
         )
     # A plain dtype never reaches the check.
     manager._init_mixed_precision(KvCacheConfig(), None, 1024, DataType.FP8)
-    assert manager.high_layers == {}
+    assert manager.mixed_precision_high_layers == {}
 
     # Per-model subclasses inherit the declaration of the manager they wrap.
     class _OptedIn(_CustomManager):
@@ -300,7 +300,7 @@ def test_mixed_precision_rejects_custom_managers():
 
     assert object.__new__(_Wrapper)._mixed_precision_kv_supported()
 
-    # A manager whose pool already holds the low-precision history accepts any pool dtype.
+    # A manager whose pool already holds the mixed-precision low (NVFP4) history accepts any pool dtype.
     class _Native(_OptedIn):
         _mixed_precision_native_pool = True
 
@@ -308,13 +308,13 @@ def test_mixed_precision_rejects_custom_managers():
     native._init_mixed_precision(
         KvCacheConfig(dtype="mixed_nvfp4_bfloat16"), None, 1024, DataType.FP8
     )
-    assert native.high_precision_dtype == DataType.BF16
+    assert native.mixed_precision_high_dtype == DataType.BF16
 
 
-@pytest.mark.parametrize("retained", [DataType.FP8, DataType.BF16])
+@pytest.mark.parametrize("high_dtype", [DataType.FP8, DataType.BF16])
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
 @pytest.mark.parametrize("backend", ["dense", "dsa"])
-def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, retained):
+def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, high_dtype):
     """A drafter sharing the target manager writes its pages in their own dtype.
 
     The model side gives the drafter a KV dtype; the manager side places its layer in a pool.
@@ -345,7 +345,7 @@ def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, retained):
         quant_config=QuantConfig(),
         sparse_attention_config=sparse_config,
     )
-    validate_and_set_kv_cache_quant(target, _MIXED_DTYPE[retained])
+    validate_and_set_kv_cache_quant(target, _MIXED_DTYPE[high_dtype])
     draft = ModelConfig(quant_config=QuantConfig())
     _set_draft_kv_cache_quant_algo(draft, target)
 
@@ -355,7 +355,7 @@ def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, retained):
         else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
     )
     options = dict(
-        kv_cache_config=mixed_config(retained, pool_ratio=None, enable_block_reuse=False),
+        kv_cache_config=mixed_config(high_dtype, pool_ratio=None, enable_block_reuse=False),
         num_layers=2,
         num_kv_heads=1,
         head_dim=576,
@@ -376,14 +376,14 @@ def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, retained):
     try:
         drafter_layer = 2
         assert manager.pp_layers == [0, 1, drafter_layer]
-        assert (drafter_layer in manager.high_layers) == (drafter == "mtp")
+        assert (drafter_layer in manager.mixed_precision_high_layers) == (drafter == "mtp")
         assert manager._get_layer_dtype_by_local_id(drafter_layer) == kv_dtype(draft.quant_config)
     finally:
         manager.shutdown()
 
 
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):
-    """A separate one-model MTP draft manager builds twins for its own layers, like the target."""
+    """A separate one-model MTP draft manager adds high layers for its own layers, like the target."""
     from types import SimpleNamespace
 
     from tensorrt_llm.llmapi import MTPDecodingConfig
@@ -397,7 +397,7 @@ def test_separate_mtp_draft_manager_goes_mixed(make_manager):
         is_draft=True,
     )
     assert manager.pp_layers == [2]
-    assert manager.high_layers == {0: 1}
+    assert manager.mixed_precision_high_layers == {0: 1}
 
 
 def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
@@ -420,10 +420,10 @@ def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
         pretrained_config=SimpleNamespace(num_hidden_layers=2),
         is_draft=True,
     )
-    assert draft.high_layers == {0: 1}
+    assert draft.mixed_precision_high_layers == {0: 1}
 
 
-def test_twin_window_covers_every_draft_step(make_manager):
+def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
     """A window of last_n + 1 holds every position an MTP step reads or writes.
 
     Each step grows the capacity by 1 + draft tokens: its queries at positions history ..
@@ -446,7 +446,7 @@ def test_twin_window_covers_every_draft_step(make_manager):
     assert manager.kv_cache_manager_py_config.layers[1].sliding_window_size == last_n + 1
     native = manager.impl
     stream = torch.cuda.current_stream().cuda_stream
-    high_group = native.get_layer_group_id(manager.high_layers[0])
+    high_group = native.get_layer_group_id(manager.mixed_precision_high_layers[0])
     rng = random.Random(0)
     history = 100
     with closing(native.create_kv_cache(None, [])) as kv_cache:
@@ -467,7 +467,7 @@ def test_twin_window_covers_every_draft_step(make_manager):
 
 
 def test_deepseek_v4_mixed_disagg_names_every_layer():
-    """Disaggregated transfer gives the DeepSeek-V4 twins their own layer ids."""
+    """Disaggregated transfer gives the DeepSeek-V4 high layers their own layer ids."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
@@ -502,11 +502,11 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         pretrained_config=SimpleNamespace(num_hidden_layers=4),
     )
     try:
-        # The three compressed layers each have a twin, registered under RETAINED.
-        assert sorted(manager.high_layers) == [1, 2, 3]
-        retained = DeepseekV4AttentionType.RETAINED
-        for local, twin in manager.high_layers.items():
-            assert manager._layer_attn_to_layer_id[manager.pp_layers[local], retained] == twin
+        # Each of the three compressed layers has a high layer, registered as MIXED_PRECISION_HIGH.
+        assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
+        mixed_high = DeepseekV4AttentionType.MIXED_PRECISION_HIGH
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            assert manager._layer_attn_to_layer_id[manager.pp_layers[local], mixed_high] == high_layer
         rank = RankInfo.from_kv_cache_manager("dsv4_mixed", manager, device_id=0)
         ids = [
             layer.global_layer_id
@@ -515,23 +515,23 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         ]
         assert len(ids) == len(set(ids))
         num_types = max(member.value for member in DeepseekV4AttentionType) + 1
-        assert {layer * num_types + retained.value for layer in (1, 2, 3)} <= set(ids)
-        # A peer with the same layout pairs every pool, the twins' included.
+        assert {layer * num_types + mixed_high.value for layer in (1, 2, 3)} <= set(ids)
+        # A peer with the same layout pairs every pool, the high layers' included.
         registrar = PeerRegistrar(rank, KVRegionExtractorV1(rank.page_table))
         peer = RankInfo.from_bytes(rank.to_bytes())
         peer.instance_name = "decode"
         mapping = registrar.get_pool_mapping(peer)
         assert all(source == destination for source, destination in mapping.items())
-        twin_groups = {
-            int(manager.impl.get_layer_group_id(t)) for t in manager.high_layers.values()
+        high_layer_groups = {
+            int(manager.impl.get_layer_group_id(t)) for t in manager.mixed_precision_high_layers.values()
         }
-        assert twin_groups <= {group for group, _ in mapping}
+        assert high_layer_groups <= {group for group, _ in mapping}
     finally:
         manager.shutdown()
 
 
 def test_deepseek_v4_mtp_layer_stays_native():
-    """DeepSeek-V4's MTP layer has only a sliding window, so it gets no twin."""
+    """DeepSeek-V4's MTP layer has only a sliding window, so it gets no high layer."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
@@ -563,7 +563,7 @@ def test_deepseek_v4_mtp_layer_stays_native():
     )
     try:
         assert manager.pp_layers == [0, 1, 2, 3, 4]
-        # Only the compressed layers (ratio 4 or 128) get a twin; the MTP layer 4 does not.
-        assert sorted(manager.high_layers) == [1, 2, 3]
+        # Only the compressed layers (ratio 4 or 128) get a high layer; MTP layer 4 does not.
+        assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
     finally:
         manager.shutdown()

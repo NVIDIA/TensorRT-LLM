@@ -14,7 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
-from ..mixed_precision_retained_rows import store_retained_compressed_rows
+from ..mixed_precision_high_rows import store_mixed_precision_high_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -353,9 +353,9 @@ class Compressor(nn.Module):
             scale_output,
         )
 
-        # Write the twin with the same scatter.
-        if not self.is_indexer and metadata.has_mixed_precision_retained_rows:
-            store_retained_compressed_rows(
+        # Write the mixed-precision high layer with the same scatter.
+        if not self.is_indexer and metadata.has_mixed_precision_high_rows:
+            store_mixed_precision_high_compressed_rows(
                 self,
                 metadata,
                 kv_comp,

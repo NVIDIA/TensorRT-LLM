@@ -44,7 +44,7 @@ class MixedPrecisionKVStaging:
         pools: Dict[int, Tuple[List[int], torch.Tensor, torch.Tensor]] = {}
         self.max_page_bytes = 0
         for layer_idx, local in manager.layer_offsets.items():
-            if local not in manager.high_layers:
+            if local not in manager.mixed_precision_high_layers:
                 continue
             low, high = (
                 manager.get_buffers(layer_idx, pool_layout, mixed_precision_pool=pool)
@@ -75,14 +75,14 @@ class MixedPrecisionKVStaging:
             local = manager.layer_offsets[layer_idx]
             key = tuple(
                 int(manager.impl.get_layer_group_id(layer))
-                for layer in (local, manager.high_layers[local])
+                for layer in (local, manager.mixed_precision_high_layers[local])
             )
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
         # Cache manager interface read by the attention backends.
         self.layer_offsets = {layer: layer for layer in self.pools}
         self.max_attention_window_vec = (None,) * (max(self.pools) + 1)
         self.dtype = manager.dtype
-        self.low_precision_dtype = manager.low_precision_dtype
+        self.mixed_precision_low_dtype = manager.mixed_precision_low_dtype
         self.kv_cache_pool_pointers = torch.tensor([[storage.data_ptr(), 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.zeros((max(self.pools) + 1, 2), dtype=torch.int32)
         self.page_counts: List[int] = []
@@ -161,7 +161,7 @@ class MixedPrecisionKVStaging:
             self.page_tables[layer_idx],
             self.lengths,
             self.layout,
-            low_dtype=self.low_precision_dtype,
+            low_dtype=self.mixed_precision_low_dtype,
         )
 
     def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:

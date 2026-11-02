@@ -4091,15 +4091,15 @@ def _mixed_precision_kv_cache_config() -> KvCacheConfig:
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-def test_v2_hybrid_mixed_precision_appends_retained_group():
-    """The retained-token twin of the attention layer sits behind the SSM and attention layers."""
+def test_v2_hybrid_mixed_precision_appends_high_group():
+    """The attention layer's mixed-precision high layer comes after the SSM and attention layers."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
     )
     try:
-        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its twin.
-        assert mgr.high_layers == {1: 2}
+        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its high layer.
+        assert mgr.mixed_precision_high_layers == {1: 2}
         assert not mgr._is_local_mamba_layer(2)
         assert mgr.get_buffers(0) is None
         low = mgr.get_buffers(1, mixed_precision_pool="low")
@@ -4111,7 +4111,7 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
         low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
         assert len(low_pages[0]) == len(high_pages[0]) == 4
         assert min(low_pages[0]) >= 0
-        # The leading (sink) and trailing (window) pages are always retained.
+        # The leading (sink) and trailing (window) pages are always in the mixed-precision high pool.
         assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
         assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
     finally:
@@ -4122,21 +4122,21 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-def test_v2_hybrid_mixed_precision_disagg_names_twins():
-    """Disaggregated transfer gives a hybrid manager's twins collision-free layer ids."""
+def test_v2_hybrid_mixed_precision_disagg_names_high_layers():
+    """Disaggregated transfer gives a hybrid manager's high layers collision-free ids."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
     )
     try:
-        assert mgr.high_layers == {1: 2}
+        assert mgr.mixed_precision_high_layers == {1: 2}
         page_table = build_page_table_from_manager(mgr)
         ids = {
             layer.local_layer_id: layer.global_layer_id
             for group in page_table.layer_groups
             for layer in group.local_layers
         }
-        # Model layers L -> 2L, the twin of layer L -> 2L + 1.
+        # Model layers L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
         assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()

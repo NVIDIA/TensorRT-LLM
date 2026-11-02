@@ -1234,7 +1234,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                            get_scale(layer_idx),
                            get_kv_factor(layer_idx) if get_kv_factor else None)
                     if (self._has_mixed_precision_staging()
-                            and layer_offset in mgr.high_layers):
+                            and layer_offset in mgr.mixed_precision_high_layers):
                         key = ("mixed_precision_staging", )
                     space_ids.setdefault(key, len(space_ids))
                     layer_space[layer_idx] = space_ids[key]
