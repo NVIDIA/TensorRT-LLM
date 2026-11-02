@@ -216,7 +216,9 @@ def _serve_cli_args(config_path: Path, port: int = 17999):
         str(port),
         # With more than one frontend, launch_server spawns attached frontend
         # processes by re-executing sys.argv (here: the pytest command line);
-        # a single frontend keeps the real launch_server in-process.
+        # a single frontend keeps the real launch_server in-process. Passing
+        # the flag skips the default frontend-count resolution, so this test
+        # covers the single-frontend path only.
         "--num_serve_frontends",
         "1",
     ]
