@@ -35,3 +35,9 @@ properties:
   routed_experts:
     annotation: Optional[torch.Tensor]
     default: inspect._empty
+  spec_dec_counters:
+    annotation: Optional[tensorrt_llm.executor.result.SpecDecCounters]
+    default: inspect._empty
+  text_diff_offset:
+    annotation: int
+    default: inspect._empty

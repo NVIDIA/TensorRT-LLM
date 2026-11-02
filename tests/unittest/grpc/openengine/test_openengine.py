@@ -110,11 +110,14 @@ def test_openengine_server_serves_the_control_contract() -> None:
             context_parallel_size=1,
             guided_decoding_backend=None,
             reasoning_parser=None,
+            encode_only=False,
             kv_cache_config=SimpleNamespace(tokens_per_block=32),
         ),
         llm_id="test-instance",
         tokenizer=object(),
         check_health=lambda: True,
+        get_kv_cache_capacity=lambda: {},
+        get_openengine_discovery=lambda: {},
     )
 
     async def exercise_server() -> None:
@@ -526,10 +529,7 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
                 kv_events_config=SimpleNamespace(enable_kv_cache_events=True, publisher="zmq")
             ),
         ),
-        _executor=SimpleNamespace(
-            get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {},
-            is_shutdown=lambda: False,
-        ),
+        get_kv_cache_capacity=lambda: {"kvEventsEnabled": True} if publisher_enabled else {},
     )
 
     async def exercise_server() -> None:

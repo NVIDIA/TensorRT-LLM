@@ -187,7 +187,7 @@ class OpenEngineServer:
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
         if events_config(self._llm) is not None:
-            capacity = await asyncio.to_thread(self._llm._executor.get_kv_cache_capacity)
+            capacity = await asyncio.to_thread(self._llm.get_kv_cache_capacity)
             if not capacity.get("kvEventsEnabled", False):
                 raise KvEventsUnavailableError(
                     "KV events are configured but the loaded engine has no streaming publisher; "

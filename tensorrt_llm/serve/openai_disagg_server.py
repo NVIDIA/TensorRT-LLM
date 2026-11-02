@@ -328,6 +328,11 @@ class OpenAIDisaggServer:
 
         self.register_routes()
 
+    @property
+    def address(self) -> tuple[str, int]:
+        """The configured listen address ``(hostname, port)`` of this disaggregated server."""
+        return self._config.hostname, self._config.port
+
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
             return await self._coordinator.get_disagg_request_id()

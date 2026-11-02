@@ -146,8 +146,6 @@ import signal
 import sys
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.grpc.openengine import server
 
 root = Path(sys.argv[1])
@@ -177,8 +175,8 @@ class Engine:
         self.args = SimpleNamespace(guided_decoding_backend=None)
         self.tokenizer = None
         self.engine_dead = False
-        self._executor = Mock(spec=GenerationExecutorProxy)
-        self._executor.multi_frontend_attach_info.return_value = {"mode": "classic"}
+    def multi_frontend_attach_info(self):
+        return {"mode": "classic"}
     def check_health(self):
         return not (
             frontend == 0 and sys.argv[3] == "child-startup-engine-failure"

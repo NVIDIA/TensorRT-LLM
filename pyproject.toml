@@ -862,6 +862,7 @@ files = [
     "tensorrt_llm/_torch/pyexecutor/sampler/token_ban.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py",
     "tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py",
+    "tensorrt_llm/llmapi/engine_client.py",
     "tests/unittest/_torch/sampler/test_torch_sampler.py",
     "tests/unittest/_torch/sampler/test_token_ban.py",
     "tests/unittest/_torch/sampler/test_beam_search.py",

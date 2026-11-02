@@ -26,6 +26,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.result import CompletionOutput, SpecDecCounters
 from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
@@ -114,6 +115,34 @@ def test_GenerationResultBase():
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
     assert result._done
+
+
+def test_completion_output_spec_dec_counters_property():
+    output = CompletionOutput(0)
+    assert output.spec_dec_counters is None
+
+    counters = SpecDecCounters(per_pos_drafted=[2],
+                               per_pos_accepted=[1],
+                               spec_dec_totals=(2, 1))
+    output._spec_dec_counters = counters
+    assert output.spec_dec_counters is counters
+
+    # The result path fills the field per sequence; the property returns it.
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=7, sampling_params=sampling_params)
+    result._handle_response(create_rsp(2, finished=True))
+    sequence = result.outputs[0]
+    assert sequence.spec_dec_counters is sequence._spec_dec_counters
+
+
+def test_completion_output_text_diff_offset():
+    output = CompletionOutput(0)
+    assert output.text_diff_offset == 0
+
+    output.text = "hello world"
+    output._last_text_len = 6
+    assert output.text_diff == "world"
+    assert output.text_diff_offset == len(output.text) - len(output.text_diff)
 
 
 @pytest.mark.parametrize("pytorch", [False, True])

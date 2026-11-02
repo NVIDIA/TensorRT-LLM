@@ -1111,6 +1111,15 @@ def register_input_processor(
     return wrapper
 
 
+def registered_model_type(processor_cls: type) -> Optional[str]:
+    """The model type an input-processor class was registered under, or None.
+
+    ``register_input_processor`` stamps the type onto the processor class;
+    this is the public read of that stamp.
+    """
+    return getattr(processor_cls, "_registered_model_type", None)
+
+
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,

@@ -614,9 +614,7 @@ def _http_enablement() -> None:
             args = _args()
             args.return_perf_metrics = requested
             args.perf_metrics_output_dir = output_dir
-            generator = SimpleNamespace(
-                args=args, _executor=SimpleNamespace(resource_governor_queue=None)
-            )
+            generator = SimpleNamespace(args=args, resource_governor_queue=None)
             server = OpenAIServer(generator, "test-model", None, None, None)
             try:
                 enabled = requested or output_dir is not None

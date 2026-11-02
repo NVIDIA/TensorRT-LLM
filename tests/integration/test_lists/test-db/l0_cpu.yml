@@ -340,6 +340,7 @@ l0_cpu:
   - unittest/serve/api/visual_gen/test_private_access_lint_visual_gen.py
   - unittest/serve/test_private_access_lint.py
   - unittest/serve/test_serve_health.py
+  - unittest/serve/test_serve_runtime_api_calls.py
   - unittest/tools
   - unittest/usage
   - unittest/utils/test_logger.py

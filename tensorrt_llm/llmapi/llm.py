@@ -41,8 +41,9 @@ from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, IterationResult, LoRARequest,
-                        PostprocWorkerConfig, PromptAdapterRequest)
+                        GenerationExecutorProxy, GenerationResult,
+                        IterationResult, LoRARequest, PostprocWorkerConfig,
+                        PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
@@ -143,6 +144,20 @@ class EncoderOutput:
     logits: torch.Tensor
     prompt_token_ids: List[int]
     prompt: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class EncodeLimits:
+    """Limits that ``LLM.encode()`` checks every call against.
+
+    Attributes:
+        max_batch_size (int): Maximum number of inputs per call.
+        max_num_tokens (int): Maximum number of tokens per call.
+        max_seq_len (int): Maximum number of tokens per input.
+    """
+    max_batch_size: int
+    max_num_tokens: int
+    max_seq_len: int
 
 
 class _WhisperSuppressTokensLogitsProcessor(LogitsProcessor):
@@ -342,6 +357,12 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
         fatal_error (BaseException, optional): The unrecoverable engine error the executor recorded, or None.
         shutdown_started (bool): Whether shutdown of the generation executor has begun.
         engine_dead (bool): Whether the engine is known dead (a worker died or a fatal error was recorded).
+        encode_limits (tensorrt_llm.llmapi.llm.EncodeLimits, optional): Limits encode() checks every call against; None unless encode_only=True.
+        engine_in_worker_process (bool): Whether generation runs through the IPC executor proxy, with the engine in separate MPI worker processes.
+        hf_model_config (transformers.PretrainedConfig, optional): The Hugging Face model config loaded from the checkpoint, or None.
+        hf_model_dir (Union[str, pathlib.Path]): The local Hugging Face checkpoint directory the model was loaded from.
+        multi_frontend_ipc_dir (str, optional): The directory of the multi-frontend IPC endpoints, or None outside multi-frontend mode.
+        resource_governor_queue (Any, optional): The generation executor's resource-governor queue, or None.
 """
 
 
@@ -1232,10 +1253,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        limits = self.encode_limits
+        max_seq_len = limits.max_seq_len
+        max_num_tokens = limits.max_num_tokens
+        max_batch_size = limits.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(
@@ -1691,8 +1712,7 @@ class BaseLLM:
     def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
         if self.args.backend != "pytorch" or self.args.generation_config != "auto":
             return {}
-        model_dir = self._hf_model_dir or self.args.model
-        return ModelLoader.load_hf_generation_config_dict(model_dir)
+        return ModelLoader.load_hf_generation_config_dict(self.hf_model_dir)
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
@@ -1850,6 +1870,124 @@ class BaseLLM:
         """
         executor = getattr(self, "_executor", None)
         return False if executor is None else executor.engine_dead
+
+    @set_api_status("prototype")
+    def record_fatal_error(self, error: BaseException) -> bool:
+        """Record an unrecoverable engine error on the generation executor.
+
+        The first recorded error wins and is what ``fatal_error`` returns;
+        later calls keep the first error.
+
+        Args:
+            error (BaseException): The exception to record as the fatal error.
+
+        Returns:
+            bool: True if the executor took the call, False when the LLM has no generation executor (``encode_only=True``, or after ``shutdown()``).
+        """
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            return False
+        executor.record_fatal_error(error)
+        return True
+
+    @set_api_status("prototype")
+    def multi_frontend_attach_info(self) -> dict:
+        """Get the attach payload for serving frontends that share this LLM's engine.
+
+        Only the classic IPC executor proxy in multi-frontend mode
+        (``num_serve_frontends > 1``) has one.
+
+        Returns:
+            dict: Request and result lane addresses, HMAC keys and the rank-0 RPC endpoint.
+
+        Raises:
+            ValueError: If the executor is not the classic IPC executor proxy in multi-frontend mode.
+        """
+        executor = getattr(self, "_executor", None)
+        attach_info = (executor.multi_frontend_attach_info() if isinstance(
+            executor, GenerationExecutorProxy) else None)
+        if attach_info is None:
+            raise ValueError(
+                "num_serve_frontends > 1 requires the classic IPC executor "
+                f"proxy in multi-frontend mode, got {type(executor).__name__}")
+        return attach_info
+
+    @property
+    @set_api_status("prototype")
+    def multi_frontend_ipc_dir(self) -> Optional[str]:
+        """The directory of the multi-frontend IPC endpoints, or None outside multi-frontend mode."""
+        executor = getattr(self, "_executor", None)
+        return None if executor is None else executor.multi_frontend_ipc_dir
+
+    @property
+    @set_api_status("prototype")
+    def engine_in_worker_process(self) -> bool:
+        """Whether generation runs through the IPC executor proxy, with the engine in separate MPI worker processes."""
+        return isinstance(getattr(self, "_executor", None),
+                          GenerationExecutorProxy)
+
+    @property
+    @set_api_status("prototype")
+    def hf_model_dir(self) -> Union[str, Path]:
+        """The local Hugging Face checkpoint directory the model was loaded from (``args.model`` until it is resolved)."""
+        return self._hf_model_dir or self.args.model
+
+    @property
+    @set_api_status("prototype")
+    def hf_model_config(self) -> Optional[transformers.PretrainedConfig]:
+        """The Hugging Face model config loaded from the checkpoint, or None when it could not be loaded."""
+        return self._hf_model_config
+
+    @property
+    @set_api_status("prototype")
+    def resource_governor_queue(self) -> Optional[Any]:
+        """The generation executor's resource-governor queue, or None when it has none.
+
+        Raises:
+            RuntimeError: If the LLM has no generation executor (``encode_only=True``, or after ``shutdown()``).
+        """
+        # Read the attribute directly: every built LLM has it, and on a bare
+        # instance the AttributeError is what inspect.getmembers (the
+        # api-stability snapshotter) tolerates, where a RuntimeError would not
+        # be.
+        executor = self._executor
+        if executor is None:
+            raise RuntimeError(
+                "resource_governor_queue is not available without a generation "
+                "executor (encode_only=True, or after shutdown()).")
+        return executor.resource_governor_queue
+
+    @property
+    @set_api_status("prototype")
+    def encode_limits(self) -> Optional[EncodeLimits]:
+        """Limits ``encode()`` checks every call against; None unless ``encode_only=True`` and the encoder is up."""
+        encoder = getattr(self, "_encoder_executor", None)
+        if not getattr(self, "_encode_only", False) or encoder is None:
+            return None
+        engine = encoder.model_engine
+        return EncodeLimits(max_batch_size=engine.batch_size,
+                            max_num_tokens=engine.max_num_tokens,
+                            max_seq_len=engine.max_seq_len)
+
+    @set_api_status("prototype")
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive snapshot of the primary/GPU KV cache load.
+
+        Returns:
+            dict: The executor's snapshot; empty without a generation executor or when the executor does not report load.
+        """
+        executor = getattr(self, "_executor", None)
+        return {} if executor is None else executor.get_kv_cache_load()
+
+    @set_api_status("prototype")
+    def get_openengine_discovery(self) -> dict:
+        """Get the OpenEngine node and KV-event publisher discovery metadata recorded at startup.
+
+        Returns:
+            dict: The executor's discovery metadata; empty without a generation executor or when none was recorded.
+        """
+        executor = getattr(self, "_executor", None)
+        return {} if executor is None else executor.get_openengine_discovery()
 
     @staticmethod
     def _shutdown_wrapper(self_ref):

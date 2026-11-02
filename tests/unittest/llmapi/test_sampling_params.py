@@ -171,6 +171,36 @@ def test_explicit_serve_request_overrides_generation_config(request_obj):
     assert prepared.temperature == 0.2
 
 
+def test_set_request_provided_fields_keeps_only_sampler_fields():
+    params = SamplingParams(end_id=1)
+    params.temperature = 0.2
+    params.set_request_provided_fields(["temperature", "not_a_field"])
+    assert params._request_provided_fields == frozenset({"temperature"})
+
+    # A recorded field stays request-provided through model defaulting, exactly
+    # as the private recording did; unrecorded fields take the model default.
+    prepared = _apply_generation_config_sampling_defaults(
+        "auto", params, {"temperature": 0.7, "top_p": 0.9}
+    )
+    assert prepared.temperature == 0.2
+    assert prepared.top_p == 0.9
+
+
+def test_stop_word_ids_filled_in_by_request_setup():
+    params = SamplingParams(end_id=1, stop="halt")
+    assert params.stop_word_ids is None
+
+    class _Tokenizer:
+        eos_token_id = 1
+        pad_token_id = 0
+
+        def encode(self, text, add_special_tokens=False):
+            return [10, 11]
+
+    params._setup(_Tokenizer(), hf_model_config=None, generation_config=None)
+    assert params.stop_word_ids == [[10, 11]]
+
+
 def test_absent_generation_config_value_preserves_existing_defaults():
     direct_params = _apply_generation_config_sampling_defaults("auto", SamplingParams(end_id=1), {})
     serve_params = _apply_generation_config_sampling_defaults(

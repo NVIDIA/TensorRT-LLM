@@ -149,7 +149,7 @@ def parse_chat_message_content_part(
     if part_type == "image_url":
         str_content = cast(str, content)
         image_io = _make_media_io("image",
-                                  mm_data_tracker._multimodal_server_config,
+                                  mm_data_tracker.multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="image",
                               data=image_io.async_load(str_content),
@@ -168,7 +168,7 @@ def parse_chat_message_content_part(
     if part_type == "video_url":
         str_content = cast(str, content)
         video_io = _make_media_io("video",
-                                  mm_data_tracker._multimodal_server_config,
+                                  mm_data_tracker.multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="video",
                               data=video_io.async_load(str_content),
@@ -177,7 +177,7 @@ def parse_chat_message_content_part(
     if part_type == "audio_url":
         str_content = cast(str, content)
         audio_io = _make_media_io("audio",
-                                  mm_data_tracker._multimodal_server_config,
+                                  mm_data_tracker.multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="audio",
                               data=audio_io.async_load(str_content),
@@ -195,7 +195,7 @@ def parse_chat_message_content_part(
         audio_format = dict_content.get("format", "")
         audio_url = f"data:audio/{audio_format};base64,{audio_data}"
         audio_io = _make_media_io("audio",
-                                  mm_data_tracker._multimodal_server_config,
+                                  mm_data_tracker.multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="audio",
                               data=audio_io.async_load(audio_url),

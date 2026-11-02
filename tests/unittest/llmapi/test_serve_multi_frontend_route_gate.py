@@ -65,7 +65,7 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server = object.__new__(OpenAIServer)
     server.app = FastAPI()
     server.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
+        resource_governor_queue=None,
         args=SimpleNamespace(return_perf_metrics=False),
     )
     server.use_harmony = False

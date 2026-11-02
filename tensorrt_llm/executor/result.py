@@ -67,7 +67,7 @@ class LogProbsResult(NamedTuple):
     prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] = None
 
 
-class _SpecDecCounters(NamedTuple):
+class SpecDecCounters(NamedTuple):
     """Speculative-decoding counters reported by the request behind one sequence.
 
     Field names match the executor response so a formatter can read either.
@@ -128,6 +128,8 @@ class CompletionOutput:
         logprobs_diff (TokenLogprobs | SimpleTokenLogprobs): Logprobs of newly generated tokens.
         text_diff (str): Newly generated tokens.
         routed_experts (Optional[torch.Tensor]): Per-token pre-EPLB logical top-k MoE expert ids (Router Replay / R3), or None when not requested.
+        spec_dec_counters (tensorrt_llm.executor.result.SpecDecCounters, optional): This sequence's speculative-decoding counters, or None.
+        text_diff_offset (int): Offset in text at which text_diff starts.
     """
     index: int
     text: str = ""
@@ -157,9 +159,9 @@ class CompletionOutput:
     # the result of result_handler passed to postprocess workers
     _postprocess_result: Any = None
     # this sequence's own spec-decode counters; see _handle_sequence
-    _spec_dec_counters: Optional[_SpecDecCounters] = field(default=None,
-                                                           init=False,
-                                                           repr=False)
+    _spec_dec_counters: Optional[SpecDecCounters] = field(default=None,
+                                                          init=False,
+                                                          repr=False)
 
     def __getstate__(self) -> dict:
         # _incremental_states holds a tokenizers.DecodeStream (a Rust object,
@@ -207,6 +209,16 @@ class CompletionOutput:
     @property
     def text_diff(self) -> str:
         return self.text[self._last_text_len:]
+
+    @property
+    def text_diff_offset(self) -> int:
+        """Offset in ``text`` at which ``text_diff`` starts."""
+        return self._last_text_len
+
+    @property
+    def spec_dec_counters(self) -> Optional[SpecDecCounters]:
+        """This sequence's own speculative-decoding counters, or None if the request did not draft."""
+        return self._spec_dec_counters
 
     @property
     def token_ids_diff(self) -> List[int]:
@@ -382,7 +394,7 @@ class GenerationResultBase:
         output.disaggregated_params = self.disaggregated_params
         output._last_token_ids_len = len(output.token_ids)
         output._last_logprobs_len = len(output.logprobs)
-        output._spec_dec_counters = _SpecDecCounters()
+        output._spec_dec_counters = SpecDecCounters()
         decoder_output_prefix = ()
         if (self.sampling_params.exclude_input_from_output
                 or getattr(self, "_streaming", False)):
@@ -463,7 +475,7 @@ class GenerationResultBase:
             # counters, while the request-level copies on self are overwritten by
             # every candidate's response. Capture this sequence's here so a choice
             # never reports whichever candidate happened to respond last.
-            output._spec_dec_counters = _SpecDecCounters(
+            output._spec_dec_counters = SpecDecCounters(
                 per_pos_drafted=response_tensors.per_pos_drafted,
                 per_pos_accepted=response_tensors.per_pos_accepted,
                 spec_dec_totals=response_tensors.spec_dec_totals)

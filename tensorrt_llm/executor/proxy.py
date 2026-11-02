@@ -680,6 +680,19 @@ class GenerationExecutorProxy(GenerationExecutor):
             frontend_result_queue_addrs=frontend_result_addrs,
         )
 
+    @property
+    def multi_frontend_ipc_dir(self) -> Optional[str]:
+        """The launcher-owned directory of the multi-frontend IPC endpoints.
+
+        None unless multi-frontend mode is active. The launcher places its
+        own Unix sockets (the attached frontends' forwarding endpoint) in it;
+        the directory is private to the user and removed, socket files
+        included, when this proxy shuts down.
+        """
+        # GenerationExecutorFrontendProxy skips this class's __init__, so the
+        # attribute can be missing there; an attached frontend owns no ipc dir.
+        return getattr(self, "_multi_frontend_ipc_dir", None)
+
     def multi_frontend_attach_info(self) -> Optional[dict]:
         """The attach payload consumed by attached serving frontends.
 
@@ -1693,8 +1706,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         self.garbage_collection_gen0_threshold = None
         self.workers_started = False
         self.dispatch_result_thread: Optional[ManagedThread] = None
-        # Must be None: OpenAIServer reads the resource_governor_queue
-        # property at init; the governor lives with the launcher only.
+        # Must be None: LLM.resource_governor_queue reads this property at
+        # server init; the governor lives with the launcher only.
         self._resource_governor_queue = None
 
         hmac_key = bytes.fromhex(attach_info["hmac_key"])

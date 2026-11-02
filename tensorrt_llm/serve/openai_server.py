@@ -303,10 +303,7 @@ def _record_generator_termination(generator) -> None:
     reporting_source = "self"
     termination_kind = "exception"
     try:
-        from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-
-        if isinstance(getattr(generator, "_executor", None),
-                      GenerationExecutorProxy):
+        if generator.engine_in_worker_process:
             component = "engine_worker"
             reporting_source = "executor_proxy"
             termination_kind = "worker_failure"
@@ -964,11 +961,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
-        hf_tokenizer_path = self.generator._hf_model_dir
-        if not hf_tokenizer_path:
-            hf_tokenizer_path = getattr(
-                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
-                    self.tokenizer, "name_or_path", None)
+        hf_tokenizer_path = self.generator.hf_model_dir
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
@@ -1261,7 +1254,7 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
-        resource_governor_queue = self.generator._executor.resource_governor_queue
+        resource_governor_queue = self.generator.resource_governor_queue
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
             self.resource_governor = ResourceGovernor(
@@ -1474,20 +1467,15 @@ class OpenAIServer(_VideoRoutesMixin):
             # returns one EncoderOutput per item, in input order.
             return self.generator.encode(token_ids_batch)
 
-        # Source the batch limits from the resolved encoder engine — the same
-        # attributes encode() validates against (llm.py: engine.max_seq_len /
-        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
-        # to None and are not written back to args, so reading them from args
-        # would leave the batcher's seq-len/token-budget guards inert (typed 400s
-        # would never fire) and could let it form a batch encode() then rejects.
-        engine = self.generator._encoder_executor.model_engine
+        # The limits encode() checks every call against; see LLM.encode_limits.
+        limits = self.generator.encode_limits
         self.embedding_batcher = EncodeBatcher(
             encode_fn,
-            max_batch_size=engine.batch_size,
+            max_batch_size=limits.max_batch_size,
             max_queue_delay=self._embedding_max_queue_delay,
             max_queue_size=self._embedding_max_queue_size,
-            max_num_tokens=engine.max_num_tokens,
-            max_seq_len=engine.max_seq_len,
+            max_num_tokens=limits.max_num_tokens,
+            max_seq_len=limits.max_seq_len,
         )
 
     def register_embedding_routes(self):
@@ -1710,11 +1698,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Mirrors the fatal-error branch of ``health``.
         """
-        executor = self.generator._executor
-        if executor is None:  # the LLM already shut down
+        # record_fatal_error keeps only the first error; False means the LLM
+        # already shut down.
+        if not self.generator.record_fatal_error(error):
             return
-        executor._set_fatal_error(error)  # keeps only the first error
-        if not executor.doing_shutdown:
+        if not self.generator.shutdown_started:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 

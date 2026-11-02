@@ -37,7 +37,7 @@ EXCLUDED = ("tensorrt_llm/serve/scripts/", "tensorrt_llm/grpc/openengine/_genera
 OPENENGINE_SCOPE = "tensorrt_llm/grpc/openengine/"
 
 # Lower this when you remove accesses; never raise it.
-MAX_TOTAL = 50
+MAX_TOTAL = 19
 
 # (path, member) -> (verdict, reason). Verdicts: "cross", "same-package", "third-party".
 # Needed only where the name index cannot tell: the name is defined both inside and

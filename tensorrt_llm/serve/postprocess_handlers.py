@@ -153,11 +153,10 @@ def _build_spec_decode_stats(
         finish_reason: Optional[str]) -> Optional[SpeculativeDecodingStats]:
     """Derive per-request speculative-decoding acceptance for one sequence.
 
-    ``counters`` is the sequence's own ``CompletionOutput._spec_dec_counters``,
+    ``counters`` is the sequence's own ``CompletionOutput.spec_dec_counters``,
     never the request-level copies on the GenerationResult: with n > 1 every
     candidate reports its own counters and those copies hold whichever
-    candidate responded last. Callers read it with getattr, since outputs that
-    are not a CompletionOutput (test doubles, for one) lack the field.
+    candidate responded last.
 
     Returns None -- meaning the field is omitted entirely -- when the caller has
     not opted in, when the sequence has not finished (streaming carries this
@@ -593,8 +592,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
+                output.spec_dec_counters, args, output.finish_reason),
             stop_reason=output.stop_reason,
         )
         if args.return_logprobs:
@@ -761,8 +759,7 @@ def chat_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
+                output.spec_dec_counters, args, output.finish_reason),
         )
         if output.finish_reason == "stop" and args.has_tool_call.get(
                 output.index, False):
@@ -892,14 +889,13 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
+                output.spec_dec_counters, args, output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
             choice.logprobs = create_completion_logprobs(
-                token_ids, args.tokenizer, logprobs, output._last_text_len)
+                token_ids, args.tokenizer, logprobs, output.text_diff_offset)
 
         chunk = CompletionStreamResponse(model=args.model,
                                          choices=[choice],
@@ -963,8 +959,7 @@ def completion_response_post_processor(
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
             speculative_decoding=_build_spec_decode_stats(
-                getattr(output, '_spec_dec_counters', None), args,
-                output.finish_reason),
+                output.spec_dec_counters, args, output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs

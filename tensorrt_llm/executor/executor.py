@@ -342,6 +342,10 @@ class GenerationExecutor(ABC):
         """The unrecoverable engine error recorded by ``_set_fatal_error``, or None."""
         return self._fatal_error
 
+    def record_fatal_error(self, error: BaseException) -> None:
+        """Record an unrecoverable engine error; the first recorded error wins (see ``fatal_error``)."""
+        self._set_fatal_error(error)
+
     @property
     def engine_dead(self) -> bool:
         """Whether the engine is known dead (an unrecoverable error was recorded)."""
@@ -413,6 +417,11 @@ class GenerationExecutor(ABC):
     @property
     def resource_governor_queue(self):
         """Return the resource governor queue if this executor supports it."""
+        return None
+
+    @property
+    def multi_frontend_ipc_dir(self) -> Optional[str]:
+        """The multi-frontend IPC directory if this executor runs one, else None."""
         return None
 
     @property

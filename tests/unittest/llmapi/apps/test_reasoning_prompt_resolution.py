@@ -142,6 +142,7 @@ class _FakeOutput:
         self.finish_reason = "stop"
         self.stop_reason = None
         self.logprobs = None
+        self.spec_dec_counters = None
         self.disaggregated_params = LlmDisaggregatedParams(request_type="context_only")
 
 

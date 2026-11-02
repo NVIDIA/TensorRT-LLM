@@ -269,6 +269,9 @@ class SamplingParams:
         truncate_prompt_tokens (int, optional): If set to an integer k, will use only the last k tokens from the prompt (i.e., left truncation). Defaults to None.
         skip_special_tokens (bool): Whether to skip special tokens in the output. Defaults to True.
         spaces_between_special_tokens (bool): Whether to add spaces between special tokens in the output. Defaults to True.
+
+    Attributes:
+        stop_word_ids (List[List[int]], optional): Token ids of each stop string, filled in when the LLM sets up the request.
     """  # noqa: E501
 
     # [TO DEVELOPER] This class provides an interface to LLMAPI users.
@@ -467,9 +470,25 @@ class SamplingParams:
         if self.logprobs_simple_format and self.use_beam_search:
             raise ValueError("logprobs_simple_format is not supported with beam search")
 
-    def _set_request_provided_fields(self, field_names: Iterable[str]) -> None:
-        """Record sampler fields explicitly supplied by a serving request."""
+    def set_request_provided_fields(self, field_names: Iterable[str]) -> None:
+        """Record which sampler fields a serving request set explicitly.
+
+        Serving adapters fill protocol defaults into every field; recording the
+        fields the request set keeps generation_config.json defaults for the rest.
+
+        Args:
+            field_names (Iterable[str]): Names of the fields the request set;
+                names that are not sampler fields are ignored.
+        """
         self._request_provided_fields = frozenset(field_names) & _GENERATION_CONFIG_SAMPLING_FIELDS
+
+    @property
+    def stop_word_ids(self) -> Optional[List[List[int]]]:
+        """Token ids of each ``stop`` string, filled in when the LLM sets up the request.
+
+        None before that, or when the request has no ``stop`` strings.
+        """
+        return self._stop_word_ids
 
     def _apply_generation_config_defaults(self, generation_config: Mapping[str, Any]) -> None:
         """Apply compatible model defaults without overriding request values."""

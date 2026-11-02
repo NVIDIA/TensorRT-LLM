@@ -131,9 +131,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         async with self._load_snapshot_lock:
             now = time.monotonic()
             if now >= self._load_snapshot_deadline:
-                executor = getattr(self._llm, "_executor", None)
-                getter = getattr(executor, "get_kv_cache_load", None)
-                self._load_snapshot = await asyncio.to_thread(getter) if callable(getter) else {}
+                self._load_snapshot = await asyncio.to_thread(self._llm.get_kv_cache_load)
                 self._load_snapshot_deadline = time.monotonic() + _LOAD_SNAPSHOT_CACHE_SECONDS
         return self._load_snapshot
 
@@ -218,15 +216,17 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         block_size = _positive_int(self._llm.args.kv_cache_config.tokens_per_block)
         if block_size is not None:
             capacity.kv_block_size = block_size
-        executor = getattr(self._llm, "_executor", None)
-        capacity_getter = getattr(executor, "get_kv_cache_capacity", None)
-        if callable(capacity_getter):
-            kv_capacity = await asyncio.to_thread(capacity_getter)
-            local_blocks = _positive_int(kv_capacity.get("maxNumBlocks"))
-            if local_blocks is not None and data_parallel_size(self._llm) == 1:
-                capacity.total_kv_blocks = local_blocks
-        discovery_getter = getattr(executor, "get_openengine_discovery", None)
-        discovery = await asyncio.to_thread(discovery_getter) if callable(discovery_getter) else {}
+        # An encode-only LLM has no generation executor and no KV capacity;
+        # LLM.get_kv_cache_capacity() raises for it, so skip the query.
+        kv_capacity = (
+            {}
+            if self._llm.args.encode_only is True
+            else await asyncio.to_thread(self._llm.get_kv_cache_capacity)
+        )
+        local_blocks = _positive_int(kv_capacity.get("maxNumBlocks"))
+        if local_blocks is not None and data_parallel_size(self._llm) == 1:
+            capacity.total_kv_blocks = local_blocks
+        discovery = await asyncio.to_thread(self._llm.get_openengine_discovery)
         events = events_config(self._llm)
         discovery_required = (
             getattr(self._llm.args, "_openengine_discovery", None) is not None
@@ -656,9 +656,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         """
         if events_config(self._llm) is None:
             return []
-        executor = getattr(self._llm, "_executor", None)
-        getter = getattr(executor, "get_openengine_discovery", None)
-        discovery = await asyncio.to_thread(getter) if callable(getter) else {}
+        discovery = await asyncio.to_thread(self._llm.get_openengine_discovery)
         descriptors = discovery.get("sources")
         if descriptors is None:
             await context.abort(

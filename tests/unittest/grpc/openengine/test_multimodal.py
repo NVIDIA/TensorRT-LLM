@@ -193,7 +193,7 @@ class _ResultHandle:
 class _ImageLlm:
     def __init__(self, input_processor, config) -> None:
         self.input_processor = input_processor
-        self._hf_model_config = config
+        self.hf_model_config = config
         self.args = SimpleNamespace(guided_decoding_backend=None)
         self.tokenizer = _Tokenizer()
         output = SimpleNamespace(
@@ -285,7 +285,7 @@ def image_llm(monkeypatch):
     )
     return (
         SimpleNamespace(
-            _hf_model_config=config,
+            hf_model_config=config,
             input_processor=input_processor,
         ),
         seen_model_types,
@@ -310,7 +310,7 @@ def image_video_llm(monkeypatch):
         lambda model_type, modality: f"<{modality}_{{}}>",
     )
     return SimpleNamespace(
-        _hf_model_config=config,
+        hf_model_config=config,
         input_processor=input_processor,
     )
 
@@ -333,7 +333,7 @@ def image_video_audio_llm(monkeypatch):
         lambda model_type, modality: f"<{modality}_{{}}>",
     )
     return SimpleNamespace(
-        _hf_model_config=config,
+        hf_model_config=config,
         input_processor=input_processor,
     )
 
@@ -345,7 +345,7 @@ def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     assert seen_model_types == [_ImageConfig.model_type] * 3
     assert (
         request_mapping.media_capabilities_for_model(
-            SimpleNamespace(_hf_model_config=llm._hf_model_config, input_processor=object())
+            SimpleNamespace(hf_model_config=llm.hf_model_config, input_processor=object())
         ).modalities
         == set()
     )
@@ -364,7 +364,7 @@ def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
         lambda model_type, modality: "",
     )
     llm = SimpleNamespace(
-        _hf_model_config=config,
+        hf_model_config=config,
         input_processor=_AudioInputProcessor(config),
     )
 
@@ -418,7 +418,7 @@ def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatc
     config = _ImageConfig()
     monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_args: True)
     llm = SimpleNamespace(
-        _hf_model_config=config,
+        hf_model_config=config,
         input_processor=_NonCallableRegisteredInputProcessor(config),
     )
 
@@ -429,7 +429,7 @@ def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatc
 @pytest.mark.parametrize("disabled", [False, True])
 async def test_disabled_mm_encoder_agrees_between_discovery_and_generate(image_llm, disabled):
     capability_llm, _ = image_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
     llm.args.disable_mm_encoder = disabled
     llm.args.reasoning_parser = None
     llm.args.max_seq_len = 2048
@@ -726,7 +726,7 @@ def test_gemma4_missing_processor_config_fails_closed(config_state):
     processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
     if config_state == "none":
         processor._config = None
-    llm = SimpleNamespace(input_processor=processor, _hf_model_config=config)
+    llm = SimpleNamespace(input_processor=processor, hf_model_config=config)
     assert processor.supported_modalities == frozenset()
     assert request_mapping.media_capabilities_for_model(llm).modalities == frozenset()
 
@@ -1029,7 +1029,7 @@ def test_passthrough_placeholder_policy_follows_processor_input_path(
     from tensorrt_llm.inputs.content_format import ContentFormat
 
     capability_llm, _ = image_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
     monkeypatch.setattr(llm.input_processor, "supports_token_id_mm_expansion", fast_path)
     monkeypatch.setattr(
         MULTIMODAL_PLACEHOLDER_REGISTRY,
@@ -1112,7 +1112,7 @@ async def test_media_and_preprocessing_do_not_block_control_executor(image_llm, 
 
     loop = asyncio.get_running_loop()
     capability_llm, _ = image_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
     llm.args = SimpleNamespace(
         guided_decoding_backend=None,
         tensor_parallel_size=1,
@@ -1120,11 +1120,11 @@ async def test_media_and_preprocessing_do_not_block_control_executor(image_llm, 
         context_parallel_size=1,
         max_batch_size=8,
         max_num_tokens=2048,
+        encode_only=False,
         kv_cache_config=SimpleNamespace(tokens_per_block=32),
     )
-    llm._executor = SimpleNamespace(
-        get_kv_cache_capacity=lambda: {}, get_openengine_discovery=lambda: {}
-    )
+    llm.get_kv_cache_capacity = lambda: {}
+    llm.get_openengine_discovery = lambda: {}
     with (
         ThreadPoolExecutor(max_workers=1, thread_name_prefix="test_input") as input_pool,
         ThreadPoolExecutor(max_workers=1, thread_name_prefix="test_media") as media_pool,
@@ -1432,7 +1432,7 @@ async def test_request_validation_precedes_media_loading(
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
 
     class _ImageIo:
@@ -1470,7 +1470,7 @@ async def test_capability_error_precedes_other_request_validation(image_llm):
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
     request = generation_pb2.GenerateRequest(
         request_id="unsupported-video",
@@ -1784,7 +1784,7 @@ async def test_generate_submits_image_and_reports_expanded_prompt_usage(image_ll
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
 
     class _ImageIo:
@@ -1828,7 +1828,7 @@ async def test_placeholder_mismatch_does_not_poison_hashing(
     import torch
 
     capability_llm, _ = image_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
     processor = llm.input_processor
     processor.multimodal_hashing_supported = None
     monkeypatch.setattr(processor, "get_mm_token_ids", lambda: torch.tensor([21, 23]))
@@ -1917,7 +1917,7 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
     image_video_llm, monkeypatch, outcome, modality
 ):
     capability_llm = image_video_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
     loop = asyncio.get_running_loop()
     serving_thread = threading.get_ident()
     request_context = ContextVar("preprocess_request_context", default=None)
@@ -2090,7 +2090,7 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(
 )
 async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error, expected_code):
     capability_llm, _ = image_llm
-    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm.hf_model_config)
 
     class _ImageIo:
         @classmethod
@@ -2136,7 +2136,7 @@ async def test_duplicate_request_id_is_reserved_while_media_loads(image_llm, mon
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
     load_started = asyncio.Event()
     load_cancelled = asyncio.Event()
@@ -2209,7 +2209,7 @@ async def test_media_loading_stops_for_coordinator_abort_or_rpc_cancellation(
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
     load_started = asyncio.Event()
     load_cancelled = asyncio.Event()
@@ -2284,7 +2284,7 @@ async def test_coordinator_abort_before_reservation_binding_prevents_media_loadi
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
     decoder_creations = 0
 
@@ -2339,7 +2339,7 @@ async def test_generate_maps_media_errors_to_grpc_statuses(image_llm):
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
     servicer = OpenEngineInferenceServicer(llm, model="image-model")
 
@@ -2389,7 +2389,7 @@ async def test_generate_maps_transient_media_fetch_to_failed_precondition(
     capability_llm, _ = image_llm
     llm = _ImageLlm(
         capability_llm.input_processor,
-        capability_llm._hf_model_config,
+        capability_llm.hf_model_config,
     )
 
     class _ImageIo:
