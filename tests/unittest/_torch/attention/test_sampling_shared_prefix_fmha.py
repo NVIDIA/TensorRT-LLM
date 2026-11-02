@@ -1312,7 +1312,7 @@ def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
 
 def _run_fused_spec(
     case, num_heads, head_dim, q_len, pool, q, k, v, out, workspace, group_grid=None, ctx=None,
-    tail_splits=1,
+    tail_splits=1, fa4_tail=None,
 ):
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         fused_sampling_attention,
@@ -1343,8 +1343,47 @@ def _run_fused_spec(
         tail_last_page_len=d["last"], write_page=d["zeros"], write_slot=d["zeros"],
         sm_scale=1.0 / math.sqrt(head_dim), num_groups=case["groups"] + 1,
         max_group_rows=case["per_group"], workspace=workspace, q_len=q_len,
-        prefix_splits=2, tail_splits=tail_splits, group_grid=group_grid, ctx=ctx,
+        prefix_splits=2, tail_splits=tail_splits, group_grid=group_grid, ctx=ctx, fa4_tail=fa4_tail,
     )  # fmt: skip
+
+
+def _make_fa4_tail(case, num_heads, head_dim, q_len, prefix_pages=4, kv_factor=2):
+    """``Fa4Tail`` of a fused-spec case with its step tables built from a device block-offset table
+    (batch order, ``kv_factor`` entries per pool-view page, a row's shared pages first)."""
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import Fa4Tail
+
+    device = torch.device("cuda")
+    t = case["tables"]
+    rows, tpb = case["rows"], case["tpb"]
+    perm = t["perm"].tolist()
+    max_blocks = 64
+    offsets = torch.full((rows, max_blocks), -7, dtype=torch.int32)
+    shared = []
+    kv_lens = [0] * rows
+    for i in range(rows):
+        b = perm[i]
+        sharing = i < case["sharing_rows"]
+        g = i // case["per_group"]
+        pages = (list(range(g * prefix_pages, (g + 1) * prefix_pages)) if sharing else []) + case["own"][i]
+        offsets[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32) * kv_factor
+        shared.append(prefix_pages if sharing else 0)
+        kv_lens[b] = shared[-1] * tpb + case["cached"][i] + q_len
+    tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_blocks, torch.bfloat16, device)
+    tail.build_tables(
+        offsets.to(device),
+        t["perm"],
+        torch.tensor(shared, dtype=torch.int32, device=device),
+        torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        kv_factor,
+        tpb,
+    )
+    torch.cuda.synchronize()
+    for i in range(rows):
+        b = perm[i]
+        own = case["own"][i]
+        assert tail.table[b, : len(own)].tolist() == own
+        assert int(tail.tail_lens[b]) == case["cached"][i] + q_len
+    return tail
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -1478,6 +1517,59 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
         torch.cuda.synchronize()
         err = (out.double() - case["ref"]).abs().amax() / case["ref"].abs().amax()
         assert float(err) < 2e-2, f"seed {seed}: rel err {float(err)}"
+        expect = before.clone()
+        for i in range(case["rows"]):
+            b = int(case["tables"]["perm"][i])
+            for j in range(q_len):
+                pos = case["cached"][i] + j
+                page = case["own"][i][pos // case["tpb"]]
+                expect[page, 0, :, pos % case["tpb"]] = case["k"][b * q_len + j]
+                expect[page, 1, :, pos % case["tpb"]] = case["v"][b * q_len + j]
+        assert torch.equal(pool, expect)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
+    [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False),
+     (20, 20, 128, 9, True, 2, False)],
+)
+@pytest.mark.parametrize("massive", [False, True])
+def test_fused_spec_attention_with_fa4_prefix_and_tail_matches_dense_and_writes_kv(
+    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive
+):
+    """FlashAttention-4 for the shared pages and the private pages (SM90) + their merge against the
+    float64 reference (also with massive activations), and the step's K/V written at cached + j."""
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
+        FusedWorkspace,
+    )
+
+    device = torch.device("cuda")
+    for seed in range(2):
+        case = _fused_spec_case(
+            num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, seed, overshoot,
+            massive=massive,
+        )  # fmt: skip
+        ctx = _make_ctx(case, num_heads, head_dim, q_len, kind="fa4")
+        tail = _make_fa4_tail(case, num_heads, head_dim, q_len)
+        pool = case["pool"]
+        before = pool.clone()
+        out = torch.empty_like(case["q"])
+        ws = FusedWorkspace(case["ntok"], num_heads, head_dim, 3, device)
+        _run_fused_spec(
+            case, num_heads, head_dim, q_len, pool, case["q"], case["k"], case["v"], out, ws, ctx=ctx,
+            fa4_tail=tail,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        ref = case["ref"]
+        if massive:
+            head_max = ref.abs().amax(-1)
+            err = (out.double() - ref).abs().amax(-1)
+            assert not bool(((out.abs().amax(-1) == 0) & (head_max > 1e-3)).any()), "zero head"
+            assert float((err / head_max.clamp(min=1e-3)).max()) < 2.5e-2
+        else:
+            err = (out.double() - ref).abs().amax() / ref.abs().amax()
+            assert float(err) < 2e-2, f"seed {seed}: rel err {float(err)}"
         expect = before.clone()
         for i in range(case["rows"]):
             b = int(case["tables"]["perm"][i])
