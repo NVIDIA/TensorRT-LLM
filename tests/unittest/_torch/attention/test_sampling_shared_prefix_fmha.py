@@ -1313,8 +1313,20 @@ def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx", splits=1):
 
 
 def _run_fused_spec(
-    case, num_heads, head_dim, q_len, pool, q, k, v, out, workspace, group_grid=None, ctx=None,
-    tail_splits=1, fa4_tail=None,
+    case,
+    num_heads,
+    head_dim,
+    q_len,
+    pool,
+    q,
+    k,
+    v,
+    out,
+    workspace,
+    group_grid=None,
+    ctx=None,
+    tail_splits=1,
+    fa4_tail=None,
 ):
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         fused_sampling_attention,
@@ -1366,11 +1378,15 @@ def _make_fa4_tail(case, num_heads, head_dim, q_len, prefix_pages=4, kv_factor=2
         b = perm[i]
         sharing = i < case["sharing_rows"]
         g = i // case["per_group"]
-        pages = (list(range(g * prefix_pages, (g + 1) * prefix_pages)) if sharing else []) + case["own"][i]
+        pages = (list(range(g * prefix_pages, (g + 1) * prefix_pages)) if sharing else []) + case[
+            "own"
+        ][i]
         offsets[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32) * kv_factor
         shared.append(prefix_pages if sharing else 0)
         kv_lens[b] = shared[-1] * tpb + case["cached"][i] + q_len
-    tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_blocks, torch.bfloat16, device, splits=splits)
+    tail = Fa4Tail(
+        rows, q_len, num_heads, head_dim, max_blocks, torch.bfloat16, device, splits=splits
+    )
     tail.build_tables(
         offsets.to(device),
         t["perm"],
@@ -1447,7 +1463,12 @@ def test_fused_spec_attention_matches_dense_and_writes_kv(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,prefix_kernel",
-    [(28, 4, 128, 2, "triton"), (28, 4, 128, 2, "ctx"), (28, 4, 128, 4, "fa4"), (28, 4, 128, 9, "fa4")],
+    [
+        (28, 4, 128, 2, "triton"),
+        (28, 4, 128, 2, "ctx"),
+        (28, 4, 128, 4, "fa4"),
+        (28, 4, 128, 9, "fa4"),
+    ],
 )
 def test_fused_attention_with_massive_activations(
     num_heads, num_kv_heads, head_dim, q_len, prefix_kernel
@@ -1490,7 +1511,11 @@ def test_fused_attention_with_massive_activations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
-    [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False)],
+    [
+        (28, 4, 128, 4, True, 2, True),
+        (28, 4, 128, 9, True, 2, True),
+        (20, 20, 128, 4, False, 0, False),
+    ],
 )
 @pytest.mark.parametrize("tail_splits", [1, 3, 8])
 def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
@@ -1533,8 +1558,12 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
-    [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False),
-     (20, 20, 128, 9, True, 2, False)],
+    [
+        (28, 4, 128, 4, True, 2, True),
+        (28, 4, 128, 9, True, 2, True),
+        (20, 20, 128, 4, False, 0, False),
+        (20, 20, 128, 9, True, 2, False),
+    ],
 )
 @pytest.mark.parametrize("massive", [False, True])
 @pytest.mark.parametrize(
@@ -1542,8 +1571,18 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
     [(1, 1, 512), (3, 1, 32), (8, 1, 32), (1, 4, 32), (8, 16, 32), (8, 16, 512)],
 )
 def test_fused_spec_attention_with_fa4_prefix_and_tail_matches_dense_and_writes_kv(
-    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive,
-    prefix_splits, tail_splits, min_split_tokens, monkeypatch,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    q_len,
+    shuffled,
+    placeholder_rows,
+    overshoot,
+    massive,
+    prefix_splits,
+    tail_splits,
+    min_split_tokens,
+    monkeypatch,
 ):
     """FlashAttention-4 for the shared pages (whole, or split into runs, some empty: 4 shared pages
     split 8 ways) and the private pages (SM90) + their merge against the float64 reference (also
