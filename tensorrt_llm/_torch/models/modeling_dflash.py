@@ -461,13 +461,25 @@ def resolve_draft_logit_transform(dflash_config: Dict) -> tuple[float, Optional[
     `final_logit_softcapping`), its drafters are trained on logits transformed
     the same way, and their `dflash_config` repeats the two values. `(1.0,
     None)` means no transform; a softcap of 0 means none.
+
+    Raises `ValueError` for a multiplier that is not positive and finite, or a
+    softcap that is negative or not finite: such a value only lowers acceptance
+    without failing, and a negative multiplier also reverses the argmax that
+    the vocabulary-parallel draft path takes without the transform.
     """
     multiplier = dflash_config.get("output_multiplier")
+    multiplier = 1.0 if multiplier is None else float(multiplier)
+    if not (math.isfinite(multiplier) and multiplier > 0):
+        raise ValueError(
+            f"dflash_config.output_multiplier must be positive and finite, got {multiplier}"
+        )
     softcap = dflash_config.get("final_logit_softcapping")
-    return (
-        1.0 if multiplier is None else float(multiplier),
-        float(softcap) if softcap else None,
-    )
+    softcap = 0.0 if softcap is None else float(softcap)
+    if not (math.isfinite(softcap) and softcap >= 0):
+        raise ValueError(
+            f"dflash_config.final_logit_softcapping must be non-negative and finite, got {softcap}"
+        )
+    return multiplier, softcap or None
 
 
 class DFlashForCausalLM(nn.Module):

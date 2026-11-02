@@ -26,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     dflash2_walk_candidate_paths,
     resolve_draft_logit_transform,
 )
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
 
@@ -777,6 +778,47 @@ def test_logit_transform_decides_the_selector_walk():
     assert int(transformed[0, 0].argmax()) == int(raw_unary[0, 0].argmax()) == 0
     assert walk(raw_unary) == 0
     assert walk(transformed) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "declared",
+    [
+        {"output_multiplier": 0},
+        {"output_multiplier": -0.5},
+        {"output_multiplier": float("nan")},
+        {"final_logit_softcapping": -20.0},
+        {"final_logit_softcapping": float("inf")},
+    ],
+)
+def test_logit_transform_rejects_values_that_would_only_lower_acceptance(declared):
+    with pytest.raises(ValueError, match=f"dflash_config.{next(iter(declared))}"):
+        resolve_draft_logit_transform(declared)
+
+
+@pytest.mark.cpu_only
+def test_declared_transform_needs_the_plain_logits_processor():
+    """A processor that transforms the logits itself would get the transform twice."""
+
+    class TransformingProcessor(LogitsProcessor):
+        pass
+
+    worker = DFlashWorker.__new__(DFlashWorker)
+    worker._target_model_ref = None
+    worker._vocab_parallel = None
+    for dflash_config, processor, rejected in (
+        (DECLARED_LOGIT_TRANSFORM, LogitsProcessor(), False),
+        (DECLARED_LOGIT_TRANSFORM, TransformingProcessor(), True),
+        ({}, TransformingProcessor(), False),
+    ):
+        draft = _transform_wrapper(dflash_config)
+        draft.logits_processor = processor
+        worker._draft_model_ref = lambda draft=draft: draft
+        if rejected:
+            with pytest.raises(RuntimeError, match="plain LogitsProcessor"):
+                worker.setup_aliases()
+        else:
+            worker.setup_aliases()
 
 
 # ---------------------------------------------------------------------------

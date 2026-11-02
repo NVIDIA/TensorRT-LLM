@@ -718,6 +718,27 @@ class VocabParallelSelection:
     draft_tokens: Optional[VocabParallelDraftTokens] = None
 
 
+def check_draft_logits_processor(draft_model) -> None:
+    """Require the plain logits processor on a drafter that declares a logit transform.
+
+    The worker applies the transform a drafter's `dflash_config` declares to
+    the logits of the drafter's own processor, so that processor must be the
+    plain `LogitsProcessor`. One that transforms the logits itself, such as a
+    target's, would get the transform a second time.
+    """
+    declares = (
+        getattr(draft_model, "logit_multiplier", 1.0) != 1.0
+        or getattr(draft_model, "logit_softcap", None) is not None
+    )
+    processor = getattr(draft_model, "logits_processor", None)
+    if declares and type(processor) is not LogitsProcessor:
+        raise RuntimeError(
+            "The DFlash drafter declares a logit transform (output_multiplier "
+            f"{draft_model.logit_multiplier}, final_logit_softcapping {draft_model.logit_softcap}), "
+            f"which assumes the plain LogitsProcessor; got {type(processor).__name__}"
+        )
+
+
 class DFlashWorker(SpecWorkerBase):
     """
     Worker for DFlash speculative decoding.
@@ -947,7 +968,9 @@ class DFlashWorker(SpecWorkerBase):
         if target_model is not None:
             self.bind_target_lm_head(target_model.lm_head, target_model.logits_processor)
         if self._draft_model_ref is not None:
-            self.bind_draft_lm_head(self._draft_model_ref())
+            draft_model = self._draft_model_ref()
+            check_draft_logits_processor(draft_model)
+            self.bind_draft_lm_head(draft_model)
 
     def post_load_weights(self) -> None:
         self.setup_aliases()
