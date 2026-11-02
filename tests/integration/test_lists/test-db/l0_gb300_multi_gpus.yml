@@ -64,6 +64,7 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  - unittest/_torch/modeling/test_kimi_k3_moe_front.py
   # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM) and the LL TP exchanges.
   - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
   - unittest/_torch/multi_gpu/test_ll_exchange.py
@@ -71,6 +72,8 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   # KDA runtime state-pool and mixed-batch core coverage.
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   - unittest/_torch/modules/kimi_kda/test_kda_mixed_batch_core_layout.py

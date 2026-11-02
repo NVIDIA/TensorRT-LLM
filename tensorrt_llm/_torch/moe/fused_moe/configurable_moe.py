@@ -28,6 +28,7 @@ Design Principles:
 """
 
 import copy
+import functools
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional, Type, Union
 
@@ -464,6 +465,59 @@ class ConfigurableMoE(MoE):
             self.accepts_global_routed_output
             and self.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
         )
+
+    @functools.cached_property
+    def sort_routing_applies(self) -> bool:
+        """Whether routing may come from a kernel that also writes the backend's
+        ``moe_sort`` tables (``backend.try_route_with_sort``): the routed ids
+        reach this rank unchanged (no communication strategy, EPLB or router
+        weight folded into the input) and the backend runs on such tables.
+
+        Fixed by the configuration; read after the weights exist (the backend's
+        answer depends on its final quantization).
+        """
+        return (
+            self.comm is None
+            and not self._using_load_balancer()
+            and not self.apply_router_weight_on_input
+            and self.backend.consumes_sort_tables()
+        )
+
+    def routes_with_sort_tables(self, num_tokens: int) -> bool:
+        """Whether a forward of ``num_tokens`` tokens (contiguous FP32 router
+        logits on the current device, no ``routing_aux``) is routed by the
+        sorting kernel, so the backend runs no ``moe_sort`` of its own."""
+        backend = self.backend
+        return self.sort_routing_applies and self.routing_method.serves_with_sort(
+            num_tokens,
+            self.num_experts,
+            backend.slot_start,
+            backend.expert_size_per_partition,
+            torch.device("cuda"),
+        )
+
+    def nvfp4_input_scale(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """Global scale of an NVFP4 input that a forward of ``num_tokens``
+        tokens takes as is (``Fp4QuantizedTensor`` with linear scale factors,
+        e.g. from :meth:`quantize_nvfp4_input` or a producer's epilogue), or
+        ``None`` when it needs an unquantized input: the backend must accept
+        one (``prequantized_nvfp4_input_scale``), with no communication
+        strategy, EPLB or router weight folded into the input, and in one
+        chunk."""
+        if (
+            self.comm is not None
+            or self._using_load_balancer()
+            or self.apply_router_weight_on_input
+            or num_tokens > self.moe_max_num_tokens
+        ):
+            return None
+        return self.backend.prequantized_nvfp4_input_scale()
+
+    def quantize_nvfp4_input(self, x: torch.Tensor) -> Fp4QuantizedTensor:
+        """``x`` quantized as the backend quantizes its input, for a forward
+        whose :meth:`nvfp4_input_scale` is not ``None``."""
+        x_fp4, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
+        return Fp4QuantizedTensor(x_fp4, x_sf, is_sf_swizzled=False)
 
     @property
     def num_fused_shared_expert(self) -> int:

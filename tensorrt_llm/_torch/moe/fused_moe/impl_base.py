@@ -33,6 +33,7 @@ from .impl_contract import (
     MoEEplbBinding,
     MoEProblem,
     MoERunContext,
+    MoESortTables,
     identity_quant_of,
     require_layer_quant_format,
 )
@@ -297,6 +298,50 @@ class MoEImplBase(
         that itself. Overriding this is how a backend opts in.
         """
         return None
+
+    def prequantized_nvfp4_input_scale(self) -> "torch.Tensor | None":
+        """Global scale under which ``run_moe`` takes an NVFP4 input quantized
+        ahead of it as is (``Fp4QuantizedTensor``: 16-element groups, linear
+        E4M3 scale factors, as ``quantize_input(x, post_quant_comm=False)``
+        produces), or ``None`` (the default) when the backend quantizes its
+        input itself only."""
+        return None
+
+    def consumes_sort_tables(self) -> bool:
+        """Whether ``run_moe`` runs on ``MoERunContext.sort_tables`` (the
+        ``moe_sort`` outputs a routing kernel wrote) instead of sorting itself.
+
+        A fixed property of the configured backend (quantization, expert
+        layout), read once by ``ConfigurableMoE``. Declining is the default;
+        overriding this is how a backend opts in.
+        """
+        return False
+
+    def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
+        """Keep ``num_sms`` SMs free of ``run_moe``'s persistent grid for kernels another
+        stream runs beside it; returns the SMs kept free from now on.
+
+        Called once by a model that runs other work (e.g. a shared expert) on a side stream
+        while the routed experts run. Declining (0, the default) means the backend does not
+        size a persistent grid it could shrink; overriding this is how a backend opts in.
+        """
+        return 0
+
+    def try_route_with_sort(
+        self, router_logits: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":
+        """Route with a kernel that also writes this rank's ``moe_sort`` tables.
+
+        Returns ``routing_method.apply``'s selected experts and scales plus
+        the tables, which reach ``run_moe`` as ``MoERunContext.sort_tables``,
+        or ``None`` when the routing method has no such kernel for these
+        logits. The scheduler asks only a backend that
+        :meth:`consumes_sort_tables`, and only when the routed ids reach this
+        rank unchanged (``ConfigurableMoE.sort_routing_applies``).
+        """
+        return self.routing_method.apply_with_sort(
+            router_logits, self.slot_start, self.expert_size_per_partition
+        )
 
     # ---- impl-owned resources: produced here, never passed in -------------
     def get_workspaces(self, *args: object, **kwargs: object) -> "list[dict] | None":
