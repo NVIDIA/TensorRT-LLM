@@ -156,6 +156,70 @@ def test_requested_protection_rejects_local_failure_collectively(
     activation.warning.assert_not_called()
 
 
+@pytest.mark.parametrize("failing_rank", [0, 1])
+@pytest.mark.parametrize(
+    "helper,error,selected",
+    [
+        ("_validate_fp4_mla_bridge_profile", TypeError("invalid profile"), (False, False)),
+        ("supports_context_first_bf16", RuntimeError(), (False, False)),
+        ("_retirement_executor_comm", AssertionError(), (False, True)),
+    ],
+)
+def test_local_selection_exception_rejects_every_rank_before_worker_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    activation: SimpleNamespace,
+    failing_rank: int,
+    helper: str,
+    error: Exception,
+    selected: tuple[bool, bool],
+) -> None:
+    """Replay a two-rank failure exchange without creating either transfer worker.
+
+    Empty exception messages must still transmit a nonempty failure marker.
+    """
+    monkeypatch.setenv(transceiver._KV_LIFECYCLE_ENFORCEMENT_ENV, "1")
+    failure = f"{type(error).__name__}: {error}"
+    selections = [(False, True, None), (False, True, None)]
+    selections[failing_rank] = (*selected, failure)
+    worker = Mock()
+    monkeypatch.setattr(transceiver, "TransferWorker", worker)
+    monkeypatch.setattr(transceiver.KvCacheTransceiverV2, "_check_compatible", lambda _: None)
+    messages = []
+    for rank in (0, 1):
+        activation.mapping = Mapping(world_size=2, rank=rank, tp_size=2)
+        activation.dist.allgather.reset_mock()
+        activation.dist.allgather.side_effect = lambda local: selections
+        with monkeypatch.context() as local_patch:
+            if rank == failing_rank:
+                local_patch.setattr(transceiver, helper, Mock(side_effect=error))
+            with pytest.raises(ValueError, match="KV lifecycle initialization rejected") as caught:
+                transceiver.KvCacheTransceiverV2(
+                    activation.mapping, activation.dist, activation.manager, activation.config
+                )
+        activation.dist.allgather.assert_called_once_with(selections[rank])
+        messages.append(str(caught.value))
+
+    assert messages == [f"KV lifecycle initialization rejected: rank {failing_rank}: {failure}"] * 2
+    worker.assert_not_called()
+    activation.warning.assert_not_called()
+
+
+def test_activation_collective_failure_propagates_without_retry(
+    monkeypatch: pytest.MonkeyPatch, activation: SimpleNamespace
+) -> None:
+    """Collective failures are not caught as local errors or retried."""
+    monkeypatch.setenv(transceiver._KV_LIFECYCLE_ENFORCEMENT_ENV, "1")
+    error = RuntimeError("collective unavailable")
+    activation.dist.allgather.side_effect = error
+
+    with pytest.raises(RuntimeError, match="collective unavailable") as caught:
+        _select(activation)
+
+    assert caught.value is error
+    activation.dist.allgather.assert_called_once_with((False, True, None))
+    activation.warning.assert_not_called()
+
+
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize(
     "remote_selection",

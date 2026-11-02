@@ -299,8 +299,9 @@ def _select_lifecycle_ownership(
                     )
         if fp4 or context_first:
             communicator = _retirement_executor_comm(mapping, warn=False)
-    except ValueError as error:
-        failure = str(error)
+    except Exception as error:
+        # Exchange all rank-local failures before raising so peers reach agreement.
+        failure = f"{type(error).__name__}: {error}"
 
     selections = dist.allgather((fp4, context_first, failure))
     failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
