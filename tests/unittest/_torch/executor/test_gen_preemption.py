@@ -55,14 +55,20 @@ def step(reqs, iters=1, tokens_per_iter=1):
         req.generated += iters * tokens_per_iter
 
 
-def make_preemption(max_paused=4, decode_s=20.0, unpaused_tps=10.0, **kwargs):
+def make_preemption(
+    max_paused=4, decode_s=20.0, unpaused_tps=10.0, tpot_budget=0.5, target_output_tps=None, **knobs
+):
     """D = 20 s (window 3 s at g = 1, max pause 7 s), cap ``max_paused``, no
-    minimum run; a 50% TPOT budget unless ``target_output_tps`` is given."""
-    kwargs = {"min_run_frac": 0.0, "warmup_min_run_s": 0.0, "min_remaining_tokens": 0, **kwargs}
-    kwargs.setdefault("tpot_budget", None if "target_output_tps" in kwargs else 0.5)
-    p = GenPreemption(GenPreemptionSettings(cap_frac=1.0, **kwargs), max_paused)
-    p.mean_decode_s = decode_s
+    minimum run; a 50% TPOT budget unless ``target_output_tps`` is given.
+    ``knobs`` override policy constants."""
+    budget = None if target_output_tps is not None else tpot_budget
+    p = GenPreemption(GenPreemptionSettings(budget, target_output_tps), 128)
+    p.max_paused, p.mean_decode_s = max_paused, decode_s
     p.mean_tpot_s = None if unpaused_tps is None else 1.0 / unpaused_tps
+    knobs = {"min_run_frac": 0.0, "warmup_min_run_s": 0.0, "min_remaining_tokens": 0, **knobs}
+    for name, value in knobs.items():
+        assert hasattr(p, name), name
+        setattr(p, name, value)
     return p
 
 
@@ -120,9 +126,9 @@ class TestSettingsAndPools:
     def test_from_config(self):
         assert not GenPreemptionSettings.from_config(GenPreemptionConfig()).enabled
         slo = GenPreemptionSettings.from_config(GenPreemptionConfig(target_output_tps=40))
-        assert slo.enabled and slo.slo and slo.tpot_budget is None
+        assert slo.enabled and slo.tpot_budget is None
         budget = GenPreemptionSettings.from_config(GenPreemptionConfig(tpot_budget=0.1))
-        assert budget.enabled and not budget.slo
+        assert budget.enabled and budget.target_output_tps is None
         assert [resident_headroom(n, budget) for n in (128, 64, 1)] == [48, 24, 1]
         assert resident_headroom(128, GenPreemptionSettings()) == 0
 

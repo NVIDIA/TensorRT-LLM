@@ -39,33 +39,10 @@ from .gen_admission_queue import STATS_LOG_PERIOD_S, GenAdmissionWaitingQueue
 
 @dataclass(frozen=True)
 class GenPreemptionSettings:
-    """The user's bound (``scheduler_config.gen_preemption``) and the policy
-    constants, which are fields only so that tests can vary them."""
+    """``scheduler_config.gen_preemption``: at most one bound; neither is off."""
 
     tpot_budget: Optional[float] = None
     target_output_tps: Optional[float] = None
-    slack_decode_frac: float = 0.15  # at-risk window at g = 1, x D
-    gain_min: float = 0.25
-    gain_max: float = 2.0
-    time_constant: float = 3000.0  # controller, in completions
-    ewma_n: float = 500.0  # running means of D and TPOT, in completions
-    target_frac: float = 0.8  # controller setpoint, x tpot_budget
-    cap_frac: float = 0.375  # paused cap, x max_num_active_requests
-    max_pause_frac: float = 0.35  # x D
-    min_run_frac: float = 0.07  # x D
-    warmup_max_pause_s: float = 10.0  # until the first completion
-    warmup_min_run_s: float = 2.0
-    max_per_request: int = 2
-    max_per_pass: int = 1
-    hysteresis_iters: int = 64  # decode steps after a resume
-    min_remaining_tokens: int = 32
-    # target_output_tps only.
-    slo_eps: float = 0.2
-    slo_credit_depth: float = 3000.0  # credit clamp, x slo_eps
-    laxity_min_frac: float = 0.02  # x D
-    laxity_resume_frac: float = 0.01  # x D
-    laxity_max_pauses: int = 8
-    below_target_max_pauses: int = 3
 
     @classmethod
     def from_config(cls, config) -> "GenPreemptionSettings":
@@ -75,12 +52,10 @@ class GenPreemptionSettings:
     def enabled(self) -> bool:
         return self.tpot_budget is not None or self.target_output_tps is not None
 
-    @property
-    def slo(self) -> bool:
-        return self.target_output_tps is not None
 
-    def paused_cap(self, max_num_active_requests: int) -> int:
-        return max(1, int(round(self.cap_frac * max_num_active_requests)))
+def paused_cap(max_num_active_requests: int) -> int:
+    """Requests paused at once, also the pools' resident headroom."""
+    return max(1, int(round(0.375 * max_num_active_requests)))
 
 
 # Settings of the executor being created; pools are sized from them.
@@ -96,7 +71,7 @@ def configure(config) -> None:
 def resident_headroom(max_batch_size: int, settings: Optional[GenPreemptionSettings] = None) -> int:
     """Entries a pool with one per resident request adds for paused requests."""
     settings = settings or _active_settings
-    return settings.paused_cap(max_batch_size) if settings.enabled else 0
+    return paused_cap(max_batch_size) if settings.enabled else 0
 
 
 def generated_tokens(req) -> int:
@@ -122,11 +97,25 @@ class GenPreemption:
     """Pause/resume bookkeeping and the two victim policies; ``step`` runs once
     per scheduling pass."""
 
+    # Policy constants; D is the mean decode time, counts are in completions.
+    slack_decode_frac = 0.15  # at-risk window at g = 1, x D
+    gain_min, gain_max = 0.25, 2.0
+    time_constant = 3000.0  # controller
+    ewma_n = 500.0  # running means of D and TPOT
+    target_frac = 0.8  # controller setpoint, x tpot_budget
+    max_pause_frac, min_run_frac = 0.35, 0.07  # x D
+    warmup_max_pause_s, warmup_min_run_s = 10.0, 2.0  # until the first completion
+    max_per_request, max_per_pass = 2, 1
+    hysteresis_iters = 64  # decode steps after a resume
+    min_remaining_tokens = 32
+    slo_eps, slo_credit_depth = 0.2, 3000.0  # share allowed below T; credit clamp, x eps
+    laxity_min_frac, laxity_resume_frac = 0.02, 0.01  # x D
+    laxity_max_pauses, below_target_max_pauses = 8, 3
+
     def __init__(self, settings: GenPreemptionSettings, max_num_active_requests: int) -> None:
         self.settings = settings
-        slo_max = max(settings.laxity_max_pauses, settings.below_target_max_pauses)
-        self._max_pauses = slo_max if settings.slo else settings.max_per_request
-        self.max_paused = settings.paused_cap(max_num_active_requests)
+        self.slo = settings.target_output_tps is not None
+        self.max_paused = paused_cap(max_num_active_requests)
         self._reqs: dict[int, _Req] = {}
         self._paused: dict = {}  # req_id -> request, in pause order
         self._order = 0
@@ -151,15 +140,15 @@ class GenPreemption:
 
     @property
     def slack_s(self) -> float:
-        return self.gain * self._of_decode(self.settings.slack_decode_frac, 0.0)
+        return self.gain * self._of_decode(self.slack_decode_frac, 0.0)
 
     @property
     def max_pause_s(self) -> float:
-        return self._of_decode(self.settings.max_pause_frac, self.settings.warmup_max_pause_s)
+        return self._of_decode(self.max_pause_frac, self.warmup_max_pause_s)
 
     @property
     def min_run_s(self) -> float:
-        return self._of_decode(self.settings.min_run_frac, self.settings.warmup_min_run_s)
+        return self._of_decode(self.min_run_frac, self.warmup_min_run_s)
 
     def _paused_s(self, r: _Req) -> float:
         open_pause = 0.0 if r.paused_t is None else max(0.0, self._now - r.paused_t)
@@ -204,7 +193,7 @@ class GenPreemption:
             self._paused.pop(rid, None)
 
     def _on_left(self, r: _Req, target_ready: bool) -> None:
-        s, now = self.settings, self._now
+        now = self._now
         if r.first_token_t is None or now is None:
             return
         paused = self._paused_s(r)
@@ -215,23 +204,23 @@ class GenPreemption:
         if self.mean_decode_s is None:
             self.mean_decode_s, self.mean_tpot_s = decode, decode / tokens
         else:
-            self.mean_decode_s += (decode - self.mean_decode_s) / s.ewma_n
-            self.mean_tpot_s += (decode / tokens - self.mean_tpot_s) / s.ewma_n
+            self.mean_decode_s += (decode - self.mean_decode_s) / self.ewma_n
+            self.mean_tpot_s += (decode / tokens - self.mean_tpot_s) / self.ewma_n
         if not target_ready:
             return
         inflation = paused / tokens / self.mean_tpot_s
         self.stats["scored"] += 1
         self.stats["infl"] += inflation
-        if s.slo:
-            below = tokens / (now - r.first_token_t) < s.target_output_tps
+        if self.slo:
+            below = tokens / (now - r.first_token_t) < self.settings.target_output_tps
             self.stats["below"] += below
-            depth = s.slo_credit_depth * s.slo_eps
-            credit = self.credit + r.sacrificed + s.slo_eps - below
+            depth = self.slo_credit_depth * self.slo_eps
+            credit = self.credit + r.sacrificed + self.slo_eps - below
             self.credit = min(depth, max(-depth, credit))
         else:
-            target = s.target_frac * s.tpot_budget
-            theta = self.theta + (target - inflation) / (target * s.time_constant)
-            self.theta = min(math.log(s.gain_max), max(math.log(s.gain_min), theta))
+            target = self.target_frac * self.settings.tpot_budget
+            theta = self.theta + (target - inflation) / (target * self.time_constant)
+            self.theta = min(math.log(self.gain_max), max(math.log(self.gain_min), theta))
 
     def laxity(self, req) -> Optional[float]:
         """Seconds ``req`` can still be paused and finish at or above
@@ -274,37 +263,42 @@ class GenPreemption:
             self.stats["resumed"] += 1
         return n
 
+    def _max_pauses(self) -> int:
+        if self.slo:
+            return max(self.laxity_max_pauses, self.below_target_max_pauses)
+        return self.max_per_request
+
     def _key(self, req) -> tuple:
         """Longest resident first; ties: the newest."""
         r = self._reqs[req.py_request_id]
         return (r.first_seen, -r.order)
 
     def _eligible(self, req) -> bool:
-        s, r = self.settings, self._reqs[req.py_request_id]
+        r = self._reqs[req.py_request_id]
         return (
             req.py_request_id not in self._paused
             and req.state == LlmRequestState.GENERATION_IN_PROGRESS
             and not req.is_dummy_request
             and req.py_decoding_iter >= 1
-            and r.pauses < self._max_pauses
+            and r.pauses < self._max_pauses()
             and r.first_token_t is not None
             and self._now is not None
             and self._now - r.first_token_t >= self.min_run_s
             and (
                 r.resumed_at_iter is None
-                or req.py_decoding_iter - r.resumed_at_iter >= s.hysteresis_iters
+                or req.py_decoding_iter - r.resumed_at_iter >= self.hysteresis_iters
             )
-            and req.py_max_new_tokens - generated_tokens(req) > s.min_remaining_tokens
+            and req.py_max_new_tokens - generated_tokens(req) > self.min_remaining_tokens
         )
 
     def _victims(self, active_requests, num_at_risk: int) -> list:
-        n = min(num_at_risk, self.settings.max_per_pass, self.max_paused - len(self._paused))
+        n = min(num_at_risk, self.max_per_pass, self.max_paused - len(self._paused))
         if n <= 0:
             return []
         candidates = [req for req in active_requests if self._eligible(req)]
         victims = []
         while len(victims) < n:
-            if self.settings.slo:
+            if self.slo:
                 victim = self._slo_victim(candidates)
             else:
                 victim = min(candidates, key=self._key, default=None)
@@ -317,16 +311,15 @@ class GenPreemption:
     def _slo_victim(self, candidates: list):
         """The largest laxity (>= 0.02 D), else the longest resident request
         already below the target, else a new sacrifice if the credit allows."""
-        s = self.settings
-        min_laxity = s.laxity_min_frac * (self.mean_decode_s or 0.0)
+        min_laxity = self.laxity_min_frac * (self.mean_decode_s or 0.0)
         lax, below, fresh = [], [], []
         for req in candidates:
             r = self._reqs[req.py_request_id]
             laxity = self.laxity(req)
             if r.sacrificed or (laxity is not None and laxity < 0.0):
-                if r.pauses < s.below_target_max_pauses:
+                if r.pauses < self.below_target_max_pauses:
                     below.append(req)
-            elif r.pauses < s.laxity_max_pauses:
+            elif r.pauses < self.laxity_max_pauses:
                 fresh.append(req)
                 if laxity is not None and laxity >= min_laxity:
                     lax.append(((-laxity, self._key(req)), req))
@@ -342,12 +335,12 @@ class GenPreemption:
         return None
 
     def _pause(self, req) -> None:
-        s, r = self.settings, self._reqs[req.py_request_id]
-        if s.slo and not r.sacrificed:
+        r = self._reqs[req.py_request_id]
+        if self.slo and not r.sacrificed:
             # Resume when the laxity is down to the margin (below target: no).
             laxity = self.laxity(req)
             if laxity is not None and laxity >= 0.0:
-                margin = s.laxity_resume_frac * (self.mean_decode_s or 0.0)
+                margin = self.laxity_resume_frac * (self.mean_decode_s or 0.0)
                 r.laxity_resume_t = self._now + laxity - margin
         self._paused[req.py_request_id] = req
         r.pauses += 1
@@ -363,7 +356,7 @@ class GenPreemption:
             f"paused_now={len(self._paused)}/{self.max_paused} g={self.gain:.3f} "
             f"slack={self.slack_s:.2f}s decode={decode} tpot_infl={infl}"
         )
-        if self.settings.slo:
+        if self.slo:
             line += f" below_target={st['below']}/{n} credit={self.credit:.1f}"
         st.clear()
         return line
@@ -377,7 +370,7 @@ class GenPreemption:
             logger.info(self.stats_line())
 
 
-def _unsupported(ex, settings: GenPreemptionSettings) -> Optional[str]:
+def _unsupported(ex) -> Optional[str]:
     if not hasattr(ex.scheduler, "set_gen_paused_ids"):
         return "needs the KV cache manager V2 scheduler"
     if not ex._gen_admission.needs_clock:
@@ -387,7 +380,7 @@ def _unsupported(ex, settings: GenPreemptionSettings) -> Optional[str]:
     from ..resource_manager import ResourceManagerType
 
     # Every pool with one entry per resident request must hold the paused ones.
-    need = ex.max_num_active_requests + settings.paused_cap(ex.max_num_active_requests)
+    need = ex.max_num_active_requests + paused_cap(ex.max_num_active_requests)
     seq_slots = ex.resource_manager.resource_managers.get(ResourceManagerType.SEQ_SLOT_MANAGER)
     pools = [("sequence slot pool", seq_slots and seq_slots.get_max_resource_count())]
     for mgr in (ex.kv_cache_manager, ex.draft_kv_cache_manager):
@@ -406,7 +399,7 @@ def create_gen_preemption(executor, settings: Optional[GenPreemptionSettings]):
     """The executor's GenPreemption, or None (off, or unsupported: a warning)."""
     if settings is None or not settings.enabled:
         return None
-    reason = _unsupported(executor, settings)
+    reason = _unsupported(executor)
     if executor.dist.rank == 0:
         if reason is None:
             logger.info(f"[gen_preempt] GEN slot preemption (pause in place) enabled: {settings}")
