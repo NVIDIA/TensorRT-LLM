@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Spatial Winograd F(4x4, 3x3) for the frame-pair convs on Blackwell (sm100), on the CuTe DSL
-kernels of this package: input transform, one batched tcgen05 GEMM over the 36 coordinates of
-every component (fp16 in, fp32 accumulate, fp16 out) on the static persistent schedule, output
-transform. Interpolation points (0, +-3/2, +-5/8, inf). :func:`spatial_filters` transforms a
-conv's filters.
+"""Spatial Winograd F(4x4, 3x3) for the frame-pair convs on Blackwell (sm100): input transform,
+one batched tcgen05 GEMM over the 36 coordinates of every component (fp16 in, fp32 accumulate,
+fp16 out; the shared :mod:`tensorrt_llm._torch.kernels.blackwell.dense_gemm_persistent`),
+output transform. Interpolation points (0, +-3/2, +-5/8, inf). :func:`spatial_filters`
+transforms a conv's filters.
 
 The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel level lives in
 :mod:`.fused_conv`; :func:`wino_spatial_conv_fused` is its per-component entry point.
@@ -23,9 +23,9 @@ def sm100_wino_available() -> bool:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         return False
     try:
+        from tensorrt_llm._torch.kernels.blackwell import dense_gemm_persistent  # noqa: F401
         from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import (  # noqa: F401
             fused_conv,
-            gemm,
             transforms,
         )
     except ImportError:
@@ -98,11 +98,12 @@ def _gemm(a, b, c, n_tile: int, device: int, dtypes: tuple):
     """The batched GEMM ``C[l] = A[l] B[l]^T`` (M = Cout, N = tiles, K = Cin, batched over the
     coordinates x components) on the static persistent schedule, compiled once per device, N
     tile and dtypes."""
+    import cutlass
     import cutlass.cute as cute
     import cutlass.utils as utils
     from cutlass.cute.runtime import make_fake_stream
 
-    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.gemm import (
+    from tensorrt_llm._torch.kernels.blackwell.dense_gemm_persistent import (
         PersistentDenseGemmKernel,
     )
 
@@ -110,7 +111,12 @@ def _gemm(a, b, c, n_tile: int, device: int, dtypes: tuple):
     fn = _gemms.get(key)
     if fn is None:
         max_clusters = utils.HardwareInfo().get_max_active_clusters(2)
-        op = PersistentDenseGemmKernel(mma_tiler_mn=(256, n_tile), cluster_shape_mn=(2, 1))
+        op = PersistentDenseGemmKernel(
+            acc_dtype=cutlass.Float32,
+            use_2cta_instrs=True,
+            mma_tiler_mn=(256, n_tile),
+            cluster_shape_mn=(2, 1),
+        )
         fn = cute.compile(op, a, b, c, max_clusters, make_fake_stream())
         _gemms[key] = fn
     return fn
