@@ -35,6 +35,8 @@ DEFAULT_ROUTER_TRITON_ROWS = "8625-16384"
 every row count checked). Below 8625 cuBLAS alternates between kernels whose K order differs."""
 
 _SUPPORTED_SM = (103,)
+_VERIFIED_SHAPES = ((128, 6144),)
+"""(num_experts, hidden_size) pairs whose bitwise match with the cuBLAS router GEMM was checked."""
 
 
 def _parse_rows(text: str) -> Tuple[Tuple[int, int], ...]:
@@ -110,7 +112,7 @@ def router_split_applies(x: torch.Tensor, split_weight: torch.Tensor, hidden_siz
         and split_weight.is_contiguous()
         and split_weight.shape[1] % hidden_size == 0
         and hidden_size % _BK == 0
-        and num_experts in (64, 128)
+        and (num_experts, hidden_size) in _VERIFIED_SHAPES
         and get_sm_version() in _SUPPORTED_SM
     )
 

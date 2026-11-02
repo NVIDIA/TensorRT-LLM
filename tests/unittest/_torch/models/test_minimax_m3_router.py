@@ -59,3 +59,16 @@ def test_router_split_skips_rows_outside_range(monkeypatch):
     assert not router_split_applies(x, split_weight, HIDDEN)
     monkeypatch.setattr(minimax_m3_router, "ROUTER_TRITON_ROWS", ())
     assert not router_split_applies(x[:1].expand(150, HIDDEN), split_weight, HIDDEN)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_router_split_skips_unverified_shapes(monkeypatch):
+    monkeypatch.setattr(minimax_m3_router, "ROUTER_TRITON_ROWS", ((100, 200),))
+    x = torch.zeros(150, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    assert not router_split_applies(
+        x, torch.zeros(64, 3 * HIDDEN, dtype=torch.bfloat16, device="cuda"), HIDDEN
+    )
+    x_wide = torch.zeros(150, 2 * HIDDEN, dtype=torch.bfloat16, device="cuda")
+    assert not router_split_applies(
+        x_wide, torch.zeros(EXPERTS, 6 * HIDDEN, dtype=torch.bfloat16, device="cuda"), 2 * HIDDEN
+    )

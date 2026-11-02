@@ -25,6 +25,8 @@ l0_gb300:
   - unittest/_torch/modules/test_engram_history_uploads.py
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  # MiniMax-M3 Triton prefill router: bitwise match with cuBLAS is verified on SM103 only.
+  - unittest/_torch/models/test_minimax_m3_router.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
   # CSA2 kernel, indexer, chunked prefill and prefix-cache parity on Grace Blackwell.
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_packed_attention_parity

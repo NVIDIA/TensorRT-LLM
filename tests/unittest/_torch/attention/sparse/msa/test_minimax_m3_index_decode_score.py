@@ -403,7 +403,7 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
 
 @skip_not_sm100
 @pytest.mark.parametrize("decode_query_len", [1, 7])
-def test_cutedsl_score_helper_matches_registered_op(decode_query_len):
+def test_cutedsl_score_helper_matches_registered_op(decode_query_len, monkeypatch):
     """_cutedsl_score calls the runner directly in eager mode; the bytes must match the op's."""
     _runner()
     seq_lens = [max(s, decode_query_len) for s in (300, 4097, 129)]
@@ -413,6 +413,14 @@ def test_cutedsl_score_helper_matches_registered_op(decode_query_len):
     want_backing = backing.clone()
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
         idx_q, k_cache, block_table, seq_lens_dev, want_backing.transpose(1, 2), decode_query_len
+    )
+
+    # Eager dispatch must not go through the registered op.
+    def _op_must_not_run(*args, **kwargs):
+        raise AssertionError("_cutedsl_score called the registered op in eager mode")
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "cute_dsl_minimax_m3_index_decode_score", _op_must_not_run, raising=False
     )
     # _cutedsl_score takes the paged pool [pages, 1, page, dim] and the selector's
     # [heads, blocks, tokens] buffer.
