@@ -76,7 +76,7 @@ def decode_metadata():
     try:
         request_ids = list(range(batch_size))
         kv_cache_manager.add_dummy_requests(
-            request_ids=request_ids, token_nums=KV_LENS, is_gen=False, prepare_resource=True
+            request_ids=request_ids, token_nums=KV_LENS, is_gen=False
         )
         cached = [kv_len - 1 for kv_len in KV_LENS]
         metadata = DSAtrtllmAttentionMetadata(
