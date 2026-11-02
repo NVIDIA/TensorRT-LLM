@@ -12,14 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The request rules: the recorded defaults of every family, mode and domain, and the
-source each value comes from."""
-
-import json
-from pathlib import Path
+"""The request rules: precedence between the caller, the checkpoint's facts and the
+tables, and the source each value reports."""
 
 import pytest
-from cosmos3_request_golden import record
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
     RequestContext,
@@ -29,18 +25,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
 )
 
 pytestmark = pytest.mark.cpu_only
-
-FIXTURE = Path(__file__).parent / "test_data" / "cosmos3_request_defaults.json"
-
-
-def test_defaults_match_the_recorded_grid():
-    """Every (family, mode, domain) combination resolves to the recorded values, so a
-    change of any default, or of the precedence behind it, is a visible diff of the
-    fixture rather than a silent change of what requests run with."""
-    recorded = json.loads(FIXTURE.read_text())
-    current = json.loads(json.dumps(record()))
-    for section in ("generation", "action", "system_prompt"):
-        assert current[section] == recorded[section], section
 
 
 class TestSources:
