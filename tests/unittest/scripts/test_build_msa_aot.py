@@ -363,3 +363,55 @@ def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
     assert artifact.read_bytes() == b"keep"
     if link_kind.startswith("shared"):
         assert other.read_bytes() == b"shared"
+
+
+def test_wheel_staging_refuses_symlink_even_without_previous_artifacts(tmp_path):
+    from setuptools.command.build_py import build_py
+    from setuptools.dist import Distribution
+
+    setup_path = _SCRIPT.parents[1] / "setup.py"
+    setup_tree = ast.parse(setup_path.read_text())
+    command = next(node for node in setup_tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    namespace = {"Path": Path, "build_py": build_py}
+    exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    marker = shared / "existing.py"
+    marker.write_text("keep")
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "fmha_sm100").symlink_to(shared, target_is_directory=True)
+    command_instance = namespace["MsaBuildPy"](Distribution())
+    command_instance.build_lib = str(build)
+    command_instance.package_dir = {"fmha_sm100": str(tmp_path / "source")}
+    with pytest.raises(RuntimeError, match="symlink"):
+        command_instance.run()
+    assert marker.read_text() == "keep"
+
+
+def test_editable_build_does_not_clean_symlinked_source(tmp_path):
+    from setuptools.command.build_py import build_py
+    from setuptools.dist import Distribution
+
+    setup_path = _SCRIPT.parents[1] / "setup.py"
+    setup_tree = ast.parse(setup_path.read_text())
+    command = next(node for node in setup_tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    namespace = {"Path": Path, "build_py": build_py}
+    exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
+    source = tmp_path / "source"
+    artifact = source / "_aot/hash/kernel.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"keep")
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "fmha_sm100").symlink_to(source, target_is_directory=True)
+    command_instance = namespace["MsaBuildPy"](Distribution())
+    command_instance.build_lib = str(build)
+    command_instance.package_dir = {"fmha_sm100": str(source)}
+    command_instance.py_modules = []
+    command_instance.packages = ["fmha_sm100"]
+    command_instance.editable_mode = True
+    command_instance.run()
+    assert artifact.read_bytes() == b"keep"

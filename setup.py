@@ -25,19 +25,20 @@ from setuptools.dist import Distribution
 
 
 class MsaBuildPy(build_py):
-    """Do not reuse precompiled FMHA binaries from a previous wheel build."""
+    """Replace old FMHA binaries using a non-symlinked wheel staging tree."""
 
     def run(self):
         import shutil
 
+        if getattr(self, "editable_mode", False):
+            return super().run()
         package_dir = Path(self.build_lib) / "fmha_sm100"
         target = package_dir / "_aot"
-        if target.exists() or target.is_symlink():
-            for directory in (package_dir, *package_dir.parents):
-                if directory.is_symlink():
-                    raise RuntimeError(f"Refusing to clean FMHA artifacts through symlink: {directory}")
-            if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
-                raise RuntimeError(f"Refusing to clean FMHA source directory: {package_dir}")
+        for directory in (package_dir, *package_dir.parents):
+            if directory.is_symlink():
+                raise RuntimeError(f"Refusing to stage FMHA artifacts through symlink: {directory}")
+        if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
+            raise RuntimeError(f"Refusing to stage over FMHA source directory: {package_dir}")
         if target.is_symlink() or target.is_file():
             target.unlink()
         elif target.is_dir():
