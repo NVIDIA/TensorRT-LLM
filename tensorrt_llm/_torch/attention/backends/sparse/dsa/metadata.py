@@ -94,10 +94,9 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
-    # Twin page table (-1 = not retained) and context positions.
+    # Twin page tables; -1 = not retained.
     retained_block_table = None
     draft_retained_block_table = None
-    retained_context_positions = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -390,30 +389,27 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
         return self.retained_block_table is not None
 
-    def _fill_retained_block_tables(self) -> None:
-        """Refresh the twin page tables over their full width.
+    def _fill_retained_block_table(self, manager, layer_idx: int, high_table) -> None:
+        """Refresh a twin page table over its full width; the rest stay -1.
 
         The MTP draft loop writes past this step's kv lengths, so every column a request
-        has allocated must be current; the rest stay -1.
+        has allocated must be current.
         """
+        table = torch.full(
+            (self.num_seqs, high_table.shape[1]), -1, dtype=torch.int32, pin_memory=prefer_pinned()
+        )
+        manager.fill_high_precision_page_table(self.request_ids, layer_idx, table.numpy())
+        high_table[: self.num_seqs].copy_(table, non_blocking=True)
+
+    def _fill_retained_block_tables(self) -> None:
         for manager, high_table in (
             (self.kv_cache_manager, self.retained_block_table),
             (self.draft_kv_cache_manager, self.draft_retained_block_table),
         ):
-            if high_table is None:
-                continue
-            table = torch.full(
-                (self.num_seqs, high_table.shape[1]),
-                -1,
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-            )
-            # Every twin shares one pool and page scale, so one table serves all layers.
-            local = next(iter(manager.high_layers))
-            manager.fill_high_precision_page_table(
-                self.request_ids, manager.pp_layers[local], table.numpy()
-            )
-            high_table[: self.num_seqs].copy_(table, non_blocking=True)
+            if high_table is not None:
+                # Every twin shares one pool and page scale, so one table serves all layers.
+                layer_idx = manager.pp_layers[next(iter(manager.high_layers))]
+                self._fill_retained_block_table(manager, layer_idx, high_table)
 
     def prepare(self):
         self._validate_ragged_verification()
@@ -2137,25 +2133,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             host_block_table, non_blocking=True
         )
         self._fill_retained_block_tables()
-        high_table = self.retained_block_table
-        if high_table is not None:
-            # Absolute position of every context token, for the retained-row write.
-            self.retained_context_positions = None
-            if self.num_ctx_tokens > 0:
-                positions = torch.empty(
-                    self.num_ctx_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
-                )
-                torch.cat(
-                    [
-                        torch.arange(int(cached), int(cached) + int(length), dtype=torch.int32)
-                        for cached, length in zip(
-                            cached_token_lens[: self.num_contexts].tolist(),
-                            self.seq_lens[: self.num_contexts].tolist(),
-                        )
-                    ],
-                    out=positions,
-                )
-                self.retained_context_positions = positions.to(high_table.device, non_blocking=True)
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
