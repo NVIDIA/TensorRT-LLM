@@ -13,9 +13,11 @@ from .coordinator import CoordinationError, Coordinator
 class CoordinatorReactor:
     """Own the synchronous coordinator without blocking the launcher loop.
 
-    The health callback reads cached status only. Frontend 0 still sends its
-    heartbeat from the launcher loop, so a sufficiently long stall can expire
-    its lease and stop the group.
+    The health callback reads cached status only. Coordinator handlers run on
+    their own threads but share the launcher's GIL, so CPU-bound Python on the
+    launcher loop still slows them, and a large burst of ownership RPCs can
+    exceed its deadline. Frontend 0 still sends its heartbeat from the launcher
+    loop, so a sufficiently long stall can expire its lease and stop the group.
     """
 
     def __init__(
