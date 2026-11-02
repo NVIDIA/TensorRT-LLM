@@ -113,6 +113,9 @@ SPLITS_ENV = "TLLM_FLASH_ATTN4_GENERATION_SPLITS"
 """KV splits of a generation call: unset or 0 picks them from the grid (``generation_splits``),
 1 turns splitting off, a larger value fixes the count."""
 MAX_SPLITS = 16
+MIN_SPLIT_TOKENS = 512
+"""Fewest cached tokens per KV split: a split of a short cache costs more in launches and merging
+than it saves (H100, Qwen2.5-7B, K=8, 1 row, ~1.6k cached tokens: 16 splits were slower than none)."""
 
 
 def generation_splits(
@@ -417,6 +420,7 @@ def _split_tables_kernel(
     LAST_WIDTH: tl.constexpr,
     TOKENS_PER_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
+    MIN_CHUNK_PAGES: tl.constexpr,
 ):
     # Program (r, c): row r's cached pages before the page of its first step token,
     # [0, p0), cut into SPLITS chunks of up to ceil(p0 / SPLITS) pages (c < SPLITS), or the
@@ -428,7 +432,8 @@ def _split_tables_kernel(
     offs = tl.arange(0, BLOCK)
     src_row = page_table_ptr + r.to(tl.int64) * page_table_stride
     if c < SPLITS:
-        per = (p0 + SPLITS - 1) // SPLITS
+        # Chunks of at least MIN_CHUNK_PAGES: a short cache uses fewer (non-empty) splits.
+        per = tl.maximum((p0 + SPLITS - 1) // SPLITS, MIN_CHUNK_PAGES)
         start = c * per
         count = tl.minimum(tl.maximum(p0 - start, 0), per)
         dst_row = split_table_ptr + (r * SPLITS + c).to(tl.int64) * split_table_stride
@@ -520,7 +525,9 @@ def split_tables(
     """Page tables and KV lengths of a split generation call (see ``_split_tables_kernel``):
     ``(split_table [rows * splits, chunk], split_lens, last_table [rows, last], last_lens)``."""
     rows, width = page_table.shape
-    chunk = max(1, -(-width // splits))
+    min_pages = max(1, MIN_SPLIT_TOKENS // tokens_per_block)
+    # A chunk holds ceil(cached pages / splits) pages, but at least min_pages.
+    chunk = min(width, max(1, -(-width // splits), min_pages))
     last = triton.next_power_of_2(-(-(tokens_per_block - 1 + q_len) // tokens_per_block))
     device = page_table.device
     split_table = torch.empty((rows * splits, chunk), dtype=torch.int32, device=device)
@@ -531,6 +538,7 @@ def split_tables(
         page_table, page_table.stride(0), kv_lens, split_table, split_table.stride(0), split_lens,
         last_table, last_table.stride(0), last_lens, width, Q_LEN=q_len, SPLITS=splits,
         CHUNK_WIDTH=chunk, LAST_WIDTH=last, TOKENS_PER_BLOCK=tokens_per_block, BLOCK=128,
+        MIN_CHUNK_PAGES=min_pages,
     )  # fmt: skip
     return split_table, split_lens, last_table, last_lens
 
