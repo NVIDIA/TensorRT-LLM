@@ -1617,13 +1617,11 @@ class TestInternalApiContract:
         assert hasattr(api.Distributed, "get")
 
     def test_params_wire_roundtrip_through_real_bindings(self, api):
-        # opaque_state must DESERIALIZE in the ContextPhaseParams ctor
-        # (arbitrary bytes -> std::bad_alloc), so use the serialized empty
-        # state: b"" is re-encoded by the bindings into its canonical form.
+        # Empty DataTransceiverState: no comm state, no cache state, and not arbitrary.
         source = api.DisaggregatedParams(
             ctx_request_id=42,
             first_gen_tokens=[7, 8],
-            opaque_state=b"",
+            opaque_state=bytes([0, 0, 0]),
             draft_tokens=[9],
             ctx_dp_rank=1,
             ctx_info_endpoint="tcp://host:1234",
@@ -1639,7 +1637,7 @@ class TestInternalApiContract:
         ctx_params = api.DisaggregatedParams(
             ctx_request_id=13,
             first_gen_tokens=[1],
-            opaque_state=b"",
+            opaque_state=bytes([0, 0, 0]),
             ctx_dp_rank=0,
         ).get_context_phase_params()
         gen_req = rp.make_request(False, rid=13, req_len=8, runtime="CPP", ctx_params=ctx_params)
