@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
@@ -28,14 +27,11 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
-from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
-from ..distributed.communicator import init_pp_comm
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
-from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
@@ -48,7 +44,11 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_setup import (
     apply_torch_compile,
     compile_model,
+    create_model_loader,
+    init_process_setup,
+    prepare_loaded_model,
     remove_torch_compile,
+    resolve_attention_backend,
     resolve_max_num_tokens,
     resolve_max_seq_len,
 )
@@ -79,7 +79,6 @@ from .engine.runners.interface import (
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
-from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader
 from .resource_manager import ResourceManager, ResourceManagerType
@@ -119,19 +118,6 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
 # Clearing and recapturing the piecewise graphs is the part that was dropped:
 # refit moves no tensor, so the captures stay valid and PWCG stays hot across a
 # refit (976 graphs measured still live) instead of going cold.
-
-_DEEP_GEMM_PDL_CONFIGURED = False
-
-
-def _configure_deep_gemm_pdl() -> None:
-    global _DEEP_GEMM_PDL_CONFIGURED
-    if _DEEP_GEMM_PDL_CONFIGURED:
-        return
-
-    from tensorrt_llm import deep_gemm
-
-    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
-    _DEEP_GEMM_PDL_CONFIGURED = True
 
 
 class ModelEngine:
@@ -189,7 +175,7 @@ class ModelEngine:
         """Resolve the requested sizes, the original speculation widths and the
         services derived from the arguments; capacity may still be unset.
         Returns the encoder token budget before any multimodal increase."""
-        _configure_deep_gemm_pdl()
+        init_process_setup(mapping, dist)
 
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError("encode_only and mm_encoder_only are mutually exclusive.")
@@ -220,12 +206,8 @@ class ModelEngine:
         self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         self.mapping = mapping
-        if mapping.has_pp():
-            init_pp_comm(mapping)
         self.dist = dist
         self.llm_args = llm_args
-        if dist is not None:
-            ExpertStatistic.create(self.dist.rank)
         # Opt-in tiered sampling captured into the forward graph. Off by
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
@@ -285,16 +267,13 @@ class ModelEngine:
         """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: BaseMoeLoadBalancer | None = None
         if model is None:
-            lora_config: LoraConfig | None = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
-            self.model_loader = ModelLoader(
-                llm_args=self.llm_args,
-                mapping=self.mapping,
+            self.model_loader = create_model_loader(
+                self.llm_args,
+                self.mapping,
                 spec_config=self.spec_config,
-                sparse_attention_config=self.llm_args.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
-                lora_config=lora_config,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
             )
@@ -351,10 +330,7 @@ class ModelEngine:
             self.llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self.enable_overlap_headroom,
         )
-        # AutoModelForCausalLM sets extra_attrs; a model passed in through
-        # `model=`, such as a test stub, may not have it.
-        if not hasattr(self.model, "extra_attrs"):
-            self.model.extra_attrs = {}
+        prepare_loaded_model(self.model, self.llm_args)
         # Router Replay (R3) capturer owned by this engine (None when disabled).
         # Registered in the model extra attrs so the MoE
         # routing hook reaches this engine's capturer during its forward, the
@@ -406,17 +382,6 @@ class ModelEngine:
             if mm_item_scheduler is not None
             else None,
         )
-        if self.llm_args.enable_layerwise_nvtx_marker:
-            layerwise_nvtx_marker = LayerwiseNvtxMarker()
-            module_prefix = "Model"
-            if (
-                self.model.model_config
-                and self.model.model_config.pretrained_config
-                and self.model.model_config.pretrained_config.architectures
-            ):
-                module_prefix = "|".join(self.model.model_config.pretrained_config.architectures)
-            layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
-
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._init_model_capacity()
 
@@ -481,17 +446,7 @@ class ModelEngine:
         self._warmup_depth = 0
         self._set_warmup_effects(False)
 
-        sparse_attention_config = self.model.model_config.sparse_attention_config
-        sparse_params = (
-            sparse_attention_config.to_sparse_params(
-                pretrained_config=self.model.model_config.pretrained_config
-            )
-            if sparse_attention_config is not None
-            else None
-        )
-        self.attn_backend = get_attention_backend(
-            self.llm_args.attn_backend, sparse_params=sparse_params
-        )
+        self.attn_backend = resolve_attention_backend(self.model, self.llm_args)
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):

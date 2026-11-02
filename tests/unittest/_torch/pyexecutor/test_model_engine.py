@@ -999,8 +999,8 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     ):
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     for name in (
-        "_configure_deep_gemm_pdl",
         "create_input_processor",
         "setup_mm_encoder_attn_metadata",
     ):
@@ -1026,7 +1026,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 16)
     # Stop after the complete compilation block, before runtime cache allocation.
     monkeypatch.setattr(
-        model_engine_module,
+        model_setup,
         "get_attention_backend",
         Mock(side_effect=RuntimeError("compile setup complete")),
     )

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Model setup shared by every executor: capacity, compilation and model resources."""
+"""Model setup shared by every executor: process setup, loading, capacity and compilation."""
 
 import math
 import os
@@ -12,15 +12,27 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
+from tensorrt_llm._torch.attention.backends.interface import AttentionBackend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed.communicator import init_pp_comm
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.utils import set_torch_compiling
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend, TorchCompileConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -339,3 +351,83 @@ def compile_model(
         prefill_compile_only=prefill_only,
     )
     return CompiledModel(model=model, caller=caller, backend=backend, prefill_only=prefill_only)
+
+
+_DEEP_GEMM_PDL_CONFIGURED = False
+
+
+def _configure_deep_gemm_pdl() -> None:
+    global _DEEP_GEMM_PDL_CONFIGURED
+    if _DEEP_GEMM_PDL_CONFIGURED:
+        return
+
+    from tensorrt_llm import deep_gemm
+
+    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    _DEEP_GEMM_PDL_CONFIGURED = True
+
+
+def init_process_setup(mapping: Mapping, dist: Distributed | None) -> None:
+    """Configure the process-wide state a model executor needs before loading."""
+    _configure_deep_gemm_pdl()
+    if mapping.has_pp():
+        init_pp_comm(mapping)
+    if dist is not None:
+        ExpertStatistic.create(dist.rank)
+
+
+def create_model_loader(
+    llm_args: TorchLlmArgs,
+    mapping: Mapping,
+    *,
+    spec_config: DecodingBaseConfig | None,
+    max_num_tokens: int,
+    max_seq_len: int | None,
+    model_weights_memory_tag: str | None = None,
+    model_weights_restore_mode=None,
+) -> ModelLoader:
+    """Create the loader that opens the checkpoint and can reload weights later."""
+    return ModelLoader(
+        llm_args=llm_args,
+        mapping=mapping,
+        spec_config=spec_config,
+        sparse_attention_config=llm_args.sparse_attention_config,
+        max_num_tokens=max_num_tokens,
+        max_seq_len=max_seq_len,
+        lora_config=llm_args.lora_config,
+        model_weights_memory_tag=model_weights_memory_tag,
+        model_weights_restore_mode=model_weights_restore_mode,
+    )
+
+
+def prepare_loaded_model(model: torch.nn.Module, llm_args: TorchLlmArgs) -> None:
+    """Give the model its extra attributes and the requested NVTX markers."""
+    # AutoModelForCausalLM sets extra_attrs; a model passed in through
+    # `model=`, such as a test stub, may not have it.
+    if not hasattr(model, "extra_attrs"):
+        model.extra_attrs = {}
+    if llm_args.enable_layerwise_nvtx_marker:
+        layerwise_nvtx_marker = LayerwiseNvtxMarker()
+        module_prefix = "Model"
+        if (
+            model.model_config
+            and model.model_config.pretrained_config
+            and model.model_config.pretrained_config.architectures
+        ):
+            module_prefix = "|".join(model.model_config.pretrained_config.architectures)
+        layerwise_nvtx_marker.register_hooks(model, module_prefix)
+
+
+def resolve_attention_backend(
+    model: torch.nn.Module, llm_args: TorchLlmArgs
+) -> type[AttentionBackend]:
+    """Select the attention backend, with the model's sparse attention parameters."""
+    sparse_attention_config = model.model_config.sparse_attention_config
+    sparse_params = (
+        sparse_attention_config.to_sparse_params(
+            pretrained_config=model.model_config.pretrained_config
+        )
+        if sparse_attention_config is not None
+        else None
+    )
+    return get_attention_backend(llm_args.attn_backend, sparse_params=sparse_params)
