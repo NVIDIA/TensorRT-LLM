@@ -29,17 +29,14 @@ StrEnum
 # sentencepiece>=0.2.3 bundles protobuf 7.36.1 gencode that fails to import on the protobuf<7
 # runtime below; it does not declare this, so pip cannot resolve around it. Lift with the protobuf pin.
 sentencepiece>=0.1.99,<0.2.3
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09 uses 2.14.0a0.
-# The floor is the NGC alpha, which PEP 440 orders below the public release of the same
-# series; the ceiling is that public release, which is what the resolver picks off the public
-# index. Ordered comparisons drop the local version, so the container's +nv build stays
-# admissible against the floor.
-torch>=2.14.0a0,<=2.14.0
+# Admit public PyTorch 2.15.0 and the preinstalled NGC 26.11 2.15 alpha builds.
+# Both installation paths use Triton 3.9; exclude later PyTorch releases.
+torch>=2.15.0a0,<=2.15.0
 torchvision
 # The floor is the exact pin of the public torch above; the ceiling is the NCCL that
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-11.html#rel-26-11
 # ships, so the resolver lands on the container's own NCCL version there instead of an older one.
-nvidia-nccl-cu13>=2.30.7,<=2.31.2
+nvidia-nccl-cu13>=2.30.7,<=2.32.6
 # NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
 # from pinned source by CMake so it links against the container's NCCL.
 nccl4py>=0.4,<=0.5
@@ -64,7 +61,9 @@ click_option_group>=0.5.3
 aenum
 pyzmq
 fastapi>=0.136.3,<0.140.0
-starlette>=1.3.1
+# Starlette 1.10+ preserves partial streams in TestClient and requires Python 3.11+.
+starlette>=1.3.1; python_version < "3.11"
+starlette>=1.10.0; python_version >= "3.11"
 uvicorn
 setuptools<80
 # FlashInfer source builds (--no-build-isolation) need packaging>=24.2 for setuptools license-expression validation
@@ -85,12 +84,11 @@ meson
 ninja
 blake3
 soundfile
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
-# ships 3.8.0 and the torch pin above requires the same series, so floor and ceiling coincide.
+# Public PyTorch 2.15.0 and NGC PyTorch 26.11 both use Triton 3.9.
 # The pin carries no local version, which keeps the container's own +nv build admissible -- it
 # must not be reinstalled underneath the rest of the stack that was built against it. This is
 # also the version the vendored triton_kernels below track.
-triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
+triton==3.9.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 tiktoken
 blobfile
 openai-harmony==0.0.4
@@ -104,7 +102,7 @@ numexpr
 partial_json_parser
 mcp>=1.30.0,<2.0.0 # 2.0.0 removed mcp.server.fastmcp; scaffolding still uses the 1.x APIs
 apache-tvm-ffi==0.1.13.post2 # required by the CUTLASS DSL TVM-FFI provider
-torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
+torch-c-dlpack-ext==0.1.5 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
 flash-attn-4==4.0.0b19
 mistral-common[opencv]>=1.13.0; python_version >= "3.11"
 mistral-common[opencv]>=1.12.0; python_version < "3.11" # 1.13.0 requires Python 3.11+
