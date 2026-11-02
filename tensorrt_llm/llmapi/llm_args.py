@@ -2510,7 +2510,8 @@ class DecodingBaseConfig(StrictBaseModel):
         "verification (Sun et al., 2024, arXiv:2403.10444), which judges the "
         "drafted block jointly; it is lossless, equals 'standard' for one "
         "draft, and accepts at least as many tokens in expectation. Linear-chain "
-        "one-model paths only (not the dynamic tree); ragged (confidence-"
+        "one-model paths only (not the dynamic tree, nor with relaxed thinking "
+        "acceptance); ragged (confidence-"
         "scheduled) verification steps fall back to 'standard'.")
 
     draft_temperature_only: bool = Field(
@@ -7516,7 +7517,9 @@ class TorchLlmArgs(BaseLlmArgs):
         ``rejection_sample_method`` and ``draft_temperature_only`` only change
         the rejection path, so setting them while it is off is a configuration
         mistake. Neither is wired into the dynamic tree, whose drafts come from
-        a softmax top-k of the raw draft logits.
+        a softmax top-k of the raw draft logits, and relaxed thinking-phase
+        acceptance replaces the rejection rule, so block verification would
+        never run under it.
         """
         spec_cfg = self.speculative_config
         method = getattr(spec_cfg, "rejection_sample_method", "standard")
@@ -7538,6 +7541,11 @@ class TorchLlmArgs(BaseLlmArgs):
             if temperature_only:
                 raise ValueError("draft_temperature_only=True is not supported "
                                  "with use_dynamic_tree=True.")
+        if method == "block" and getattr(
+                spec_cfg, "use_relaxed_acceptance_for_thinking", False):
+            raise ValueError(
+                "rejection_sample_method='block' is not supported with "
+                "use_relaxed_acceptance_for_thinking=True.")
 
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None

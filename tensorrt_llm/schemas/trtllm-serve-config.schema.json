@@ -304,7 +304,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -919,7 +919,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -1243,7 +1243,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -1862,7 +1862,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -2210,7 +2210,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -2513,7 +2513,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -3811,7 +3811,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -4807,7 +4807,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -5069,7 +5069,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -5808,7 +5808,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -6081,7 +6081,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"
@@ -6611,7 +6611,7 @@
         },
         "rejection_sample_method": {
           "default": "standard",
-          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling (Leviathan et al., 2023): each draft is accepted with probability min(1, p/q) in order, and the first rejection resamples from max(p - q, 0). 'block': block verification (Sun et al., 2024, arXiv:2403.10444), which judges the drafted block jointly; it is lossless, equals 'standard' for one draft, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
           "enum": [
             "standard",
             "block"

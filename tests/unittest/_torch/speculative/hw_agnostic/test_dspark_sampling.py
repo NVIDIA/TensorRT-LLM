@@ -250,6 +250,26 @@ def test_rejection_options_are_rejected_with_the_dynamic_tree(options: dict) -> 
 
 
 @pytest.mark.cpu_only
+def test_block_verification_is_rejected_with_relaxed_acceptance() -> None:
+    # Relaxed thinking-phase acceptance returns before the rejection rule runs.
+    spec_config = types.SimpleNamespace(
+        use_rejection_sampling=True,
+        use_dynamic_tree=False,
+        use_relaxed_acceptance_for_thinking=True,
+        rejection_sample_method="standard",
+        draft_temperature_only=True,
+    )
+    TorchLlmArgs._validate_rejection_sampling_options(
+        types.SimpleNamespace(speculative_config=spec_config)
+    )
+    spec_config.rejection_sample_method = "block"
+    with pytest.raises(ValueError, match="use_relaxed_acceptance_for_thinking=True"):
+        TorchLlmArgs._validate_rejection_sampling_options(
+            types.SimpleNamespace(speculative_config=spec_config)
+        )
+
+
+@pytest.mark.cpu_only
 def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
     generator = torch.Generator().manual_seed(1)
     drafter = _drafter(generator)
