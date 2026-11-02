@@ -65,9 +65,11 @@ def kda_prefill(
     refreshed before replay when packed lengths change, retaining their storage.
     Without them, BT16 regenerates metadata on the device each invocation.
 
-    Auto selects Small-BH for BF16 state when twice the sequence/head count
-    fits the device SM count. ``bt16`` retains BT16's engine/decomposition
-    selection; ``small-bh`` forces Small-BH. ``max_seqlen`` is an optional
+    Auto and ``bt16`` use BT16's engine/decomposition selection. ``small-bh``
+    forces Small-BH, which auto never selects: with BF16 state its output
+    diverges from the reference on long sequences whose heads mix near-unit
+    and strong per-channel decay, until it overflows to NaN (a repeated token
+    over about a thousand steps is enough). ``max_seqlen`` is an optional
     upper bound for all replays, or zero to use the total token capacity.
     Small-BH and BT16 decomposition consume aligned, head-contiguous beta
     views directly; the engine requires compact beta storage.
@@ -158,11 +160,9 @@ def kda_prefill(
     small_bh_eligible = state_pool.dtype == torch.bfloat16 and q.shape[1] > 1
     if mode == "small-bh" and not small_bh_eligible:
         raise ValueError("Small-BH requires BF16 state and more than one packed token")
-    use_small_bh = mode == "small-bh" or (
-        mode == "auto" and small_bh_eligible and 2 * n * heads <= sm_count
-    )
-    # Match BT16's occupancy router, including auto with FP32 state where
-    # Small-BH is unavailable. Forced engine calls must still pack beta.
+    # Auto stays on BT16 (see the docstring): Small-BH is opt-in only.
+    use_small_bh = mode == "small-bh"
+    # Match BT16's occupancy router. Forced engine calls must still pack beta.
     use_decomp = mode == "decomp" or (mode in ("auto", "bt16") and 2 * n * heads <= sm_count)
     # The merged [f_a | beta] projection has unit head stride and a padded,
     # 16-byte-aligned token pitch. Preserve packing for other input layouts.

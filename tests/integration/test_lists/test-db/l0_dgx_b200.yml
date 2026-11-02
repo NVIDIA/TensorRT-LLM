@@ -36,6 +36,8 @@ l0_dgx_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_eviction
   # ------------- VisualGen multi-GPU tests ---------------
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16-2gpu]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16-2gpu]
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
@@ -158,6 +160,7 @@ l0_dgx_b200:
       orchestrator: ray
   tests:
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu4"
+    - unittest/_torch/ray_orchestrator/multi_gpu/test_kv_cache_reset_events_streaming.py
     - unittest/_torch/ray_orchestrator/multi_gpu/test_mnnvl_allreduce.py
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-8B-Qwen3/Qwen3-8B-FP8]
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_fp8[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B-FP8]
@@ -173,21 +176,6 @@ l0_dgx_b200:
     - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 8
-        lte: 8
-    wildcards:
-      gpu:
-        - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: pytorch
-      orchestrator: ray
-  tests:
-    - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_qwen35_35b_bf16_tp8_cuda_graph
 - condition:
     ranges:
       system_gpu_count:

@@ -22,6 +22,55 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
+get_filename_component(TRTLLM_REPO_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                       ABSOLUTE)
+set(TRTLLM_FMHA_PARAMS_GENERATOR
+    "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
+set(TRTLLM_FMHA_PARAMS_SCHEMAS
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/phased.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/trtllm.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
+)
+# The C++ consumer decides which members of the mirrored runtime classes
+# (TrtllmAttention, TrtllmAttentionMetadata) are emitted: a member crosses when
+# these sources read it as attn.<name> / meta.<name>.
+set(TRTLLM_FMHA_PARAMS_USAGE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionFeature.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionVariant.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/nanobind/thop/bindings.cpp")
+set(TRTLLM_FMHA_PARAMS_SCHEMA_ARGS "")
+foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --module-path "${_schema}")
+endforeach()
+foreach(_usage ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --usage-source "${_usage}")
+endforeach()
+set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Generate during configuration so clangd can resolve the headers before a
+# build.
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS ${TRTLLM_FMHA_PARAMS_GENERATOR}
+           ${TRTLLM_FMHA_PARAMS_SCHEMAS} ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
+execute_process(
+  COMMAND
+    "${Python3_EXECUTABLE}" "${TRTLLM_FMHA_PARAMS_GENERATOR}"
+    ${TRTLLM_FMHA_PARAMS_SCHEMA_ARGS} --class-name FmhaParams --out-dir
+    "${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR}/tensorrt_llm/thop"
+  RESULT_VARIABLE TRTLLM_FMHA_PARAMS_RESULT
+  OUTPUT_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT
+  ERROR_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT)
+if(NOT TRTLLM_FMHA_PARAMS_RESULT EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Generating native FmhaParams failed:\n${TRTLLM_FMHA_PARAMS_OUTPUT}")
+endif()
+
 set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
@@ -149,11 +198,6 @@ set_target_properties(
                                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 add_subdirectory(kernels)
-set(KIMI_K3_MODEL_CSRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../tensorrt_llm/_torch/_experimental/modeling_v2/models/kimi_k3_vl/csrc"
-)
-add_subdirectory("${KIMI_K3_MODEL_CSRC}"
-                 "${CMAKE_CURRENT_BINARY_DIR}/kimi_k3_model")
 add_subdirectory(runtime)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
@@ -199,7 +243,6 @@ set(TRTLLM_LINK_LIBS
     mamba2_mtp_ssm_cache_src
     kda_decode_src
     kimi_k3_attn_res_src
-    kimi_k3_model_src
     ws_layernorm_src
     fusedGatedRMSNormQuant_src
     fpA_intB_gemm_src

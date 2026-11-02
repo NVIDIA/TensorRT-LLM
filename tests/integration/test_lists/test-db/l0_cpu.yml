@@ -12,6 +12,8 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_tp4_drift.py
   - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
   - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_rejects_unsupported_projection_before_forward
   - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_dispatches_to_linear_method
@@ -45,9 +47,9 @@ l0_cpu:
   # The GPU lists' attention/ entries run -m "not cpu_only", so hw_agnostic/ runs only here.
   - unittest/_torch/attention
   # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
-  - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
-  - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
-  - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_decode_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pool_layout.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -55,7 +57,7 @@ l0_cpu:
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
   - unittest/test_startup.py
@@ -75,22 +77,31 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_fp4_test_helpers.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
-  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py::test_k3_workspace_threshold_is_inclusive_and_two_shot_pads
-  - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_worker.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_capture_view.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_ctx_rows_start.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_multimodal_embeds.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_moe_scalars.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_validate_request.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_pool_contract.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_kv_quant.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_thop_attention_calls.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_qwen4_exp_weight_table.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_multimodal_embeds.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_moe_scalars.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_validate_request.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_pool_contract.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_kv_quant.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_thop_attention_calls.py
+  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
@@ -156,6 +167,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/sparse_attention/skip_softmax/test_skip_softmax.py
   - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
   - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_token_order.py
   - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor_kernels.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py::test_flashinfer_backend_is_registered
   - unittest/_torch/visual_gen/test_attention_integration.py
@@ -167,6 +179,9 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx23_registry.py
+  - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
+  - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
@@ -200,10 +215,12 @@ l0_cpu:
   - unittest/executor/test_ipc.py
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
+  - unittest/executor/test_proxy_request_sender.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
+  - unittest/executor/test_shutdown_retry_contracts.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
@@ -213,9 +230,12 @@ l0_cpu:
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
   - unittest/grpc/openengine/test_control.py
+  - unittest/grpc/openengine/test_image_routing.py
   - unittest/grpc/openengine/test_multimodal.py
+  - unittest/grpc/openengine/test_preparation.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_metrics.py
   - unittest/grpc/openengine/test_servicer.py
   - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
   - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history
@@ -241,6 +261,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
+  - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
@@ -249,12 +270,13 @@ l0_cpu:
   - unittest/llmapi/apps/test_render_http.py
   - unittest/llmapi/apps/test_render_standalone.py
   # test_request_metrics.py as a whole is not registered on any list, so only the
-  # two cases added with the KV-transfer fix are selected here. Registering the
-  # file would also enable a dozen pre-existing cases that have never run in CI,
-  # which belongs in its own change.
+  # cases below are selected here. Registering the file would also enable a dozen
+  # pre-existing cases that have never run in CI, which belongs in its own change.
   - unittest/llmapi/apps/test_request_metrics.py::test_header_derived_record_keeps_kv_transfer_without_kv_cache_size
   - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
+  - unittest/llmapi/apps/test_request_metrics.py::TestJsonlWriterSurvival
   - unittest/llmapi/apps/test_responses_custom_tools.py
+  - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
   - unittest/llmapi/apps/test_responses_store_replay.py
   - unittest/llmapi/apps/test_responses_stream_final_consistency.py
@@ -273,6 +295,7 @@ l0_cpu:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_kv_cache_dtype_override.py
   - unittest/llmapi/test_llm_args.py
+  - unittest/llmapi/test_gms_args.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.
@@ -294,8 +317,10 @@ l0_cpu:
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_frontend_affinity.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
+  - unittest/llmapi/test_serve_num_frontends_default.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py

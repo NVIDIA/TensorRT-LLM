@@ -30,6 +30,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Cohere2ForCausalLM",
         "Cosmos3EdgeForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
+        "DSparkMiniMaxDraftModel",
         "DeciLMForCausalLM",
         "DeepSeekV2ForCausalLM",
         "DeepseekV32ForCausalLM",

@@ -874,14 +874,17 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
+                 enable_tokenization_cache: bool = False,
                  **kwargs) -> None:
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block,
-                                 custom_tokenizer,
-                                 tokenizer_dir,
-                                 use_harmony=use_harmony,
-                                 model_path=model_path)
+        self._init_block_hashing(
+            tokens_per_block,
+            custom_tokenizer,
+            tokenizer_dir,
+            use_harmony=use_harmony,
+            model_path=model_path,
+            enable_tokenization_cache=enable_tokenization_cache)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
@@ -1384,12 +1387,16 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  hash_skip_count: int = 0,
                  max_sessions: int = 100000,
                  use_harmony: Optional[bool] = None,
+                 enable_tokenization_cache: bool = False,
                  new_conversation_min_match_blocks: int = 32,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
         self._init_load_balancing(servers)
-        self._init_block_hashing(tokens_per_block, use_harmony=use_harmony)
+        self._init_block_hashing(
+            tokens_per_block,
+            use_harmony=use_harmony,
+            enable_tokenization_cache=enable_tokenization_cache)
 
         if new_conversation_min_match_blocks < 0:
             raise ValueError("new_conversation_min_match_blocks must be >= 0")
@@ -2023,14 +2030,31 @@ class CoordinatorDelegatingRouter(Router):
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
-        body = await self._post_select(payload)
-        info = body.get("info") or {}
-        if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
-            # The coordinator placed nothing; repeat with the content key.
-            payload["routing_key"] = await asyncio.to_thread(
-                self._local.content_routing_key, request)
-            body = await self._post_select(payload)
+        selection = asyncio.create_task(self._post_select(payload))
+        try:
+            body = await asyncio.shield(selection)
             info = body.get("info") or {}
+            if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
+                # The coordinator placed nothing; repeat with the content key.
+                payload["routing_key"] = await asyncio.to_thread(
+                    self._local.content_routing_key, request)
+                selection = asyncio.create_task(self._post_select(payload))
+                body = await asyncio.shield(selection)
+                info = body.get("info") or {}
+        except asyncio.CancelledError:
+            # /finish must not overtake /select and leave a late reservation.
+            # Keep its existing HTTP timeout/retry bounds, even if the caller
+            # cancels again while we wait to release the original routing ID.
+            settled = asyncio.gather(selection, return_exceptions=True)
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    pass
+            await self.finish_request(request,
+                                      success=False,
+                                      req_id=payload["req_id"])
+            raise
         self._select_lat.record(time.monotonic() - _t0)
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "

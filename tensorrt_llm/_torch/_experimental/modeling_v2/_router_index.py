@@ -113,11 +113,13 @@ class ModelingV2Mode(str, enum.Enum):
         return cls(llm_args.modeling_v2)
 
 
-class NoTarget(Exception):
-    """Raised by a family's ``route`` when no target fits.
+class NoTarget(ValueError):
+    """Raised by a family's ``route`` when no target fits, or by a target at construction when the runtime
+    the engine arguments set is not the one it is written for.
 
     The message says, in words, which fact ruled the targets out. Under
-    ``auto`` the resolver logs it and falls back to the built-in implementation;
+    ``auto`` the resolver logs it and falls back to the built-in implementation
+    (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
 
@@ -196,6 +198,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -219,7 +222,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
-    _RESOLVED_MODES[target] = mode
+    if target is not None:
+        _RESOLVED_MODES[target] = mode
     return target
 
 

@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import weakref
 from abc import abstractmethod
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union, final
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union, final
 
 import torch
 from torch import nn
@@ -52,6 +53,7 @@ from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
 from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_expert_ids,
                       get_cached_perfect_router_logits,
                       precompute_common_perfect_router_logits)
 
@@ -232,6 +234,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
     # Set by callers that compose a ``FUSED_COMM`` backend's globally combined
     # routed output themselves; read through ``returns_global_routed_output``.
     accepts_global_routed_output: bool = False
+    # Set only inside ``load_balancer_overlap``; consumed by the next route.
+    _load_balancer_overlap_fn: Optional[Callable[[], None]] = None
 
     @property
     def returns_global_routed_output(self) -> bool:
@@ -388,7 +392,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         # un-overridden default would be ``expert_size_per_partition =
         # num_experts`` (each rank allocating storage for every expert).
         self._init_dwdp_expert_layout()
-        self._init_perfect_router()
+        self._init_perfect_router(model_config)
 
     def _init_dwdp_expert_layout(self):
         """Override expert layout when DWDP is enabled.
@@ -462,9 +466,17 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             return torch.float32
         return self.dtype if self.dtype is not None else torch.float32
 
-    def _init_perfect_router(self):
-        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
-                                                     "0") == "1"
+    def _init_perfect_router(self, model_config: ModelConfig):
+        # ENABLE_PERFECT_ROUTER=1 replaces the router logits before routing;
+        # ENABLE_PERFECT_ROUTER=expert_ids replaces the routed expert ids after
+        # routing. Both are for performance analysis only.
+        perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER", "0")
+        self._enable_perfect_router = perfect_router == "1"
+        self._enable_perfect_router_expert_ids = perfect_router == "expert_ids"
+        # No MoE call routes more local tokens than this. It sizes the
+        # expert-id table, which is built on the first call, not here: the
+        # module may still be on the meta device.
+        self._perfect_router_max_num_tokens = model_config.max_num_tokens
         if not self._enable_perfect_router:
             return
 
@@ -493,6 +505,28 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             dtype=router_logits.dtype,
             routing_method=self.routing_method)
 
+    def _maybe_get_perfect_router_expert_ids(
+            self, token_selected_experts: torch.Tensor) -> torch.Tensor:
+        """Return balanced expert ids under ENABLE_PERFECT_ROUTER=expert_ids.
+
+        The router still runs, so its cost is kept; only its expert ids are
+        replaced, by a view of a cached table (see
+        ``get_cached_perfect_router_expert_ids``). The routing scales are left
+        as computed. Model outputs are wrong by design.
+        """
+        if not self._enable_perfect_router_expert_ids:
+            return token_selected_experts
+
+        num_tokens, experts_per_token = token_selected_experts.shape
+        return get_cached_perfect_router_expert_ids(
+            num_tokens=num_tokens,
+            num_experts=self.num_experts,
+            experts_per_token=experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            max_num_tokens=self._perfect_router_max_num_tokens,
+            device=token_selected_experts.device)
+
     def _init_load_balancer(
         self,
         model_config: ModelConfig,
@@ -514,8 +548,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         moe_load_balancer = get_moe_load_balancer()
         moe_load_balancer_config = model_config.moe_load_balancer
 
-        # Calculate initial expert assignments
-        if moe_load_balancer_config:
+        # Standard EPLB checkpoints carry one expert id per physical slot.
+        # Per-layer dynamic EPLB keeps checkpoint/source storage on the resident
+        # axis H=E/EP; only the live kernel planes are widened to M=P/EP.
+        per_layer_dynamic_eplb = (getattr(moe_load_balancer_config, "mode",
+                                          None) == "per_layer_dynamic")
+        if moe_load_balancer_config and not per_layer_dynamic_eplb:
             init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.initial_global_assignments = [
                 (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
@@ -523,7 +561,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 for local_slot_id in range(init_expert_size_per_partition)
             ]
         else:
-            # Sequential mapping: expert i → slot i; covers all experts regardless of divisibility
+            # Sequential resident mapping covers every logical expert exactly once.
             self.initial_global_assignments = list(range(self.num_experts))
 
         # Setup load balancer if available
@@ -543,23 +581,44 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     f"by ep_size ({self.ep_size}) so each rank holds the same "
                     f"number of slots.")
             top_k = self.routing_method.experts_per_token
-            self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            if per_layer_dynamic_eplb:
+                validate_capacity = getattr(moe_load_balancer_config,
+                                            "validate_expert_capacity", None)
+                if callable(validate_capacity):
+                    validate_capacity(self.num_experts)
+                if self.num_experts % self.ep_size != 0:
+                    raise ValueError(
+                        f"{type(self).__name__}: per-layer dynamic EPLB requires "
+                        f"num_experts ({self.num_experts}) divisible by ep_size "
+                        f"({self.ep_size}) so resident H is rank-identical.")
+                self.expert_size_per_partition = self.num_experts // self.ep_size
+            else:
+                self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
 
-            # Add this layer to the load balancer
+            # Add this layer to the load balancer. slot_count_per_rank is the
+            # compute capacity M for per-layer dynamic mode and the ordinary local
+            # slot count for standard mode.
             aux_stream = getattr(self, '_get_load_balancer_aux_stream',
                                  lambda: None)()
+            slot_count_per_rank = (moe_load_balancer_config.num_local_slots
+                                   if per_layer_dynamic_eplb else
+                                   self.expert_size_per_partition)
             self.layer_load_balancer = moe_load_balancer.add_layer(
                 self.num_experts,
                 top_k,
-                self.expert_size_per_partition,
+                slot_count_per_rank,
                 aux_stream=aux_stream)
 
             self.repeat_count = self.layer_load_balancer.get_repeat_count()
 
             # Handle initial global assignments
-            loaded_initial_global_assignments = (
-                moe_load_balancer_config.get_layer_initial_global_assignments(
-                    self.layer_idx))
+            get_initial_assignments = getattr(
+                moe_load_balancer_config,
+                "get_layer_initial_global_assignments",
+                None,
+            )
+            loaded_initial_global_assignments = (get_initial_assignments(
+                self.layer_idx) if callable(get_initial_assignments) else None)
             self.num_slots = moe_load_balancer_config.num_slots
 
             if loaded_initial_global_assignments is not None:
@@ -581,7 +640,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
             )
 
-            # Slot boundaries for EPLB (uniform: all ranks hold same num_local_slots)
+            # Source/checkpoint boundaries are resident H in per-layer dynamic
+            # mode. The layer manager separately owns compute slots M.
             self.slot_start = self.ep_rank * self.expert_size_per_partition
             self.slot_end = self.slot_start + self.expert_size_per_partition
             self.initial_local_expert_ids = self.initial_global_assignments[
@@ -673,18 +733,52 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     is_last_stage=is_last_call,
                     allreduce=self.allreduce)
 
+    @contextlib.contextmanager
+    def load_balancer_overlap(self,
+                              overlap_fn: Callable[[], None]) -> Iterator[None]:
+        """Run ``overlap_fn`` inside the next load-balancer route call.
+
+        A per-layer dynamic EPLB layer calls it after the copy stream has been
+        submitted and before the routes are returned, so independent
+        main-stream work such as shared experts overlaps planning and the
+        helper-weight copy. Only the first route call consumes it, and it is
+        cleared on every exit; if no route call consumes it, the caller still
+        owns that work. Every EP rank must install the same function.
+        """
+        if not callable(overlap_fn):
+            raise TypeError("overlap_fn must be callable")
+        self._load_balancer_overlap_fn = overlap_fn
+        try:
+            yield
+        finally:
+            self._load_balancer_overlap_fn = None
+
     def _load_balancer_route(self, token_selected_experts: torch.Tensor,
                              use_dp: bool) -> torch.Tensor:
-        """Route tokens using load balancer."""
-        if self.layer_load_balancer:
+        """Route tokens and enqueue a per-layer dynamic replica plan when enabled."""
+        if not self.layer_load_balancer:
+            return token_selected_experts
+
+        overlap_fn = self._load_balancer_overlap_fn
+        if overlap_fn is None:
             return self.layer_load_balancer.route(token_selected_experts,
                                                   use_dp)
-        else:
-            return token_selected_experts
+        self._load_balancer_overlap_fn = None
+        return self.layer_load_balancer.route(token_selected_experts,
+                                              use_dp,
+                                              overlap_fn=overlap_fn)
+
+    def _load_balancer_uses_replica_plan(self) -> bool:
+        """Whether routing is produced by the per-layer dynamic device planner."""
+        return bool(self.layer_load_balancer
+                    and self.layer_load_balancer.produces_replica_plan)
 
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""
-        if self._using_dynamic_load_balancer() and is_last_call:
+        # A per-layer dynamic EPLB layer plans every chunk and releases that
+        # chunk's replica plan here, after the chunk's MoE kernel.
+        if self._load_balancer_uses_replica_plan() or (
+                self._using_dynamic_load_balancer() and is_last_call):
             self.layer_load_balancer.start_set_cpu_stage()
 
     def _load_balancer_done_set_cpu_stage(self, is_last_call: bool):
@@ -839,6 +933,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     "adapter pointers). Disable `register_to_config`/"
                     "torch.compile for this model, or remove the MoE modules "
                     "from `lora_config.lora_target_modules`.")
+            if kwargs.get("prerouted") is not None:
+                raise NotImplementedError(
+                    "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
+                )
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,

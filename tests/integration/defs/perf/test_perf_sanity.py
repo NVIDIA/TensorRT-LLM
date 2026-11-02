@@ -1017,9 +1017,6 @@ MAXIMIZE_METRICS = [
     "d_token_throughput",
     "d_total_token_throughput",
     "d_user_throughput",
-    "d_mean_tpot",
-    "d_median_tpot",
-    "d_p99_tpot",
     "d_al",
 ]
 
@@ -1031,6 +1028,9 @@ MINIMIZE_METRICS = [
     "d_mean_itl",
     "d_median_itl",
     "d_p99_itl",
+    "d_mean_tpot",
+    "d_median_tpot",
+    "d_p99_tpot",
     "d_mean_e2el",
     "d_median_e2el",
     "d_p99_e2el",

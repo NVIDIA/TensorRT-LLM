@@ -72,7 +72,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -94,6 +93,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -141,6 +141,7 @@ from ..scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -309,7 +310,7 @@ class KVCacheLayerSpec:
     buffer_roles: tuple[DataRole, ...]
     sliding_window_size: Optional[int] = None
     num_sink_tokens: Optional[int] = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     def __post_init__(self) -> None:
         if self.global_layer_id < 0:
@@ -1075,6 +1076,7 @@ def _augment_tokens_with_mm_run_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     metadata: _MmRunMetadata,
     chunk_start: int,
     chunk_end: int,
@@ -1109,6 +1111,7 @@ def _augment_tokens_with_mm_run_metadata(
 
     current_item_idx: Optional[int] = None
     digest = b""
+    uuid: str | None = None
     for item_idx, chunk_result_offset, item_token_offset, length in zip(
         overlap_run_item_indices.tolist(),
         chunk_result_offsets.tolist(),
@@ -1119,13 +1122,22 @@ def _augment_tokens_with_mm_run_metadata(
         if item_idx != current_item_idx:
             current_item_idx = item_idx
             digest = _hash_to_digest(multimodal_hashes[item_idx])
+            uuid = (
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            )
         # Feed the coarse item property (content digest) and granular run
         # properties (item-local offset and span length) into the key
         # generator, so cache keys reflect the actual multimodal tokens being
         # rewritten.
         result[chunk_result_offset : chunk_result_offset + length] = (
             gen_multimodal_cache_key_tokens(
-                vocab_size, digest, length, token_offset=item_token_offset
+                vocab_size,
+                digest,
+                length,
+                token_offset=item_token_offset,
+                uuid=uuid,
             )
         )
 
@@ -1136,6 +1148,7 @@ def _augment_tokens_with_contiguous_mm_metadata(
     vocab_size: int,
     result: list[TokenIdExt],
     multimodal_hashes: Sequence[Sequence[int]],
+    multimodal_uuids: Sequence[str | None] | None,
     multimodal_positions: Sequence[int] | torch.Tensor,
     multimodal_lengths: Sequence[int] | torch.Tensor,
     chunk_start: int,
@@ -1163,6 +1176,11 @@ def _augment_tokens_with_contiguous_mm_metadata(
             _hash_to_digest(multimodal_hashes[item_idx]),
             overlap_length,
             token_offset=source_offset,
+            uuid=(
+                multimodal_uuids[item_idx]
+                if multimodal_uuids is not None and item_idx < len(multimodal_uuids)
+                else None
+            ),
         )
 
     return result
@@ -1768,6 +1786,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Staging rows per batch for recurrent-state snapshots taken inside the
+    # forward (MambaHybridCacheManagerV2); 0 = none.
+    inforward_snapshot_rows: int = 0
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
@@ -2588,10 +2609,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 }
             )
         )
-        if self._sparse_layer_group_ids:
-            self.sparse_metadata_batch = Batch(
-                self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
-            )
+        # Metadata publication belongs to the sparse fetch path, which builds the Batch
+        # it publishes through; this manager does not. Every use of
+        # `sparse_metadata_batch` is guarded on it being set, so leaving it unset keeps
+        # those paths inert. Restore this with the full sparse attention support, which
+        # brings that fetch path with it -- it is dropped here only so the KVCM2 core
+        # change stands alone.
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
@@ -3904,7 +3927,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
                 else:
-                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+                    layers.append(
+                        SsmLayerConfig(
+                            layer_id=layer_id, buffers=buffers, reuse_policy=layer.reuse_policy
+                        )
+                    )
 
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
@@ -4042,7 +4069,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Native SWA includes the next query's write position.
                     sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
-                    reuse_policy=AttentionReusePolicy.REQUIRED,
+                    reuse_policy=ReusePolicy.REQUIRED,
                 )
             )
 
@@ -4653,8 +4680,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft,
+                # or a CTX with a smaller max_draft_len) up to
+                # max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _helix_local_len(self, global_len: int) -> int:
@@ -6134,13 +6164,20 @@ class KVCacheManagerV2(BaseResourceManager):
         run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(
-                self.vocab_size, result, req.multimodal_hashes, run_metadata, chunk_start, chunk_end
+                self.vocab_size,
+                result,
+                req.multimodal_hashes,
+                req.multimodal_uuids,
+                run_metadata,
+                chunk_start,
+                chunk_end,
             )
 
         return _augment_tokens_with_contiguous_mm_metadata(
             self.vocab_size,
             result,
             req.multimodal_hashes,
+            req.multimodal_uuids,
             req.multimodal_positions,
             req.multimodal_lengths,
             chunk_start,
@@ -8120,6 +8157,41 @@ class KVCacheManagerV2(BaseResourceManager):
             stream=stream,
         )
 
+    # Trailing blocks of a request that a decode step can change at an unchanged block count: a step appends at
+    # most one block and the rewind of its rejected drafts frees at most one, so only the last block can come back
+    # on another page; two cover any step of fewer than two blocks' tokens.
+    _BLOCK_TABLE_KEY_TAIL_BLOCKS = 2
+
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
+        copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
+        the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
+        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        finite attention window freeing earlier blocks, other beams)."""
+        if (
+            self.enable_swa_scratch_reuse
+            or self.enable_block_reuse
+            or self.max_beam_width > 1
+            or any(
+                window is not None and window < self.max_seq_len
+                for window in self.max_attention_window_vec
+            )
+            or self._use_per_layer_page_tables
+            or self.sparse_metadata_batch is not None
+        ):
+            return None
+        host = self.host_kv_cache_block_offsets.numpy()
+        keys = []
+        for request_id in request_ids:
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None:
+                return None
+            num_blocks = int(kv_cache.num_blocks)
+            row = self.index_mapper.get_index(request_id) * self.max_beam_width
+            first = max(0, num_blocks - self._BLOCK_TABLE_KEY_TAIL_BLOCKS)
+            keys.append((num_blocks, host[:, row, 0, first:num_blocks].tobytes()))
+        return tuple(keys)
+
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> str | None:
         """Return the string namespace shared by creation, prefetch and probes."""
@@ -8281,9 +8353,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 success = False
         return success
 
-    def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+    def reset_reuse_state(
+        self,
+        *,
+        on_cleared: Optional[Callable[[], None]] = None,
+    ):
+        try:
+            self.impl.clear_reusable_blocks()
+            if on_cleared is not None:
+                on_cleared()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # The sidecar consumes the per-rank streaming publisher. Flush it
+            # even while inference is paused, without starting a buffered ADP gather.
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.flush_iteration_events()
