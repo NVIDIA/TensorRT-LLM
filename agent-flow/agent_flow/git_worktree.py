@@ -164,7 +164,8 @@ class GitWorktreeIsolation:
         Removes only the worktree directory. The node's branch — its durable
         output — is deliberately kept alive so a later fan-in node can merge it;
         it is deleted later by :meth:`reclaim`. Tolerates an already-removed
-        worktree so a redundant release cannot fail.
+        worktree, and a directory git no longer counts as one, so a redundant
+        or interrupted release cannot fail.
 
         Raises:
             IsolationError: If the ``git worktree remove`` command fails for a
@@ -177,7 +178,21 @@ class GitWorktreeIsolation:
         if not path.exists():
             # Nothing to free: the worktree was already removed (idempotent).
             return
-        await self._git("worktree", "remove", "--force", str(path))
+        returncode, _stdout, stderr = await self._run_git(
+            "worktree", "remove", "--force", str(path)
+        )
+        if returncode == 0:
+            return
+        if (path / ".git").exists():
+            raise IsolationError(
+                f"git worktree remove --force {path} failed (exit code {returncode}): "
+                f"{stderr.strip()}"
+            )
+        # Without its ``.git`` file the directory is no longer a worktree to git
+        # (an earlier removal stopped partway, or something wrote into it
+        # afterwards): what is left is plain files.
+        shutil.rmtree(path, ignore_errors=True)
+        await self._git("worktree", "prune", check=False)
 
     async def reclaim(self, node: Node) -> None:
         """Free ``node``'s durable output: delete its branch and prune worktrees.
@@ -216,6 +231,7 @@ class GitWorktreeIsolation:
         commit (a clean tree). ``--no-verify`` skips any pre-commit hooks the
         target repo installs: a per-node commit is internal plumbing, not a
         user-authored commit, so a slow or failing hook must not block the handoff.
+        The commit is signed off all the same, for repositories that require it.
 
         Raises:
             IsolationError: If a ``git`` step fails for an unexpected reason.
@@ -227,7 +243,7 @@ class GitWorktreeIsolation:
         if returncode == 0:
             return None
         message = f"[agent-flow] node {node.id} ({node.kind}) output"
-        await self._git("commit", "--no-verify", "-m", message, cwd=cwd)
+        await self._git("commit", "-s", "--no-verify", "-m", message, cwd=cwd)
         return (await self._git("rev-parse", "--short", "HEAD", cwd=cwd)).strip()
 
     async def clean(self) -> None:
@@ -324,7 +340,7 @@ class GitWorktreeIsolation:
                 report.skipped.append(branch)
                 continue
             returncode, _stdout, stderr = await self._run_git(
-                "merge", "--no-edit", branch, cwd=worktree
+                "merge", "--no-edit", "--signoff", branch, cwd=worktree
             )
             if returncode == 0:
                 report.merged.append(branch)

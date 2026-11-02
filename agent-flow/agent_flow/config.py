@@ -44,6 +44,9 @@ class BackendConfig:
 @dataclass(frozen=True)
 class SessionConfig:
     mode: SessionMode = "stateless"
+    # Start as a fork of this earlier session (its backend id): with its
+    # history, under a new id. Only backends that can fork accept it.
+    fork_from: str | None = None
 
 
 @dataclass(frozen=True)
