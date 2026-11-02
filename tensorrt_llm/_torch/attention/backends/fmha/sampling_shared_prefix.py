@@ -134,6 +134,7 @@ if IS_FLASHINFER_AVAILABLE:
         MAX_QUERIES_PER_TILE,
         CtxPrefix,
         Fa4Prefix,
+        Fa4Tail,
         FusedWorkspace,
         ctx_prefix_supported,
         default_prefix_splits,
@@ -259,6 +260,11 @@ PREFIX_KERNEL_ENV = "TLLM_SAMPLING_SHARED_PREFIX_PREFIX_KERNEL"
 context kernel where it exists (SM100/SM103, bf16, head_dim 64/128), through FlashAttention-4 on SM90
 (``Fa4Prefix``) and through the Triton prefix kernel elsewhere; ``triton`` forces the Triton kernel
 (see ``CtxPrefix``)."""
+TAIL_KERNEL_ENV = "TLLM_SAMPLING_SHARED_PREFIX_TAIL_KERNEL"
+"""``auto`` (default) serves the private pages of captured n-sample batches through FlashAttention-4
+whenever the shared pages are (``Fa4Tail``, SM90); ``triton`` keeps the Triton tail launch. On H100
+(Qwen2.5-7B, 120 rows) FA4's tensor-core decode tile reads a row's private pages faster than the
+Triton tail program, which covers every (row, KV head) with one CUDA-core-bound program."""
 FA4_PREFIX_MAX_GROUPS = 8
 """Default sharing-group capacity of a captured batch on the FlashAttention-4 prefix path: FA4 launches
 blocks for every padded request, so the padded group count stays small. Further groups are attended
@@ -1040,6 +1046,8 @@ class _GraphBuffers:
     tail_slice: tuple = (0, 0)
     ctx: Optional[Any] = None
     """``CtxPrefix`` serving the shared pages through the TRTLLM-Gen context kernel, if enabled."""
+    fa4_tail: Optional[Any] = None
+    """``Fa4Tail`` serving the private pages through FlashAttention-4, if enabled (with ``Fa4Prefix``)."""
     ctx_staging: Optional[tuple] = None
     uploaded_ctx_version: int = -1
 
@@ -1623,7 +1631,10 @@ def _maybe_enable_ctx_prefix(
     max_pages = int(metadata.host_kv_cache_block_offsets.size(-1))
     tokens_per_block = int(metadata.tokens_per_block)
     max_kv_len = int(metadata.max_seq_len or max_pages * tokens_per_block)
-    prefix_cls = Fa4Prefix if _fa4_prefix_active(head_dim, q_len) else CtxPrefix
+    fa4 = _fa4_prefix_active(head_dim, q_len)
+    prefix_cls = Fa4Prefix if fa4 else CtxPrefix
+    if fa4 and os.environ.get(TAIL_KERNEL_ENV, "auto").strip().lower() != "triton":
+        graph.fa4_tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_pages, torch.bfloat16, device)
     graph.enable_ctx(
         prefix_cls(
             tokens,
@@ -2477,6 +2488,15 @@ class SamplingSharedPrefixFmha(PhasedFmha):
                         graph.base_len,
                         graph.tail_last_page_len,
                     )
+                    if graph.fa4_tail is not None:
+                        graph.fa4_tail.build_tables(
+                            metadata.kv_cache_block_offsets[state.pool_index, : plan.num_rows, 0],
+                            graph.perm,
+                            graph.shared,
+                            metadata.kv_lens_cuda_runtime[: plan.num_rows],
+                            int(metadata.kv_cache_manager.kv_factor),
+                            int(metadata.tokens_per_block),
+                        )
                 else:
                     step_slots(
                         metadata.kv_lens_cuda_runtime[: plan.num_rows],
@@ -2524,10 +2544,13 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             assert graph is not None
             group_rows = min(FUSED_GROUP_ROWS, plan.num_rows)
             ctx = graph.ctx
+            fa4_tail = graph.fa4_tail
             if ctx is not None and (
                 qkv.dtype != ctx.q.dtype or tuple(ctx.q.shape) != (rows, num_heads, head_dim)
             ):
                 ctx = None
+            if ctx is None or fa4_tail is None or fa4_tail.out.dtype != qkv.dtype:
+                fa4_tail = None
             if ctx is not None:
                 prefix_splits = 0
                 tail_kwargs = dict(
@@ -2539,6 +2562,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
                     block_nt=CTX_TAIL_BLOCK,
                     tail_num_warps=CTX_TAIL_WARPS,
                     ctx=ctx,
+                    fa4_tail=fa4_tail,
                 )
             else:
                 prefix_splits = FUSED_PREFIX_SPLITS or default_prefix_splits(
