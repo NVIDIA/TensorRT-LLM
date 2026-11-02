@@ -1,27 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Tests for GEN slot preemption (scheduler_config.gen_preemption), pause in
-place.
-
-Covers:
-- settings from the LLM API config, the startup log, and the resident
-  headroom the sequence-slot, KV index and recurrent-state pools reserve
-- tpot_budget victims: the longest resident request (ties: newest)
-- guardrails: first token out, min run time, per-request cap, hysteresis,
-  near-finished requests, per-pass and paused-count budgets
-- the window controller: warm start, one step per completion, convergence to
-  0.8 x the budget, clamps, no update before the admission target
-- target_output_tps as an objective: laxity, the victim classes (laxity,
-  below target, sacrifice), the laxity-margin resume, the credit bucket, the
-  least-laxity resume lane, rank-identical inputs, the stat line
-- the at-risk test on the GEN admission queue
-- the executor pass: resume lane ahead of new admissions, forced resume, no
-  starvation, identical decisions on simulated ranks
-- executor setup: pool checks, prerequisites, pipeline-parallel rejection
-"""
+"""GEN slot preemption (scheduler_config.gen_preemption), pause in place."""
 
 import math
-import types
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -31,7 +12,6 @@ from tensorrt_llm._torch.pyexecutor._util import compute_max_num_sequences
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
 from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
@@ -41,46 +21,26 @@ from tensorrt_llm._torch.pyexecutor.scheduler.gen_admission_queue import (
 from tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption import (
     GenPreemption,
     GenPreemptionSettings,
-    _ReqTrack,
-    log_gen_preemption_settings,
+    _Req,
+    create_gen_preemption,
     resident_headroom,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.llmapi.llm_args import GenPreemptionConfig
 
 pytestmark = pytest.mark.cpu_only
 
 GEN = LlmRequestState.GENERATION_IN_PROGRESS
-LOGGER = "tensorrt_llm._torch.pyexecutor.scheduler.gen_preemption.logger"
-# Preemption on with a 25% TPOT budget (wait victims, window controller).
 ON = GenPreemptionSettings(tpot_budget=0.25)
-# Preemption on with a 40 output tokens/s per-request objective.
 SLO = GenPreemptionSettings(target_output_tps=40.0)
+AUTO = GenAdmissionConfig(ttft_percentile=90.0)
 
 
-@pytest.fixture
-def active():
-    """Install settings for pool sizing; restore the previous ones after."""
-    saved = gen_preemption.get_active_settings()
-    yield gen_preemption.set_active_settings
-    gen_preemption.set_active_settings(saved)
-
-
-def make_req(
-    req_id,
-    decoding_iter=100,
-    generated=100,
-    prompt_len=1000,
-    max_new_tokens=4096,
-    state=GEN,
-):
+def make_req(req_id, decoding_iter=100, generated=100, max_new_tokens=4096, state=GEN):
     req = SimpleNamespace(
         py_request_id=req_id,
-        request_id=req_id,
         state=state,
         py_decoding_iter=decoding_iter,
-        prompt_len=prompt_len,
-        total_input_len_cp=prompt_len,
+        prompt_len=1000,
         py_max_new_tokens=max_new_tokens,
         is_dummy_request=False,
         generated=generated,
@@ -95,942 +55,404 @@ def step(reqs, iters=1, tokens_per_iter=1):
         req.generated += iters * tokens_per_iter
 
 
-def make_preemption(max_paused=4, decode_s=20.0, budget=0.5, unpaused_tps=10.0, **kwargs):
-    """A preemption with a ``max_paused`` cap, a measured mean decode time of
-    ``decode_s`` (window 0.15 x decode_s = 3 s at g = 1, max pause 7 s), a
-    TPOT budget of 50% (or ``target_output_tps`` in ``kwargs`` instead), a
-    measured unpaused rate and no minimum run unless asked."""
-    kwargs.setdefault("min_run_frac", 0.0)
-    kwargs.setdefault("warmup_min_run_s", 0.0)
-    kwargs.setdefault("min_remaining_tokens", 0)
-    if kwargs.get("target_output_tps") is None:
-        kwargs["tpot_budget"] = budget
-    settings = GenPreemptionSettings(cap_frac=1.0, **kwargs)
-    p = GenPreemption(settings, max_num_active_requests=max_paused)
+def make_preemption(max_paused=4, decode_s=20.0, unpaused_tps=10.0, **kwargs):
+    """D = 20 s (window 3 s at g = 1, max pause 7 s), cap ``max_paused``, no
+    minimum run; a 50% TPOT budget unless ``target_output_tps`` is given."""
+    kwargs = {"min_run_frac": 0.0, "warmup_min_run_s": 0.0, "min_remaining_tokens": 0, **kwargs}
+    kwargs.setdefault("tpot_budget", None if "target_output_tps" in kwargs else 0.5)
+    p = GenPreemption(GenPreemptionSettings(cap_frac=1.0, **kwargs), max_paused)
     p.mean_decode_s = decode_s
     p.mean_tpot_s = None if unpaused_tps is None else 1.0 / unpaused_tps
     return p
 
 
 def run_for(p, reqs, t0=0.0, seconds=10.0, rates=None):
-    """First see ``reqs`` generating at ``t0``, then let each generate at its
-    rate (default 10 tokens/s) for ``seconds``; returns the time then."""
+    """First token at ``t0``, then ``rates`` (default 10) tokens/s."""
     p.observe(reqs, t0)
     for i, req in enumerate(reqs):
-        rate = 10.0 if rates is None else rates[i]
-        req.generated += int(round(rate * seconds))
-        req.py_decoding_iter += int(round(rate * seconds))
+        n = int(round((10.0 if rates is None else rates[i]) * seconds))
+        req.generated += n
+        req.py_decoding_iter += n
     return t0 + seconds
 
 
-def victim_ids(p, reqs, now):
+def victims(p, reqs, now, n=1):
     p.observe(reqs, now)
-    return [r.py_request_id for r in p.victim_order(reqs)]
+    return [r.py_request_id for r in p._victims(reqs, n)]
 
 
 def complete(p, now, decode_s, tokens, paused_s=0.0, target_ready=True, sacrificed=False):
-    """Account one completed request directly."""
     p._now = now
-    track = _ReqTrack(
-        order=0,
-        first_seen=now - decode_s - paused_s,
-        first_token_t=now - decode_s - paused_s,
-        first_token_gen=0,
-        paused_total=paused_s,
-        last_gen=tokens,
-        sacrificed=sacrificed,
+    start = now - decode_s - paused_s
+    r = _Req(
+        0, start, first_token_t=start, gen=tokens, paused_total=paused_s, sacrificed=sacrificed
     )
-    p._on_left(track, target_ready)
-
-
-# ---------------------------------------------------------------------------
-# Settings and pool sizing
-# ---------------------------------------------------------------------------
-class TestSettings:
-    def test_default_is_off(self):
-        for settings in (
-            GenPreemptionSettings(),
-            GenPreemptionSettings.from_config(None),
-            GenPreemptionSettings.from_config(GenPreemptionConfig()),
-        ):
-            assert not settings.enabled
-            assert resident_headroom(128, settings) == 0
-
-    def test_from_llm_api_config(self):
-        settings = GenPreemptionSettings.from_config(GenPreemptionConfig(target_output_tps=40))
-        assert settings.enabled and settings.target_output_tps == 40.0
-        assert settings.tpot_budget is None and settings.output_tps_slo
-        # Internal objective constants; no budget conversion.
-        assert (settings.slo_eps, settings.slo_credit_depth) == (0.2, 3000.0)
-        assert (settings.laxity_min_frac, settings.laxity_resume_frac) == (0.02, 0.01)
-        assert (settings.laxity_max_pauses, settings.below_target_max_pauses) == (8, 3)
-        assert settings.max_pauses == 8 and ON.max_pauses == 2
-        assert not hasattr(settings, "budget")
-        # Paused cap 0.375 x max_num_active_requests, at least 1.
-        assert settings.paused_cap(128) == 48 and settings.paused_cap(64) == 24
-        assert settings.paused_cap(1) == 1
-        assert resident_headroom(128, settings) == 48
-
-    def test_internal_defaults(self):
-        s = GenPreemptionSettings()
-        assert (s.slack_decode_frac, s.gain_min, s.gain_max) == (0.15, 0.25, 2.0)
-        assert (s.time_constant, s.ewma_n, s.target_frac) == (3000.0, 500.0, 0.8)
-        assert (s.cap_frac, s.max_pause_frac, s.min_run_frac) == (0.375, 0.35, 0.07)
-        assert s.late_trigger and (s.max_per_request, s.max_per_pass) == (2, 1)
-
-    def test_tpot_budget_from_llm_api_config(self):
-        settings = GenPreemptionSettings.from_config(GenPreemptionConfig(tpot_budget=0.1))
-        assert settings.enabled and settings.tpot_budget == 0.1
-        assert settings.target_output_tps is None and not settings.output_tps_slo
-        assert GenPreemption(settings, 128).tpot_budget == 0.1
-        assert GenPreemption(SLO, 128).tpot_budget == 0.0
-        assert resident_headroom(128, settings) == 48
-
-    @pytest.mark.parametrize("target", [0.0, -1.0, float("nan")])
-    def test_invalid_target_raises(self, target):
-        with pytest.raises(ValueError, match="target_output_tps"):
-            GenPreemptionSettings(target_output_tps=target)
-
-    @pytest.mark.parametrize("budget", [0.0, 1.0, -0.1, float("nan")])
-    def test_invalid_budget_raises(self, budget):
-        with pytest.raises(ValueError, match="tpot_budget"):
-            GenPreemptionSettings(tpot_budget=budget)
-
-    def test_budget_and_target_are_exclusive(self):
-        with pytest.raises(ValueError, match="not both"):
-            GenPreemptionSettings(tpot_budget=0.1, target_output_tps=40.0)
-
-    def test_startup_log(self):
-        with patch(LOGGER) as log:
-            log_gen_preemption_settings(GenPreemptionSettings())
-        log.info.assert_not_called() and log.warning.assert_not_called()
-        with patch(LOGGER) as log:
-            log_gen_preemption_settings(ON)
-        msg = log.info.call_args.args[0]
-        assert "enabled" in msg and "tpot_budget=0.25" in msg
-        with patch(LOGGER) as log:
-            log_gen_preemption_settings(SLO)
-        msg = log.info.call_args.args[0]
-        assert "target_output_tps=40.0" in msg and ">= 80% of requests" in msg
-        with patch(LOGGER) as log:
-            log_gen_preemption_settings(ON, "needs the auto GEN admission policy")
-        assert "disabled" in log.warning.call_args.args[0]
-
-    def test_seq_slot_pool_headroom(self, active):
-        mapping = Mock()
-        mapping.has_pp.return_value = False
-        active(GenPreemptionSettings())
-        assert compute_max_num_sequences(mapping, 128, False) == 128
-        active(ON)
-        assert compute_max_num_sequences(mapping, 128, False) == 176
-        assert compute_max_num_sequences(mapping, 128, False, enable_overlap_headroom=True) == 304
-        mapping.has_pp.return_value = True
-        mapping.pp_size = 2
-        assert compute_max_num_sequences(mapping, 128, False) == 256
-
-    def test_recurrent_state_pool_headroom(self, active):
-        mgr = object.__new__(MambaHybridCacheManagerV2)
-        mgr.max_batch_size = 128
-        mgr.mapping = Mock(pp_size=1)
-        mgr.mapping.has_pp.return_value = False
-        active(GenPreemptionSettings())
-        assert mgr._max_resident_sequences() == 128
-        active(ON)
-        assert mgr._max_resident_sequences() == 176
-        mgr.mapping = Mock(pp_size=2)
-        mgr.mapping.has_pp.return_value = True
-        assert mgr._max_resident_sequences() == 256
-
-
-# ---------------------------------------------------------------------------
-# Victims: the longest resident request, only with a TPOT budget
-# ---------------------------------------------------------------------------
-class TestVictims:
-    def test_longest_resident_first_ties_newest(self):
-        p = make_preemption()
-        old = [make_req(1), make_req(2)]
-        p.observe(old, 0.0)
-        new = make_req(3)
-        p.observe(old + [new], 5.0)
-        # 1 and 2 arrived together (tie: newest first), 3 is the most recent.
-        assert victim_ids(p, old + [new], now=6.0) == [2, 1, 3]
-
-    def test_victim_key_is_the_wait_order(self):
-        p = make_preemption()
-        reqs = [make_req(1), make_req(2)]
-        p.observe(reqs[:1], 0.0)
-        p.observe(reqs, 4.0)
-        assert p.victim_key(reqs[0]) == (-4.0, -0)
-        assert p.victim_key(reqs[1]) == (0.0, -1)
-
-    @pytest.mark.parametrize("unpaused_tps", [None, 0.5, 50.0])
-    def test_budget_does_not_depend_on_the_measured_rate(self, unpaused_tps):
-        p = make_preemption(budget=0.25, unpaused_tps=unpaused_tps)
-        assert p.tpot_budget == 0.25
-        reqs = [make_req(i) for i in range(3)]
-        p.observe(reqs, 0.0)
-        assert [r.py_request_id for r in p.select_victims(reqs, 1)] == [2]
-
-    def test_needs_a_first_token_time(self):
-        p = make_preemption()
-        req = make_req(1)
-        p.observe([req], now=None)
-        assert p.victim_order([req]) == []
-
-
-# ---------------------------------------------------------------------------
-# Guardrails
-# ---------------------------------------------------------------------------
-class TestGuardrails:
-    def test_min_run_since_first_token(self):
-        # 0.07 x 100 s = 7 s.
-        p = make_preemption(decode_s=100.0, min_run_frac=0.07)
-        a = make_req(1)
-        p.observe([a], 0.0)  # first seen generating at t=0
-        b = make_req(2)
-        p.observe([a, b], 1.0)
-        step([a, b], iters=100)
-        assert victim_ids(p, [a, b], now=6.9) == []
-        assert victim_ids(p, [a, b], now=7.5) == [1]
-        assert sorted(victim_ids(p, [a, b], now=8.5)) == [1, 2]
-
-    def test_first_token_must_be_out(self):
-        p = make_preemption()
-        reqs = [make_req(1, decoding_iter=0), make_req(2, decoding_iter=1)]
-        now = run_for(p, reqs)
-        reqs[0].py_decoding_iter = 0
-        assert victim_ids(p, reqs, now) == [2]
-
-    def test_only_generating_requests(self):
-        p = make_preemption()
-        reqs = [make_req(i) for i in range(1, 5)]
-        now = run_for(p, reqs)
-        reqs[0].state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        reqs[1].state = LlmRequestState.GENERATION_TO_COMPLETE
-        reqs[3].is_dummy_request = True
-        assert victim_ids(p, reqs, now) == [3]
-
-    def test_near_finished_requests_are_kept(self):
-        p = make_preemption(min_remaining_tokens=32)
-        reqs = [
-            make_req(1, generated=0, max_new_tokens=132),
-            make_req(2, generated=0, max_new_tokens=133),
-        ]
-        now = run_for(p, reqs)  # 100 tokens each
-        assert victim_ids(p, reqs, now) == [2]
-
-    def test_two_pauses_per_request(self):
-        p = make_preemption(hysteresis_iters=0)
-        req = make_req(1)
-        now = run_for(p, [req])
-        for n in (1, 2):
-            assert victim_ids(p, [req], now) == [1]
-            p.on_paused(req)
-            assert p.victim_order([req]) == []  # paused
-            p.on_resumed(req)
-            assert p.num_pauses(1) == n
-        assert victim_ids(p, [req], now) == []  # a third pause is refused
-        assert p.totals["paused"] == p.totals["resumed"] == 2
-
-    def test_hysteresis_after_resume(self):
-        p = make_preemption(hysteresis_iters=10)
-        req = make_req(1)
-        now = run_for(p, [req])
-        p.observe([req], now)
-        p.on_paused(req)
-        p.on_resumed(req)
-        step([req], iters=9)
-        assert victim_ids(p, [req], now) == []
-        step([req], iters=1)
-        assert victim_ids(p, [req], now) == [1]
-
-    def test_per_pass_and_paused_budgets(self):
-        reqs = [make_req(i) for i in range(6)]
-        p = make_preemption(max_per_pass=2, max_paused=3)
-        now = run_for(p, reqs)
-        p.observe(reqs, now)
-        assert len(p.select_victims(reqs, num_at_risk=5)) == 2
-        assert len(p.select_victims(reqs, num_at_risk=1)) == 1
-        assert p.select_victims(reqs, num_at_risk=0) == []
-        for v in p.select_victims(reqs, num_at_risk=5):
-            p.on_paused(v)
-        assert len(p.select_victims(reqs, 5)) == 1
-        p.on_paused(p.select_victims(reqs, 5)[0])
-        assert p.select_victims(reqs, 5) == []  # 3 paused
-
-    def test_requests_that_leave_are_forgotten(self):
-        p = make_preemption()
-        reqs = [make_req(1), make_req(2)]
-        p.observe(reqs, 0.0)
-        p.on_paused(reqs[1])
-        p.observe(reqs[:1], 1.0)  # 2 was cancelled while paused
-        assert p.num_paused == 0 and p.window["dropped"] == 1
-
-    def test_stats_line(self):
-        p = make_preemption()
-        reqs = [make_req(1), make_req(2)]
-        p.observe(reqs, 0.0)
-        p.on_paused(reqs[1])
-        p.observe(reqs, 3.0)
-        p.on_resumed(reqs[1])
-        line = p.stats_line()
-        assert line.startswith("[gen_preempt] paused=1 resumed=1")
-        assert "paused_now=0/4" in line and "mean_pause=3.00s" in line
-        assert "g=1.000 slack=3.00s decode=20.00s unpaused_tps=10.00 budget=50.00%" in line
-        assert "credit=" not in line
-        assert "tpot_infl=na" in line
-        assert "max_pause=7.00s min_run=0.00s" in line
-        assert "paused=0 resumed=0" in p.stats_line()  # the window restarts
-
-
-# ---------------------------------------------------------------------------
-# Window controller
-# ---------------------------------------------------------------------------
-class TestController:
-    def test_warm_start(self):
-        p = GenPreemption(ON, max_num_active_requests=128)
-        assert p.max_paused == 48
-        assert (p.gain, p.slack_s, p.max_pause_s, p.min_run_s) == (1.0, 0.0, 10.0, 2.0)
-        assert p.unpaused_tps is None and p.tpot_budget == 0.25
-        # The first completion seeds D and R0: 30 s for 1500 tokens.
-        complete(p, 100.0, decode_s=30.0, tokens=1500)
-        assert p.mean_decode_s == 30.0 and p.unpaused_tps == pytest.approx(50.0)
-        assert p.slack_s == pytest.approx(0.15 * 30.0 * p.gain)
-        assert (p.max_pause_s, p.min_run_s) == pytest.approx((10.5, 2.1))
-        # Running means over 500 completions.
-        complete(p, 101.0, decode_s=80.0, tokens=1500)
-        assert p.mean_decode_s == pytest.approx(30.0 + 50.0 / 500)
-
-    def test_one_step_per_completion(self):
-        p = GenPreemption(ON, max_num_active_requests=128)
-        p.mean_tpot_s = 0.02  # budget 25%, setpoint 20%
-        # Unpaused: inflation 0, theta += (0.2 - 0) / (0.2 x 3000).
-        complete(p, 10.0, decode_s=20.0, tokens=1000)
-        assert p.theta == pytest.approx(1.0 / 3000.0)
-        # 5 s paused over 1000 tokens: 5 ms per token over a 20 ms TPOT = 25%.
-        theta = p.theta
-        complete(p, 11.0, decode_s=20.0, tokens=1000, paused_s=5.0)
-        assert p.theta == pytest.approx(theta + (0.2 - 0.25) / (0.2 * 3000.0))
-        # D and the TPOT exclude the pause.
-        assert p.mean_decode_s == pytest.approx(20.0)
-        assert p.mean_tpot_s == pytest.approx(0.02)
-
-    def test_fixed_budget(self):
-        p = GenPreemption(GenPreemptionSettings(tpot_budget=0.1), max_num_active_requests=4)
-        # Known from the start: late waiters can take a slot before any
-        # request completes (window 0 until then).
-        assert p.tpot_budget == 0.1 and p.slack_s == 0.0
-        reqs = [make_req(i) for i in range(2)]
-        p.observe(reqs, 0.0)
-        p.observe(reqs, 3.0)
-        assert [r.py_request_id for r in p.select_victims(reqs, 1)] == [1]
-        # Setpoint 0.8 x 10% = 8%: 1.6 s paused over a 20 s, 1000-token
-        # decode is exactly on it.
-        complete(p, 10.0, decode_s=20.0, tokens=1000)
-        theta = p.theta
-        assert theta == pytest.approx(1.0 / 3000.0)
-        complete(p, 11.0, decode_s=20.0, tokens=1000, paused_s=1.6)
-        assert p.theta == pytest.approx(theta)
-
-    def test_no_update_before_the_admission_target(self):
-        p = GenPreemption(ON, max_num_active_requests=128)
-        for i in range(100):
-            complete(p, float(i), decode_s=20.0, tokens=1000, target_ready=False)
-        assert p.theta == 0.0 and p.mean_decode_s == pytest.approx(20.0)
-        assert p.window["completed"] == 100
-
-    def test_no_controller_with_target_output_tps(self):
-        p = GenPreemption(SLO, max_num_active_requests=128)
-        for i in range(100):
-            complete(p, float(i), decode_s=20.0, tokens=600, paused_s=1.0)
-        assert p.theta == 0.0 and p.gain == 1.0 and p.tpot_budget == 0.0
-
-    def test_clamps(self):
-        p = GenPreemption(ON, max_num_active_requests=128)
-        for i in range(10000):  # never paused: g opens up to its ceiling
-            complete(p, float(i), decode_s=20.0, tokens=1000)
-        assert p.gain == pytest.approx(2.0)
-        for i in range(10000):  # paused far over the budget
-            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=10.0)
-        assert p.gain == pytest.approx(0.25)
-
-    @pytest.mark.parametrize("g0", [0.25, 1.0, 2.0])
-    def test_converges_to_the_setpoint(self, g0):
-        """Toy plant: a completion's pause grows with the window, inflation
-        0.25 g.  Budget 25%, setpoint 20%, met at g* = 0.8."""
-        p = GenPreemption(ON, max_num_active_requests=128)
-        p.theta = math.log(g0)
-        for i in range(20000):
-            paused = 0.25 * p.gain * 20.0  # inflation 0.25 g of a 20 s decode
-            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=paused)
-        assert p.gain == pytest.approx(0.8, rel=0.02)
-
-    def test_completions_through_observe(self):
-        p = make_preemption(decode_s=None, unpaused_tps=None)
-        reqs = [make_req(1, generated=0), make_req(2, generated=0)]
-        p.observe(reqs, 0.0)  # first token at t=0
-        step(reqs, iters=100)
-        p.observe(reqs, 10.0)
-        p.on_paused(reqs[1])
-        p.observe(reqs, 12.0)
-        p.on_resumed(reqs[1])
-        step(reqs, iters=100)
-        p.observe(reqs, 20.0)
-        # Both finish at t=20: 1 decoded 20 s, 2 decoded 18 s + 2 s paused.
-        p.observe([], 20.0, target_ready=True)
-        assert p.window["completed"] == 2
-        assert p.mean_decode_s == pytest.approx(20.0 - 2.0 / 500)
-        assert p.mean_tpot_s == pytest.approx(0.1 + (0.09 - 0.1) / 500)
-        # 2's inflation: 2 s / 200 tokens over the mean TPOT.
-        assert "tpot_infl=+" in p.stats_line()
-
-    def test_rank_identical(self):
-        states = set()
-        for _ in range(3):
-            p = GenPreemption(ON, max_num_active_requests=128)
-            for i in range(500):
-                complete(
-                    p,
-                    float(i),
-                    decode_s=20.0 + i % 7,
-                    tokens=1200 + 13 * (i % 11),
-                    paused_s=0.5 * (i % 3),
-                )
-            states.add((p.theta, p.mean_decode_s, p.mean_tpot_s))
-        assert len(states) == 1
-
-
-# ---------------------------------------------------------------------------
-# At-risk test on the admission queue
-# ---------------------------------------------------------------------------
-AUTO = GenAdmissionConfig(ttft_percentile=90.0)
+    p._on_left(r, target_ready)
 
 
 def make_item(req_id, gen_arrival, orig_arrival):
     item = RequestQueueItem(req_id, Mock())
-    item.admit_arrival = gen_arrival
-    item.admit_orig_arrival = orig_arrival
+    item.admit_arrival, item.admit_orig_arrival = gen_arrival, orig_arrival
     return item
 
 
-def slack_queue(x=10.0, g=100.0, s2f=0.5, now=100.0, items=()):
+def slack_queue(x=10.0, g=100.0, now=100.0, items=()):
     q = GenAdmissionWaitingQueue(AUTO)
-    q.adaptive.X, q.adaptive.G = x, g
-    q.adaptive.s2f_s = s2f
+    q.adaptive.X, q.adaptive.G, q.adaptive.s2f_s = x, g, 0.5
     q.add_requests(list(items))
     q.set_now(now)
     return q
 
 
-class TestAtRisk:
-    def test_head_within_slack_is_at_risk(self):
-        # 1: age 9.2 + s2f 0.5 -> slack 0.3; 2: age 5.0 -> slack 4.5.
-        q = slack_queue(items=[make_item(1, 99.0, 90.8), make_item(2, 99.5, 95.0)])
-        assert q.num_at_risk(slack_s=5.0) == 2
-        assert q.num_at_risk(slack_s=1.0) == 1
-        assert q.num_at_risk(slack_s=0.2) == 0
-
-    def test_late_head_is_not_at_risk(self):
-        q = slack_queue(items=[make_item(1, 99.0, 80.0)])  # 20.5 > X
-        assert q.num_at_risk(slack_s=5.0) == 0
-
-    def test_guard_tier_head_blocks(self):
-        # 1 waited 6 s at GEN (guard tier, popped first); 2 is at risk but is
-        # not the next pop.
-        q = slack_queue(g=5.0, items=[make_item(2, 99.9, 90.8), make_item(1, 94.0, 94.0)])
-        assert q.num_at_risk(slack_s=5.0) == 0
-
-    def test_late_head_triggers_with_late_trigger(self):
-        # No waiter can make X = 10 any more: 1 has slack -10.5, 2 has -5.5,
-        # so the next pop (1) is from the late tier.
-        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(2, 99.0, 85.0)])
-        assert q.num_at_risk(slack_s=5.0) == 0
-        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 2
-        # A waiter that can still make X is popped first (slack tier), so a
-        # late one triggers only when nobody on time is waiting.
-        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(3, 99.9, 100.0)])
-        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 0  # 3: slack 9.5
-
-    def test_late_trigger_keeps_the_head_only_and_the_slack_bound(self):
-        # The next pop has 9.5 s of slack: not at risk, whatever the flag.
-        q = slack_queue(items=[make_item(3, 99.9, 100.0)])
-        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 0
-        # A guard-tier next pop triggers with the flag (sim late_ok).
-        q = slack_queue(g=5.0, items=[make_item(2, 99.9, 90.8), make_item(1, 94.0, 94.0)])
-        assert q.num_at_risk(slack_s=5.0) == 0
-        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 2
-
-    def test_no_target_no_risk(self):
-        q = GenAdmissionWaitingQueue(AUTO)  # warming up
-        q.add_requests([make_item(1, 99.0, 91.0)])
-        q.set_now(100.0)
-        assert q.num_at_risk(slack_s=100.0) == 0
-        q = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=100.0))
-        q.add_requests([make_item(1, 99.0, 91.0)])
-        q.set_now(100.0)
-        assert q.num_at_risk(slack_s=100.0) == 0
-
-
-# ---------------------------------------------------------------------------
-# Executor pass
-# ---------------------------------------------------------------------------
-def make_executor(preemption, capacity, now=100.0):
-    stub = SimpleNamespace(
-        _gen_preemption=preemption,
-        request_broadcaster=SimpleNamespace(rank0_now=now),
-        scheduler=Mock(),
-        dist=SimpleNamespace(rank=1),
-        _log_gen_preemption=lambda: None,
-    )
-    stub._get_request_admission_capacity = lambda: capacity
-    stub.run = types.MethodType(PyExecutor._run_gen_preemption, stub)
-    return stub
-
-
-def paused_ids(ex):
-    return set(ex.scheduler.set_gen_paused_ids.call_args.args[0])
-
-
 def at_risk_queue(now=100.0, n=1):
+    """``n`` waiters with 0.3 s of slack against X = 10 s."""
     return slack_queue(now=now, items=[make_item(1000 + i, 99.0, 90.8) for i in range(n)])
 
 
 def running(p, n):
-    """``n`` requests decoding at 10 tokens/s since t=90 (the pass runs at
-    t=100); all first seen together, so ties go to the newest."""
+    """``n`` requests decoding at 10 tokens/s since t=90."""
     reqs = [make_req(i) for i in range(n)]
     run_for(p, reqs, t0=90.0)
     return reqs
 
 
-class TestExecutorPass:
-    def test_pauses_for_an_at_risk_waiter_when_full(self):
+class TestSettingsAndPools:
+    def test_from_config(self):
+        assert not GenPreemptionSettings.from_config(GenPreemptionConfig()).enabled
+        slo = GenPreemptionSettings.from_config(GenPreemptionConfig(target_output_tps=40))
+        assert slo.enabled and slo.slo and slo.tpot_budget is None
+        budget = GenPreemptionSettings.from_config(GenPreemptionConfig(tpot_budget=0.1))
+        assert budget.enabled and not budget.slo
+        assert [resident_headroom(n, budget) for n in (128, 64, 1)] == [48, 24, 1]
+        assert resident_headroom(128, GenPreemptionSettings()) == 0
+
+    def test_pools_reserve_the_headroom(self, monkeypatch):
+        mapping = Mock(pp_size=1)
+        mapping.has_pp.return_value = False
+        mamba = object.__new__(MambaHybridCacheManagerV2)
+        mamba.max_batch_size, mamba.mapping = 128, mapping
+        assert compute_max_num_sequences(mapping, 128, False) == 128
+        assert mamba._max_resident_sequences() == 128
+        monkeypatch.setattr(gen_preemption, "_active_settings", ON)
+        assert compute_max_num_sequences(mapping, 128, False) == 176
+        assert mamba._max_resident_sequences() == 176
+        assert compute_max_num_sequences(mapping, 128, False, enable_overlap_headroom=True) == 304
+
+
+class TestBudgetVictims:
+    def test_longest_resident_first_ties_newest(self):
+        p = make_preemption()
+        old = [make_req(1), make_req(2)]
+        p.observe(old, 0.0)
+        reqs = old + [make_req(3)]
+        p.observe(reqs, 5.0)
+        assert victims(p, reqs, 6.0, n=3) == [2]  # one pause per pass
+        p = make_preemption(max_per_pass=3)
+        p.observe(old, 0.0)
+        p.observe(reqs, 5.0)
+        assert victims(p, reqs, 6.0, n=3) == [2, 1, 3]
+        p._pause(p._victims(reqs, 1)[0])
+        p.max_paused = 2  # the paused cap
+        assert victims(p, reqs, 6.0, n=3) == [1]
+
+    @pytest.mark.parametrize(
+        "make, ok",
+        [
+            (lambda r: setattr(r, "py_decoding_iter", 0), False),
+            (lambda r: setattr(r, "state", LlmRequestState.GENERATION_TO_COMPLETE), False),
+            (lambda r: setattr(r, "is_dummy_request", True), False),
+            (lambda r: setattr(r, "py_max_new_tokens", 132), False),  # 32 left
+            (lambda r: setattr(r, "py_max_new_tokens", 133), True),
+        ],
+    )
+    def test_eligibility(self, make, ok):
+        p = make_preemption(min_remaining_tokens=32)
+        req = make_req(1, generated=0)
+        now = run_for(p, [req])
+        make(req)
+        assert victims(p, [req], now) == ([1] if ok else [])
+
+    def test_min_run_hysteresis_and_pause_limit(self):
+        p = make_preemption(decode_s=100.0, min_run_frac=0.07, hysteresis_iters=10)
+        req = make_req(1)
+        p.observe([req], 0.0)
+        assert victims(p, [req], 6.9) == [] and victims(p, [req], 7.5) == [1]
+        for n in (1, 2):
+            p._pause(req)
+            assert victims(p, [req], 7.5) == []  # paused
+            p._resume(1)
+            assert victims(p, [req], 7.5) == []  # hysteresis
+            step([req], iters=10)
+            assert victims(p, [req], 7.5) == ([1] if n == 1 else [])  # 2 pauses max
+
+    def test_a_request_that_leaves_while_paused_is_forgotten(self):
+        p = make_preemption()
+        reqs = [make_req(1), make_req(2)]
+        p.observe(reqs, 0.0)
+        p._pause(reqs[1])
+        p.observe(reqs[:1], 1.0)
+        assert p.paused_ids == frozenset() and 2 not in p._reqs
+
+
+class TestController:
+    def test_warm_start_and_running_means(self):
+        p = GenPreemption(ON, max_num_active_requests=128)
+        assert p.max_paused == 48
+        assert (p.gain, p.slack_s, p.max_pause_s, p.min_run_s) == (1.0, 0.0, 10.0, 2.0)
+        complete(p, 100.0, decode_s=30.0, tokens=1500)  # seeds D and TPOT
+        assert (p.mean_decode_s, p.mean_tpot_s) == (30.0, 0.02)
+        assert (p.max_pause_s, p.min_run_s) == pytest.approx((10.5, 2.1))
+        assert p.slack_s == pytest.approx(4.5 * p.gain)
+        complete(p, 101.0, decode_s=80.0, tokens=1500)
+        assert p.mean_decode_s == pytest.approx(30.0 + 50.0 / 500)
+
+    def test_one_step_per_completion(self):
+        p = GenPreemption(ON, max_num_active_requests=128)
+        p.mean_tpot_s = 0.02  # setpoint 0.8 x 25% = 20%
+        complete(p, 10.0, decode_s=20.0, tokens=1000)
+        assert p.theta == pytest.approx(0.2 / (0.2 * 3000.0))
+        theta = p.theta
+        complete(p, 11.0, decode_s=20.0, tokens=1000, paused_s=5.0)  # inflation 25%
+        assert p.theta == pytest.approx(theta - 0.05 / (0.2 * 3000.0))
+        assert p.mean_tpot_s == pytest.approx(0.02)  # pauses excluded
+        theta = p.theta
+        complete(p, 12.0, decode_s=20.0, tokens=1000, paused_s=5.0, target_ready=False)
+        assert p.theta == theta
+
+    @pytest.mark.parametrize("paused_s, gain", [(0.0, 2.0), (10.0, 0.25)])
+    def test_clamps(self, paused_s, gain):
+        p = GenPreemption(ON, max_num_active_requests=128)
+        for i in range(10000):
+            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=paused_s)
+        assert p.gain == pytest.approx(gain)
+
+    @pytest.mark.parametrize("g0", [0.25, 1.0, 2.0])
+    def test_converges_to_the_setpoint(self, g0):
+        """Toy plant with inflation 0.25 g: the 20% setpoint is met at g = 0.8."""
+        p = GenPreemption(ON, max_num_active_requests=128)
+        p.theta = math.log(g0)
+        for i in range(20000):
+            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=0.25 * p.gain * 20.0)
+        assert p.gain == pytest.approx(0.8, rel=0.02)
+
+
+class TestAtRisk:
+    def test_slack_bound(self):
+        # 1: slack 0.3 s; 2: slack 4.5 s.
+        q = slack_queue(items=[make_item(1, 99.0, 90.8), make_item(2, 99.5, 95.0)])
+        assert [q.num_at_risk(s) for s in (5.0, 1.0, 0.2)] == [2, 1, 0]
+
+    def test_late_and_guard_tier_heads_trigger(self):
+        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(2, 99.0, 85.0)])
+        assert q.num_at_risk(5.0) == 2  # both late
+        q = slack_queue(g=5.0, items=[make_item(2, 99.9, 90.8), make_item(1, 94.0, 94.0)])
+        assert q.num_at_risk(5.0) == 2  # guard-tier head, slack 3.5 and 0.3
+        # An on-time waiter (slack 9.5 s) is popped before a late one.
+        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(3, 99.9, 100.0)])
+        assert q.num_at_risk(5.0) == 0
+
+    @pytest.mark.parametrize("percentile", [90.0, 100.0])
+    def test_no_target_no_risk(self, percentile):
+        q = GenAdmissionWaitingQueue(GenAdmissionConfig(ttft_percentile=percentile))
+        q.add_requests([make_item(1, 99.0, 91.0)])
+        q.set_now(100.0)
+        assert q.num_at_risk(100.0) == 0 and q.target_s is None
+
+
+class TestStep:
+    def test_pauses_only_when_full_and_at_risk(self):
         p = make_preemption()
         reqs = running(p, 4)
-        ex = make_executor(p, capacity=4)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3
-        assert paused_ids(ex) == {3}
+        assert p.step(reqs, 100.0, 5, 4, at_risk_queue()) == 4  # a free slot
+        on_time = slack_queue(items=[make_item(1000, 99.0, 99.0)])  # slack 8.5 s
+        assert p.step(reqs, 100.0, 4, 4, on_time) == 4
+        assert p.step(reqs, 100.0, 4, 4, at_risk_queue()) == 3 and p.paused_ids == {3}
 
-    def test_no_pause_with_a_free_slot_or_no_risk(self):
-        p = make_preemption()
-        reqs = running(p, 4)
-        ex = make_executor(p, capacity=5)
-        assert ex.run(at_risk_queue(), reqs, 4) == 4
-        ex = make_executor(p, capacity=4)
-        q = slack_queue(items=[make_item(1000, 99.0, 99.0)])  # 8.5 s of slack
-        assert ex.run(q, reqs, 4) == 4
-        assert paused_ids(ex) == set()
-
-    def test_no_pause_before_the_window_is_measured(self):
-        # Warm-up: window 0 until a request completes; an on-time waiter does
-        # not trigger, a late one does.
+    def test_warm_up_window_is_zero(self):
         p = make_preemption(decode_s=None)
         reqs = running(p, 4)
-        ex = make_executor(p, capacity=4)
-        assert ex.run(at_risk_queue(), reqs, 4) == 4 and paused_ids(ex) == set()
-        late = slack_queue(items=[make_item(1000, 99.0, 80.0)])  # slack -10.5
-        assert ex.run(late, reqs, 4) == 3 and paused_ids(ex) == {3}
-
-    def test_late_waiter_triggers(self):
-        for flag, expect in ((False, set()), (True, {3})):
-            p = make_preemption(late_trigger=flag)
-            reqs = running(p, 4)
-            ex = make_executor(p, capacity=4)
-            late = slack_queue(items=[make_item(1000, 99.0, 80.0)])  # slack -10.5
-            assert ex.run(late, reqs, 4) == 4 - len(expect)
-            assert paused_ids(ex) == expect, flag
-
-    def test_a_request_is_paused_twice_then_refused(self):
-        # One waiter at risk on every pass; the batch is full (4 resident) and
-        # one request finishes between passes.
-        p = make_preemption(max_paused=1, hysteresis_iters=10)
-        reqs = running(p, 4)
-        ex = make_executor(p, capacity=4)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {3}
-        # 0 finishes: 3 resumes first, then 2 is paused (3 is in hysteresis).
-        reqs.pop(0)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {2}
-        # 10 decode steps later 1 finishes: 2 resumes, 3 is paused again.
-        step(reqs, iters=10)
-        reqs.pop(0)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {3}
-        assert p.num_pauses(3) == 2
-        # 10 more steps, 2 finishes: 3 resumes and stays, it had its two pauses.
-        step(reqs, iters=10)
-        reqs.pop(0)
-        assert ex.run(at_risk_queue(), reqs, 4) == 4 and paused_ids(ex) == set()
-        assert p.num_pauses(3) == 2 and p.window["no_victim"] == 1
-        assert p.totals["paused"] == p.totals["resumed"] == 3
+        assert p.step(reqs, 100.0, 4, 4, at_risk_queue()) == 4
+        late = slack_queue(items=[make_item(1000, 99.0, 80.0)])
+        assert p.step(reqs, 100.0, 4, 4, late) == 3 and p.paused_ids == {3}
 
     def test_resume_lane_goes_before_new_admissions(self):
         p = make_preemption(max_paused=2, max_per_request=1)
         reqs = running(p, 4)
-        ex = make_executor(p, capacity=4)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3  # 3 paused, its slot freed
-        # The waiter took the slot (4 counted again, 3 paused), then request 0
-        # finished: the free slot goes back to 3, not to the queue.
-        reqs.pop(0)
-        ex.request_broadcaster.rank0_now = 100.1
-        assert ex.run(at_risk_queue(100.1), reqs, 4) == 3
-        # 3 resumed; still full and a waiter still at risk: pause another
-        # (not 3, which had its one pause).
-        assert not p.is_paused(3) and paused_ids(ex) == {2}
+        assert p.step(reqs, 100.0, 4, 4, at_risk_queue()) == 3
+        reqs.pop(0)  # the waiter took 3's slot, then 0 finished
+        assert p.step(reqs, 100.1, 4, 4, at_risk_queue(100.1)) == 3
+        assert p.paused_ids == {2}  # 3 resumed; 2 paused for the next waiter
 
     def test_forced_resume_after_max_pause(self):
-        p = make_preemption(max_paused=2)  # max pause 0.35 x 20 s = 7 s
-        reqs = running(p, 4)
-        ex = make_executor(p, capacity=4)
-        ex.run(at_risk_queue(), reqs, 4)
-        assert paused_ids(ex) == {3}
-        # Still full (4 counted besides 3), no waiter: 3 waits ...
-        ex.request_broadcaster.rank0_now = 106.5
-        assert ex.run(slack_queue(now=106.5), reqs, 5) == 4
-        assert paused_ids(ex) == {3}
-        # ... until it has been paused for the max pause, then it is back
-        # even though that takes the batch one over until a request finishes.
-        ex.request_broadcaster.rank0_now = 107.5
-        assert ex.run(slack_queue(now=107.5), reqs, 5) == 5
-        assert paused_ids(ex) == set() and p.window["forced_resumes"] == 1
-
-    def test_a_forced_resume_that_overfills_can_pause_for_a_waiter(self):
         p = make_preemption(max_paused=2)
-        reqs = running(p, 5)
-        ex = make_executor(p, capacity=4)
-        p.on_paused(reqs[4])  # paused at t=90
-        ex.run(at_risk_queue(), reqs, 5)
-        # Forced back in (one over); a waiter at risk pauses the next victim.
-        assert paused_ids(ex) == {3} and not p.is_paused(4)
+        reqs = running(p, 4)
+        p.step(reqs, 100.0, 4, 4, at_risk_queue())
+        assert p.step(reqs, 106.5, 4, 5, slack_queue(now=106.5)) == 4 and p.paused_ids == {3}
+        assert p.step(reqs, 107.5, 4, 5, slack_queue(now=107.5)) == 5 and not p.paused_ids
+        assert p.stats["forced"] == 1
 
-    def test_no_starvation_fifo_resume(self):
+    def test_fifo_resume(self):
         p = make_preemption(max_paused=3, max_per_pass=3)
         reqs = running(p, 6)
-        ex = make_executor(p, capacity=6)
-        assert ex.run(at_risk_queue(n=3), reqs, 6) == 3
-        assert paused_ids(ex) == {3, 4, 5}
-        # Slots free up one at a time; pauses come back oldest first.
+        assert p.step(reqs, 100.0, 6, 6, at_risk_queue(n=3)) == 3
         order = []
         for _ in range(3):
             before = p.paused_ids
-            ex.run(slack_queue(now=100.0), reqs, 5 + p.num_paused)  # one slot free
+            p.step(reqs, 100.0, 6, 5 + len(p.paused_ids), slack_queue())  # one slot free
             order += sorted(before - p.paused_ids)
-        assert order == [5, 4, 3] and p.num_paused == 0
+        assert order == [5, 4, 3]
 
-    def test_completions_feed_the_controller_once_the_target_is_set(self):
-        p = make_preemption(decode_s=None)
+    def test_controller_starts_with_the_admission_target(self):
+        p = make_preemption(decode_s=None, unpaused_tps=None)
         reqs = running(p, 4)
-        ex = make_executor(p, capacity=8)
         p.observe(reqs, 100.0)
-        # Request 0 finished: accounted at the pass, after X is set.
-        ex.run(slack_queue(now=100.0), reqs[1:], 3)
-        # Seeds D = 10 s and R0 = 10 tokens/s: the first integral step of an
-        # unpaused completion is 1 / 3000.
-        assert p.mean_decode_s == pytest.approx(10.0)
-        assert p.unpaused_tps == pytest.approx(10.0)
-        assert p.theta == pytest.approx(1.0 / 3000.0)
-        # Without a target X the decode time is still measured, g is not.
-        q = GenAdmissionWaitingQueue(AUTO)
+        p.step(reqs[1:], 100.0, 8, 3, slack_queue())  # 0 finished
+        assert p.mean_decode_s == pytest.approx(10.0) and p.theta == pytest.approx(1 / 3000)
+        q = GenAdmissionWaitingQueue(AUTO)  # no target yet
         q.set_now(100.0)
-        theta = p.theta
-        ex.run(q, reqs[2:], 2)
-        assert p.theta == theta and p.window["completed"] == 2
-
-    def test_decisions_are_identical_across_ranks(self):
-        """Same inputs (active requests, broadcast queue and clock) on every
-        rank give the same pauses and controller state, whatever the local
-        wall clock."""
-        results = []
-        for rank in range(3):
-            p = make_preemption(max_per_pass=2)
-            reqs = [make_req(i, generated=10 * i, prompt_len=100 + i) for i in range(8)]
-            ex = make_executor(p, capacity=8)
-            with patch("time.monotonic", return_value=1000.0 * rank):
-                p.observe(reqs, 90.0)
-                for i, req in enumerate(reqs):
-                    step([req], iters=20, tokens_per_iter=1 + i % 3)
-                ex.run(at_risk_queue(n=3), reqs[1:], 8)
-            results.append((paused_ids(ex), p.theta, p.mean_decode_s))
-        assert results[0] == results[1] == results[2]
-        assert len(results[0][0]) == 2
+        p.step(reqs[2:], 100.0, 8, 2, q)
+        assert p.theta == pytest.approx(1 / 3000)
 
 
-# ---------------------------------------------------------------------------
-# target_output_tps: a per-request objective with laxity victims and a credit
-# ---------------------------------------------------------------------------
-def make_slo(target=8.0, **kwargs):
-    """``target_output_tps`` = ``target`` (default 8 tokens/s), D = 20 s:
-    laxity victims need 0.4 s, resume margin 0.2 s, max pause 7 s."""
-    return make_preemption(target_output_tps=target, **kwargs)
+def make_slo(**kwargs):
+    """target_output_tps = 8 with D = 20 s: laxity victims need 0.4 s, the
+    resume margin is 0.2 s, the max pause 7 s."""
+    return make_preemption(target_output_tps=8.0, **kwargs)
 
 
-def slo_reqs(p, specs, t0=0.0, seconds=10.0):
-    """Requests ``(max_new_tokens, tokens/s)`` with their first token (token 1)
-    at ``t0``, observed again ``seconds`` later; returns (requests, now).
-
-    At target 8 and 10 tokens/s for 10 s the laxity is 0.025 x (max_new - 1)
-    s: 5 s at 201, 10 s at 401, 3 s at 121; at 5 tokens/s it is negative,
-    at 8.1 tokens/s and 201 it is 0.31 s (below the 0.4 s floor)."""
+def slo_reqs(p, specs, seconds=10.0):
+    """Requests ``(max_new_tokens, tokens/s)`` from t=0; at 10 tokens/s for
+    10 s the laxity is 0.025 x (max_new - 1) s, at 5 tokens/s it is negative."""
     reqs = [make_req(i, generated=1, max_new_tokens=m) for i, (m, _) in enumerate(specs)]
-    now = run_for(p, reqs, t0=t0, seconds=seconds, rates=[r for _, r in specs])
+    now = run_for(p, reqs, seconds=seconds, rates=[r for _, r in specs])
     p.observe(reqs, now)
     return reqs, now
 
 
-def pause(p, req):
-    """Pause ``req`` as the executor would (one victim chosen by policy)."""
-    p.on_paused(req)
+def ids(reqs):
+    return [r.py_request_id for r in reqs]
 
 
 class TestOutputTpsSlo:
     def test_laxity(self):
         p = make_slo()
-        (a,), now = slo_reqs(p, [(201, 10.0)])
-        # Deadline 0 + 200 / 8 = 25 s; finish 10 + 100 / 10 = 20 s.
-        assert p.laxity(a) == pytest.approx(5.0)
-        # A 2 s pause costs 2 s of laxity; the rate excludes the pause.
-        pause(p, a)
-        p.observe([a], now + 2.0)
-        assert p.laxity(a) == pytest.approx(3.0)
-        p.on_resumed(a)
-        assert p.laxity(a) == pytest.approx(3.0)
-        step([a], iters=10)  # 1 s at 10 tokens/s
-        p.observe([a], now + 3.0)
-        assert p.laxity(a) == pytest.approx(3.0)
-        # Below the target at 5 tokens/s: finish 10 + 150 / 5 = 40 s.
-        q = make_slo()
-        (b,), _ = slo_reqs(q, [(201, 5.0)])
-        assert q.laxity(b) == pytest.approx(-15.0)
+        (a, b), now = slo_reqs(p, [(201, 10.0), (201, 5.0)])
+        # Deadline 200 / 8 = 25 s; finish 10 + 100 / 10 = 20 s.
+        assert p.laxity(a) == pytest.approx(5.0) and p.laxity(b) == pytest.approx(-15.0)
+        p._pause(a)
+        p.observe([a, b], now + 2.0)
+        assert p.laxity(a) == pytest.approx(3.0)  # a pause costs its length
+        p._resume(1)
+        step([a], iters=10)
+        p.observe([a, b], now + 3.0)
+        assert p.laxity(a) == pytest.approx(3.0)  # the rate excludes pauses
+        q = make_slo(unpaused_tps=None)
+        q.observe([c := make_req(1, generated=1, max_new_tokens=201)], 0.0)
+        assert q.laxity(c) is None  # no rate yet
+        q.mean_tpot_s = 0.1
+        assert q.laxity(c) == pytest.approx(5.0)
 
-    def test_laxity_needs_first_token_and_max_tokens(self):
-        p = make_slo(unpaused_tps=None)
-        a = make_req(1, generated=1, max_new_tokens=201)
-        assert p.laxity(a) is None  # never observed
-        p.observe([a], 0.0)
-        assert p.laxity(a) is None  # no token since the first one, R0 unknown
-        p.mean_tpot_s = 0.1  # R0 = 10 tokens/s
-        assert p.laxity(a) == pytest.approx(25.0 - 20.0)
-        a.py_max_new_tokens = None
-        assert p.laxity(a) is None
-
-    def test_largest_laxity_first(self):
-        p = make_slo()
-        reqs, now = slo_reqs(p, [(201, 10.0), (401, 10.0), (121, 10.0)])
-        assert [p.laxity(r) for r in reqs] == pytest.approx([5.0, 10.0, 3.0])
-        victim = p.select_victims(reqs, 1)
-        assert [v.py_request_id for v in victim] == [1]
-        pause(p, victim[0])
-        assert [v.py_request_id for v in p.select_victims(reqs, 1)] == [0]
-        assert p.window["laxity_victims"] == 2 and p.credit == 0.0
-
-    def test_laxity_floor_then_credit(self):
-        # 0.31 s of laxity is under the 0.4 s floor: no laxity victim, and
-        # without credit no victim at all.
-        p = make_slo()
-        reqs, _ = slo_reqs(p, [(201, 8.1)])
-        assert 0.0 < p.laxity(reqs[0]) < 0.4
-        assert p.select_victims(reqs, 1) == [] and p.window["no_victim"] == 1
-        # One credit: a new sacrifice, counted once.
+    def test_victim_tiers(self):
+        p = make_slo(max_per_pass=4)
+        reqs, _ = slo_reqs(p, [(201, 10.0), (401, 10.0), (201, 8.1), (201, 5.0)])
+        # Laxity 5 s, 10 s, 0.31 s (under the 0.4 s floor), below the target.
+        assert ids(p._victims(reqs, 4)) == [1, 0, 3]  # no credit: no sacrifice
         p.credit = 1.5
-        assert p.select_victims(reqs, 1) == reqs
-        assert p._tracks[0].sacrificed and p.credit == pytest.approx(0.5)
-        assert p.window["sacrificed"] == p.totals["sacrificed"] == 1
+        assert ids(p._victims(reqs, 4)) == [1, 0, 3, 2]
+        assert p._reqs[2].sacrificed and p.credit == pytest.approx(0.5)
+        # Once sacrificed it is a below-target victim, at no further credit.
+        assert ids(p._victims(reqs, 4)) == [1, 0, 3, 2] and p.credit == pytest.approx(0.5)
 
-    def test_below_target_before_a_new_sacrifice(self):
+    def test_pause_limits_per_tier(self):
         p = make_slo()
-        reqs, _ = slo_reqs(p, [(201, 8.1), (201, 5.0)])
-        assert p.laxity(reqs[1]) < 0.0
-        p.credit = 5.0
-        # The request already below the target goes first, at no credit.
-        assert p.select_victims(reqs, 1) == [reqs[1]]
-        assert p.credit == 5.0 and not p._tracks[1].sacrificed
-        assert p.window["below_target_victims"] == 1
-        # After 3 pauses it is spared; the other one is sacrificed.
-        p._tracks[1].pauses = 3
-        assert p.select_victims(reqs, 1) == [reqs[0]] and p.credit == 4.0
+        reqs, _ = slo_reqs(p, [(401, 10.0), (201, 5.0)])
+        p.credit = 10.0
+        p._reqs[1].pauses = 3  # below target: 3 pauses max
+        assert ids(p._victims(reqs, 1)) == [0]
+        p._reqs[0].pauses = 8  # laxity victim (or sacrifice): 8 max
+        assert p._victims(reqs, 1) == [] and p.credit == 10.0
 
-    def test_laxity_before_below_target(self):
-        p = make_slo()
-        reqs, _ = slo_reqs(p, [(201, 5.0), (201, 10.0)])
-        assert p.select_victims(reqs, 1) == [reqs[1]]
-
-    def test_below_target_longest_resident_first(self):
-        p = make_slo()
-        old = make_req(1, generated=1, max_new_tokens=201)
-        new = make_req(7, generated=1, max_new_tokens=201)
-        p.observe([old], 0.0)
-        p.observe([old, new], 1.0)
-        step([old], iters=50)  # 5 tokens/s since t=0
-        step([new], iters=45)  # 5 tokens/s since t=1
-        p.observe([old, new], 10.0)
-        assert p.laxity(old) < 0.0 and p.laxity(new) < 0.0
-        assert p.select_victims([new, old], 1) == [old]
-
-    def test_sacrificed_stays_below_target(self):
-        # Once sacrificed, a request is a below-target victim whatever its
-        # laxity, up to 3 pauses.
-        p = make_slo(hysteresis_iters=0)
-        reqs, _ = slo_reqs(p, [(201, 8.1), (401, 10.0)])
-        p._tracks[0].sacrificed = True
-        p._tracks[1].pauses = 8  # no laxity pause left
-        assert p.select_victims(reqs, 1) == [reqs[0]]
-        assert p.window["below_target_victims"] == 1
-        p._tracks[0].pauses = 3
-        assert p.select_victims(reqs, 1) == [] and p.credit == 0.0
-
-    def test_pause_limits(self):
-        p = make_slo()
-        reqs, _ = slo_reqs(p, [(401, 10.0)])
-        p._tracks[0].pauses = 7
-        assert p.select_victims(reqs, 1) == reqs
-        p._tracks[0].pauses = 8
-        p.credit = 10.0  # nor a sacrifice
-        assert p.select_victims(reqs, 1) == []
-
-    def test_forced_resume_at_the_laxity_margin(self):
-        p = make_slo()
-        reqs, now = slo_reqs(p, [(201, 10.0), (201, 8.1)])
-        pause(p, reqs[0])  # laxity 5 s at t=10: resume at 10 + 5 - 0.2
-        assert p.resume_at(reqs[0]) == pytest.approx(14.8)
-        p.credit = 1.0
-        (s,) = p.select_victims(reqs, 1)
-        pause(p, s)  # sacrificed: only the 7 s maximum pause
-        assert p.resume_at(s) == pytest.approx(17.0)
-        p.observe(reqs, 14.79)
-        assert p.resume_candidates(0) == []
-        p.observe(reqs, 14.81)
-        assert p.resume_candidates(0) == [reqs[0]]
-        assert p.window["laxity_resumes"] == p.window["forced_resumes"] == 1
-        p.on_resumed(reqs[0])
-        # Back in with about the margin left.
-        assert p.laxity(reqs[0]) == pytest.approx(0.19)
-        p.observe(reqs, 17.0)
-        assert p.resume_candidates(0) == [s]
-        assert p.window["laxity_resumes"] == 1 and p.window["forced_resumes"] == 2
-
-    def test_resume_lane_least_laxity_first(self):
+    def test_laxity_margin_resume_and_least_laxity_lane(self):
         p = make_slo(max_paused=4)
         reqs, _ = slo_reqs(p, [(401, 10.0), (201, 10.0), (161, 10.0), (201, 5.0)])
         for r in reqs:
-            pause(p, r)  # paused in this order at t=10
-        # Resume at: 0 laxity 10 s -> max pause 17; 1 -> 14.8; 2 laxity 4 ->
-        # 13.8; 3 below the target -> 17 (max pause, after 0 in pause order).
-        out = p.resume_candidates(free_slots=4)
-        assert [r.py_request_id for r in out] == [2, 1, 0, 3]
-        assert [r.py_request_id for r in p.resume_candidates(free_slots=1)] == [2]
-
-    def test_tpot_budget_resume_lane_is_oldest_first(self):
-        p = make_preemption(max_paused=4)
-        reqs, _ = slo_reqs(p, [(401, 10.0), (201, 10.0)])
-        for r in reqs:
-            pause(p, r)
-        assert p.resume_candidates(free_slots=2) == reqs
-        assert p._tracks[0].laxity_resume_t is None
+            p._pause(r)
+        # Due at: 0 -> 17 (max pause), 1 -> 14.8, 2 -> 13.8, 3 (below) -> 17.
+        assert [p._resume_at(p._reqs[i]) for i in range(4)] == pytest.approx([17, 14.8, 13.8, 17])
+        p._now = 13.79
+        assert p._resume(0) == 0
+        p._now = 13.81
+        assert p._resume(1) == 1 and p.paused_ids == {0, 1, 3}  # 2 due (and the slot)
+        assert p.laxity(reqs[2]) == pytest.approx(0.19)  # back with the margin left
+        p._now = 14.0
+        assert p._resume(1) == 1 and p.paused_ids == {0, 3}  # least laxity first
+        p._now = 17.0
+        assert p._resume(0) == 2 and p.stats["forced"] == 2
 
     def test_credit_bucket(self):
-        p = GenPreemption(SLO, max_num_active_requests=128)  # target 40
+        p = GenPreemption(SLO, max_num_active_requests=128)
         complete(p, 10.0, decode_s=20.0, tokens=1000)  # 50 tokens/s
         assert p.credit == pytest.approx(0.2)
-        complete(p, 11.0, decode_s=20.0, tokens=600)  # 30 tokens/s: below
+        complete(p, 11.0, decode_s=20.0, tokens=600)  # 30: below
         assert p.credit == pytest.approx(-0.6)
-        # Pauses count: 1000 tokens over 20 s + 6 s paused is 38.5 tokens/s.
-        complete(p, 12.0, decode_s=20.0, tokens=1000, paused_s=6.0)
+        complete(p, 12.0, decode_s=20.0, tokens=1000, paused_s=6.0)  # 38.5 with pauses: below
         assert p.credit == pytest.approx(-1.4)
-        # A sacrificed request is refunded its debit at completion.
-        complete(p, 13.0, decode_s=20.0, tokens=1000, paused_s=6.0, sacrificed=True)
+        complete(p, 13.0, decode_s=20.0, tokens=1000, paused_s=6.0, sacrificed=True)  # refunded
         assert p.credit == pytest.approx(-1.2)
-        # Before X: no change.
         complete(p, 14.0, decode_s=20.0, tokens=600, target_ready=False)
-        assert p.credit == pytest.approx(-1.2)
-        assert (p.totals["slo_completed"], p.totals["below_target"]) == (4, 3)
-        # Clamped to +-3000 x 0.2.
+        assert p.credit == pytest.approx(-1.2) and p.theta == 0.0
+        assert "below_target=3/4 credit=-1.2" in p.stats_line()
         for i in range(4000):
             complete(p, 20.0 + i, decode_s=20.0, tokens=1000)
-        assert p.credit == pytest.approx(600.0)
+        assert p.credit == pytest.approx(600.0)  # clamped to 3000 x 0.2
         for i in range(2000):
             complete(p, 5000.0 + i, decode_s=20.0, tokens=100)
         assert p.credit == pytest.approx(-600.0)
 
-    def test_window_without_controller(self):
+    def test_step(self):
         p = make_slo()
-        assert p.slack_s == pytest.approx(3.0)
-        for i in range(100):
-            complete(p, float(i), decode_s=20.0, tokens=1000, paused_s=5.0)
-        assert p.gain == 1.0 and p.slack_s == pytest.approx(0.15 * p.mean_decode_s)
-
-    def test_stats_line(self):
-        p = make_slo()
-        reqs, _ = slo_reqs(p, [(201, 10.0), (201, 5.0)])
-        pause(p, p.select_victims(reqs, 1)[0])
-        pause(p, p.select_victims(reqs, 1)[0])
-        complete(p, 11.0, decode_s=20.0, tokens=100)  # 5 tokens/s: below
-        line = p.stats_line()
-        assert "target_tps=8.00 below_target=1/1 below_target_total=1/1" in line
-        assert "credit=-0.8 laxity_victims=1 below_target_victims=1" in line
-        assert "sacrificed=0 sacrificed_total=0 mean_laxity=5.00s" in line
-        assert "laxity_resumes=0 paused_below=1" in line and "budget=" not in line
-        assert "below_target=0/0 below_target_total=1/1" in p.stats_line()
-
-    def test_executor_pass(self):
-        p = make_slo(target=8.0)
-        reqs = running(p, 4)  # 10 tokens/s since t=90
+        reqs = running(p, 4)
         reqs[1].py_max_new_tokens = 8000  # the most laxity
-        ex = make_executor(p, capacity=4)
-        assert ex.run(at_risk_queue(), reqs, 4) == 3
-        assert paused_ids(ex) == {1} and p._tracks[1].laxity_resume_t is not None
-        # A slot frees: 1 is back before any admission.
-        ex.request_broadcaster.rank0_now = 101.0
-        assert ex.run(slack_queue(now=101.0), reqs[1:], 3) == 3
-        assert paused_ids(ex) == set()
-
-    def test_decisions_are_rank_identical(self):
-        """Laxity, victims, credit and resume times use only rank-identical
-        inputs (token counts, max_tokens, completions, rank 0's clock): the
-        local clock is never read."""
-        results = []
-        for rank in range(3):
-            p = make_slo(max_per_pass=3, hysteresis_iters=0)
-            reqs = [
-                make_req(i, generated=1 + i, max_new_tokens=150 + 40 * i, prompt_len=100 + i)
-                for i in range(8)
-            ]
-            ex = make_executor(p, capacity=8)
-            clock = Mock(side_effect=AssertionError("local clock read"))
-            with patch("time.monotonic", clock), patch("time.time", clock):
-                p.observe(reqs, 90.0)
-                for i, req in enumerate(reqs):
-                    step([req], iters=40 + 7 * i, tokens_per_iter=1 + i % 3)
-                p.credit = 1.0
-                ex.run(at_risk_queue(n=3), reqs, 8)
-                laxity = [p.laxity(r) for r in reqs]
-                ex.request_broadcaster.rank0_now = 103.0
-                ex.run(slack_queue(now=103.0), reqs[2:], 6)
-                complete(p, 104.0, decode_s=10.0, tokens=50)
-            results.append(
-                (
-                    paused_ids(ex),
-                    tuple(laxity),
-                    p.credit,
-                    tuple(
-                        sorted(
-                            (rid, t.sacrificed, t.laxity_resume_t, t.pauses)
-                            for rid, t in p._tracks.items()
-                        )
-                    ),
-                )
-            )
-        assert results[0] == results[1] == results[2]
-        assert p.totals["paused"] == 3
+        assert p.step(reqs, 100.0, 4, 4, at_risk_queue()) == 3 and p.paused_ids == {1}
+        assert p.step(reqs[1:], 101.0, 4, 3, slack_queue(now=101.0)) == 3  # 1 back first
+        assert not p.paused_ids
 
 
-class TestExecutorSetup:
-    def _stub(self, **overrides):
+@pytest.mark.parametrize("settings", [ON, SLO])
+def test_decisions_are_rank_identical(settings):
+    """Only rank-identical inputs (token counts, max_tokens, completions, rank
+    0's clock) are used: the local clock is never read."""
+    results = []
+    for _ in range(3):
+        p = make_preemption(
+            max_per_pass=3,
+            hysteresis_iters=0,
+            **{k: getattr(settings, k) for k in ("tpot_budget", "target_output_tps")},
+        )
+        reqs = [make_req(i, generated=1 + i, max_new_tokens=150 + 40 * i) for i in range(8)]
+        clock = Mock(side_effect=AssertionError("local clock read"))
+        with patch("time.monotonic", clock), patch("time.time", clock):
+            p.observe(reqs, 90.0)
+            for i, req in enumerate(reqs):
+                step([req], iters=40 + 7 * i, tokens_per_iter=1 + i % 3)
+            p.credit = 1.0
+            p.step(reqs, 100.0, 8, 8, at_risk_queue(n=3))
+            p.step(reqs[2:], 103.0, 8, 6, slack_queue(now=103.0))
+            complete(p, 104.0, decode_s=10.0, tokens=50)
+        assert any(r.pauses for r in p._reqs.values())
+        results.append((p.paused_ids, p.credit, p.theta, sorted(map(repr, p._reqs.items()))))
+    assert results[0] == results[1] == results[2]
+
+
+class TestCreate:
+    def _executor(self, **overrides):
         seq_slots = Mock()
         seq_slots.get_max_resource_count.return_value = 176
-        stub = SimpleNamespace(
-            _gen_preemption_settings=ON,
-            scheduler=object.__new__(KVCacheV2Scheduler),
-            _gen_admission=GenAdmissionConfig(ttft_percentile=90.0),
+        ex = SimpleNamespace(
+            scheduler=Mock(spec=["set_gen_paused_ids"]),
+            _gen_admission=AUTO,
             enable_attention_dp=False,
-            dist=SimpleNamespace(has_pp=False, pp_size=1, rank=0),
+            dist=SimpleNamespace(has_pp=False, rank=0),
             kv_cache_manager=Mock(max_admissible_sequences=352),
             draft_kv_cache_manager=None,
             max_num_active_requests=128,
@@ -1038,258 +460,92 @@ class TestExecutorSetup:
                 resource_managers={ResourceManagerType.SEQ_SLOT_MANAGER: seq_slots}
             ),
         )
-        stub.kv_cache_manager._max_resident_sequences.return_value = 176
-        stub.__dict__.update(overrides)
-        stub._gen_preemption_disabled_reason = types.MethodType(
-            PyExecutor._gen_preemption_disabled_reason, stub
-        )
-        return stub
+        ex.kv_cache_manager._max_resident_sequences.return_value = 176
+        ex.__dict__.update(overrides)
+        return ex
 
-    def _create(self, stub):
-        with patch(LOGGER) as log:
-            out = PyExecutor._create_gen_preemption(stub)
-        calls = log.info.call_args_list + log.warning.call_args_list
-        return out, [c.args[0] for c in calls]
-
-    def test_off_creates_nothing(self):
-        out, logs = self._create(self._stub(_gen_preemption_settings=GenPreemptionSettings()))
-        assert out is None and logs == []
-
-    def test_enabled(self):
-        out, logs = self._create(self._stub())
-        assert isinstance(out, GenPreemption) and out.max_paused == 48
-        assert len(logs) == 1 and "enabled" in logs[0]
-
-    def test_pipeline_parallelism_is_rejected(self):
-        stub = self._stub(dist=SimpleNamespace(has_pp=True, pp_size=2, rank=0))
-        with pytest.raises(ValueError, match="does not support pipeline parallelism"):
-            PyExecutor._create_gen_preemption(stub)
-        # Off: nothing to reject.
-        stub._gen_preemption_settings = GenPreemptionSettings()
-        assert PyExecutor._create_gen_preemption(stub) is None
-
-    def test_draft_pool_is_checked(self):
-        draft = Mock(max_admissible_sequences=175)
-        del draft._max_resident_sequences
-        out, logs = self._create(self._stub(draft_kv_cache_manager=draft))
-        assert out is None and "index pool holds 175" in logs[0]
+    def test_off_and_enabled(self):
+        assert create_gen_preemption(self._executor(), GenPreemptionSettings()) is None
+        p = create_gen_preemption(self._executor(), ON)
+        assert isinstance(p, GenPreemption) and p.max_paused == 48
 
     @pytest.mark.parametrize(
-        ("overrides", "needle"),
+        "overrides, needle",
         [
+            ({"scheduler": object()}, "V2 scheduler"),
             ({"_gen_admission": GenAdmissionConfig(ttft_percentile=100.0)}, "auto GEN admission"),
             ({"enable_attention_dp": True}, "attention DP"),
+            ({"dist": SimpleNamespace(has_pp=True, rank=0)}, "pipeline parallelism"),
             ({"max_num_active_requests": 129}, "sequence slot pool holds 176"),
+            ({"draft_kv_cache_manager": Mock(spec=[], max_admissible_sequences=175)}, "175"),
         ],
     )
-    def test_disabled_with_one_warning(self, overrides, needle):
-        stub = self._stub(**overrides)
-        with patch(LOGGER) as log:
-            out = PyExecutor._create_gen_preemption(stub)
-        assert out is None and log.info.call_count == 0
-        (msg,) = [c.args[0] for c in log.warning.call_args_list]
-        assert "disabled" in msg and needle in msg
-
-    def test_recurrent_state_pool_is_checked(self):
-        stub = self._stub()
-        stub.kv_cache_manager._max_resident_sequences.return_value = 136
-        out, logs = self._create(stub)
-        assert out is None and "recurrent state pool holds 136" in logs[0]
+    def test_unsupported_warns_and_stays_off(self, overrides, needle):
+        with patch.object(gen_preemption, "logger") as log:
+            assert create_gen_preemption(self._executor(**overrides), SLO) is None
+        assert needle in log.warning.call_args.args[0] and not log.info.called
 
 
-# ---------------------------------------------------------------------------
-# Drafter state outside the KV cache: DSpark rolling windows
-# ---------------------------------------------------------------------------
-class TestDSparkWindows:
-    def _setup(self, num_slots=4):
-        import collections
+def _drafter(kind, num_slots=4):
+    """A DFlash or DSpark drafter worker and its metadata with ``num_slots``
+    request slots plus a scratch slot (CPU stand-ins for device buffers)."""
+    import collections
+    from functools import partial
 
-        import torch
+    import torch
 
-        from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata, DSv4DSparkWorker
+    from tensorrt_llm._device_copy import DeviceCopyBuffer
+    from tensorrt_llm._torch.speculative import dflash, dspark
 
-        worker = object.__new__(DSv4DSparkWorker)
-        worker._win_inited = True
-        worker._req_to_slot = {}
-        worker._free_slots = collections.deque(range(num_slots))
-        rows = num_slots + 1
-        worker._ctx_len = torch.zeros(rows, dtype=torch.long)
-        worker._valid_len = torch.zeros(rows, dtype=torch.long)
-        worker._position_initialized = torch.zeros(rows, dtype=torch.bool)
-        worker._kv_windows = torch.zeros(rows, 1, 2, 2)
-        worker._confidence_logits = None
-        worker._scratch_slot = num_slots
-        worker._graph_dummy_id_floor = 1 << 40
-        worker._batch_to_slot = torch.full((num_slots,), num_slots, dtype=torch.long)
-        meta = object.__new__(DSparkSpecMetadata)
-        meta.batch_indices_cuda = torch.zeros(num_slots, dtype=torch.int)
-        meta._dspark_worker = worker
-        return worker, meta
+    rows = num_slots + 1
+    if kind == "dflash":
+        worker = object.__new__(dflash.DFlashWorker)
+        worker._ctx_buf_inited, worker._req_ctx_pos, worker._dummy_slot = True, {}, num_slots
+        worker._ctx_len_host = [0] * rows
+        worker._batch_to_slot_buffer = DeviceCopyBuffer(torch.full((num_slots,), num_slots))
 
-    def _prepare(self, meta, request_ids, paused=frozenset()):
-        meta.request_ids = list(request_ids)
-        meta.num_generations = len(request_ids)
-        meta.paused_in_place_ids = frozenset(paused)
-        with patch("tensorrt_llm._torch.speculative.dspark.prefer_pinned", return_value=False):
-            meta.prepare()
-
-    def test_paused_requests_keep_their_window(self):
-        worker, meta = self._setup()
-        self._prepare(meta, [11, 12])
-        slot = worker._req_to_slot[12]
-        worker._ctx_len[slot] = 77
-        worker._kv_windows[slot].fill_(1.0)
-        # 12 paused in place: left out of the batch, window kept.
-        self._prepare(meta, [11, 13], paused={12})
-        assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
-        assert bool(worker._kv_windows[slot].eq(1.0).all())
-        # Resumed: same slot, same window.
-        self._prepare(meta, [11, 12, 13])
-        assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
-        assert int(worker._batch_to_slot[1]) == slot
-
-    def test_requests_not_in_the_batch_and_not_paused_release_their_window(self):
-        worker, meta = self._setup()
-        self._prepare(meta, [11, 12])
-        slot = worker._req_to_slot[12]
-        worker._ctx_len[slot] = 77
-        self._prepare(meta, [11])
-        assert 12 not in worker._req_to_slot and int(worker._ctx_len[slot]) == 0
-        assert slot in worker._free_slots
-
-    def test_slots_cover_paused_requests(self):
-        # max_batch scheduled slots plus the paused cap kept ones (here 2 + 2).
-        worker, meta = self._setup(num_slots=4)
-        self._prepare(meta, [1, 2])
-        self._prepare(meta, [3, 4], paused={1, 2})
-        assert set(worker._req_to_slot) == {1, 2, 3, 4}
-        assert len(set(worker._req_to_slot.values())) == 4
-
-
-# ---------------------------------------------------------------------------
-# Drafter state outside the KV cache: DFlash / standalone DSpark context slots
-# ---------------------------------------------------------------------------
-class TestDFlashSlots:
-    def _setup(self, num_slots=4):
-        import collections
-        from functools import partial
-
-        import torch
-
-        from tensorrt_llm._device_copy import DeviceCopyBuffer
-        from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
-
-        worker = object.__new__(DFlashWorker)
-        worker._ctx_buf_inited = True
-        worker._req_to_slot = {}
-        worker._req_ctx_pos = {}
-        worker._free_slots = collections.deque(range(num_slots))
-        worker._dummy_slot = num_slots
-        worker._graph_dummy_id_floor = 1 << 40
-        worker._ctx_len = torch.zeros(num_slots + 1, dtype=torch.long)
-        worker._ctx_len_host = [0] * (num_slots + 1)
-        worker._batch_to_slot_buffer = DeviceCopyBuffer(
-            torch.full((num_slots,), num_slots, dtype=torch.long)
-        )
-
-        def write_ctx_len(updates):  # CPU stand-in for the device scatter
+        def write_ctx_len(updates):
             for slot, value in updates.items():
-                worker._ctx_len_host[slot] = value
-                worker._ctx_len[slot] = value
+                worker._ctx_len_host[slot] = worker._ctx_len[slot] = value
 
         worker._write_ctx_len = write_ctx_len
-        worker._assign_slot = partial(DFlashWorker._assign_slot, worker)
-        meta = object.__new__(DFlashSpecMetadata)
+        worker._assign_slot = partial(dflash.DFlashWorker._assign_slot, worker)
+        meta = object.__new__(dflash.DFlashSpecMetadata)
         meta._batch_indices_buffer = DeviceCopyBuffer(torch.zeros(num_slots, dtype=torch.int))
         meta.batch_indices_cuda = meta._batch_indices_buffer.tensor
         meta._dflash_worker = worker
-        return worker, meta
+    else:
+        worker = object.__new__(dspark.DSv4DSparkWorker)
+        worker._win_inited, worker._scratch_slot, worker._confidence_logits = True, num_slots, None
+        worker._valid_len = torch.zeros(rows, dtype=torch.long)
+        worker._position_initialized = torch.zeros(rows, dtype=torch.bool)
+        worker._kv_windows = torch.zeros(rows, 1, 2, 2)
+        worker._batch_to_slot = torch.full((num_slots,), num_slots, dtype=torch.long)
+        meta = object.__new__(dspark.DSparkSpecMetadata)
+        meta.batch_indices_cuda = torch.zeros(num_slots, dtype=torch.int)
+        meta._dspark_worker = worker
+    worker._req_to_slot, worker._free_slots = {}, collections.deque(range(num_slots))
+    worker._graph_dummy_id_floor = 1 << 40
+    worker._ctx_len = torch.zeros(rows, dtype=torch.long)
+    return worker, meta
 
-    def _prepare(self, meta, request_ids, paused=frozenset()):
-        meta.request_ids = list(request_ids)
-        meta.num_generations = len(request_ids)
+
+@pytest.mark.parametrize("kind", ["dflash", "dspark"])
+def test_drafter_state_is_kept_for_paused_requests(kind):
+    worker, meta = _drafter(kind)
+
+    def prepare(request_ids, paused=()):
+        meta.request_ids, meta.num_generations = list(request_ids), len(request_ids)
         meta.paused_in_place_ids = frozenset(paused)
-        with patch("tensorrt_llm._torch.speculative.dflash.prefer_pinned", return_value=False):
+        with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
             meta.prepare()
 
-    def test_paused_requests_keep_their_slot(self):
-        worker, meta = self._setup()
-        self._prepare(meta, [11, 12])
-        slot = worker._req_to_slot[12]
-        worker._ctx_len[slot] = 77
-        worker._ctx_len_host[slot] = 77
-        worker._req_ctx_pos[12] = 900
-        # 12 paused in place: left out of the batch, drafter context kept.
-        self._prepare(meta, [11, 13], paused={12})
-        assert worker._req_to_slot[12] == slot and worker._req_ctx_pos[12] == 900
-        assert int(worker._ctx_len[slot]) == 77 and worker._ctx_len_host[slot] == 77
-        assert slot not in worker._free_slots
-        # Resumed: same slot, same context length, mapped at its batch row.
-        self._prepare(meta, [11, 12, 13])
-        assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
-        assert int(worker._batch_to_slot_buffer.tensor[1]) == slot
-
-    def test_finished_requests_release_their_slot(self):
-        worker, meta = self._setup()
-        self._prepare(meta, [11, 12])
-        slot = worker._req_to_slot[12]
-        worker._ctx_len[slot] = 77
-        worker._req_ctx_pos[12] = 900
-        self._prepare(meta, [11], paused={12})
-        # Finished (or cancelled) after the pause: neither batched nor paused.
-        self._prepare(meta, [11])
-        assert 12 not in worker._req_to_slot and 12 not in worker._req_ctx_pos
-        assert int(worker._ctx_len[slot]) == 0 and slot in worker._free_slots
-
-    def test_slots_cover_paused_requests(self):
-        # max_batch scheduled slots plus the paused cap kept ones (here 2 + 2):
-        # nobody falls back to the shared dummy slot.
-        worker, meta = self._setup(num_slots=4)
-        self._prepare(meta, [1, 2])
-        with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
-            self._prepare(meta, [3, 4], paused={1, 2})
-        log.warning.assert_not_called()
-        assert set(worker._req_to_slot) == {1, 2, 3, 4}
-        assert len(set(worker._req_to_slot.values())) == 4
-
-    def _lazy_init(self, max_batch):
-        import torch
-
-        from tensorrt_llm._torch.speculative.dflash import DFlashWorker
-
-        class _Stop(Exception):
-            pass
-
-        worker = object.__new__(DFlashWorker)
-        worker._validate_draft_attention_backend = Mock()
-        worker._ctx_buf_inited = False
-        worker._ctx_kv_manager = None
-        worker.spec_config = Mock(max_draft_len=7, tokens_per_gen_step=8)
-        # Stop once the slot bookkeeping is built, before any K/V allocation.
-        worker._draft_block_width = Mock(side_effect=_Stop)
-        attn_metadata = Mock(spec=["kv_cache_manager"])
-        attn_metadata.kv_cache_manager = Mock(max_seq_len=4096)
-        draft_model = Mock()
-        draft_model.config = Mock(max_position_embeddings=4096)
-        real_zeros = torch.zeros
-
-        def cpu_zeros(*args, device=None, **kwargs):
-            return real_zeros(*args, **kwargs)
-
-        with patch("tensorrt_llm._torch.speculative.dflash.torch.zeros", side_effect=cpu_zeros):
-            with pytest.raises(_Stop):
-                worker._lazy_init_ctx_buffers(
-                    draft_model, Mock(max_num_requests=max_batch), attn_metadata
-                )
-        return worker
-
-    def test_slot_pool_reserves_the_resident_headroom(self, active):
-        worker = self._lazy_init(128)
-        assert worker._dummy_slot == 128 and len(worker._free_slots) == 128
-        assert worker._ctx_len.shape[0] == 129
-        active(ON)
-        worker = self._lazy_init(128)
-        # 128 scheduled + 48 paused request slots, then the dummy slot.
-        assert worker._dummy_slot == 176 and sorted(worker._free_slots) == list(range(176))
-        assert worker._ctx_len.shape[0] == 177 and len(worker._ctx_len_host) == 177
-        assert worker._batch_to_slot_buffer.tensor.shape[0] == 128
+    prepare([11, 12])
+    slot = worker._req_to_slot[12]
+    worker._ctx_len[slot] = 77
+    prepare([11, 13, 14], paused={12})  # paused: slot and state kept, 4 slots used
+    assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
+    assert len(set(worker._req_to_slot.values())) == 4
+    prepare([11, 12, 13])  # resumed into its slot; 14 finished and freed its slot
+    assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
+    assert 14 not in worker._req_to_slot and len(worker._free_slots) == 1

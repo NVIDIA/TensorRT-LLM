@@ -3934,15 +3934,13 @@ def compute_max_num_sequences(mapping: Mapping,
 
     ``enable_overlap_headroom`` is intentionally opt-in; see
     ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
-    pool by ``pp_size``. Without it, GEN slot preemption
-    (``scheduler_config.gen_preemption``) adds one slot per request it may
-    hold paused, since a paused request keeps its slot while its replacement
-    runs.
+    pool by ``pp_size``. GEN slot preemption adds a slot per paused request.
     """
     if mapping.has_pp():
-        return max_batch_size * mapping.pp_size
-    num_micro_batches = (2 if enable_overlap_headroom
-                         and not disable_overlap_scheduler else 1)
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = (2 if enable_overlap_headroom
+                             and not disable_overlap_scheduler else 1)
     return (max_batch_size * num_micro_batches +
             gen_preempt_resident_headroom(max_batch_size))
 

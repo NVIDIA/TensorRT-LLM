@@ -298,8 +298,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
-        # Generation requests the executor paused in place for GEN slot
-        # preemption; see set_gen_paused_ids.
+        # Generation requests paused in place (GEN slot preemption).
         self._gen_paused_ids: frozenset[int] = frozenset()
 
         # `is True`: a manager without the flag reads as off.
@@ -393,21 +392,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._remote_tail_generation_ids = generation_request_ids
 
     def set_gen_paused_ids(self, request_ids: frozenset[int]) -> None:
-        """Generation requests to leave out of the batch (GEN slot preemption,
-        see gen_preemption.py). They stay resident: KV, recurrent state and
-        draft KV are kept, and they are scheduled again once removed."""
+        """Generation requests to leave out of the batch but keep resident."""
         self._gen_paused_ids = request_ids
 
     def _filter_paused_requests(self, requests: RequestList) -> RequestList:
-        eligible = []
-        for req in requests:
-            if req.py_request_id in self._gen_paused_ids:
-                # Resume from the host token, not an overlap tensor of a batch
-                # this request was not in.
-                self._clear_request_runtime_state(req)
-            else:
-                eligible.append(req)
-        return eligible
+        paused = [req for req in requests if req.py_request_id in self._gen_paused_ids]
+        for req in paused:
+            # Resume from the host token, not a stale overlap tensor.
+            self._clear_request_runtime_state(req)
+        return [req for req in requests if req.py_request_id not in self._gen_paused_ids]
 
     def _filter_remote_tail_phase_requests(self, requests: RequestList) -> RequestList:
         phase = self.remote_tail_phase

@@ -387,43 +387,23 @@ configured retry policy, including the transient TCP retry budget.
 
 ### Generation slot preemption (prototype)
 
-When every slot of a generation worker is taken by decode requests, a request
-waiting for a slot can only wait for one of them to finish. With GEN slot
-preemption the generation worker pauses a decode request in place (it keeps
-its KV cache and slot, and is only left out of the scheduled batch) whenever
-the request its admission queue would admit next is about to miss its TTFT
-target, and gives the freed slot to the waiting request. Pauses
-cost TPOT; bound that cost with one of the two fields of
-`scheduler_config.gen_preemption` in the generation worker's YAML:
+When every slot of a generation worker is taken and the request it would admit
+next is about to miss its TTFT target, GEN slot preemption pauses a decode
+request in place (it keeps its KV cache and slot, and is only left out of the
+batch) and gives the slot to the waiting request. Bound the TPOT cost with one
+of the two fields (neither: off; both: an error):
 
 ```yaml
 scheduler_config:
   gen_preemption:
-    tpot_budget: 0.10        # allow up to 10% mean-TPOT increase from pausing
+    tpot_budget: 0.10          # up to +10% mean TPOT from pauses
+    # target_output_tps: 35.0  # or: a per-request tokens/s floor for ~80% of requests
 ```
 
-```yaml
-scheduler_config:
-  gen_preemption:
-    target_output_tps: 35.0  # per-request output tokens/s floor for at least ~80% of requests
-```
-
-With `tpot_budget` the longest resident request is paused, and an integral
-controller keeps the TPOT cost of pauses at 0.8 of the budget. With
-`target_output_tps` the target is a service-level objective: a per-request
-output rate that at least about 80% of requests keep. Requests with slack
-against the target (projected to finish above it even after a pause) are
-paused first and resumed before they would fall below it; a small credit,
-earned per completed request, allows sacrificing a few requests when no
-request has slack. With neither field set (the default) preemption is off;
-setting both is an error. Everything else (the at-risk window, the number of
-paused requests, the maximum pause) is derived online from the measured
-decode time of completed requests.
-
-Preemption needs the generation worker's TTFT-percentile admission policy
-(`TLLM_GEN_ADMISSION_TTFT_PERCENTILE` between 0 and 99) and the KV cache
-manager V2 scheduler; without them it stays off with a warning. Pipeline
-parallelism and attention DP are rejected.
+Everything else is derived online from completed requests. Preemption needs
+the TTFT-percentile GEN admission policy (`TLLM_GEN_ADMISSION_TTFT_PERCENTILE`
+between 0 and 99) and the KV cache manager V2 scheduler; pipeline parallelism
+and attention DP are rejected.
 
 ## Environment Variables
 

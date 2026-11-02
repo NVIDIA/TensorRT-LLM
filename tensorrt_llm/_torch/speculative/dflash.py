@@ -771,7 +771,7 @@ class DFlashWorker(SpecWorkerBase):
         self._kv_rewind_bs = None
         self._batch_to_slot_buffer = None
         self._max_ctx = 0
-        self._ctx_k_buf = None  # [num_slots, L, max_ctx+block, nkv, hd]
+        self._ctx_k_buf = None  # [max_batch+1, L, max_ctx+block, nkv, hd]
         self._ctx_v_buf = None
         # Set by _lazy_init_ctx_buffers; every context write switches on the
         # cache layout rather than on which kernel reads it.
@@ -789,7 +789,7 @@ class DFlashWorker(SpecWorkerBase):
         # Static per-slot page table for the private arena. When bound to the
         # manager it is replaced by _ctx_block_tables, refreshed per iteration.
         self._ctx_page_table = None
-        self._ctx_block_tables = None  # [num_slots, max_blocks_per_seq] int32
+        self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
         self._ctx_block_indptr = None
         # Pages the manager handed this request, per batch row. Saturates at
         # the table width on the default backend -- dflash_allocated_ctx_limit.
@@ -1259,11 +1259,10 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
 
-        # Real requests draw slots ``[0, num_req_slots)``: ``max_batch`` plus
-        # the requests GEN slot preemption may hold paused in place, which keep
-        # their slot while others run. Slot index ``num_req_slots`` is a scratch
-        # slot for padding/unknown dummies, so dummy writes land there and
-        # can't corrupt a real request's context.
+        # Real requests draw slots 0..num_req_slots-1 (max_batch plus requests
+        # paused in place by GEN slot preemption); the next slot is a scratch
+        # slot for padding/unknown dummies, so dummy writes can't corrupt a
+        # real request's context.
         from ..pyexecutor.scheduler.gen_preemption import resident_headroom
 
         num_req_slots = max_batch + resident_headroom(max_batch)
@@ -1438,7 +1437,6 @@ class DFlashWorker(SpecWorkerBase):
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"request_slots={num_req_slots}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"

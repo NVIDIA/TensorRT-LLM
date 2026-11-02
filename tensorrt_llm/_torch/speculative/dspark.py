@@ -386,10 +386,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._win_inited = False
         self._output_verify_lens: Optional[torch.Tensor] = None
         self._attention_warmup_attempted = False
-        self._kv_windows: Optional[torch.Tensor] = None  # [num_slots + 1, num_stages, win, hd]
-        self._ctx_len: Optional[torch.Tensor] = None  # [num_slots + 1] abs decode position
-        self._valid_len: Optional[torch.Tensor] = None  # [num_slots + 1] written window entries
-        self._position_initialized: Optional[torch.Tensor] = None  # [num_slots + 1] bool
+        self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
+        self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
+        self._position_initialized: Optional[torch.Tensor] = None  # [max_batch] bool
         self._win = 0
         # Set in _lazy_init from the RoPE table the drafter will build; None
         # leaves positions unbounded (direct construction in tests).
@@ -404,7 +404,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
         # Index of the throwaway "scratch" window row that absorbs padded /
-        # unknown request IDs (set in ``_lazy_init`` to ``num_slots``); it is
+        # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
 
@@ -412,7 +412,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # captured draft graph cannot diverge. ``_confidence_logits`` is the
         # slot-indexed handoff to the verification scheduler.
         self.return_confidence = bool(getattr(spec_config, "enable_confidence_scheduling", False))
-        self._confidence_logits: Optional[torch.Tensor] = None  # [num_slots + 2, block]
+        self._confidence_logits: Optional[torch.Tensor] = None  # [max_batch+2, block]
         # Draft-pass stamps for the buffer above; allocated in ``_lazy_init``.
         self._confidence_stamp: Optional[torch.Tensor] = None
         self._draft_seq_host = 0
@@ -553,10 +553,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Real requests occupy slots ``[0, num_slots)``: ``max_batch`` plus
-            # the requests GEN slot preemption may hold paused in place, which
-            # keep their slot while others run. One extra "scratch" row at index
-            # ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
+            # Real requests occupy slots ``[0, num_slots)`` (``max_batch`` plus
+            # requests paused in place by GEN slot preemption); one extra "scratch"
+            # row at index ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
             # padding, ADP idle requests, or disagg seed forwards that arrive without
             # a real request id) so they can never overwrite a live request's rolling
             # window. Previously such IDs aliased to slot 0 and corrupted whichever

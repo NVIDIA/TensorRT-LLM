@@ -234,9 +234,8 @@ class ScheduledRequests:
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
     paused_in_place_ids: frozenset[int]
-    """Generation requests left out of this batch but still resident (GEN slot
-    preemption): per-request model state outside the KV cache, such as a
-    drafter's rolling windows, must be kept for them."""
+    """Generation requests paused in place (GEN slot preemption): left out of
+    this batch, but their drafter state must be kept."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
