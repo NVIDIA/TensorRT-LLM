@@ -275,13 +275,15 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, shutdown_start
 
 def test_on_launcher_lost_is_a_no_op_after_llm_shutdown(monkeypatch) -> None:
     """record_fatal_error returning False means the LLM already shut down."""
-    server = object.__new__(OpenAIServer)
-    server.generator = _FatalErrorRecorder(shutdown_started=False, has_executor=False)
+    # The production method on a stand-in: _on_launcher_lost reads only self.generator.
+    server = SimpleNamespace(
+        generator=_FatalErrorRecorder(shutdown_started=False, has_executor=False)
+    )
     signals, terminations = [], []
     monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
     monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
 
-    server._on_launcher_lost(RuntimeError("attached frontend lost its engine: test"))
+    OpenAIServer._on_launcher_lost(server, RuntimeError("attached frontend lost its engine: test"))
 
     assert server.generator.fatal_errors == []
     assert signals == []
