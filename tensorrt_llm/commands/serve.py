@@ -2694,6 +2694,32 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
+    """What keeps the context and generation servers from sharing draft KV, or None."""
+    with_spec = {
+        cfg.type
+        for cfg in server_configs if cfg.other_args.get("speculative_config")
+    }
+    if with_spec != {"ctx", "gen"}:
+        return ("speculative_config in both context_servers and "
+                "generation_servers")
+    if len({(cfg.other_args.get("tensor_parallel_size", 1),
+             bool(cfg.other_args.get("enable_attention_dp", False)))
+            for cfg in server_configs}) != 1:
+        return ("the same tensor_parallel_size and enable_attention_dp in "
+                "context_servers and generation_servers")
+    for cfg in server_configs:
+        spec = cfg.other_args["speculative_config"]
+        backend = spec.get("attention_backend")
+        if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
+                or (spec.get("decoding_type") == "DSpark"
+                    and backend in (None, "AUTO", "TRTLLM"))):
+            return ("speculative_config to be DFlash with attention_backend "
+                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
+                    "in both sections")
+    return None
+
+
 @click.command("disaggregated_mpi_worker")
 @stability_option(
     "-c",
@@ -2742,37 +2768,14 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
-    with_spec = {
-        cfg.type
-        for cfg in disagg_cfg.server_configs
-        if cfg.other_args.get("speculative_config")
-    }
-    attention_parallel_configs = {(cfg.other_args.get("tensor_parallel_size",
-                                                      1),
-                                   cfg.other_args.get("enable_attention_dp",
-                                                      False))
-                                  for cfg in disagg_cfg.server_configs}
-    shared_draft_kv_supported = True
-    for cfg in disagg_cfg.server_configs:
-        spec = cfg.other_args.get("speculative_config") or {}
-        kv_cache = cfg.other_args.get("kv_cache_config") or {}
-        if (spec.get("decoding_type") != "DFlash"
-                or spec.get("attention_backend") != "TRTLLM"
-                or spec.get("draft_len_schedule") is not None
-                or spec.get("max_concurrency") is not None
-                or cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM"
-                or cfg.other_args.get("pipeline_parallel_size", 1) != 1
-                or cfg.other_args.get("context_parallel_size", 1) != 1
-                or cfg.other_args.get("kv_cache_compression_config") is not None
-                or str(kv_cache.get("dtype",
-                                    "auto")).lower().startswith("mixed_")
-                or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
-            shared_draft_kv_supported = False
-            break
-    os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = (
-        "1"
-        if with_spec == {"ctx", "gen"} and len(attention_parallel_configs) == 1
-        and shared_draft_kv_supported else "0")
+    blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
+    if blocker is not None and os.environ.get(
+            "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
+        raise click.UsageError(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
+    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
+                                                       if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
