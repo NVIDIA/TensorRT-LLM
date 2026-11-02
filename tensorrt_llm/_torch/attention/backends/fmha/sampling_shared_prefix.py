@@ -2001,12 +2001,12 @@ def _graph_wrappers(
             "HND",
             backend=_backend_from_env(),
             use_cuda_graph=True,
-            qo_indptr_buf=torch.zeros((groups + 1 + 1024,), dtype=torch.int32, device=device),
-            paged_kv_indptr_buf=torch.zeros((groups + 1 + 1024,), dtype=torch.int32, device=device),
+            qo_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
             paged_kv_indices_buf=torch.zeros(
-                (graph.prefix_capacity + 64,), dtype=torch.int32, device=device
+                (graph.prefix_capacity,), dtype=torch.int32, device=device
             ),
-            paged_kv_last_page_len_buf=torch.zeros((groups + 1024,), dtype=torch.int32, device=device),
+            paged_kv_last_page_len_buf=torch.zeros((groups,), dtype=torch.int32, device=device),
         )
         if key.q_len > 1:
             tail = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -2014,12 +2014,12 @@ def _graph_wrappers(
                 "HND",
                 backend=_backend_from_env(),
                 use_cuda_graph=True,
-                qo_indptr_buf=torch.zeros((graph.rows + 1 + 1024,), dtype=torch.int32, device=device),
+                qo_indptr_buf=torch.zeros((graph.rows + 1,), dtype=torch.int32, device=device),
                 paged_kv_indptr_buf=torch.zeros(
-                    (graph.rows + 1 + 1024,), dtype=torch.int32, device=device
+                    (graph.rows + 1,), dtype=torch.int32, device=device
                 ),
                 paged_kv_indices_buf=torch.zeros(
-                    (graph.tail_capacity + 64,), dtype=torch.int32, device=device
+                    (graph.tail_capacity,), dtype=torch.int32, device=device
                 ),
                 paged_kv_last_page_len_buf=graph.tail_last_page_len,
             )
@@ -2030,10 +2030,10 @@ def _graph_wrappers(
                 use_cuda_graph=True,
                 use_tensor_cores=key.num_heads != key.num_kv_heads,
                 paged_kv_indptr_buffer=torch.zeros(
-                    (graph.rows + 1 + 1024,), dtype=torch.int32, device=device
+                    (graph.rows + 1,), dtype=torch.int32, device=device
                 ),
                 paged_kv_indices_buffer=torch.zeros(
-                    (graph.tail_capacity + 64,), dtype=torch.int32, device=device
+                    (graph.tail_capacity,), dtype=torch.int32, device=device
                 ),
                 paged_kv_last_page_len_buffer=graph.tail_last_page_len,
             )
