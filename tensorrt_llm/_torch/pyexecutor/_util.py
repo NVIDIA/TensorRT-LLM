@@ -84,6 +84,7 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
+from .scheduler.gen_preemption import GenPreemptionSettings
 from .scheduler.gen_preemption import \
     resident_headroom as gen_preempt_resident_headroom
 from .seq_slot_manager import SeqSlotManager
@@ -3934,14 +3935,16 @@ def compute_max_num_sequences(mapping: Mapping,
     ``enable_overlap_headroom`` is intentionally opt-in; see
     ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
     pool by ``pp_size``. Without it, GEN slot preemption
-    (``TLLM_GEN_PREEMPT_MAX_PAUSED``) adds one slot per request it may hold
-    paused, since a paused request keeps its slot while its replacement runs.
+    (``scheduler_config.gen_preemption``) adds one slot per request it may
+    hold paused, since a paused request keeps its slot while its replacement
+    runs.
     """
     if mapping.has_pp():
         return max_batch_size * mapping.pp_size
     num_micro_batches = (2 if enable_overlap_headroom
                          and not disable_overlap_scheduler else 1)
-    return max_batch_size * num_micro_batches + gen_preempt_resident_headroom()
+    return (max_batch_size * num_micro_batches +
+            gen_preempt_resident_headroom(max_batch_size))
 
 
 def resolve_max_num_sequences(model_engine,
@@ -4554,6 +4557,8 @@ def create_py_executor_instance(
         enable_non_overlap_adp_forward_intent=(
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler)),
+        gen_preemption=GenPreemptionSettings.from_config(
+            llm_args.scheduler_config.gen_preemption),
     )
 
 

@@ -2102,6 +2102,75 @@ def test_SchedulerConfig_declaration() -> None:
 
 
 @pytest.mark.cpu_only
+def test_gen_preemption_config() -> None:
+    gen_preemption = llm_args_mod.GenPreemptionConfig
+    off = SchedulerConfig().gen_preemption
+    assert off.tpot_budget is None and off.target_output_tps is None
+    assert not off.enabled
+    config = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    assert config.gen_preemption.target_output_tps == 40.0
+    assert config.gen_preemption.enabled
+    budget = SchedulerConfig(gen_preemption={"tpot_budget": 0.1})
+    assert budget.gen_preemption.tpot_budget == 0.1 and budget.gen_preemption.enabled
+
+    # Dict / YAML round trip.
+    dumped = yaml.safe_dump(config.gen_preemption.model_dump())
+    assert gen_preemption(**yaml.safe_load(dumped)) == config.gen_preemption
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 32.5
+"""))
+    assert SchedulerConfig(
+        **merged["scheduler_config"]).gen_preemption.target_output_tps == 32.5
+    merged = update_llm_args_with_extra_dict({"model": "dummy"},
+                                             yaml.safe_load("""
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.08
+"""))
+    assert SchedulerConfig(
+        **merged["scheduler_config"]).gen_preemption.tpot_budget == 0.08
+
+    for bad in (0, -1.0, "fast"):
+        with pytest.raises(ValidationError):
+            gen_preemption(target_output_tps=bad)
+    for bad in (0, 1.0, -0.1):
+        with pytest.raises(ValidationError):
+            gen_preemption(tpot_budget=bad)
+    with pytest.raises(ValidationError, match="not both"):
+        gen_preemption(tpot_budget=0.1, target_output_tps=40)
+    with pytest.raises(ValidationError):
+        gen_preemption(policy="wait")  # not a field
+
+
+@pytest.mark.cpu_only
+def test_gen_preemption_rejects_pp_and_attention_dp() -> None:
+    on = SchedulerConfig(gen_preemption={"target_output_tps": 40})
+    args = TorchLlmArgs(model=llama_model_path, scheduler_config=on)
+    assert args.scheduler_config.gen_preemption.target_output_tps == 40.0
+    with pytest.raises(ValueError,
+                       match="does not support pipeline parallelism"):
+        TorchLlmArgs(model=llama_model_path,
+                     scheduler_config=on,
+                     pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="does not support attention DP"):
+        TorchLlmArgs(model=llama_model_path,
+                     scheduler_config=on,
+                     tensor_parallel_size=2,
+                     enable_attention_dp=True)
+    with pytest.raises(ValueError,
+                       match="does not support pipeline parallelism"):
+        TorchLlmArgs(model=llama_model_path,
+                     scheduler_config=SchedulerConfig(
+                         gen_preemption={"tpot_budget": 0.1}),
+                     pipeline_parallel_size=2)
+    # Off: no restriction.
+    TorchLlmArgs(model=llama_model_path, pipeline_parallel_size=2)
+
+
+@pytest.mark.cpu_only
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,

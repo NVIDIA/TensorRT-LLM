@@ -2574,7 +2574,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # requests that took their slots.
             from ..scheduler.gen_preemption import resident_headroom
 
-            self.max_admissible_sequences += resident_headroom()
+            self.max_admissible_sequences += resident_headroom(max_batch_size)
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no

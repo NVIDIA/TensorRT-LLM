@@ -420,6 +420,11 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self._order = self._build_order()[::-1]
         return self._order[-1]
 
+    @property
+    def target_s(self) -> Optional[float]:
+        """The ``auto`` policy's TTFT target X once it is set, else None."""
+        return self.adaptive.X if self.adaptive is not None else None
+
     def num_at_risk(self, slack_s: float, late_trigger: bool = False) -> int:
         """Waiting requests that a free slot now would still bring in on time,
         but with at most ``slack_s`` to spare: ``X - (age + s2f)`` in

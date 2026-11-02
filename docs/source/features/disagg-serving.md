@@ -385,6 +385,42 @@ requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
 
+### Generation slot preemption (prototype)
+
+When every slot of a generation worker is taken by decode requests, a request
+waiting for a slot can only wait for one of them to finish. With GEN slot
+preemption the generation worker pauses the longest resident decode request in
+place (it keeps its KV cache and slot, and is only left out of the scheduled
+batch) whenever the request its admission queue would admit next is about to
+miss its TTFT target, and gives the freed slot to the waiting request. Pauses
+cost TPOT; bound that cost with one of the two fields of
+`scheduler_config.gen_preemption` in the generation worker's YAML:
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.10        # allow up to 10% mean-TPOT increase from pausing
+```
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    target_output_tps: 35.0  # per-request output tokens/s to keep; budget = R0 / target - 1
+```
+
+`target_output_tps` is converted to a budget from R0, the measured output rate
+of requests without pauses; nothing is paused while R0 is at or below the
+target. With neither field set (the default) preemption is off; setting both
+is an error. Everything else (the at-risk window, the number of paused
+requests, the maximum pause) is derived online from the measured decode time
+of completed requests, and an integral controller keeps the TPOT cost at 0.8
+of the budget.
+
+Preemption needs the generation worker's TTFT-percentile admission policy
+(`TLLM_GEN_ADMISSION_TTFT_PERCENTILE` between 0 and 99) and the KV cache
+manager V2 scheduler; without them it stays off with a warning. Pipeline
+parallelism and attention DP are rejected.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

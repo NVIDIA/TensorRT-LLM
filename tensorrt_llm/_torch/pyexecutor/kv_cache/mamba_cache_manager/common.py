@@ -626,7 +626,7 @@ def _estimate_mamba_hybrid_cache_cost(
         # Paused GEN requests (MambaHybridCacheManagerV2._max_resident_sequences).
         from ...scheduler.gen_preemption import resident_headroom
 
-        max_resident_sequences += resident_headroom()
+        max_resident_sequences += resident_headroom(max_batch_size)
 
     if include_explicit_snapshots:
         fixed_rules, unaligned_fixed_rules = _mamba_snapshot_rule_counts(

@@ -1266,7 +1266,7 @@ class DFlashWorker(SpecWorkerBase):
         # can't corrupt a real request's context.
         from ..pyexecutor.scheduler.gen_preemption import resident_headroom
 
-        num_req_slots = max_batch + resident_headroom()
+        num_req_slots = max_batch + resident_headroom(max_batch)
         self._dummy_slot = num_req_slots
         num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from

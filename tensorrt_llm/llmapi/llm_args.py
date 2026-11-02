@@ -4345,6 +4345,63 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+class GenPreemptionConfig(StrictBaseModel):
+    """GEN slot preemption on a disaggregated generation worker.
+
+    When every generation slot is taken and the request the GEN admission
+    queue admits next is at risk of missing its TTFT target, the longest
+    resident decode request is paused in place (it keeps its KV cache and
+    slot) and the waiting request takes its slot. The pauses cost TPOT; set
+    at most one of the two fields to bound that cost (neither: off):
+
+    - ``tpot_budget``: the allowed increase of the mean TPOT, as a fraction.
+    - ``target_output_tps``: a per-request output rate to keep. With R0 the
+      measured per-request output rate without pauses, the budget is
+      R0 / target_output_tps - 1, so requests running faster than the target
+      donate slot time; nothing is paused when R0 is at or below it.
+
+    The at-risk window, the number of paused requests (0.375 x
+    max_num_active_requests), the maximum pause and the minimum run before a
+    pause are derived online from the measured decode time of completed
+    requests, and an integral controller holds the TPOT cost of pauses at
+    0.8 of the budget.
+
+    Needs the ``auto`` GEN admission policy
+    (``TLLM_GEN_ADMISSION_TTFT_PERCENTILE``) and the KV cache manager V2
+    scheduler; not supported with pipeline parallelism or attention DP.
+    """
+    tpot_budget: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        lt=1.0,
+        description=
+        "Allowed increase of the mean time per output token from pauses, as a "
+        "fraction (0.10 = +10%). Mutually exclusive with target_output_tps; "
+        "with neither set, GEN slot preemption is off.",
+        status="prototype")
+    target_output_tps: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=
+        "Per-request output rate to keep, in output tokens per second "
+        "(1 / TPOT, accepted draft tokens included); converted to a TPOT "
+        "budget from the measured unpaused rate. Mutually exclusive with "
+        "tpot_budget; with neither set, GEN slot preemption is off.",
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_one_bound(self) -> "GenPreemptionConfig":
+        if self.tpot_budget is not None and self.target_output_tps is not None:
+            raise ValueError(
+                "gen_preemption: set tpot_budget or target_output_tps, not both"
+            )
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.tpot_budget is not None or self.target_output_tps is not None
+
+
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
 class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
@@ -4376,6 +4433,13 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    gen_preemption: GenPreemptionConfig = Field(
+        default_factory=GenPreemptionConfig,
+        description=
+        "GEN slot preemption on disaggregated generation workers (PyTorch "
+        "backend).",
+        status="prototype")
 
     def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(
@@ -7182,6 +7246,21 @@ class TorchLlmArgs(BaseLlmArgs):
     @extra_resource_managers.setter
     def extra_resource_managers(self, value: Dict[str, object]) -> None:
         self._extra_resource_managers = value
+
+    @model_validator(mode="after")
+    def validate_gen_preemption(self) -> 'TorchLlmArgs':
+        if not self.scheduler_config.gen_preemption.enabled:
+            return self
+        if self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "GEN slot preemption (scheduler_config.gen_preemption) does "
+                "not support pipeline parallelism: it needs "
+                f"pipeline_parallel_size=1, got {self.pipeline_parallel_size}.")
+        if self.enable_attention_dp:
+            raise ValueError(
+                "GEN slot preemption (scheduler_config.gen_preemption) does "
+                "not support attention DP: it needs enable_attention_dp=False.")
+        return self
 
     @model_validator(mode="after")
     def validate_encoder_modes(self) -> 'TorchLlmArgs':

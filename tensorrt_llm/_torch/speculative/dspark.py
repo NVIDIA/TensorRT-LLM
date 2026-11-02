@@ -564,7 +564,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             # ``_free_slots`` and its contents are throwaway.
             from ..pyexecutor.scheduler.gen_preemption import resident_headroom
 
-            num_slots = max_batch + resident_headroom()
+            num_slots = max_batch + resident_headroom(max_batch)
             self._scratch_slot = num_slots
             num_rows = num_slots + 1
 
