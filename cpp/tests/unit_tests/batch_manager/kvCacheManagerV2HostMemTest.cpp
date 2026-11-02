@@ -110,7 +110,7 @@ TEST(KvCacheManagerV2HostMemTest, SelectsConfiguredPageMode)
     EXPECT_EQ(gCapturedAdvice, MADV_NOHUGEPAGE);
 
     ScopedEnv defaultThp("TLLM_KV_CACHE_MANAGER_V2_THP", std::nullopt);
-    EXPECT_FALSE(hostUseThp());
+    EXPECT_TRUE(hostUseThp());
     {
         ScopedEnv enableThp("TLLM_KV_CACHE_MANAGER_V2_THP", "1");
         EXPECT_TRUE(hostUseThp());
