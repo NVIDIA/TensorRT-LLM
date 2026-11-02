@@ -47,6 +47,7 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
+from .lever14_vae_fp8 import convert_decoder_linears_fp8
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -72,7 +73,6 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
-from .lever14_vae_fp8 import convert_decoder_linears_fp8
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
@@ -625,7 +625,9 @@ class MiniMaxH3Pipeline(BasePipeline):
                     tile_sample_min_overlap_height=tile[2],
                     tile_sample_min_overlap_width=tile[2],
                 )
-                logger.info(f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]} (lever 14)")
+                logger.info(
+                    f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]} (lever 14)"
+                )
             _prepare_vae_decoder(self.vae)
             if _L14_VAE_FP8:
                 convert_decoder_linears_fp8(self.vae.decoder)
