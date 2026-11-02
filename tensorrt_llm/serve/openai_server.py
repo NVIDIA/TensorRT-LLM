@@ -1369,6 +1369,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"])
 
         self._register_runtime_control_routes()
+        self._register_memory_report_route()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
@@ -1443,6 +1444,22 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.UNAUTHORIZED,
                 detail=str(error),
             ) from error
+
+    def _register_memory_report_route(self) -> None:
+        """Serve ``GET /memory_report`` when the GPU memory monitor is on.
+
+        Opt-in through the monitor's own switch, ``TLLM_MEM_MONITOR=1``, so
+        it neither depends on sleep mode, as the runtime-control routes do,
+        nor exists when the monitor is off.
+        """
+        from tensorrt_llm._torch.memory.monitor import \
+            enabled as monitor_enabled
+
+        if not monitor_enabled():
+            return
+        self.app.add_api_route("/memory_report",
+                               self.memory_report,
+                               methods=["GET"])
 
     def _register_runtime_control_routes(self) -> None:
         if not self._enable_runtime_control_endpoints:
@@ -3850,6 +3867,24 @@ class OpenAIServer(_VideoRoutesMixin):
                                     "message": str(error)
                                 }})
         return JSONResponse(content=status.model_dump(mode="json"))
+
+    async def memory_report(self) -> JSONResponse:
+        """Where each GPU worker's memory is going, as readable reports.
+
+        See ``LLM.get_memory_report``.
+        """
+        try:
+            if isinstance(self.generator, AsyncLLM):
+                reports = await self.generator.get_memory_report()
+            else:
+                reports = await asyncio.to_thread(
+                    self.generator.get_memory_report)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content={"reports": reports})
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:

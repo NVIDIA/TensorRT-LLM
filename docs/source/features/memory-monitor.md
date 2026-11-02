@@ -67,6 +67,10 @@ with LLM(model="Qwen/Qwen2-0.5B-Instruct") as llm:
 Without `TLLM_MEM_MONITOR=1` for the run, the report has no startup-step
 breakdown and no comparison with warmup, but every row is still there.
 
+A `trtllm-serve` started with `TLLM_MEM_MONITOR=1` answers the same request
+at `GET /memory_report`, with `{"reports": [...]}`. The route exists only
+while the monitor is on.
+
 ## Reading a report
 
 An out-of-memory report from a run whose logits processor kept allocating:
