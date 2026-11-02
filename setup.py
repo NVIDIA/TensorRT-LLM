@@ -20,7 +20,27 @@ import sys
 from pathlib import Path
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
 from setuptools.dist import Distribution
+
+
+class MsaBuildPy(build_py):
+    """Do not reuse precompiled FMHA binaries from a previous wheel build."""
+
+    def run(self):
+        import shutil
+
+        package_dir = Path(self.build_lib) / "fmha_sm100"
+        if package_dir.is_symlink():
+            raise RuntimeError(f"Refusing to clean FMHA artifacts through symlink: {package_dir}")
+        if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
+            raise RuntimeError(f"Refusing to clean FMHA source directory: {package_dir}")
+        target = package_dir / "_aot"
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        super().run()
 
 
 def parse_requirements(filename: os.PathLike):
@@ -699,6 +719,7 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    cmdclass={"build_py": MsaBuildPy},
     options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",

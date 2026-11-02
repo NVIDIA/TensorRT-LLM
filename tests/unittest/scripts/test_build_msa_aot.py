@@ -7,6 +7,7 @@ import ast
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -282,3 +283,67 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
     assert "fmha_sm100/cutlass/include/cutlass/cutlass.h" in entries
     for name in ("manifest.json", "all_variants.so", "plan.so", "sparse_topk.so", "reduction.so"):
         assert f"fmha_sm100/_aot/sourcehash/{name}" in entries
+
+
+def test_incremental_wheel_drops_previous_fmha_artifacts(tmp_path):
+    setup_path = _SCRIPT.parents[1] / "setup.py"
+    setup_source = setup_path.read_text()
+    setup_tree = ast.parse(setup_source)
+    command = next(node for node in setup_tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    command_source = ast.get_source_segment(setup_source, command)
+    package = tmp_path / "fmha_sm100"
+    old = package / "_aot/oldhash"
+    old.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (old / "old.so").write_bytes(b"old")
+    (tmp_path / "setup.py").write_text(
+        "from pathlib import Path\nfrom setuptools import setup\n"
+        "from setuptools.command.build_py import build_py\n"
+        f"{command_source}\n"
+        "setup(name='msa-incremental-check', version='0.0.1', packages=['fmha_sm100'], "
+        "package_data={'fmha_sm100': ['_aot/*/*.so']}, cmdclass={'build_py': MsaBuildPy})\n"
+    )
+    build = [sys.executable, "setup.py", "bdist_wheel"]
+    subprocess.run(build, cwd=tmp_path, check=True, capture_output=True, text=True)
+    shutil.rmtree(package / "_aot")
+    new = package / "_aot/newhash"
+    new.mkdir(parents=True)
+    (new / "new.so").write_bytes(b"new")
+    subprocess.run(build, cwd=tmp_path, check=True, capture_output=True, text=True)
+    with zipfile.ZipFile(next((tmp_path / "dist").glob("*.whl"))) as archive:
+        entries = set(archive.namelist())
+    assert "fmha_sm100/_aot/newhash/new.so" in entries
+    assert "fmha_sm100/_aot/oldhash/old.so" not in entries
+    subprocess.run([sys.executable, "setup.py", "editable_wheel"], cwd=tmp_path,
+                   check=True, capture_output=True, text=True)
+    assert (new / "new.so").read_bytes() == b"new"
+
+
+@pytest.mark.parametrize("link_kind", ["package", "build_root"])
+def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
+    from setuptools.command.build_py import build_py
+    from setuptools.dist import Distribution
+
+    setup_path = _SCRIPT.parents[1] / "setup.py"
+    setup_tree = ast.parse(setup_path.read_text())
+    command = next(node for node in setup_tree.body
+                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    namespace = {"Path": Path, "build_py": build_py}
+    exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
+    source = tmp_path / "source/fmha_sm100"
+    artifact = source / "_aot/hash/kernel.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"keep")
+    build = tmp_path / "build"
+    if link_kind == "package":
+        build.mkdir()
+        (build / "fmha_sm100").symlink_to(source, target_is_directory=True)
+    else:
+        build.symlink_to(source.parent, target_is_directory=True)
+    command_instance = namespace["MsaBuildPy"](Distribution())
+    command_instance.build_lib = str(build)
+    command_instance.package_dir = {"fmha_sm100": str(source)}
+    with pytest.raises(RuntimeError, match="symlink|source"):
+        command_instance.run()
+    assert artifact.read_bytes() == b"keep"
