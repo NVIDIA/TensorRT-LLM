@@ -167,7 +167,6 @@ if [ "${useRunTests:-false}" = "true" ]; then
     # isolated and rerun pytest sessions, then merges the results.
     runTestsArgs=(
         python3 "$llmSrcNode/jenkins/scripts/run_tests.py"
-        --render
         --test-db-list "$testListPathNode"
         --splits "${testSplits:-1}"
         --group "${testGroup:-1}"

@@ -13,19 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.util
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-_RUN_TESTS_PATH = REPO_ROOT / "jenkins" / "scripts" / "run_tests.py"
+# run_tests.py and the ci_test_runner package import each other and test_rerun
+# from jenkins/scripts, as they do when run_tests.py is the entry point.
+sys.path.insert(0, str(REPO_ROOT / "jenkins" / "scripts"))
 
-_spec = importlib.util.spec_from_file_location("run_tests", _RUN_TESTS_PATH)
-run_tests = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(run_tests)
+import run_tests  # noqa: E402
+from ci_test_runner import execution, render, results  # noqa: E402
+from ci_test_runner.execution import RunOutcome  # noqa: E402
 
 ATTENTION_DIR = (
     "unittest/_torch/attention"
@@ -44,12 +46,18 @@ def _collect_output(test_ids):
     return "\n".join(lines)
 
 
+def _tmp_dir(test_case):
+    tmp = tempfile.TemporaryDirectory()
+    test_case.addCleanup(tmp.cleanup)
+    return Path(tmp.name)
+
+
 class FindTestListLineTest(unittest.TestCase):
     def test_exact_match_wins_over_ignore_substring(self) -> None:
         lines = [ATTENTION_DIR, GVR_FILE]
 
-        self.assertEqual(run_tests._find_test_list_line(GVR_FILE, lines), GVR_FILE)
-        self.assertEqual(run_tests._find_test_list_line(ATTENTION_DIR, lines), ATTENTION_DIR)
+        self.assertEqual(render._find_test_list_line(GVR_FILE, lines), GVR_FILE)
+        self.assertEqual(render._find_test_list_line(ATTENTION_DIR, lines), ATTENTION_DIR)
 
     def test_marker_suffix_is_ignored_when_matching(self) -> None:
         unittest_line = "unittest/_torch/modules/test_mhc.py TIMEOUT (90)"
@@ -57,9 +65,9 @@ class FindTestListLineTest(unittest.TestCase):
         lines = [unittest_line, nodeid_line]
 
         # test_unittests_v2 keeps the TIMEOUT marker in its parameter id.
-        self.assertEqual(run_tests._find_test_list_line(unittest_line, lines), unittest_line)
+        self.assertEqual(render._find_test_list_line(unittest_line, lines), unittest_line)
         self.assertEqual(
-            run_tests._find_test_list_line(
+            render._find_test_list_line(
                 "accuracy/test_llm_api_pytorch.py::TestA::test_b[c]", lines
             ),
             nodeid_line,
@@ -69,23 +77,21 @@ class FindTestListLineTest(unittest.TestCase):
         line = 'unittest/_torch/moe/test_moe_module.py::test_single_gpu -k "CUTLASS"'
 
         self.assertEqual(
-            run_tests._find_test_list_line("test_moe_module.py::test_single_gpu", [line]), line
+            render._find_test_list_line("test_moe_module.py::test_single_gpu", [line]), line
         )
-        self.assertIsNone(run_tests._find_test_list_line("unittest/other.py", [line]))
+        self.assertIsNone(render._find_test_list_line("unittest/other.py", [line]))
 
 
 class RenderTestListTest(unittest.TestCase):
-    def _render(self, test_db_lines, collected_ids):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        tmp_dir = Path(tmp.name)
+    def _render(self, test_db_lines, collected_ids, returncode=0):
+        tmp_dir = _tmp_dir(self)
         test_db = tmp_dir / "l0_test.txt"
         test_db.write_text("\n".join(test_db_lines) + "\n")
         collect = subprocess.CompletedProcess(
-            args="pytest", returncode=0, stdout=_collect_output(collected_ids), stderr=""
+            args="pytest", returncode=returncode, stdout=_collect_output(collected_ids), stderr=""
         )
-        with mock.patch.object(run_tests.subprocess, "run", return_value=collect):
-            regular_file, isolate_file, _, _ = run_tests.render_test_list(
+        with mock.patch.object(render.subprocess, "run", return_value=collect):
+            regular_file, isolate_file, _, _ = render.render_test_list(
                 str(test_db), str(tmp_dir), splits=1, group=1, perf_mode=False
             )
         return (
@@ -117,49 +123,66 @@ class RenderTestListTest(unittest.TestCase):
         self.assertEqual(regular, [GVR_FILE])
         self.assertEqual(isolate, [ATTENTION_DIR])
 
+    def test_failed_collection_is_a_setup_error(self) -> None:
+        with self.assertRaises(render.SetupError):
+            self._render([GVR_FILE], [], returncode=4)
+
 
 class RunIsolatedTestsSummaryTest(unittest.TestCase):
-    def _run(self, write_rerun_0):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        output_dir = Path(tmp.name)
+    def _run(self, not_rerun):
+        output_dir = _tmp_dir(self)
         isolate_list = output_dir / "isolate.txt"
         isolate_list.write_text("unittest/a.py\nunittest/b.py\n")
 
-        def fake_check_and_rerun(result_xml, base_cmd, working_dir, out_dir, rerun_tag, *args):
-            if write_rerun_0:
-                rerun_dir = Path(out_dir, "rerun", rerun_tag)
-                rerun_dir.mkdir(parents=True, exist_ok=True)
-                (rerun_dir / "rerun_0.txt").write_text("unittest/b.py\n")
-            return False, []
+        def fake_check_and_rerun(result_xml, *args):
+            return RunOutcome(result_xml, not_rerun=not_rerun)
 
         # The first isolated test passes, the second fails after > 10 min.
         pytest_results = iter([(0, 30.0, []), (1, 700.0, [])])
         with (
             mock.patch.object(
-                run_tests, "run_pytest", side_effect=lambda *a, **k: next(pytest_results)
+                execution, "run_pytest", side_effect=lambda *a, **k: next(pytest_results)
             ),
-            mock.patch.object(run_tests, "check_and_rerun", side_effect=fake_check_and_rerun),
-            mock.patch.object(run_tests, "print_phase_summary") as summary,
+            mock.patch.object(execution, "check_and_rerun", side_effect=fake_check_and_rerun),
+            mock.patch.object(execution, "print_phase_summary") as summary,
         ):
-            run_tests.run_isolated_tests(
+            outcomes = execution.run_isolated_tests(
                 "pytest", str(isolate_list), str(output_dir), str(output_dir), "stage", []
             )
         _, passed, failed, _ = summary.call_args.args
-        return passed, failed
+        return passed, failed, outcomes
 
     def test_failure_not_eligible_for_rerun_is_counted_as_failed(self) -> None:
-        self.assertEqual(self._run(write_rerun_0=True), (1, 1))
+        passed, failed, outcomes = self._run(not_rerun=True)
+        self.assertEqual((passed, failed), (1, 1))
+        self.assertEqual([o.not_rerun for o in outcomes], [False, True])
 
     def test_failure_fixed_by_rerun_is_counted_as_passed(self) -> None:
-        self.assertEqual(self._run(write_rerun_0=False), (2, 0))
+        passed, failed, _ = self._run(not_rerun=False)
+        self.assertEqual((passed, failed), (2, 0))
 
 
 class CheckAndRerunTest(unittest.TestCase):
+    def _check_and_rerun(self, output_dir, fake_generate, fake_run_pytest):
+        with (
+            mock.patch.object(
+                execution.test_rerun, "generate_rerun_tests_list", side_effect=fake_generate
+            ),
+            mock.patch.object(execution, "run_pytest", side_effect=fake_run_pytest) as run,
+        ):
+            outcome = execution.check_and_rerun(
+                str(output_dir / "results.xml"),
+                "pytest",
+                str(output_dir),
+                str(output_dir),
+                "regular",
+                [],
+                str(output_dir / "regular.txt"),
+            )
+        return outcome, run
+
     def test_reruns_every_eligible_test_without_a_cap(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        output_dir = Path(tmp.name)
+        output_dir = _tmp_dir(self)
         not_run = [f"unittest/t{i}.py" for i in range(24)]
 
         def fake_generate(rerun_dir, *args):
@@ -169,30 +192,15 @@ class CheckAndRerunTest(unittest.TestCase):
             Path(output_dir, "rerun", "regular", "rerun_results_1.xml").write_text("<testsuites/>")
             return 0, 1.0, []
 
-        with (
-            mock.patch.object(
-                run_tests.test_rerun, "generate_rerun_tests_list", side_effect=fake_generate
-            ),
-            mock.patch.object(run_tests, "run_pytest", side_effect=fake_run_pytest) as run,
-        ):
-            is_rerun_failed, xmls = run_tests.check_and_rerun(
-                str(output_dir / "results.xml"),
-                "pytest",
-                str(output_dir),
-                str(output_dir),
-                "regular",
-                [],
-                str(output_dir / "regular.txt"),
-            )
+        outcome, run = self._check_and_rerun(output_dir, fake_generate, fake_run_pytest)
 
         run.assert_called_once()
-        self.assertFalse(is_rerun_failed)
-        self.assertEqual(len(xmls), 1)
+        self.assertFalse(outcome.failed_after_rerun)
+        self.assertFalse(outcome.not_rerun)
+        self.assertEqual(len(outcome.rerun_xmls), 1)
 
     def test_crashed_rerun_keeps_the_earlier_attempt_xml(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        output_dir = Path(tmp.name)
+        output_dir = _tmp_dir(self)
         rerun_dir = output_dir / "rerun" / "regular"
 
         def fake_generate(rerun_dir, *args):
@@ -205,31 +213,125 @@ class CheckAndRerunTest(unittest.TestCase):
                 Path(rerun_dir, "rerun_results_1.xml").write_text("<testsuites/>")
             return 1, 1.0, []
 
+        outcome, _ = self._check_and_rerun(output_dir, fake_generate, fake_run_pytest)
+
+        self.assertTrue(outcome.failed_after_rerun)
+        self.assertEqual(outcome.rerun_xmls, [str(rerun_dir / "rerun_results_1.xml")])
+
+    def test_failure_not_eligible_for_rerun_is_reported(self) -> None:
+        output_dir = _tmp_dir(self)
+
+        def fake_generate(rerun_dir, *args):
+            Path(rerun_dir, "rerun_0.txt").write_text("unittest/long.py\n")
+
+        outcome, run = self._check_and_rerun(output_dir, fake_generate, None)
+
+        run.assert_not_called()
+        self.assertTrue(outcome.not_rerun)
+        self.assertFalse(outcome.failed_after_rerun)
+
+
+class MergeResultsTest(unittest.TestCase):
+    def test_rerun_report_covers_only_runs_that_were_rerun(self) -> None:
+        output_dir = _tmp_dir(self)
+
+        def xml(name):
+            path = output_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('<testsuites><testsuite name="pytest"/></testsuites>')
+            return str(path)
+
+        regular = RunOutcome(xml("results.xml"), [xml("rerun/regular/rerun_results_1.xml")])
+        iso_0 = RunOutcome(xml("results_isolated_0.xml"))
+        iso_1 = RunOutcome(
+            xml("results_isolated_1.xml"), [xml("rerun/isolated_1/rerun_results_2.xml")]
+        )
+        # pytest died before writing this one.
+        iso_2 = RunOutcome(str(output_dir / "results_isolated_2.xml"))
+
         with (
-            mock.patch.object(
-                run_tests.test_rerun, "generate_rerun_tests_list", side_effect=fake_generate
-            ),
-            mock.patch.object(run_tests, "run_pytest", side_effect=fake_run_pytest),
+            mock.patch.object(results.test_rerun, "generate_rerun_report") as report,
+            mock.patch.object(results.test_rerun, "merge_junit_xmls") as merge,
         ):
-            is_rerun_failed, xmls = run_tests.check_and_rerun(
-                str(output_dir / "results.xml"),
-                "pytest",
-                str(output_dir),
-                str(output_dir),
-                "regular",
-                [],
-                str(output_dir / "regular.txt"),
+            results.merge_results(str(output_dir), "stage", [regular, iso_0, iso_1, iso_2])
+
+        self.assertEqual(
+            report.call_args.args[1],
+            [
+                regular.result_xml,
+                iso_1.result_xml,
+                *regular.rerun_xmls,
+                *iso_1.rerun_xmls,
+            ],
+        )
+        self.assertEqual(
+            merge.call_args.args[1],
+            [
+                regular.result_xml,
+                *regular.rerun_xmls,
+                iso_0.result_xml,
+                iso_1.result_xml,
+                *iso_1.rerun_xmls,
+            ],
+        )
+        self.assertIn('name="stage"', Path(regular.result_xml).read_text())
+        self.assertFalse(Path(iso_0.result_xml).exists())
+        self.assertFalse(Path(iso_1.result_xml).exists())
+
+    def test_no_rerun_report_without_reruns(self) -> None:
+        output_dir = _tmp_dir(self)
+        results.create_empty_results_xml(str(output_dir), "stage")
+
+        with (
+            mock.patch.object(results.test_rerun, "generate_rerun_report") as report,
+            mock.patch.object(results.test_rerun, "merge_junit_xmls"),
+        ):
+            results.merge_results(
+                str(output_dir), "stage", [RunOutcome(str(output_dir / "results.xml"))]
             )
 
-        self.assertTrue(is_rerun_failed)
-        self.assertEqual(xmls, [str(rerun_dir / "rerun_results_1.xml")])
+        report.assert_not_called()
+
+
+class RunExitCodeTest(unittest.TestCase):
+    def _run(self, regular_outcome, counts=(1, 0)):
+        output_dir = _tmp_dir(self)
+        argv = [
+            "--test-db-list",
+            str(output_dir / "l0.txt"),
+            "--pytest-base-cmd",
+            "pytest",
+            "--stage-name",
+            "stage",
+            "--output-dir",
+            str(output_dir),
+        ]
+        rendered = ("regular.txt", "isolate.txt", *counts)
+        with (
+            mock.patch.object(run_tests, "render_test_list", return_value=rendered),
+            mock.patch.object(run_tests, "run_regular_tests", return_value=regular_outcome),
+            mock.patch.object(run_tests, "merge_results"),
+        ):
+            return run_tests.main(argv)
+
+    def test_passing_run_exits_zero(self) -> None:
+        self.assertEqual(self._run(RunOutcome("results.xml")), 0)
+
+    def test_failure_after_rerun_wins_over_not_rerun(self) -> None:
+        outcome = RunOutcome("results.xml", failed_after_rerun=True, not_rerun=True)
+        self.assertEqual(self._run(outcome), run_tests.EXIT_TESTS_FAILED)
+
+    def test_failure_not_eligible_for_rerun(self) -> None:
+        outcome = RunOutcome("results.xml", not_rerun=True)
+        self.assertEqual(self._run(outcome), run_tests.EXIT_TESTS_NOT_RERUN)
+
+    def test_no_tests_is_a_setup_failure(self) -> None:
+        self.assertEqual(self._run(None, counts=(0, 0)), run_tests.EXIT_SETUP_FAILED)
 
 
 class CountXmlResultsTest(unittest.TestCase):
     def test_counts_passed_and_failed_excluding_skipped(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        xml = Path(tmp.name, "results.xml")
+        xml = _tmp_dir(self) / "results.xml"
         xml.write_text(
             "<testsuites><testsuite>"
             '<testcase name="a"/>'
@@ -239,10 +341,10 @@ class CountXmlResultsTest(unittest.TestCase):
             '<testcase name="e"><skipped/></testcase>'
             "</testsuite></testsuites>"
         )
-        self.assertEqual(run_tests.count_xml_results(str(xml)), (2, 2))
+        self.assertEqual(results.count_xml_results(str(xml)), (2, 2))
 
     def test_missing_xml_counts_nothing(self) -> None:
-        self.assertEqual(run_tests.count_xml_results("/nonexistent/results.xml"), (0, 0))
+        self.assertEqual(results.count_xml_results("/nonexistent/results.xml"), (0, 0))
 
 
 if __name__ == "__main__":

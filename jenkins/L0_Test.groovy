@@ -5478,7 +5478,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rm -rf '${stageName}/'
                             cd '${llmSrc}/tests/integration/defs'
                             python3 ${llmSrc}/jenkins/scripts/run_tests.py \\
-                                --render \\
                                 --test-db-list ${testDBList} \\
                                 --splits ${splits} \\
                                 --group ${splitId} \\
