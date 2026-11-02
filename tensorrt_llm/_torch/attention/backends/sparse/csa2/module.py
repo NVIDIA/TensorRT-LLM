@@ -13,7 +13,11 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.distributed import AllReduceStrategy
-from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    mxfp8_gemm_backend_override,
+)
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -108,15 +112,21 @@ class DeepseekV41Attention(nn.Module):
         if sparse_params.fuse_packed_output_rope and pos_embd_params.is_neox:
             raise ValueError("CSA2 packed output RoPE requires interleaved rotary channels")
         quant_config = None
+        self._o_a_flashinfer = False
         if projection_quantization == "mxfp8":
             if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
                 (10, 0),
                 (10, 3),
+                (12, 0),
             ):
-                raise ValueError("CSA2 native MXFP8 projections require SM100/SM103")
+                raise ValueError(
+                    "CSA2 native MXFP8 projections require SM100/SM103/SM120; "
+                    "SM121 has no FP8 block-scale BMM for the output projection"
+                )
             if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
                 raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
             quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)
+            self._o_a_flashinfer = mxfp8_gemm_backend_override() == "flashinfer"
         if self._fuse_index_q and (
             projection_quantization != "mxfp8"
             or index_head_dim != 128
@@ -487,8 +497,12 @@ class DeepseekV41Attention(nn.Module):
         projections = []
         for group in range(self.n_local_groups):
             data, scales = torch.ops.trtllm.mxfp8_quantize(grouped[:, group].contiguous(), True)
-            projections.append(
-                torch.ops.trtllm.mxfp8_mxfp8_gemm(
+            if self._o_a_flashinfer:
+                projection = torch.ops.trtllm.flashinfer_mm_mxfp8(
+                    data, scales, self.o_a_proj[group], self.o_a_proj_scale[group], self.dtype
+                )
+            else:
+                projection = torch.ops.trtllm.mxfp8_mxfp8_gemm(
                     data,
                     scales,
                     self.o_a_proj[group],
@@ -496,7 +510,7 @@ class DeepseekV41Attention(nn.Module):
                     self._fp8_alpha,
                     self.dtype,
                 )
-            )
+            projections.append(projection)
         return self.o_b_proj(torch.cat(projections, dim=-1))
 
     def forward(

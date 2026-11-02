@@ -1033,6 +1033,11 @@
       "path": "mm_encoder_only"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "mnnvl_allreduce_fp8_payload"
+    },
+    {
       "allowed_values": [
         "off",
         "auto",
@@ -1377,6 +1382,11 @@
       "path": "reorder_policy_config.policy_name"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "replicate_embedding"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "request_stats_max_iterations"
@@ -1412,6 +1422,20 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "allowed_values": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "capture_policy": "enum[ContextSchedulingPolicy]",
+      "kind": "categorical",
+      "path": "scheduler_config.context_scheduling_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_starvation_iterations"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
@@ -1444,6 +1468,11 @@
       "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",
       "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_frontend_affinity_port_stride"
     },
     {
       "capture_policy": "bool",
@@ -1764,6 +1793,24 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "speculative_config.decoding_type"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "mxfp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_lm_head_dtype"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "nvfp4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_moe_dtype"
     },
     {
       "capture_policy": "int|none",

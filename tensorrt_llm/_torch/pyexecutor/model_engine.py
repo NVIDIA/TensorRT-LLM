@@ -88,6 +88,21 @@ from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the one-engine speculative language model
+    (the model itself, or a multimodal model's language model); False for any
+    other model."""
+    from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
+
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return isinstance(model, SpecDecOneEngineForCausalLM) and model.spec_decode_fast_paths
+
+
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
 # matches checkpoint tensors by dotted path (modeling_utils.py:1141-1160). With
@@ -293,6 +308,7 @@ class ModelEngine:
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
         self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
@@ -760,6 +776,7 @@ class ModelEngine:
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
+            spec_decode_fast_paths=self.spec_decode_fast_paths,
             **extra_fields,
         )
 
@@ -921,6 +938,11 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             assert self._lora_model is not None
             self._runner.init_cuda_graph_lora_manager(lora_config, self._lora_model)
+
+    def drop_greedy_only_outputs(self) -> None:
+        """Have every batch return logits, for an executor-side guided decoder that reads them."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.keep_greedy_only_outputs = False
 
     def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
         if hasattr(self.model, "set_guided_decoder"):

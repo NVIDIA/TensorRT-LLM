@@ -2922,7 +2922,6 @@ def _compile_k2(
     has_state_output: bool,
     transpose_state: bool,
     is_varlen: bool,
-    state_row_stride: int | None,
     has_state_indices: bool,
 ):
     if torch.cuda.is_current_stream_capturing():
@@ -2948,11 +2947,14 @@ def _compile_k2(
     state = (b, h, d, d)
 
     def fake_state():
-        if state_row_stride is None:
+        if not has_state_indices:
             return _fake(_cute_dtype(state_dtype), state)
+        # An indexed row may start beyond 2**31 elements into the pool (a strided
+        # view of the KV-cache memory), so the row stride is a 64-bit runtime value.
         return cute.runtime.make_fake_tensor(
             _cute_dtype(state_dtype), state,
-            stride=(state_row_stride, d * d, d, 1), assumed_align=16,
+            stride=(cute.sym_int64(divisibility=16 // state_dtype.itemsize), d * d, d, 1),
+            assumed_align=16,
         )
 
     q, k, kr = [_fake(cu_dtype, feature) for _ in range(3)]
@@ -3104,7 +3106,6 @@ def chunk_kda_fwd_k2(
         has_output,
         transpose_state,
         is_varlen,
-        state_input.stride(0) if state_indices is not None else None,
         state_indices is not None,
     )
     compiled(

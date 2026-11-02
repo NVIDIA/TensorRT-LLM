@@ -43,6 +43,7 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/pyexecutor/kv_cache/sharing
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
+  - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
   - unittest/_torch/pyexecutor/test_error_classification.py
@@ -62,6 +63,7 @@ l0_a10:
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_cuda_architecture_check.py
+  - unittest/others/test_import_cuda_context.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
@@ -71,11 +73,11 @@ l0_a10:
   # false advertisement by construction. The image case uses Qwen3-VL-2B.
   - unittest/grpc/openengine/test_capability_conformance.py
   - unittest/grpc/openengine/test_multimodal_conformance.py
+  - unittest/grpc/openengine/test_image_routing_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
   - unittest/disaggregated/test_extractor.py
-  - unittest/disaggregated/test_bounce.py
   - unittest/disaggregated/test_mamba_transfer.py
   - unittest/disaggregated/test_msgspec_route.py
   - unittest/disaggregated/test_steady_clock_sync.py

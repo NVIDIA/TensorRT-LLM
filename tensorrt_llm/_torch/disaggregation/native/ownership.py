@@ -15,11 +15,11 @@
 
 """Physical-access bookkeeping for the native transfer protocol.
 
-Native sessions supply participant mappings and protocol evidence, submit and
-poll backend operations, and synchronize local copies. These helpers retain
-operation roots and account for physical access; allocation and registration
-ownership remain with the native caller. Logical outcomes stay separate, and
-deadline arbitration comes from the shared lifecycle package.
+Native sessions supply participant mappings and protocol evidence, and submit
+and poll backend operations. These helpers retain operation roots and account
+for physical access; allocation and registration ownership remain with the
+native caller. Logical outcomes stay separate, and deadline arbitration comes
+from the shared lifecycle package.
 """
 
 from __future__ import annotations
@@ -262,11 +262,10 @@ class ReceiveOperationOwner:
         self._in_doubt_writers: set[int] = set()
         self._settled_writers: set[int] = set()
         self._publication_failed = False
-        self._local_completion_pending = False
         self._invalid_evidence = False
 
     def _settle_if_drained_locked(self) -> None:
-        """Remove this claim only after the complete cohort and local work settle."""
+        """Remove this claim only after the complete cohort and publication settle."""
         if self._retirement is not None and self._resources_drained_locked():
             self._retirement.settle(self)
 
@@ -408,13 +407,7 @@ class ReceiveOperationOwner:
             self._settle_if_drained_locked()
             return True
 
-    def record_writer_result(
-        self,
-        peer_rank: int,
-        succeeded: bool,
-        *,
-        wait_for_local_completion: bool,
-    ) -> tuple[bool, bool]:
+    def record_writer_result(self, peer_rank: int, succeeded: bool) -> tuple[bool, bool]:
         """Record one writer and return ``(accepted, all_succeeded)``."""
         with self._lock:
             if self._expected_writers is None:
@@ -445,15 +438,8 @@ class ReceiveOperationOwner:
             all_succeeded = (
                 all_reported and not self._publication_failed and all(self._writer_results.values())
             )
-            if all_succeeded and wait_for_local_completion:
-                self._local_completion_pending = True
             self._settle_if_drained_locked()
             return True, all_succeeded
-
-    def finish_local_completion(self) -> None:
-        with self._lock:
-            self._local_completion_pending = False
-            self._settle_if_drained_locked()
 
     @property
     def all_writers_reported(self) -> bool:
@@ -484,7 +470,6 @@ class ReceiveOperationOwner:
                 )
             )
             and not self._publication_pending
-            and not self._local_completion_pending
             and not self._in_doubt_writers
             and not self._invalid_evidence
         )
