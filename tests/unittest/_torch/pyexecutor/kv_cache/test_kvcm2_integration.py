@@ -1404,11 +1404,14 @@ def test_extend_swa_windows_for_reuse_preserves_non_attention_windows() -> None:
     ) == [None, 0, recurrent_states, 6, None]
 
 
-def test_pool_ratio_overrides_constraints() -> None:
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("offload", [False, True])
+def test_pool_ratio_overrides_constraints(offload: bool) -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(pool_ratio=[1.0], avg_seq_len=256, host_cache_size=0),
         max_batch_size=3,
         max_num_tokens=2048,
+        sparse_kv_offload=SparseKvCacheOffloadConfig() if offload else None,
     )
 
     assert config.initial_pool_ratio == pytest.approx([1.0])
@@ -1446,8 +1449,9 @@ def test_avg_seq_len_builds_context_warmup_constraint() -> None:
     assert config.constraints == [BatchDesc([KVCacheDesc(capacity=2048, history_length=0)])]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("avg_seq_len", "capacity"), [(1024, 1024), (None, 2048)], ids=["avg_seq_len", "max_seq_len"]
+    ("avg_seq_len", "capacity"), [(1024, 897), (None, 1921)], ids=["avg_seq_len", "max_seq_len"]
 )
 def test_sparse_kv_offload_typical_step_models_only_decoding(
     avg_seq_len: int | None, capacity: int
@@ -1457,18 +1461,67 @@ def test_sparse_kv_offload_typical_step_models_only_decoding(
         max_batch_size=3,
         max_seq_len=2048,
         max_num_tokens=2048,
-        max_draft_len=2,
         sparse_kv_offload=SparseKvCacheOffloadConfig(),
     )
 
-    # A worker that offloads sparse history only decodes requests of avg_seq_len, or
-    # else of max_seq_len, and its warmup runs no context batch to hold room for. The
-    # manager splits the quota from this step, host-backed pools included.
+    # Decode-only sizing samples a block boundary within avg_seq_len or max_seq_len,
+    # with no context warmup batch. The native manager still derives the pool ratio.
     assert config.typical_step == BatchDesc(
-        [KVCacheDesc(capacity=capacity, history_length=capacity - 3)] * 3
+        [KVCacheDesc(capacity=capacity, history_length=capacity - 1)] * 3
     )
     assert config.constraints == []
     assert config.initial_pool_ratio is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("max_seq_len", "full_history_pages"),
+    [
+        (1, 1),
+        (127, 1),
+        (128, 1),
+        (129, 2),
+        (255, 2),
+        (256, 2),
+        (257, 3),
+        (32768, 256),
+        (32769, 257),
+        (33024, 258),
+        (33025, 259),
+    ],
+)
+@pytest.mark.parametrize("num_sink_tokens", [0, 129])
+def test_sparse_kv_offload_pool_sizing_covers_window_boundaries(
+    max_seq_len: int, full_history_pages: int, num_sink_tokens: int
+) -> None:
+    config = _make_cache_config_for_test(
+        KvCacheConfig(host_cache_size=0),
+        max_seq_len=max_seq_len,
+        sparse_kv_offload=SparseKvCacheOffloadConfig(),
+    )
+    tokens_per_block = config.tokens_per_block
+    generation = config.typical_step.kv_caches[0]
+    assert 0 < generation.capacity <= max_seq_len
+    assert generation.history_length == generation.capacity - 1
+    assert (generation.capacity + tokens_per_block - 1) // tokens_per_block == full_history_pages
+
+    def required_pages(life_cycle: AttnLifeCycle, capacity: int) -> int:
+        stale = life_cycle.get_stale_range(capacity - 1, tokens_per_block)
+        return (capacity + tokens_per_block - 1) // tokens_per_block - len(stale)
+
+    for window in (None, 1, 8, 128, 129, 256, 65536):
+        life_cycle = AttnLifeCycle.make(
+            window, num_sink_tokens if window is not None else 0, tokens_per_block
+        )
+        # Native lifecycle accounting must cover every decode phase, including
+        # windows shorter than a page, non-aligned windows and retained sinks.
+        peak_pages = max(
+            required_pages(life_cycle, capacity)
+            for capacity in range(max(1, max_seq_len - tokens_per_block + 1), max_seq_len + 1)
+        )
+        assert required_pages(life_cycle, generation.capacity) == peak_pages, window
+        if max_seq_len == 33024 and num_sink_tokens == 0 and window in (8, 128):
+            assert peak_pages == 2
 
 
 def test_avg_seq_len_updates_typical_step() -> None:

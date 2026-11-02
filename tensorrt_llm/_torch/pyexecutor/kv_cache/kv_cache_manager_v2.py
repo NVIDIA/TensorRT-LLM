@@ -3913,6 +3913,12 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Size its step for the length offload is sized for, which is
                 # max_seq_len when avg_seq_len is not set.
                 typical_seq_len = self._get_sparse_offload_seq_len(kv_cache_config)
+                # Use the first token in the last ledger block: full-history pools
+                # still need the same number of pages, while sliding windows span
+                # their maximum number of pages as decode crosses a block boundary.
+                typical_seq_len = (
+                    (typical_seq_len - 1) // self._ledger_tokens_per_block
+                ) * self._ledger_tokens_per_block + 1
 
             if typical_seq_len is not None:
                 # Model enough generation requests to fill the resident request
