@@ -4085,7 +4085,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..1a181a3 100644
+index fa63a02..478a23a 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4297,70 +4297,209 @@ index fa63a02..1a181a3 100644
          self._inst_template = None
          self._run_template = None
  
-@@ -256,10 +374,13 @@ class FMHAVariantManager:
+@@ -254,12 +372,21 @@ class FMHAVariantManager:
+             with open(_FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja") as f:
+                 self._run_template = jinja2.Template(f.read())
  
-     def _ensure_all_module(self):
-         if not self._all_module_checked:
+-    def _ensure_all_module(self):
+-        if not self._all_module_checked:
 -            self._all_module_checked = True
 -            if _ALL_VARIANTS_SO.exists():
++    def _ensure_all_module(self, packaged=None):
++        if packaged is None:
 +            packaged = _aot_module_path("variants")
++        use_packaged = packaged is not None
++        if not self._all_module_checked or self._all_module_packaged != use_packaged:
 +            path = packaged or _ALL_VARIANTS_SO
++            if packaged is not None and not path.is_file():
++                raise FileNotFoundError(path)
++            module = None
 +            if path.exists():
                  import tvm_ffi
 -                self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
-+                self._all_module = tvm_ffi.load_module(str(path))
-+                self._all_module_packaged = packaged is not None
++                module = tvm_ffi.load_module(str(path))
++            self._all_module = module
++            self._all_module_packaged = use_packaged
 +            self._all_module_checked = True
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -285,8 +406,9 @@ class FMHAVariantManager:
+@@ -267,26 +394,29 @@ class FMHAVariantManager:
+             dtype_code, qo_tile_size, single_wg,
+             sparse_mode, page_size, split_kv, pack_factor)
+ 
+-        cached = self._loaded.get(variant_name)
++        packaged = _aot_module_path("variants")
++        cache_key = (variant_name, packaged is not None)
++        cached = self._loaded.get(cache_key)
+         if cached is not None:
+             return cached
+ 
+         with self._lock:
+-            cached = self._loaded.get(variant_name)
++            cached = self._loaded.get(cache_key)
+             if cached is not None:
+                 return cached
+ 
+             fn_name = f"run_{variant_name}"
+ 
+             # Try all_variants.so
+-            self._ensure_all_module()
++            self._ensure_all_module(packaged)
+             if self._all_module is not None:
+                 try:
                      fn = getattr(self._all_module, fn_name)
-                     self._loaded[variant_name] = _VariantWrapper(fn)
-                     return self._loaded[variant_name]
+-                    self._loaded[variant_name] = _VariantWrapper(fn)
+-                    return self._loaded[variant_name]
 -                except AttributeError:
 -                    pass
++                    self._loaded[cache_key] = _VariantWrapper(fn)
++                    return self._loaded[cache_key]
 +                except AttributeError as exc:
 +                    if self._all_module_packaged:
 +                        raise RuntimeError(f"Packaged FMHA library is missing {fn_name}") from exc
  
              # Try per-variant .so
              cache_dir = CACHE_BASE / variant_name
-@@ -455,6 +577,10 @@ def _compile_plan_only():
+@@ -301,8 +431,8 @@ class FMHAVariantManager:
+                 fn = getattr(module, fn_name)
+             finally:
+                 _release_file_lock(lock_fd)
+-            self._loaded[variant_name] = _VariantWrapper(fn)
+-            return self._loaded[variant_name]
++            self._loaded[cache_key] = _VariantWrapper(fn)
++            return self._loaded[cache_key]
  
- def _compile_plan_module():
+     def _compile_only(self, variant_name, params):
+         """Compile a variant without loading. Safe to call from subprocesses."""
+@@ -391,7 +521,7 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
+ # Plan kernel JIT (also needs sm_100a, can't be statically compiled)
+ # ============================================================================
+ 
+-_plan_module = None
++_plan_modules = {}
+ _plan_lock = threading.Lock()
+ 
+ 
+@@ -453,8 +583,11 @@ def _compile_plan_only():
+     _do_compile_plan()
+ 
+ 
+-def _compile_plan_module():
++def _compile_plan_module(aot_path):
      """Compile and load plan kernel."""
-+    aot_path = _aot_module_path("plan")
 +    if aot_path is not None:
 +        import tvm_ffi
 +        return tvm_ffi.load_module(str(aot_path))
      lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
      try:
          _do_compile_plan()
-@@ -553,6 +679,11 @@ def get_sparse_topk_module():
+@@ -467,22 +600,22 @@ def _compile_plan_module():
+ 
+ def get_plan_fn():
+     """Get the plan function. JIT compiles on first call."""
+-    global _plan_module
+-    if _plan_module is not None:
+-        return _plan_module
++    aot_path = _aot_module_path("plan")
++    key = aot_path is not None
++    if key in _plan_modules:
++        return _plan_modules[key]
+ 
+     with _plan_lock:
+-        if _plan_module is not None:
+-            return _plan_module
+-        _plan_module = _compile_plan_module()
+-        return _plan_module
++        if key not in _plan_modules:
++            _plan_modules[key] = _compile_plan_module(aot_path)
++        return _plan_modules[key]
+ 
+ 
+ # ============================================================================
+ # Sparse TopK Select kernel JIT
+ # ============================================================================
+ 
+-_sparse_topk_module = None
++_sparse_topk_modules = {}
+ _sparse_topk_lock = threading.Lock()
+ 
+ 
+@@ -546,29 +679,34 @@ build {so_path}: nvcc_link {obj}
+ 
+ def get_sparse_topk_module():
+     """Get the sparse_topk_select module. JIT compiles on first call."""
+-    global _sparse_topk_module
+-    if _sparse_topk_module is not None:
+-        return _sparse_topk_module
++    aot_path = _aot_module_path("sparse_topk")
++    key = aot_path is not None
++    if key in _sparse_topk_modules:
++        return _sparse_topk_modules[key]
+ 
      with _sparse_topk_lock:
-         if _sparse_topk_module is not None:
-             return _sparse_topk_module
-+        aot_path = _aot_module_path("sparse_topk")
+-        if _sparse_topk_module is not None:
+-            return _sparse_topk_module
++        if key in _sparse_topk_modules:
++            return _sparse_topk_modules[key]
 +        if aot_path is not None:
 +            import tvm_ffi
-+            _sparse_topk_module = tvm_ffi.load_module(str(aot_path))
-+            return _sparse_topk_module
++            _sparse_topk_modules[key] = tvm_ffi.load_module(str(aot_path))
++            return _sparse_topk_modules[key]
          lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
          try:
              _do_compile_sparse_topk()
-@@ -638,6 +769,11 @@ def get_reduction_module():
+             import tvm_ffi
+             so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
+-            _sparse_topk_module = tvm_ffi.load_module(str(so_path))
++            _sparse_topk_modules[key] = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
+-        return _sparse_topk_module
++        return _sparse_topk_modules[key]
+ 
+ 
+ # ============================================================================
+ # Split-KV reduction kernel JIT
+ # ============================================================================
+ 
+-_reduction_module = None
++_reduction_modules = {}
+ _reduction_lock = threading.Lock()
+ 
+ 
+@@ -631,19 +769,24 @@ build {so_path}: nvcc_link {obj}
+ 
+ def get_reduction_module():
+     """Get the split-KV reduction module. JIT compiles on first call."""
+-    global _reduction_module
+-    if _reduction_module is not None:
+-        return _reduction_module
++    aot_path = _aot_module_path("reduction")
++    key = aot_path is not None
++    if key in _reduction_modules:
++        return _reduction_modules[key]
+ 
      with _reduction_lock:
-         if _reduction_module is not None:
-             return _reduction_module
-+        aot_path = _aot_module_path("reduction")
+-        if _reduction_module is not None:
+-            return _reduction_module
++        if key in _reduction_modules:
++            return _reduction_modules[key]
 +        if aot_path is not None:
 +            import tvm_ffi
-+            _reduction_module = tvm_ffi.load_module(str(aot_path))
-+            return _reduction_module
++            _reduction_modules[key] = tvm_ffi.load_module(str(aot_path))
++            return _reduction_modules[key]
          lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
          try:
              _do_compile_reduction()
+             import tvm_ffi
+             so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
+-            _reduction_module = tvm_ffi.load_module(str(so_path))
++            _reduction_modules[key] = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
+-        return _reduction_module
++        return _reduction_modules[key]
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
 index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py

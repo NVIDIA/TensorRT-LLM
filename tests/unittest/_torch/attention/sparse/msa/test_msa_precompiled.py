@@ -165,6 +165,18 @@ def test_packaged_library_missing_export_never_silently_falls_back(jit_package, 
     assert not cache.exists()
 
 
+def test_removed_packaged_library_never_silently_falls_back(jit_package, monkeypatch):
+    jit, package, cache, _ = jit_package
+    artifact_dir = _stage_artifacts(jit, package)
+    assert jit._aot_module_path("variants") == artifact_dir / "all_variants.so"
+    (artifact_dir / "all_variants.so").unlink()
+    manager = jit.FMHAVariantManager()
+    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+    with pytest.raises(FileNotFoundError):
+        manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert not cache.exists()
+
+
 def test_packaged_source_verification_is_reused(jit_package, monkeypatch):
     jit, package, _, _ = jit_package
     _stage_artifacts(jit, package)
@@ -247,6 +259,57 @@ def test_packaged_gpu_compatibility_is_checked_for_each_device(jit_package, monk
     assert jit._aot_module_path("variants") == artifact_dir / "all_variants.so"
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
     assert jit._aot_module_path("variants") is None
+
+
+def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(jit_package, monkeypatch):
+    jit, package, _, _ = jit_package
+    artifact_dir = _stage_artifacts(jit, package)
+    manager = jit.FMHAVariantManager()
+
+    def load_module(path):
+        kind = "packaged" if Path(path).parent == artifact_dir else "jit"
+        return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda: kind})
+
+    def compile_fixture(name, _params):
+        path = jit.CACHE_BASE / name / f"{name}.so"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"JIT fixture")
+
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
+    monkeypatch.setattr(manager, "_compile_only", compile_fixture)
+    args = (jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert manager.get_variant(*args).run() == "packaged"
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
+    assert manager.get_variant(*args).run() == "packaged"  # both images exist
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    assert manager.get_variant(*args).run() == "jit"
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    assert manager.get_variant(*args).run() == "packaged"
+
+
+def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_package, monkeypatch):
+    jit, package, _, _ = jit_package
+    artifact_dir = _stage_artifacts(jit, package)
+
+    def load_module(path):
+        kind = "packaged" if Path(path).parent == artifact_dir else "jit"
+        return types.SimpleNamespace(kind=kind)
+
+    def compile_fixture(relative):
+        path = jit.CACHE_BASE / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"JIT fixture")
+
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
+    monkeypatch.setattr(jit, "_do_compile_plan", lambda: compile_fixture("plan/fmha_sm100_plan.so"))
+    monkeypatch.setattr(jit, "_do_compile_sparse_topk", lambda: compile_fixture("sparse_topk/sparse_topk_select.so"))
+    monkeypatch.setattr(jit, "_do_compile_reduction", lambda: compile_fixture("reduction/fmha_sm100_reduction.so"))
+    helpers = (jit.get_plan_fn, jit.get_sparse_topk_module, jit.get_reduction_module)
+    assert [fn().kind for fn in helpers] == ["packaged"] * 3
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_unsupported")
+    assert [fn().kind for fn in helpers] == ["jit"] * 3
+    monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_103a")
+    assert [fn().kind for fn in helpers] == ["packaged"] * 3
 
 
 @pytest.mark.parametrize("corruption", ["missing_manifest", "invalid_json", "unsafe_path", "duplicate_variant"])
