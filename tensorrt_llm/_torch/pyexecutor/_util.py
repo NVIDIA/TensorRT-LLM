@@ -938,7 +938,7 @@ def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
     if draft_kv_config.pool_ratio is None:
         return
     if draft_kv_config.mixed_precision_kv is not None:
-        # The mixed MTP draft manager has its own pool plus a retained-token
+        # The mixed MTP draft manager has its own pool plus a mixed-precision high
         # pool; the target's ratios describe the target's pools.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "

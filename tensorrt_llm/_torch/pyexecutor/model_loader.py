@@ -70,7 +70,7 @@ _KV_CACHE_MAP = {
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto",
-    # Mixed-precision KV: the retained tokens and attention use the second
+    # Mixed-precision KV: the first/last tokens and attention use the second
     # dtype. float16/bfloat16 leave the KV cache unquantized and must equal
     # the model dtype (checked in validate_and_set_kv_cache_quant).
     "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
@@ -201,11 +201,11 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
-    unquantized_retained_dtype = mapped_pyt_quant is None
+    unquantized_mixed_precision_high_dtype = mapped_pyt_quant is None
     if (pyt_kv_cache_dtype.startswith("mixed_")
             and getattr(model_config.sparse_attention_config, "algorithm",
                         None) in ("dsa", "deepseek_v4")):
-        # These backends keep the history in their own pool, in the low-precision
+        # These backends keep the history in their own pool, in the mixed-precision low
         # format; a drafter inherits it like any target KV dtype.
         mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
@@ -244,15 +244,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
+    # An unquantized high dtype has to be the model dtype; KVCacheManagerV2
     # would otherwise reject it after the weights are loaded.
-    if unquantized_retained_dtype:
-        retained_dtype = str_dtype_to_torch(
+    if unquantized_mixed_precision_high_dtype:
+        mixed_precision_high_dtype = str_dtype_to_torch(
             pyt_kv_cache_dtype.rsplit("_", 1)[1])
-        if model_config.torch_dtype != retained_dtype:
+        if model_config.torch_dtype != mixed_precision_high_dtype:
             raise ValueError(
                 f'llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" keeps '
-                f"the retained tokens in {retained_dtype}, but the model dtype "
+                f"the first/last tokens in {mixed_precision_high_dtype}, but the model dtype "
                 f"is {model_config.torch_dtype}.")
 
     # If we get to this point we have a valid explicit quantization setting.

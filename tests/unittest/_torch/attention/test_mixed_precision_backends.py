@@ -61,7 +61,7 @@ def test_optimized_two_pool_prefill_and_decode(
             dtype="mixed_nvfp4_fp8" if high_dtype == DataType.FP8 else "mixed_nvfp4_bfloat16",
             mixed_precision_first_n=block,
             mixed_precision_last_n=block,
-            # Full-history (low) group, then the retained-token (high) group.
+            # Full-history (low) group, then the mixed-precision high group.
             pool_ratio=[0.75, 0.25],
         ),
         CacheType.SELF,
@@ -710,8 +710,8 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
 
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
-def test_draft_forward_hides_retained_rows(backend):
-    """A draft forward on a manager without twin layers turns the retained-row hooks off."""
+def test_draft_forward_hides_mixed_precision_high_rows(backend):
+    """A draft forward on a manager without high layers turns the high-layer writes and reads off."""
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
         DeepseekV4TrtllmAttentionMetadata,
     )
@@ -725,22 +725,22 @@ def test_draft_forward_hides_retained_rows(backend):
     meta = Mock()
     meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
     meta.draft_sliding_block_tables = None
-    meta.draft_retained_block_table = None
+    meta.draft_mixed_precision_high_block_table = None
     meta.draft_replay_swapped_attrs = {}
     for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
         setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
     table = torch.full((2, 4), -1, dtype=torch.int32)
-    meta.retained_block_table = table
+    meta.mixed_precision_high_block_table = table
 
     assert cls.prepare_for_draft_forward(meta) is None
-    assert cls.has_mixed_precision_retained_rows.fget(meta) is False
+    assert cls.has_mixed_precision_high_rows.fget(meta) is False
     meta.restore_draft_swaps()
-    assert meta.retained_block_table is table
-    assert cls.has_mixed_precision_retained_rows.fget(meta) is True
+    assert meta.mixed_precision_high_block_table is table
+    assert cls.has_mixed_precision_high_rows.fget(meta) is True
 
 
 @pytest.mark.cpu_only
-def test_dsa_twin_tables_refresh_full_width():
+def test_dsa_mixed_precision_high_tables_refresh_full_width():
     """An MTP draft loop reads past this step's kv lengths: no column may keep a stale page."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
@@ -755,7 +755,7 @@ def test_dsa_twin_tables_refresh_full_width():
 
     def manager():
         return SimpleNamespace(
-            high_layers={0: 1}, pp_layers=[0], fill_high_precision_page_table=fill
+            mixed_precision_high_layers={0: 1}, pp_layers=[0], fill_mixed_precision_high_page_table=fill
         )
 
     meta = SimpleNamespace(
@@ -764,22 +764,22 @@ def test_dsa_twin_tables_refresh_full_width():
         kv_cache_manager=manager(),
         draft_kv_cache_manager=manager(),
         # Stale page ids from an earlier step, page 0 included.
-        retained_block_table=torch.zeros(4, 6, dtype=torch.int32),
-        draft_retained_block_table=torch.full((4, 6), 7, dtype=torch.int32),
+        mixed_precision_high_block_table=torch.zeros(4, 6, dtype=torch.int32),
+        draft_mixed_precision_high_block_table=torch.full((4, 6), 7, dtype=torch.int32),
     )
-    meta._fill_retained_block_table = partial(
-        DSAtrtllmAttentionMetadata._fill_retained_block_table, meta
+    meta._fill_mixed_precision_high_block_table = partial(
+        DSAtrtllmAttentionMetadata._fill_mixed_precision_high_block_table, meta
     )
-    DSAtrtllmAttentionMetadata._fill_retained_block_tables(meta)
+    DSAtrtllmAttentionMetadata._fill_mixed_precision_high_block_tables(meta)
 
     expected = torch.tensor([[100] * 3 + [-1] * 3, [101] + [-1] * 5], dtype=torch.int32)
-    for table in (meta.retained_block_table, meta.draft_retained_block_table):
+    for table in (meta.mixed_precision_high_block_table, meta.draft_mixed_precision_high_block_table):
         assert torch.equal(table[:2], expected)
 
 
 @pytest.mark.cpu_only
-def test_dsa_draft_forward_uses_draft_twin_table():
-    """MTP layers on a mixed DSA draft manager read its own twin table during the draft forward."""
+def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
+    """MTP layers on a mixed DSA draft manager read its own high page table during the draft forward."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
@@ -790,13 +790,13 @@ def test_dsa_draft_forward_uses_draft_twin_table():
     for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
         setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
     target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
-    meta.retained_block_table = target
-    meta.draft_retained_block_table = draft
+    meta.mixed_precision_high_block_table = target
+    meta.draft_mixed_precision_high_block_table = draft
 
     DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
-    assert meta.retained_block_table is draft
+    assert meta.mixed_precision_high_block_table is draft
     meta.restore_draft_swaps()
-    assert meta.retained_block_table is target
+    assert meta.mixed_precision_high_block_table is target
 
 
 @pytest.mark.cpu_only
@@ -817,13 +817,13 @@ def test_draft_forward_swaps_in_draft_staging():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_retained_compressed_row_mask_matches_reference():
-    """DeepSeek-V4: the twin scatter only writes rows whose page the twin holds.
+def test_mixed_precision_high_compressed_row_mask_matches_reference():
+    """DeepSeek-V4: the high-layer scatter only writes rows whose page the high layer holds.
 
     Many requests with padding rows, released pages and pages past the table width.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        _retained_compressed_row_mask,
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        _mixed_precision_high_compressed_row_mask,
     )
 
     torch.manual_seed(0)
@@ -835,7 +835,7 @@ def test_retained_compressed_row_mask_matches_reference():
     start_pos = torch.randint(0, 40, (batch,), dtype=torch.int32)
     compressed_mask = torch.rand(total) > 0.2
     table = torch.randint(-1, 9, (batch, width), dtype=torch.int32)
-    mask = _retained_compressed_row_mask(
+    mask = _mixed_precision_high_compressed_row_mask(
         table.cuda(),
         rows_per_page,
         num_comp.cuda(),
@@ -856,15 +856,15 @@ def test_retained_compressed_row_mask_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_store_retained_context_rows_uses_context_positions():
-    """DSA context: each row lands at its position_ids entry if the twin holds that page."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        store_retained_context_rows,
+def test_store_mixed_precision_high_context_rows_uses_context_positions():
+    """DSA context: each row lands at its position_ids entry if the high layer holds that page."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        store_mixed_precision_high_context_rows,
     )
 
     tokens_per_block, width, num_ctx = 4, 576, 10
     pool = torch.zeros((4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
-    # Request 0 resumes at position 6; request 1 starts at 0 and the twin released its page 0.
+    # Request 0 resumes at position 6; request 1 starts at 0 and its high layer released page 0.
     table = torch.tensor([[-1, 2, 0, -1], [-1, 3, -1, -1]], dtype=torch.int32, device="cuda")
     ctx_positions = [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
     # position_ids spans [ctx..., gen...]; the generation tail must not be stored here.
@@ -874,17 +874,17 @@ def test_store_retained_context_rows_uses_context_positions():
     owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=torch.ones(1, device="cuda"))
     manager = SimpleNamespace(
         layer_offsets={0: 0},
-        high_layers={0: 1},
+        mixed_precision_high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: pool,
     )
     meta = SimpleNamespace(
-        retained_block_table=table,
+        mixed_precision_high_block_table=table,
         kv_cache_manager=manager,
         num_ctx_tokens=num_ctx,
         req_idx_per_token=requests,
     )
 
-    store_retained_context_rows(owner, meta, latent_cache, position_ids)
+    store_mixed_precision_high_context_rows(owner, meta, latent_cache, position_ids)
 
     expected = torch.zeros(4 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
     for token, pos in enumerate(ctx_positions):
@@ -895,10 +895,10 @@ def test_store_retained_context_rows_uses_context_positions():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_store_retained_generation_rows_rotates_k_pe():
+def test_store_mixed_precision_high_generation_rows_rotates_k_pe():
     """DSA generation: the store rotates k_pe at the trailing positions, like the append kernel."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        store_retained_generation_rows,
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        store_mixed_precision_high_generation_rows,
     )
 
     tokens_per_block, nope, rope_dim, num_ctx = 4, 512, 64, 2
@@ -918,17 +918,17 @@ def test_store_retained_generation_rows_rotates_k_pe():
     )
     manager = SimpleNamespace(
         layer_offsets={0: 0},
-        high_layers={0: 1},
+        mixed_precision_high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: pool,
     )
     meta = SimpleNamespace(
-        retained_block_table=table,
+        mixed_precision_high_block_table=table,
         kv_cache_manager=manager,
         num_ctx_tokens=num_ctx,
         req_idx_per_token=torch.zeros(5, dtype=torch.int32, device="cuda"),
     )
 
-    store_retained_generation_rows(owner, meta, rows, position_ids)
+    store_mixed_precision_high_generation_rows(owner, meta, rows, position_ids)
 
     expected = torch.zeros(2 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
     for token, pos in enumerate(gen_positions):
@@ -944,14 +944,14 @@ def test_store_retained_generation_rows_rotates_k_pe():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("shared_rows", [False, True])
-def test_overlay_retained_rows_copies_held_rows(shared_rows):
-    """The overlay replaces exactly the scratch rows whose token the twin holds.
+def test_overlay_mixed_precision_high_rows_copies_held_rows(shared_rows):
+    """The overlay replaces exactly the scratch rows whose token the high layer holds.
 
     Two calls in a row: the context overlay's row records from the first call must not leak
     into the second, which releases pages the first one held.
     """
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        overlay_retained_rows,
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        overlay_mixed_precision_high_rows,
     )
 
     torch.manual_seed(0)
@@ -976,14 +976,14 @@ def test_overlay_retained_rows_copies_held_rows(shared_rows):
     owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=None)
     manager = SimpleNamespace(
         layer_offsets={0: 0},
-        high_layers={0: 1},
+        mixed_precision_high_layers={0: 1},
         _get_mixed_precision_buffers=lambda *args: pool,
     )
     flat = pool.view(-1, width)
     for table in tables:
         scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
-        meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
-        overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
+        meta = SimpleNamespace(mixed_precision_high_block_table=table, kv_cache_manager=manager)
+        overlay_mixed_precision_high_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
 
         expected = torch.zeros_like(scratch)
         for q in range(queries):
@@ -998,7 +998,7 @@ def test_overlay_retained_rows_copies_held_rows(shared_rows):
 
 
 @pytest.mark.cpu_only
-def test_mixed_precision_retained_dtype_must_match_model_dtype():
+def test_mixed_precision_high_dtype_must_match_model_dtype():
     from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 
     model_config = SimpleNamespace(
@@ -1011,7 +1011,7 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_bfloat16")
     assert model_config.quant_config.kv_cache_quant_algo is None
-    # Sparse MLA models map the pool to NVFP4, but the retained dtype still has to match.
+    # Sparse MLA models map the pool to NVFP4, but the high dtype must still match.
     sparse = SimpleNamespace(
         quant_config=QuantConfig(),
         quant_config_dict=None,

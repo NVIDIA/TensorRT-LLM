@@ -307,24 +307,24 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # One twin page table per compression ratio; -1 = not retained.
+        # One mixed-precision high page table per compression ratio; -1 = not in the high pool.
         manager = self.kv_cache_manager
-        if manager.high_layers:
-            self._retained_table_layers = {}
-            for local in manager.high_layers:
+        if manager.mixed_precision_high_layers:
+            self._mixed_precision_high_table_layers = {}
+            for local in manager.mixed_precision_high_layers:
                 layer_idx = manager.pp_layers[local]
-                self._retained_table_layers.setdefault(
+                self._mixed_precision_high_table_layers.setdefault(
                     manager._compress_ratios[layer_idx], layer_idx
                 )
-            self.retained_block_table = {
+            self.mixed_precision_high_block_table = {
                 compress_ratio: self.get_empty(
                     self.cuda_graph_buffers,
                     compress_block_table_shape,
-                    cache_name=f"retained_block_table_{compress_ratio}",
+                    cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
-                for compress_ratio in self._retained_table_layers
+                for compress_ratio in self._mixed_precision_high_table_layers
             }
         self._init_sparse_offload_state()
 
@@ -537,10 +537,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
-        for compress_ratio, high_table in (self.retained_block_table or {}).items():
-            # Any twin of this ratio shares the pool.
-            self._fill_retained_block_table(
-                self.kv_cache_manager, self._retained_table_layers[compress_ratio], high_table
+        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
+            # Any mixed-precision high layer of this ratio shares the pool.
+            self._fill_mixed_precision_high_block_table(
+                self.kv_cache_manager, self._mixed_precision_high_table_layers[compress_ratio], high_table
             )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
@@ -722,8 +722,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Repoint sparse fields to the draft buffers for a draft forward."""
-        # Draft layers keep a plain cache: no retained rows while the draft manager is swapped in.
-        self.swap_for_draft("retained_block_table", None)
+        # Draft layers have no mixed-precision high layer while the draft manager is in use.
+        self.swap_for_draft("mixed_precision_high_block_table", None)
         if self.draft_sliding_block_tables is None:
             return None
         saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}

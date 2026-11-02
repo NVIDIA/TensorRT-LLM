@@ -143,16 +143,16 @@ kv_cache_config:
 
 The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+in and the first/last tokens are stored in. Like `dtype: fp8`, it overrides the
 checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
-select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of `mixed_precision_first_n` and
+select the unquantized model dtype. Tokens are kept in
+whole cache pages, and at least one of `mixed_precision_first_n` and
 `mixed_precision_last_n` must be positive.
 
 Each mixed-precision layer owns two pools: its original pool holds the NVFP4
 history, and a second layer group, appended after the model's own layer
-groups, holds the retained tokens. When `pool_ratio` is set it must therefore
-carry one more entry than the model has layer groups, with the retained-token
+groups, holds the first/last tokens. When `pool_ratio` is set it must therefore
+carry one more entry than the model has layer groups, with the mixed-precision high
 group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
