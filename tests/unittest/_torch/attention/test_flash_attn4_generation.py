@@ -218,3 +218,51 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     assert torch.equal(pool[:, 1], ref_pool[:, 1])
     torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=0)
     assert torch.equal(qkv[:, :q_size], ref_qkv[:, :q_size])
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,q_len,massive",
+    [(28, 4, 128, 1, False), (28, 4, 128, 4, False), (28, 4, 128, 9, False), (20, 20, 128, 9, False),
+     (16, 8, 64, 4, False), (28, 4, 128, 9, True)],
+)
+@pytest.mark.parametrize("splits", [2, 5, 16])
+def test_fa4_paged_generation_split_matches_dense(num_heads, num_kv_heads, head_dim, q_len, massive, splits):
+    """Split-KV generation (non-causal chunks of the cached pages + causal last part, merged) against the
+    float64 reference, including rows whose cache is shorter than the split count (empty chunks) and rows
+    with nothing cached before the page of their first step token."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        fa4_paged_generation_split,
+        split_tables,
+        write_kv_paged,
+    )
+
+    for seed in range(2):
+        case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=5, seed=seed, massive=massive)
+        ref = _reference(case, num_heads, num_kv_heads, head_dim, q_len)
+        write_kv_paged(case["pool"], case["k"], case["v"], case["page_table"], case["kv_lens"], q_len)
+        tables = split_tables(case["page_table"], case["kv_lens"], q_len, splits, case["tpb"])
+        out = torch.empty_like(case["q"])
+        fa4_paged_generation_split(
+            case["pool"], case["q"], out, tables, q_len, splits, 1.0 / math.sqrt(head_dim)
+        )
+        torch.cuda.synchronize()
+        head_max = ref.abs().amax(-1)
+        err = (out.double() - ref).abs().amax(-1)
+        assert not bool(((out.abs().amax(-1) == 0) & (head_max > 1e-3)).any()), "zero head"
+        assert float((err / head_max.clamp(min=1e-3)).max()) < 2e-2, f"seed {seed}"
+
+
+def test_generation_splits_follow_the_grid(monkeypatch):
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        SPLITS_ENV,
+        generation_splits,
+    )
+
+    monkeypatch.delenv(SPLITS_ENV, raising=False)
+    assert generation_splits(120, 28, 4, 9, 132) == 1  # 480 CTAs
+    assert generation_splits(60, 28, 4, 4, 132) == 1  # 240 CTAs
+    assert generation_splits(4, 28, 4, 9, 132) == 9  # 16 CTAs
+    assert generation_splits(1, 28, 4, 1, 132) == 16  # 4 CTAs, capped
+    assert generation_splits(4, 20, 20, 9, 132) == 1  # MHA: 80 CTAs
+    monkeypatch.setenv(SPLITS_ENV, "1")
+    assert generation_splits(1, 28, 4, 1, 132) == 1
