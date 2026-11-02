@@ -537,19 +537,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
-        if self.retained_block_table is not None:
-            manager = self.kv_cache_manager
-            for compress_ratio, high_table in self.retained_block_table.items():
-                # Any twin of this ratio shares the pool.
-                layer_idx = self._retained_table_layers[compress_ratio]
-                table = torch.full(
-                    (self.num_seqs, high_table.shape[1]),
-                    -1,
-                    dtype=torch.int32,
-                    pin_memory=prefer_pinned(),
-                )
-                manager.fill_high_precision_page_table(self.request_ids, layer_idx, table.numpy())
-                high_table[: self.num_seqs].copy_(table, non_blocking=True)
+        for compress_ratio, high_table in (self.retained_block_table or {}).items():
+            # Any twin of this ratio shares the pool.
+            self._fill_retained_block_table(
+                self.kv_cache_manager, self._retained_table_layers[compress_ratio], high_table
+            )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""

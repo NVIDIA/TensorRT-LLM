@@ -15,47 +15,6 @@ import triton.language as tl
 
 
 @triton.jit
-def _copy_kv_row(
-    src_ptr,
-    src_row,
-    dst_ptr,
-    dst_row,
-    scale_ptr,
-    cos_sin_ptr,
-    cos_sin_stride,
-    position,
-    APPLY_SCALE: tl.constexpr,
-    ROTATE: tl.constexpr,
-    ROW_WIDTH: tl.constexpr,
-    ROPE_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < ROW_WIDTH
-    src = src_ptr + src_row.to(tl.int64) * ROW_WIDTH
-    row = tl.load(src + offsets, mask=mask, other=0.0)
-    if ROTATE:
-        # Rotate k_pe like the append kernel: float math, round, scale.
-        rope = offsets - (ROW_WIDTH - ROPE_DIM)
-        in_rope = mask & (rope >= 0)
-        x = row.to(tl.float32)
-        partner = tl.load(src + (offsets ^ 1), mask=in_rope, other=0.0).to(tl.float32)
-        cos_sin = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride + (rope // 2) * 2
-        cos = tl.load(cos_sin, mask=in_rope, other=1.0)
-        sin = tl.load(cos_sin + 1, mask=in_rope, other=0.0)
-        rotated = tl.where(rope % 2 == 0, x * cos - partner * sin, x * cos + partner * sin)
-        row = tl.where(in_rope, rotated.to(src_ptr.dtype.element_ty), row)
-    if APPLY_SCALE:
-        # Per-tensor FP8 KV scale, as the native append kernel applies it.
-        row = row.to(tl.float32) * tl.load(scale_ptr)
-    tl.store(
-        dst_ptr + dst_row.to(tl.int64) * ROW_WIDTH + offsets,
-        row.to(dst_ptr.dtype.element_ty),
-        mask=mask,
-    )
-
-
-@triton.jit
 def _store_retained_rows_kernel(
     rows_ptr,
     request_ptr,
@@ -84,22 +43,56 @@ def _store_retained_rows_kernel(
     valid = (position >= 0) & (block < max_blocks) & (request >= 0) & (request < num_requests)
     page = tl.load(block_table_ptr + request * block_table_stride + block, mask=valid, other=-1)
     if (page >= 0) & (page < num_blocks):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < ROW_WIDTH
+        src = rows_ptr + token.to(tl.int64) * ROW_WIDTH
+        row = tl.load(src + offsets, mask=mask, other=0.0)
+        if ROTATE:
+            # Rotate k_pe like the append kernel: float math, round, scale.
+            rope = offsets - (ROW_WIDTH - ROPE_DIM)
+            in_rope = mask & (rope >= 0)
+            x = row.to(tl.float32)
+            partner = tl.load(src + (offsets ^ 1), mask=in_rope, other=0.0).to(tl.float32)
+            cos_sin = cos_sin_ptr + position.to(tl.int64) * cos_sin_stride + (rope // 2) * 2
+            cos = tl.load(cos_sin, mask=in_rope, other=1.0)
+            sin = tl.load(cos_sin + 1, mask=in_rope, other=0.0)
+            rotated = tl.where(rope % 2 == 0, x * cos - partner * sin, x * cos + partner * sin)
+            row = tl.where(in_rope, rotated.to(rows_ptr.dtype.element_ty), row)
+        if APPLY_SCALE:
+            # Per-tensor FP8 KV scale, as the native append kernel applies it.
+            row = row.to(tl.float32) * tl.load(scale_ptr)
         slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
-        _copy_kv_row(
-            rows_ptr,
-            token,
-            kv_cache_ptr,
-            slot,
-            scale_ptr,
-            cos_sin_ptr,
-            cos_sin_stride,
-            position,
-            APPLY_SCALE,
-            ROTATE,
-            ROW_WIDTH,
-            ROPE_DIM,
-            BLOCK_SIZE,
+        tl.store(
+            kv_cache_ptr + slot * ROW_WIDTH + offsets,
+            row.to(kv_cache_ptr.dtype.element_ty),
+            mask=mask,
         )
+
+
+@triton.jit
+def _copy_rows(
+    kv_cache_ptr,
+    slot,
+    scratch_ptr,
+    scratch_row,
+    valid,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """Copy twin rows ``slot`` to scratch rows ``scratch_row`` where ``valid``, scaled to FP8."""
+    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
+    dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
+    if APPLY_SCALE:
+        scale = tl.load(scale_ptr)
+    for start in range(0, ROW_WIDTH, BLOCK_W):
+        cols = start + tl.arange(0, BLOCK_W)
+        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
+        row = tl.load(src + cols[None, :], mask=mask)
+        if APPLY_SCALE:
+            row = row.to(tl.float32) * scale
+        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
 
 
 # The epoch changes every call: keep it out of the specialization key.
@@ -154,17 +147,9 @@ def _overlay_retained_rows_kernel(
         current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
         tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
         return
-    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
-    dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
-    if APPLY_SCALE:
-        scale = tl.load(scale_ptr)
-    for start in range(0, ROW_WIDTH, BLOCK_W):
-        cols = start + tl.arange(0, BLOCK_W)
-        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
-        row = tl.load(src + cols[None, :], mask=mask)
-        if APPLY_SCALE:
-            row = row.to(tl.float32) * scale
-        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
+    _copy_rows(
+        kv_cache_ptr, slot, scratch_ptr, scratch_row, valid, scale_ptr, APPLY_SCALE, ROW_WIDTH, BLOCK_W
+    )
 
 
 # The epoch changes every call: keep it out of the specialization key.
@@ -185,18 +170,17 @@ def _copy_recorded_rows_kernel(
     rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
     recorded = tl.load(claim_ptr + rows, mask=rows < scratch_rows, other=0)
     valid = (rows < scratch_rows) & ((recorded >> 32) == claim_epoch.to(tl.int64))
-    slot = recorded & 0xFFFFFFFF
-    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
-    dst = scratch_ptr + rows.to(tl.int64)[:, None] * ROW_WIDTH
-    if APPLY_SCALE:
-        scale = tl.load(scale_ptr)
-    for start in range(0, ROW_WIDTH, BLOCK_W):
-        cols = start + tl.arange(0, BLOCK_W)
-        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
-        row = tl.load(src + cols[None, :], mask=mask)
-        if APPLY_SCALE:
-            row = row.to(tl.float32) * scale
-        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
+    _copy_rows(
+        kv_cache_ptr,
+        recorded & 0xFFFFFFFF,
+        scratch_ptr,
+        rows,
+        valid,
+        scale_ptr,
+        APPLY_SCALE,
+        ROW_WIDTH,
+        BLOCK_W,
+    )
 
 
 def _retained_block_table(metadata, owner) -> Optional[torch.Tensor]:
@@ -280,18 +264,20 @@ def store_retained_rows(
     )
 
 
-def store_retained_context_rows(attention, metadata, latent_cache: torch.Tensor) -> None:
+def store_retained_context_rows(
+    attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
+) -> None:
     """Context phase: the append kernel wrote the rotated k_pe back into ``latent_cache``."""
-    positions = getattr(metadata, "retained_context_positions", None)
-    if positions is None:
-        return
     num_ctx = metadata.num_ctx_tokens
+    if num_ctx == 0:
+        return
+    # position_ids spans [ctx..., gen...]; a context token's position is its KV position.
     store_retained_rows(
         metadata,
         attention,
         latent_cache[:num_ctx],
         metadata.req_idx_per_token[:num_ctx],
-        positions,
+        position_ids.reshape(-1)[:num_ctx],
         attention.kv_scale_orig_quant,
     )
 
