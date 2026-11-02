@@ -26,6 +26,8 @@ include(sanitizers)
 
 project(tensorrt_llm LANGUAGES CXX)
 
+include(host_linker)
+
 # Single source of truth for the inline ABI namespace. Read by both the C++ side
 # (via tensorrt_llm/common/config.h's `#ifndef TRTLLM_ABI_NAMESPACE` guard) and
 # the cubin INCBIN aggregator (cpp/cmake/modules/ tllm_cubin_archive.cmake bakes

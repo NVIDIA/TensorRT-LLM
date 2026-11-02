@@ -966,6 +966,7 @@ def main(*,
          configure_cmake: bool = False,
          configure_only: bool = False,
          use_ccache: bool = False,
+         use_lld: bool = False,
          out_of_tree: bool = False,
          use_3rdparty_cache: bool = False,
          fast_build: bool = False,
@@ -1066,7 +1067,7 @@ def main(*,
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
-    cmake_def_args = []
+    cmake_def_args = [f"-DUSE_LLD={'ON' if use_lld else 'OFF'}"]
     cmake_generator = ""
 
     if on_windows:
@@ -1766,6 +1767,12 @@ def add_arguments(parser: ArgumentParser):
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use_lld",
+        action="store_true",
+        help=
+        "Use the LLVM lld host linker (Linux, GCC/Clang; requires ld.lld on PATH)"
+    )
     parser.add_argument(
         "--use-3rdparty-cache",
         default=False,
