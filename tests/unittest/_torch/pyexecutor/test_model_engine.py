@@ -601,6 +601,16 @@ class DecoderForwardTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.num_contexts, 0)
 
 
+@pytest.mark.cpu_only
+def test_model_engine_rejects_encode_only() -> None:
+    with pytest.raises(ValueError, match="EncoderExecutor"):
+        ModelEngine(
+            model_path="dummy",
+            llm_args=SimpleNamespace(encode_only=True),
+            mapping=Mapping(),
+        )
+
+
 class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(ModelEngine)

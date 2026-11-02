@@ -571,8 +571,7 @@ class BaseLLM:
             if getattr(self, "_encoder_executor", None) is not None:
                 try:
                     runtime_pretrained_config = (
-                        self._encoder_executor.model_engine.model.model_config.
-                        pretrained_config)
+                        self._encoder_executor.pretrained_config)
                     if runtime_pretrained_config is not None:
                         pretrained_config = runtime_pretrained_config
                 except AttributeError:
@@ -1229,10 +1228,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        executor = self._encoder_executor
+        max_seq_len = executor.max_seq_len
+        max_num_tokens = executor.max_num_tokens
+        max_batch_size = executor.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(

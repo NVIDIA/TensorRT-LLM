@@ -63,7 +63,6 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderRunner
 from .engine.runners.encoder_decoder import (
     EncoderDecoderRunner,
     EncoderDecoderRunnerConfig,
@@ -175,10 +174,12 @@ class ModelEngine:
         """Resolve the requested sizes, the original speculation widths and the
         services derived from the arguments; capacity may still be unset.
         Returns the encoder token budget before any multimodal increase."""
+        if llm_args.encode_only:
+            raise ValueError(
+                "encode_only models run through EncoderExecutor, which does not use ModelEngine."
+            )
         init_process_setup(mapping, dist)
 
-        if llm_args.encode_only and llm_args.mm_encoder_only:
-            raise ValueError("encode_only and mm_encoder_only are mutually exclusive.")
         (
             max_beam_width,
             max_num_tokens,
@@ -485,8 +486,6 @@ class ModelEngine:
 
     def _initialize_runner(self, runner_cls: type[ModelRunner]) -> ModelRunner:
         assert self._model_caller is not None
-        if issubclass(runner_cls, EncoderRunner):
-            return self._initialize_encoder_runner(runner_cls)
         if issubclass(runner_cls, EncoderDecoderRunner):
             return self._initialize_encoder_decoder_runner(runner_cls)
         if issubclass(runner_cls, NoKVCacheRunner):
@@ -496,22 +495,6 @@ class ModelEngine:
         raise TypeError(
             f"No runner initializer registered for "
             f"{runner_cls.__module__}.{runner_cls.__qualname__}"
-        )
-
-    def _initialize_encoder_runner(self, runner_cls: type[EncoderRunner]) -> EncoderRunner:
-        return runner_cls.create(
-            self.model,
-            llm_args=self.llm_args,
-            mapping=self.mapping,
-            dist=self.dist,
-            max_batch_size=self.batch_size,
-            max_num_tokens=self.max_num_tokens,
-            max_seq_len=self.max_seq_len,
-            max_beam_width=self.max_beam_width,
-            model_caller=self._model_caller,
-            attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
-            moe_load_balancer=self.moe_load_balancer,
         )
 
     def _initialize_encoder_decoder_runner(
