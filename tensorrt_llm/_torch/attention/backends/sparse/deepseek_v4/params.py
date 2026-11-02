@@ -28,8 +28,8 @@ class DeepseekV4AttentionType(Enum):
     COMPRESS = 5
     INDEXER_COMPRESS = 6
 
-    # Mixed-precision KV: the high layer of a COMPRESS cache. The base manager owns its
-    # buffers; this entry only gives it a layer id for disaggregated transfer.
+    # Mixed-precision KV: the mixed-precision high pool of a COMPRESS cache. The base manager
+    # owns its buffers; this entry only gives it a layer id for disaggregated transfer.
     MIXED_PRECISION_HIGH = 7
 
     @property

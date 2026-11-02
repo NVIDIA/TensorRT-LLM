@@ -86,7 +86,7 @@ def forward_context_sparse_attn(
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )
-        # The append kernel wrote the NVFP4 pool; also write the FP8 high layer.
+        # The append kernel wrote the NVFP4 pool; also write the FP8 mixed-precision high pool.
         if attn_metadata.has_mixed_precision_high_rows:
             store_mixed_precision_high_context_rows(
                 self.mqa, attn_metadata, latent_cache, position_ids

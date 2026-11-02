@@ -149,11 +149,11 @@ select the unquantized model dtype. Tokens are kept in
 whole cache pages, and at least one of `mixed_precision_first_n` and
 `mixed_precision_last_n` must be positive.
 
-Each mixed-precision layer owns two pools: its original pool holds the NVFP4
-history, and a second layer group, appended after the model's own layer
-groups, holds the first/last tokens. When `pool_ratio` is set it must therefore
-carry one more entry than the model has layer groups, with the mixed-precision high
-group last; leave it unset to size all groups automatically. Sliding-window
+Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
+the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
+The mixed-precision high pools form one extra layer group after the model's own,
+so a `pool_ratio` must carry one more entry than the model has layer groups, with
+the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
 Before a mixed-precision layer runs, the attention metadata gathers the two

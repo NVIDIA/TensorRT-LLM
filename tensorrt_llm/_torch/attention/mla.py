@@ -1994,7 +1994,8 @@ class MLA(nn.Module):
                             **fp4_rope_kwargs,
                         )
                         if getattr(attn_metadata, "has_mixed_precision_high_rows", False):
-                            # The fused kernel wrote the NVFP4 pool; also write the FP8 high layer.
+                            # The fused kernel wrote the NVFP4 pool; also write the FP8
+                            # mixed-precision high pool.
                             store_mixed_precision_high_generation_rows(
                                 self.mqa, attn_metadata, latent_cache, position_ids
                             )

@@ -430,7 +430,8 @@ class AttentionMetadata:
         staging = self.mixed_precision_staging
         if (staging is None or layer_idx not in staging.pools
                 or staging.manager is not self.kv_cache_manager):
-            # No staging for a layer without a high layer or of a manager not in use.
+            # No staging for a layer without a mixed-precision high pool, or of a manager not in
+            # use.
             return None
         return staging
 
