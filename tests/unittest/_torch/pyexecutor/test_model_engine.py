@@ -18,7 +18,6 @@ import torch
 from _torch.pyexecutor.engine_test_utils import (
     DummyModel,
     DummyModelEngine,
-    _AttentionBackend,
     _clone_tensors,
     _create_request,
     _create_request_with_tokens,
@@ -27,7 +26,6 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
@@ -53,12 +51,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
-from tensorrt_llm.llmapi.llm_args import (
-    EncodeCudaGraphConfig,
-    MultimodalConfig,
-    PrefillCudaGraphBackend,
-    TorchLlmArgs,
-)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, PrefillCudaGraphBackend, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -1137,66 +1130,6 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         self.assertEqual(warmup_depths, [1])
         self.assertEqual(model_engine._warmup_depth, 0)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("cuda_graph_config", "expected_encode_config"),
-    [
-        (None, False),
-        (CudaGraphConfig(), False),
-        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
-    ],
-)
-def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
-    cuda_graph_config: CudaGraphConfig | None,
-    expected_encode_config: bool,
-) -> None:
-    """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
-    engine = object.__new__(ModelEngine)
-    engine._model_caller = Mock()
-    engine.model = object()
-    engine.mapping = object()
-    engine.cuda_graph_config = cuda_graph_config
-    engine.llm_args = SimpleNamespace(
-        encoder_cuda_graph_config=EncodeCudaGraphConfig(
-            batch_sizes=[8],
-            num_tokens=[64],
-            seq_lens=[64],
-        ),
-        enable_autotuner=False,
-    )
-    engine.batch_size = 4
-    engine.max_num_tokens = 16
-    engine.max_seq_len = 16
-    engine.max_beam_width = 1
-    engine.without_logits = False
-    engine.attn_backend = _AttentionBackend
-    engine.attn_runtime_features = AttentionRuntimeFeatures()
-    engine.dist = object()
-    engine.moe_load_balancer = None
-    runner_config = object()
-    expected_runner = object()
-    runner_type = Mock(return_value=expected_runner)
-
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.EncoderRunnerConfig.create",
-        return_value=runner_config,
-    ) as create_config:
-        actual = engine._initialize_encoder_runner(runner_type)
-
-    assert actual is expected_runner
-    resolved = create_config.call_args.kwargs["graph_config"]
-    assert resolved is (cuda_graph_config if expected_encode_config else None)
-    runner_type.assert_called_once_with(
-        engine.model,
-        runner_config,
-        mapping=engine.mapping,
-        dist=engine.dist,
-        moe_load_balancer=engine.moe_load_balancer,
-        model_caller=engine._model_caller,
-        attention_runtime_features=engine.attn_runtime_features,
-    )
 
 
 @pytest.mark.cpu_only

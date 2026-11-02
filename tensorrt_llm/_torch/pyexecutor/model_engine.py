@@ -63,7 +63,7 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
+from .engine.runners.encoder import EncoderRunner
 from .engine.runners.encoder_decoder import (
     EncoderDecoderRunner,
     EncoderDecoderRunnerConfig,
@@ -499,30 +499,19 @@ class ModelEngine:
         )
 
     def _initialize_encoder_runner(self, runner_cls: type[EncoderRunner]) -> EncoderRunner:
-        runner_config = EncoderRunnerConfig.create(
-            model=self.model,
+        return runner_cls.create(
+            self.model,
+            llm_args=self.llm_args,
             mapping=self.mapping,
-            graph_config=(
-                self.cuda_graph_config
-                if isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
-                else None
-            ),
+            dist=self.dist,
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
             max_beam_width=self.max_beam_width,
-            without_logits=self.without_logits,
-            attention_backend=self.attn_backend,
-            enable_autotuner=self.llm_args.enable_autotuner,
-        )
-        return runner_cls(
-            self.model,
-            runner_config,
-            mapping=self.mapping,
-            dist=self.dist,
-            moe_load_balancer=self.moe_load_balancer,
             model_caller=self._model_caller,
+            attention_backend=self.attn_backend,
             attention_runtime_features=self.attn_runtime_features,
+            moe_load_balancer=self.moe_load_balancer,
         )
 
     def _initialize_encoder_decoder_runner(
