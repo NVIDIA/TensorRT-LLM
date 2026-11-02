@@ -486,6 +486,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         spec_metadata = Mock(
             _force_non_greedy_for_capture=False,
             context_prompt_lookahead_tokens=None,
+            supports_steady_prepare=False,
         )
 
         # The sampler's slot stores as the previous step left them.

@@ -177,20 +177,37 @@ ARG TRT_LLM_VER
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+# Used when BUILD_WHEEL_SCRIPT takes the wheel from a packaged build
+# (scripts/get_wheel_from_package.py): the location read first (aws or urm; empty
+# means aws) and the name of the credential behind the artifactory_netrc secret,
+# which appears only in error messages.
+ARG LLM_ARTIFACTS_PRIMARY=""
+ARG ARTIFACTORY_CREDENTIAL_ID=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
     --mount=type=secret,id=github_clone_token \
+    --mount=type=secret,id=artifactory_netrc \
+    --mount=type=bind,source=jenkins/scripts/fetch_build_artifact.sh,target=/src/tensorrt_llm/jenkins/scripts/fetch_build_artifact.sh \
     if [ -n "$GITHUB_MIRROR" ]; then \
       export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"; \
     fi && \
     # Authenticates `git submodule update` and the CMake FetchContent clones
     # (3rdparty/fetch_content.json) that this build pulls from github.com.
     . docker/common/github_auth.sh && \
+    # get_wheel_from_package.py reads the packaged build through the bind-mounted
+    # jenkins/scripts/fetch_build_artifact.sh, which takes the Artifactory access token
+    # for artifactory.nvidia.com from this netrc. The secret is present only when the
+    # build passes it (ARTIFACTORY_NETRC in docker/Makefile).
+    if [ -f /run/secrets/artifactory_netrc ]; then \
+      export ARTIFACTORY_NETRC=/run/secrets/artifactory_netrc; \
+    fi && \
     set -- ${BUILD_WHEEL_ARGS} && \
     if [ "${BUILD_WHEEL_SCRIPT}" = "scripts/build_wheel.py" ] && [ -n "${TRT_LLM_VER}" ]; then \
       set -- "$@" --version-override "${TRT_LLM_VER}"; \
     fi && \
     TRTLLM_BUILD_SOURCE_COMMIT=${GIT_COMMIT} \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
+    LLM_ARTIFACTS_PRIMARY=${LLM_ARTIFACTS_PRIMARY} \
+    ARTIFACTORY_CREDENTIAL_ID=${ARTIFACTORY_CREDENTIAL_ID} \
     python3 ${BUILD_WHEEL_SCRIPT} "$@"
 
 FROM ${DEVEL_IMAGE} AS release

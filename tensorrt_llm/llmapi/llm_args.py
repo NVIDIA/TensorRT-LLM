@@ -3310,6 +3310,24 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "is enabled. Required when use_dynamic_tree is True; ignored (with a "
         "warning) when use_dynamic_tree is False.")
 
+    draft_lm_head_dtype: Literal["auto", "mxfp8"] = Field(
+        default="auto",
+        status="prototype",
+        description=
+        "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an "
+        "MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention "
+        "DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the "
+        "acceptance length, but never the output.")
+
+    draft_moe_dtype: Literal["auto", "nvfp4"] = Field(
+        default="auto",
+        status="prototype",
+        description=
+        "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized "
+        "to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the "
+        "TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never "
+        "the output.")
+
     # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
@@ -4401,6 +4419,14 @@ class WaitingQueuePolicy(StrEnum):
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
+class ContextSchedulingPolicy(StrEnum):
+    """Order in which the scheduler admits pending context requests."""
+
+    FCFS = "fcfs"  # Arrival order
+    # Fewest prompt tokens not covered by reusable KV cache first; ties in arrival order
+    SHORTEST_UNCACHED_FIRST = "shortest_uncached_first"
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -4461,6 +4487,37 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    context_scheduling_policy: ContextSchedulingPolicy = Field(
+        default=ContextSchedulingPolicy.FCFS,
+        description=(
+            "Order in which pending context requests are admitted: 'fcfs' "
+            "(arrival order) or 'shortest_uncached_first' (fewest prompt "
+            "tokens not covered by reusable KV cache first, which lowers "
+            "TTFT under load at the cost of fairness). Only the KV cache "
+            "manager V2 scheduler supports 'shortest_uncached_first'."),
+        status="prototype")
+
+    context_starvation_iterations: Optional[PositiveInt] = Field(
+        default=None,
+        description=(
+            "With context_scheduling_policy='shortest_uncached_first', "
+            "chunked prefill and a max_num_tokens budget: a context request "
+            "pending for more than this many scheduler iterations takes up "
+            "to a quarter of max_num_tokens of each iteration's budget "
+            "ahead of the shortest-first order, oldest first. None "
+            "disables it."),
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
+        if (self.context_starvation_iterations is not None
+                and self.context_scheduling_policy
+                != ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST):
+            raise ValueError(
+                "context_starvation_iterations requires "
+                "context_scheduling_policy='shortest_uncached_first'")
+        return self
 
     def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(
@@ -5613,15 +5670,25 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
-        "coalesces a request's scattered per-block KV for a single multi-rail "
-        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
-        "the per-block path, >0 enables bounce at that capacity. By default "
-        "two buffers of this size are allocated (one for send, one for recv); "
-        "with agent_bounce_buffer_enable a single shared buffer is allocated "
-        "instead and the size should be a power of two (256/512/1024). "
-        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
-        "transceiver does not support bounce and ignores this field.")
+        "Size in MiB of the KV-cache bounce buffer in the C++ NIXL transfer "
+        "agent; 0 (default) turns it off and KV fragments are written "
+        "directly with standard NIXL. A positive value allocates one buffer "
+        "of this size per rank, shared by send and receive. Use a power of "
+        "two such as 256, 512 or 1024; for other values only the largest "
+        "power of two that fits is used. For an eligible write, the sender "
+        "gathers the fragments into the buffer and sends them in chunks, "
+        "and the receiver scatters them into its KV cache. By default a "
+        "write is eligible only with >= 1024 descriptors averaging <= 16 KiB "
+        "(typical when context and generation split attention heads "
+        "differently); agent_bounce_params changes that. Set it on both "
+        "context and generation servers; if either side has 0, the pair "
+        "uses standard NIXL. If either side's buffer is smaller than "
+        "max_chunk_size (32 MiB by default), both sides must use the same "
+        "size, or the pair uses standard NIXL. Requires the Python (v2) "
+        "transceiver with the C++ NIXL agent; on a build without bounce "
+        "support (libzmq) a positive value fails at startup. The C++ "
+        "transceiver and the pure-Python NIXL agent ignore it with a "
+        "warning.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -5629,27 +5696,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
-        "bounce selected by agent_bounce_buffer_enable is allowed) or "
-        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
-        "Invalid static settings fail at "
-        "startup; per-request constraints reject the request.")
+        "peers, beam_width=1, no Mamba/hybrid cache, and block reuse disabled "
+        "or set to all_reusable. Invalid static settings fail at startup; "
+        "per-request constraints reject the request.")
 
     agent_bounce_buffer_enable: bool = Field(
         default=False,
+        status="deprecated",
         description=
-        "Run the KV-cache bounce in the C++ transfer agent instead of the "
-        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
-        "(use a power of two). Set this identically on context and "
-        "generation; kv_cache_bounce_size_mb matters only when its usable "
-        "capacity (rounded down to a power of two) is below max_chunk_size; "
-        "both sides must then clamp to the same chunk cap, otherwise the pair "
-        "falls back to standard NIXL. By default only writes with "
-        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
-        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
-        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
-        "relaxes the gate. Requires the Python (v2) transceiver; see the "
-        "disaggregated-serving docs.")
+        "DEPRECATED: no-op kept so existing configs still parse; it will be "
+        "removed in a future release. kv_cache_bounce_size_mb > 0 alone "
+        "enables the C++ transfer-agent bounce buffer, and 0 disables it.")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
@@ -5658,12 +5715,13 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
         "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
         "Precedence: this dict > environment variable > built-in default. "
-        "Requires agent_bounce_buffer_enable. request_timeout_ms and the "
-        "effective max_chunk_size (after the arena clamp) must match between "
-        "context and generation. "
-        "max_average_descriptor_size=0 stops outbound routing only (arena, "
-        "handshake and inbound scatter stay active); set "
-        "agent_bounce_buffer_enable=False to turn the feature off.")
+        "Requires kv_cache_bounce_size_mb > 0. request_timeout_ms and the "
+        "effective chunk size (max_chunk_size, capped by the buffer size) "
+        "must match between context and generation. "
+        "max_average_descriptor_size=0 stops this worker from sending "
+        "through the buffer, but it still allocates the buffer and receives "
+        "bounced writes; set kv_cache_bounce_size_mb=0 to turn the feature "
+        "off.")
 
     @field_validator('agent_bounce_params', mode='before')
     @classmethod
@@ -5679,17 +5737,23 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_bounce_config(self) -> 'CacheTransceiverConfig':
-        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
-            raise ValueError(
-                "agent_bounce_buffer_enable selects the C++ transfer-agent "
-                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
-                "(bounce disabled); set a positive capacity.")
+        # Deprecated no-op: warn only on True. An explicit False looks like the
+        # default after apply_model_defaults_to_llm_args re-validates
+        # model_dump(), and warning_once keeps that re-validation from
+        # repeating the warning.
+        if self.agent_bounce_buffer_enable:
+            logger.warning_once(
+                "cache_transceiver_config.agent_bounce_buffer_enable is "
+                "deprecated and ignored: kv_cache_bounce_size_mb > 0 alone "
+                "enables the C++ transfer-agent bounce buffer. Remove the "
+                "field; it will be deleted in a future release.",
+                key="cache_transceiver_config.agent_bounce_buffer_enable")
         if self.agent_bounce_params:
-            if not self.agent_bounce_buffer_enable:
+            if self.kv_cache_bounce_size_mb == 0:
                 raise ValueError(
-                    "agent_bounce_params only applies to the C++ transfer-agent "
-                    "bounce implementation; set agent_bounce_buffer_enable=True "
-                    "or drop the params.")
+                    "agent_bounce_params tunes the C++ transfer-agent bounce "
+                    "buffer, but kv_cache_bounce_size_mb is 0 (bounce "
+                    "disabled); set a positive capacity or drop the params.")
             # Lazy: importing tensorrt_llm._torch at module scope is circular.
             from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
                 AGENT_BOUNCE_PARAM_KEYS
@@ -6055,6 +6119,17 @@ class BaseLlmArgs(StrictBaseModel):
         "trtllm-serve: values > 1 run additional attached frontend processes "
         "that share the serving port via SO_REUSEPORT (classic IPC executor "
         "path only).",
+        status="prototype")
+
+    serve_frontend_affinity_port_stride: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also "
+        "listens on its own port, port + stride * (i + 1), so a client can "
+        "send every turn of a conversation to the same frontend process. A "
+        "disaggregated server does so for context requests that carry a "
+        "conversation id when its context_servers section sets the same "
+        "num_serve_frontends and serve_frontend_affinity_port_stride.",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
@@ -6977,6 +7052,22 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
+    mnnvl_allreduce_fp8_payload: bool = Field(
+        default=False,
+        description=
+        "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of "
+        "1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which "
+        "halves the NVLink bytes of both stages.",
+        status="prototype")
+
+    replicate_embedding: bool = Field(
+        default=False,
+        description=
+        "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a "
+        "lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by "
+        "Qwen3-Next / Qwen3.5 models without attention DP.",
+        status="prototype")
 
     checkpoint_loader: Optional[object] = Field(
         default=None,

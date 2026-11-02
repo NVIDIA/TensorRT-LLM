@@ -146,8 +146,9 @@ add_th_common_family(
   fusedGemmAllreduceOp.cpp
   dwdpFabricGatherOp.cpp)
 
-add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
-                     mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
+add_th_common_family(
+  th_common_sequence causalConv1dOp.cpp gdnVerifyOp.cpp mambaConv1dOp.cpp
+  mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
   th_common_visual_gen

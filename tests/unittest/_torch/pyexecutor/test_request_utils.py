@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import SlotSamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequest as CppLlmRequest
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.inputs.multimodal import (
@@ -581,6 +582,40 @@ def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> 
     assert llm_request.draft_tokens == draft_tokens
     assert llm_request.py_draft_tokens == draft_tokens
     assert llm_request.context_phase_params.draft_tokens == draft_tokens
+
+
+_I32_PROMPT = [7, 0, 2**31 - 1, 3, 151_643]
+
+
+def test_executor_request_to_llm_request_ingests_int32_tokens() -> None:
+    executor_request = trtllm.Request(input_token_ids=_I32_PROMPT, max_tokens=4)
+    tokens = executor_request.get_input_token_ids_array()
+    assert tokens.dtype == np.int32 and tokens.tolist() == _I32_PROMPT
+    tokens[0] = -5  # an owned copy
+    assert executor_request.input_token_ids == _I32_PROMPT
+
+    llm_request = executor_request_to_llm_request(
+        3, executor_request, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    assert llm_request.get_tokens(0) == _I32_PROMPT
+    assert llm_request.orig_prompt_len == len(_I32_PROMPT)
+
+
+@pytest.mark.parametrize(
+    "dtype, stride", [(np.int32, 1), (np.int64, 1), (np.int32, 2)], ids=["i32", "i64", "strided"]
+)
+def test_llm_request_ctor_copies_token_ndarray(dtype, stride) -> None:
+    # Only a contiguous int32 array is memcpy'd; any other array takes the sequence cast.
+    tokens = np.repeat(np.asarray(_I32_PROMPT, dtype=dtype), stride)[::stride]
+    request = CppLlmRequest(
+        request_id=1,
+        max_new_tokens=4,
+        input_tokens=tokens,
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=False,
+    )
+    tokens[:] = 0
+    assert request.get_tokens(0) == _I32_PROMPT
 
 
 def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
