@@ -141,15 +141,17 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | Backend | GPU arch | Quantization |
 |---|---|---|
 | `CUTLASS` | SM80+ | unquantized, FP8 QDQ, FP8 block-scale, NVFP4, W4A16_NVFP4, W4A8_AWQ, W8A16, MXFP4, MXFP8 |
-| `TRTLLM` | SM100 / SM103 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 (a separate FlashInfer path) |
+| `TRTLLM` | SM100 / SM103 / SM107 | NVFP4, FP8 block-scale, W4A8_NVFP4_FP8, W4A16_MXFP4, W4A8_MXFP4_FP8, W4A8_MXFP4_MXFP8, BF16 (a separate FlashInfer path) |
 | `CUTEDSL` | SM100 / SM103 / SM107, SM120 / SM121 (CUTLASS prefill / FlashInfer decode) | NVFP4, BF16 (SM107), W4A16_NVFP4 (SM120 / SM121) |
 | `CUTEDSL_FC12` | SM107 | NVFP4 |
 | `DEEPGEMM` | SM100 / SM103 / SM107 | FP8 block-scale |
 | `DENSEGEMM` | SM100 / SM103 | NVFP4 |
 | `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4 |
-| `MEGAMOE_DEEPGEMM` | SM100 / SM103 | W4A8_MXFP4_MXFP8 |
+| `MEGAMOE_DEEPGEMM` | SM100 / SM103 / SM107 | W4A8_MXFP4_MXFP8 |
 | `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
 | `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |
+
+The SM107 measurements here cover NVFP4 and W4A8_MXFP4_MXFP8; see the capability matrix for format-specific support.
 
 ##### How to assign a backend?
 
@@ -203,33 +205,72 @@ Backend
 │      ├─ NVFP4, tokens per rank < 64, ep_size==1, no attention DP  → CUTEDSL
 │      └─ else                                                      → CUTLASS
 │
-└─ SM100 / SM103  (B300 / GB300)
+├─ SM100 / SM103  (B300 / GB300)
+│      │
+│      ├─ attention TP                                          → TRTLLM
+│      │
+│      └─ attention DP
+│             │
+│             ├─ GB300 with world_size <= 72, or B300 with world_size <= 8
+│             │  (EP within one NVLink domain)
+│             │      │
+│             │      ├─ NVFP4
+│             │      │      ├─ decode (CUDA graph on)
+│             │      │      │      ├─ activated_tokens_per_rank <= 512
+│             │      │      │      │      ├─ world_size <= 8      → TRTLLM
+│             │      │      │      │      └─ else                 → CUTEDSL
+│             │      │      │      └─ else                        → MEGAMOE_CUTEDSL
+│             │      │      │
+│             │      │      └─ prefill (CUDA graph off)
+│             │      │             ├─ activated_tokens_per_rank <= 16384
+│             │      │             │                              → TRTLLM
+│             │      │             └─ else                        → MEGAMOE_CUTEDSL
+│             │      │
+│             │      └─ W4A8_MXFP4_MXFP8                          → MEGAMOE_DEEPGEMM
+│             │
+│             └─ B300 with world_size > 8
+│                (EP crosses the NVLink domain)
+│                       ├─ NVFP4             → CUTEDSL
+│                       └─ W4A8_MXFP4_MXFP8  → TRTLLM
+│
+└─ SM107 (Vera Rubin NVL72)
        │
-       ├─ attention TP                                          → TRTLLM
+       ├─ attention TP
+       │      │
+       │      ├─ NVFP4
+       │      │      ├─ hidden_size <= 3584                → CUTEDSL
+       │      │      └─ else
+       │      │             ├─ intermediate_size <= 2048
+       │      │             │      ├─ decode (CUDA graph on)
+       │      │             │      │      ├─ activated_tokens_per_rank <= 128 and world_size <= 8
+       │      │             │      │      │                → TRTLLM
+       │      │             │      │      └─ else          → CUTEDSL
+       │      │             │      └─ prefill (CUDA graph off)
+       │      │             │             ├─ activated_tokens_per_rank <= 10240
+       │      │             │             │                → TRTLLM
+       │      │             │             └─ else          → CUTEDSL
+       │      │             └─ else                       → TRTLLM
+       │      │
+       │      └─ W4A8_MXFP4_MXFP8                         → TRTLLM
        │
        └─ attention DP
               │
-              ├─ GB300 with world_size <= 72, or B300 with world_size <= 8
-              │  (EP within one NVLink domain)
+              ├─ NVFP4
+              │      ├─ decode (CUDA graph on)
+              │      │      ├─ 4 < activated_tokens_per_rank < 192
+              │      │      │                             → TRTLLM
+              │      │      └─ else                       → MEGAMOE_CUTEDSL
               │      │
-              │      ├─ NVFP4
-              │      │      ├─ decode (CUDA graph on)
-              │      │      │      ├─ activated_tokens_per_rank <= 512
-              │      │      │      │      ├─ world_size <= 8      → TRTLLM
-              │      │      │      │      └─ else                 → CUTEDSL
-              │      │      │      └─ else                        → MEGAMOE_CUTEDSL
-              │      │      │
-              │      │      └─ prefill (CUDA graph off)
-              │      │             ├─ activated_tokens_per_rank <= 16384
-              │      │             │                              → TRTLLM
-              │      │             └─ else                        → MEGAMOE_CUTEDSL
-              │      │
-              │      └─ W4A8_MXFP4_MXFP8                          → MEGAMOE_DEEPGEMM
+              │      └─ prefill (CUDA graph off)
+              │             ├─ intermediate_size <= 2048
+              │             │      ├─ activated_tokens_per_rank <= 16384
+              │             │      │                      → TRTLLM
+              │             │      ├─ else if activated_tokens_per_rank <= 24576
+              │             │      │                      → MEGAMOE_CUTEDSL
+              │             │      └─ else                → CUTEDSL
+              │             └─ else                       → MEGAMOE_CUTEDSL
               │
-              └─ B300 with world_size > 8
-                 (EP crosses the NVLink domain)
-                        ├─ NVFP4             → CUTEDSL
-                        └─ W4A8_MXFP4_MXFP8  → TRTLLM
+              └─ W4A8_MXFP4_MXFP8                         → MEGAMOE_DEEPGEMM
 
 
 ═════════════════ STEP3: Communication ═════════════════
@@ -255,8 +296,9 @@ Communication
 > `{2048, 2560, 3584, 4096, 5120, 6144, 7168}` and `top_k <= 16`.
 
 > **Notes**
-> - The tree is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
+> - The SM100 / SM103 branch is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
 > - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`. GB300 is covered only through `world_size <= 72`; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.
+> - The SM107 branch is based on module-level `bench_moe` sweeps on Vera Rubin NVL72 using TensorRT-LLM `1.4.0rc2` (`b96ba434e8`): NVFP4 and W4A8_MXFP4_MXFP8, CUDA Graph on/off, and world sizes 4, 8, 16 and 32 within one NVLink domain.
 > - Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.
 > - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
 
