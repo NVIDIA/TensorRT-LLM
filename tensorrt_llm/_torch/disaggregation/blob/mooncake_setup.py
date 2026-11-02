@@ -173,8 +173,9 @@ def load_store_config(
 
 
 def open_sdk(config: MooncakeConfig) -> Any:
-    """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
-    while it mounts this process's segment.
+    """Opens a set-up ``MooncakeDistributedStore``, before the executor loop starts: ``setup``
+    holds the GIL throughout, stalling every Python thread, while it connects to the master and
+    mounts any segment of this process.
 
     Raises:
         ValueError: TCP would use its legacy framing, the local hot cache is on, or the newer
@@ -219,8 +220,8 @@ def open_mooncake_driver(
     """Opens the Mooncake driver a store config describes, once both its sections are read: opening
     waits for the master and mounts this process's segment, so a bad config fails before that.
 
-    The caller owns the driver and closes it last, with ``MooncakeDriver.close``, which also closes
-    the SDK client.
+    The caller owns the driver and closes it last, at shutdown once the executor loop stopped, with
+    ``MooncakeDriver.close``, which also closes the SDK client.
 
     Args:
         config: A store config, as ``load_store_config`` takes it.

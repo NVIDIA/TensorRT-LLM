@@ -513,11 +513,16 @@ class MooncakeDriver:
     def close(self) -> None:
         """The owner's last step, once a drain returned True and every region is unregistered:
         tries once to revoke the sessions of the keys left open for close, then closes the SDK
-        client, which takes no call after that. The SDK revokes the sessions it holds and answers
-        INVALID_PARAMS for the others. The revocation waits on the master, and closing holds the
-        GIL through the unmount, so the owner calls it off the executor loop's thread. A session
-        whose revocation fails is freed by the master after ``put_start_release_timeout_sec``;
-        the sessions of keys left to the master are never revoked here."""
+        client, which takes no call after that. The SDK revokes the sessions it holds, waiting on
+        the master without the GIL, and answers INVALID_PARAMS for the others. A session whose
+        revocation fails is freed by the master after ``put_start_release_timeout_sec``; the
+        sessions of keys left to the master are never revoked here.
+
+        Closing the client holds the GIL, so every Python thread waits, whichever thread closes:
+        up to a few seconds while the SDK's threads stop and any segment is unmounted, and, while
+        the master does not answer, the SDK's RPC timeouts for each call it waits on
+        (``MC_RPC_TIMEOUT_MS`` and ``MC_RPC_CONNECT_TIMEOUT_MS``, 30 s by default, read at setup).
+        The owner therefore closes the driver at shutdown, once the executor loop stopped."""
         with self._lock:
             if self._closed:
                 return
