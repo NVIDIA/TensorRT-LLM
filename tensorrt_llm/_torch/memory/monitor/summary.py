@@ -340,7 +340,15 @@ def render_summary(
     # part is the KV cache is working as designed, and telling its reader to
     # shrink it would be noise at best.
     out.extend(
-        _conclusion(totals, baseline, (advice or {}) if headline else {}, suggestion, device)
+        _conclusion(
+            totals,
+            baseline,
+            (advice or {}) if headline else {},
+            suggestion,
+            device,
+            sites=unattributed_sites,
+            alarm=bool(headline),
+        )
     )
     return out
 
@@ -351,8 +359,11 @@ def _conclusion(
     advice: dict[Group, str],
     suggestion: str = "",
     device=None,
+    sites: dict[str, int] | None = None,
+    alarm: bool = False,
 ) -> list[str]:
     known = {g: s for g, s in totals.sizes.items() if s is not None}
+    grew = 0
     if not known:
         return ["  Conclusion: nothing could be measured."]
 
@@ -372,6 +383,7 @@ def _conclusion(
         grown = {g: d for g, d in growth.items() if d >= _SHOWN}
         if grown:
             focus = max(grown, key=grown.get)
+            grew = grown[focus]
             lines.append(
                 f"  Conclusion: since warmup, {focus.value} grew the most "
                 f"({grown[focus] / _GIB:+.2f} GiB)."
@@ -401,8 +413,49 @@ def _conclusion(
             "can still fail if that space is fragmented."
         )
 
+    # Growth after warmup, which already ran the largest batch, is the most
+    # specific evidence a report has; when it is large or memory ran out it
+    # outranks the generic advice for the row.
+    explained = _growth_suggestion(focus, grew, advice.get(focus), sites)
     if suggestion:
         lines.append(f"  Suggestion: {suggestion}.")
+    elif explained and (alarm or grew >= _GROWTH_WORTH_NAMING):
+        lines.append(f"  Suggestion: {explained}.")
     elif focus in advice:
         lines.append(f"  Suggestion: {advice[focus]}.")
     return lines
+
+
+#: Growth since warmup large enough to explain even when nothing failed, so
+#: a periodic report can point at a leak before it runs out.
+_GROWTH_WORTH_NAMING = 1 << 30
+
+
+def _growth_suggestion(
+    focus: Group, grew: int, advice: str | None, sites: dict[str, int] | None
+) -> str:
+    """What to do about a row that grew since warmup, or ``""``."""
+    if not grew:
+        return ""
+    amount = f"{grew / _GIB:.2f} GiB"
+    if focus is Group.TORCH_UNATTRIBUTED:
+        fallback = f"; if it is activation memory, {advice}" if advice else ""
+        if sites:
+            site, size = max(sites.items(), key=lambda kv: kv[1])
+            return (
+                f"PyTorch memory with no known owner grew {amount} after warmup, which already "
+                f"ran the largest batch; most of it was allocated by {site} "
+                f"({size / _GIB:.2f} GiB) and is still held{fallback}"
+            )
+        return (
+            f"PyTorch memory with no known owner grew {amount} after warmup, which already ran "
+            "the largest batch, so something is holding on to memory (a cache, a callback, a "
+            "leak); rerun with TLLM_MEM_MONITOR_STACKS=1 to name the code that allocated it"
+            f"{fallback}"
+        )
+    if focus is Group.OVERHEAD:
+        return (
+            f"memory outside PyTorch grew {amount} after warmup: a library allocating on first "
+            "use, or native code holding memory; the overhead row's parts show when it appeared"
+        )
+    return ""
