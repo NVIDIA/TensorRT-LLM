@@ -416,32 +416,12 @@ class _ConversationState:
     planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
 
 
-def committed_drop_plan_is_always_empty(
-    layers: Sequence[Union[AttentionLayerConfig, SsmLayerConfig]],
-) -> bool:
-    """Whether ``plan_committed_block_drop()`` never returns a plan: it needs committed pages of
-    every dense windowed attention group, and a PRIVATE windowed group is never committed."""
-    for layer in layers:
-        if (
-            isinstance(layer, AttentionLayerConfig)
-            and layer.reuse_policy == ReusePolicy.PRIVATE
-            and layer.sliding_window_size is not None
-            and not any(buffer.is_sparse for buffer in layer.buffers)
-        ):
-            return True
-    return False
-
-
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self, max_num_turns: int, skip_empty_drop_plans: bool = False) -> None:
+    def __init__(self, max_num_turns: int) -> None:
         self._max_num_turns = max_num_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
-        # Every plan would be empty: skip the native planner (a full re-match of the prefix per
-        # completed context) and warn once instead of once per request.
-        self._skip_empty_drop_plans = skip_empty_drop_plans
-        self._warned_empty_drop_plans = False
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
@@ -452,16 +432,6 @@ class ConversationManager:
 
         state = self._conversation_states[conversation_id]
         if state.current_request_id != request_id:
-            return
-
-        if self._skip_empty_drop_plans:
-            if not self._warned_empty_drop_plans:
-                self._warned_empty_drop_plans = True
-                logger.warning(
-                    "Committed blocks of completed contexts cannot be planned for dropping: the KV "
-                    "cache has a PRIVATE sliding-window group (logged once)."
-                )
-            self.finish_request(request)
             return
 
         drop_handle = kv_cache.plan_committed_block_drop()
@@ -2832,10 +2802,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
         )
         self.conversation_manager = (
-            ConversationManager(
-                block_reuse_config.max_num_turns,
-                skip_empty_drop_plans=committed_drop_plan_is_always_empty(config.layers),
-            )
+            ConversationManager(block_reuse_config.max_num_turns)
             if enable_conversation_manager
             else None
         )
