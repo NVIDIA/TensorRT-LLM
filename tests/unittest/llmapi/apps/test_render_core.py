@@ -630,7 +630,13 @@ class TestExtensions:
         assert low == default.replace("`thinking_effort=max`", "`thinking_effort=low`")
 
         # A native effort is passed through while thinking is off, and the template ignores it.
-        assert render(thinking_effort="high", reasoning_effort="none") == off
+        native = chat_request(
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"thinking_effort": "high", "reasoning_effort": "none"},
+        )
+        assert render_chat(native, res, tokenize=False).text == off
+        assert native.chat_template_kwargs["thinking"] is False
+        assert native.chat_template_kwargs["thinking_effort"] == "high"
 
 
 class TestRenderConversation:
