@@ -300,6 +300,8 @@ class DecoderWarmup:
     ) -> list[tuple[int, int]]:
         """
         Returns warmup configs covering the maximum context and generation shapes.
+
+        A context-only KV cache cannot hold generation rows, so it gets the context shape only.
         """
 
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -320,10 +322,10 @@ class DecoderWarmup:
             // self._config.max_beam_width,
         )
 
-        warmup_requests_configs = [
-            (curr_max_num_tokens, 0),  # max_num_tokens, pure context
-            (max_batch_size, max_batch_size),  # max_batch_size, pure generation
-        ]
+        warmup_requests_configs = [(curr_max_num_tokens, 0)]  # max_num_tokens, pure context
+        if not is_context_only_kv_cache(kv_cache_manager):
+            # max_batch_size, pure generation
+            warmup_requests_configs.append((max_batch_size, max_batch_size))
 
         return warmup_requests_configs
 
@@ -337,8 +339,12 @@ class DecoderWarmup:
         and small-context (2-token path) cases.
         """
         max_configs = self._get_max_shape_warmup_requests(resource_manager)
-        # Specialize for 1 token pure ctx and pure gen
-        one_token_configs = [(1, 0), (1, 1)]
+        # Specialize for 1 token pure ctx and pure gen (no gen on a context-only cache)
+        one_token_configs = [(1, 0)]
+        if not is_context_only_kv_cache(
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        ):
+            one_token_configs.append((1, 1))
         # Small ctx specialization
         small_ctx_configs = [(2, 0)]
 

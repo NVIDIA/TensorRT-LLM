@@ -191,6 +191,28 @@ class _StandInMambaCacheManager:
         return self._available_tokens
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
+@pytest.mark.parametrize("context_only", [False, True])
+def test_general_and_memory_pool_warmups_leave_out_generation_shapes_on_context_only_cache(
+    cache_flag: str, context_only: bool
+) -> None:
+    """A context-only cache that is not a Mamba hybrid one runs the general and memory-pool phases.
+
+    Both take their shapes from these lists, so the lists must hold context shapes only.
+    """
+    warmup = decoder_warmup(decoder_config(), agreement=_agreement(world_size=4, dwdp_size=4))
+    resources = _context_only_cache_resources(cache_flag, context_only)
+
+    max_shapes = warmup._get_max_shape_warmup_requests(resources)
+    general_shapes = warmup._get_full_general_warmup_requests(resources)
+
+    for shapes in (max_shapes, general_shapes):
+        has_generation = any(num_gen > 0 for _, num_gen in shapes)
+        assert has_generation is not context_only, shapes
+    assert ((1, 1) in general_shapes) is not context_only
+
+
 def _engine(
     *, world_size: int = 1, dwdp_size: int = 0, config: DecoderRunnerConfig | None = None
 ) -> DecoderWarmup:
