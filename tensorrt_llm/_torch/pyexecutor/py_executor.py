@@ -2258,9 +2258,10 @@ class PyExecutor:
 
         Empty unless the memory monitor is on and ranks span MPI.
         """
-        if self._memory_report_ranks is None:
+        memory_report_ranks = getattr(self, "_memory_report_ranks", None)
+        if memory_report_ranks is None:
             return []
-        return self._memory_report_ranks.gather()
+        return memory_report_ranks.gather()
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:
         """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
@@ -2642,8 +2643,9 @@ class PyExecutor:
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()
-        if self._memory_report_ranks is not None:
-            self._memory_report_ranks.stop()
+        memory_report_ranks = getattr(self, "_memory_report_ranks", None)
+        if memory_report_ranks is not None:
+            memory_report_ranks.stop()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
