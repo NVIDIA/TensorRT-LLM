@@ -1852,7 +1852,9 @@ class TestEdgeCheckpoint:
         assert captured["guidance_scale"] == 5.0
         # Edge video defaults: 121 frames -> 31 latent frames, 480x832 -> 30x52.
         assert tuple(captured["latents"].shape) == (1, 48, 31, 30, 52)
-        assert captured["scheduler"] is edge_pipeline._scheduler_for(3.0)
+        assert captured["scheduler"] is edge_pipeline._scheduler_for(
+            edge_pipeline.sampling.checkpoint_flow_shift
+        )
         assert captured["scheduler"].num_inference_steps == 50
         assert captured["decoded"] is True
 

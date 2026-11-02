@@ -867,7 +867,7 @@ class TestCosmos3V2V:
         assert result.frame_rate == FRAME_RATE
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
@@ -897,7 +897,7 @@ class TestCosmos3V2V:
         )
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
@@ -977,7 +977,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
-        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=1.0)
         rebuilt = []
 
         class StopAfterTokenize(Exception):
@@ -1023,7 +1023,8 @@ class TestCosmos3V2V:
                 enable_audio=True,
             )
 
-        assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
+        # Video-to-video keeps the checkpoint shift and forces the uniform sigma grid.
+        assert rebuilt == [("video", 1.0, False), ("audio", 1.0, False)]
 
     def test_action_video_is_not_classified_as_v2v(self):
         """An action reference arrives as the same `video` bytes V2V uses, but
@@ -1092,7 +1093,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=7.0)
         pipeline.family = QWEN3_RECIPE.name
         calls = []
 
@@ -1343,7 +1344,7 @@ class TestCosmos3Audio:
         _assert_valid_audio(result.audio, result.audio_sample_rate)
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
