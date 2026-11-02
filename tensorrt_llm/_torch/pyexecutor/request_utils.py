@@ -8,6 +8,7 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 if TYPE_CHECKING:
+    from .executor_request_queue import RequestQueueItem
     from .scheduler import WaitingQueue
 
 import numpy as np
@@ -347,7 +348,9 @@ class RequestBroadcaster:
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
 
-    def broadcast(self, new_requests: List, prefer_cpu: bool = False) -> List:
+    def broadcast(
+        self, new_requests: list["RequestQueueItem"], prefer_cpu: bool = False
+    ) -> list["RequestQueueItem"]:
         """Broadcast self-contained request envelopes across ranks.
 
         Args:
@@ -396,7 +399,9 @@ class RequestBroadcaster:
         )
 
     @nvtx_range("broadcast_requests")
-    def _broadcast_single_round(self, new_requests: List) -> List:
+    def _broadcast_single_round(
+        self, new_requests: list["RequestQueueItem"]
+    ) -> list["RequestQueueItem"]:
         """One collective: rank 0 sends request envelopes or "nothing".
 
         Empty iterations cost one size exchange instead of the count probe's
@@ -432,7 +437,7 @@ class RequestBroadcaster:
             self.rank0_aux = None if header[2] < 0 else header[2] / 1e6
         return header[0]
 
-    def _broadcast_header(self, header: List[int], prefer_cpu: bool = False) -> List[int]:
+    def _broadcast_header(self, header: list[int], prefer_cpu: bool = False) -> list[int]:
         """Broadcast rank 0's header using the same PP route as requests."""
         if self.dist.world_size == 1:
             return header
@@ -459,7 +464,9 @@ class RequestBroadcaster:
         return header
 
     @nvtx_range("broadcast_requests")
-    def _broadcast_requests(self, new_requests: List) -> List:
+    def _broadcast_requests(
+        self, new_requests: list["RequestQueueItem"]
+    ) -> list["RequestQueueItem"]:
         """Broadcast request envelopes across pipeline stages."""
         payloads = new_requests
 
