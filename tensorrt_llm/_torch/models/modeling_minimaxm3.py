@@ -1635,8 +1635,9 @@ class MiniMaxM3Attention(Attention):
         weights and epsilons) is fixed for a given set of cache views and
         parameters, so the checks run once per distinct set and the resolved
         arguments are reused. The key is the address and layout (shape, strides,
-        dtype, device) of every tensor involved: a reloaded parameter or a new
-        cache manager starts a fresh entry, even when it reuses freed memory.
+        dtype, device) of every tensor involved plus the norm epsilons: a
+        reloaded parameter or a new cache manager starts a fresh entry, even
+        when it reuses freed memory.
         The plan holds the kernel's static arguments only; the cache views
         themselves are passed per call. Returns ``None`` when the fused producer
         does not apply.
@@ -1653,7 +1654,7 @@ class MiniMaxM3Attention(Attention):
             _tensor_view_key(out_cache_loc),
             _tensor_view_key(rotary_cos_sin),
             tuple(
-                module.weight.data_ptr()
+                (_tensor_view_key(module.weight), module.variance_epsilon)
                 for module in (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm)
             ),
         )
