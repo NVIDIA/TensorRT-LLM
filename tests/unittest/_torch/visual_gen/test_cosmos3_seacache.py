@@ -186,5 +186,10 @@ class TestCompiled:
         compiled generator blocks that SeaCache wraps."""
         blocks = compiled_seacache_pipeline.transformer.gen_layers
         assert all(isinstance(b, torch._dynamo.eval_frame.OptimizedModule) for b in blocks)
+        # Compiled code is cached per code object, and only the generator stack uses
+        # this block class, so this observes the warm-up compiling gen_layers.
+        block_forward = type(blocks[0]._orig_mod).forward.__code__
+        assert torch._dynamo.eval_frame._debug_get_cache_entry_list(block_forward), (
+            "warm-up did not compile the generator blocks"
+        )
         _check_failed_request_recovers(compiled_seacache_pipeline, monkeypatch)
-        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] > 0
