@@ -24,6 +24,7 @@ include =
     examples/*.py
     scripts/*.py
     tests/test_common/*.py
+    tests/integration/defs/stress_test/stress_test.py
     conftest.py
     tests/conftest.py
     tests/*/conftest.py

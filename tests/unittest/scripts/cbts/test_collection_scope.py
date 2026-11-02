@@ -69,6 +69,9 @@ def test_canonicalize_without_repository_root(
         ("examples/a/b.py", True),
         ("scripts/a/b.py", True),
         ("tests/test_common/a/b.py", True),
+        ("tests/integration/defs/stress_test/stress_test.py", True),
+        ("tests/integration/defs/stress_test/helper.py", False),
+        ("tests/integration/defs/stress_test/stress_test_other.py", False),
         ("conftest.py", True),
         ("tests/conftest.py", True),
         ("tests/unittest/a/conftest.py", True),
@@ -91,16 +94,21 @@ def test_tracker_uses_configured_include_patterns(
 
 
 @pytest.mark.parametrize("linked_root", [False, True])
+@pytest.mark.parametrize(
+    "relative_path", ["examples/x.py", "tests/integration/defs/stress_test/stress_test.py"]
+)
 @_REQUIRES_MONITORING
-def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_root: bool) -> None:
-    """Real and symlinked filenames produce the same persisted coverage symbol."""
+def test_symlinked_checkout_records_one_file_identity(
+    tmp_path: Path, linked_root: bool, relative_path: str
+) -> None:
+    """Default-scope source records one test-attributed identity through either checkout path."""
     tool_id = next(
         (slot for slot in (3, 5, 4, 2, 1, 0) if sys.monitoring.get_tool(slot) is None), None
     )
     if tool_id is None:
         pytest.skip("No sys.monitoring tool ID is available")
     checkout = tmp_path / "checkout"
-    source = checkout / "examples/x.py"
+    source = checkout / relative_path
     source.parent.mkdir(parents=True)
     source.write_text("def run():\n    return 1\n")
     link = tmp_path / "linked-checkout"
@@ -111,12 +119,12 @@ def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_roo
         str(tmp_path),
         tool_id=tool_id,
         repository_root=str(root),
-        include=["examples/*.py"],
+        include=read_source_config().get("run", "include").split(),
     )
     tracker.switch_test_context("test_scope")
     assert tracker.start()
     try:
-        for filename in (source, link / "examples/x.py"):
+        for filename in (source, link / relative_path):
             assert tracker._in_source(str(filename))
             namespace = {}
             exec(compile(source.read_text(), str(filename), "exec"), namespace)
@@ -127,9 +135,9 @@ def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_roo
     assert database is not None
     with sqlite3.connect(database) as connection:
         rows = connection.execute(
-            "SELECT file, qualname FROM touch_rows WHERE qualname = 'run'"
+            "SELECT file, qualname FROM touch_rows WHERE qualname = 'run' AND test != ''"
         ).fetchall()
-    assert rows == [("examples/x.py", "run")]
+    assert rows == [(relative_path, "run")]
 
 
 @_REQUIRES_MONITORING
@@ -208,11 +216,18 @@ def test_report_scope_and_directory_pruning(
         "examples/a/b.py",
         "scripts/x.py",
         "tests/test_common/x.py",
+        "tests/integration/defs/stress_test/stress_test.py",
         "conftest.py",
         "tests/conftest.py",
         "tests/unittest/a/conftest.py",
     }
-    excluded = {".git/x.py", "cpp/build/x.py", "3rdparty/x.py", "tests/unittest/test_x.py"}
+    excluded = {
+        ".git/x.py",
+        "cpp/build/x.py",
+        "3rdparty/x.py",
+        "tests/unittest/test_x.py",
+        "tests/integration/defs/stress_test/helper.py",
+    }
     for relative in included | excluded:
         path = checkout / relative
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -35,11 +35,14 @@ machinery / pytest actually load by bare name live outside the `cbts` package, i
 | `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source`, `include` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
 
 The default scope covers library Python from both the installed wheel and checkout, all Python
-under `examples/`, `scripts/` and `tests/test_common/`, and the root and `tests/` conftest files.
+under `examples/`, `scripts/` and `tests/test_common/`, the root and `tests/` conftest files,
+and `tests/integration/defs/stress_test/stress_test.py`.
 The Python bootstrap resolves `%(repository_root)s` from its own location in the checkout, so K8s
 and SLURM use the checkout visible to their test process. Include patterns match repository-relative
-paths with `fnmatch` semantics (`*` also matches `/`). Extending collection does not extend the
-coverage selector's core-Python eligibility rules.
+paths with `fnmatch` semantics (`*` also matches `/`). The stress harness is recorded only when
+it actually runs in an instrumented process; adding it here neither schedules a stress test nor
+backfills existing coverage DBs. Python files in any repository directory remain subject to the
+selector's test-attributed coverage and changed-scope checks.
 
 Source roots and filenames resolve symlinks before membership checks. Installed
 `site-packages/tensorrt_llm/` and `dist-packages/tensorrt_llm/` paths retain the same library
@@ -264,7 +267,7 @@ Coverage stage merges every stage's files through `pystart_report.py` and upload
 
 For a coverage-rate report, pass the checkout as `--source-root`. The report reads include patterns
 from the same template as the collector, so its denominator covers the same library, examples,
-scripts, test_common and conftest scope.
+scripts, test_common, conftest and standalone stress-harness scope.
 
 Every database uses schema version 5. `case_stage` stores a bare test ID beside its stage ID, and
 logical views reconstruct the selector's `<stage>/<test>` key. Integer IDs are local to a database,
