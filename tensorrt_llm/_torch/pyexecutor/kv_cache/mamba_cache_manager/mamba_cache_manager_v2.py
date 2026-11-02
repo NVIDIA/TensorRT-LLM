@@ -47,7 +47,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
     Role,
-    _mixed_precision_cost_components,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -55,13 +54,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
-    KVCacheManager,
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MixedPrecisionKV
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -490,34 +488,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if max_resident_sequences > 0:
                 attention_page_bytes_override = attention_intercept // max_resident_sequences
 
-        mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-        if isinstance(mixed, MixedPrecisionKV) and attention_slope_override is None:
-            # Mixed-precision attention layers hold an NVFP4 history plus the first/last tokens.
-            _, _, local_attention_layers = _get_local_mamba_cache_layout(
-                model_config,
-                mapping,
-                spec_config=spec_config,
-                is_draft=kwargs.get("is_draft", False),
-                use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
-            )
-            high = (
-                KVCacheManager.get_cache_size_per_token(
-                    model_config, mapping, num_layers=local_attention_layers, **kwargs
-                )
-                if local_attention_layers > 0
-                else 0
-            )
-            (attention_slope_override, _), (_, window) = _mixed_precision_cost_components(
-                [high], [None], mixed
-            )
-            attention_intercept = (
-                max_batch_size
-                * mapping.pp_size
-                * math.ceil(window / tokens_per_block)
-                * tokens_per_block
-                * high
-            )
-
         slope, intercept = _estimate_mamba_hybrid_cache_cost(
             model_config,
             mapping,
@@ -646,8 +616,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         if local_layer_idx >= len(self.pp_layers):
-            # Virtual layers past the model's own (the FP4 MLA HP ring or the
-            # mixed-precision high layers) are attention layers.
+            # Virtual layers past the model's own (the FP4 MLA HP ring and the mixed-precision
+            # high layers) are attention layers.
             return False
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
@@ -655,8 +625,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
         if layer_id >= self.num_local_layers:
-            # Virtual layers past the model's own are the FP4 MLA HP ring or
-            # the mixed-precision high layers.
             if (
                 self._attention_cache_layout_policy is not None
                 and LayerId(layer_id) in self._hp_manager_layer_ids

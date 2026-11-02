@@ -20,7 +20,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
-from ..mixed_precision_high_rows import store_mixed_precision_high_context_rows
+from ..mixed_precision_high_rows import store_mixed_precision_high_rows
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
@@ -86,10 +86,10 @@ def forward_context_sparse_attn(
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )
-        # The append kernel wrote the NVFP4 pool; also write the FP8 mixed-precision high pool.
+        # The append kernel wrote the NVFP4 pool; also write the mixed-precision high pool.
         if attn_metadata.has_mixed_precision_high_rows:
-            store_mixed_precision_high_context_rows(
-                self.mqa, attn_metadata, latent_cache, position_ids
+            store_mixed_precision_high_rows(
+                self.mqa, attn_metadata, latent_cache, position_ids, is_generation=False
             )
         return self.forward_absorption_context(
             q,

@@ -30,7 +30,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MixedPrecisionKV,
+    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
     MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
     SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
@@ -813,22 +813,6 @@ def _derive_v2_layer_type_attention_windows(
         return None
     pool_ratio = kv_cache_config.pool_ratio
     num_layer_groups = len(set(derived_windows))
-    mixed = kv_cache_config.mixed_precision_kv
-    if isinstance(mixed, MixedPrecisionKV) and max_seq_len in derived_windows:
-        # The full-attention layers' mixed-precision high layers form one more
-        # group, unless they have no sink and the retained window of a sliding
-        # group (widened by the draft lookahead under block reuse, as the
-        # manager does), which makes them that group.
-        backoff = 0
-        if (kv_cache_config.enable_block_reuse
-                and kv_cache_manager_cls._supports_reuse_match_backoff):
-            backoff = draft_prompt_lookahead(model_config.spec_config) or 0
-        sliding = {
-            window + backoff
-            for window in derived_windows if window + backoff < max_seq_len
-        }
-        if mixed.first_n != 0 or mixed.last_n + 1 not in sliding:
-            num_layer_groups += 1
     if pool_ratio is not None and len(pool_ratio) != num_layer_groups:
         logger.warning_once(
             f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, but the "
@@ -954,8 +938,8 @@ def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
     if draft_kv_config.pool_ratio is None:
         return
     if draft_kv_config.mixed_precision_kv is not None:
-        # The mixed MTP draft manager has its own pool plus a mixed-precision high
-        # pool; the target's ratios describe the target's pools.
+        # An MTP draft manager with mixed-precision KV has its own pool plus a
+        # mixed-precision high pool, so the target's pool_ratio does not fit it.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
             "target KV cache only; the mixed-precision MTP draft KV cache sizes "
@@ -963,11 +947,7 @@ def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
         draft_kv_config.pool_ratio = None
     elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
           and len(draft_kv_config.pool_ratio) != 1):
-        # pool_ratio describes one manager's layer-group layout. The
-        # target hybrid manager may have separate recurrent-state and
-        # attention layer groups, while a non-VSWA draft manager has one
-        # attention layer group. Reusing the target's ratios fails its arity
-        # check.
+        # pool_ratio describes one manager's layer groups: the target's ratios do not fit the draft.
         logger.info(
             "Normalizing the separate one-model draft KV cache pool_ratio "
             f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
@@ -2413,8 +2393,8 @@ class KvCacheCreator:
         update = {"max_attention_window": max_attention_window}
         if (kv_cache_config.mixed_precision_kv is not None and
                 not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
-            # A drafter with its own architecture keeps a plain cache; MTP layers go
-            # mixed like the target. The pool dtype follows the model's KV quant algo.
+            # MTP layers use mixed-precision KV like the target; a drafter with
+            # its own architecture uses the "auto" KV dtype instead.
             update["dtype"] = "auto"
         return kv_cache_config.model_copy(update=update)
 

@@ -187,33 +187,10 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     (model_layer, attn_type) into synthetic IDs via the
     _layer_attn_to_layer_id inverse mapping.
     """
-    local_layer_ids = [int(layer_id) for layer_id in manager.impl.layer_grouping[lg_idx]]
-    # Mixed-precision KV renames the layers by one rule; see mixed_precision_transfer_ids.
-    # The dict check keeps stand-in managers (mocks) on their own naming.
-    mixed = (
-        manager.mixed_precision_transfer_ids
-        if isinstance(getattr(manager, "mixed_precision_high_layers", None), dict)
-        else None
-    )
-    ids = (
-        mixed(local_layer_ids, lambda own: _own_global_layer_ids(manager, lg_idx, own))
-        if mixed
-        else None
-    )
-    return ids if ids is not None else _own_global_layer_ids(manager, lg_idx, local_layer_ids)
+    local_layer_ids = manager.impl.layer_grouping[lg_idx]
 
-
-def _own_global_layer_ids(manager, lg_idx: int, local_layer_ids: List[int]) -> List[int]:
-    """The manager's own ids for ``local_layer_ids``, layers of layer group ``lg_idx``."""
-    if not local_layer_ids:
-        return []
     get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
     if get_global_layer_ids is not None:
-        if len(local_layer_ids) != len(manager.impl.layer_grouping[lg_idx]):
-            raise NotImplementedError(
-                f"Layer group {lg_idx} mixes mixed-precision high layers with layers that "
-                "get_disagg_global_layer_ids names"
-            )
         global_layer_ids = [int(layer_id) for layer_id in get_global_layer_ids(lg_idx)]
         if len(global_layer_ids) != len(local_layer_ids):
             raise ValueError(
