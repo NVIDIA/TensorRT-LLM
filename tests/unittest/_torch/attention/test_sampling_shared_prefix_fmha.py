@@ -1405,12 +1405,7 @@ def test_fused_spec_attention_matches_dense_and_writes_kv(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,prefix_kernel",
-    [
-        (28, 4, 128, 2, "triton"),
-        (28, 4, 128, 2, "ctx"),
-        (28, 4, 128, 4, "fa4"),
-        (28, 4, 128, 9, "fa4"),
-    ],
+    [(28, 4, 128, 2, "triton"), (28, 4, 128, 2, "ctx"), (28, 4, 128, 4, "fa4"), (28, 4, 128, 9, "fa4")],
 )
 def test_fused_attention_with_massive_activations(
     num_heads, num_kv_heads, head_dim, q_len, prefix_kernel
@@ -1453,11 +1448,7 @@ def test_fused_attention_with_massive_activations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
-    [
-        (28, 4, 128, 4, True, 2, True),
-        (28, 4, 128, 9, True, 2, True),
-        (20, 20, 128, 4, False, 0, False),
-    ],
+    [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False)],
 )
 def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
     num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot

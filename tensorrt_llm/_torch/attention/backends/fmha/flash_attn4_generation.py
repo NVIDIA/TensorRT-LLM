@@ -27,7 +27,7 @@ Per layer it
 
 The page table is derived on the device from the attention op's block offsets, and every
 launch reads only fixed-address tensors, so the layer can be captured in a CUDA graph.
-Draft layers (they run on a draft KV-cache manager) are declined.
+Draft layers (they run on a draft KV-cache manager) are served too unless ``TLLM_FLASH_ATTN4_GENERATION_DRAFT=0``.
 
 Opt in with ``TLLM_FMHA_LIBS=+flash_attn4_generation``.
 """
@@ -68,6 +68,18 @@ LIB_NAME = "flash_attn4_generation"
 CHECK_ENV = "TLLM_FLASH_ATTN4_GENERATION_CHECK"
 """Set to 1 to compare the device page table with the host block-offset table on eager steps.
 Debugging aid: it synchronizes the device and must stay off for measurements."""
+
+DRAFT_ENV = "TLLM_FLASH_ATTN4_GENERATION_DRAFT"
+"""Serve the EAGLE-3 draft layer too (default 1). The draft forward swaps the draft KV-cache manager
+and its block offsets into the metadata (``draft_kv_cache_context``), so the page table and pool view
+below follow it. On H100 (Qwen2.5-7B, 120 rows, 4k-token prompts) the multi-token XQA kernel took 515 us
+(K=3) / 990 us (K=8) for the first draft step and ~260 us for each later one; set to 0 to keep draft
+layers on the regular kernel."""
+
+
+def _draft_enabled() -> bool:
+    return os.environ.get(DRAFT_ENV, "1") != "0"
+
 
 FA4_TILE_MN = (64, 128)
 FA4_NUM_THREADS = 256
@@ -275,7 +287,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         if (
             manager is None
             or not hasattr(manager, "index_mapper")
-            or getattr(manager, "is_draft", False)
+            or (getattr(manager, "is_draft", False) and not _draft_enabled())
             or metadata.kv_cache_block_offsets is None
         ):
             return False
