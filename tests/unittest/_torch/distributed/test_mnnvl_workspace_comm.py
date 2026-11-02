@@ -393,7 +393,12 @@ def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray):
     monkeypatch.delenv("TRTLLM_FORCE_MNNVL_AR", raising=False)
 
     if use_ray:
-        process_group = object()
+
+        class FakeProcessGroup:
+            def rank(self) -> int:
+                return 0
+
+        process_group = FakeProcessGroup()
 
         class FakeMesh:
             mesh_dim_names = ("tp",)
