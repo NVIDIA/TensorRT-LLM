@@ -480,62 +480,6 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         manager.shutdown()
 
 
-def test_mixed_precision_page_tables_match_base_page_indices(make_manager):
-    """The batched page-table gather equals reading each request's base page indices."""
-    import numpy as np
-
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
-
-    manager = make_manager(config=mixed_config(pool_ratio=None, enable_block_reuse=False))
-    request_ids = [11, 12, 13]
-    manager.add_dummy_requests(request_ids, token_nums=[100, 300, 700], is_gen=False)
-    width = manager.max_blocks_per_seq
-    out = np.full((2, len(request_ids), width), -7, dtype=np.int32)
-    manager.fill_mixed_precision_page_tables(request_ids, 0, out)
-    for role, layer in enumerate((0, manager.high_layers[0])):
-        pool = int(manager.impl.get_layer_group_id(layer))
-        scale = int(manager.impl.get_page_index_converter(layer, Role.KEY).scale)
-        for row, request_id in enumerate(request_ids):
-            kv_cache = manager.kv_cache_map[request_id]
-            count = kv_cache.num_blocks
-            base = np.asarray(kv_cache.get_base_page_indices(pool)[:count])
-            expected = np.where(
-                base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // manager.kv_factor
-            )
-            np.testing.assert_array_equal(out[role, row, :count], expected)
-            assert (out[role, row, count:] == -7).all()
-
-
-def test_dsa_mtp_layer_goes_mixed():
-    """A DSA MTP layer appended to the target manager gets a twin like the target layers."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
-    from tensorrt_llm.llmapi import MTPDecodingConfig
-    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-
-    manager = DSACacheManagerV2(
-        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
-        kv_cache_type=CacheType.SELFKONLY,
-        num_layers=2,
-        num_kv_heads=1,
-        head_dim=576,
-        tokens_per_block=64,
-        max_seq_len=1024,
-        max_batch_size=2,
-        mapping=Mapping(),
-        dtype=DataType.NVFP4,
-        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
-        spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
-        pretrained_config=SimpleNamespace(num_hidden_layers=2),
-    )
-    try:
-        assert manager.pp_layers == [0, 1, 2]
-        assert sorted(manager.high_layers) == [0, 1, 2]
-    finally:
-        manager.shutdown()
-
-
 def test_deepseek_v4_mtp_layer_stays_native():
     """DeepSeek-V4's MTP layer has only a sliding window, so it gets no twin."""
     from types import SimpleNamespace

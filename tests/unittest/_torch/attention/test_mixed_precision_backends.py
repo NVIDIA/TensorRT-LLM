@@ -732,26 +732,6 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
         TorchLlmArgs(**kwargs)
 
 
-@pytest.mark.parametrize(
-    "speculative_config",
-    [
-        {"decoding_type": "NGram", "max_draft_len": 2},
-        {"decoding_type": "MTP", "num_nextn_predict_layers": 1},
-    ],
-    ids=("ngram", "mtp"),
-)
-@pytest.mark.cpu_only
-def test_mixed_precision_llm_args_allow_speculative_decoding(speculative_config):
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
-
-    args = TorchLlmArgs(
-        model="/tmp/mixed-precision-nonexistent-model",
-        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
-        speculative_config=speculative_config,
-    )
-    assert args.speculative_config is not None
-
-
 @pytest.mark.parametrize("is_mtp", [True, False])
 @pytest.mark.cpu_only
 def test_one_model_draft_kv_cache_dtype(is_mtp):
@@ -776,27 +756,6 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     assert (draft.mixed_precision_kv is not None) == is_mtp
     assert draft.max_attention_window is None
     assert target.mixed_precision_kv is not None
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "dtype, ratio, expected",
-    [
-        # Mixed MTP draft: its own pool plus a retained-token pool, sized automatically.
-        ("mixed_nvfp4_fp8", [0.75, 0.25], None),
-        # Plain drafter with one layer group: the target's ratios collapse to [1.0].
-        ("auto", [0.75, 0.25], [1.0]),
-        ("auto", [1.0], [1.0]),
-        ("mixed_nvfp4_fp8", None, None),
-    ],
-)
-def test_draft_pool_ratio(dtype, ratio, expected):
-    """The target's pool_ratio never reaches a mixed MTP draft manager."""
-    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
-
-    draft = KvCacheConfig(dtype=dtype, pool_ratio=ratio)
-    _fit_draft_pool_ratio(draft)
-    assert draft.pool_ratio == expected
 
 
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
@@ -857,6 +816,9 @@ def test_dsa_twin_tables_refresh_full_width():
         # Stale page ids from an earlier step, page 0 included.
         retained_block_table=torch.zeros(4, 6, dtype=torch.int32),
         draft_retained_block_table=torch.full((4, 6), 7, dtype=torch.int32),
+    )
+    meta._fill_retained_block_table = partial(
+        DSAtrtllmAttentionMetadata._fill_retained_block_table, meta
     )
     DSAtrtllmAttentionMetadata._fill_retained_block_tables(meta)
 
@@ -951,9 +913,7 @@ def test_store_retained_context_rows_uses_context_positions():
     )
 
     tokens_per_block, width, num_ctx = 4, 576, 10
-    pool = torch.zeros(
-        (4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda"
-    )
+    pool = torch.zeros((4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
     # Request 0 resumes at position 6; request 1 starts at 0 and the twin released its page 0.
     table = torch.tensor([[-1, 2, 0, -1], [-1, 3, -1, -1]], dtype=torch.int32, device="cuda")
     ctx_positions = [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]

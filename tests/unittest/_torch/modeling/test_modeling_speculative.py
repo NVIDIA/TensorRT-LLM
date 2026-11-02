@@ -124,9 +124,7 @@ def test_draft_kv_cache_quant_algo_mixed_precision_default(
 ) -> None:
     """The model's own draft override always wins; the mixed-precision default only
     applies to a drafter with its own cache, never to MTP heads or a shared cache."""
-    spec_config = Eagle3DecodingConfig(
-        max_draft_len=3, speculative_model="draft", eagle3_one_model=True
-    )
+    spec_config = Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft")
     # py_executor_creator shares the cache this way, e.g. with a cache transceiver.
     spec_config._allow_separate_draft_kv_cache = not shares_target_cache
     target = ModelConfig(

@@ -68,12 +68,13 @@ def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
     algo = target_config.quant_config.kv_cache_quant_algo
     override = target_config.extra_attrs.get(
         "draft_kv_cache_quant_algo_override")
-    if (override is None and not is_mtp
+    mixed = target_config.extra_attrs.get(
+        "mixed_precision_draft_kv_cache_quant_algo")
+    if (override is None and mixed is not None and not is_mtp
             and should_use_separate_draft_kv_cache(target_config.spec_config)):
         # Mixed-precision KV on a sparse model: a drafter with its own cache keeps
         # it plain; one that shares the target cache and MTP heads keep the target's dtype.
-        override = target_config.extra_attrs.get(
-            "mixed_precision_draft_kv_cache_quant_algo")
+        override = mixed
     if override is not None:
         # NO_QUANT: the draft cache stays in the model dtype.
         algo = None if override == QuantAlgo.NO_QUANT else QuantAlgo(override)
