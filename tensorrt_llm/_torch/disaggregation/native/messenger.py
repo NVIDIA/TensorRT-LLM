@@ -30,9 +30,11 @@ class MessengerInterface(ABC):
         ...
 
     @abstractmethod
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
         """
         Receive messages.
+        :param timeout_ms: Maximum wait in milliseconds, or None to wait indefinitely.
+        :raises TimeoutError: If no message arrives within the timeout.
         :return: List of byte messages received.
         """
         ...
@@ -123,7 +125,9 @@ class ZMQMessenger(MessengerInterface):
         else:
             self._socket.send_multipart(messages)
 
-    def receive(self) -> list[bytes]:
+    def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
+        if timeout_ms is not None and not self._socket.poll(timeout_ms, zmq.POLLIN):
+            raise TimeoutError("Timed out waiting for a peer response")
         return self._socket.recv_multipart()
 
     def start_listener(
