@@ -24,6 +24,7 @@ from typing import Iterable, List, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
+from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -228,6 +229,7 @@ class BlockHashMixin:
         tokenizer_dir: Optional[str] = None,
         use_harmony: Optional[bool] = None,
         model_path: Optional[str] = None,
+        enable_tokenization_cache: bool = False,
     ) -> None:
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
@@ -240,12 +242,17 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._tok_prefix_cache: OrderedDict = OrderedDict()
+        self._enable_tokenization_cache = enable_tokenization_cache
+        # id(tokenizer) -> (tokenizer, its prefix token cache or None)
+        self._prefix_token_caches: dict[int, tuple[object, Optional[PrefixTokenCache]]] = {}
         logger.info(
             f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
             f", model_path={self._model_path}"
             f", use_harmony={self._use_harmony}"
+            f", enable_tokenization_cache={self._enable_tokenization_cache}"
         )
 
     def _get_tokenizer(self, model: str):
@@ -271,17 +278,29 @@ class BlockHashMixin:
                 self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
+    def _prefix_token_cache(self, tokenizer) -> Optional[PrefixTokenCache]:
+        """The prefix token cache of ``tokenizer`` with enable_tokenization_cache, else None."""
+        if not self._enable_tokenization_cache:
+            return None
+        entry = self._prefix_token_caches.get(id(tokenizer))
+        if entry is None or entry[0] is not tokenizer:
+            entry = (tokenizer, create_prefix_token_cache(tokenizer))
+            self._prefix_token_caches[id(tokenizer)] = entry
+        return entry[1]
+
     def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
-        cache = getattr(self, "_tok_prefix_cache", None)
-        if cache is None:
-            cache = self._tok_prefix_cache = OrderedDict()
+        cache = self._tok_prefix_cache
         entry = cache.get(key)
         if entry is not None and rendered == entry[0]:
             ids = entry[1]
         else:
-            # Tokenizing a suffix independently is not generally composable:
-            # BPE/SentencePiece merges can cross the cached string boundary.
-            ids = tokenizer.encode(rendered, add_special_tokens=False)
+            prefix_token_cache = self._prefix_token_cache(tokenizer)
+            if prefix_token_cache is not None:
+                ids = prefix_token_cache.encode(tokenizer, rendered)
+            else:
+                # Tokenizing a suffix independently is not generally composable:
+                # BPE/SentencePiece merges can cross the cached string boundary.
+                ids = tokenizer.encode(rendered, add_special_tokens=False)
         cache[key] = (rendered, ids)
         cache.move_to_end(key)
         while len(cache) > 1024:

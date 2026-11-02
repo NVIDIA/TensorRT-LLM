@@ -83,10 +83,6 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                      returns that class; the registry is not consulted
 ```
 
-`route` imports the target class on the branch that returns it, so a routing
-module that declines never loads modeling code, and the class a reader sees
-returned is the class that runs -- no name to look up elsewhere.
-
 ## What may decide a target
 
 A quantity may be a routing criterion only if it is known when
