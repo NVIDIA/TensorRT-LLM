@@ -1445,3 +1445,29 @@ def test_attention_replicated_validation_rejects_missing_index_key_view():
     peer_pt = make_page_table(global_layer_ids=[0])
     with pytest.raises(ValueError, match="AttentionPolicy.*differ on overlapping layers"):
         AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+
+
+@pytest.mark.parametrize(("local_draft", "peer_draft"), [(0, 0), (1, 1), (1, 0), (0, 1)])
+def test_peer_registrar_requires_matching_unified_draft_layers(
+    local_draft: int, peer_draft: int
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = local_draft
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = peer_draft
+    if local_draft != peer_draft:
+        with pytest.raises(
+            ValueError,
+            match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
