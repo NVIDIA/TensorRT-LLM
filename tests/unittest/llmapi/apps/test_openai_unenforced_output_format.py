@@ -204,7 +204,9 @@ def test_chat_format_is_served_and_warned_about_once(served, format_warnings):
     assert warning.startswith("Chat Completions API: 'response_format'")
     assert "accepted but not enforced" in warning
     assert "no guided decoding backend" in warning
-    assert "`guided_decoding_backend: xgrammar` (or `llguidance`)" in warning
+    # xgrammar also handles the structural tags gpt-oss uses, which llguidance does not.
+    assert "`guided_decoding_backend: xgrammar` in the --config YAML" in warning
+    assert "llguidance" not in warning
 
 
 @pytest.mark.parametrize(
@@ -335,3 +337,17 @@ def test_harmony_chat_format_is_served_and_warned_about(served, format_warnings,
     assert params.guided_decoding.structural_tag is not None
     (warning,) = format_warnings()
     assert warning.startswith("Chat Completions API: 'response_format'")
+
+
+def test_harmony_responses_format_is_served_and_warned_about(served, format_warnings):
+    served.server.use_harmony = True
+    path, body = REQUESTS["responses"]
+    response = served.client.post(path, json={"model": MODEL, **body, **FORMATS["responses"]})
+
+    assert response.status_code == 200, response.text
+    (params,) = served.engine_calls
+    # As on Harmony chat, gpt-oss carries the schema in a structural tag on its final channel.
+    assert params.guided_decoding.json is None
+    assert '"answer"' in str(params.guided_decoding.structural_tag)
+    (warning,) = format_warnings()
+    assert warning.startswith("Responses API: 'text.format'")

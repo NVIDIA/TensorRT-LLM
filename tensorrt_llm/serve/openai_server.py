@@ -1116,8 +1116,8 @@ class OpenAIServer(_VideoRoutesMixin):
             f"{_OUTPUT_FORMAT_FIELDS[route]} is accepted but not enforced: "
             "the server has no guided decoding backend, so the output is not "
             "constrained to the requested format. Set "
-            "`guided_decoding_backend: xgrammar` (or `llguidance`) in the "
-            "--config YAML to enforce it.",
+            "`guided_decoding_backend: xgrammar` in the --config YAML to "
+            "enforce it.",
             key=f"{route}_output_format_unenforced")
 
     def _has_cache_transceiver_config(self) -> bool:
