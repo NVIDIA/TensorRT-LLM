@@ -5878,6 +5878,11 @@ class KVCacheManagerV2(BaseResourceManager):
             req, local_end
         )
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        # A connector-served prefix starves a hidden-state drafter like local
+        # reuse does: leave the spec recompute tail to the forward pass.
+        limit = self.context_reuse_claim_limit(req)
+        if limit is not None:
+            offered_end = min(offered_end, max(limit, local_end))
 
         position = local_end
         if offered_end > local_end:

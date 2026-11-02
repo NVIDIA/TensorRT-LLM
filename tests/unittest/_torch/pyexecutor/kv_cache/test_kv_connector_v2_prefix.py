@@ -457,6 +457,29 @@ class TestOfferIsClamped:
         assert connector.commits == [(0, 0, False)]
 
 
+class TestSpecRecomputeTail:
+    """A query-and-commit offer leaves a hidden-state drafter its recompute tail."""
+
+    @pytest.mark.parametrize(
+        "tail, committed, served_to",
+        [(96, 0, 160), (96, 192, 192), (-1, 0, 0)],
+        ids=["capped", "local-match-past-the-cap", "full-re-prefill"],
+    )
+    def test_the_offer_stops_at_the_claim_limit(
+        self, tail: int, committed: int, served_to: int
+    ) -> None:
+        connector = FakeConnectorManager(num_matched=PROMPT_LEN)
+        manager = make_manager(connector)
+        manager._spec_recompute_tail = tail
+        req = FakeRequest()
+
+        moved = serve(manager, req, FakeKvCache(committed=committed, capacity=PROMPT_LEN))
+
+        assert moved == (served_to > committed)
+        assert req.context_current_position == max(served_to, committed)
+        assert connector.commits == [(0, max(served_to - committed, 0), False)]
+
+
 class TestConnectorReuseStats:
     """The served token span is reported to the core's stats.
 

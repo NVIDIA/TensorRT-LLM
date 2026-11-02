@@ -68,8 +68,9 @@ def _mix_u32(values: torch.Tensor) -> torch.Tensor:
 
 
 def counter_uniforms(seed: torch.Tensor, offset: torch.Tensor, num_draws: int) -> torch.Tensor:
-    """Counter-based uniforms in (0, 1): draw ``d`` of row ``r`` hashes
-    ``(seed[r], offset[r], d)``, so it is identical on every rank and replay.
+    """Counter-based uniforms in (0, 1), identical on every rank and replay.
+
+    Draw ``d`` of row ``r`` hashes ``(seed[r], offset[r], d)``.
 
     Args:
         seed: ``[rows]`` integer seeds.
@@ -90,8 +91,9 @@ def counter_uniforms(seed: torch.Tensor, offset: torch.Tensor, num_draws: int) -
 
 
 def sample_from_weights(weights: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
-    """Inverse-CDF draw from each ``[rows, vocab]`` row of nonnegative weights
-    with ``[rows]`` uniforms; returns int64 indices (meaningless for an all-zero row).
+    """Inverse-CDF draw from each row of ``[rows, vocab]`` nonnegative weights.
+
+    Takes ``[rows]`` uniforms; returns int64 indices (meaningless for an all-zero row).
     """
     cdf = weights.to(torch.float64).cumsum(-1)
     threshold = uniforms.to(torch.float64).unsqueeze(-1) * cdf[:, -1:]

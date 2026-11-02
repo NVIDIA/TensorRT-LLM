@@ -3951,9 +3951,10 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     @model_validator(mode="after")
     def default_embedded_recompute_tail(self) -> "DSparkDecodingConfig":
-        """Resolve ``context_recompute_tail: None`` to 0 without a drafter
-        checkpoint (the embedded draft has no recompute), so a config that skips
-        ``TorchLlmArgs`` validation never hands the managers an unresolved None.
+        """Resolve ``context_recompute_tail: None`` to 0 without a drafter checkpoint.
+
+        The embedded draft has no recompute; resolving here keeps a config that
+        skips ``TorchLlmArgs`` validation from handing the managers a None.
         """
         if self.context_recompute_tail is None and self.speculative_model is None:
             self.context_recompute_tail = 0

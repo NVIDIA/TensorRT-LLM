@@ -996,7 +996,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         A first-chunk request has not claimed its reusable prefix yet, so its
         remaining length still counts it; the prefix is probed once per
-        scheduling pass, without claiming pages.
+        scheduling pass, without claiming pages, and capped like the claim
+        (``context_reuse_claim_limit``).
         """
         remaining = req.context_remaining_length
         if not req.is_first_context_chunk:
@@ -1006,6 +1007,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         reusable = self._reuse_probes[req.py_request_id]
         if reusable is None:
             return remaining
+        limit = self.kv_cache_manager.context_reuse_claim_limit(req)
+        if limit is not None:
+            reusable = min(reusable, limit)
         return remaining - min(max(reusable - req.context_current_position, 0), remaining)
 
     def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:

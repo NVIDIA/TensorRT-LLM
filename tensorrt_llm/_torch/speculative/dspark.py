@@ -1298,10 +1298,11 @@ class DSparkWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Draw each position from ``softmax((base_k + bias(d_{k-1})) / T)`` with the seeded draft
-        sampler and store that distribution as its proposal in ``draft_probs``.
+        """Draw the block ancestrally and store each position's proposal in ``draft_probs``.
 
-        ``gen_logits`` are the ``[num_gens, K, vocab]`` unbiased block logits. Returns the
+        Position k is drawn by the seeded draft sampler from
+        ``softmax((base_k + bias(d_{k-1})) / T)``. ``gen_logits`` are the
+        ``[num_gens, K, vocab]`` unbiased block logits. Returns the
         ``[num_gens, K]`` int32 draft tokens and the stored vocab width.
         """
         num_gens, num_drafts, _ = gen_logits.shape

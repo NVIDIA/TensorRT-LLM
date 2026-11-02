@@ -3024,8 +3024,9 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_probs: torch.Tensor, target_probs: torch.Tensor,
             seed: torch.Tensor,
             offset: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Block verification of the gen subset, with the contract of
-        ``rejection_sampling_one_model``. The acceptance uniforms
+        """Block verification of the gen subset (``rejection_sampling_one_model`` contract).
+
+        The acceptance uniforms
         (``counter_uniforms``) and the emitted token (seeded sampler on the
         residual) are both keyed by the request's acceptance-slot RNG state.
         """
