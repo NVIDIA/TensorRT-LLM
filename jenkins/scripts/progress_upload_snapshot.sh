@@ -27,18 +27,34 @@
 #                       (default: ${WORKSPACE}/${PROGRESS_TAR}.last_hash)
 #                       Set to empty string to disable dedup.
 #   TIMEOUT_XML_SCRIPT  path to generate_timeout_xml.py; when set, regenerates
-#                       results-timeout.xml from unfinished_test.txt before each upload.
+#                       results-timeout.xml from unfinished_test.txt on final snapshots
+#                       (FINAL_SNAPSHOT set).
 
 set +e
 
-# --- Generate timeout XML from unfinished_test.txt (final snapshot only) ---
+# --- Regenerate timeout XML from unfinished_test.txt (final snapshot only) ---
 # Skipped during periodic snapshots so incomplete unfinished_test.txt does not produce premature timeout reports.
-if [ -n "$FINAL_SNAPSHOT" ] && \
-        [ -n "$TIMEOUT_XML_SCRIPT" ] && [ -f "${WORKSPACE}/${STAGE_NAME}/unfinished_test.txt" ]; then
-    ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
-        --stage-name "$STAGE_NAME" \
-        --test-file-path "unfinished_test.txt" \
-        --output-file "${WORKSPACE}/${STAGE_NAME}/results-timeout.xml" ) 2>/dev/null || true
+# The new file is generated into a temporary path and then replaces the existing one, so a
+# test a later rerun finished (its teardown removes the nodeid) is not still reported from an
+# earlier snapshot's results-timeout.xml. If generation fails, the existing file is kept.
+if [ -n "$FINAL_SNAPSHOT" ] && [ -n "$TIMEOUT_XML_SCRIPT" ]; then
+    timeout_xml="${WORKSPACE}/${STAGE_NAME}/results-timeout.xml"
+    if [ -f "${WORKSPACE}/${STAGE_NAME}/unfinished_test.txt" ]; then
+        rm -f "${timeout_xml}.tmp"
+        if ( cd "$WORKSPACE" && python3 "$TIMEOUT_XML_SCRIPT" \
+                --stage-name "$STAGE_NAME" \
+                --test-file-path "unfinished_test.txt" \
+                --output-file "${timeout_xml}.tmp" ) 2>/dev/null; then
+            if [ -f "${timeout_xml}.tmp" ]; then
+                mv -f "${timeout_xml}.tmp" "$timeout_xml"
+            else
+                rm -f "$timeout_xml"
+            fi
+        fi
+        rm -f "${timeout_xml}.tmp"
+    else
+        rm -f "$timeout_xml"
+    fi
 fi
 
 # --- Fix testsuite name in XML files (pytest default -> stage name) ---
