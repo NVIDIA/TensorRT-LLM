@@ -340,7 +340,8 @@ metadata converter does not recognize. Do not substitute it or on-load NVFP4
 and claim equivalence to the measured static recipe. LTX NVFP4 here concerns
 transformer linear layers, not VAE quantization.
 
-LTX one-stage uses an explicit BF16 file and a separate family YAML with
+All LTX recipes select the explicit BF16 file, rather than a directory that
+contains several precision variants. One-stage uses a separate family YAML with
 `TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE=1`. Two-stage recipes explicitly set that
 flag to `0` and supply both auxiliary paths. The model directory contains an
 upscaler and a distilled LoRA, so omitting those paths alone would still allow

@@ -13,7 +13,7 @@ environment:
 server_configs:
   - name: ltx2_2stage_bf16_fa4_i2v_cfg2_ulysses4_cg_compile_on
     model_name: ltx2_bf16
-    model_path: LTX-2
+    model_path: LTX-2/ltx-2-19b-dev.safetensors
     server_config:
       attention_config:
         backend: FA4
@@ -22,7 +22,7 @@ server_configs:
         ulysses_size: 4
         async_ulysses: true
         parallel_vae_size: 8
-      model: LTX-2
+      model: LTX-2/ltx-2-19b-dev.safetensors
       pipeline_config:
         text_encoder_path: google/gemma-3-12b-it
         spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
@@ -56,7 +56,7 @@ server_configs:
 
   - name: ltx2_2stage_fp8bw_fa4_t2v_cfg2_ulysses4_cg_compile_on
     model_name: ltx2_fp8bw
-    model_path: LTX-2
+    model_path: LTX-2/ltx-2-19b-dev.safetensors
     server_config:
       quant_config:
         quant_algo: FP8_BLOCK_SCALES
@@ -68,7 +68,7 @@ server_configs:
         ulysses_size: 4
         async_ulysses: true
         parallel_vae_size: 8
-      model: LTX-2
+      model: LTX-2/ltx-2-19b-dev.safetensors
       pipeline_config:
         text_encoder_path: google/gemma-3-12b-it
         spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
