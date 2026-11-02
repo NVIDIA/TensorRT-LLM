@@ -218,6 +218,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
+    # Per-step device tensors that FMHA libraries derive once and share across
+    # the layers of a forward (e.g. page tables); emptied by every prepare().
+    fmha_step_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
     context_plan: Optional[_ContextPlan] = field(init=False,
                                                  default=None,
@@ -459,6 +464,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.fmha_step_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1089,6 +1095,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
+        self.fmha_step_caches = {}
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
