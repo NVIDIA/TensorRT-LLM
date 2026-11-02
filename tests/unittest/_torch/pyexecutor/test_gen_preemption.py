@@ -555,3 +555,79 @@ def test_drafter_state_is_kept_for_paused_requests(kind):
     prepare([11, 12, 13])  # resumed into its slot; 14 finished and freed its slot
     assert worker._req_to_slot[12] == slot and int(worker._ctx_len[slot]) == 77
     assert 14 not in worker._req_to_slot and len(worker._free_slots) == 1
+
+
+@pytest.mark.parametrize("kind", ["dflash", "dspark"])
+def test_executor_forced_resume_preserves_displaced_request(kind):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SchedulerOutput
+
+    p = make_preemption()
+    reqs = running(p, 2)
+    for i, req in enumerate(reqs):
+        req.py_batch_idx = i
+    p._pause(reqs[0])
+    reqs[0].py_batch_idx = None  # cleared by the scheduler while paused
+    now = 108.0  # past the 7 s maximum pause, with the only batch slot full
+    scheduler = Mock()
+    scheduler.schedule_request.return_value = SchedulerOutput([], [], reqs[:1], [], [], 1)
+    ex = SimpleNamespace(
+        _gen_preemption=p,
+        _get_request_admission_capacity=lambda: 1,
+        request_broadcaster=SimpleNamespace(rank0_now=now),
+        scheduler=scheduler,
+        active_requests=reqs,
+        inflight_req_ids=set(),
+        enable_attention_dp=False,
+        enable_iter_perf_stats=False,
+        enable_batch_waiting=False,
+        is_encoder_decoder=False,
+        adp_router=SimpleNamespace(exclude_retiring_requests=False),
+        dist=SimpleNamespace(rank=1, cp_config={}, cp_rank=0, cp_size=1),
+        num_fetch_requests=0,
+        kv_cache_transceiver=None,
+        kv_cache_manager=Mock(spec=[]),
+        _kv_load_tracker=Mock(begin_step=Mock(return_value=None)),
+        _kv_cache_capacity={},
+        _fetch_and_enqueue_requests=Mock(),
+        _should_exclude_last_generation_logits=lambda: False,
+        _pop_from_waiting_queue=Mock(return_value=([], {})),
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _cap_context_by_total_kv_len=lambda requests: requests,
+    )
+    queue = slack_queue(now=now)
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor.merge_requests", return_value=[]):
+        assert PyExecutor._fetch_new_requests(ex, queue, reqs) == []
+    assert not p.paused_ids and p.stats["forced"] == 1
+    scheduler.set_gen_paused_ids.assert_called_once_with(frozenset())
+    # step returns occupancy, so a forced resume blocks further admissions.
+    ex._pop_from_waiting_queue.assert_called_once_with(queue, 2, None)
+
+    worker, meta = _drafter(kind)
+    meta.request_ids, meta.num_generations = [0, 1], 2
+    with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
+        meta.prepare()
+    old_slots = dict(worker._req_to_slot)
+    worker._ctx_len[old_slots[1]] = 77
+
+    scheduled, _, num_fitting = PyExecutor._schedule(ex)
+    assert scheduled.generation_requests == reqs[:1] and num_fitting == 1
+    assert scheduled.paused_in_place_ids == {1}
+    assert reqs[1].py_batch_idx is None
+    meta.request_ids, meta.num_generations = [0], 1
+    meta.paused_in_place_ids = scheduled.paused_in_place_ids
+    with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
+        meta.prepare()
+    assert worker._req_to_slot == old_slots
+    assert int(worker._ctx_len[old_slots[1]]) == 77
+
+    # The deferred request can run again without losing its drafter slot.
+    scheduler.schedule_request.return_value = SchedulerOutput([], [], reqs[1:], [], [], 1)
+    resumed, _, _ = PyExecutor._schedule(ex)
+    assert resumed.paused_in_place_ids == {0}
+    meta.request_ids, meta.num_generations = [1], 1
+    meta.paused_in_place_ids = resumed.paused_in_place_ids
+    with patch(f"tensorrt_llm._torch.speculative.{kind}.prefer_pinned", return_value=False):
+        meta.prepare()
+    assert worker._req_to_slot == old_slots
+    assert int(worker._ctx_len[old_slots[1]]) == 77

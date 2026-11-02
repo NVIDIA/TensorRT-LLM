@@ -136,6 +136,14 @@ class TestCtxBufferBudget:
         assert f"max_batch_size estimated to fit is {fitting}" in message
         assert "max_batch_size + 1 slots" in message  # the formula
 
+    def test_preemption_rows_can_exceed_an_otherwise_fitting_budget(self):
+        budget = 9 * PER_SLOT_BYTES_MSL  # batch 8 plus scratch, no paused rows
+        _validate(max_batch_size=8, memory_budget_bytes=budget)
+        with pytest.raises(ValueError, match="max_batch_size estimated to fit is 6") as excinfo:
+            _validate(max_batch_size=8, memory_budget_bytes=budget, gen_preemption_enabled=True)
+        assert "resident_headroom" in str(excinfo.value)
+        assert f"{12 * PER_SLOT_BYTES_MSL / GIB:.2f} GiB" in str(excinfo.value)
+
     def test_unset_max_seq_len_skips_the_buffer_check(self):
         # max_seq_len is unset at config time and resolved later from the model
         # config; falling back to the drafter's 1M positions would refuse every
@@ -474,6 +482,17 @@ class TestLlmArgsWiring:
         args = self._args(tmp_path, max_batch_size=32)
         with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
             args._validate_dflash_ctx_budget(memory_budget_bytes=10 * PER_SLOT_BYTES_MSL)
+
+    def test_preemption_headroom_reaches_config_budget_check(self, tmp_path):
+        from tensorrt_llm.llmapi.llm_args import SchedulerConfig
+
+        args = self._args(
+            tmp_path,
+            max_batch_size=8,
+            scheduler_config=SchedulerConfig(gen_preemption={"tpot_budget": 0.1}),
+        )
+        with pytest.raises(ValueError, match="max_batch_size estimated to fit is 6"):
+            args._validate_dflash_ctx_budget(memory_budget_bytes=9 * PER_SLOT_BYTES_MSL)
 
     def test_default_batch_is_clamped_not_rejected(self, tmp_path):
         # max_batch_size left at its default overruns a tight token budget;

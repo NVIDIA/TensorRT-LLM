@@ -1908,6 +1908,30 @@ class TestGenSlotPreemption:
         sched.set_gen_paused_ids(frozenset())
         assert ids(sched.schedule_request(reqs, set()).generation_requests) == [0, 1, 2]
 
+    @pytest.mark.parametrize("paused_ids", [frozenset({0}), frozenset()])
+    def test_paused_and_displaced_requests_keep_peft_claims(self, paused_ids):
+        peft = make_peft_cache_manager(max_device_pages=1)
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(paused_ids)
+        resident = make_gen_request(0, lora_task_id=10)
+        waiter = make_disagg_request(1, lora_task_id=20)
+        # Transfer admission precedes decode and bypasses the batch-slot budget.
+        # The resident adapter must be claimed even when decode is not reached.
+        out = sched.schedule_request([waiter, resident], set())
+        assert out.fitting_disagg_gen_init_requests == []
+        assert out.generation_requests == []
+        resumed = sched.schedule_request([resident], set())
+        assert ids(resumed.generation_requests) == ([] if paused_ids else [0])
+
+    def test_forced_resume_displaces_a_live_request_within_batch_limit(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1)
+        # A forced resume removes the old request from the policy's paused set.
+        sched.set_gen_paused_ids(frozenset())
+        reqs = [make_gen_request(i) for i in range(2)]
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.paused_requests == []
+
     def test_paused_requests_do_not_take_batch_slots(self):
         sched = make_scheduler(make_kv_cache_manager(), max_batch_size=2)
         reqs = [make_gen_request(i) for i in range(4)]

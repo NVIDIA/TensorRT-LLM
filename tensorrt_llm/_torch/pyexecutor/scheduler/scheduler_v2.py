@@ -346,6 +346,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Generation requests paused in place (GEN slot preemption).
         self._gen_paused_ids: frozenset[int] = frozenset()
+        self._gen_preemption_enabled = False
 
         # `is True`: a manager without the flag reads as off.
         self._swa_scratch_reuse = (
@@ -450,6 +451,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def set_gen_paused_ids(self, request_ids: frozenset[int]) -> None:
         """Generation requests to leave out of the batch but keep resident."""
+        self._gen_preemption_enabled = True
         self._gen_paused_ids = request_ids
 
     def _filter_paused_requests(self, requests: RequestList) -> RequestList:
@@ -559,7 +561,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # adapters that can't be evicted mid-iteration.
         pending_ctx: RequestList = []
 
-        # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
+        # Pre-claim PEFT pages for terminal requests and, with GEN preemption,
+        # every live decode, including requests omitted from this batch.
         # In the overlap executor these requests are no longer scheduled
         # (state outside schedulable range) but their adapters haven't
         # been released yet (mark_request_done runs after prepare_resources
@@ -567,8 +570,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
-        for req in requests_list:
-            if req.state_value == self._gen_to_complete_state_value:
+        for req in active_requests:
+            if req.state_value == self._gen_to_complete_state_value or (
+                self._gen_preemption_enabled
+                and req.state_value == LlmRequestState.GENERATION_IN_PROGRESS.value
+            ):
+                # Paused and displaced decode requests still hold their adapters.
                 budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---

@@ -3231,7 +3231,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
-        return self.max_batch_size
+        from ..scheduler.gen_preemption import resident_headroom
+
+        return self.max_batch_size + resident_headroom(self.max_batch_size)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
@@ -7605,8 +7607,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # The affine slope covers all tokens; context additionally retains SWA
         # pages for the current token batch beyond the generation windows.
+        from ..scheduler.gen_preemption import resident_headroom
+
+        resident_capacity = max_batch_size + resident_headroom(max_batch_size)
         fixed_cost = (
-            swa_size_per_request * max_batch_size
+            swa_size_per_request * resident_capacity
             + (context_size_per_token - cache_size_per_token) * max_num_tokens
         )
         bytes_per_slot = _get_single_swa_pool_slot_bytes(
@@ -7632,7 +7637,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     costs.append(
                         (
-                            layer_size * max_num_tokens + retained_bytes * max_batch_size,
+                            layer_size * max_num_tokens + retained_bytes * resident_capacity,
                             layer_size * tokens_per_block,
                         )
                     )

@@ -413,6 +413,20 @@ the TTFT-percentile GEN admission policy (`TLLM_GEN_ADMISSION_TTFT_PERCENTILE`
 between 0 and 99) and the KV cache manager V2 scheduler; pipeline parallelism
 and attention DP are rejected.
 
+`target_output_tps` has simulation coverage only; GPU validation is currently
+limited to `tpot_budget`.
+
+Pausing frees a batch slot, not KV pages. Size the KV cache for active plus
+paused requests: sliding-window reservations include the paused cap, but
+full-attention cache demand still depends on request lengths. Paused requests
+are excluded from KV eviction candidates, and disaggregated GEN workers cannot
+recompute their context locally. Under Helix CP, a decode allocation failure
+raises an error rather than evicting another request. Reduce concurrency or
+increase the KV budget when both slots and KV pages are under pressure.
+
+Pool sizing assumes one executor per process. The same
+preemption configuration on a context worker also reserves pool headroom.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

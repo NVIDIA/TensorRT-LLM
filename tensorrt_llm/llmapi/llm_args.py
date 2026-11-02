@@ -7637,6 +7637,7 @@ class TorchLlmArgs(BaseLlmArgs):
             tp_size=self.tensor_parallel_size,
             memory_budget_bytes=memory_budget_bytes,
             arena_before_pool=arena_before_pool,
+            gen_preemption_enabled=self.scheduler_config.gen_preemption.enabled,
         )
 
     @model_validator(mode="after")

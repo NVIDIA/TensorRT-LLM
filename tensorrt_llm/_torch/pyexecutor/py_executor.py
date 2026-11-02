@@ -8163,7 +8163,25 @@ class PyExecutor:
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
         if getattr(self, "_gen_preemption", None) is not None:
-            scheduled_requests.paused_in_place_ids = self._gen_preemption.paused_ids
+            retained_ids = set(self._gen_preemption.paused_ids)
+            scheduled_ids = {
+                req.py_request_id
+                for req in scheduled_requests.generation_requests
+            }
+            evicted_ids = {
+                req.py_request_id
+                for req in (scheduled_requests.paused_requests +
+                            scheduled_requests.recompute_paused_requests)
+            }
+            for req in self.active_requests:
+                if (req.state == LlmRequestState.GENERATION_IN_PROGRESS
+                        and req.py_request_id not in scheduled_ids
+                        and req.py_request_id not in evicted_ids):
+                    # Forced resumes may displace another live decode request.
+                    # Its previous sample is harvested without a new forward.
+                    req.py_batch_idx = None
+                    retained_ids.add(req.py_request_id)
+            scheduled_requests.paused_in_place_ids = frozenset(retained_ids)
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
