@@ -107,6 +107,17 @@ def _expand_env_refs(value: str, *, label: str) -> str:
     return _ENV_REF_RE.sub(replace, value)
 
 
+def _require_readable_log(path: str, label: str) -> None:
+    """Raise `RuntimeError` unless `path` is a file this process can read.
+
+    Args:
+        path: Expanded log path from the `external_cluster` block.
+        label: Config-field name embedded in the error message.
+    """
+    if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+        raise RuntimeError(f"{label} {path!r} is not a readable file")
+
+
 def _unset_env_refs(value: str) -> list[str]:
     """Return the `${VAR}` names in `value` that are unset in the environment."""
     return [name for name in _ENV_REF_RE.findall(value) if os.environ.get(name) is None]
@@ -1228,7 +1239,10 @@ class DisaggCancellationStressHarness:
         block, binds the orchestrator endpoint for the probe thread,
         and registers worker/server log paths as `WorkerLaunchSpec`
         shadows so the log-scanner thread tails them exactly as it
-        would for a locally-launched cluster. No workers are tracked
+        would for a locally-launched cluster. The cluster is already up,
+        so every listed log must already be a readable file: the scanner
+        waits silently for a missing one, which would leave that worker
+        unchecked. No workers are tracked
         (`_tracked_workers` stays empty): fault injection is
         unavailable in attach mode, which `StressConfig.validate`
         already enforces by rejecting `full_cancel_poison`.
@@ -1237,8 +1251,9 @@ class DisaggCancellationStressHarness:
             ValueError: If an `${VAR}` reference is unset, or the
                 YAML lacks both `external_cluster.model_name` and a
                 top-level `model`.
-            RuntimeError: If a configured `worker_health_urls` probe
-                does not return HTTP 200.
+            RuntimeError: If a listed log is not a readable file, or a
+                configured `worker_health_urls` probe does not return
+                HTTP 200.
         """
         ext = self.config.external_cluster
         assert ext is not None  # guarded by setup()
@@ -1277,12 +1292,17 @@ class DisaggCancellationStressHarness:
                     ),
                 )
             )
+        for spec in specs:
+            _require_readable_log(
+                spec.log_path, f"external_cluster.worker_logs[{spec.role}_{spec.index}].path"
+            )
         self._worker_specs = specs
         self._tracked_workers = []
         if ext.server_log is not None:
             self._server_log_path = _expand_env_refs(
                 ext.server_log, label="external_cluster.server_log"
             )
+            _require_readable_log(self._server_log_path, "external_cluster.server_log")
 
         for i, raw_url in enumerate(ext.worker_health_urls):
             url = _expand_env_refs(raw_url, label=f"external_cluster.worker_health_urls[{i}]")

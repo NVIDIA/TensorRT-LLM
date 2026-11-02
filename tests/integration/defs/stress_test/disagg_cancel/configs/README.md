@@ -71,8 +71,10 @@ stress_config:
 When the block is present, `harness.setup()` skips the local launcher
 entirely: it binds the orchestrator endpoint for the probe thread,
 verifies `server_url` + `worker_health_urls` respond with HTTP 200,
-and registers the log paths for the log-scanner thread. The attach
-test itself needs **no GPUs** — only HTTP reachability to the
+checks that every listed log is a readable file (the cluster is
+already up, so a missing log means a wrong path or an unmounted
+filesystem), and registers the log paths for the log-scanner
+thread. The attach test itself needs **no GPUs** — only HTTP reachability to the
 orchestrator and filesystem access to the worker logs (a shared
 filesystem when the cluster spans nodes).
 
