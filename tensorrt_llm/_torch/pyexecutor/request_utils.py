@@ -5,7 +5,7 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .executor_request_queue import RequestQueueItem
@@ -65,7 +65,7 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+    req_item, all_ranks_num_active_requests: list[int], max_num_active_requests: int
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -97,8 +97,8 @@ def get_from_waiting_queue(
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
-    all_ranks_num_active_requests: Optional[List[int]] = None,
-) -> List:
+    all_ranks_num_active_requests: Optional[list[int]] = None,
+) -> list["RequestQueueItem"]:
     """Get requests from the waiting queue.
 
     Args:
@@ -154,7 +154,7 @@ def get_from_waiting_queue(
 
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
-) -> Tuple[List[int], List[int], int, int]:
+) -> tuple[list[int], list[int], int, int]:
     """Partition context for Helix CP.
 
     Only this rank's ~input_len / cp_size tokens are turned into Python ints.
@@ -209,8 +209,8 @@ def partition_context_for_helix(
 
 
 def merge_requests_to_llm_requests(
-    new_requests: List, exclude_last_generation_logits: bool
-) -> List[LlmRequest]:
+    new_requests: list["RequestQueueItem"], exclude_last_generation_logits: bool
+) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
     Args:
@@ -232,12 +232,12 @@ def merge_requests_to_llm_requests(
 
 
 def merge_helix_requests(
-    new_requests: List,
+    new_requests: list["RequestQueueItem"],
     cp_rank: int,
     cp_size: int,
     tokens_per_block: int,
     exclude_last_generation_logits: bool,
-) -> List[LlmRequest]:
+) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
     Note: Helix parallelism is a decode-only feature run with disaggregated serving.
@@ -279,13 +279,13 @@ def merge_helix_requests(
 
 @nvtx_range("merge_requests")
 def merge_requests(
-    new_requests: List,
+    new_requests: list["RequestQueueItem"],
     cp_config: dict,
     cp_rank: int,
     cp_size: int,
     exclude_last_generation_logits: bool,
     is_disagg: bool,
-) -> List[LlmRequest]:
+) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
     This is a router function that dispatches to the appropriate merge function
