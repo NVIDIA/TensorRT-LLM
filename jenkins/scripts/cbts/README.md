@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 # CBTS — Change-Based Testing Selection
 
 CI test-selection tool. Narrows the Jenkins stages and per-stage tests that
@@ -19,9 +22,9 @@ for what it does and does not record.
 Tier 2 is evaluated for every eligible CBTS run (`/bot run` and
 `/bot run --post-merge`). Coverage decisions for authors outside
 `CBTS_COVERAGE_PILOT_USERS` are shadow-only: their candidate scope, stages,
-case counts, and skip rate are reported, but the narrowed test DB is not
-uploaded and the baseline filter chain remains active. Tier 1 decisions
-continue to apply to all users.
+case counts, and skip rate are reported, and the baseline filter chain remains
+active. The candidate decision and narrowed test DB are saved as an artifact.
+Tier 1 decisions continue to apply to all users.
 
 ## Consumption layers
 
@@ -47,11 +50,11 @@ Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (excl. docs; reference images such as `cat_piano.png` ARE test fixtures and stay claimed; outward-facing files force fallback) |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
-| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
-| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) |
+| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
+| `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
-| `DocsRule` | `docsonly` | `docs/**` → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, QA / dev test lists, `.test_durations`, `microbenchmarks/` (image suffixes intentionally not claimed — image fixtures cannot be distinguished from doc diagrams by location, so image edits fall back to baseline) |
+| `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure; see `cbts/rules/README.md` |
 
 See `cbts/rules/README.md` for per-rule logic.
 
@@ -64,12 +67,12 @@ See `cbts/rules/README.md` for per-rule logic.
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
 | `visualgenonly` | `VisualGenRule` fired solo: PR only touches VisualGen internal source paths (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`; excl. docs; image fixtures like `cat_piano.png` are claimed). Narrows to blocks containing VG test entries. Outward-facing files under `tensorrt_llm/visual_gen/**` and `tensorrt_llm/media/**` (eagerly imported by `trtllm-serve`) force `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
-| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches the modeling_v2 subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`; excl. docs, which are a fifth of the subtree — every catalog entry carries a contract document). Narrows to blocks containing modeling_v2 test entries (`unittest/_torch/modeling_v2/`, `test_modeling_v2_*`). No outward-facing fallback is needed: nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)` is on, and its callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching the shared resolver falls back to baseline. |
+| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A change under `models/` selects its model node's unit tests and target accuracy gates, plus whole-tree checks; shared code or an unreadable routing tree selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on the always-run `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
 | `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run the complete `l0_cpu` suite on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
 | `testsonly` | Multiple rules from the testsonly family fired (`waiveonly`, `testdefonly`, `testlistonly`, `visualgenonly`, `specdeconly`, `modelingv2only`, `agentflowonly`, `openengineonly`, `docsonly`); their narrows union. |
-| `noop` | Rule(s) fired but determined no test stages need to run (QA-only path, removals-only test list, all-miss waives, in-namespace .py with no covering YAML entry). Layer 2 still applies. |
+| `noop` | Rule(s) claimed files without contributing tests. Always-run CPU stages remain; a pure noop uses the source CPU list. In mixed PRs, other rules and coverage decide the remaining tests. |
 | `null` (fallback) | A rule cannot decide, scopes don't combine, or there are unhandled files. Groovy defers to baseline filter chain. |
 
 `_combine_scopes` (`cbts/command/main.py`): rules with `scope="noop"` give way to any
@@ -81,6 +84,15 @@ A rule can yield `noop` (no impact), a narrow (actionable scope), or
 `None` (cannot decide → fallback). Files matched by a rule are claimed;
 unclaimed files in `pr.changed_files` → fallback.
 
+Outside noop paths, Python docstring edits are a documentation contribution even in a mixed PR.
+Input analysis verifies the raw patch against the checkout and parses both
+source images. Literal docstring lines in existing scopes are removed from the
+executable selection diff; the original patch is retained for reconstruction.
+`DocsRule` claims a Python file only when no executable edits remain. Mixed
+files continue through the other rules or coverage, and their selections union
+with the docs build and CPU checks. This is a low-risk documentation policy,
+not an exhaustive analysis of runtime `__doc__` readers.
+
 ## File map
 
 ```
@@ -90,6 +102,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   ├── __init__.py
 │   ├── blocks.py          YAML index + path/waive lookup + filtered tmp test-db generation + per-stage count
 │   ├── repository_reference.py  shared repository import and binding-reference index
+│   ├── python_docstring_analysis.py  verified literal docstring edits → executable selection diff
 │   ├── rules/
 │   │   ├── README.md      per-rule logic
 │   │   ├── base.py        Rule ABC + PRInputs + RuleResult
@@ -242,9 +255,9 @@ Decision JSON:
 ```
 
 - `scope: null` → fallback; Groovy defers to baseline.
-- `scope: "noop"` → rule(s) fired but no narrow contribution; affected
-  stages may be empty. Layer 2 still honors `sanity_required` /
-  `perfsanity_required`.
+- `scope: "noop"` → rule(s) fired without a test contribution; the final
+  affected stages still include the always-run CPU baseline. Layer 2 also
+  honors `sanity_required` / `perfsanity_required`.
 - `test_db_dir_override: null` → no Layer 3 narrowing; trt-test-db reads
   the source test-db.
 - `affected_stage_test_counts` → per-stage kept-entry count (telemetry).
@@ -264,14 +277,18 @@ available to downstream `L0_Test-*` pods. To deliver it per stage:
 
 If the upload or the download/extraction fails, the override directory is
 absent and `renderTestDB` falls back to the source test-db. Layer 2 still
-applies. The tarball carries only the narrowed YAMLs, so no PR diff text
-travels between jobs.
+applies. For applied decisions, the tarball carries only the narrowed YAMLs,
+so no PR diff text travels between jobs.
 
-Shadow coverage decisions return to the baseline before this upload step, so
-neither Layer 2 stage filtering nor Layer 3 test-db narrowing can affect the
-run. OpenSearch records `b_cbts_applied` and
-`b_coverage_pilot_eligible`; `s_scope=coverage` with
-`b_cbts_applied=false` identifies a successful shadow candidate.
+Shadow coverage decisions use the same `cbts/cbts_test_db.tar.gz` upload path,
+then return `null` to the baseline filter chain. The archive contains the final
+`cbts_shadow_decision.json` and, when present, the narrowed `cbts_test_db/`.
+Downstream stages use the archive only when the CBTS result is applied, so
+neither Layer 2 stage filtering nor Layer 3 test-db narrowing affects a shadow
+run.
+OpenSearch records the artifact path in `s_shadow_selection_artifact_path` after
+a successful upload. `s_scope=coverage` with `b_cbts_applied=false` identifies
+a successful shadow candidate.
 
 ## Split-resize heuristic (Layer 2.5)
 

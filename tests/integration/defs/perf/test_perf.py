@@ -24,7 +24,7 @@ import json
 import os
 import re
 import shutil
-from typing import Dict, List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import pytest
 import yaml
@@ -40,6 +40,8 @@ from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfServeScriptTestCmds,
                     generate_test_nodes)
+from .warmup_pass import (WarmupPass, build_warmup_pass_cmd, one_wave_requests,
+                          warmup_pass_enabled)
 
 if not hasattr(re, "Pattern"):
     re.Pattern = type(re.compile(""))
@@ -48,6 +50,14 @@ ALLOWED_CONFIGS_CACHE = None  # Cache to avoid modifying sys.path many times.
 MAP_BY_SOCKET = None
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
+
+# trtllm-bench throughput's --warmup default.
+TRTLLM_BENCH_DEFAULT_WARMUP = 2
+
+
+class NotEnoughSamplesError(ValueError):
+    """A real-text source holds fewer usable articles than a dataset file asks for."""
+
 
 # Models served with the Nemotron reasoning/tool parsers, a long max model len
 # and a longer server-start timeout. "nano-v3" and "nemotron-v3" are two
@@ -63,6 +73,10 @@ NEMOTRON_SUPER_MODELS = {
 }
 
 KIMI_K3_MODELS = {"kimi_k3"}
+DEEPSEEK_V41_MODELS = {
+    "deepseek_v41_flash_nvfp4",
+    "deepseek_v41_flash_nvfp4_dspark",
+}
 QWEN38_MTP_MODELS = {
     "qwen3.8_max_fp4_mtp",
     "qwen3.8_flash_next_fp8_mtp",
@@ -73,6 +87,7 @@ KIMI_K3_SERVER_ENV = {
 }
 
 TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    *DEEPSEEK_V41_MODELS,
     *QWEN38_MTP_MODELS,
     "kimi_k2.5_fp4",
     "kimi_k3",
@@ -80,7 +95,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
-    "glm_5_fp8",
+    "glm_5.3_fp8",
+    "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
@@ -106,8 +122,12 @@ OPENAI_CHAT_BACKEND_MODELS = {
     "nemotron_3_nano_omni_nvfp4_image",
 }
 
-# Spec-dec models real dataset in serve perf tests.
+# Spec-dec models and their non-speculative controls use real text in serve tests.
 SPEC_DEC_REAL_DATASET_MODELS = {
+    **{
+        model: "cnn_dailymail"
+        for model in DEEPSEEK_V41_MODELS
+    },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_bf16_mtp": "cnn_dailymail",
@@ -1106,6 +1126,29 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return data_cmd
 
+    def _get_bench_warmup_requests(self) -> int:
+        """Return trtllm-bench's --warmup for this case, or 0 for its default.
+
+        trtllm-bench runs these requests in its own process before the measured
+        ones, at the same concurrency, and reports none of them. With the warmup
+        pass on, they are one wave of the measured traffic (see warmup_pass.py),
+        and never fewer than without it. They are drawn from the measured
+        dataset, though, so a case whose config reuses KV cache blocks keeps the
+        fewer requests it has without the pass: otherwise its measured requests
+        would hit the warmup's cached prefixes.
+        """
+        without_pass = 2 * self._config.num_gpus if self._config.num_gpus > 1 else 0
+        if not warmup_pass_enabled():
+            return without_pass
+        kv_cache_config = self._get_model_yaml_config().get(
+            'kv_cache_config') or {}
+        if kv_cache_config.get('enable_block_reuse'):
+            return without_pass
+        wave = one_wave_requests(self._config.concurrency,
+                                 self._config.num_reqs,
+                                 self._config.max_batch_size)
+        return max(without_pass or TRTLLM_BENCH_DEFAULT_WARMUP, wave)
+
     def get_trtllm_bench_command(self, engine_dir):
         model_dir = self.get_trtllm_bench_model()
         model_name = self._config.model_name
@@ -1140,8 +1183,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-        if self._config.num_gpus > 1:
-            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
+        warmup_requests = self._get_bench_warmup_requests()
+        if warmup_requests:
+            benchmark_cmd += [f"--warmup={warmup_requests}"]
 
         # Add extra-llm-api-config.yml for the PyTorch backend.
         if self._config.backend == "pytorch":
@@ -1218,9 +1262,20 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
         return server_cmd
 
-    def generate_trtllm_custom_dataset(self, dst_dataset_path: str,
-                                       input_len: int, output_len: int,
-                                       dataset_source: str):
+    def generate_trtllm_custom_dataset(self,
+                                       dst_dataset_path: str,
+                                       input_len: int,
+                                       output_len: int,
+                                       dataset_source: str,
+                                       num_requests: Optional[int] = None,
+                                       skip_requests: int = 0):
+        """Write a real-text dataset of fixed-length prompts.
+
+        Args:
+            num_requests: Samples to write; the case's request count if None.
+            skip_requests: Leading usable articles to skip, so that another
+                file can hold prompts this one does not.
+        """
         # Currently only support cnn_dailymail dataset source.
         if dataset_source != "cnn_dailymail":
             raise ValueError(
@@ -1230,10 +1285,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         from transformers import AutoTokenizer
 
         model_dir = self.get_trtllm_bench_model()
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_dir,
-            trust_remote_code=self._config.model_name
-            in TRUST_REMOTE_CODE_MODELS)
+        model_config = self._get_model_yaml_config()
+        custom_tokenizer = model_config.get('custom_tokenizer')
+        trust_remote_code = self._config.model_name in TRUST_REMOTE_CODE_MODELS
+        if custom_tokenizer:
+            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            tokenizer = load_custom_tokenizer(
+                custom_tokenizer,
+                model_dir,
+                trust_remote_code=trust_remote_code)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_dir, trust_remote_code=trust_remote_code)
         dataset = load_dataset(os.path.join(llm_models_root(), "datasets",
                                             "cnn_dailymail"),
                                "3.0.0",
@@ -1243,8 +1306,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if not os.path.exists(os.path.dirname(dst_dataset_path)):
             os.makedirs(os.path.dirname(dst_dataset_path), exist_ok=True)
 
-        num_reqs = self._config.num_reqs
+        num_reqs = self._config.num_reqs if num_requests is None else num_requests
         req_count = 0
+        num_skipped = 0
         with open(dst_dataset_path, "w", encoding="utf-8") as f:
             for req in dataset:
                 article = req.get("article")
@@ -1264,8 +1328,28 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         prompt_ids = (prompt_ids * repeats)[:input_len]
                     elif len(prompt_ids) > input_len:
                         prompt_ids = prompt_ids[:input_len]
+                if num_skipped < skip_requests:
+                    num_skipped += 1
+                    continue
                 prompt_text = tokenizer.decode(prompt_ids,
                                                skip_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{
+                            "role": "user",
+                            "content": prompt_text
+                        }],
+                        tokenize=False,
+                        enable_thinking=False,
+                        add_generation_prompt=True,
+                    )
+                    prompt_ids = tokenizer.encode(prompt_text,
+                                                  add_special_tokens=False)
+                    max_seq_len = model_config['max_seq_len']
+                    if len(prompt_ids) + output_len > max_seq_len:
+                        raise ValueError(
+                            "Rendered V4.1 prompt and output cap exceed max_seq_len"
+                        )
 
                 sample = {
                     "input": {
@@ -1288,7 +1372,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     break
 
         if req_count < num_reqs:
-            raise ValueError(
+            raise NotEnoughSamplesError(
                 f"Cannot sample enough requests from cnn_dailymail: requested={num_reqs}, sampled={req_count}"
             )
         print_info(f"Generated {req_count} samples from {dataset_source} to "
@@ -1315,6 +1399,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             "--percentile-metrics",
             "ttft,tpot,itl,e2el",
         ]
+        custom_tokenizer = self._get_model_yaml_config().get('custom_tokenizer')
+        if custom_tokenizer:
+            client_cmd += ["--custom-tokenizer", custom_tokenizer]
+        if self._config.model_name in DEEPSEEK_V41_MODELS:
+            client_cmd += [
+                "--save-result",
+                "--save-detailed",
+                "--result-dir",
+                engine_dir,
+                "--result-filename",
+                f"result_{input_len}_{output_len}.json",
+            ]
         # --ignore-eos must be off for spec-decoding models: forcing generation
         # past EOS produces unstable acceptance rates.
         if self._config.model_name not in SPEC_DEC_MODELS:
@@ -1370,7 +1466,54 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             client_cmd += ["--trust-remote-code"]
         return client_cmd
 
+    def _get_serve_warmup_pass(self, engine_dir: str, input_len: int,
+                               output_len: int,
+                               client_cmd: List[str]) -> Optional[WarmupPass]:
+        """Return the warmup pass before a serve client, or None; see warmup_pass.py.
+
+        A real-text client gets a prompt file of its own, with the articles
+        after the measured ones. The measured file holds exactly the measured
+        prompts, so another shuffle of it would resend them, and KV cache block
+        reuse would then serve their prefixes to the measured requests. If the
+        source has no articles to spare, the client gets no pass.
+        """
+        if not warmup_pass_enabled():
+            return None
+        num_requests = one_wave_requests(self._config.concurrency,
+                                         self._config.num_reqs,
+                                         self._config.max_batch_size)
+        if num_requests < 1:
+            return None
+        dataset_source = SPEC_DEC_REAL_DATASET_MODELS.get(
+            self._config.model_name)
+        if dataset_source is not None:
+            warmup_dataset_path = os.path.join(
+                engine_dir,
+                f"dataset_custom_{input_len}_{output_len}_warmup_pass.jsonl")
+            try:
+                self.generate_trtllm_custom_dataset(
+                    warmup_dataset_path,
+                    input_len,
+                    output_len,
+                    dataset_source=dataset_source,
+                    num_requests=num_requests,
+                    skip_requests=self._config.num_reqs)
+            except NotEnoughSamplesError as error:
+                print_warning(
+                    f"Warmup pass: none for this client, since {dataset_source} "
+                    f"has no {num_requests} articles to spare after the "
+                    f"{self._config.num_reqs} measured ones: {error}")
+                return None
+            client_cmd = self.get_trtllm_serve_client_command(
+                engine_dir,
+                input_len,
+                output_len,
+                real_dataset_path=warmup_dataset_path)
+        return WarmupPass(build_warmup_pass_cmd(client_cmd, num_requests),
+                          num_requests)
+
     def get_commands(self):
+        """Build performance commands with per-case server log storage."""
         num_gpus = self._config.num_gpus
 
         if is_windows() and num_gpus > 1:
@@ -1382,6 +1525,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.runtime == "serve":
             server_cmd = self.get_trtllm_serve_server_command(engine_dir)
             client_cmds = []
+            warmup_passes = []
             data_cmds = []
             for bs in self._config.batch_sizes:
                 for len_idx, input_len in enumerate(self._config.input_lens):
@@ -1407,6 +1551,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         output_len,
                         real_dataset_path=real_dataset_path)
                     client_cmds.append(client_cmd)
+                    warmup_passes.append(
+                        self._get_serve_warmup_pass(engine_dir, input_len,
+                                                    output_len, client_cmd))
             server_env = os.environ.copy()
             if self._config.model_name.startswith("qwen3.8_flash_next_"):
                 server_env["TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD"] = "1"
@@ -1414,25 +1561,47 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_env["TLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
             if self._config.model_name in KIMI_K3_MODELS:
                 server_env.update(KIMI_K3_SERVER_ENV)
+            if self._config.model_name in DEEPSEEK_V41_MODELS:
+                # Compare real acceptance with the same bounded-replay policy.
+                server_env = {
+                    name: value
+                    for name, value in server_env.items()
+                    if not name.startswith("TRTLLM_V41_")
+                }
+                server_env.pop("TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS",
+                               None)
+                server_env["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
             if self._config.model_name in QWEN38_MTP_MODELS:
                 server_timeout = 5400
             elif self._config.model_name in NEMOTRON_SUPER_MODELS:
                 server_timeout = 3600
             elif self._config.model_name in KIMI_K3_MODELS:
                 server_timeout = 5400
+            elif self._config.model_name in DEEPSEEK_V41_MODELS:
+                server_timeout = 3600
             elif self._config.model_name == "deepseek_v4_pro_base_fp8":
                 # Allow time for model loading and executor warmup.
                 server_timeout = 1800
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_flash_fp8":
+                # Weight loading and executor warmup can exceed 10 minutes.
+                server_timeout = 3600
             else:
                 server_timeout = 600
+            server_log_dir = None
+            if self._output_dir is not None:
+                server_log_dir = os.path.abspath(
+                    os.path.join(self._output_dir, "detailed_results",
+                                 os.path.basename(engine_dir)))
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
                                            data_cmds=data_cmds,
                                            server_env=server_env,
-                                           server_timeout=server_timeout)
+                                           server_timeout=server_timeout,
+                                           warmup_passes=warmup_passes,
+                                           server_log_dir=server_log_dir)
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []
@@ -1577,6 +1746,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         outputs = {}
         result_states = {}
         errors = []
+        copy_error = None
 
         if self._config.runtime == 'bench':
             print_info(f"Running command for generating dataset")
@@ -1643,7 +1813,24 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             if isinstance(commands, PerfServeScriptTestCmds):
                 print_info("Stopping serve server")
                 commands.stop_server()
-            shutil.rmtree(self._get_engine_dir(), ignore_errors=True)
+            engine_dir = self._get_engine_dir()
+            if (self._config.model_name in DEEPSEEK_V41_MODELS
+                    and os.path.isdir(engine_dir)):
+                # Preserve raw results, prompts and config before workspace cleanup.
+                result_dir = os.path.join(output_dir, "detailed_results",
+                                          os.path.basename(engine_dir))
+                try:
+                    shutil.copytree(engine_dir, result_dir, dirs_exist_ok=True)
+                except OSError as error:
+                    copy_error = error
+                    print_warning(
+                        f"Failed to preserve detailed results in {result_dir}: {error}"
+                    )
+            if copy_error is None:
+                shutil.rmtree(engine_dir, ignore_errors=True)
+
+        if copy_error is not None:
+            errors.append(copy_error)
 
         def add_myelin_time_pass_to(input_env):
             time_pass_flag = r" -time_pass=on"
@@ -1656,7 +1843,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         llm_venv._new_env["__LUNOWUD"] = old_llm_venv
 
         # Check if any commands failed.
-        if not all([result_states[idx] == "valid" for idx in result_states]):
+        if errors or not all(
+            [result_states[idx] == "valid" for idx in result_states]):
             # If there is only one error, throw it directly.
             if len(errors) == 1:
                 raise errors[0]

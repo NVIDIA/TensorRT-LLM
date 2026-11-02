@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-_VENDOR_SOURCES = _REPO_ROOT / "scripts" / "vendor_sources.py"
+_VENDOR_SOURCES = _REPO_ROOT / "scripts" / "vendor" / "manage.py"
 _VENDOR_NAME = "example"
 _SOURCE = "python/example"
 _DESTINATION = "src/example"

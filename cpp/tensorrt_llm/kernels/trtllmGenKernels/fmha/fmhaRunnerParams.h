@@ -255,6 +255,8 @@ struct TllmGenFmhaRunnerParams
     void const* qPtr;
     void const* kPtr;
     void const* vPtr;
+    // Zero derives the separate V token stride from the layout.
+    int64_t mVTokenStrideInBytes = 0;
     // Packed KV buffer
     void const* kvPtr;
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
@@ -269,6 +271,8 @@ struct TllmGenFmhaRunnerParams
     int32_t const* generalPackedCustoMaskPtr;
     // The custom mask ptr.
     uint32_t* customMaskPtr;
+    // The number of uint32 elements behind customMaskPtr.
+    int64_t customMaskCapacity = 0;
     // The packed custom mask's offsets of each sequence.
     int64_t* customMaskOffsetsPtr;
     // The first sparseMask offsets in the Kv sequence dimension.

@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Triton kernels of the glm_kpool sparse backend: pool-key refresh, pool scoring and selection
-expansion over the paged indexer cache. Fixed shapes, no host synchronization, CUDA-graph safe.
+"""Triton kernels of the glm_kpool sparse backend: paged state append, pool-key refresh, pool
+scoring and selection expansion over the paged indexer cache. Fixed shapes, no host
+synchronization, CUDA-graph safe.
 """
 
 from __future__ import annotations
@@ -100,13 +101,18 @@ def _kpool_update_kernel(
     HD: tl.constexpr,
     KPOOL: tl.constexpr,
     HAS_REQ: tl.constexpr,
+    ROWS_PER_TABLE: tl.constexpr,
 ):
     """Recompute the pool key of the pool containing ``POS[b]``.
 
     Members beyond ``POS[b]`` are masked (they are not visible yet), so an
     incomplete pool carries the key of its visible members and is finalized by
     the write of its last member. Row ``b`` reads block table ``REQ[b]`` when
-    ``HAS_REQ`` (several rows of one request share a table), else table ``b``. Numerics follow ``build_pools``: fp32
+    ``HAS_REQ`` (several rows of one request share a table), else table
+    ``b // ROWS_PER_TABLE``. With ``ROWS_PER_TABLE > 1`` the rows of one table are
+    consecutive positions; a row whose successor falls in the same pool is skipped,
+    so each pool is written once with its last visible member, as sequential
+    updates would leave it. Numerics follow ``build_pools``: fp32
     softmax over ``gate + ape``, bf16 probabilities and products, fp32 sum,
     bf16 result.
     """
@@ -114,8 +120,12 @@ def _kpool_update_kernel(
     if HAS_REQ:
         tbl = tl.load(REQ + b).to(tl.int64)
     else:
-        tbl = b.to(tl.int64)
+        tbl = (b // ROWS_PER_TABLE).to(tl.int64)
     pos = tl.load(POS + b).to(tl.int64)
+    if ROWS_PER_TABLE > 1:
+        if b % ROWS_PER_TABLE < ROWS_PER_TABLE - 1:
+            if tl.load(POS + b + 1).to(tl.int64) // KPOOL == pos // KPOOL:
+                return
     start = (pos // KPOOL) * KPOOL
     m = tl.arange(0, KPOOL)
     d = tl.arange(0, HD)
@@ -155,12 +165,19 @@ def kpool_update(
     """Refresh the pool keys of the pools containing ``positions`` (one per row).
 
     ``index_pool`` is the slot-major ``[slots, tokens_per_block, 3 * head_dim]``
-    view, ``block_tables`` ``[N, max_pages]`` int64, ``positions`` ``[N]``.
-    With ``request_ids`` (``[N]`` int32) row ``i`` reads block table
-    ``block_tables[request_ids[i]]`` instead of row ``i`` -- the packed rows of
-    several context requests. In-place; no host sync, fixed shapes:
-    CUDA-graph safe.
+    view, ``block_tables`` ``[N, max_pages]`` int64, ``positions`` ``[N]``, or
+    ``[N, T]`` consecutive positions per table (draft verification); the result
+    equals updating the T columns in order. With ``request_ids`` (``[N]`` int32)
+    row ``i`` reads block table ``block_tables[request_ids[i]]`` instead of row
+    ``i`` -- the packed rows of several context requests. In-place; no host sync,
+    fixed shapes: CUDA-graph safe.
     """
+    if request_ids is not None and positions.dim() != 1:
+        # The same-pool skip compares POS[b] with POS[b + 1], which is only valid
+        # when consecutive rows belong to one table.
+        raise ValueError("kpool_update: request_ids requires 1-D positions")
+    rows_per_table = positions.shape[1] if positions.dim() == 2 else 1
+    positions = positions.reshape(-1)
     n = positions.shape[0]
     if n == 0:
         return
@@ -177,6 +194,106 @@ def kpool_update(
         HD=head_dim,
         KPOOL=kpool,
         HAS_REQ=request_ids is not None,
+        ROWS_PER_TABLE=rows_per_table,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _append_paged_state_kernel(
+    LATENT,
+    PACKED,
+    POS,
+    BT,
+    LATENT_POOL,
+    INDEX_POOL,
+    SCALE,
+    latent_stride,
+    packed_stride,
+    bt_stride,
+    latent_slot_stride,
+    latent_row_stride,
+    index_slot_stride,
+    index_row_stride,
+    tpb,
+    ROWS_PER_TABLE: tl.constexpr,
+    LATENT_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    FP8: tl.constexpr,
+):
+    """Write row ``r``'s latent and packed state at position ``POS[r]`` of table ``r // ROWS_PER_TABLE``."""
+    r = tl.program_id(0)
+    tbl = (r // ROWS_PER_TABLE).to(tl.int64)
+    pos = tl.load(POS + r).to(tl.int64)
+    page = pos // tpb
+    off = pos - page * tpb
+    slot = tl.load(BT + tbl * bt_stride + page).to(tl.int64)
+    ld = tl.arange(0, LATENT_DIM)
+    latent = tl.load(LATENT + r * latent_stride + ld)
+    latent_dst = LATENT_POOL + slot * latent_slot_stride + off * latent_row_stride + ld
+    if FP8:
+        scaled = latent.to(tl.float32) * tl.load(SCALE)
+        tl.store(latent_dst, tl.clamp(scaled, -448.0, 448.0).to(LATENT_POOL.dtype.element_ty))
+    else:
+        tl.store(latent_dst, latent.to(LATENT_POOL.dtype.element_ty))
+    pd = tl.arange(0, PACKED_DIM)
+    packed = tl.load(PACKED + r * packed_stride + pd)
+    tl.store(
+        INDEX_POOL + slot * index_slot_stride + off * index_row_stride + pd,
+        packed.to(INDEX_POOL.dtype.element_ty),
+    )
+
+
+def append_paged_state_rows(
+    latent: torch.Tensor,
+    packed: torch.Tensor,
+    positions: torch.Tensor,
+    block_tables: torch.Tensor,
+    latent_pool: torch.Tensor,
+    index_pool: torch.Tensor,
+    tokens_per_block: int,
+    scale: torch.Tensor | None,
+) -> None:
+    """Write generation rows into the paged latent and indexer pools in one launch.
+
+    ``latent`` / ``packed`` are ``[N, T, dim]`` (unit inner stride), ``positions``
+    ``[N, T]`` and ``block_tables`` ``[N, max_pages]``. FP8 latent pools receive
+    ``clamp(latent * scale)`` rounded to E4M3; ``packed`` fills the leading
+    columns of each indexer row. Pools are slot-major ``[slots, tokens_per_block,
+    dim]`` views with arbitrary slot/row strides. CUDA-graph safe.
+    """
+    for name, width in (("latent", latent.shape[-1]), ("packed", packed.shape[-1])):
+        # The kernel spans each row with tl.arange, which needs a power-of-two width.
+        if width <= 0 or width & (width - 1):
+            raise ValueError(f"append_paged_state_rows: {name} width {width} is not a power of two")
+    rows_per_table = positions.shape[1]
+    latent = latent.reshape(-1, latent.shape[-1])
+    packed = packed.reshape(-1, packed.shape[-1])
+    positions = positions.reshape(-1)
+    n = positions.shape[0]
+    if n == 0:
+        return
+    fp8 = latent_pool.dtype == torch.float8_e4m3fn
+    _append_paged_state_kernel[(n,)](
+        latent,
+        packed,
+        positions,
+        block_tables,
+        latent_pool,
+        index_pool,
+        scale if fp8 else latent,
+        latent.stride(0),
+        packed.stride(0),
+        block_tables.stride(0),
+        latent_pool.stride(0),
+        latent_pool.stride(1),
+        index_pool.stride(0),
+        index_pool.stride(1),
+        tokens_per_block,
+        ROWS_PER_TABLE=rows_per_table,
+        LATENT_DIM=latent.shape[-1],
+        PACKED_DIM=packed.shape[-1],
+        FP8=fp8,
         num_warps=4,
     )
 
@@ -395,6 +512,71 @@ def kpool_score(
     return out
 
 
+def kpool_score_fp8(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tokens_per_block: int,
+    *,
+    head_dim: int,
+    kpool: int,
+    q_scale: float,
+    w_scale: float,
+    request_ids: torch.Tensor,
+    max_kv_len: int,
+) -> torch.Tensor | None:
+    """FP8 :func:`kpool_score` for packed context rows, via DeepGEMM ``fp8_mqa_logits``.
+
+    The pool keys of every block table are gathered into ``[tables * pools, head_dim]``
+    and quantized per row; queries are quantized per (row, head), with their scales
+    folded into the head weights, so each score is ``sum_h w * relu(q . key)`` as in
+    :func:`kpool_score`. ``max_kv_len`` bounds every row's ``kv_lens``. Row ``r``
+    scores only the first ``kv_lens[r] // kpool`` pools of table ``request_ids[r]``;
+    later columns are not meaningful, so readers must stop there. The result may be
+    a strided view with an aligned row stride. Returns ``None`` when there are no
+    rows or no complete pools.
+    """
+    from tensorrt_llm.deep_gemm import fp8_mqa_logits
+
+    n = q.shape[0]
+    pools = max(0, int(max_kv_len)) // kpool
+    tables = block_tables.shape[0]
+    if n == 0 or pools == 0:
+        return None
+    positions = torch.arange(pools, device=q.device) * kpool
+    page = positions // tokens_per_block
+    offset = positions - page * tokens_per_block
+    slots = block_tables[:, page].long()  # [tables, pools]
+    keys = index_pool[slots, offset, 2 * head_dim : 3 * head_dim].reshape(-1, head_dim)
+    half = head_dim // 2
+    keys_fp8, key_scale = torch.ops.trtllm.fused_cat_fp8(keys[:, :half], keys[:, half:], False)
+    q_rows = q.reshape(-1, head_dim)
+    q_fp8, q_row_scale = torch.ops.trtllm.fused_cat_fp8(q_rows[:, :half], q_rows[:, half:], False)
+    head_weights = weights.float() * q_row_scale.view(n, -1) * (w_scale * q_scale)
+    start = request_ids.to(torch.int32) * pools
+    end = start + (kv_lens // kpool).to(torch.int32)
+    logits = fp8_mqa_logits(
+        q_fp8.view(q.shape),
+        (keys_fp8, key_scale.view(-1)),
+        head_weights,
+        start,
+        end,
+        clean_logits=False,
+    )
+    if tables == 1:
+        # DeepGEMM pads the logits rows to an aligned stride, as the pool top-k needs.
+        return logits[:, :pools]
+    # Keep the copy's rows aligned and wider than the selection, like the logits arena.
+    out = torch.empty(
+        n, max(1024, triton.cdiv(pools, 64) * 64), dtype=torch.float32, device=q.device
+    )
+    rows = torch.arange(n, device=q.device)
+    out[:, :pools] = logits[:, : tables * pools].view(n, tables, pools)[rows, request_ids.long()]
+    return out
+
+
 @triton.jit
 def _kpool_expand_kernel(
     SEL,
@@ -524,6 +706,7 @@ def _compact_sparse_rows_kernel(
     Width: tl.constexpr,
     OutWidth: tl.constexpr,
     Block: tl.constexpr,
+    OutBlock: tl.constexpr,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, Block)
@@ -532,6 +715,10 @@ def _compact_sparse_rows_kernel(
     destination = tl.cumsum(valid.to(tl.int32)) - 1
     length = tl.sum(valid.to(tl.int32))
     tl.store(Packed + row * OutWidth + destination, value, valid)
+    tail = tl.arange(0, OutBlock)
+    tl.store(
+        Packed + row * OutWidth + tail, -1, (tail >= tl.maximum(length, 1)) & (tail < OutWidth)
+    )
     if length == 0:
         tl.store(Packed + row * OutWidth, 0)
     tl.store(Lengths + row, tl.maximum(length, 1))
@@ -546,7 +733,7 @@ def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     """
     rows = indices.shape[0]
     width = triton.cdiv(indices.shape[1], 64) * 64
-    packed = torch.full((rows, width), -1, dtype=torch.int32, device=indices.device)
+    packed = torch.empty((rows, width), dtype=torch.int32, device=indices.device)
     lengths = torch.empty(rows, dtype=torch.int32, device=indices.device)
     nonempty = torch.empty(rows, dtype=torch.bool, device=indices.device)
     _compact_sparse_rows_kernel[(rows,)](
@@ -558,5 +745,6 @@ def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         indices.shape[1],
         width,
         triton.next_power_of_2(indices.shape[1]),
+        triton.next_power_of_2(width),
     )
     return packed, lengths, nonempty

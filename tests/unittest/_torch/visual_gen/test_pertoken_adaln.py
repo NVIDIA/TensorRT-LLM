@@ -20,11 +20,11 @@ import torch.nn.functional as F
 pytest.importorskip("cutlass")
 pytest.importorskip("cuda.bindings.driver")
 
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln import (
+from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln import (
     fused_pertoken_adaln,
     fused_pertoken_adaln_residual,
 )
-from tensorrt_llm._torch.cute_dsl_kernels.blackwell.pertoken_adaln.pertoken_adaln import (
+from tensorrt_llm._torch.visual_gen.kernels.blackwell.pertoken_adaln.pertoken_adaln import (
     WARP_SIZE,
     PerTokenAdaLN,
 )

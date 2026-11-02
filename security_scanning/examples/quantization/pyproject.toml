@@ -7,6 +7,7 @@ authors = [
 ]
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "python-dateutil (<3.0.0)",
     "datasets (==3.1.0)",
     "rouge-score (>=0.1.2,<0.2.0)",
     "transformers-stream-generator (==0.0.4)",

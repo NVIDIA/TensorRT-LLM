@@ -22,9 +22,10 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -547,6 +548,7 @@ def test_nonblocking_gen_progress_notifies_unsettled_senders_once(terminal: str)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     transceiver._mapping = SimpleNamespace(enable_attention_dp=False, world_size=1, pp_size=1)
     transceiver._recv_sessions, transceiver._recv_reqs = {401: session}, {401: object()}
     transceiver._gen_allgather = Mock()

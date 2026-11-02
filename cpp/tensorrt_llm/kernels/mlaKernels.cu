@@ -1431,8 +1431,8 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, KV
 template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM, bool ABSORPTION_MODE>
 __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quant_q_buf, T const* k_buf,
     __nv_fp8_e4m3* quant_k_buf, T const* v_buf, __nv_fp8_e4m3* quant_v_buf, int total_q_len, int total_kv_len,
-    float const* quant_scale_qkv_ptr, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
-    float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale)
+    size_t src_v_token_stride, float const* quant_scale_qkv_ptr, float* bmm1_scale, float* bmm2_scale,
+    float const* quant_scale_o, float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -1517,8 +1517,7 @@ __global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quan
                 quantCopy<T, ELTS_PER_VEC>(quant_k_buf + dst_k_idx, &k_buf[src_k_idx], quant_scale_qkv_val);
             }
         }
-        // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
-        size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
+        // Quantize V from its physical token stride into the contiguous workspace.
         for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
              v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
         {
@@ -1842,6 +1841,12 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         "MLA Context: quant_k_buf must be non-null in non-absorption mode");
     TLLM_CHECK_WITH_INFO(params.absorption_mode || params.quant_v_buf != nullptr,
         "MLA Context: quant_v_buf must be non-null in non-absorption mode");
+    TLLM_CHECK_WITH_INFO(params.absorption_mode || params.v_token_stride_elements >= 0,
+        "MLA Context: V token stride must be nonnegative");
+
+    size_t const srcVTokenStride = params.v_token_stride_elements > 0
+        ? static_cast<size_t>(params.v_token_stride_elements)
+        : static_cast<size_t>(params.meta.qk_nope_head_dim + params.meta.v_head_dim) * params.head_num;
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
@@ -1868,8 +1873,8 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                         static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
                         static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
                         static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
-                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+                        srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
             }
             else
             {
@@ -1887,8 +1892,8 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                         static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
                         static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
                         static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
-                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+                        srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                        params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
             }
         }
         else
@@ -1909,7 +1914,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
                 <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
                     params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, srcVTokenStride,
                     params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
                     params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
         }

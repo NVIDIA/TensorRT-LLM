@@ -91,7 +91,7 @@ measured: []
   group-top-k / expert-top-k / normalize math, within fp tolerance). Still a
   kernel rewrite, so **verify vs reference**; tie-breaking on equal scores can
   differ from the PyTorch path.
-- **Verify:** correctness — `pytest tests/unittest/_torch/thop/parallel/test_noaux_tc.py`
+- **Verify:** correctness — `pytest tests/unittest/_torch/kernels/parallel_hw_agnostic/test_noaux_tc.py`
   and `test_moe.py`, plus the C++ `routingDeepSeekTest`; compare
   `topk_values`/`topk_indices` to the PyTorch reference within tolerance,
   including tie cases. Perf — nsys before/after: routing kernel count, total

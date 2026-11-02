@@ -30,11 +30,21 @@ The single-step flow of PyExecutor involves:
 - Running the decoder using the model forward outputs for the scheduled requests.
 - Adding output tokens for each request and handling finished requests.
 
+## Multimodal Request Data
+
+See the [multimodal developer guide](../developer-guide/multimodal.md) for
+shared data contracts, process boundaries, and request ownership.
+
 ## Model Engine
 
-The core component of `PyExecutor` is the `ModelEngine`, responsible for executing the model's forward pass efficiently on the GPU.
-The key method of `ModelEngine` is `forward`, which handles the forward pass computation.
-For the PyTorch backend, the derived class is `PyTorchModelEngine`, declared in [model_engine.py](../../../tensorrt_llm/_torch/pyexecutor/model_engine.py).
+[`ModelEngine`](../../../tensorrt_llm/_torch/pyexecutor/model_engine.py) loads the model, resolves capacity and execution settings, constructs a model runner, and coordinates its lifecycle.
+`PyExecutor` calls `ModelEngine.forward` with scheduled requests, runtime resources, and the current speculative decoding state; the engine builds `ScheduledInputs` and delegates to a `ScheduledModelRunner`.
+`EncoderExecutor` instead passes `PackedInputs` through the engine to a `PackedModelRunner`.
+
+The concrete runner owns input preparation, model execution, CUDA graphs, metadata, and output processing.
+`EncoderDecoderRunner` combines decoder execution with a separate encoder stage, which `PyExecutor` schedules through explicit encoder entry points.
+Multimodal item encoding also has a separate scheduled entry point.
+The engine retains the shared services and coordinates warmup, late-installed hooks, and resource release.
 
 ## Decoder
 

@@ -19,8 +19,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/exceptions.h"
 
-// Reuse existing copy implementations (no Python round-trip).
-#include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 
 #include "tensorrt_llm/common/assert.h"
 

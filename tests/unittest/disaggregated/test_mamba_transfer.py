@@ -37,7 +37,12 @@ from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import Atte
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.config_utils import Qwen4ExpPLECacheParams
+from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
+    Qwen4ExpHybridCacheManager,
+    Qwen4ExpPLECacheParams,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MixedMambaHybridCacheManager,
@@ -210,7 +215,7 @@ def _create_managers(
     tp,
     max_batch_size=MAX_BATCH_SIZE,
     enable_attention_dp=False,
-    use_v2=False,
+    use_v2=True,
     conv_state_layout="x_b_c",
     with_ple=False,
 ):
@@ -224,7 +229,14 @@ def _create_managers(
         mapping = Mapping(
             world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_attention_dp
         )
-        manager_cls = MambaHybridCacheManagerV2 if use_v2 else MixedMambaHybridCacheManager
+        if not use_v2:
+            manager_cls = MixedMambaHybridCacheManager
+        elif with_ple:
+            manager_cls = Qwen4ExpHybridCacheManager
+        elif conv_state_layout == "q_k_v":
+            manager_cls = Qwen35HybridCacheManager
+        else:
+            manager_cls = NemotronHybridCacheManager
         manager_kwargs = (
             {
                 "is_disagg": True,
@@ -292,7 +304,7 @@ def _zero_mamba_states(manager):
     for layer_idx in _mamba_layer_ids(manager):
         manager.get_conv_states(layer_idx).zero_()
         manager.get_ssm_states(layer_idx).zero_()
-    if isinstance(manager, MambaHybridCacheManagerV2):
+    if isinstance(manager, Qwen4ExpHybridCacheManager):
         for state in manager._ple_conv_states.values():
             state.zero_()
         for state in manager._ple_ngram_contexts.values():
@@ -663,7 +675,7 @@ def _write_ple_ground_truth_to_ctx(managers, request_ids):
 # Main test logic
 # ---------------------------------------------------------------------------
 def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
-    mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True)[0]
+    mgr = _create_managers(1, max_batch_size=1, enable_attention_dp=True, use_v2=False)[0]
     try:
         req = LlmRequest(
             request_id=100,
@@ -679,7 +691,7 @@ def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
         batch.reset_context_requests([req])
         mgr.prepare_resources(batch)
 
-        mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID], is_gen=True, prepare_resource=True)
+        mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID], is_gen=True)
 
         assert mgr._impl.mamba_cache_free_blocks == []
         assert (
@@ -694,7 +706,7 @@ def test_mamba_disagg_attention_dp_dummy_with_batch_size_one():
 def run_mamba_transfer_test(
     ctx_tp: int,
     gen_tp: int,
-    use_v2: bool = False,
+    use_v2: bool = True,
     conv_state_layout: str = "x_b_c",
     with_ple: bool = False,
 ):
@@ -767,29 +779,19 @@ def run_mamba_transfer_test(
 
     # -- 4. Allocate slots --
     ctx_batch = ScheduledRequests()
-    if use_v2:
-        ctx_batch.context_requests_last_chunk = ctx_reqs
-        for mgr in ctx_mgrs:
-            for req in ctx_reqs:
-                assert mgr.prepare_context(req)
-                assert mgr.resize_context(req, req.context_chunk_size)
-            mgr.prepare_resources(ctx_batch)
-    else:
-        ctx_batch.reset_context_requests(ctx_reqs)
-        for mgr in ctx_mgrs:
-            mgr.prepare_resources(ctx_batch)
+    ctx_batch.context_requests_last_chunk = ctx_reqs
+    for mgr in ctx_mgrs:
+        for req in ctx_reqs:
+            assert mgr.prepare_context(req)
+            assert mgr.resize_context(req, req.context_chunk_size)
+        mgr.prepare_resources(ctx_batch)
 
     gen_batch = ScheduledRequests()
-    if use_v2:
-        gen_batch.context_requests_last_chunk = gen_reqs
-        for mgr in gen_mgrs:
-            for req in gen_reqs:
-                assert mgr.prepare_disagg_gen_init(req)
-            mgr.prepare_resources(gen_batch)
-    else:
-        gen_batch.reset_context_requests(gen_reqs)
-        for mgr in gen_mgrs:
-            mgr.prepare_resources(gen_batch)
+    gen_batch.context_requests_last_chunk = gen_reqs
+    for mgr in gen_mgrs:
+        for req in gen_reqs:
+            assert mgr.prepare_disagg_gen_init(req)
+        mgr.prepare_resources(gen_batch)
 
     for req in ctx_reqs + gen_reqs:
         req.context_current_position = req.prompt_len
@@ -854,7 +856,7 @@ def run_mamba_transfer_test(
                 ),
             )
 
-    # Only the V2 manager owns PLE state.
+    # PLE buffers are owned by the Qwen4 manager.
     if with_ple:
         for gen_rank, manager in enumerate(gen_mgrs):
             for req_idx, request_id in enumerate(gen_rids):

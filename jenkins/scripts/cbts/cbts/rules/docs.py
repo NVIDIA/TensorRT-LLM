@@ -17,10 +17,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from cbts.blocks import Stage, YAMLIndex, _entry_target
+from cbts.blocks import Stage, YAMLIndex
 
-from ._helpers import resolve_affected_stages, stages_by_yaml_stem
+from ._helpers import block_filters_for_stem, resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .out_of_scope import is_out_of_scope
 
 # Stage key declared in jenkins/L0_Test.groovy::docBuildConfigs. This stage is
 # not test-db-driven, so CBTS contributes its name literally.
@@ -33,12 +34,15 @@ _DOCS_SUFFIXES: tuple[str, ...] = (".md", ".rst")
 
 def is_docs_path(path: str) -> bool:
     """Return whether ``path`` contributes to the repository documentation."""
-    return path.startswith(_DOCS_PREFIX) or path.endswith(_DOCS_SUFFIXES)
+    return not is_out_of_scope(path) and (
+        path.startswith(_DOCS_PREFIX) or path.endswith(_DOCS_SUFFIXES)
+    )
 
 
 class DocsRule(Rule):
     name = "docs"
-    needs_diff_for: tuple[str, ...] = ()
+    needs_diff_for: tuple[str, ...] = ("**/*.py",)
+    handles_docstrings = True
 
     def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
@@ -54,25 +58,21 @@ class DocsRule(Rule):
         conservatively run the complete CPU suite. Using each entry's own
         canonical target and raw text preserves `-k` variants through Layer
         3's normal subtree and keyword filtering.
+
+        Literal docstrings contribute this same CPU set, which includes API
+        stability and documentation checks, without a consumer-path allowlist.
         """
-        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
-        for block in self.yaml_index.blocks:
-            if block.yaml_stem != CPU_TEST_YAML_STEM:
-                continue
-            prefix_to_entries: dict[str, set[str]] = {}
-            for entry in block.tests:
-                target = _entry_target(entry)
-                if target:
-                    prefix_to_entries.setdefault(target, set()).add(entry)
-            block_filters[(block.yaml_stem, block.block_index)] = prefix_to_entries
-        return block_filters
+        return block_filters_for_stem(self.yaml_index, CPU_TEST_YAML_STEM)
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {path for path in pr.changed_files if is_docs_path(path)}
-        if not claimed:
+        docstring_files = {path for path in pr.docstring_files if not is_out_of_scope(path)}
+        claimed = {path for path in pr.changed_files if is_docs_path(path)} | {
+            path for path in pr.docstring_only_files if not is_out_of_scope(path)
+        }
+        if not claimed and not docstring_files:
             return None
 
-        if not any(path.startswith(_DOCS_PREFIX) for path in claimed):
+        if not docstring_files and not any(path.startswith(_DOCS_PREFIX) for path in claimed):
             return RuleResult(
                 handled_files=claimed,
                 affected_stages={DOCS_STAGE},
@@ -93,7 +93,7 @@ class DocsRule(Rule):
                 affected_stages=set(),
                 scope=None,
                 reason=(
-                    f"docs: {len(claimed)} documentation file(s); "
+                    f"docs: {len(claimed | docstring_files)} documentation/docstring file(s); "
                     "no CPU test-db blocks or stages resolved — fallback"
                 ),
             )
@@ -107,7 +107,8 @@ class DocsRule(Rule):
             sanity_relevant=False,
             perfsanity_relevant=False,
             reason=(
-                f"docs: {len(claimed)} documentation file(s) → {DOCS_STAGE} + "
+                f"docs: {len(claimed | docstring_files)} documentation/docstring file(s) → "
+                f"{DOCS_STAGE} + "
                 f"{len(cpu_stages)} CPU test stage(s)"
             ),
         )
