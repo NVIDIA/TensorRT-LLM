@@ -364,7 +364,10 @@ def test_state_workspace_warmup_growth(monkeypatch):
 @skip_unsupported
 @pytest.mark.parametrize("capacity", [1, 3, 64])
 @pytest.mark.parametrize("inplace", [False, True])
-def test_state_workspace_smaller_than_batch(capacity, inplace):
+# 6 value heads (Qwen3.5-27B at TP8) make a g/beta row 24 bytes, so groups that
+# start at an odd token have g/beta views off FlashInfer's 16-byte alignment.
+@pytest.mark.parametrize("num_q_heads,num_v_heads", [(4, 16), (2, 6)])
+def test_state_workspace_smaller_than_batch(capacity, inplace, num_q_heads, num_v_heads):
     """A batch larger than the workspace runs in groups and matches one call over the batch."""
     from unittest.mock import patch
 
@@ -374,7 +377,7 @@ def test_state_workspace_smaller_than_batch(capacity, inplace):
 
     seq_lens = [37, 1, 1, 130, 1, 64, 1, 9]
     num_seqs = len(seq_lens)
-    q, k, v, g, beta, cu = _make_inputs(seq_lens)
+    q, k, v, g, beta, cu = _make_inputs(seq_lens, num_q_heads=num_q_heads, num_v_heads=num_v_heads)
     torch.manual_seed(1)
     num_heads, head_dim = v.shape[2], v.shape[3]
     pool = torch.randn(num_seqs + 4, num_heads, head_dim, head_dim, device="cuda") * 0.01
@@ -415,6 +418,8 @@ def test_state_workspace_smaller_than_batch(capacity, inplace):
     group_sizes = [c.kwargs["cu_seqlens"].shape[0] - 1 for c in call.call_args_list]
     assert sum(group_sizes) == num_seqs and max(group_sizes) - min(group_sizes) <= 1
     assert max(group_sizes) <= capacity
+    for c in call.call_args_list:
+        assert c.kwargs["g"].data_ptr() % 16 == 0 and c.kwargs["beta"].data_ptr() % 16 == 0
     # FlashInfer runs a call on its chunk-parallel kernel when the call has few
     # sequence-heads for the SM count, and sizes the chunks from the call's tokens
     # and sequences. A group can therefore run a different kernel or chunking than

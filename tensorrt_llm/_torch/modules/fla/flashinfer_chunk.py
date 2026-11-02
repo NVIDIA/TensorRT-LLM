@@ -40,6 +40,17 @@ from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import is_sm_100f
 
 
+def _aligned_rows(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Return rows ``[start, end)`` of ``tensor``, copied if the view is not 16-byte aligned.
+
+    FlashInfer's GDN prefill kernels assume 16-byte aligned operands. A ``g`` or
+    ``beta`` row holds one fp32 value per value head, so a row slice can start off
+    that boundary, e.g. at an odd token with 6 value heads.
+    """
+    rows = tensor[start:end]
+    return rows if rows.data_ptr() % 16 == 0 else rows.clone()
+
+
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
 # (chunk.py:119): Dynamo must not trace this wrapper because it imports
 # `flashinfer` lazily and calls into FI's CuTe-DSL kernels, neither of
@@ -197,12 +208,14 @@ def chunk_gated_delta_rule(
         )
 
         # --- Step 6: call FlashInfer with pre-allocated output/state buffers
+        # A q/k/v/output token row is heads x head_size (128) 16-bit values, a multiple
+        # of 16 bytes, so their group slices stay aligned; g/beta rows may not.
         flashinfer_args = dict(
             q=q3[tok_lo:tok_hi],
             k=k3[tok_lo:tok_hi],
             v=v3[tok_lo:tok_hi],
-            g=g2[tok_lo:tok_hi],
-            beta=beta2[tok_lo:tok_hi],
+            g=_aligned_rows(g2, tok_lo, tok_hi),
+            beta=_aligned_rows(beta2, tok_lo, tok_hi),
             scale=scale,
             initial_state=gathered_init,
             cu_seqlens=group_cu,
