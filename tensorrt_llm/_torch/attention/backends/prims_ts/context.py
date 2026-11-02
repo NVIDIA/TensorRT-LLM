@@ -37,12 +37,14 @@ register trace templates.
 
 from dataclasses import dataclass
 import functools
-import importlib.metadata
 import itertools
 import math
 import numbers
 import struct
 from typing import TYPE_CHECKING, Callable, Literal, Optional
+
+from ._compile_cache import build_and_load_attention_kernel
+from ._hardware import get_max_active_clusters
 
 import torch
 
@@ -328,6 +330,9 @@ def _make_context_kernel(
         enable_skip_correction=True,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
+        use_blackwell_tma_oob_workaround=(
+            torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
+        ),
         **paged_kwargs,
     )
     return fmha
@@ -494,22 +499,6 @@ def _validate_device(device: torch.device) -> int:
     return device_index
 
 
-@functools.cache
-def _dsl_supports_ldtm_stat() -> bool:
-    """LDTM.STAT uses a native wrapper in DSL 4.8 or inline PTX in 4.7."""
-    try:
-        dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
-    except importlib.metadata.PackageNotFoundError:
-        return False
-    from packaging import version as pkg_version
-
-    try:
-        # Use .release so 4.7.0.dev* includes the inline-PTX path.
-        return pkg_version.Version(dsl_version).release >= (4, 7, 0)
-    except pkg_version.InvalidVersion:
-        return False
-
-
 def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
 
@@ -537,21 +526,10 @@ def _default_two_cta_umma(device_index: int) -> bool:
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT on SM103/SM107 with native or compatibility lowering."""
-    if not _dsl_supports_ldtm_stat():
-        return False
-    # tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
-    # (SM107), not B200 (SM100).
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability == (10, 3):
-        return True
-    if capability == (10, 7):
-        # DSL 4.7's Rubin escape hatch targets sm_100f, which cannot emit
-        # LDTM.STAT. Keep Rubin on the native wrapper/target support path.
-        from cutlass.experimental import primitives as prims
+    """Enable LDTM.STAT where the shared tcgen05 gate allows it."""
+    from .kernels.tcgen05_compat import ldtm_stat_supported
 
-        return hasattr(prims, "tcgen05_ld_red")
-    return False
+    return ldtm_stat_supported(torch.cuda.get_device_capability(device_index))
 
 
 def _resolve_cuda_device(
@@ -1486,7 +1464,6 @@ def _make_context_scheduler_probe(
     """Build the common static probe and logical work count for policy."""
 
     import cutlass
-    import cutlass.utils as utils
 
     dtype_map = {
         torch.float16: cutlass.Float16,
@@ -1513,7 +1490,7 @@ def _make_context_scheduler_probe(
         max_kv_len=max_kv_len,
     )
     with torch.cuda.device(geometry.device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     num_seq_tiles = (
         geometry.max_seq_len_q + probe.cfg.cta_tiler[0] - 1
     ) // probe.cfg.cta_tiler[0]
@@ -1782,7 +1759,6 @@ def _get_compiled_context(
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    import cutlass.utils as utils
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -1794,7 +1770,7 @@ def _get_compiled_context(
     output_dtype = dtype_map[output_dtype_key]
     has_variable_window = mask_type == "variable_window"
     with torch.cuda.device(device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
         input_qk_dtype=input_qk_dtype,
@@ -1941,8 +1917,8 @@ def _get_compiled_context(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             tensor_adapter,
             q_fake,
             k_fake,
@@ -1961,6 +1937,16 @@ def _get_compiled_context(
             max_seq_len_q,
             max_seq_len_k,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled = build_and_load_attention_kernel(
+            "context",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(max_active_clusters,),
         )
     policy = (
         ("scheduler", scheduler),
@@ -2000,7 +1986,6 @@ def _get_compiled_paged_context(
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    import cutlass.utils as utils
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -2011,7 +1996,7 @@ def _get_compiled_paged_context(
     input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     with torch.cuda.device(device_index):
-        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+        max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
         input_qk_dtype=input_qk_dtype,
@@ -2115,8 +2100,8 @@ def _get_compiled_paged_context(
     seq_lens_fake = fake_compact(cutlass.Int32, (batch_size,), 4)
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+    def compile_kernel():
+        return cute.compile[cute.FrontendNext](
             tensor_adapter,
             q_fake,
             k_fake,
@@ -2132,6 +2117,16 @@ def _get_compiled_paged_context(
             max_seq_len_q,
             max_kv_len,
             options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled = build_and_load_attention_kernel(
+            "context",
+            "paged",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_kernel,
+            extra=(max_active_clusters,),
         )
     policy = (
         ("scheduler", scheduler),

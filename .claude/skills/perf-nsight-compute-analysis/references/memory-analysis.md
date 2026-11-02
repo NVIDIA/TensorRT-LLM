@@ -54,7 +54,7 @@ The Memory Chart visualizes the GPU memory hierarchy as a diagram of interconnec
 
 ### Device Memory (DRAM)
 - Off-chip, highest capacity, highest latency
-- Highest bandwidth when access is coalesced (128-byte transactions)
+- Accessed in 32-byte sectors (a 128-byte cache line holds four); highest bandwidth when a warp's accesses fill whole sectors
 
 ## Key Memory Metrics
 
@@ -80,12 +80,13 @@ Low hit rates indicate:
 
 ### Coalescing Efficiency
 
-Global memory loads/stores should coalesce into minimal 128-byte transactions. Metrics to watch:
+Global memory loads/stores should coalesce into the fewest 32-byte sectors. Metrics to watch:
 
 | Metric | Ideal | Problem Indicator |
 |--------|-------|-------------------|
-| Global Load Efficiency | >90% | <50% = uncoalesced reads |
-| Global Store Efficiency | >90% | <50% = uncoalesced writes |
+| `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld.ratio` | Access size in bytes (4 for 4-byte loads by a full warp) | Higher = uncoalesced loads |
+| `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_st.ratio` | Same, for stores | Higher = uncoalesced stores |
+| `L2 Theoretical Sectors Global Excessive` (source page, per instruction) | 0 | >0 = that instruction fetches unused sectors |
 
 **Causes of poor coalescing:**
 - Strided access patterns (accessing every Nth element)
@@ -96,7 +97,10 @@ Global memory loads/stores should coalesce into minimal 128-byte transactions. M
 
 Shared memory has 32 banks. Conflicts occur when multiple threads in a warp access different addresses in the same bank.
 
-**Metric:** Shared memory wavefronts per request > 1 indicates conflicts.
+**Metrics:** `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` and
+`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum` count conflicts. Per
+instruction, the source page's `L1 Conflicts Shared N-Way` shows how many ways each
+access splits (1 = conflict-free, 32 = every lane on one bank).
 
 **Fixes:**
 - Pad shared memory arrays to avoid stride conflicts
@@ -118,7 +122,7 @@ Run `--section MemoryWorkloadAnalysis` and check:
 | High DRAM throughput, low cache hit | Data not reused | Improve locality, kernel fusion |
 | Low DRAM throughput, high L2 hit | Good L2 caching | Check if L1 can be improved |
 | Low DRAM throughput, low L2 hit | Bandwidth underused | Check coalescing, occupancy |
-| High shared memory traffic | Possible bank conflicts | Check wavefronts per request |
+| High shared memory traffic | Possible bank conflicts | Check the bank conflict counts (Shared Memory Bank Conflicts above) |
 
 ### Step 3: Identify the Memory Limiter
 
@@ -127,22 +131,25 @@ Memory performance is limited when any of these saturates:
 - **Max Bandwidth:** Communication bandwidth between units exhausted
 - **Mem Pipes Busy:** Memory instruction issue rate maxed
 
-## Memory Tables (MemoryWorkloadAnalysis Detail)
+## Memory Tables (`--section MemoryWorkloadAnalysis_Tables`)
 
 ### Shared Memory Table
-Per-block shared memory usage, bank conflict counts, access efficiency.
+Instructions, requests, wavefronts and bank conflicts for shared loads, stores and atomics.
 
 ### L1/TEX Cache Table
-Hit/miss rates, transaction patterns, sector access details.
+Per memory space (global, local, surface, texture) and operation: instructions, requests,
+wavefronts, sectors, sectors per request, hit rate and bytes.
 
 ### L2 Cache Table
-Request counts, hits, misses, bandwidth utilization per slice.
+Per operation (loads, stores, atomics, reductions): requests, sectors, sectors per request, hit
+rate, bytes, throughput, and sector misses to device, system and peer memory.
 
 ### L2 Cache Eviction Policies Table
-Eviction behavior when cache capacity is exceeded.
+Sectors accessed and hit rate for each L2 eviction-priority hint (evict_first, evict_last,
+evict_normal, evict_normal_demote).
 
 ### Device Memory Table
-Global memory access patterns, DRAM bandwidth consumption.
+Sectors, bytes and throughput of device memory loads and stores.
 
 ## Common Memory Optimization Patterns
 

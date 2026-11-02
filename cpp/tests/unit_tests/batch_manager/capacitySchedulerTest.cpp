@@ -26,12 +26,12 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/executor/requestUtils.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
 
 #include "tensorrt_llm/common/tllmDataType.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -41,11 +41,24 @@
 
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::batch_manager;
-using tensorrt_llm::executor::insertRequestInOrder;
 namespace tc = tensorrt_llm::common;
 
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using VecTokens = std::vector<TokenIdType>;
+
+namespace
+{
+
+// Insert in descending priority order, preserving arrival order for ties.
+void insertRequestInOrder(RequestList& reqList, std::shared_ptr<LlmRequest> const& req)
+{
+    auto const it = std::upper_bound(std::begin(reqList), std::end(reqList), req,
+        [](std::shared_ptr<LlmRequest> const& a, std::shared_ptr<LlmRequest> const& b)
+        { return a->priority() > b->priority(); });
+    reqList.insert(it, req);
+}
+
+} // namespace
 
 struct RequestState
 {

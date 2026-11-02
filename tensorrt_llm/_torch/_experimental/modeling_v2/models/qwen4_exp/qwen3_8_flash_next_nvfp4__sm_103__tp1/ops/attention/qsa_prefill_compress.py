@@ -15,7 +15,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 
 #: The mRoPE sections the checkpoint declares; the target passes `None` today
-#: (`_QSA_MROPE_SECTION`) and these are certified for when it flips.
+#: (`_QSA_MROPE_SECTION`) and these are certified, on the NVFP4 trunk-plane cell,
+#: for when it flips.
 MROPE_SECTION = (11, 11, 10)
 
 #: This checkpoint's index geometry and the engine's QSA metadata: index head
@@ -31,12 +32,12 @@ _CKPT = dict(
     mrope_section=None,
     logical_dtype=torch.int64,
     request_dtype=torch.int32,
-    distinct_axes=True,
     layout="plain",
-    duplicate=False,
 )
 
-_DECODE = ((4095, 1), (4096, 1), (4097, 1), (4098, 1), (4099, 1), (8191, 1), (3, 1), (2047, 1))
+#: 32 requests of one MTP7 verify block each (8 rows, two completed groups), at starts that put
+#: some blocks across a page edge and some inside one.
+_MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
 
 
 def _spec(segments, pages, **overrides) -> dict:
@@ -44,8 +45,8 @@ def _spec(segments, pages, **overrides) -> dict:
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
 
 
-def _old(segments, pages, **overrides) -> dict:
-    """The old receipt's scenes: prefill from 0 under mRoPE (11, 11, 10)."""
+def _mrope(segments, pages, **overrides) -> dict:
+    """Prefill from 0 under mRoPE (11, 11, 10)."""
     return _spec(segments, pages, mrope_section=MROPE_SECTION, **overrides)
 
 
@@ -73,8 +74,7 @@ class QsaPrefillCompress(OpWrapper):
 
     Not idempotent: the anchor slot is the group's last input and its only
     output, so a second call over the same rows re-pools a compressed anchor
-    (measured: all 48 of 48 anchors moved, up to 2.94). Two rows naming one
-    anchor in a launch are harmless.
+    (measured: all 48 of 48 anchors moved, up to 2.94).
 
     Fusion boundary: pool, Gemma norm, position gather, rotation, store. The
     raw-key and position stores (`qsa_paged_index_store`, which must run
@@ -84,69 +84,21 @@ class QsaPrefillCompress(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
-        # First on purpose: the process's first, JIT-compiling call.
-        Cell(
-            why="prefill 2 x 128 from 0, mRoPE, distinct t/h/w: cold call",
-            spec=_old(((0, 128),) * 2, pages=8),
-        ),
         Cell(
             why="prefill 2 x 128 from 0, mrope_section None: the target's call",
             spec=_spec(((0, 128),) * 2, pages=8),
         ),
         Cell(
-            why="prefill 3 x 64, mRoPE: three requests' pages interleaved",
-            spec=_old(((0, 64),) * 3, pages=6),
+            why="decode MTP7: 32 requests x 8 rows, two anchors each, None",
+            spec=_spec(_MTP7_32, pages=1100, slots=40, rounding_flips=1),
         ),
+        # Under an NVFP4 KV pool the position page shares each physical page with the index
+        # pages, so both caches are strided views of one allocation: index page stride
+        # 12 x 4096 + 192 = 49344 on the trunk, position strides (24672, 3, 1).
         Cell(
-            why="text rows (t == h == w) under mRoPE",
-            spec=_old(((0, 128),), pages=4, distinct_axes=False),
+            why="NVFP4 trunk planes: 12 index roles and the position page share each page",
+            spec=_mrope(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
         ),
-        Cell(
-            why="2-token pages: every group straddles two pages",
-            spec=_old(((0, 64),) * 2, pages=64, tokens_per_block=2),
-        ),
-        Cell(
-            why="decode: 8 rows to 8191, anchors and non-anchors, None",
-            spec=_spec(_DECODE, pages=1024),
-        ),
-        Cell(why="decode: the same rows under mRoPE", spec=_old(_DECODE, pages=1024)),
-        Cell(
-            why="decode MTP: 4 requests x 2 rows, one anchor each, None",
-            spec=_spec(((4094, 2), (4095, 2), (1022, 2), (30, 2)), pages=512),
-        ),
-        Cell(
-            why="mixed: chunk from 0, chunk from 1000, 2 MTP decodes, None",
-            spec=_spec(((0, 64), (1000, 36), (4094, 2), (255, 2)), pages=256),
-        ),
-        Cell(why="eps 0.0", spec=_old(((0, 64),), pages=2, eps=0.0)),
-        Cell(why="eps 1e-5", spec=_old(((0, 64),), pages=2, eps=1e-5)),
-        Cell(
-            why="int32 positions, int32 requests",
-            spec=_old(((0, 64),) * 2, pages=4, logical_dtype=torch.int32),
-        ),
-        Cell(
-            why="int64 positions, int64 requests",
-            spec=_old(((0, 64),) * 2, pages=4, request_dtype=torch.int64),
-        ),
-        Cell(
-            why="int32 positions, int64 requests",
-            spec=_old(
-                ((0, 64),) * 2, pages=4, logical_dtype=torch.int32, request_dtype=torch.int64
-            ),
-        ),
-        Cell(
-            why="page-sliced cache, axis-strided plane, column-strided table",
-            spec=_old(((0, 64),) * 2, pages=4, layout="strided"),
-        ),
-        Cell(
-            why="index cache with a head-dim stride of 2",
-            spec=_old(((0, 64),), pages=2, layout="head_dim_strided"),
-        ),
-        Cell(
-            why="every row twice: two rows per anchor in one launch",
-            spec=_old(((0, 64),) * 2, pages=4, duplicate=True),
-        ),
-        Cell(why="zero rows: returns before launching", spec=_old((), pages=2)),
     )
 
     note = """
@@ -169,7 +121,7 @@ class QsaPrefillCompress(OpWrapper):
         dim of `cos_sin` are read with an assumed unit stride while the
         callable checks only shape: each was measured accepted and wrong
         (max abs 4.72, 6.20, 0.80, 7.16). `is_valid` refuses them.
-    The callable rejects loudly: metadata shape/dtype mismatches, a non-int32
+    The callable rejects loudly (not pinned by a test): metadata shape/dtype mismatches, a non-int32
     or non-2-D table, more than one index head, a position plane with fewer
     than 3 axes or not int32, a non-bf16 cache, page sizes that disagree with
     `tokens_per_block`, a malformed cos|sin table, `4 R != D`, a non-2^k `D`
@@ -179,16 +131,32 @@ class QsaPrefillCompress(OpWrapper):
 
     `cos_sin`'s dtype is the rotation's precision: bf16 is accepted and was
     measured 1.4% of elements off by up to 1.56e-2 -- not certified. Text
-    rows reduce mRoPE to plain RoPE bit for bit. Plain `@triton.jit`, no
-    autotune; CUDA-graph capturable at a fixed row count.
+    rows reduce mRoPE to plain RoPE bit for bit (measured, not pinned by a
+    test). Plain `@triton.jit`, no
+    autotune; CUDA-graph capturable at a fixed row count (captured at 256
+    rows, 32 MTP7 verify blocks).
+
+    Under an NVFP4 KV pool both caches are strided views of one per-slot
+    allocation (each physical page holds the index roles, then the position
+    page); the trunk-plane cell checks the other index roles and the position
+    page untouched.
+
+    The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
+    reference's: every cell is bitwise the reference but the 32-block MTP7 one, where
+    1 of 8192 anchor elements rounds one bf16 step away.
 
     Hard limits (read from the kernel, not probed): positions, requests and
     page ids are widened to int64 before any address arithmetic, so no int32
-    boundary inside the call. Certified extent: positions to 8191 through a
-    [32, 260] table over 1024 pages.
+    boundary inside the call. Certified extent: positions to 1928 through a
+    [40, 260] table over 1100 pages.
 
     Not certified: `compress_ratio` other than 4, `D` other than 128, a bf16
-    or fp16 `cos_sin`, positions past the table's rows, multiple devices.
+    or fp16 `cos_sin`, positions past 1928 or the table's rows, mRoPE outside
+    the NVFP4 trunk-plane cell, the NVFP4 draft planes (one index role a page), multiple devices,
+    `tokens_per_block` other than 32 (no group straddles a page), eps other
+    than 1e-6, int32 positions or int64 request indices, a strided view of the
+    index cache, position plane or table other than the NVFP4 pool's shared
+    page, two rows naming one anchor in a launch, and `rows == 0`.
     """
 
     def __call__(

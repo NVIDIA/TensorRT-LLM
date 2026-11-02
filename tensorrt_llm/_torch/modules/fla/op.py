@@ -23,6 +23,19 @@ else:
 
 
 @triton.jit
+def gdc_wait_with_memory_clobber():
+    """griddepcontrol.wait with a memory clobber: the compiler cannot hoist dependent loads above the wait."""
+    tl.inline_asm_elementwise(
+        "griddepcontrol.wait; // dummy $0",
+        "=r,~{memory}",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def safe_exp(x):
     return exp(tl.where(x <= 0, x, float("-inf")))
 
