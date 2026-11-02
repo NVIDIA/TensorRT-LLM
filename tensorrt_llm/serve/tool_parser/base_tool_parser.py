@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+from xgrammar.structural_tag import StructuralTag
 
 from tensorrt_llm.logger import logger
 
@@ -78,6 +79,7 @@ class BaseToolParser(ABC):
     streaming_matches_whole_parse: bool = False
 
     def __init__(self):
+        self.grammar_constrained: bool = False
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
@@ -204,6 +206,11 @@ class BaseToolParser(ABC):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
+
+    def parse_partial(self, text: str,
+                      tools: List[Tool]) -> StreamingParseResult:
+        """Inspect unfinished output without updating the streaming state."""
+        return self.detect_and_parse(text, tools)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
         """Finalize a stream that ended before the format's closing markers.
@@ -428,6 +435,12 @@ class BaseToolParser(ABC):
         XTML call tags). Returns the xgrammar structural-tag format dict,
         or None to fall back to the `structure_info` path.
         """
+        return None
+
+    def build_required_structural_tag(
+            self, tools: List[Tool], *,
+            thinking: bool) -> Optional[StructuralTag]:
+        """Build a mandatory native tool-call format, or return None if unsupported."""
         return None
 
     @abstractmethod

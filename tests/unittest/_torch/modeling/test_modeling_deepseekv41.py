@@ -2372,6 +2372,8 @@ def test_empty_decoder_layer_participates_only_in_required_collectives(
         assert layer.forward_MoE.call_args.kwargs["hidden_states"].shape == (0, 64)
 
 
+# SM120 pads attention-DP inputs to the largest rank; this checks the unpadded path.
+@skip_blackwell_geforce
 def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
     from tensorrt_llm._torch.utils import EventType
@@ -3031,10 +3033,10 @@ def test_v41_attention_topology_has_no_per_head_query_norm() -> None:
 
 
 @requires_cuda
-def test_attention_uses_native_mxfp8_projections_only_on_sm100_and_sm103():
+def test_attention_uses_native_mxfp8_projections_only_on_sm100_sm103_and_sm120():
     model_config, _ = _tiny_v41_model_config()
     attention = DeepseekV41Attention(model_config, layer_idx=0)
-    native = torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    native = torch.cuda.get_device_capability() in ((10, 0), (10, 3), (12, 0))
     assert attention.projection_quantization == ("mxfp8" if native else "bf16")
     del attention
     torch.cuda.empty_cache()
@@ -3055,7 +3057,8 @@ def _mock_csa2_device(monkeypatch, capability, gemm_compiled, cuda_available=Tru
         ((9, 0), True, "bf16"),
         ((10, 0), True, "mxfp8"),
         ((10, 3), True, "mxfp8"),
-        ((12, 0), True, "bf16"),
+        ((12, 0), True, "mxfp8"),
+        ((12, 1), True, "bf16"),
         ((10, 0), False, "bf16"),
     ],
 )
@@ -3081,11 +3084,18 @@ def test_attention_projection_quantization_follows_device_capability(
     assert logged == [(v41.logger.INFO, (f"DeepSeek-V4.1 CSA2 attention projections: {expected}",))]
 
 
+SM_ERROR = (
+    "CSA2 native MXFP8 projections require SM100/SM103/SM120; "
+    "SM121 has no FP8 block-scale BMM for the output projection"
+)
+
+
 @pytest.mark.parametrize(
     ("cuda_available", "capability", "gemm_compiled", "error", "message"),
     [
-        (False, (10, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
-        (True, (9, 0), True, ValueError, "CSA2 native MXFP8 projections require SM100/SM103"),
+        (False, (10, 0), True, ValueError, SM_ERROR),
+        (True, (9, 0), True, ValueError, SM_ERROR),
+        (True, (12, 1), True, ValueError, SM_ERROR),
         (True, (10, 0), False, RuntimeError, "CSA2 native MXFP8 GEMM is not compiled"),
     ],
 )

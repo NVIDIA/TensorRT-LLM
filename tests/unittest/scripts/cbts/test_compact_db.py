@@ -19,8 +19,10 @@ import unittest
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
+from cbts.command.coverage.collection import pystart_report
 from cbts.command.coverage.collection.pystart_report import merge_to_sqlite
 from cbts.coverage.collection.compact_db import (
     merge_databases,
@@ -30,6 +32,32 @@ from cbts.coverage.collection.compact_db import (
 from cbts.coverage.selection.touch_db import TouchDB
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_report_counts_tainted_complete_tests_as_unsafe(tmp_path: Path) -> None:
+    """Taint and failed outcome each make a report row unsafe."""
+    leaf = tmp_path / "leaf.sqlite"
+    tests = ("test_safe", "test_tainted", "test_failed")
+    write_leaf_database(
+        leaf,
+        stage="stage",
+        process_uid="stage/coordinator",
+        touches={test: {("tensorrt_llm/x.py", "run")} for test in tests},
+        outcomes={test: "failed" if test == "test_failed" else "passed" for test in tests},
+        taints=[("stage/unidentified_worker", "test_tainted", "attribution", "unconfirmed")],
+    )
+    output = tmp_path / "merged.sqlite"
+    result = CliRunner().invoke(
+        pystart_report.main, ["--glob", str(leaf), "--out-sqlite", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 (test, stage) rows, 2 not safe to skip" in result.output
+    assert "or tainted" in result.output
+    with sqlite3.connect(output) as connection:
+        row = connection.execute(
+            "SELECT outcome, tainted FROM test_case_meta WHERE test = 'stage/test_tainted'"
+        ).fetchone()
+    assert row == ("passed", 1)
 
 
 def _rows(path: Path, query: str) -> list[tuple]:
@@ -60,7 +88,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={"stage/test_a.py::test_one": "passed"},
-                expected_workers={"stage/test_a.py::test_one": 0},
             )
             connection = sqlite3.connect(leaf)
             connection.execute("DROP VIEW test_case_meta")
@@ -84,7 +111,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={"stage/test_a.py::test_one": "passed"},
-                expected_workers={"stage/test_a.py::test_one": 0},
             )
             in_progress = root / ".cbtscov.stage.pid2.sqlite.tmp"
             sqlite3.connect(in_progress).close()
@@ -113,7 +139,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={"x86_64/test_a.py::test_one": "passed"},
-                expected_workers={"x86_64/test_a.py::test_one": 0},
             )
 
             validate_database(leaf)
@@ -127,10 +152,9 @@ class CompactDatabaseTest(unittest.TestCase):
             self.assertEqual(
                 _rows(
                     leaf,
-                    "SELECT test, stage, outcome, expected_workers, saved_procs "
-                    "FROM test_case_meta",
+                    "SELECT test, stage, outcome FROM test_case_meta",
                 ),
-                [("x86_64/test_a.py::test_one", "x86_64", "passed", 0, 1)],
+                [("x86_64/test_a.py::test_one", "x86_64", "passed")],
             )
 
     def test_hierarchical_merge_is_equivalent_and_idempotent(self):
@@ -155,7 +179,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={x86_test: "passed"},
-                expected_workers={x86_test: 1},
             )
             write_leaf_database(
                 x86_worker,
@@ -167,7 +190,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={},
-                expected_workers={},
             )
             write_leaf_database(
                 sbsa_coordinator,
@@ -180,7 +202,6 @@ class CompactDatabaseTest(unittest.TestCase):
                     }
                 },
                 outcomes={sbsa_test: "failed"},
-                expected_workers={sbsa_test: 0},
             )
 
             direct = root / "direct.sqlite"
@@ -198,10 +219,7 @@ class CompactDatabaseTest(unittest.TestCase):
                 "SELECT test, file, qualname, stage FROM touch_rows "
                 "ORDER BY test, file, qualname, stage"
             )
-            meta_query = (
-                "SELECT test, stage, outcome, expected_workers, saved_procs "
-                "FROM test_case_meta ORDER BY test, stage"
-            )
+            meta_query = "SELECT test, stage, outcome FROM test_case_meta ORDER BY test, stage"
             direct_touches = _rows(direct, touch_query)
             direct_metadata = _rows(direct, meta_query)
             for merged in (hierarchical, duplicated):
@@ -212,14 +230,14 @@ class CompactDatabaseTest(unittest.TestCase):
             self.assertEqual(
                 direct_metadata,
                 [
-                    (x86_test, x86_stage, "passed", 1, 2),
-                    (sbsa_test, sbsa_stage, "incomplete", 0, 1),
+                    (x86_test, x86_stage, "passed"),
+                    (sbsa_test, sbsa_stage, "incomplete"),
                 ],
             )
             self.assertEqual(_rows(duplicated, "SELECT COUNT(*) FROM process"), [(3,)])
 
             with TouchDB.open(duplicated) as database:
-                self.assertEqual(database.schema_version(), "4")
+                self.assertEqual(database.schema_version(), "5")
                 self.assertEqual(database.known_tests(), {x86_test, sbsa_test})
                 self.assertEqual(
                     database.known_by_stage(),
@@ -289,7 +307,6 @@ class TaintScopeTest(unittest.TestCase):
             process_uid="x86_64/writer",
             touches=self._TOUCHES,
             outcomes={test: "passed" for test in self._TOUCHES},
-            expected_workers={test: 0 for test in self._TOUCHES},
             taints=taints,
         )
         merge_databases([leaf], merged)
@@ -322,36 +339,6 @@ class TaintScopeTest(unittest.TestCase):
                 [("", 1), ("x86_64/alpha.py::test_one", 1), ("x86_64/beta.py::test_two", 1)],
             )
 
-    def test_a_tainted_process_is_not_counted_as_having_saved(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            leaf = os.path.join(temp_dir, "leaf.sqlite")
-            merged = os.path.join(temp_dir, "merged.sqlite")
-            write_leaf_database(
-                leaf,
-                stage="x86_64",
-                process_uid="x86_64/writer",
-                touches=self._TOUCHES,
-                outcomes={test: "passed" for test in self._TOUCHES},
-                expected_workers={test: 0 for test in self._TOUCHES},
-                taints=[
-                    (
-                        "x86_64/never_saved",
-                        "alpha.py::test_one",
-                        "incomplete",
-                        "unreachable_on_subscribe",
-                    )
-                ],
-            )
-            merge_databases([leaf], merged)
-            self.assertEqual(
-                _rows(
-                    merged,
-                    "SELECT saved_procs FROM test_case_meta "
-                    "WHERE test = 'x86_64/alpha.py::test_one'",
-                ),
-                [(1,)],
-            )
-
 
 class ProcessDiagnosticTest(unittest.TestCase):
     """Arbitrary {key: value} facts about a confirmed-dead subscriber, diagnostic only."""
@@ -370,7 +357,6 @@ class ProcessDiagnosticTest(unittest.TestCase):
                 process_uid="x86_64/coordinator",
                 touches=self._TOUCHES,
                 outcomes={test: "passed" for test in self._TOUCHES},
-                expected_workers={test: 0 for test in self._TOUCHES},
                 taints=[
                     (
                         "x86_64/dead_worker",
@@ -429,7 +415,6 @@ class ProcessDiagnosticTest(unittest.TestCase):
                 process_uid="x86_64/coordinator",
                 touches=self._TOUCHES,
                 outcomes={test: "passed" for test in self._TOUCHES},
-                expected_workers={test: 0 for test in self._TOUCHES},
                 taints=[
                     (
                         "x86_64/unknown_worker",
@@ -455,15 +440,14 @@ class ProcessDiagnosticTest(unittest.TestCase):
             leaf_b = os.path.join(temp_dir, "b.sqlite")
             merged = os.path.join(temp_dir, "merged.sqlite")
             # The outer pytest process (coordinator) is the one that learns of and records
-            # the dead worker's diagnostic -- it never saved its own leaf process_case row
-            # for it, matching how taints already record a process that is not the writer.
+            # the dead worker's diagnostic, matching how taints already record a process
+            # that is not the writer.
             write_leaf_database(
                 leaf_a,
                 stage="x86_64",
                 process_uid="x86_64/coordinator",
                 touches={},
                 outcomes={},
-                expected_workers={},
                 taints=[
                     (
                         "x86_64/dead_worker",
@@ -480,7 +464,6 @@ class ProcessDiagnosticTest(unittest.TestCase):
                 process_uid="x86_64/other_coordinator",
                 touches=self._TOUCHES,
                 outcomes={test: "passed" for test in self._TOUCHES},
-                expected_workers={test: 0 for test in self._TOUCHES},
             )
             merge_databases([leaf_a, leaf_b], merged)
             self.assertEqual(

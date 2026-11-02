@@ -30,6 +30,8 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              MoEAllReduceParams)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    discard_nccl_window_tensor_outputs
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -255,25 +257,28 @@ def run_allreduce_op(
 
     calc_func, ref_func = fusion_op_to_func[fusion_op]
 
-    # common allreduce path
-    xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
+    # This helper invokes NCCL-symmetric modules directly, so it owns their
+    # output windows until validation finishes.
+    with discard_nccl_window_tensor_outputs((x, residual)):
+        # common allreduce path
+        xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
 
-    # trigger autotune
-    with autotune():
-        tuning_output = calc_func(xs[tensor_parallel_rank], residual)
+        # trigger autotune
+        with autotune():
+            tuning_output = calc_func(xs[tensor_parallel_rank], residual)
 
-    native_output = calc_func(xs[tensor_parallel_rank], residual)
-    ref_output = ref_func(xs[tensor_parallel_rank], residual)
+        native_output = calc_func(xs[tensor_parallel_rank], residual)
+        ref_output = ref_func(xs[tensor_parallel_rank], residual)
 
-    for calc_output in (tuning_output, native_output):
-        assert len(calc_output) == len(ref_output)
-        for calc_output_tensor, ref_output_tensor in zip(
-                calc_output, ref_output):
-            check_accuracy(calc_output_tensor,
-                           ref_output_tensor,
-                           atol=0.05,
-                           rtol=0.15,
-                           percent=0.99)
+        for calc_output in (tuning_output, native_output):
+            assert len(calc_output) == len(ref_output)
+            for calc_output_tensor, ref_output_tensor in zip(
+                    calc_output, ref_output):
+                check_accuracy(calc_output_tensor,
+                               ref_output_tensor,
+                               atol=0.05,
+                               rtol=0.15,
+                               percent=0.99)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
@@ -925,6 +930,43 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
         *zip(*[(tensor_parallel_size, run_minimax_allreduce_rms_qk_op, q_input,
                 k_input, rms_weights_q, rms_weights_k, eps,
                 non_contiguous_input)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_nccl_symmetric_unregistered_input(tensor_parallel_size: int,
+                                          num_tokens: int, hidden_size: int,
+                                          num_calls: int) -> bool:
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.NCCL_SYMMETRIC).cuda()
+    for call in range(num_calls):
+        gen = torch.Generator(device="cuda").manual_seed(call)
+        shards = torch.randn((tensor_parallel_size, num_tokens, hidden_size),
+                             generator=gen,
+                             device="cuda").to(torch.bfloat16)
+        # A plain allocation: below the registration threshold it stays outside the NCCL window.
+        out = allreduce(shards[rank].clone())
+        ref = shards.float().sum(dim=0)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=0.125)
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="Requires at least 4 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_nccl_symmetric_unregistered_small_input(mpi_pool_executor):
+    """NCCL_SYMMETRIC on a small input outside the NCCL window returns the plain sum on every call."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_nccl_symmetric_unregistered_input,
+        *zip(*[(tensor_parallel_size, 7, 4096, 300)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True

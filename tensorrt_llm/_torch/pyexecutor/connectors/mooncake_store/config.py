@@ -31,8 +31,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from tensorrt_llm.logger import logger
-
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
 
@@ -289,21 +287,12 @@ class MooncakeStoreConnectorConfig:
     #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
-    #: pools with Mooncake. The only transfer path supported today, so a False
-    #: here is raised back to True.
-    stage_through_host: bool = True
+    #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
+    #: RDMA, which registering device memory requires.
+    stage_through_host: bool = False
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
-        if not self.stage_through_host:
-            if self.role.transfers:
-                logger.warning(
-                    "mooncake-store: ignoring stage_through_host=False. Pages "
-                    "pass through pinned host memory; registering the KV pools "
-                    "takes one registration per pool mapping, which this "
-                    "connector does not do yet."
-                )
-            object.__setattr__(self, "stage_through_host", True)
         if not self.master_server_address:
             raise ValueError("master_server_address is required")
         if self.local_buffer_size <= 0:
@@ -346,7 +335,7 @@ class MooncakeStoreConnectorConfig:
             namespace=str(raw.get("namespace", DEFAULT_NAMESPACE)),
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
-            stage_through_host=bool(raw.get("stage_through_host", True)),
+            stage_through_host=bool(raw.get("stage_through_host", False)),
         )
 
     @staticmethod

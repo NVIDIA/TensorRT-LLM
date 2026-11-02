@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "RoutingCustomPolicy.cuh"
+#include "RoutingCustomSelection.h"
 #include "RoutingKernel.cuh"
 #include "RoutingKernel.h"
 #include <tensorrt_llm/common/cudaUtils.h>
@@ -111,7 +112,8 @@ void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void
     }
     else
     {
-        bool const canUseCoop = (smMajor >= 9) && (data.mNumExperts <= 1024) && (data.mPtrPermutedIdxSize != nullptr);
+        bool const canUseCoop = !routingCustom::coopLaunchDisabled() && (smMajor >= 9) && (data.mNumExperts <= 1024)
+            && (data.mPtrPermutedIdxSize != nullptr);
         bool useCoop = false;
         int numBlocksCoop = 0;
 

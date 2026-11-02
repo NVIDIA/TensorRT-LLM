@@ -61,7 +61,9 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
+from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
+    ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     Router,
@@ -222,7 +224,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def select(
         self, role: str, routing_key, req_id, exclude_server: Optional[str]
-    ) -> Tuple[str, dict, Optional[str]]:
+    ) -> Tuple[Optional[str], dict, Optional[str]]:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
@@ -235,15 +237,22 @@ class DisaggCoordinatorService(DisaggCoordinator):
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
             )
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, router)
-            )
+            # A router that placed nothing asks for more routing input; the
+            # worker repeats the select with it, so nothing is reserved.
+            if server is not None:
+                self._reservation_tasks[reservation_key] = asyncio.create_task(
+                    self._expire_reservation(reservation_key, router)
+                )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
         return server, self._compact_route_info(info), request_id
 
     @staticmethod
     def _compact_route_info(info: dict) -> dict:
-        compact = {key: info[key] for key in ("match_length", "num_tokens") if key in info}
+        compact = {
+            key: info[key]
+            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED)
+            if key in info
+        }
         disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
         if disaggregated_params is not None:
             compact["server_info"] = {"disaggregated_params": disaggregated_params}
@@ -378,6 +387,15 @@ class DisaggCoordinatorService(DisaggCoordinator):
                     routing_key_configs[role] = config
         if routing_key_configs:
             info["routing_key_configs"] = routing_key_configs
+        # Frontends never fetch /server_info, so they cannot check that a worker renders like
+        # their own router; they use the fingerprints this coordinator already fetched.
+        info["render_fingerprints"] = {
+            role: {
+                server: fingerprint_summary(server_info.get("render_fingerprint"))
+                for server, server_info in (getattr(router, "_server_info", None) or {}).items()
+            }
+            for role, router in (("context", self._ctx_router), ("generation", self._gen_router))
+        }
         if self._disagg_cluster_manager:
             info.update(await self._disagg_cluster_manager.cluster_info())
         return info
@@ -646,6 +664,17 @@ class CoordinatorClient(DisaggCoordinator):
         self._is_ready = info.get("is_ready", False)
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
+        self._sync_render_fingerprints(info)
+
+    def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
+        published = info.get("render_fingerprints")
+        if published is None:
+            return
+        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+            local = getattr(router, "_local", None)
+            setter = getattr(local, "set_published_render_fingerprints", None)
+            if setter is not None:
+                setter(published.get(role, {}))
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})

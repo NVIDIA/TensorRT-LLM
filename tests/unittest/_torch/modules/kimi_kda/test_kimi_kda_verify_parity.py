@@ -25,6 +25,7 @@ pytest.importorskip("fla")
 
 from kimi_kda_test_utils import get_production_decode_kernel_path
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -129,10 +130,12 @@ def test_forward_uses_metadata_aligned_generation_state_indices(
         use_kda_replay_update = True
 
         def __init__(self) -> None:
-            self.state_indices = torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+            self._state_indices_buffer = DeviceCopyBuffer(
+                torch.tensor([9, 4], dtype=torch.int32, device="cuda")
+            )
 
         def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
-            return self.state_indices[: len(request_ids)]
+            return self._state_indices_buffer.tensor[: len(request_ids)]
 
         def mamba_layer_cache(self, layer_idx: int) -> SimpleNamespace:
             return layer_cache

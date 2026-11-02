@@ -25,8 +25,9 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -325,7 +326,6 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
     """The receiver resolves the task using its own slice id."""
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 1
-    session._receiver._bounce.is_bounced.return_value = False
 
     session.process_kv_agent_result(
         peer_rank=0,
@@ -486,7 +486,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=2, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock()
+    transceiver._kv_cache_manager = MagicMock(enable_block_reuse=False)
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -495,42 +495,21 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
-def test_pipelined_transfer_rejects_bounce_buffer():
-    """The Python bounce buffer stages whole requests rather than individual chunks."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+def test_pipelined_transfer_allows_bounce_buffer():
+    """The transfer-agent bounce buffer is compatible with per-chunk pipelined transfer.
 
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock()
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL",
-        enable_pipelined_transfer=True,
-        kv_cache_bounce_size_mb=1,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="not supported with the Python bounce buffer \\(kv_cache_bounce_size_mb=1",
-    ):
-        KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
-
-
-def test_pipelined_transfer_allows_agent_bounce_buffer():
-    """The C++ transfer-agent bounce is compatible with per-chunk pipelined transfer.
-
-    It stages each transfer request on its own below the Python layer, so a pipelined
-    chunk is just another request.
+    The C++ agent stages each transfer request on its own below the Python layer, so a
+    pipelined chunk is just another request.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock()
+    transceiver._kv_cache_manager = MagicMock(enable_block_reuse=False)
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
         kv_cache_bounce_size_mb=1,
-        agent_bounce_buffer_enable=True,
     )
 
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
@@ -539,11 +518,15 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
 def test_pipelined_transfer_rejects_mamba_cache_manager():
     """Pipelined transfer does not support recurrent-state cache managers."""
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        MambaHybridCacheManagerV2,
+    )
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock(spec=MambaHybridCacheManager)
+    transceiver._kv_cache_manager = MagicMock(
+        spec=MambaHybridCacheManagerV2, enable_block_reuse=False
+    )
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -587,7 +570,7 @@ def test_pipelined_transfer_rejects_context_parallelism():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=2)
-    transceiver._kv_cache_manager = MagicMock()
+    transceiver._kv_cache_manager = MagicMock(enable_block_reuse=False)
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,

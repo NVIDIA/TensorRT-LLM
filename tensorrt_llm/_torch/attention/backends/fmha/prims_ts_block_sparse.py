@@ -16,7 +16,7 @@
 """TRT-LLM FMHA adapter for the vendored PrimTS block-sparse kernels."""
 
 import math
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
@@ -28,6 +28,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.prims_ts._block_sparse.config import (
     _validate_block_sparse_static_profile,
+)
+from tensorrt_llm._torch.attention.backends.prims_ts.sage import (
+    SageAttentionConfig,
+    SageAttentionParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import BlockSparseForwardInputs
 from tensorrt_llm.logger import logger
@@ -79,14 +83,20 @@ class _BlockSparsePlanKey:
     page_size: int | None
     q_block_size: int
     kv_block_size: int
-    max_blocks_per_row: int
+    max_blocks_per_row: int | None
     mask_type: Literal["dense", "causal"]
     dtype: torch.dtype
+    qk_dtype: torch.dtype
+    v_dtype: torch.dtype
     use_kv_valid_bits: bool
     sparse_format: Literal["bsr", "bitmask"]
     use_proxy_routes: bool
+    sage: SageAttentionConfig | None
+    use_block_sparse: bool = True
 
     def unsupported_reason(self) -> str | None:
+        # A dense plan has no route capacity.
+        capacity = {"max_blocks_per_row": self.max_blocks_per_row} if self.use_block_sparse else {}
         try:
             _validate_block_sparse_static_profile(
                 batch_size=self.batch_size,
@@ -99,11 +109,14 @@ class _BlockSparsePlanKey:
                 kv_block_size=self.kv_block_size,
                 use_kv_valid_bits=self.use_kv_valid_bits,
                 mask_type=self.mask_type,
-                q_dtype=self.dtype,
-                kv_dtype=self.dtype,
+                q_dtype=self.qk_dtype,
+                kv_dtype=self.qk_dtype,
+                v_dtype=self.v_dtype,
                 output_dtype=self.dtype,
-                max_blocks_per_row=self.max_blocks_per_row,
                 page_size=self.page_size,
+                sage=self.sage,
+                use_block_sparse=self.use_block_sparse,
+                **capacity,
             )
         except (ValueError, NotImplementedError, OverflowError) as error:
             return str(error)
@@ -129,16 +142,20 @@ class _BlockSparsePlanKey:
             "max_blocks_per_row": self.max_blocks_per_row,
             "use_kv_valid_bits": self.use_kv_valid_bits,
             "mask_type": self.mask_type,
-            "q_data_type": self.dtype,
-            "kv_data_type": self.dtype,
+            "q_data_type": self.qk_dtype,
             "o_data_type": self.dtype,
         }
         if paged:
             plan_args += (self.page_size,)
+            plan_kwargs.update(kv_data_type=self.qk_dtype)
         else:
             plan_kwargs.update(
+                use_block_sparse=self.use_block_sparse,
                 sparse_format=self.sparse_format,
                 use_proxy_routes=self.use_proxy_routes,
+                k_data_type=self.qk_dtype,
+                v_data_type=self.v_dtype,
+                sage_config=self.sage,
             )
         wrapper.plan(*plan_args, **plan_kwargs)
         return wrapper
@@ -162,7 +179,12 @@ def _has_other_sparse_runtime(forward_args: AttentionForwardArgs) -> bool:
     return False
 
 
-def _route_batch_size(inputs: BlockSparseForwardInputs) -> int:
+def _contiguous_batch_size(
+    inputs: BlockSparseForwardInputs | None, metadata: "TrtllmAttentionMetadata"
+) -> int:
+    """Return the route batch of block-sparse inputs, or the context batch of a dense call."""
+    if inputs is None:
+        return int(metadata.num_contexts)
     routes = inputs.block_indptr if inputs.sparse_format == "bsr" else inputs.exact_block_bits
     return int(routes.shape[0])
 
@@ -184,8 +206,29 @@ def _uniform_seq_len_q(
     return seq_len_q
 
 
+def _sage_recipe(
+    forward_args: AttentionForwardArgs,
+) -> tuple[SageAttentionConfig, torch.dtype] | None:
+    """Return the forward's SageAttention plan config and quantized Q/K dtype, if any."""
+    qk_dtype = forward_args.sage_attn_qk_dtype
+    if qk_dtype is None:
+        return None
+    # Every proxy K summary is quantized with its own scale.
+    config = SageAttentionConfig(
+        q_block_size=forward_args.sage_attn_num_elts_per_blk_q,
+        k_block_size=forward_args.sage_attn_num_elts_per_blk_k,
+        v_mean=forward_args.sage_attn_smooth_v,
+        k_summary_block_size=1,
+    )
+    return config, qk_dtype
+
+
 class PrimsTSBlockSparseFmha(PrimsTSFmha):
-    """Contiguous context and fixed-Q paged generation block-sparse FMHA."""
+    """Contiguous context and fixed-Q paged generation block-sparse FMHA.
+
+    Contiguous dense calls whose SageAttention inputs the attention core quantized also run
+    here, on a dense plan.
+    """
 
     PLAN_CACHE_KEY = "prims_ts_block_sparse"
 
@@ -245,7 +288,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         forward_args: AttentionForwardArgs,
     ) -> str | None:
         """Gates shared by the contiguous and paged block-sparse paths."""
-        if _get_block_sparse_inputs(forward_args) is None:
+        if _get_block_sparse_inputs(forward_args) is None and forward_args.sage_quantized is None:
             return "block-sparse forward inputs are required"
         if metadata.is_cross:
             return "cross attention is not supported"
@@ -274,17 +317,29 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     def _make_plan_key(
         self,
         q: torch.Tensor,
-        inputs: BlockSparseForwardInputs,
+        inputs: BlockSparseForwardInputs | None,
         *,
         batch_size: int,
         seq_len_q: int,
         kv_capacity: int,
         page_size: int | None,
         mask_type: Literal["dense", "causal"],
+        sage: tuple[SageAttentionConfig, torch.dtype] | None = None,
     ) -> _BlockSparsePlanKey:
-        max_blocks_per_row = inputs.max_blocks_per_row
-        if max_blocks_per_row is None:
-            max_blocks_per_row = math.ceil(kv_capacity / inputs.kv_block_size)
+        if inputs is None:
+            # Dense plans use 128-token blocks, which select the Q128/KV128 Sage profile, faster
+            # for dense attention than Q64/KV256.
+            q_block_size, kv_block_size = 128, 128
+            max_blocks_per_row = None
+        else:
+            q_block_size, kv_block_size = inputs.q_block_size, inputs.kv_block_size
+            max_blocks_per_row = inputs.max_blocks_per_row
+            if max_blocks_per_row is None:
+                max_blocks_per_row = math.ceil(kv_capacity / kv_block_size)
+        sage_config, qk_dtype, v_dtype = None, q.dtype, q.dtype
+        if sage is not None:
+            sage_config, qk_dtype = sage
+            v_dtype = torch.float8_e4m3fn
         return _BlockSparsePlanKey(
             device=q.device,
             batch_size=batch_size,
@@ -294,14 +349,18 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             num_kv_heads=self.attn.num_kv_heads,
             head_dim=self.attn.head_dim,
             page_size=page_size,
-            q_block_size=inputs.q_block_size,
-            kv_block_size=inputs.kv_block_size,
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
             max_blocks_per_row=max_blocks_per_row,
             mask_type=mask_type,
             dtype=q.dtype,
-            use_kv_valid_bits=inputs.kv_valid_bits is not None,
-            sparse_format=inputs.sparse_format,
-            use_proxy_routes=inputs.use_proxy_routes,
+            qk_dtype=qk_dtype,
+            v_dtype=v_dtype,
+            use_kv_valid_bits=inputs is not None and inputs.kv_valid_bits is not None,
+            sparse_format="bsr" if inputs is None else inputs.sparse_format,
+            use_proxy_routes=inputs is not None and inputs.use_proxy_routes,
+            sage=sage_config,
+            use_block_sparse=inputs is not None,
         )
 
     def _get_or_plan_wrapper(
@@ -332,19 +391,20 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
     ) -> str | None:
         if forward_args.is_fused_qkv or k is None or v is None:
             return "contiguous block-sparse attention requires separate Q, K, and V"
+        if forward_args.sage_attn_qk_dtype is not None and forward_args.sage_quantized is None:
+            return "SageAttention requires inputs quantized by the attention core"
         if self.attn.position_embedding_type != 0 or forward_args.mrope_position_deltas is not None:
             return "contiguous Q/K/V must have position embedding applied before attention"
         if forward_args.cu_q_seqlens is not None or forward_args.cu_kv_seqlens is not None:
             return "packed variable-length Q/KV inputs are not supported"
         inputs = _get_block_sparse_inputs(forward_args)
-        assert inputs is not None
         mask_type = self._get_prims_mask_type(forward_args)
-        if inputs.use_proxy_routes and mask_type != "dense":
+        if inputs is not None and inputs.use_proxy_routes and mask_type != "dense":
             return "block-sparse proxy routes require mask_type='dense'"
-        batch_size = _route_batch_size(inputs)
+        batch_size = _contiguous_batch_size(inputs, metadata)
         seq_len_q = _uniform_seq_len_q(q, metadata, batch_size)
         if seq_len_q is None or k.shape[0] % batch_size:
-            return "query and KV token counts must be batch-uniform over the route batch size"
+            return "query and KV token counts must be batch-uniform over the batch size"
         key = self._make_plan_key(
             q,
             inputs,
@@ -353,6 +413,7 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             kv_capacity=int(k.shape[0]) // batch_size,
             page_size=None,
             mask_type=mask_type,
+            sage=_sage_recipe(forward_args),
         )
         return key.unsupported_reason()
 
@@ -366,6 +427,8 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         assert inputs is not None
         if inputs.sparse_format != "bsr" or inputs.use_proxy_routes:
             return "paged block-sparse attention only supports BSR exact routes"
+        if forward_args.sage_attn_qk_dtype is not None:
+            return "paged block-sparse attention does not support SageAttention"
         if not forward_args.is_fused_qkv:
             return "paged block-sparse attention requires fused QKV input"
         if (
@@ -521,9 +584,8 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         inputs = _get_block_sparse_inputs(forward_args)
-        assert inputs is not None
         assert forward_args.output is not None
-        batch_size = _route_batch_size(inputs)
+        batch_size = _contiguous_batch_size(inputs, metadata)
         query = q.view(batch_size, -1, self.attn.num_heads, self.attn.head_dim)
         key_states = k.view(batch_size, -1, self.attn.num_kv_heads, self.attn.head_dim)
         value_states = v.view_as(key_states)
@@ -535,22 +597,51 @@ class PrimsTSBlockSparseFmha(PrimsTSFmha):
             kv_capacity=int(key_states.shape[1]),
             page_size=None,
             mask_type=self._get_prims_mask_type(forward_args),
+            sage=_sage_recipe(forward_args),
         )
         wrapper = cast("BlockSparseTSWrapper", self._get_or_plan_wrapper(key, metadata))
+        sage_params = None
+        if key.sage is not None:
+            quantized = forward_args.sage_quantized
+            assert quantized is not None, "Sage inputs are quantized before the FMHA forward"
+            query = quantized.q.view_as(query)
+            key_states = quantized.k.view_as(key_states)
+            value_states = quantized.v.view_as(value_states)
+            if inputs is not None and inputs.use_proxy_routes:
+                inputs = replace(
+                    inputs, k_summary=quantized.k_summary, v_summary=quantized.v_summary
+                )
+            sage_params = SageAttentionParams(
+                q_scale=quantized.q_scale,
+                k_scale=quantized.k_scale,
+                v_scale=quantized.v_scale,
+                k_summary_scale=quantized.k_summary_scale,
+                v_mean=quantized.v_mean,
+            )
+        # A dense plan takes no routes.
+        routes = {}
+        if inputs is not None:
+            routes = {
+                "block_indptr": inputs.block_indptr,
+                "block_indices": inputs.block_indices,
+                "exact_block_bits": inputs.exact_block_bits,
+                "k_summary": inputs.k_summary,
+                "v_summary": inputs.v_summary,
+                "kv_valid_bits": inputs.kv_valid_bits,
+            }
         wrapper.run(
             query,
             key_states,
             value_states,
-            block_indptr=inputs.block_indptr,
-            block_indices=inputs.block_indices,
-            exact_block_bits=inputs.exact_block_bits,
-            k_summary=inputs.k_summary,
-            v_summary=inputs.v_summary,
-            kv_valid_bits=inputs.kv_valid_bits,
             sm_scale=self._get_bmm1_scale(self.attn),
             out=forward_args.output.view_as(query),
+            sage=sage_params,
+            **routes,
         )
 
+    # Planning records an external CUDA event that Dynamo cannot construct, so
+    # compiled callers run the PrimTS call eagerly between graph segments.
+    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
