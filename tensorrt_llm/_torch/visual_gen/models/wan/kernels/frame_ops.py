@@ -1,20 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""WinoVae frame operations in CuTe DSL (bf16, batch-1 channels-last frames ``[T, P, C]``).
-
-``avg_down_add``: ``y = x (+ bias) + AvgDown3D(r)``, the residual down block's shortcut add.
-AvgDown3D groups the ``cin * factor`` values of an output pixel's window (input channel
-slowest, then the temporal tap, then the two spatial taps; ``factor = factor_t * factor_s^2``)
-into ``cout`` groups of ``group_size`` consecutive values and takes each group's mean. When a
-group lies inside one input channel's window (``factor % group_size == 0``, every Wan
-configuration), a thread owns one output pixel and 8 input channels: it reads each window tap
-as one 16-byte vector (the residual is read exactly once) and produces the ``8 * factor /
-group_size`` output channels those inputs feed.
-
-Numerics, per output channel: the group's values summed in fp32 in window order (temporal pad
-taps add nothing), the mean ``sum * (1 / group_size)`` rounded to bf16, then ``x + bias`` in
-fp32 plus the mean, rounded once.
-"""
+"""WinoVae frame operations in CuTe DSL on batch-1 channels-last bf16 frames ``[T, P, C]``: the
+down block's AvgDown3D shortcut add (:func:`avg_down_add`), the temporal upsample's frame
+interleave with its bias (:func:`interleave_bias`) and the decoder output's unpatchify and
+clamp (:func:`unpatchify_clamp_into`)."""
 
 from __future__ import annotations
 
@@ -28,19 +17,55 @@ from cutlass import BFloat16, Float32, Int32
 
 from .common import (
     CHANNELS_PER_VECTOR,
+    THREADS,
     compile_cached,
+    current_stream,
+    flat_1d,
+    flat_view,
+    grid_1d,
+    linear_thread_index,
     load_words,
     pack2,
+    pack_words,
+    round_pair_bf16,
     store_words,
     u32_view,
     unpack_bf16,
     vec_view,
 )
 
-THREADS = 256
+
+def _check_aligned(align: int, **tensors: torch.Tensor | None) -> None:
+    """Reject tensors whose data does not start on an ``align``-byte boundary."""
+    for name, t in tensors.items():
+        if t is not None and t.data_ptr() % align:
+            raise ValueError(f"{name} must be {align}-byte aligned")
+
+
+def _check_bias(bias: torch.Tensor | None, values: int, what: str) -> None:
+    """A bias is a contiguous 1-D bf16 tensor of ``values`` elements."""
+    if bias is not None and (
+        bias.dtype != torch.bfloat16 or tuple(bias.shape) != (values,) or not bias.is_contiguous()
+    ):
+        raise ValueError(f"bias must be a contiguous bf16 [{what}] tensor")
 
 
 class AvgDownAddKernel:
+    """``y = x (+ bias) + AvgDown3D(r)``, the residual down block's shortcut add.
+
+    AvgDown3D groups the ``cin * factor`` values of an output pixel's window (input channel
+    slowest, then the temporal tap, then the two spatial taps; ``factor = factor_t * factor_s^2``)
+    into ``cout`` groups of ``group_size`` consecutive values and takes each group's mean. The
+    kernel requires ``factor % group_size == 0``, so every group lies inside one input
+    channel's window. A thread owns one output pixel and 8 input channels: it reads each window
+    tap as one 16-byte vector (the residual is read exactly once) and produces the ``8 * factor
+    / group_size`` output channels those inputs feed.
+
+    Numerics, per output channel: the group's values summed in fp32 in window order (temporal
+    pad taps add nothing), the mean ``sum * (1 / group_size)`` rounded to bf16, then ``x +
+    bias`` in fp32 plus the mean, rounded once.
+    """
+
     def __init__(
         self, cin: int, cout: int, factor_t: int, factor_s: int, group_size: int, has_bias: bool
     ) -> None:
@@ -69,9 +94,7 @@ class AvgDownAddKernel:
     ):
         self.kernel(
             x_ptr, r_ptr, bias_ptr, y_ptr, out_positions, out_width, in_width, in_rows, pad_t, items
-        ).launch(
-            grid=[(items + THREADS - 1) // THREADS, 1, 1], block=[THREADS, 1, 1], stream=stream
-        )
+        ).launch(grid=grid_1d(items), block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -87,69 +110,86 @@ class AvgDownAddKernel:
         pad_t: Int32,
         items: Int32,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
-        idx = Int32(bid) * THREADS + Int32(tid)
+        idx = linear_thread_index()
         if idx < items:
-            ux = u32_view(x_ptr)
-            ub = u32_view(bias_ptr)
-            uy = u32_view(y_ptr)
-            gr = vec_view(r_ptr)
-            fs, ft = self.factor_s, self.factor_t
-            cv = idx % self.cvec
+            x_words = u32_view(x_ptr)
+            bias_words = u32_view(bias_ptr)
+            y_words = u32_view(y_ptr)
+            residual_vecs = vec_view(r_ptr)
+            in_vec = idx % self.cvec
             pix = idx // self.cvec
             t_out = pix // out_positions
-            sp = pix - t_out * out_positions
-            i_out = sp // out_width
-            j_out = sp - i_out * out_width
+            position = pix - t_out * out_positions
+            i_out = position // out_width
+            j_out = position - i_out * out_width
+            taps = self._load_window_taps(
+                residual_vecs, in_vec, t_out, i_out, j_out, in_width, in_rows, pad_t
+            )
 
-            # The window taps in window order (temporal, then the two spatial), 8 channels each.
-            taps = []
-            for a in cutlass.range_constexpr(ft):
-                t_in = t_out * ft + a - pad_t
-                for b in cutlass.range_constexpr(fs):
-                    for d in cutlass.range_constexpr(fs):
-                        row = (t_in * in_rows + i_out * fs + b) * in_width + j_out * fs + d
-                        buf = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), BFloat16)
-                        if t_in >= 0:
-                            buf.store(gr[(None, cutlass.Int64(row) * self.cvec + cv)].load())
-                        else:
-                            buf.store(cute.full((CHANNELS_PER_VECTOR,), 0.0, Float32).to(BFloat16))
-                        taps.append(buf.load().to(Float32))
-
-            inv = Float32(1.0 / self.group_size)
+            inv_group = Float32(1.0 / self.group_size)
             for w in cutlass.range_constexpr(self.per_input):
-                ov = (
+                out_vec = (
                     cutlass.Int64(pix) * (self.cout // CHANNELS_PER_VECTOR)
-                    + cv * self.per_input
+                    + in_vec * self.per_input
                     + w
                 )
-                xs = unpack_bf16(load_words(ux, ov))
+                xs = unpack_bf16(load_words(x_words, out_vec))
                 bs = None
                 if cutlass.const_expr(self.has_bias):
-                    bs = unpack_bf16(load_words(ub, cv * self.per_input + w))
-                means = []
-                for k in cutlass.range_constexpr(CHANNELS_PER_VECTOR):
-                    o = (
-                        w * CHANNELS_PER_VECTOR + k
-                    )  # output channel, counted from this thread's first one
-                    e, q = o // self.per_input, o % self.per_input
-                    acc = Float32(0.0)
-                    for g in cutlass.range_constexpr(self.group_size):
-                        acc = acc + taps[q * self.group_size + g][e]
-                    means.append(acc * inv)
-                words = []
-                for i in cutlass.range_constexpr(CHANNELS_PER_VECTOR // 2):
-                    mw = pack2(means[2 * i], means[2 * i + 1])
-                    rounded = unpack_bf16([mw])
-                    s = []
-                    for h in cutlass.range_constexpr(2):
-                        xb = xs[2 * i + h]
-                        if cutlass.const_expr(self.has_bias):
-                            xb = xb + bs[2 * i + h]
-                        s.append(xb + rounded[h])
-                    words.append(pack2(s[0], s[1]))
-                store_words(uy, ov, words)
+                    bs = unpack_bf16(load_words(bias_words, in_vec * self.per_input + w))
+                means = self._group_means(taps, w, inv_group)
+                store_words(y_words, out_vec, self._add_means(xs, bs, means))
+
+    @cute.jit
+    def _load_window_taps(
+        self, residual_vecs, in_vec, t_out, i_out, j_out, in_width, in_rows, pad_t
+    ) -> list:
+        """The window taps of the thread's 8 input channels in window order (temporal, then the
+        two spatial), as fp32 vectors; temporal pad taps are zero."""
+        fs, ft = self.factor_s, self.factor_t
+        taps = []
+        for a in cutlass.range_constexpr(ft):
+            t_in = t_out * ft + a - pad_t
+            for b in cutlass.range_constexpr(fs):
+                for d in cutlass.range_constexpr(fs):
+                    row = (t_in * in_rows + i_out * fs + b) * in_width + j_out * fs + d
+                    buf = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), BFloat16)
+                    if t_in >= 0:
+                        buf.store(
+                            residual_vecs[(None, cutlass.Int64(row) * self.cvec + in_vec)].load()
+                        )
+                    else:
+                        buf.fill(0.0)
+                    taps.append(buf.load().to(Float32))
+        return taps
+
+    def _group_means(self, taps: list, w: int, inv_group: Float32) -> list:
+        """The means of the 8 output channels of the thread's output vector ``w``."""
+        means = []
+        for k in range(CHANNELS_PER_VECTOR):
+            # Output channel o, counted from the thread's first one, is group tap_group of the
+            # window of input channel lane.
+            o = w * CHANNELS_PER_VECTOR + k
+            lane, tap_group = o // self.per_input, o % self.per_input
+            acc = Float32(0.0)
+            for g in range(self.group_size):
+                acc = acc + taps[tap_group * self.group_size + g][lane]
+            means.append(acc * inv_group)
+        return means
+
+    def _add_means(self, xs: list, bs: list | None, means: list) -> list:
+        """``x (+ bias) + mean`` per channel, the mean rounded to bf16 first, as packed words."""
+        words = []
+        for i in range(CHANNELS_PER_VECTOR // 2):
+            _, mean_lo, mean_hi = round_pair_bf16(means[2 * i], means[2 * i + 1])
+            sums = []
+            for h, mean in enumerate((mean_lo, mean_hi)):
+                value = xs[2 * i + h]
+                if self.has_bias:
+                    value = value + bs[2 * i + h]
+                sums.append(value + mean)
+            words.append(pack2(sums[0], sums[1]))
+        return words
 
 
 @functools.lru_cache(maxsize=None)
@@ -162,9 +202,12 @@ def _avg_down_add_kernel(
 
     def compile_fn():
         ptrs = [make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16) for _ in range(4)]
-        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         return cute.compile(
-            kernel.wrapper, *ptrs, *([Int32(1)] * 6), stream, options="--enable-tvm-ffi"
+            kernel.wrapper,
+            *ptrs,
+            *([Int32(1)] * 6),
+            current_stream(device),
+            options="--enable-tvm-ffi",
         )
 
     name = f"avg_down_add[{cin},{cout},{factor_t},{factor_s},{group_size},{int(bias)}]"
@@ -184,18 +227,25 @@ def avg_down_add(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``
-    contiguous bf16, ``pad_t`` zero frames in front of ``r``; ``bias`` (``Cout`` values) is the
-    downsample conv's bias when that conv ran without it. Returns ``y`` like ``x``."""
-    for name, t in (("x", x), ("r", r), ("bias", bias)):
-        if t is not None and (t.dtype != torch.bfloat16 or not t.is_contiguous()):
+    contiguous 16-byte aligned bf16 with ``P == out_height * factor_s * in_width``, ``pad_t``
+    zero frames in front of ``r``; ``bias`` (contiguous ``[Cout]`` bf16) is the downsample
+    conv's bias when that conv ran without it. ``group_size`` must divide ``factor_t *
+    factor_s^2``. Returns ``y`` like ``x``."""
+    for name, t in (("x", x), ("r", r)):
+        if t.dtype != torch.bfloat16 or not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous bf16")
     if x.dim() != 3 or r.dim() != 3:
         raise ValueError("x and r must be [T, P, C] frames")
     out_frames, out_positions, cout = x.shape
-    in_frames, _, cin = r.shape
+    in_frames, in_positions, cin = r.shape
     factor = factor_t * factor_s * factor_s
     if out_positions != out_height * out_width:
         raise ValueError("x positions must equal out_height * out_width")
+    if in_positions != out_height * factor_s * in_width or in_width < out_width * factor_s:
+        raise ValueError(
+            "r positions must equal out_height * factor_s * in_width, with in_width at least "
+            "out_width * factor_s"
+        )
     if in_frames + pad_t != out_frames * factor_t:
         raise ValueError("frame counts do not match the temporal factor")
     if (
@@ -208,8 +258,8 @@ def avg_down_add(
             "avg_down_add needs cin * factor == cout * group_size, group_size dividing factor "
             "and channel counts that are multiples of 8"
         )
-    if bias is not None and bias.numel() != cout:
-        raise ValueError("bias must have cout values")
+    _check_bias(bias, cout, "Cout")
+    _check_aligned(16, x=x, r=r, bias=bias)
     y = torch.empty_like(x)
     items = out_frames * out_positions * (cin // CHANNELS_PER_VECTOR)
     if items == 0:
@@ -229,7 +279,7 @@ def avg_down_add(
         out_height * factor_s,
         pad_t,
         items,
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        current_stream(device),
     )
     return y
 
@@ -254,7 +304,7 @@ class InterleaveBiasKernel:
         stream: cuda.CUstream,
     ):
         self.kernel(u_ptr, bias_ptr, y_ptr, positions, items).launch(
-            grid=[(items + THREADS - 1) // THREADS, 1, 1], block=[THREADS, 1, 1], stream=stream
+            grid=grid_1d(items), block=[THREADS, 1, 1], stream=stream
         )
 
     @cute.kernel
@@ -266,32 +316,28 @@ class InterleaveBiasKernel:
         positions: Int32,
         items: Int32,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
-        idx = Int32(bid) * THREADS + Int32(tid)
+        idx = linear_thread_index()
         if idx < items:
-            uu = u32_view(u_ptr)
-            ub = u32_view(bias_ptr)
-            uy = u32_view(y_ptr)
-            row_vecs = positions * self.cvec
-            t_out = idx // row_vecs
-            in_frame = idx - t_out * row_vecs
-            pos = in_frame // self.cvec
-            cv = in_frame - pos * self.cvec
+            u_words = u32_view(u_ptr)
+            bias_words = u32_view(bias_ptr)
+            y_words = u32_view(y_ptr)
+            frame_vecs = positions * self.cvec
+            t_out = idx // frame_vecs
+            vec_in_frame = idx - t_out * frame_vecs
+            pos = vec_in_frame // self.cvec
+            channel_vec = vec_in_frame - pos * self.cvec
             half = t_out % 2
             src = (
                 (cutlass.Int64(t_out // 2) * positions + pos) * (2 * self.cvec)
                 + half * self.cvec
-                + cv
+                + channel_vec
             )
-            words = load_words(uu, src)
+            words = load_words(u_words, src)
             if cutlass.const_expr(self.has_bias):
                 vs = unpack_bf16(words)
-                bs = unpack_bf16(load_words(ub, half * self.cvec + cv))
-                words = []
-                for i in cutlass.range_constexpr(CHANNELS_PER_VECTOR // 2):
-                    words.append(pack2(vs[2 * i] + bs[2 * i], vs[2 * i + 1] + bs[2 * i + 1]))
-            store_words(uy, cutlass.Int64(idx), words)
+                bs = unpack_bf16(load_words(bias_words, half * self.cvec + channel_vec))
+                words = pack_words([vs[k] + bs[k] for k in range(CHANNELS_PER_VECTOR)])
+            store_words(y_words, cutlass.Int64(idx), words)
 
 
 @functools.lru_cache(maxsize=None)
@@ -302,9 +348,13 @@ def _interleave_bias_kernel(device: int, channels: int, bias: bool):
 
     def compile_fn():
         ptrs = [make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=16) for _ in range(3)]
-        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         return cute.compile(
-            kernel.wrapper, *ptrs, Int32(1), Int32(1), stream, options="--enable-tvm-ffi"
+            kernel.wrapper,
+            *ptrs,
+            Int32(1),
+            Int32(1),
+            current_stream(device),
+            options="--enable-tvm-ffi",
         )
 
     name = f"interleave_bias[{channels},{int(bias)}]"
@@ -312,15 +362,14 @@ def _interleave_bias_kernel(device: int, channels: int, bias: bool):
 
 
 def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
-    """``u [T, P, 2C]`` contiguous bf16 -> ``[2T, P, C]``: even frames from channels ``0:C``, odd
-    from ``C:2C``, plus ``bias`` (``2C`` values) when given. ``C`` must be a multiple of 8."""
+    """``u [T, P, 2C]`` contiguous 16-byte aligned bf16 -> ``[2T, P, C]``: even frames from
+    channels ``0:C``, odd from ``C:2C``, plus ``bias`` (contiguous ``[2C]`` bf16) when given.
+    ``C`` must be a multiple of 8."""
     if u.dim() != 3 or u.dtype != torch.bfloat16 or not u.is_contiguous() or u.shape[2] % 16:
         raise ValueError("u must be contiguous bf16 [T, P, 2C] with C a multiple of 8")
     frames, positions, c2 = u.shape
-    if bias is not None:
-        bias = bias.reshape(-1)
-        if bias.numel() != c2 or bias.dtype != torch.bfloat16 or not bias.is_contiguous():
-            raise ValueError("bias must be 2C contiguous bf16 values")
+    _check_bias(bias, c2, "2C")
+    _check_aligned(16, u=u, bias=bias)
     y = torch.empty((2 * frames, positions, c2 // 2), dtype=u.dtype, device=u.device)
     items = 2 * frames * positions * (c2 // 2 // CHANNELS_PER_VECTOR)
     if items == 0:
@@ -334,22 +383,28 @@ def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         y.data_ptr(),
         positions,
         items,
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        current_stream(device),
     )
     return y
+
+
+def _unpatchify_packed(channels: int, patch: int) -> bool:
+    """Whether the unpatchify kernel moves packed bf16 pairs: ``C*P`` even and ``C*P*P`` a
+    multiple of 4 (8-byte reads, 4-byte writes)."""
+    return (channels * patch) % 2 == 0 and (channels * patch * patch) % 4 == 0
 
 
 class UnpatchifyClampKernel:
     """``chunk [t, H, W, C*P*P]`` -> ``out[frame0 + f, h*P + j, w*P + i, c] = clamp(chunk[f, h,
     w, (c*P + i)*P + j], -1, 1)`` (the element mapping of ``wan_vae.unpatchify``). One thread
     per chunk pixel; each of its ``P`` output row segments (``P`` pixels of ``C`` channels) is
-    written as packed bf16 pairs when ``C*P`` is even and ``C*P*P`` a multiple of 4 (8-byte
-    reads), else element by element."""
+    written as packed bf16 pairs when :func:`_unpatchify_packed` holds, else element by
+    element."""
 
     def __init__(self, channels: int, patch: int) -> None:
-        self.C, self.P = channels, patch
-        self.cpp = channels * patch * patch
-        self.packed = (channels * patch) % 2 == 0 and self.cpp % 4 == 0
+        self.channels, self.patch = channels, patch
+        self.values_per_pixel = channels * patch * patch
+        self.packed = _unpatchify_packed(channels, patch)
 
     @cute.jit
     def wrapper(
@@ -363,7 +418,7 @@ class UnpatchifyClampKernel:
         stream: cuda.CUstream,
     ):
         self.kernel(chunk_ptr, out_ptr, height, width, frame0, items).launch(
-            grid=[(items + THREADS - 1) // THREADS, 1, 1], block=[THREADS, 1, 1], stream=stream
+            grid=grid_1d(items), block=[THREADS, 1, 1], stream=stream
         )
 
     @cute.kernel
@@ -376,49 +431,60 @@ class UnpatchifyClampKernel:
         frame0: Int32,
         items: Int32,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
-        idx = Int32(bid) * THREADS + Int32(tid)
+        idx = linear_thread_index()
         if idx < items:
-            C, P = self.C, self.P
+            channels, patch = self.channels, self.patch
             w = idx % width
             th = idx // width
             h = th % height
             f = th // height
-            vals = []
-            if cutlass.const_expr(self.packed):
-                # 8-byte words of the chunk pixel, 4-byte words of the output row segments.
-                src = cute.make_tensor(
-                    cute.recast_ptr(chunk_ptr, dtype=Int32),
-                    cute.make_layout((2, cutlass.Int64(1) << 40), stride=(1, 2)),
-                )
-                dst = cute.make_tensor(
-                    cute.recast_ptr(out_ptr, dtype=Int32), cute.make_layout((1 << 40,))
-                )
-                for q in cutlass.range_constexpr(self.cpp // 4):
-                    pair = src[(None, cutlass.Int64(idx) * (self.cpp // 4) + q)].load()
-                    vals.extend(unpack_bf16([pair[0], pair[1]]))
-            else:
-                src = cute.make_tensor(chunk_ptr, cute.make_layout((1 << 40,)))
-                dst = cute.make_tensor(out_ptr, cute.make_layout((1 << 40,)))
-                for q in cutlass.range_constexpr(self.cpp):
-                    vals.append(Float32(src[cutlass.Int64(idx) * self.cpp + q]))
-            out_w = width * P
-            for j in cutlass.range_constexpr(P):
+            vals = self._load_pixel(chunk_ptr, idx)
+            dst = self._out_view(out_ptr)
+            out_w = width * patch
+            for j in cutlass.range_constexpr(patch):
                 seg = []
-                for i in cutlass.range_constexpr(P):
-                    for c in cutlass.range_constexpr(C):
-                        v = vals[(c * P + i) * P + j]
+                for i in cutlass.range_constexpr(patch):
+                    for c in cutlass.range_constexpr(channels):
+                        v = vals[(c * patch + i) * patch + j]
                         seg.append(cute.arch.fmin(cute.arch.fmax(v, Float32(-1.0)), Float32(1.0)))
-                row = (cutlass.Int64(frame0 + f) * (height * P) + h * P + j) * out_w + w * P
-                if cutlass.const_expr(self.packed):
-                    base = row * C // 2  # C*P is even: every segment starts on a 4-byte word
-                    for k in cutlass.range_constexpr(C * P // 2):
-                        dst[base + k] = pack2(seg[2 * k], seg[2 * k + 1])
-                else:
-                    # The clamped values are bf16 already: the conversion is exact.
-                    for k in cutlass.range_constexpr(C * P):
-                        dst[row * C + k] = BFloat16(seg[k])
+                row = (
+                    cutlass.Int64(frame0 + f) * (height * patch) + h * patch + j
+                ) * out_w + w * patch
+                self._store_row_segment(dst, row, seg)
+
+    def _load_pixel(self, chunk_ptr: cute.Pointer, idx) -> list:
+        """The ``C*P*P`` values of chunk pixel ``idx`` as floats, in channel order."""
+        vals = []
+        if self.packed:
+            words = self.values_per_pixel // 4  # 8-byte words per pixel
+            src = flat_view(cute.recast_ptr(chunk_ptr, dtype=Int32), 2)
+            for q in range(words):
+                pair = src[(None, cutlass.Int64(idx) * words + q)].load()
+                vals.extend(unpack_bf16([pair[0], pair[1]]))
+        else:
+            src = flat_1d(chunk_ptr)
+            for q in range(self.values_per_pixel):
+                vals.append(Float32(src[cutlass.Int64(idx) * self.values_per_pixel + q]))
+        return vals
+
+    def _out_view(self, out_ptr: cute.Pointer) -> cute.Tensor:
+        """The output as 4-byte words (packed) or bf16 elements."""
+        if self.packed:
+            return flat_1d(cute.recast_ptr(out_ptr, dtype=Int32))
+        return flat_1d(out_ptr)
+
+    def _store_row_segment(self, dst: cute.Tensor, row, seg: list) -> None:
+        """Store the ``P * C`` clamped values of one output row segment starting at pixel
+        ``row``."""
+        channels, patch = self.channels, self.patch
+        if self.packed:
+            base = row * channels // 2  # C*P is even: every segment starts on a 4-byte word
+            for k in range(channels * patch // 2):
+                dst[base + k] = pack2(seg[2 * k], seg[2 * k + 1])
+        else:
+            # The clamped values are bf16 already: the conversion is exact.
+            for k in range(channels * patch):
+                dst[row * channels + k] = BFloat16(seg[k])
 
 
 @functools.lru_cache(maxsize=None)
@@ -432,9 +498,12 @@ def _unpatchify_clamp_kernel(device: int, channels: int, patch: int):
         ptrs = [
             make_ptr(BFloat16, 16, cute.AddressSpace.gmem, assumed_align=align) for _ in range(2)
         ]
-        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         return cute.compile(
-            kernel.wrapper, *ptrs, *([Int32(1)] * 4), stream, options="--enable-tvm-ffi"
+            kernel.wrapper,
+            *ptrs,
+            *([Int32(1)] * 4),
+            current_stream(device),
+            options="--enable-tvm-ffi",
         )
 
     name = f"unpatchify_clamp[{channels},{patch}]"
@@ -444,7 +513,8 @@ def _unpatchify_clamp_kernel(device: int, channels: int, patch: int):
 def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, patch: int) -> None:
     """Write ``clamp(unpatchify(chunk), -1, 1)`` into ``out[:, :, frame0:frame0 + t]``: ``chunk``
     ``[1, C*patch*patch, t, H, W]`` and ``out`` ``[1, C, T, H*patch, W*patch]``, both
-    channels-last bf16. Same element mapping as :func:`wan_vae.unpatchify`."""
+    channels-last bf16, 8-byte aligned when :func:`_unpatchify_packed` holds. Same element
+    mapping as :func:`wan_vae.unpatchify`."""
     cl = torch.channels_last_3d
     if chunk.dim() != 5 or out.dim() != 5 or chunk.shape[0] != 1 or out.shape[0] != 1:
         raise ValueError("chunk and out must be batch-1 5D tensors")
@@ -457,10 +527,15 @@ def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, p
     if cpp != channels * patch * patch or (height * patch, width * patch) != tuple(out.shape[3:]):
         raise ValueError("chunk must hold C*patch^2 channels at 1/patch of out's spatial size")
     if frame0 < 0 or frame0 + frames > out.shape[2]:
-        raise ValueError("frame range")
+        raise ValueError(
+            f"frames [{frame0}, {frame0 + frames}) of chunk do not fit in out's {out.shape[2]}"
+        )
+    _check_aligned(8 if _unpatchify_packed(channels, patch) else 2, chunk=chunk, out=out)
     items = frames * height * width
     if items == 0:
         return
+    if items >= 2**31:
+        raise ValueError("unpatchify_clamp_into: too many chunk pixels for one launch")
     device = chunk.device.index
     _unpatchify_clamp_kernel(device, channels, patch)(
         chunk.data_ptr(),
@@ -469,5 +544,5 @@ def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, p
         width,
         frame0,
         items,
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        current_stream(device),
     )

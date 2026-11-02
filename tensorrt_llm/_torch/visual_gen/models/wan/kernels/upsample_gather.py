@@ -8,9 +8,10 @@ shortcut while writing.
 
 One thread owns one source pixel ``(b, tr, i, j)`` and 8 output channels, and produces the
 ``factor_t x 2 x 2`` output pixels that descend from it: ``factor_t * 4`` 16-byte loads from the
-conv output, one shortcut span load, ``factor_t * 4`` 16-byte stores in channels-last order.
-Consecutive threads hold consecutive channel vectors of one pixel, so every warp access is
-contiguous. Rounding: ``round(temp + bias)``, then ``round(that + shortcut)``, per element.
+conv output, the thread's shortcut span in loads of up to 16 bytes (at most 8), and
+``factor_t * 4`` 16-byte stores in channels-last order. Consecutive threads hold consecutive
+channel vectors of one pixel, so every warp access is contiguous. Rounding: ``round(temp +
+bias)``, then ``round(that + shortcut)``, per element.
 """
 
 from __future__ import annotations
@@ -25,16 +26,20 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64
 
 from .common import (
     CHANNELS_PER_VECTOR,
-    bf16_hi,
-    bf16_lo,
+    THREADS,
     compile_cached,
-    pack2,
+    current_stream,
+    flat_view,
+    grid_1d,
+    linear_thread_index,
+    pack_words,
+    round_pair_bf16,
     store_words,
     u32_view,
     vec_view,
 )
 
-THREADS = 256
+PHASES = 4  # output pixels (2 x 2) per source pixel and frame
 
 
 class UpsampleGatherKernel:
@@ -44,7 +49,7 @@ class UpsampleGatherKernel:
         self.fp16 = fp16
         self.dtype = Float16 if fp16 else BFloat16
         self.factor_t = factor_t
-        self.factor = factor_t * 4
+        self.factor = factor_t * PHASES
         self.repeats = repeats
         self.shortcut = shortcut
         self.has_bias = has_bias
@@ -71,9 +76,7 @@ class UpsampleGatherKernel:
     ):
         self.kernel(
             temp_ptr, sc_ptr, bias_ptr, out_ptr, frames, height, width, cout, cin, crop, items
-        ).launch(
-            grid=[(items + THREADS - 1) // THREADS, 1, 1], block=[THREADS, 1, 1], stream=stream
-        )
+        ).launch(grid=grid_1d(items), block=[THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -90,88 +93,118 @@ class UpsampleGatherKernel:
         crop: Int32,
         items: Int32,
     ):
-        tid, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
-        idx = Int32(bid) * THREADS + Int32(tid)
+        idx = linear_thread_index()
         if idx < items:
-            gt = vec_view(temp_ptr)
-            gb = vec_view(bias_ptr)
-            uo = u32_view(out_ptr)
-            gs = cute.make_tensor(
-                sc_ptr, cute.make_layout((self.chunk, 1 << 40), stride=(1, self.chunk))
-            )
-            ft = self.factor_t
+            temp_vecs = vec_view(temp_ptr)
+            bias_vecs = vec_view(bias_ptr)
+            out_words = u32_view(out_ptr)
+            shortcut_chunks = flat_view(sc_ptr, self.chunk)
             cvec = cout // CHANNELS_PER_VECTOR
-            ov = idx % cvec
-            o = ov * CHANNELS_PER_VECTOR
-            pix = idx // cvec
-            j = pix % width
-            pix = pix // width
-            i = pix % height
-            pix = pix // height
-            frames_r = (frames + crop) // ft
-            tr = pix % frames_r
-            b = pix // frames_r
-
-            bias = None
-            if cutlass.const_expr(self.has_bias):
-                # Scalars extracted here, once: an element read from the vector inside the frame
-                # branches would be materialized in the first branch only.
-                loaded_bias = gb[(None, ov)].load().to(Float32)
-                bias = [loaded_bias[k] for k in range(CHANNELS_PER_VECTOR)]
-            span = []
-            if cutlass.const_expr(self.shortcut):
-                pix_base = ((Int64(b) * frames_r + tr) * height + i) * width + j
-                first = (pix_base * cin + (Int64(o) * self.factor) // self.repeats) // self.chunk
-                for c in cutlass.range_constexpr(self.span // self.chunk):
-                    loaded = gs[(None, first + c)].load().to(Float32)
-                    for e in cutlass.range_constexpr(self.chunk):
-                        span.append(loaded[e])
+            out_vec, channel0, b, tr, i, j, frames_r = self._decode_source_pixel(
+                idx, cvec, frames, height, width, crop
+            )
+            bias = self._load_bias(bias_vecs, out_vec)
+            span = self._load_shortcut_span(
+                shortcut_chunks, b, tr, i, j, frames_r, height, width, cin, channel0
+            )
 
             temp_pix = Int64(height + 1) * (width + 1)
-            temp_row = Int64(width + 1) * (4 * cvec)  # in 16-byte vectors
+            temp_row = Int64(width + 1) * (PHASES * cvec)  # in 16-byte vectors
             out_row = Int64(2 * width) * cvec
             out_frame = Int64(2 * height) * out_row
             # Every phase load of every frame is issued before the first store (the stores could
             # alias the loads as far as the compiler knows). On the cropped first chunk the
             # dropped frame reads frame 0 and skips its stores.
-            frame = []
-            phases = []
-            for a in cutlass.range_constexpr(ft):
-                f = tr * ft + a - crop  # output frame; negative on the cropped first chunk
-                bt = Int64(b) * frames + cutlass.max(f, 0)
-                temp_base = (bt * temp_pix + Int64(i) * (width + 1) + j) * (4 * cvec) + ov
-                for ph in cutlass.range_constexpr(4):
-                    pp, qq = ph // 2, ph % 2
-                    t_idx = temp_base + pp * temp_row + qq * (4 * cvec) + ph * cvec
-                    phases.append(gt[(None, t_idx)].load().to(Float32))
-                frame.append((f, bt))
-            for a in cutlass.range_constexpr(ft):
+            frame, phases = self._load_phases(
+                temp_vecs, b, tr, i, j, out_vec, cvec, frames, width, crop, temp_pix, temp_row
+            )
+            for a in cutlass.range_constexpr(self.factor_t):
                 f, bt = frame[a]
-                out_base = bt * out_frame + Int64(2 * i) * out_row + Int64(2 * j) * cvec + ov
-                words_ph = []
-                for ph in cutlass.range_constexpr(4):
-                    pp, qq = ph // 2, ph % 2
-                    v = phases[a * 4 + ph]
-                    vals = [v[k] for k in range(CHANNELS_PER_VECTOR)]
-                    if cutlass.const_expr(self.has_bias):
-                        vals = self._round8([vals[k] + bias[k] for k in range(CHANNELS_PER_VECTOR)])
-                    if cutlass.const_expr(self.shortcut):
-                        s = (a * 2 + pp) * 2 + qq
-                        vals = [
-                            vals[k] + span[(k * self.factor + s) // self.repeats]
-                            for k in range(CHANNELS_PER_VECTOR)
-                        ]
-                    words_ph.append(
-                        [
-                            pack2(vals[2 * w], vals[2 * w + 1], self.fp16)
-                            for w in range(CHANNELS_PER_VECTOR // 2)
-                        ]
-                    )
+                out_base = bt * out_frame + Int64(2 * i) * out_row + Int64(2 * j) * cvec + out_vec
+                words = [
+                    self._phase_words(phases[a * PHASES + ph], bias, span, a, ph)
+                    for ph in range(PHASES)
+                ]
                 if f >= 0:
-                    for ph in cutlass.range_constexpr(4):
-                        pp, qq = ph // 2, ph % 2
-                        store_words(uo, out_base + pp * out_row + qq * cvec, words_ph[ph])
+                    for ph in cutlass.range_constexpr(PHASES):
+                        phase_row, phase_col = divmod(ph, 2)
+                        store_words(
+                            out_words, out_base + phase_row * out_row + phase_col * cvec, words[ph]
+                        )
+
+    def _decode_source_pixel(self, idx, cvec, frames, height, width, crop):
+        """Thread index -> (channel vector, its first channel, batch, source frame, row, column,
+        source frames per batch)."""
+        out_vec = idx % cvec
+        channel0 = out_vec * CHANNELS_PER_VECTOR
+        pix = idx // cvec
+        j = pix % width
+        rows = pix // width
+        i = rows % height
+        frames_all = rows // height
+        frames_r = (frames + crop) // self.factor_t
+        tr = frames_all % frames_r
+        b = frames_all // frames_r
+        return out_vec, channel0, b, tr, i, j, frames_r
+
+    def _load_bias(self, bias_vecs, out_vec) -> list | None:
+        """The thread's 8 bias values as floats, or ``None`` without a bias."""
+        if not self.has_bias:
+            return None
+        # Scalars extracted here, once: an element read from the vector inside the frame
+        # branches would be materialized in the first branch only.
+        loaded = bias_vecs[(None, out_vec)].load().to(Float32)
+        return [loaded[k] for k in range(CHANNELS_PER_VECTOR)]
+
+    def _load_shortcut_span(
+        self, shortcut_chunks, b, tr, i, j, frames_r, height, width, cin, channel0
+    ) -> list:
+        """The shortcut values the thread's output channels repeat, as floats (empty without a
+        shortcut)."""
+        span = []
+        if not self.shortcut:
+            return span
+        pix_base = ((Int64(b) * frames_r + tr) * height + i) * width + j
+        first = (pix_base * cin + (Int64(channel0) * self.factor) // self.repeats) // self.chunk
+        for c in range(self.span // self.chunk):
+            loaded = shortcut_chunks[(None, first + c)].load().to(Float32)
+            for e in range(self.chunk):
+                span.append(loaded[e])
+        return span
+
+    def _load_phases(
+        self, temp_vecs, b, tr, i, j, out_vec, cvec, frames, width, crop, temp_pix, temp_row
+    ):
+        """The four phase vectors of every output frame of the thread, as fp32 vectors in
+        (frame, phase) order, and per frame ``(output frame, its batch-frame index)``; the
+        output frame is negative for the frame dropped on the cropped first chunk."""
+        frame = []
+        phases = []
+        for a in range(self.factor_t):
+            f = tr * self.factor_t + a - crop
+            bt = Int64(b) * frames + cutlass.max(f, 0)
+            temp_base = (bt * temp_pix + Int64(i) * (width + 1) + j) * (PHASES * cvec) + out_vec
+            for ph in range(PHASES):
+                phase_row, phase_col = divmod(ph, 2)
+                t_idx = temp_base + phase_row * temp_row + phase_col * (PHASES * cvec) + ph * cvec
+                phases.append(temp_vecs[(None, t_idx)].load().to(Float32))
+            frame.append((f, bt))
+        return frame, phases
+
+    def _phase_words(self, v, bias: list | None, span: list, a: int, ph: int) -> list:
+        """Output pixel ``ph`` of output frame ``a``: the phase vector ``v`` plus the bias
+        (rounded) plus the shortcut, as packed words."""
+        vals = [v[k] for k in range(CHANNELS_PER_VECTOR)]
+        if self.has_bias:
+            vals = self._round8([vals[k] + bias[k] for k in range(CHANNELS_PER_VECTOR)])
+        if self.shortcut:
+            phase_row, phase_col = divmod(ph, 2)
+            s = (a * 2 + phase_row) * 2 + phase_col
+            vals = [
+                vals[k] + span[(k * self.factor + s) // self.repeats]
+                for k in range(CHANNELS_PER_VECTOR)
+            ]
+        return pack_words(vals, self.fp16)
 
     def _round8(self, vals: list) -> list:
         """Eight floats rounded to the activation dtype and back: packed pairs for bf16 (the
@@ -180,8 +213,8 @@ class UpsampleGatherKernel:
         if not self.fp16:
             out = []
             for w in range(CHANNELS_PER_VECTOR // 2):
-                word = pack2(vals[2 * w], vals[2 * w + 1])
-                out += [bf16_lo(word), bf16_hi(word)]
+                _, lo, hi = round_pair_bf16(vals[2 * w], vals[2 * w + 1])
+                out += [lo, hi]
             return out
         t = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), Float32)
         for k in range(CHANNELS_PER_VECTOR):
@@ -197,13 +230,17 @@ def _gather_kernel(
     from cutlass.cute.runtime import make_ptr
 
     kernel = UpsampleGatherKernel(fp16, factor_t, repeats, shortcut, bias)
-    dtype = Float16 if fp16 else BFloat16
 
     def compile_fn():
-        ptrs = [make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16) for _ in range(4)]
-        stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+        ptrs = [
+            make_ptr(kernel.dtype, 16, cute.AddressSpace.gmem, assumed_align=16) for _ in range(4)
+        ]
         return cute.compile(
-            kernel.wrapper, *ptrs, *([Int32(1)] * 7), stream, options="--enable-tvm-ffi"
+            kernel.wrapper,
+            *ptrs,
+            *([Int32(1)] * 7),
+            current_stream(device),
+            options="--enable-tvm-ffi",
         )
 
     name = f"upsample_gather[{int(fp16)},{factor_t},{repeats},{int(shortcut)},{int(bias)}]"
@@ -214,7 +251,10 @@ def can_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
     """Shapes the gather covers: ``Cout`` a multiple of 8, a temporal factor of 1 or 2 and a
     power-of-two channel repeat up to 32."""
     return (
-        cout % 8 == 0 and factor_t in (1, 2) and 1 <= repeats <= 32 and not repeats & (repeats - 1)
+        cout % CHANNELS_PER_VECTOR == 0
+        and factor_t in (1, 2)
+        and 1 <= repeats <= 32
+        and not repeats & (repeats - 1)
     )
 
 
@@ -230,10 +270,10 @@ def upsample_gather(
 ) -> torch.Tensor:
     """Phase gather of the packed 2x2 conv output ``temp [B*T, 4*Cout, H+1, W+1]``
     (channels-last, bf16 or fp16) into ``[B, Cout, T, 2H, 2W]`` (channels_last_3d), with the
-    conv ``bias`` (``Cout`` values) and the DupUp3D ``shortcut`` (``[B, Cin, Tr, H, W]``
-    channels_last_3d, ``Tr * factor_t == T + crop``, ``Cin * repeats == 4 * Cout * factor_t``)
-    added while writing; ``crop`` leading output frames of the shortcut's expansion are
-    dropped (the first chunk)."""
+    conv ``bias`` (contiguous ``[Cout]`` of temp's dtype) and the DupUp3D ``shortcut`` (``[B,
+    Cin, Tr, H, W]`` channels_last_3d, ``Tr * factor_t == T + crop``, ``Cin * repeats == 4 *
+    Cout * factor_t``) added while writing; ``crop`` leading output frames of the shortcut's
+    expansion are dropped (the first chunk). All inputs must be 16-byte aligned."""
     if temp.dim() != 4 or temp.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("temp must be a bf16 or fp16 [B*T, 4*Cout, H+1, W+1] tensor")
     if not temp.is_contiguous(memory_format=torch.channels_last):
@@ -259,10 +299,13 @@ def upsample_gather(
         if s.shape[2] * factor_t != frames + crop or s.shape[1] * repeats != cout * factor_t * 4:
             raise ValueError("shortcut frames or channels do not match")
         cin = s.shape[1]
-    if bias is not None:
-        bias = bias.contiguous()
-        if bias.dtype != temp.dtype or bias.numel() != cout:
-            raise ValueError("bias must be [Cout] values of temp's dtype")
+    if bias is not None and (
+        bias.dtype != temp.dtype or tuple(bias.shape) != (cout,) or not bias.is_contiguous()
+    ):
+        raise ValueError("bias must be a contiguous [Cout] tensor of temp's dtype")
+    for name, t in (("temp", temp), ("shortcut", shortcut), ("bias", bias)):
+        if t is not None and t.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned")
     out = torch.empty(
         (batch, cout, frames, 2 * height, 2 * width),
         dtype=temp.dtype,
@@ -296,6 +339,6 @@ def upsample_gather(
         cin,
         crop,
         items,
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        current_stream(device),
     )
     return out
