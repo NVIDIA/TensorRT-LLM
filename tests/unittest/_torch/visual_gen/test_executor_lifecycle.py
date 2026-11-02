@@ -862,12 +862,9 @@ def test_shutdown_skips_registered_process_that_never_started() -> None:
 
 
 @pytest.mark.parametrize("finishes", [True, False], ids=["teardown-finishes", "teardown-hangs"])
-def test_shutdown_waits_for_external_worker_teardown(monkeypatch, finishes: bool) -> None:
-    monkeypatch.setattr(executor_module, "WORKER_TIMEOUT", 0.01)
-    monkeypatch.setattr(executor_module, "EXT_WORKER_TEARDOWN_TIMEOUT", 10.0 if finishes else 0.1)
-    release = threading.Event()
-    teardown = threading.Thread(target=release.wait, args=(0.5 if finishes else 10.0,), daemon=True)
-    teardown.start()
+def test_shutdown_waits_for_external_worker_teardown(finishes: bool) -> None:
+    teardown = MagicMock()
+    teardown.is_alive.side_effect = lambda: not teardown.join.called or not finishes
 
     client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
     client._shutdown_lock = threading.Lock()
@@ -880,16 +877,12 @@ def test_shutdown_waits_for_external_worker_teardown(monkeypatch, finishes: bool
     client._worker_spawner = None
     client._ext_worker_thread = teardown
 
-    try:
-        if finishes:
+    if finishes:
+        client.shutdown()
+    else:
+        with pytest.raises(RuntimeError, match="did not finish its teardown"):
             client.shutdown()
-            assert not teardown.is_alive()
-        else:
-            with pytest.raises(RuntimeError, match="did not finish its teardown"):
-                client.shutdown()
-    finally:
-        release.set()
-        teardown.join(timeout=10.0)
+    teardown.join.assert_called_once_with(timeout=executor_module.EXT_WORKER_TEARDOWN_TIMEOUT)
 
 
 def test_worker_death_during_request_send_is_contained() -> None:
