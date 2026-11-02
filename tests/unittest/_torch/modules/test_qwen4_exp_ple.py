@@ -768,9 +768,11 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 masking is checked on CUDA")
-def test_ple_attention_dp_row_shard_masks_fp8_table(monkeypatch) -> None:
+def test_ple_attention_dp_row_shard_masks_fp8_table(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm._torch.modules.qwen4_exp import ple as qwen4_exp_ple
 
+    # Host offload would build a BF16 pinned table instead of the resident one under test.
+    monkeypatch.setenv("TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD", "0")
     config = _make_config()
     mapping = SimpleNamespace(tp_size=2, tp_rank=0, cp_size=1, enable_attention_dp=True)
     module = Qwen4ExpNGramEmbedding(
@@ -817,10 +819,20 @@ def test_ple_attention_dp_row_shard_masks_fp8_table(monkeypatch) -> None:
     )
     expected_partial[owned] = (full_weight[gathered_ids[owned]] * 0.5).to(torch.bfloat16)
 
-    def fake_allgather(input_ids, actual_mapping, dim, sizes):
+    def fake_allgather(
+        input_ids: torch.Tensor,
+        actual_mapping: object,
+        dim: int,
+        sizes: list[int] | None,
+    ) -> torch.Tensor:
         return gathered_ids
 
-    def fake_reducescatter(partial, actual_mapping, dim, sizes):
+    def fake_reducescatter(
+        partial: torch.Tensor,
+        actual_mapping: object,
+        dim: int,
+        sizes: list[int] | None,
+    ) -> torch.Tensor:
         assert partial.dtype == torch.bfloat16
         torch.testing.assert_close(partial, expected_partial, rtol=0, atol=0)
         return partial[:3]
