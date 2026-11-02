@@ -254,7 +254,7 @@ class PagePool:
         zero.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Prefetch slot index.
 
         Returns:
             Number of page handles currently held.
