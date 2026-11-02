@@ -123,6 +123,11 @@ def get_spec_decoding_position_offsets(
     return offsets
 
 
+def _leading_rows(t: torch.Tensor, n: int) -> torch.Tensor:
+    """``t[:n]``; ``t`` itself when it has n rows."""
+    return t if t.shape[0] == n else t[:n]
+
+
 class PhasedFmha(Fmha):
     """FMHA helper for paged-KV libraries that split work by request phase."""
 
@@ -206,6 +211,118 @@ class PhasedFmha(Fmha):
     ) -> None:
         pass
 
+    def _out_tensor(
+        self,
+        output: torch.Tensor,
+        num_tokens: int,
+        is_gen_only: bool,
+        fused_epilogue: bool,
+    ) -> torch.Tensor:
+        """The call's output as the [num_tokens, heads, head size] view the phases write."""
+        if fused_epilogue:
+            # DSv4 owns a contiguous [groups, tokens, K] output buffer for each phase.
+            return output
+        out_head_size = self.generation_out_head_size if is_gen_only else self.context_out_head_size
+        if output.dtype == torch.uint8:
+            # NVFP4 stores two output values in each byte.
+            out_head_size //= 2
+        return output.view(num_tokens, self.attn.num_heads, out_head_size)
+
+    def _shared_params(
+        self,
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+        total_num_blocks: int,
+        num_gen_tokens: int = 0,
+    ) -> FmhaParams:
+        """FmhaParams with the fields of the call that both phases share.
+
+        ``total_num_blocks`` is ``_get_total_num_blocks(metadata)``, or 0 without NEEDS_BLOCK_EXTENT;
+        ``num_gen_tokens`` the call's generation tokens (0 without a generation phase).
+        """
+        attn = self.attn
+        attention_window_size = forward_args.attention_window_size
+        cache_indirection = metadata.cache_indirection
+        max_attention_window_size = (
+            attention_window_size
+            if metadata.beam_width == 1
+            else (
+                cache_indirection.size(2)
+                if cache_indirection is not None
+                else attention_window_size
+            )
+        )
+        tokens_per_block = (
+            metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
+        )
+        local_layer_idx = attn.local_layer_idx
+        if local_layer_idx is None:
+            local_layer_idx = attn.get_local_layer_idx(metadata)
+        return FmhaParams(
+            attn=attn,
+            meta=metadata,
+            fwd=forward_args,
+            workspace=workspace,
+            max_attention_window_size=max_attention_window_size,
+            cyclic_attention_window_size=attention_window_size,
+            tokens_per_block=tokens_per_block,
+            kv_factor=self.kv_factor,
+            total_num_blocks=total_num_blocks,
+            is_cross=metadata.is_cross,
+            num_gen_tokens=num_gen_tokens,
+            local_layer_idx=local_layer_idx,
+        )
+
+    def context_params(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+        total_num_blocks: int,
+        max_q_len: int,
+        max_kv_len: int,
+        num_gen_tokens: int = 0,
+    ) -> FmhaParams:
+        """FmhaParams of the context phase of a call (forward(), and TrtllmAttention's context plan).
+
+        Args:
+            q, k, v: The call's inputs [num_tokens, ...], context tokens first; k / v None with fused QKV.
+            metadata: The context phase is its first num_contexts sequences and num_ctx_tokens tokens.
+            forward_args: The call's arguments; its output [num_tokens, ...] is written.
+            workspace: The call's attention workspace.
+            total_num_blocks: _get_total_num_blocks(metadata), or 0 without NEEDS_BLOCK_EXTENT.
+            max_q_len: Largest prompt length of the context sequences.
+            max_kv_len: Largest KV length of the context sequences.
+            num_gen_tokens: Generation tokens of the call (0 without a generation phase).
+        """
+        num_seqs = metadata.num_contexts
+        num_ctx_tokens = metadata.num_ctx_tokens
+        params = self._shared_params(
+            metadata, forward_args, workspace, total_num_blocks, num_gen_tokens
+        )
+        fused_epilogue = forward_args.enable_dsv4_epilogue_fusion
+        out_tensor = self._out_tensor(forward_args.output, q.shape[0], False, fused_epilogue)
+        phase_input = _leading_rows(q, num_ctx_tokens)
+        params.qkv_input = phase_input if forward_args.is_fused_qkv else None
+        params.query_input = None if forward_args.is_fused_qkv else phase_input
+        params.key_input = _leading_rows(k, num_ctx_tokens) if k is not None else None
+        params.value_input = _leading_rows(v, num_ctx_tokens) if v is not None else None
+        params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
+        params.sequence_lengths = metadata.kv_lens_cuda_runtime
+        params.context_lengths = metadata.prompt_lens_cuda_runtime
+        params.max_past_kv_length = max_kv_len
+        params.num_tokens = num_ctx_tokens
+        params.seq_offset = 0
+        params.token_offset = 0
+        params.input_seq_length = max_q_len
+        params.batch_size = num_seqs
+        params.num_requests = num_seqs
+        return params
+
     def forward(
         self,
         q: torch.Tensor,
@@ -253,98 +370,38 @@ class PhasedFmha(Fmha):
             workspace,
         )
 
-        if fused_epilogue:
-            # DSv4 owns a contiguous [groups, tokens, K] output buffer for each phase.
-            out_tensor = output
-        else:
-            out_head_size = (
-                self.generation_out_head_size if is_gen_only else self.context_out_head_size
-            )
-            if output.dtype == torch.uint8:
-                # NVFP4 stores two output values in each byte.
-                out_head_size //= 2
-            out_tensor = output.view(num_tokens, attn.num_heads, out_head_size)
-
-        attention_window_size = forward_args.attention_window_size
-        cache_indirection = metadata.cache_indirection
-        max_attention_window_size = (
-            attention_window_size
-            if metadata.beam_width == 1
-            else (
-                cache_indirection.size(2)
-                if cache_indirection is not None
-                else attention_window_size
-            )
-        )
-        tokens_per_block = (
-            metadata.tokens_per_block if metadata.tokens_per_block is not None else 64
-        )
-
-        is_fused_qkv = forward_args.is_fused_qkv
-        local_layer_idx = attn.local_layer_idx
-        if local_layer_idx is None:
-            local_layer_idx = attn.get_local_layer_idx(metadata)
-        params = FmhaParams(
-            attn=attn,
-            meta=metadata,
-            fwd=forward_args,
-            workspace=workspace,
-            max_attention_window_size=max_attention_window_size,
-            cyclic_attention_window_size=attention_window_size,
-            tokens_per_block=tokens_per_block,
-            kv_factor=self.kv_factor,
-            total_num_blocks=(
-                self._get_total_num_blocks(metadata) if self.NEEDS_BLOCK_EXTENT else 0
-            ),
-            is_cross=metadata.is_cross,
-            num_gen_tokens=num_gen_tokens if has_generation else 0,
-            local_layer_idx=local_layer_idx,
-        )
-
+        total_num_blocks = self._get_total_num_blocks(metadata) if self.NEEDS_BLOCK_EXTENT else 0
+        phase_num_gen_tokens = num_gen_tokens if has_generation else 0
         sequence_length = metadata.kv_lens_cuda_runtime
         host_past_key_value_lengths = metadata.kv_lens_runtime
 
+        params = None
         if has_context:
-            seq_offset = 0
-            token_offset = 0
-            num_seqs = num_contexts
-
-            context_lengths = metadata.prompt_lens_cuda_runtime
             host_context_lengths = metadata.prompt_lens_cpu_runtime
-            max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
-            max_past_kv_len = int(
-                host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max()
+            params = self.context_params(
+                q,
+                k,
+                v,
+                metadata,
+                forward_args,
+                workspace,
+                total_num_blocks,
+                max_q_len=int(host_context_lengths[:num_contexts].max()),
+                max_kv_len=int(host_past_key_value_lengths[:num_contexts].max()),
+                num_gen_tokens=phase_num_gen_tokens,
             )
-
-            phase_input = q[token_offset : token_offset + num_ctx_tokens]
-            params.qkv_input = phase_input if is_fused_qkv else None
-            params.query_input = None if is_fused_qkv else phase_input
-            params.key_input = (
-                k[token_offset : token_offset + num_ctx_tokens] if k is not None else None
-            )
-            params.value_input = (
-                v[token_offset : token_offset + num_ctx_tokens] if v is not None else None
-            )
-            params.output = (
-                out_tensor
-                if fused_epilogue
-                else out_tensor[token_offset : token_offset + num_ctx_tokens]
-            )
-            params.sequence_lengths = sequence_length[seq_offset:]
-            params.context_lengths = context_lengths[seq_offset:]
-            params.max_past_kv_length = max_past_kv_len
-            params.num_tokens = num_ctx_tokens
-            params.seq_offset = seq_offset
-            params.token_offset = token_offset
-            params.input_seq_length = max_context_q_len
-            params.batch_size = num_seqs
-            params.num_requests = num_seqs
             if attn.is_mla_enable:
                 self.run_mla_context(params)
             else:
                 self.run_context(params)
 
         if has_generation:
+            if params is None:
+                params = self._shared_params(
+                    metadata, forward_args, workspace, total_num_blocks, phase_num_gen_tokens
+                )
+            out_tensor = self._out_tensor(output, num_tokens, is_gen_only, fused_epilogue)
+            is_fused_qkv = forward_args.is_fused_qkv
             seq_offset = num_contexts
             token_offset = 0 if is_gen_only else num_ctx_tokens
             num_seqs = num_generations

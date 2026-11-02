@@ -490,7 +490,7 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
 
     // If this is a full-attention block or a sink block: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && alc->requiresPrefixCoverage()
+    if (alc && requiresPrefixCoverage(*alc)
         && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
@@ -899,7 +899,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
-            if (!attn->requiresPrefixCoverage())
+            if (!requiresPrefixCoverage(*attn))
             {
                 continue;
             }
@@ -973,7 +973,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
-    auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
+    auto const ssmLcId = mLifeCycles.requiredSsmLifeCycleId();
     // Page requirements depend on the final endpoint. Back off before pruning
     // so SWA coverage and recurrent snapshots are validated at that endpoint.
     if (backoff > 0)
@@ -1015,6 +1015,10 @@ void BlockRadixTree::clear()
     TLLM_CHECK_DEBUG(mRoots.size() == mPendingRootErases.size());
     mRoots.clear();
     mPendingRootErases.clear();
+    if (mEventSink)
+    {
+        mEventSink->addAllBlocksCleared();
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
