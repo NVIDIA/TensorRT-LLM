@@ -132,6 +132,71 @@ def test_symlinked_checkout_records_one_file_identity(tmp_path: Path, linked_roo
     assert rows == [("examples/x.py", "run")]
 
 
+@_REQUIRES_MONITORING
+def test_tracker_records_named_closures_but_skips_lambdas_and_genexprs(tmp_path: Path) -> None:
+    """A decorator's wrapper earns its own row; a lambda or genexpr earns none.
+
+    The wrapper is a real, individually addressable function -- just one nested
+    inside another -- so it is recorded under its own dotted qualname like any
+    other function. A lambda or genexpr has no such identity: two of them directly
+    inside the same enclosing scope share the identical ``co_qualname``, so neither
+    is ever recorded (see ``PyStartTracker._SKIP_QUALNAMES``).
+    """
+    tool_id = next(
+        (slot for slot in (3, 5, 4, 2, 1, 0) if sys.monitoring.get_tool(slot) is None), None
+    )
+    if tool_id is None:
+        pytest.skip("No sys.monitoring tool ID is available")
+    checkout = tmp_path / "checkout"
+    source = checkout / "examples/x.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n"
+        "\n"
+        "@decorator\n"
+        "def foo():\n"
+        "    return 1\n"
+        "\n"
+        "def make_values():\n"
+        "    doubled = [x * 2 for x in range(3)]\n"
+        "    squared = list(x * x for x in range(3))\n"
+        "    adder = lambda x: x + 1\n"
+        "    return doubled, squared, adder(1)\n"
+    )
+    tracker = PyStartTracker(
+        [str(checkout)],
+        str(tmp_path),
+        tool_id=tool_id,
+        repository_root=str(checkout),
+        include=["examples/*.py"],
+    )
+    tracker.switch_test_context("test_scope")
+    assert tracker.start()
+    try:
+        namespace = {}
+        exec(compile(source.read_text(), str(source), "exec"), namespace)
+        namespace["foo"]()
+        namespace["make_values"]()
+    finally:
+        tracker.stop()
+    database = tracker.save()
+    assert database is not None
+    with sqlite3.connect(database) as connection:
+        qualnames = {
+            row[0]
+            for row in connection.execute(
+                "SELECT qualname FROM touch_rows WHERE file = 'examples/x.py'"
+            ).fetchall()
+        }
+    assert "decorator.<locals>.wrapper" in qualnames
+    assert "foo" in qualnames
+    assert "make_values" in qualnames
+    assert not any("<lambda>" in q or "<genexpr>" in q for q in qualnames)
+
+
 @pytest.mark.parametrize("source_kind", ["checkout", "symlink", "legacy"])
 def test_report_scope_and_directory_pruning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_kind: str
@@ -190,6 +255,38 @@ def test_report_pruning_respects_custom_patterns(
     assert definitions == {("tools/deep/x.py", "run")}
 
 
+def test_report_denominator_includes_closures_but_not_lambdas(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coverage-rate denominator counts a decorator's wrapper like any function.
+
+    It has to match what the collector actually records (`PyStartTracker`), or
+    the rate the report prints would be computed over the wrong population.
+    """
+    config = configparser.ConfigParser()
+    config.read_dict({"run": {"include": "tools/*.py"}})
+    monkeypatch.setattr(pystart_report, "read_source_config", lambda: config)
+    source = tmp_path / "tools/x.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n"
+        "\n"
+        "def make_values():\n"
+        "    doubled = [x * 2 for x in range(3)]\n"
+        "    adder = lambda x: x + 1\n"
+        "    return doubled, adder(1)\n"
+    )
+    _files, definitions = pystart_report.enumerate_defs(str(tmp_path))
+    assert definitions == {
+        ("tools/x.py", "decorator"),
+        ("tools/x.py", "decorator.<locals>.wrapper"),
+        ("tools/x.py", "make_values"),
+    }
+
+
 @pytest.mark.parametrize("config_kind", ["valid", "missing", "malformed"])
 def test_bootstrap_passes_scope_and_disables_on_config_errors(
     tmp_path: Path, config_kind: str
@@ -233,46 +330,3 @@ def test_bootstrap_passes_scope_and_disables_on_config_errors(
     else:
         assert json.loads(result.stdout) == [False, None, []]
         assert "coverage disabled" in result.stderr
-
-
-def test_worker_excludes_symlinked_repository_root_from_product_imports(tmp_path: Path) -> None:
-    """A checkout alias must not become a product import watched by an MPI worker."""
-    checkout = tmp_path / "checkout"
-    package = checkout / "fakeprod"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text("value = 1\n")
-    link = tmp_path / "linked-checkout"
-    link.symlink_to(checkout, target_is_directory=True)
-    rcfile = tmp_path / ".coveragerc"
-    rcfile.write_text(
-        f"[run]\nrepository_root = {checkout}\nsource =\n    {link}/\n    {package}/\n"
-        f"data_file = {tmp_path}/.coverage.worker\n"
-    )
-    cbts_root = Path(__file__).resolve().parents[4] / "jenkins/scripts/cbts"
-    environment = dict(os.environ)
-    environment.pop("CBTS_PROCESS_ROLE", None)
-    environment.update(
-        PYTHONPATH=os.pathsep.join(
-            [str(cbts_root / "cbts_injectors"), str(cbts_root), str(checkout)]
-        ),
-        CBTS_COVERAGE_CONFIG=str(rcfile),
-    )
-    probe = (
-        "import sys; sys.orig_argv = [sys.executable, '-m', 'mpi4py.futures.server']; "
-        "import site; site.main(); import json, sitecustomize; "
-        "print(json.dumps(sorted(sitecustomize._product_tops))); import fakeprod; "
-        "print(json.dumps(sorted(sitecustomize._watched_imports)))"
-    )
-    result = subprocess.run(
-        [sys.executable, "-S", "-c", probe],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    assert [json.loads(line) for line in result.stdout.splitlines()] == [
-        ["fakeprod"],
-        ["mpi4py.futures"],
-    ]

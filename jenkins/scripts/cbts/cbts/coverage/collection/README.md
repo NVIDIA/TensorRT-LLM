@@ -22,15 +22,15 @@ machinery / pytest actually load by bare name live outside the `cbts` package, i
 
 | File | Role |
 |---|---|
-| `pystart.py` | The tracker: a `sys.monitoring` tool (id 4) recording, per test context, the set of product `(file, qualname)` entered, plus outcomes, expected worker counts and taints. Writes one compact SQLite per process. |
+| `pystart.py` | The tracker: a `sys.monitoring` tool (id 4) recording, per test context, the set of product `(file, qualname)` entered, plus outcomes and taints. Writes one compact SQLite per process. |
 | `../../../cbts_injectors/sitecustomize.py` | The bootstrap: starts the tracker in every Python process under `CBTS_COVERAGE_CONFIG`, reads the rcfile and the process role, subscribes product processes to the context channel, and saves periodically so coverage survives a non-clean exit. |
 | `../../../cbts_injectors/cbts_plugin.py` | The pytest plugin (`-p cbts_plugin`): owns the context channel, announces each test, records outcomes, and flushes the session's record at the end. |
 | `channel.py` | The context channel: an `AF_UNIX` broadcast of the current test from the pytest process to its subprocesses, plus the taint records produced when that guarantee fails. |
-| `pool.py` | The `MPIPoolExecutor.__init__` patch, counting each test's pool workers and forwarding the channel address to them. Kept apart from the plugin so the bootstrap can use it without importing pytest. |
+| `pool.py` | The `MPIPoolExecutor.__init__` patch, forwarding the channel address to spawned pool workers. Kept apart from the plugin so the bootstrap can use it without importing pytest. |
 | `compact_db.py` | The compact schema, the leaf writer, and the merge-closed reducer. Strings live once in dimension tables; process identity makes hierarchical merges idempotent. |
 | `hooks.py` | Explicit callback registry the bootstrap installs into when active, so peers (the pool patch, the pytest plugin) can call back without importing the guest-injected `sitecustomize` module. |
-| `import_watch.py` | The generic meta-path import-completion watcher (run a callback once a named module finishes executing), used by the bootstrap to detect the framework's import finishing. |
-| `process_roles.py` | Generic launch-target detection: opts pip/cmake/ninja/Ray-infra subtrees out of instrumentation, and identifies an `mpi4py.futures` pool worker so only that process type defers `PY_START` activation. |
+| `import_watch.py` | The generic meta-path import-completion watcher (run a callback once a named module finishes executing), used by the bootstrap to install the pool patch as `mpi4py.futures` finishes importing, and to patch `_sync_set_data` as `mpi4py.futures._lib` finishes importing. |
+| `process_roles.py` | Generic launch-target detection: opts pip/cmake/ninja/Ray-infra subtrees out of instrumentation, and identifies an `mpi4py.futures` pool worker so only that process type defers activation. |
 | `../../command/coverage/collection/pystart_report.py` | The CLI (`cbts.command coverage collection pystart-report`): unions compact databases and emits `--out-sqlite` (the selector artifact), `--out-dir` (a split HTML report) and `--out-json` (the full `test -> [file::qualname]` map). |
 | `coveragerc.template`, `make_coveragerc.sh` | The runtime rcfile: `[run] source`, `include` and `data_file`, with `@...@` placeholders substituted into `$JOB_WORKSPACE/.coveragerc`. |
 
@@ -79,24 +79,10 @@ friends) opt themselves and their spawned subtree out. pip and raylet launch the
 nobody to hand them a role; they are recognised from their launch target — the `-m` module or the
 script name, parsed out of the interpreter's own options.
 
-Every product process installs a meta-path finder that wraps the resolved loader so a hook runs the
-moment `exec_module` returns, watching for `mpi4py.futures` finishing its import to install the pool
-patch before any executor exists (needed regardless of role, since it's usually the *coordinator*,
-not a worker, that constructs the pool).
-
-What happens to `PY_START` itself then splits on one check, `process_roles.is_mpi_pool_worker()`
-(recognises an `mpi4py.futures` pool worker by its `-m mpi4py.futures.server` spawn signature):
-
-- **An MPI pool worker** additionally keys activation to `tensorrt_llm` finishing its import:
-  subscribe to the channel, then enable `PY_START` — in that order, so recording never starts on a
-  stale context — with a bounded timer (`CBTS_WORKER_ACTIVATE_MAX_SECONDS`) as backstop for a worker
-  that never imports the framework at all. Waiting for that import is deliberate: instrumenting the
-  cold-start import would overrun the `wait_shutdown` worker identity barrier
-  (`tensorrt_llm/llmapi/mpi_session.py`), a budget shared with the worker's own process spawn. The
-  cost is that module and class bodies executed during the deferred import go unrecorded; see
-  `COLLECTION.md` §5.2.
-- **Any other product process** (`trtllm-serve`, disagg helpers, ...) has no such barrier to protect,
-  so it subscribes and enables `PY_START` immediately — its import phase gets recorded too.
+A product process subscribes to the context channel, then enables `PY_START` — immediately, for
+every process except one: an `mpi4py.futures` pool worker (`MPIPoolExecutor`'s dynamic
+`MPI_Comm_spawn`, detected by `process_roles.is_mpi_pool_worker()`). See the next section for why
+that one process type defers both steps.
 
 ## The context channel
 
@@ -118,11 +104,27 @@ and disconnect; once they have, the stage's output directory is quiet and the re
 it. A subscriber that misses a deadline has its socket closed, which prompts that final save — a
 signal would prevent it.
 
-Workers learn the address through the pool patch. `CBTS_CONTEXT_SOCKET` exists only once
-`pytest_configure` has bound the socket, which is after the MPI runtime captured the environment it
-spawns workers with, so the patched `MPIPoolExecutor` forwards it through `mpi4py`'s own `env`
-payload — applied during the worker's sync handshake, in time for the framework import. Ordinary
-children inherit the variable at exec.
+The channel's address is announced via the `CBTS_CONTEXT_SOCKET` environment variable. Everything
+that gets it through ordinary process launch — a fork+exec'd child, or an `mpirun`-launched
+`MPICommExecutor` sibling (`mpirun` is itself invoked as a subprocess of the already-running,
+already-`pytest_configure`'d outer pytest, e.g. `tests/integration/defs/common.py`'s
+`venv_mpi_check_call`, so it inherits the live environment, address included, same as any child) —
+subscribes immediately at interpreter startup.
+
+An `MPIPoolExecutor` worker is the one exception: it is spawned via `MPI_Comm_spawn`, which does not
+inherit a live environment the way fork+exec does — mpi4py captures an environment snapshot once, at
+`MPI_Init` time, likely before `pytest_configure` ever bound the channel. So a worker's own address
+instead arrives later, forwarded by mpi4py itself: the coordinator's patched `MPIPoolExecutor.__init__`
+(`install_pool_env_patch`) merges it into the `env` kwarg of every pool it builds, and mpi4py carries
+that `env` dict inside the `options` payload applied by `_lib._sync_set_data`
+(`os.environ.update(data.pop('env'))`) during the worker's MPI sync handshake — which always runs
+before `server_exec` (the task loop, the only place product code runs).
+
+Rather than attempt (and always fail) an immediate subscribe for this one process type, the bootstrap
+defers its whole activation — subscribe and `PY_START` together — to that handshake: `sitecustomize.py`
+wraps `_sync_set_data` itself (`_install_worker_sync_hook`), so it fires right as the address lands and
+before any product code has run. Nothing is lost by waiting that long, since nothing would have run
+yet anyway.
 
 ## Granularity
 
@@ -131,10 +133,10 @@ children inherit the variable at exec.
 - **Unit tests** (`test_unittests_v2[entry]`): the inner pytest carries no plugin, so the whole batch
   runs under the one inherited `CBTS_TEST_ID`, which equals the test-db entry. This matches CBTS's
   selection granularity.
-- `co_qualname` gives `Class.method`, so results roll up function → class → file.
-- Comprehension, generator and lambda frames are skipped, and so is any frame whose qualname
-  contains `<locals>`: a decorator's `wrapper` or a registered callback leaves no row however often
-  it runs. The consumer widens such a change to file level; see `COLLECTION.md` §5.1.
+- `co_qualname` gives `Class.method`, so results roll up function → class → file. A named closure
+  (a decorator's `wrapper`, a registered callback) keeps its full nested qualname and rolls up the
+  same way; only a generator expression or lambda frame is skipped, since neither has a positional
+  identity to record one by. See `COLLECTION.md` §5.1.
 
 ## Taint
 
@@ -226,7 +228,10 @@ enum value regardless of what, if anything, is known about the process.
 | `subscriber_stopped_recording` | `incomplete` | producer | **every test from the loss onward** — a subscriber ejected for missing an ACK, dropped for never receiving a context, or lost to an EOF that is *not* confirmed dead (it may still be running, wedged on a stale context) |
 | `context_channel_unreachable` | both | the subscriber | `attribution` on its spawn context, `incomplete` stage-scoped |
 | `no_context_channel` | both | producer | stage-scoped — `pytest_configure` could not bind, so every process spent the session on its spawn context |
-| `worker_activation_timeout` | `incomplete` | the subscriber | stage-scoped — an MPI pool worker's own bootstrap backstop timer fired before the framework import completed |
+| `py_start_unavailable` | `incomplete` | the process | stage-scoped — `sys.monitoring`'s `PY_START` tool failed to register, so this process records zero touches for its whole life |
+| `pool_env_unavailable` | both | the coordinator | stage-scoped — forwarding the channel address into a spawned pool worker's env failed, so that worker has no later retry to find it either |
+| `context_switch_failed` | both | the producer | `attribution` on the current test, `incomplete` stage-scoped — the producer's own per-test context switch or announcement to subscribers failed |
+| `session_teardown_failed` | both | the producer | stage-scoped — something in session teardown failed outside the narrower paths that already self-taint |
 
 ### Storage
 
@@ -237,8 +242,7 @@ ordinary reducer unions them.
 A taint names the process whose rows are in doubt, which is not always the process that wrote the
 file — the producer records taints about its subscribers, which is why subscribers send
 `I <process_uid>` on connect, the same uid their own leaf database carries. Those uids are inserted
-into `process` but deliberately **not** into `process_case`: that table is what `saved_procs` counts,
-and a tainted process must not be mistaken for one that saved.
+into `process` without implying the process ever ran a test to completion.
 
 ## Output
 
@@ -262,7 +266,7 @@ For a coverage-rate report, pass the checkout as `--source-root`. The report rea
 from the same template as the collector, so its denominator covers the same library, examples,
 scripts, test_common and conftest scope.
 
-Every database uses schema version 4. `case_stage` stores a bare test ID beside its stage ID, and
+Every database uses schema version 5. `case_stage` stores a bare test ID beside its stage ID, and
 logical views reconstruct the selector's `<stage>/<test>` key. Integer IDs are local to a database,
 so the reducer resolves stage names, test IDs, file paths, qualnames and process UIDs when merging.
 `touch_rows`, `taint_rows` and `test_case_meta` expose the reconstructed logical rows.
@@ -287,14 +291,13 @@ c.execute("SELECT DISTINCT test FROM touch_rows WHERE file = ? AND stage = ?",
 dict(c.execute("SELECT key, value FROM meta"))
 ```
 
-A `(test, stage)` is safe to skip only when its coverage is complete: the test passed, every process
-it spawned saved, and the channel vouched for all of them. Force-run anything else:
+A `(test, stage)` is safe to skip only when its coverage is complete: the test passed, and the
+channel vouched for it. Force-run anything else:
 
 ```python
 # rows NOT safe to skip
 c.execute("SELECT test, stage FROM test_case_meta WHERE test != '' AND "
-          "(outcome IS NULL OR outcome != 'passed' OR saved_procs < expected_workers + 1 "
-          "OR tainted != 0)").fetchall()
+          "(outcome IS NULL OR outcome != 'passed' OR tainted != 0)").fetchall()
 # every test whose coverage is in doubt, which half is in doubt, and why
 c.execute("SELECT process, test, stage, kind, reason FROM taint_rows").fetchall()
 ```

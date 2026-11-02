@@ -3,7 +3,7 @@
 
 """Resolved settings for scheduled decoder execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -23,7 +23,6 @@ class DecoderRunnerConfig(RunnerConfig):
     dtype: torch.dtype
     enable_attention_dp: bool
     disable_overlap_scheduler: bool
-    is_encode_only: bool
     is_spec_decode: bool
     spec_config: DecodingBaseConfig | None
     max_draft_len: int
@@ -49,3 +48,7 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # The model takes the one-engine speculative fast paths
+    # (SpecDecOneEngineForCausalLM.spec_decode_fast_paths); False for a config
+    # built without it. Keyword-only, so subclasses may still add required fields.
+    spec_decode_fast_paths: bool = field(default=False, kw_only=True)

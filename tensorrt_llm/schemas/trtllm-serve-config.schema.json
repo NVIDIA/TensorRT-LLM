@@ -64,6 +64,13 @@
           "title": "Enable Balance",
           "type": "boolean"
         },
+        "enable_kv_balanced_admission": {
+          "default": false,
+          "description": "Admit generation-only requests by per-rank KV load. When True and the first 32 queued requests are all generation-only requests without an attention_dp_rank, the attention DP router chooses which of them to admit and which rank takes each, keeping the largest per-rank request count and KV token count low, instead of admitting them in queue order. Request priorities are respected, and a request passed over in 64 admitting rounds is admitted next. Useful on disaggregated generation workers. Has no effect with kv_cache_routing_conversation_affinity, or with enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+          "status": "prototype",
+          "title": "Enable Kv Balanced Admission",
+          "type": "boolean"
+        },
         "enable_kv_cache_aware_routing": {
           "default": false,
           "description": "Enable internal KV cache-aware routing for attention DP. When enabled, distributes requests among ranks within a single instance's attention DP group, routing them to the rank with the matching prefix KV cache to reduce redundant prefill computation.",
@@ -620,6 +627,15 @@
         "FORCE_CHUNK"
       ],
       "title": "ContextChunkingPolicy",
+      "type": "string"
+    },
+    "ContextSchedulingPolicy": {
+      "description": "Order in which the scheduler admits pending context requests.",
+      "enum": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "title": "ContextSchedulingPolicy",
       "type": "string"
     },
     "CpConfig": {
@@ -1836,7 +1852,7 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\ndouble-buffered P2P remote regions), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -1866,6 +1882,13 @@
           "default": 0,
           "description": "The number of prefetch experts per worker.",
           "title": "Num Prefetch Experts",
+          "type": "integer"
+        },
+        "num_prefetch_slots": {
+          "default": 2,
+          "description": "The number of expert prefetch buffer slots. Each slot holds the remote experts of one MoE layer; more slots let the prefetch run further ahead of the MoE compute, at the cost of device memory that is then not available to the KV cache.",
+          "minimum": 2,
+          "title": "Num Prefetch Slots",
           "type": "integer"
         }
       },
@@ -2104,19 +2127,6 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
-        },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
         },
         "sa_config": {
           "anyOf": [
@@ -2402,19 +2412,6 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
-        },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -3228,6 +3225,13 @@
           "description": "The class name of the worker within the module.",
           "title": "Connector Worker Class"
         },
+        "control_grace_sec": {
+          "default": 60.0,
+          "description": "Grace period in seconds for pending ADP KV connector transfers after cancellation or shutdown. Can only shorten the existing transfer deadline. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Control Grace Sec",
+          "type": "number"
+        },
         "mooncake_store": {
           "anyOf": [
             {
@@ -3252,6 +3256,13 @@
           "default": null,
           "description": "URL for an external connector server (e.g. 'tcp://localhost:5555'). Connectors that run in multi-process mode use this to reach the cache server.",
           "title": "Server Url"
+        },
+        "transfer_timeout_sec": {
+          "default": 600.0,
+          "description": "Deadline in seconds for an outstanding ADP KV connector transfer. Checked at polling gates; cannot interrupt blocking callbacks. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Transfer Timeout Sec",
+          "type": "number"
         }
       },
       "title": "KvCacheConnectorConfig",
@@ -3538,6 +3549,28 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "draft_lm_head_dtype": {
+          "default": "auto",
+          "description": "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "mxfp8"
+          ],
+          "status": "prototype",
+          "title": "Draft Lm Head Dtype",
+          "type": "string"
+        },
+        "draft_moe_dtype": {
+          "default": "auto",
+          "description": "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "Draft Moe Dtype",
+          "type": "string"
         },
         "dynamic_tree_max_topK": {
           "anyOf": [
@@ -4030,47 +4063,13 @@
         "load_balancer": {
           "anyOf": [
             {
-              "additionalProperties": false,
-              "description": "Pydantic configuration model for the Mixture of Experts (MoE) load balancer.\n\nThis model holds configuration data (`num_slots`, etc.) as well as\nruntime state (`_ep_rank`, `_ep_size`) which must be set via the\n`setup()` method before use.",
-              "properties": {
-                "initial_global_assignments": {
-                  "anyOf": [
-                    {
-                      "additionalProperties": {
-                        "items": {
-                          "type": "integer"
-                        },
-                        "type": "array"
-                      },
-                      "type": "object"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Initial Global Assignments"
-                },
-                "layer_updates_per_iter": {
-                  "default": 0,
-                  "title": "Layer Updates Per Iter",
-                  "type": "integer"
-                },
-                "num_slots": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Num Slots"
-                }
-              },
-              "title": "MoeLoadBalancerConfig",
-              "type": "object"
+              "$ref": "#/$defs/MoeLoadBalancerConfig"
+            },
+            {
+              "$ref": "#/$defs/MoePerLayerDynamicLoadBalancerConfig",
+              "required": [
+                "mode"
+              ]
             },
             {
               "type": [
@@ -4078,7 +4077,10 @@
                 "null"
               ]
             }
-          ]
+          ],
+          "default": null,
+          "description": "Configuration for standard or per-layer dynamic EPLB.",
+          "title": "Load Balancer"
         },
         "max_num_tokens": {
           "anyOf": [
@@ -4101,6 +4103,106 @@
         }
       },
       "title": "MoeConfig",
+      "type": "object"
+    },
+    "MoeLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure the standard asynchronous EPLB implementation.",
+      "properties": {
+        "initial_global_assignments": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert.",
+          "title": "Initial Global Assignments"
+        },
+        "layer_updates_per_iter": {
+          "default": 0,
+          "description": "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB.",
+          "title": "Layer Updates Per Iter",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "standard",
+          "default": "standard",
+          "description": "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
+          "title": "Num Slots"
+        }
+      },
+      "title": "MoeLoadBalancerConfig",
+      "type": "object"
+    },
+    "MoePerLayerDynamicLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
+      "properties": {
+        "auxiliary_sms": {
+          "default": 4,
+          "description": "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
+          "maximum": 8,
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Auxiliary Sms",
+          "type": "integer"
+        },
+        "helper_slot_mode": {
+          "default": "per_layer_resident",
+          "description": "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+          "enum": [
+            "per_layer_resident",
+            "shared_banks"
+          ],
+          "status": "prototype",
+          "title": "Helper Slot Mode",
+          "type": "string"
+        },
+        "mode": {
+          "const": "per_layer_dynamic",
+          "default": "per_layer_dynamic",
+          "description": "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not static replicas: every forward pass refills them from that layer's routing; see `helper_slot_mode` for their storage.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_slots"
+      ],
+      "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
     },
     "MooncakeStoreConfig": {
@@ -5870,6 +5972,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_scheduling_policy": {
+          "$ref": "#/$defs/ContextSchedulingPolicy",
+          "default": "fcfs",
+          "description": "Order in which pending context requests are admitted: 'fcfs' (arrival order) or 'shortest_uncached_first' (fewest prompt tokens not covered by reusable KV cache first, which lowers TTFT under load at the cost of fairness). Only the KV cache manager V2 scheduler supports 'shortest_uncached_first'.",
+          "status": "prototype"
+        },
+        "context_starvation_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With context_scheduling_policy='shortest_uncached_first', chunked prefill and a max_num_tokens budget: a context request pending for more than this many scheduler iterations takes up to a quarter of max_num_tokens of each iteration's budget ahead of the shortest-first order, oldest first. None disables it.",
+          "status": "prototype",
+          "title": "Context Starvation Iterations"
+        },
         "dynamic_batch_config": {
           "anyOf": [
             {
@@ -6348,7 +6471,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc2/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -7144,6 +7267,13 @@
       "title": "Mm Encoder Only",
       "type": "boolean"
     },
+    "mnnvl_allreduce_fp8_payload": {
+      "default": false,
+      "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+      "status": "prototype",
+      "title": "Mnnvl Allreduce Fp8 Payload",
+      "type": "boolean"
+    },
     "model": {
       "anyOf": [
         {
@@ -7526,6 +7656,13 @@
       "description": "The request reordering policy to use.",
       "status": "prototype"
     },
+    "replicate_embedding": {
+      "default": false,
+      "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+      "status": "prototype",
+      "title": "Replicate Embedding",
+      "type": "boolean"
+    },
     "request_stats_max_iterations": {
       "anyOf": [
         {
@@ -7572,6 +7709,21 @@
       "$ref": "#/$defs/SchedulerConfig",
       "description": "Scheduler config.",
       "status": "prototype"
+    },
+    "serve_frontend_affinity_port_stride": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+      "status": "prototype",
+      "title": "Serve Frontend Affinity Port Stride"
     },
     "skip_tokenizer_init": {
       "default": false,
@@ -7831,6 +7983,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc2 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --config",
   "type": "object"
 }

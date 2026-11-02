@@ -10,7 +10,9 @@ of the time a context server spends per request.
 The prefix-tokenization cache remembers the token ids of recent prompts. When a
 new prompt extends a cached one, it tokenizes only the tail and splices it onto
 the cached ids, so the cost of a turn scales with the delta rather than the
-whole prompt.
+whole prompt. The new prompt may also rewrite the last tokens of the cached one
+(those after the seam described below), as a chat template does when it
+replaces the previous turn's generation prefix with the response.
 
 Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
@@ -59,12 +61,15 @@ feature you turned on.
   completions apply the chat template and tokenize with
   `add_special_tokens=False`, so they benefit. `/v1/completions` defaults to
   `add_special_tokens=True` and is not accelerated.
-- A prompt that extends a cached entry replaces that entry, so a conversation
+- A prompt that reuses a cached entry replaces that entry, so a conversation
   costs one entry regardless of how many turns it has. Lookup is bucketed by a
   hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters, and each
-  entry keeps a short probe of its last characters so that conversations
-  sharing a long system preamble are told apart without comparing the
-  preamble. The candidate scan runs outside the cache lock.
+  entry keeps a short probe of the characters before its seam so that
+  conversations sharing a long system preamble are told apart without
+  comparing the preamble.
+- The router of a disaggregated server uses the same cache for its routing
+  token ids when its `context_servers` / `generation_servers` section sets
+  `enable_tokenization_cache`. The candidate scan runs outside the cache lock.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
 - The cache logs its configuration at startup and, every 1000 cache-eligible

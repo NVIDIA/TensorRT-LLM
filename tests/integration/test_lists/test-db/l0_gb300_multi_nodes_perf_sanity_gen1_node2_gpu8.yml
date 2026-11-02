@@ -22,3 +22,7 @@ l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con1_ctx1_dep2_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (45)
   # glm-5-fp4 8k1k con1024
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_glm-5-fp4_8k1k_con1024_ctx1_dep2_gen1_dep8_eplb256_mtp1_ccb-NIXL] TIMEOUT (30)
+  # kimi-k3-fp4 dspark 160k1k con16, helix CP8 gen worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_kimi-k3-fp4-dspark_160k1k_con16_ctx16_dwdp16_gen1_helix8_bs16_dspark5_ccb-NIXL] TIMEOUT (30)
+  # minimax-m3-fp4 eagle3 150k1k con128, DEP8 gen worker
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con128_ctx1_tp2_gen1_dep8_eplb0_eagle3_ccb-NIXL] TIMEOUT (35)
