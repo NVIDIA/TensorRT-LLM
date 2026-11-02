@@ -598,7 +598,16 @@ class Fa4Prefix(CtxPrefix):
     TILE_MN = (128, 128)
     NUM_THREADS = 384
 
-    def run(self, pool: torch.Tensor, sm_scale: float) -> None:
+    def __init__(self, tokens: int, num_heads: int, *args, **kwargs):
+        super().__init__(tokens, num_heads, *args, **kwargs)
+        # FA4's own LSE layout: [heads, tokens], natural log.
+        self.lse_nat = torch.empty(
+            (num_heads, tokens), dtype=torch.float32, device=self.lse.device
+        )
+
+    def run(self, pool: torch.Tensor, sm_scale: float, base2_lse: bool = True) -> None:
+        """Attend the shared pages. ``base2_lse`` also writes ``lse`` ([tokens, heads], base 2);
+        without it only ``lse_nat`` ([heads, tokens], natural log) holds the LSE."""
         from .flash_attn4_generation import _fa4_forward
 
         fwd = _fa4_forward()
@@ -618,9 +627,181 @@ class Fa4Prefix(CtxPrefix):
             pack_gqa=None,
             out=self.out,
             return_lse=True,
+            lse=self.lse_nat,
         )[:2]
-        # [heads, tokens] natural log -> [tokens, heads] base 2.
-        torch.mul(lse.transpose(0, 1), 1.4426950408889634, out=self.lse)
+        if base2_lse:
+            # [heads, tokens] natural log -> [tokens, heads] base 2.
+            torch.mul(lse.transpose(0, 1), 1.4426950408889634, out=self.lse)
+
+
+@triton.jit
+def _fa4_tail_table_kernel(
+    offsets_ptr,
+    offsets_row_stride,
+    perm_ptr,
+    shared_ptr,
+    kv_lens_ptr,
+    table_ptr,
+    table_row_stride,
+    tail_lens_ptr,
+    width,
+    page_div,
+    TPB: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HAS_PERM: tl.constexpr,
+):
+    # Program (i, c): grouped position i, page chunk c. Row b = perm[i] keeps its pages from
+    # its group's shared run onward: table[b, p] = offsets[b, shared + p] // page_div.
+    i = tl.program_id(0)
+    c = tl.program_id(1)
+    if HAS_PERM:
+        b = tl.load(perm_ptr + i).to(tl.int64)
+    else:
+        b = i.to(tl.int64)
+    shared = tl.load(shared_ptr + i).to(tl.int64)
+    if c == 0:
+        kv_len = tl.load(kv_lens_ptr + b)
+        tl.store(tail_lens_ptr + b, (kv_len - shared * TPB).to(tl.int32))
+    p = c * BLOCK + tl.arange(0, BLOCK)
+    src = shared + p
+    entry = tl.load(offsets_ptr + b * offsets_row_stride + src, mask=src < width, other=0)
+    tl.store(table_ptr + b * table_row_stride + p, (entry // page_div).to(tl.int32), mask=p < width)
+
+
+@triton.jit
+def _merge_fa4_tail_kernel(
+    pre_out_ptr,
+    pre_lse_ptr,
+    tail_out_ptr,
+    tail_lse_ptr,
+    perm_ptr,
+    pempty_ptr,
+    out_ptr,
+    out_sb,
+    ntok,
+    H: tl.constexpr,
+    HP: tl.constexpr,
+    D: tl.constexpr,
+    QL: tl.constexpr,
+    HAS_PERM: tl.constexpr,
+    HAS_EMPTY: tl.constexpr,
+):
+    # One program per grouped token t: the prefix state (normalized output, grouped order,
+    # LSE [heads, tokens]) joins the tail state (normalized output, batch order, LSE
+    # [rows, heads, QL]); both LSEs are FA4's natural log.
+    LOG2E: tl.constexpr = 1.4426950408889634
+    t = tl.program_id(0)
+    pos = t // QL
+    j = t % QL
+    if HAS_PERM:
+        row = tl.load(perm_ptr + pos).to(tl.int64)
+    else:
+        row = pos.to(tl.int64)
+    tok = row * QL + j
+    heads = tl.arange(0, HP)
+    h_ok = heads < H
+    dims = tl.arange(0, D)
+    lse_p = tl.load(pre_lse_ptr + heads * ntok + t, mask=h_ok, other=_NEG) * LOG2E
+    if HAS_EMPTY:
+        lse_p = tl.where(tl.load(pempty_ptr + pos) != 0, _NEG, lse_p)
+    lse_t = tl.load(tail_lse_ptr + (row * H + heads) * QL + j, mask=h_ok, other=_NEG) * LOG2E
+    peak = tl.maximum(lse_p, lse_t)
+    w_p = tl.exp2(lse_p - peak)
+    w_t = tl.exp2(lse_t - peak)
+    pre = tl.load(
+        pre_out_ptr + (t.to(tl.int64) * H + heads[:, None]) * D + dims[None, :],
+        mask=h_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    tail = tl.load(
+        tail_out_ptr + (tok * H + heads[:, None]) * D + dims[None, :],
+        mask=h_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    res = (w_p[:, None] * pre + w_t[:, None] * tail) / (w_p + w_t)[:, None]
+    tl.store(
+        out_ptr + tok * out_sb + heads[:, None] * D + dims[None, :],
+        res.to(out_ptr.dtype.element_ty),
+        mask=h_ok[:, None],
+    )
+
+
+class Fa4Tail:
+    """The rows' private pages through FlashAttention-4 (SM90), paired with ``Fa4Prefix``.
+
+    Every row's pages from its group's shared run onward form the row's own page table
+    (``table``, batch order, rebuilt once per step on the device from the attention op's
+    block offsets), and its KV length past the shared run (``tail_lens``). The step's K/V is
+    written into those pages, then FA4's paged decode (causal, bottom-right aligned) attends
+    them and returns the normalized output and LSE that ``_merge_fa4_tail_kernel`` joins with
+    the prefix state. The tables are fixed-address, so the layer can be captured in a graph.
+    """
+
+    def __init__(
+        self, rows: int, q_len: int, num_heads: int, head_dim: int, max_pages: int, dtype, device
+    ):
+        self.rows = rows
+        self.q_len = q_len
+        self.table = torch.zeros((rows, max_pages), dtype=torch.int32, device=device)
+        self.tail_lens = torch.zeros((rows,), dtype=torch.int32, device=device)
+        self.out = torch.empty((rows * q_len, num_heads, head_dim), dtype=dtype, device=device)
+        self.lse = torch.empty((rows, num_heads, q_len), dtype=torch.float32, device=device)
+
+    def build_tables(
+        self,
+        offsets: torch.Tensor,
+        perm: Optional[torch.Tensor],
+        shared_pages: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_div: int,
+        tokens_per_block: int,
+    ) -> None:
+        """Once per step: the rows' tail page tables and lengths.
+
+        Args:
+            offsets: [rows, max_blocks] int32 device block offsets of the rows (batch order).
+            perm: [rows] batch row of each grouped position (None: identity).
+            shared_pages: [rows] int32, grouped order: shared pages of the row's group.
+            kv_lens: [rows] int32 device KV lengths including the step's tokens (batch order).
+            page_div: offset entries per pool-view page (the KV factor).
+        """
+        assert offsets.stride(-1) == 1 and offsets.shape[0] >= self.rows
+        width = min(int(offsets.shape[-1]), int(self.table.shape[1]))
+        block = 256
+        _fa4_tail_table_kernel[(self.rows, triton.cdiv(width, block))](
+            offsets, offsets.stride(0), perm if perm is not None else shared_pages,
+            shared_pages, kv_lens, self.table, self.table.stride(0), self.tail_lens,
+            width, page_div, TPB=tokens_per_block, BLOCK=block, HAS_PERM=perm is not None,
+        )  # fmt: skip
+
+    def run(
+        self, pool: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
+    ) -> None:
+        from .flash_attn4_generation import (
+            FA4_NUM_THREADS,
+            FA4_TILE_MN,
+            _fa4_forward,
+            write_kv_paged,
+        )
+
+        tokens, num_heads, head_dim = q.shape
+        write_kv_paged(pool, k, v, self.table, self.tail_lens, self.q_len)
+        _fa4_forward()(
+            q.view(self.rows, self.q_len, num_heads, head_dim),
+            pool[:, 0].transpose(1, 2),
+            pool[:, 1].transpose(1, 2),
+            seqused_k=self.tail_lens,
+            page_table=self.table,
+            softmax_scale=sm_scale,
+            causal=True,
+            tile_mn=FA4_TILE_MN,
+            num_threads=FA4_NUM_THREADS,
+            num_splits=1,
+            pack_gqa=None,
+            out=self.out.view(self.rows, self.q_len, num_heads, head_dim),
+            return_lse=True,
+            lse=self.lse,
+        )
 
 
 def fa4_prefix_supported(head_dim: int, dtype: torch.dtype, device=None) -> bool:
@@ -778,6 +959,7 @@ def fused_sampling_attention(
     tail_num_stages: int = 2,
     sm90_tune: bool = True,  # apply SM90-specific tuning (evict_last already in kernel)
     ctx: Optional[CtxPrefix] = None,
+    fa4_tail: Optional[Fa4Tail] = None,
 ) -> None:
     """One layer: persist the step's K/V, attend prefix + tail, write ``out`` (batch order).
 
@@ -809,6 +991,9 @@ def fused_sampling_attention(
         ctx: serve the shared pages through the TRTLLM-Gen context kernel (see ``CtxPrefix``;
             its tables must describe the same groups). The Triton prefix launch is skipped and
             ``prefix_splits`` is ignored; the workspace needs ``tail_splits`` slots.
+        fa4_tail: with an ``Fa4Prefix`` ``ctx``, serve the private pages through FlashAttention-4
+            (see ``Fa4Tail``; its tables must be built for this step) instead of the Triton tail
+            launch; the tail arguments and the workspace are then unused.
     """
     ntok, num_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
@@ -862,6 +1047,18 @@ def fused_sampling_attention(
             H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, QL=q_len,
             HAS_PERM=perm is not None, num_warps=4,
         )  # fmt: skip
+        if fa4_tail is not None:
+            assert isinstance(ctx, Fa4Prefix)
+            ctx.run(pool, sm_scale, base2_lse=False)
+            fa4_tail.run(pool, q, k, v, sm_scale)
+            _merge_fa4_tail_kernel[(ntok,)](
+                ctx.out, ctx.lse_nat, fa4_tail.out, fa4_tail.lse,
+                perm if perm is not None else write_page,
+                prefix_empty if prefix_empty is not None else write_page, out, out.stride(0), ntok,
+                H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, QL=q_len,
+                HAS_PERM=perm is not None, HAS_EMPTY=prefix_empty is not None, num_warps=4,
+            )  # fmt: skip
+            return
         ctx.run(pool, sm_scale)
         launch(2, num_tail, tail_num_warps, tail_num_stages, block_nt)
         _merge_ctx_kernel[(ntok,)](
