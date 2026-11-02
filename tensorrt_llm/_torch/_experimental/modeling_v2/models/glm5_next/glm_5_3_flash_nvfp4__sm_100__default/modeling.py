@@ -51,7 +51,12 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
     glm_kpool_cache_row_dim,
 )
 from tensorrt_llm._torch.attention.backends.utils import create_attention
-from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+from tensorrt_llm._torch.distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    AllReduceStrategy,
+)
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
@@ -143,6 +148,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.modules.layer_norm.LayerNorm",
     "tensorrt_llm._torch.modules.embedding.Embedding",
     "tensorrt_llm._torch.distributed.AllReduce",
+    "tensorrt_llm._torch.distributed.AllReduceFusionOp",
+    "tensorrt_llm._torch.distributed.AllReduceParams",
     "tensorrt_llm._torch.modules.multi_stream_utils.maybe_execute_in_parallel",
     # The in-model MTP step: target-token sampling, strict acceptance, the draft argmax's TP exchange, the forced
     # acceptance of benchmarks, the prompt-lookahead sentinel and the MoE load balancer's count of the MTP layer.
@@ -296,6 +303,24 @@ class Glm5NextAllReduce(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.contiguous()
         return (self.small if x.shape[0] <= self.SMALL_MAX_TOKENS else self.large)(x)
+
+    def residual_rms_norm(
+        self, x: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(norm(sum(x) + residual), sum(x) + residual)``: the reduction, the residual add and ``norm`` in one
+        collective (the strategies without a fused kernel run the add and the norm after the reduction)."""
+        x = x.contiguous()
+        reduce = self.small if x.shape[0] <= self.SMALL_MAX_TOKENS else self.large
+        normed, summed = reduce(
+            x,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                residual=residual.contiguous(),
+                norm_weight=norm.weight,
+                eps=norm.variance_epsilon,
+            ),
+        )
+        return normed, summed
 
 
 # ---------------------------------------------------------------------------
@@ -1810,11 +1835,13 @@ class Glm5NextSparseAttention(nn.Module):
         attn_metadata: AttentionMetadata,
         *,
         runtime_ctx: Glm5NextRuntimeContext | None = None,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """Process a packed batch, splitting phases only inside attention.
 
         Reuse the model's per-forward schedules and row cache across layers.
-        Reduce the complete output once, including context/verify mixtures.
+        Reduce the complete output once, including context/verify mixtures;
+        ``reduce=False`` returns the rank partial for the caller to reduce.
         """
         ctx = (
             runtime_ctx
@@ -1855,7 +1882,7 @@ class Glm5NextSparseAttention(nn.Module):
                 )
             parts.append(out)
         out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
-        return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
+        return out if not reduce or self.tp_all_reduce is None else self.tp_all_reduce(out)
 
     def forward_verify(
         self,
@@ -2080,8 +2107,9 @@ class Glm5NextMoE(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, all_rank_num_tokens: list[int] | None = None
+        self, x: torch.Tensor, all_rank_num_tokens: list[int] | None = None, reduce: bool = True
     ) -> torch.Tensor:
+        """The MoE branch's output; ``reduce=False`` returns the rank partial for the caller to reduce."""
         flat = x.reshape(-1, self.hidden_size)
         # The fused layer routes internally from the FP32 logits and runs
         # FC1 -> clamped SwiGLU -> FC2 in one backend call; one code path
@@ -2108,7 +2136,7 @@ class Glm5NextMoE(nn.Module):
         # layout). Sum them, then exactly one reduction covers the whole MoE
         # branch -- the DeepSeek-V3 order.
         mixed = routed + shared
-        if self.moe_all_reduce is not None:
+        if reduce and self.moe_all_reduce is not None:
             mixed = self.moe_all_reduce(mixed)
         return mixed.view_as(x)
 
@@ -2597,16 +2625,30 @@ class Glm5NextMTP(nn.Module):
         runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         residual = hidden_states
         attn_in = self.input_layernorm(hidden_states)
-        attn_out = self.self_attn(attn_in, attn_metadata, runtime_ctx=runtime_ctx)
-        hidden_states = residual + attn_out
+        # Under TP each branch's reduction runs fused with the residual add and the norm after it; picked rows are
+        # taken before the reduction (rows are independent), so it moves only those.
+        attn_reduce = self.self_attn.tp_all_reduce
+        moe_reduce = self.mlp.moe_all_reduce
+        fused = attn_reduce is not None and moe_reduce is not None
+        attn_out = self.self_attn(attn_in, attn_metadata, runtime_ctx=runtime_ctx, reduce=not fused)
         if pick_rows is not None:
-            hidden_states = hidden_states[pick_rows]
-
-        residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states), all_rank_num_tokens)
-        hidden_states = residual + hidden_states
-
-        hidden_states = self.shared_head.norm(hidden_states)
+            attn_out = attn_out[pick_rows]
+            residual = residual[pick_rows]
+        if fused:
+            mlp_in, hidden_states = attn_reduce.residual_rms_norm(
+                attn_out, residual, self.post_attention_layernorm
+            )
+            moe_out = self.mlp(mlp_in, all_rank_num_tokens, reduce=False)
+            hidden_states, _ = moe_reduce.residual_rms_norm(
+                moe_out, hidden_states, self.shared_head.norm
+            )
+        else:
+            hidden_states = residual + attn_out
+            residual = hidden_states
+            hidden_states = self.mlp(
+                self.post_attention_layernorm(hidden_states), all_rank_num_tokens
+            )
+            hidden_states = self.shared_head.norm(residual + hidden_states)
         if spec_metadata is not None:
             # Two-model-path hook kept for parity with the DeepSeek-V3 MTP layer.
             spec_metadata.maybe_capture_hidden_states(0, hidden_states, None)
