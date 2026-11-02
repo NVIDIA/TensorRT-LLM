@@ -1107,6 +1107,11 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         outputs: dict[str, Any] = {}
         for name, value in graph_outputs.items():
             if isinstance(value, torch.Tensor):
+                if value.is_nested:
+                    raise ValueError(
+                        f"Encoder CUDA graphs require dense outputs, but {name!r} is a "
+                        "nested tensor; remove cuda_graph_config for this model."
+                    )
                 if name == "logits":
                     value = value[: len(prepared.sequence_lengths)]
                 outputs[name] = value.clone()
