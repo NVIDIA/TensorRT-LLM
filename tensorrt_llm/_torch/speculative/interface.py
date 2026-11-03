@@ -3756,7 +3756,8 @@ class SpecWorkerBase(nn.Module, ABC):
             if spec_metadata.sharded_target_logits:
                 # Temperature-only batch: the logits are this rank's
                 # vocabulary shard.
-                return self._sample_sharded_temperature(logits, temperatures), None
+                return self._sample_sharded_temperature(logits,
+                                                        temperatures), None
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
             min_ps = spec_metadata.min_ps[:num_tokens]
