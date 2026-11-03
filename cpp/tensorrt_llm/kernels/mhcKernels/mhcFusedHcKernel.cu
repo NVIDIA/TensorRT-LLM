@@ -95,22 +95,34 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
 
 } // namespace
 
-int mhcFusedHcMmaKSplits(int M, int num_k_splits, bool all_in_one)
+int mhcFusedHcMmaKSplits(int M, int numKSplits, bool allInOne)
 {
-    if (num_k_splits > 0)
-        return num_k_splits;
-    if (all_in_one)
+    if (numKSplits > 0)
+    {
+        return numKSplits;
+    }
+    if (allInOne)
+    {
         return 1;
+    }
     // Heuristic split-K selection driven by M. Keeps large-M waves compute-bound
     // (low splits) and low-M waves fully occupied (high splits).
     if (M <= 512)
+    {
         return 16;
+    }
     if (M <= 1024)
+    {
         return 8;
+    }
     if (M <= 2048)
+    {
         return 4;
+    }
     if (M <= 4096)
+    {
         return 2;
+    }
     return 1;
 }
 
@@ -425,7 +437,7 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
     // Workspaces are per-split: y_acc [ks, M, SHAPE_N] and r_acc [ks, M]. Every slot is written by exactly
     // one CTA (no atomics, no pre-zeroing), and the big-fuse step sums the splits in split order.
-    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*all_in_one=*/false));
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*allInOne=*/false));
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
@@ -699,7 +711,7 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     uint32_t const m_u = static_cast<uint32_t>(M);
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*all_in_one=*/true));
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*allInOne=*/true));
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
 
     // ---- Zero the per-m_block done counters (Phase-3 barrier) ----

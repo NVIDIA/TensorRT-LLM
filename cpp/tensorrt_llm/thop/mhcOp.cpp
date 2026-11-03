@@ -181,11 +181,11 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
         {
             num_k_splits = tk::mhcFusedHcMmaKSplits(static_cast<int>(M), static_cast<int>(num_k_splits), backend == 2);
         }
-        int64_t const num_splits = std::max<int64_t>(num_k_splits, 1);
-        int64_t const shape_n = hc_mult * (2 + hc_mult);
-        TORCH_CHECK(y_acc_workspace.numel() >= num_splits * M * shape_n && r_acc_workspace.numel() >= num_splits * M,
-            "mhc_fused_hc: backend ", backend, " with num_k_splits=", num_splits, " needs y_acc_workspace of ",
-            num_splits * M * shape_n, " and r_acc_workspace of ", num_splits * M, " fp32 elements, got ",
+        int64_t const numSplits = std::max<int64_t>(num_k_splits, 1);
+        int64_t const shapeN = hc_mult * (2 + hc_mult);
+        TORCH_CHECK(y_acc_workspace.numel() >= numSplits * M * shapeN && r_acc_workspace.numel() >= numSplits * M,
+            "mhc_fused_hc: backend ", backend, " with num_k_splits=", numSplits, " needs y_acc_workspace of ",
+            numSplits * M * shapeN, " and r_acc_workspace of ", numSplits * M, " fp32 elements, got ",
             y_acc_workspace.numel(), " and ", r_acc_workspace.numel());
     }
 

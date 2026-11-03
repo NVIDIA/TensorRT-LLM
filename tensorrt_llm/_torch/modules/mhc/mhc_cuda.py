@@ -679,9 +679,14 @@ _FUSED_HC_BIGFUSE_BS = _BIGFUSE_BLOCK_SIZE_OPTIONS
 # block size.
 #
 # This fixes one choice only. Each tactic is reproducible on its own, but the autotuner still picks
-# among tactics that sum in different orders: fused_all_fma at ks 1 or 2 (M <= 32), FMA or MMA at
-# M == 32, fused_half_mma or fused_all_mma (M >= 64), and the two BigFuse block sizes offered at
-# M == 1024 and M >= 8192, so separate tuning runs can still settle on different numerics there.
+# among tactics that sum in different orders:
+#   - fused_all_fma at ks 1 or 2 (M <= 32), and off SM103 every half-FMA split count and block size;
+#   - FMA or MMA at M == 32, and fused_half_mma or fused_all_mma (M >= 64);
+#   - on SM107, the MMA split count in every M >= 32 bucket;
+#   - the two BigFuse block sizes offered at M == 1024 and M >= 8192;
+#   - in mhc_pre_mapping, FMA, DeepGEMM split-K or DeepGEMM without split, and the BigFuse block
+#     size, in every token bucket.
+# Separate tuning runs can settle any of these on different numerics.
 _FUSED_HC_SMALL_M_FMA_KS = ((4, 4), (32, 2))
 _FUSED_HC_SMALL_M_FMA_BS = 512
 

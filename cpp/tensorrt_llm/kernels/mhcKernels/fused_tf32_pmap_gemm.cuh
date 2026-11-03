@@ -744,11 +744,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
             // One CTA owns each (split, row) slot: store this split's partial; splits are summed in order later.
-            uint64_t const split_base = static_cast<uint64_t>(k_split_idx) * shape_m;
+            uint64_t const splitBase = static_cast<uint64_t>(k_split_idx) * shape_m;
             if (gm_u < shape_m)
-                sqr_sum[split_base + gm_u] = sqr_u;
+            {
+                sqr_sum[splitBase + gm_u] = sqr_u;
+            }
             if (gm_l < shape_m)
-                sqr_sum[split_base + gm_l] = sqr_l;
+            {
+                sqr_sum[splitBase + gm_l] = sqr_l;
+            }
         }
     }
 #else
@@ -1270,11 +1274,15 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
             // One CTA owns each (split, row) slot: store this split's partial; splits are summed in order later.
-            uint64_t const split_base = static_cast<uint64_t>(k_split_idx) * shape_m;
+            uint64_t const splitBase = static_cast<uint64_t>(k_split_idx) * shape_m;
             if (gm_u < shape_m)
-                sqr_sum[split_base + gm_u] = sqr_u;
+            {
+                sqr_sum[splitBase + gm_u] = sqr_u;
+            }
             if (gm_l < shape_m)
-                sqr_sum[split_base + gm_l] = sqr_l;
+            {
+                sqr_sum[splitBase + gm_l] = sqr_l;
+            }
         }
     }
 
@@ -1384,7 +1392,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         // 0..HC_MULT-1 then gather the mixes of their row and the sqr-sum. The skips above are warp-uniform, so
         // every lane reaches the shuffles.
         static_assert(SHAPE_N < WARP_SIZE_BF, "one lane per split-reduced value (SHAPE_N mixes + sqr-sum)");
-        float split_sum = 0.f;
+        float splitSum = 0.0F;
         if (lane_bf <= SHAPE_N)
         {
             // Load up to kSplitChunk partials with independent loads, then add them in split order, so high split
@@ -1400,30 +1408,34 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                     uint64_t const row = static_cast<uint64_t>(base + i) * shape_m + tok;
                     part[i] = (base + i < kNumSplits)
                         ? ((lane_bf < SHAPE_N) ? D[row * SHAPE_N + lane_bf] : sqr_sum[row])
-                        : 0.f;
+                        : 0.0F;
                 }
 #pragma unroll
                 for (uint32_t i = 0; i < kSplitChunk; ++i)
                 {
                     if (base + i < kNumSplits)
-                        split_sum += part[i];
+                    {
+                        splitSum += part[i];
+                    }
                 }
             }
         }
-        uint32_t const row_lane = lane_bf & (HC_MULT - 1);
-        float const r_val = __shfl_sync(0xffffffffu, split_sum, SHAPE_N);
-        float const y_pre = __shfl_sync(0xffffffffu, split_sum, row_lane);
-        float const y_post = __shfl_sync(0xffffffffu, split_sum, HC_MULT + row_lane);
-        float y_comb[HC_MULT];
+        uint32_t const rowLane = lane_bf & (HC_MULT - 1);
+        float const r_val = __shfl_sync(0xFFFFFFFFU, splitSum, SHAPE_N);
+        float const yPre = __shfl_sync(0xFFFFFFFFU, splitSum, rowLane);
+        float const yPost = __shfl_sync(0xFFFFFFFFU, splitSum, HC_MULT + rowLane);
+        float yComb[HC_MULT];
 #pragma unroll
         for (uint32_t k = 0; k < HC_MULT; ++k)
-            y_comb[k] = __shfl_sync(0xffffffffu, split_sum, 2 * HC_MULT + row_lane * HC_MULT + k);
+        {
+            yComb[k] = __shfl_sync(0xFFFFFFFFU, splitSum, 2 * HC_MULT + rowLane * HC_MULT + k);
+        }
         if (lane_bf < HC_MULT)
         {
             float const rstd = rsqrtf(r_val / static_cast<float>(HC_MULT * HIDDEN) + rms_eps);
             float const s0 = hc_scale[0];
 
-            float v = y_pre * rstd * s0 + hc_base[lane_bf];
+            float v = yPre * rstd * s0 + hc_base[lane_bf];
             pre_mix_local = 1.0f / (1.0f + __expf(-v)) + hc_pre_eps;
             if constexpr (kLaggedPre)
             {
@@ -1435,14 +1447,14 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             {
                 float const s1 = hc_scale[1];
                 float const s2 = hc_scale[2];
-                v = y_post * rstd * s1 + hc_base[HC_MULT + lane_bf];
+                v = yPost * rstd * s1 + hc_base[HC_MULT + lane_bf];
                 float const post_val = 1.0f / (1.0f + __expf(-v)) * hc_post_mult_value;
                 post_mix_out[tok * HC_MULT + lane_bf] = post_val;
 
                 float cm_vals[HC_MULT];
 #pragma unroll
                 for (uint32_t k = 0; k < HC_MULT; ++k)
-                    cm_vals[k] = y_comb[k] * rstd * s2 + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
+                    cm_vals[k] = yComb[k] * rstd * s2 + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
 
                 constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
                 float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));

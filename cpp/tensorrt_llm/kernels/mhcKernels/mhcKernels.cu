@@ -48,7 +48,7 @@ __device__ __forceinline__ float2 mhcFmaF32x2(float2 const& a, float2 const& b, 
 //
 //  Template parameters:
 //    NUM_SPLITS:  split-K reduction (1 = direct, >1 = sum across splits,
-//                 0 = runtime split count `num_splits_runtime`). Splits are
+//                 0 = runtime split count `numSplitsRuntime`). Splits are
 //                 always summed in a fixed order (split order for NUM_SPLITS
 //                 > 1, warp-strided for NUM_SPLITS == 0), so the result is
 //                 independent of how the producer's split CTAs were scheduled.
@@ -79,7 +79,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // false) ignores both pointers and behaves exactly as before.
     float const* __restrict__ pre_mix_ext = nullptr, float* __restrict__ pre_mix_out = nullptr,
     // Split count when NUM_SPLITS == 0; ignored otherwise.
-    int num_splits_runtime = 0)
+    int numSplitsRuntime = 0)
 {
     constexpr int HC_MULT = 4;
     constexpr int HC_MULT2 = HC_MULT * HC_MULT;       // 16 comb_mix entries
@@ -136,13 +136,13 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // alone in split order. Either order is fixed, so the result is independent of how the producer's split CTAs
     // ran. Two and four splits are summed per lane in Phase 1a.
     constexpr bool kLaneSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 8;
-    float r_split = 0.0f;
-    float y_pre_split = 0.0f;
-    float y_post_split = 0.0f;
-    float cm_split[HC_MULT] = {};
+    float rSplit = 0.0F;
+    float yPreSplit = 0.0F;
+    float yPostSplit = 0.0F;
+    float cmSplit[HC_MULT] = {};
     if constexpr (kLaneSplitSum)
     {
-        float split_sum = 0.0f;
+        float splitSum = 0.0F;
         if constexpr (NUM_SPLITS == 0)
         {
             constexpr int kNumWarps = BLOCK_SIZE / WARP_SIZE;
@@ -150,44 +150,48 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             // kMaxUnrolledSplits add their remaining splits one by one.
             constexpr int kMaxUnrolledSplits = 112;
             constexpr int kSplitsPerWarp = (kMaxUnrolledSplits + kNumWarps - 1) / kNumWarps;
-            __shared__ float s_split_part[kNumWarps][HC_MULT3 + 1];
+            __shared__ float sSplitPart[kNumWarps][HC_MULT3 + 1];
             if (lane <= HC_MULT3)
             {
                 // Lanes 0..HC_MULT3-1 read the mixes from y_acc [splits, M, HC_MULT3], lane HC_MULT3 the sqr-sum from
                 // r_acc [splits, M]; one pointer and a fixed offset step per warp keep the address math to one
                 // register.
-                bool const is_mix = lane < HC_MULT3;
-                float const* const src = is_mix ? y_acc + lane : r_acc;
-                int const split_step = is_mix ? M * HC_MULT3 : M;
-                int const warp_step = kNumWarps * split_step;
-                int off = (is_mix ? token * HC_MULT3 : token) + warp_id * split_step;
+                bool const isMix = lane < HC_MULT3;
+                float const* const src = isMix ? y_acc + lane : r_acc;
+                int const splitStep = isMix ? M * HC_MULT3 : M;
+                int const warpStep = kNumWarps * splitStep;
+                int off = (isMix ? token * HC_MULT3 : token) + warp_id * splitStep;
                 float vals[kSplitsPerWarp];
 #pragma unroll
                 for (int i = 0; i < kSplitsPerWarp; i++)
                 {
-                    vals[i] = (warp_id + i * kNumWarps < num_splits_runtime) ? src[off] : 0.0f;
-                    off += warp_step;
+                    vals[i] = (warp_id + i * kNumWarps < numSplitsRuntime) ? src[off] : 0.0F;
+                    off += warpStep;
                 }
-                float part = 0.0f;
+                float part = 0.0F;
 #pragma unroll
                 for (int i = 0; i < kSplitsPerWarp; i++)
                 {
-                    if (warp_id + i * kNumWarps < num_splits_runtime)
+                    if (warp_id + i * kNumWarps < numSplitsRuntime)
+                    {
                         part += vals[i];
+                    }
                 }
-                for (int s = warp_id + kSplitsPerWarp * kNumWarps; s < num_splits_runtime; s += kNumWarps)
+                for (int s = warp_id + kSplitsPerWarp * kNumWarps; s < numSplitsRuntime; s += kNumWarps)
                 {
                     part += src[off];
-                    off += warp_step;
+                    off += warpStep;
                 }
-                s_split_part[warp_id][lane] = part;
+                sSplitPart[warp_id][lane] = part;
             }
             __syncthreads();
             if (warp_id == 0 && lane <= HC_MULT3)
             {
 #pragma unroll
                 for (int w = 0; w < kNumWarps; w++)
-                    split_sum += s_split_part[w][lane];
+                {
+                    splitSum += sSplitPart[w][lane];
+                }
             }
         }
         else if (warp_id == 0 && lane <= HC_MULT3)
@@ -196,19 +200,21 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             for (int s = 0; s < NUM_SPLITS; s++)
             {
                 long long const row = static_cast<long long>(s) * M + token;
-                split_sum += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
+                splitSum += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
             }
         }
         if (warp_id == 0)
         {
-            unsigned constexpr kFullMask = 0xffffffffu;
-            int const row_lane = lane & (HC_MULT - 1);
-            r_split = __shfl_sync(kFullMask, split_sum, HC_MULT3);
-            y_pre_split = __shfl_sync(kFullMask, split_sum, row_lane);
-            y_post_split = __shfl_sync(kFullMask, split_sum, HC_MULT + row_lane);
+            unsigned constexpr kFullMask = 0xFFFFFFFFU;
+            int const rowLane = lane & (HC_MULT - 1);
+            rSplit = __shfl_sync(kFullMask, splitSum, HC_MULT3);
+            yPreSplit = __shfl_sync(kFullMask, splitSum, rowLane);
+            yPostSplit = __shfl_sync(kFullMask, splitSum, HC_MULT + rowLane);
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
-                cm_split[k] = __shfl_sync(kFullMask, split_sum, 2 * HC_MULT + row_lane * HC_MULT + k);
+            {
+                cmSplit[k] = __shfl_sync(kFullMask, splitSum, 2 * HC_MULT + rowLane * HC_MULT + k);
+            }
         }
     }
 
@@ -237,12 +243,14 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
         }
         else if constexpr (kLaneSplitSum)
         {
-            r_val = r_split;
-            y_pre = y_pre_split;
-            y_post = y_post_split;
+            r_val = rSplit;
+            y_pre = yPreSplit;
+            y_post = yPostSplit;
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
-                cm[k] = cm_split[k];
+            {
+                cm[k] = cmSplit[k];
+            }
         }
         else
         {
@@ -532,7 +540,7 @@ INST_BIGFUSE(8, 512)
 INST_BIGFUSE(16, 128)
 INST_BIGFUSE(16, 256)
 INST_BIGFUSE(16, 512)
-// NS = 0: split count read at runtime (num_splits_runtime).
+// NS = 0: split count read at runtime (numSplitsRuntime).
 INST_BIGFUSE(0, 128)
 INST_BIGFUSE(0, 256)
 INST_BIGFUSE(0, 512)
@@ -980,7 +988,7 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
     float const* hc_scale, float const* hc_base, float* post_mix, float* comb_mix, __nv_bfloat16* layer_input, int M,
     int K, int hidden_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
     int sinkhorn_repeat, int block_size, __nv_bfloat16 const* norm_weight, float norm_eps, float const* pre_mix_ext,
-    float* pre_mix_out, int num_splits_runtime, cudaStream_t stream)
+    float* pre_mix_out, int numSplitsRuntime, cudaStream_t stream)
 {
     dim3 grid(static_cast<unsigned int>(M));
 
@@ -989,7 +997,7 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
         mhcBigFuseKernel<NUM_SPLITS, BS, kFuseNorm, USE_TMA, kLaggedPre>, grid, dim3(BS), SMEM_BYTES, stream, y_acc,   \
         r_acc, residual, hc_scale, hc_base, post_mix, comb_mix, layer_input, M, K, hidden_size, rms_eps, hc_pre_eps,   \
         hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, pre_mix_ext, pre_mix_out,         \
-        num_splits_runtime)
+        numSplitsRuntime)
     if (block_size >= 512)
     {
         // BS512 is the measured winner for the small-M one-wave regime. Bulk
@@ -1002,11 +1010,11 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
         {
             if (M <= 64)
             {
-                size_t const tma_smem_bytes = static_cast<size_t>(4) * hidden_size * sizeof(__nv_bfloat16);
+                size_t const tmaSmemBytes = static_cast<size_t>(4) * hidden_size * sizeof(__nv_bfloat16);
                 TLLM_CUDA_CHECK(cudaFuncSetAttribute(
                     reinterpret_cast<void const*>(mhcBigFuseKernel<NUM_SPLITS, 512, kFuseNorm, true, kLaggedPre>),
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tma_smem_bytes)));
-                LAUNCH_BF(512, true, tma_smem_bytes);
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tmaSmemBytes)));
+                LAUNCH_BF(512, true, tmaSmemBytes);
             }
             else
             {
