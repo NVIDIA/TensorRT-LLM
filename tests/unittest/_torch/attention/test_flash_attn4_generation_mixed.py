@@ -14,7 +14,7 @@
 # limitations under the License.
 """Mixed context+generation batches through TrtllmAttention with FlashAttention-4 enabled.
 
-The context requests run on the regular op (a context-only call) and the generation rows on
+The context requests run on the regular op (its context phase) and the generation rows on
 FA4 (``CombinedFmha``); the whole forward is compared with the VanillaAttention dense
 reference, and the KV cache is checked to hold every new token (``run_backend``).
 """
@@ -65,10 +65,13 @@ def _case(num_heads, num_kv_heads, q_len, *, gen_lens=None):
 
 @pytest.fixture
 def spies(monkeypatch):
-    """Record FA4 generation calls and the input type of every regular-op call."""
-    calls = {"fa4_rows": [], "fallback": []}
+    """Record FA4 generation calls, the input type of every whole-batch regular-op call, and
+    every phase the regular op ran."""
+    calls = {"fa4_rows": [], "fallback": [], "fallback_phases": []}
     run_generation = FlashAttn4GenerationFmha.run_generation
     fallback_forward = FallbackFmha.forward
+    fallback_context = FallbackFmha.run_context
+    fallback_generation = FallbackFmha.run_generation
 
     def fa4_spy(self, params):
         calls["fa4_rows"].append((params.batch_size, params.num_tokens, params.seq_offset))
@@ -78,8 +81,18 @@ def spies(monkeypatch):
         calls["fallback"].append(forward_args.attention_input_type)
         return fallback_forward(self, q, k, v, metadata, forward_args)
 
+    def fallback_context_spy(self, params):
+        calls["fallback_phases"].append("context")
+        return fallback_context(self, params)
+
+    def fallback_generation_spy(self, params):
+        calls["fallback_phases"].append("generation")
+        return fallback_generation(self, params)
+
     monkeypatch.setattr(FlashAttn4GenerationFmha, "run_generation", fa4_spy)
     monkeypatch.setattr(FallbackFmha, "forward", fallback_spy)
+    monkeypatch.setattr(FallbackFmha, "run_context", fallback_context_spy)
+    monkeypatch.setattr(FallbackFmha, "run_generation", fallback_generation_spy)
     return calls
 
 
@@ -113,9 +126,9 @@ def test_mixed_batch_generation_rows_on_fa4_match_dense(
     golden, out, atol, rtol = _run(case, monkeypatch, libs)
     num_contexts = case.num_contexts
     num_generations = case.num_seqs - num_contexts
-    # FA4 served exactly the generation rows; the regular op took only the context requests.
+    # FA4 served exactly the generation rows; the regular op ran only its context phase.
     assert spies["fa4_rows"] == [(num_generations, num_generations * q_len, num_contexts)]
-    assert spies["fallback"] == [AttentionInputType.context_only]
+    assert spies["fallback"] == [] and spies["fallback_phases"] == ["context"]
     torch.testing.assert_close(out.float(), golden.float(), atol=atol, rtol=rtol)
 
 
@@ -169,7 +182,8 @@ def test_mixed_batch_kv_length_gate(min_kv, uses_fa4, spies, monkeypatch):
         case, "TRTLLM", inputs, kv_dtype=torch.bfloat16, fuse_rope=True, kv_layout="HND"
     )
     if uses_fa4:
-        assert spies["fa4_rows"] and spies["fallback"] == [AttentionInputType.context_only]
+        assert spies["fa4_rows"] and spies["fallback"] == []
+        assert spies["fallback_phases"] == ["context"]
         atol, rtol = _tolerances(case, torch.bfloat16)
         torch.testing.assert_close(out.float(), golden.float(), atol=atol, rtol=rtol)
     else:
