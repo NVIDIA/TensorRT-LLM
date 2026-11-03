@@ -112,10 +112,12 @@ def compiled_key(
     qkv_permuted: bool,
     rescale_cols: int = HEAD_DIM,
     kv_heads: int = KV_HEADS,
+    reqs: int = 1,
 ) -> tuple:
     """The key ``full_attention_split_kv._compiled_keys`` holds once that fold build is compiled
     (``("rescale_cols", n)`` appended for a chunked-rescale build such as the spill-free one,
-    ``("kv_heads", n)`` for the tep4 build)."""
+    ``("kv_heads", n)`` for the tep4 build, ``("reqs", n)`` for the fold of ``n`` sequences,
+    ``full_attention_prep_fold_multi``)."""
     key = (
         int(device_index),
         bool(enable_pdl),
@@ -127,6 +129,8 @@ def compiled_key(
         key += (("rescale_cols", int(rescale_cols)),)
     if kv_heads != KV_HEADS:
         key += (("kv_heads", int(kv_heads)),)
+    if reqs != 1:
+        key += (("reqs", int(reqs)),)
     return key
 
 
@@ -287,6 +291,7 @@ class FullAttnSplitKvFold(OpWrapper):
             False,
             bool(evict_first),
             fold=fold,
+            stages=_v4._ring_stages(),
             **_v4.build_options(key[5:]),
         )
         _v4._compiled_keys.add(key)
@@ -395,3 +400,233 @@ class FullAttnSplitKvFold(OpWrapper):
 
 
 full_attention_prep_fold = FullAttnSplitKvFold()
+
+
+class FullAttnSplitKvFoldMulti(OpWrapper):
+    """``full_attention_prep_fold`` of a decode step of 2..4 sequences of equal row count.
+
+    ``preattn_prep_append`` (NoPE) of the step's ``R`` sequences then ``full_attention_split_kv_multi``,
+    as one launch: the fold build of ``full_attention_split_kv_kernel`` with the base kernel's
+    multi-sequence geometry (``request_of``: sequence ``r`` takes the splits ``request_splits``
+    gives it; its Q rows, its ``[2, pages]`` table row pair and its partial rows at
+    ``r * rows``, ``r * 2 * table row stride`` and ``r * 8 H``). ``qkv`` is the raw projection
+    ``[R * M, raw_width(G)]`` with the sequences' rows one after another (``M`` <= 8 each),
+    ``block_tables`` ``[R, 2, pages]`` and ``seq_lens[r]`` the context of sequence ``r`` (its
+    rows included). Writes each sequence's step K/V into ``kv_pool`` and the partials
+    ``[R * 8 H, num_splits, 64]`` / ``[R * 8 H, num_splits]`` that ``combine_norm_gate`` with
+    ``requests`` merges -- per sequence bit for bit what ``preattn_prep_append`` with that table
+    followed by ``full_attention_split_kv_multi`` writes (the fold's per-row arithmetic is the
+    one-sequence fold's, and the multi-sequence build computes for each sequence what the
+    one-sequence kernel computes over that sequence's splits).
+
+    Loud preconditions (ValueError): the one-sequence fold's on each sequence, with R in 2..4,
+    ``R * M`` rows, an int32 ``[R, 2, pages]`` table (unit last stride, a sequence's K and V
+    rows adjacent) of at most ``MULTI_CTA_PAGES_FACTOR * cta_pages(G)`` pages per split in the
+    worst case (``R * pages / (num_splits - R)``), ``num_splits > R`` and the partials above.
+    The first call per device and build compiles the kernel; never inside a CUDA-graph capture.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    def __call__(
+        self,
+        qkv: torch.Tensor,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_splits: int,
+        enable_pdl: bool = False,
+        evict_first: bool = True,
+        part_o: Optional[torch.Tensor] = None,
+        part_lse: Optional[torch.Tensor] = None,
+        rescale_cols: int = HEAD_DIM,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        reqs = block_tables.shape[0] if block_tables.dim() == 3 else 0
+        kv_heads = kv_pool.shape[1] if kv_pool.dim() == 4 else 0
+        if kv_heads not in _v4.RANK_KV_HEADS.values() or not 2 <= reqs <= _v4.MULTI_MAX_REQUESTS:
+            raise ValueError(
+                "full_attention_prep_fold_multi takes a pool [blocks, G, "
+                f"{PAGE}, {HEAD_DIM}] with G in {sorted(_v4.RANK_KV_HEADS.values())} and an int32 "
+                f"[R, 2, pages] table with R in 2..{_v4.MULTI_MAX_REQUESTS}; got pool "
+                f"{tuple(kv_pool.shape)}, table {tuple(block_tables.shape)}"
+            )
+        if part_o is None or part_lse is None:
+            part_o, part_lse = _v4.partial_buffers(num_splits, qkv.device, kv_heads, reqs)
+        tensors = (qkv, kv_pool, block_tables, seq_lens, kv_scale_orig_quant, part_o, part_lse)
+        width = block_tables.shape[2]
+        total_rows = qkv.shape[0] if qkv.dim() == 2 else 0
+        rows = total_rows // reqs
+        stages = _v4.MULTI_CTA_PAGES_FACTOR * _v4.cta_pages(kv_heads)
+        out_rows = _v4.out_rows(kv_heads)
+        if (
+            qkv.dtype != torch.bfloat16
+            or qkv.dim() != 2
+            or qkv.shape[1] != raw_width(kv_heads)
+            or qkv.stride(-1) != 1
+            or qkv.stride(0) % 8 != 0
+            or total_rows % reqs != 0
+            or not 1 <= rows <= MAX_ROWS
+            or kv_pool.dtype != torch.float8_e4m3fn
+            or tuple(kv_pool.shape[2:]) != (PAGE, HEAD_DIM)
+            or not kv_pool.is_contiguous()
+            or block_tables.dtype != torch.int32
+            or block_tables.shape[1] != 2
+            or width < 1
+            or block_tables.stride(-1) != 1
+            or block_tables.stride(0) != 2 * block_tables.stride(1)
+            or not reqs < num_splits <= MAX_SPLITS
+            or rescale_cols not in _v4.RESCALE_COLS
+            or -(-reqs * width // (num_splits - reqs)) > stages
+            or seq_lens.dtype != torch.int32
+            or seq_lens.numel() < reqs
+            or kv_scale_orig_quant.dtype != torch.float32
+            or kv_scale_orig_quant.numel() < 1
+            or part_o.dtype != torch.float16
+            or tuple(part_o.shape) != (reqs * out_rows, num_splits, HEAD_DIM)
+            or not part_o.is_contiguous()
+            or part_lse.dtype != torch.float32
+            or tuple(part_lse.shape) != (reqs * out_rows, num_splits)
+            or not part_lse.is_contiguous()
+            or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
+            or qkv.device.type != "cuda"
+            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
+        ):
+            raise ValueError(
+                "full_attention_prep_fold_multi takes, on one sm_103 or sm_107 device and 16-byte "
+                f"aligned: a BF16 raw projection [R x 1..{MAX_ROWS}, {raw_width(kv_heads)}] (unit "
+                "last stride, rows a multiple of 8 elements apart), a contiguous FP8 E4M3 pool, an "
+                f"int32 [R, 2, pages] table (K and V rows adjacent, at most {stages} pages per split "
+                f"in the worst case), int32 seq_lens of at least R, an fp32 scale, R < splits <= "
+                f"{MAX_SPLITS} and contiguous partials FP16 [R {out_rows}, splits, {HEAD_DIM}] / "
+                f"fp32 [R {out_rows}, splits]; got qkv {qkv.dtype} {tuple(qkv.shape)} strides "
+                f"{tuple(qkv.stride())}, pool {kv_pool.dtype} {tuple(kv_pool.shape)}, table "
+                f"{block_tables.dtype} {tuple(block_tables.shape)} strides "
+                f"{tuple(block_tables.stride())}, seq_lens {seq_lens.dtype}[{seq_lens.numel()}], "
+                f"splits {num_splits}, partials {part_o.dtype} {tuple(part_o.shape)} / "
+                f"{part_lse.dtype} {tuple(part_lse.shape)}, devices {[str(t.device) for t in tensors]}"
+            )
+        device_index = qkv.device.index
+        fold = fold_key(eps, q_scale, qkv_permuted)
+        key = compiled_key(
+            device_index,
+            enable_pdl,
+            evict_first,
+            eps,
+            q_scale,
+            qkv_permuted,
+            rescale_cols,
+            kv_heads,
+            reqs,
+        )
+        if torch.cuda.is_current_stream_capturing() and key not in _v4._compiled_keys:
+            raise RuntimeError(
+                "full_attention_prep_fold_multi compiles on its first call per device and build; "
+                "make that call before capturing a CUDA graph"
+            )
+        compiled = _v4._compiled_kernel(
+            device_index,
+            bool(enable_pdl),
+            False,
+            bool(evict_first),
+            fold=fold,
+            stages=_v4._ring_stages(),
+            **_v4.build_options(key[5:]),
+        )
+        _v4._compiled_keys.add(key)
+        import cuda.bindings.driver as cuda
+
+        compiled(
+            qkv.data_ptr(),
+            kv_pool.data_ptr(),
+            block_tables.data_ptr(),
+            seq_lens.data_ptr(),
+            kv_scale_orig_quant.data_ptr(),
+            part_o.data_ptr(),
+            part_lse.data_ptr(),
+            rows,
+            qkv.stride(0),
+            kv_pool.shape[0],
+            width,
+            block_tables.stride(1),
+            num_splits,
+            cuda.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream),
+        )
+        return part_o, part_lse
+
+    def reference(
+        self,
+        qkv: torch.Tensor,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_splits: int,
+        enable_pdl: bool = False,
+        evict_first: bool = True,
+        part_o: Optional[torch.Tensor] = None,
+        part_lse: Optional[torch.Tensor] = None,
+        rescale_cols: int = HEAD_DIM,
+    ) -> torch.Tensor:
+        """The one-sequence fold's reference on each sequence's rows, table and context, in order
+        (each appends into ``kv_pool`` in place); the fp32 outputs concatenated by row."""
+        reqs = block_tables.shape[0]
+        rows = qkv.shape[0] // reqs
+        outs = []
+        for r in range(reqs):
+            outs.append(
+                full_attention_prep_fold.reference(
+                    qkv[r * rows : (r + 1) * rows],
+                    eps,
+                    q_scale,
+                    qkv_permuted,
+                    kv_pool,
+                    block_tables[r],
+                    seq_lens[r : r + 1],
+                    kv_scale_orig_quant,
+                    num_splits,
+                )
+            )
+        return torch.cat(outs)
+
+    def is_valid(
+        self,
+        qkv: torch.Tensor,
+        eps: float,
+        q_scale: float,
+        qkv_permuted: bool,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_scale_orig_quant: torch.Tensor,
+        num_splits: int,
+        enable_pdl: bool = False,
+        evict_first: bool = True,
+        part_o: Optional[torch.Tensor] = None,
+        part_lse: Optional[torch.Tensor] = None,
+        rescale_cols: int = HEAD_DIM,
+    ) -> None:
+        """The one-sequence fold's silent-wrong-answer checks on each sequence."""
+        reqs = block_tables.shape[0]
+        rows = qkv.shape[0] // reqs
+        for r in range(reqs):
+            full_attention_prep_fold.is_valid(
+                qkv[r * rows : (r + 1) * rows],
+                eps,
+                q_scale,
+                qkv_permuted,
+                kv_pool,
+                block_tables[r],
+                seq_lens[r : r + 1],
+                kv_scale_orig_quant,
+                num_splits,
+            )
+
+
+full_attention_prep_fold_multi = FullAttnSplitKvFoldMulti()

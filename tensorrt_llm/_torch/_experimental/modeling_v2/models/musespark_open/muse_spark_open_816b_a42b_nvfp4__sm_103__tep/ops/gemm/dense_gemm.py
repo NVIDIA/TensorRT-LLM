@@ -12,9 +12,11 @@ for the same layer, and the slowest rank's choice sets every collective's pace.
 This entry runs the kernel its caller names instead, so a target that names one
 kernel per shape runs it on every rank:
 
-* ``"splitk:<mma_m>,<mma_n>,<split_k>,<stages>"`` -- flashinfer's CuTe-DSL
-  cluster split-K kernel. It swaps A and B (the weight's rows are the MMA's M),
-  each CTA of a cluster accumulates one K slice in FP32 in TMEM, the peers send
+* ``"splitk:<mma_m>,<mma_n>,<split_k>,<stages>"`` -- the CuTe-DSL cluster split-K
+  kernel of ``ops/gemm/splitk_gemm.py`` (flashinfer's ``dense_bf16_gemm_sm100_splitk``,
+  moved into this target with the changes ``splitk_gemm.configure`` sets). It swaps A
+  and B (the weight's rows are the MMA's M), each CTA of a cluster accumulates one K
+  slice in FP32 in TMEM, the peers send
   their partials to the cluster's first CTA through DSMEM, which adds them in
   CTA order and rounds once to BF16. Launched with programmatic dependent launch,
   it issues the weight's TMA loads before ``griddepcontrol.wait`` and the
@@ -65,7 +67,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 
 #: Rows this entry is certified for: one request's last accepted token and up to 7 drafts.
 MAX_ROWS = 8
-#: Rows the split-K and cuBLAS kernels are also certified for (flashinfer's split-K takes
+#: Rows the split-K and cuBLAS kernels are also certified for (the split-K kernel takes
 #: M <= 32): decode steps of up to four requests at K = 7, on the TP4 per-rank shapes.
 WIDE_MAX_ROWS = 32
 #: The four per-rank projection shapes ``(K, N)`` of this checkpoint at tep8.
@@ -107,9 +109,9 @@ def parse_kernel(kernel: str) -> Tuple[str, Tuple[int, ...]]:
 
 @functools.lru_cache(maxsize=None)
 def _tactic(family: str, fields: Tuple[int, ...], rows: int):
-    """flashinfer's tactic object; a direct tactic holds all ``rows`` in one CTA."""
+    """The kernel's tactic object; a direct tactic holds all ``rows`` in one CTA."""
     if family == SPLITK:
-        from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as splitk
+        from . import splitk_gemm as splitk
 
         return splitk.SplitKTactic(*fields)
     from flashinfer.gemm.kernels import dense_bf16_gemm_direct as direct
@@ -120,14 +122,14 @@ def _tactic(family: str, fields: Tuple[int, ...], rows: int):
 def kernel_error(kernel: str, rows: int, k: int, n: int) -> Optional[str]:
     """Why ``kernel`` cannot serve ``rows x K -> N``, or ``None``.
 
-    cuBLAS serves every shape; a flashinfer tactic is checked with flashinfer's
+    cuBLAS serves every shape; a split-K or direct tactic is checked with its kernel's
     own validation (shared memory, K divisibility, tile and block limits).
     """
     family, fields = parse_kernel(kernel)
     if family == CUBLAS:
         return None
     if family == SPLITK:
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import validate_tactic
+        from .splitk_gemm import validate_tactic
     else:
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import validate_tactic
     try:
@@ -139,7 +141,7 @@ def kernel_error(kernel: str, rows: int, k: int, n: int) -> Optional[str]:
 
 def _run(x, weight, out, enable_pdl, family, fields):
     if family == SPLITK:
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense
+        from .splitk_gemm import run_splitk_dense
 
         tactic = _tactic(family, fields, 0)
         return run_splitk_dense(x, weight.t(), None, out, enable_pdl, tactic)
@@ -310,7 +312,7 @@ class L2Prefetch(OpWrapper):
 l2_prefetch = L2Prefetch()
 
 
-#: K columns per k-tile of flashinfer's split-K kernel (its ``_CTA_K``): one weight
+#: K columns per k-tile of the split-K kernel (``splitk_gemm._CTA_K``): one weight
 #: TMA load per CTA and k-tile covers ``mma_m`` rows x this many columns.
 SPLITK_CTA_K = 128
 
@@ -318,7 +320,7 @@ SPLITK_CTA_K = 128
 def post_wait_columns(kernel: str, k: int) -> Optional[Tuple[int, int, int, int]]:
     """The weight columns a split-K ``kernel`` loads only after its dependency wait, per row.
 
-    flashinfer's split-K kernel gives each CTA of a cluster one of ``split_k``
+    The split-K kernel gives each CTA of a cluster one of ``split_k``
     equal K slices; its weight warp issues the slice's k-tiles in order without
     waiting while the ``stages``-deep ring has room, and the k-tiles after the
     first ``stages`` only as the MMA frees stages, which it does only after the

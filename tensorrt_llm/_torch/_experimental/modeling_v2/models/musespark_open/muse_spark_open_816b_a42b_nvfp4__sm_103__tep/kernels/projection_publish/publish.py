@@ -136,6 +136,24 @@ def _join_named_forks(module) -> None:
         site.plan.join_role(site.role)
 
 
+class _ForkStream(torch.cuda.ExternalStream):
+    """With ``projection_publish.TEP8_POOL_PROGRAMMATIC``: a layer's MoE preparation stream (the
+    same CUDA stream) that records, while capturing, the nodes its last fork (``wait_stream``, the
+    built-in ``prepare_moe_inputs``' fork after the post-attention hop) made it depend on, when
+    they are exactly one kernel node: ``project`` may then make that edge programmatic."""
+
+    fork_sources = None
+
+    def wait_stream(self, stream):
+        sources = None
+        if torch.cuda.is_current_stream_capturing():
+            deps = _publish.capture_dependencies(stream)
+            if deps is not None and _publish.single_kernel_node(deps[0]):
+                sources = deps[0]
+        super().wait_stream(stream)
+        self.fork_sources = sources
+
+
 class PublishedProjections:
     """The decode steps of 33..448 rows on the published projections: armed per forward by
     ``DecodeTarget``.
@@ -248,19 +266,21 @@ class PublishedProjections:
                 f"{len(unpool_layers)})"
             )
         else:
-            reason = _publish.producer_refusal(torch.device("cuda", torch.cuda.current_device()))
+            reason = _publish.producer_refusal(
+                torch.device("cuda", torch.cuda.current_device()), self.mapping.tp_size
+            )
         reason = _tp_agreement.agreed_refusal(self.mapping, reason)
         if reason is None:
             try:
                 self.pool = _publish.PublishTransport(
                     self.mapping,
-                    _publish.local_columns(_publish.POOL_HIDDEN),
+                    _publish.local_columns(_publish.POOL_HIDDEN, self.mapping.tp_size),
                     MAX_ROWS,
                     comm=self._comm,
                 )
                 self.unpool = _publish.PublishTransport(
                     self.mapping,
-                    _publish.local_columns(_publish.UNPOOL_HIDDEN),
+                    _publish.local_columns(_publish.UNPOOL_HIDDEN, self.mapping.tp_size),
                     MAX_ROWS,
                     comm=self._comm,
                 )
@@ -329,10 +349,45 @@ class PublishedProjections:
         columns = transport.columns
         begin = self.mapping.tp_rank * columns
         _join_named_forks(module)
-        _publish.publish_projection(hidden_states, module.weight[begin : begin + columns], slot)
+        weight = module.weight[begin : begin + columns]
+        if site == "pool" and getattr(_publish, "TEP8_POOL_PROGRAMMATIC", False):
+            self._programmatic_pool_fork(moe, hidden_states, weight, slot)
+        _publish.publish_projection(hidden_states, weight, slot)
         self._unconsumed += 1
         self._report(site, rows)
         return slot
+
+    def _programmatic_pool_fork(self, moe, hidden_states, weight, slot) -> None:
+        """While capturing, turn the preparation stream's fork edge from the post-attention hop
+        into a programmatic edge, when the split-K producer (which waits on its prerequisite grid
+        before reading) publishes this call."""
+        stream = getattr(moe, "_prepare_stream", None)
+        sources = getattr(stream, "fork_sources", None)
+        if (
+            not isinstance(stream, _ForkStream)
+            or sources is None
+            or not torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        stream.fork_sources = None
+        if torch.cuda.current_stream().cuda_stream != stream.cuda_stream:
+            return
+        if _publish._splitk_tactic(hidden_states, weight, slot) is None:
+            return
+        try:
+            changed = _publish.programmatic_from(stream, sources)
+        except RuntimeError as error:
+            logger.warning_once(
+                f"{error}; the pool GEMM keeps the full fork edge",
+                key="musespark_open.projection_publish.programmatic_fork_failed",
+            )
+            return
+        if changed and (self._rows, "programmatic") not in self._reported:
+            self._reported.add((self._rows, "programmatic"))
+            logger.info(
+                f"[musespark_open] projection_publish: {self._rows}-row steps launch the pool GEMM as a programmatic "
+                "dependent of the post-attention hop (tep8_pool_programmatic)"
+            )
 
     def consume_pool(self, moe, pooled: torch.Tensor) -> Optional[Fp4QuantizedTensor]:
         """The pre-expert NVFP4 input from the published pool slot ``pooled``, or None when
@@ -402,14 +457,16 @@ def check(model, layer_kwargs: dict) -> None:
     """Whether ``install`` may run on ``model``; changes nothing.
 
     Raises:
-        ValueError: if the model is not TP4, the kernels cannot be built here, or the
+        ValueError: if the model is not TP4 or TP8 (two trays, with the TP8 census's
+            producer), the kernels cannot be built here, or the
             projection gathers did not fuse both sites (this path rides their classes).
     """
     layers = list(model.layers)
     mapping = layers[0].mapping
-    if mapping.tp_size != _publish.WORLD:
+    if mapping.tp_size not in _publish.WORLDS:
         raise ValueError(
-            f"[musespark_open] projection_publish serves TP{_publish.WORLD} (one tray), got TP{mapping.tp_size}"
+            f"[musespark_open] projection_publish serves TP{'/TP'.join(map(str, _publish.WORLDS))}, "
+            f"got TP{mapping.tp_size}"
         )
     if not (_pool.available() and _publish.available()):
         raise ValueError(
@@ -445,6 +502,19 @@ def install(model) -> PublishedProjections:
     for layer in layers:
         layer.feed_forward._published = published
         layer.add_ffn._published = published
+    if getattr(_publish, "TEP8_POOL_PROGRAMMATIC", False) and layers[0].mapping.tp_size == 8:
+        # Every layer's preparation stream records its fork sources (the same stream, rewrapped).
+        wrapped = 0
+        for layer in layers:
+            moe = layer.feed_forward
+            base = getattr(moe, "_prepare_stream", None)
+            if base is not None and not isinstance(base, _ForkStream):
+                moe._prepare_stream = _ForkStream(base.cuda_stream, device=base.device)
+                wrapped += 1
+        logger.info(
+            f"[musespark_open] projection_publish: tep8_pool_programmatic: {wrapped} layers' MoE "
+            "preparation streams record their fork for a programmatic pool GEMM edge"
+        )
     logger.info(
         f"[musespark_open] projection_publish: decode steps of {MIN_ROWS}..{MAX_ROWS} rows in "
         f"{len(layers)} layers will publish the pool / unpool slices from their GEMMs (transports "

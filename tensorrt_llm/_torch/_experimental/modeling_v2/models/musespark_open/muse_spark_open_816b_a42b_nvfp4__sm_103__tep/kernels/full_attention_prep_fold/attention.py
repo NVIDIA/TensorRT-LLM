@@ -72,6 +72,31 @@ from ..full_attention_split_kv import attention as _split_kv
 #: The op's build: evict-first TMA loads (``split_kv_attention.EVICT_FIRST``).
 EVICT_FIRST = _split_kv.EVICT_FIRST
 
+#: ``fold_multi`` (``configure``; lever ``full_attention_fold_multi``): also fold-route the decode
+#: steps of 2..4 sequences that ``wide_full_attention`` folds (``_prep_append_requests``), on
+#: ``full_attention_prep_fold_multi`` (the fold build with the multi-sequence geometry; partials and
+#: cache bytes per sequence those of the multi-sequence prep then
+#: ``full_attention_split_kv_multi``), merged by ``combine_norm_gate`` with ``requests`` from the
+#: gate view. Off: one sequence only, the stock routing. Read per step (``_fold_takes``) and at
+#: install.
+FOLD_MULTI = False
+
+
+def configure(*, fold_multi: bool = False) -> None:
+    """Set whether decode steps of 2..4 sequences are fold-routed (``full_attention_fold_multi``).
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
+    the stock routing (one sequence only).
+    """
+    global FOLD_MULTI
+    FOLD_MULTI = bool(fold_multi)
+
+
+def _fold_takes(requests: int) -> bool:
+    """Whether a step of ``requests`` sequences (as ``_prep_append_requests`` counts them) may be fold-routed."""
+    return requests == 1 or (FOLD_MULTI and 2 <= requests <= _v4.MULTI_MAX_REQUESTS)
+
+
 #: ``FoldRouteCensus`` outcome kinds.
 FOLD = "full_attention_prep_fold"
 NO_DECODE_PREP = "no decode prep"
@@ -98,6 +123,8 @@ class FoldCall:
     permuted: bool
     rescale_cols: int = _v4.HEAD_DIM
     launched: bool = False
+    #: Sequences of the step (``FOLD_MULTI``): ``block_tables`` is then their ``[R, 2, pages]`` rows.
+    requests: int = 1
 
     @property
     def rows(self) -> int:
@@ -269,10 +296,14 @@ class FullAttnSplitKvFoldAttention:
         if self._prep_fold_census is not None:
             self._prep_fold_census.record(self.layer_idx, kind, detail)
 
-    def _prep_fold_route(self, qkv: torch.Tensor, md) -> Tuple[Optional[str], Optional[tuple]]:
+    def _prep_fold_route(
+        self, qkv: torch.Tensor, md, requests: int = 1
+    ) -> Tuple[Optional[str], Optional[tuple]]:
         """``(None, (kv_pool, block_tables))`` for a fold-routed step, else ``(reason, None)``.
 
         Host-side reads only; called for steps ``full_attention_prep_append`` would fold.
+        ``requests`` above 1 (``FOLD_MULTI``): the step's sequences, whose ``[R, 2, pages]`` table
+        rows are returned.
         """
         permuted = self._qkv_layout_inverse is not None
         mapping = getattr(self, "mapping", None)
@@ -317,10 +348,44 @@ class FullAttnSplitKvFoldAttention:
             total_num_blocks,
             attn.quant_mode,
             0,
-            1,
+            requests,
             qkv.dtype,
         )
         splits = self._split_kv_splits
+        if requests == 1:
+            table_checks = (
+                (
+                    block_tables.dim() != 3
+                    or block_tables.shape[0] != 1
+                    or block_tables.shape[1] != 2,
+                    "not one sequence's K/V page table",
+                ),
+                (
+                    block_tables.dim() == 3
+                    and -(-block_tables.shape[2] // splits) > _v4.cta_pages(kv_heads),
+                    "more pages per split than the kernel stages",
+                ),
+            )
+        else:
+            table_checks = (
+                (
+                    block_tables.dim() != 3
+                    or block_tables.shape[0] != requests
+                    or block_tables.shape[1] != 2
+                    or block_tables.stride(-1) != 1
+                    or block_tables.stride(0) != 2 * block_tables.stride(1),
+                    "not the sequences' K/V page tables",
+                ),
+                (
+                    block_tables.dim() == 3
+                    and (
+                        splits <= requests
+                        or -(-requests * block_tables.shape[2] // (splits - requests))
+                        > _v4.MULTI_CTA_PAGES_FACTOR * _v4.cta_pages(kv_heads)
+                    ),
+                    "more pages per split than the kernel stages",
+                ),
+            )
         checks = (
             (
                 kv_pool.dtype != torch.float8_e4m3fn
@@ -329,15 +394,7 @@ class FullAttnSplitKvFoldAttention:
                 or not kv_pool.is_contiguous(),
                 "another cache view",
             ),
-            (
-                block_tables.dim() != 3 or block_tables.shape[0] != 1 or block_tables.shape[1] != 2,
-                "not one sequence's K/V page table",
-            ),
-            (
-                block_tables.dim() == 3
-                and -(-block_tables.shape[2] // splits) > _v4.cta_pages(kv_heads),
-                "more pages per split than the kernel stages",
-            ),
+            *table_checks,
             (
                 _capturing()
                 and _fold.compiled_key(
@@ -349,6 +406,7 @@ class FullAttnSplitKvFoldAttention:
                     permuted,
                     self._split_kv_rescale_cols,
                     kv_heads,
+                    requests,
                 )
                 not in _v4._compiled_keys,
                 "full_attention_prep_fold was not compiled before this capture",
@@ -357,7 +415,7 @@ class FullAttnSplitKvFoldAttention:
         for failed, reason in checks:
             if failed:
                 return reason, None
-        return None, (kv_pool, block_tables[0])
+        return None, (kv_pool, block_tables[0] if requests == 1 else block_tables[:requests])
 
     def _prep_fold_builtin_mode(self, md) -> Optional[str]:
         """Why the built-in chain would run this step as something other than causal attention
@@ -411,11 +469,12 @@ class FullAttnSplitKvFoldAttention:
             or getattr(self, "_preattn_prep", None) is None
             or not self._fits_preattn_prep(qkv, position_ids)
             or self._prep_append_decline(qkv, md) is not None
-            or self._prep_append_requests(md) != 1
+            or not _fold_takes(self._prep_append_requests(md))
         ):
             # Not a step the prep append folds: its own path decides (and records) what runs.
             return super().preprocess_qkv(qkv, position_ids)
-        reason, views = self._prep_fold_route(qkv, md)
+        requests = self._prep_append_requests(md)
+        reason, views = self._prep_fold_route(qkv, md, requests)
         if reason is not None:
             self._prep_fold_record("declined", reason)
             logger.warning_once(
@@ -438,6 +497,7 @@ class FullAttnSplitKvFoldAttention:
             eps=self.q_norm.variance_epsilon,
             q_scale=self.scale_query_by,
             permuted=permuted,
+            requests=requests,
         )
         return qkv, None, None, _fold.gate_view(qkv, permuted)
 
@@ -457,7 +517,12 @@ class FullAttnSplitKvFoldAttention:
                 "full_attention_prep_fold, but "
                 f"its attention call is not the plain one the fold serves ({reason})"
             )
-        part_o, part_lse = _fold.full_attention_prep_fold(
+        fold_op = (
+            _fold.full_attention_prep_fold_multi
+            if call.requests > 1
+            else _fold.full_attention_prep_fold
+        )
+        part_o, part_lse = fold_op(
             call.qkv,
             call.eps,
             call.q_scale,
@@ -480,7 +545,14 @@ class FullAttnSplitKvFoldAttention:
             dtype=torch.bfloat16,
             device=call.qkv.device,
         )
-        self._split_kv_pending = (part_o, part_lse, rows, out.data_ptr(), call.seq_lens, 1)
+        self._split_kv_pending = (
+            part_o,
+            part_lse,
+            rows,
+            out.data_ptr(),
+            call.seq_lens,
+            call.requests,
+        )
         self._prep_fold_record(FOLD)
         if self._split_kv_census is not None:
             self._split_kv_census.record(self.layer_idx, _split_kv.V4)
@@ -547,5 +619,11 @@ def install(model: torch.nn.Module) -> int:
         "runs inside full_attention_prep_fold (the step's K/V append and the Q norm in the attention "
         "kernel; no prep launch) on the steps full_attention_prep_append folds and "
         "full_attention_split_kv serves"
+        + (
+            f"; full_attention_fold_multi: also on its decode steps of 2..{_v4.MULTI_MAX_REQUESTS} "
+            "sequences (full_attention_prep_fold_multi)"
+            if FOLD_MULTI
+            else ""
+        )
     )
     return len(full)

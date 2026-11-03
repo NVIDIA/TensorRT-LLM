@@ -209,10 +209,53 @@ SERVED_AT = {
     "half_window_experts": ({(103, 4), (107, 4)}, "composition", "upstream"),
     "hot_replicas": ({(103, 4), (107, 4)}, "composition", "upstream"),
     "prefill_cutedsl_experts": ({(107, 4)}, "composition", "upstream"),
+    "vocab_parallel_head": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "multi_request_prep_append": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "wide_swa_block": ({(107, 4), (107, 8)}, "composition", "upstream"),
+    "wide_full_attention": ({(107, 4), (107, 8)}, "composition", "upstream"),
+    "multi_request_split_kv": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "multi_request_post_attention_hop": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "wide_drafter_hops": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "router_gemm": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "wide_dense_gemms": ({(107, 4), (107, 8)}, "composition", "upstream"),
+    "projection_publish": ({(103, 4), (107, 4), (107, 8)}, "composition", "upstream"),
+    "weight_prefetch_after_join": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "next_qkv_prefetch_skip": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "swa_one_cluster_block": ({(107, 4), (107, 8)}, "lossless-numeric", "LL"),
+    "swa_prep_split": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "full_attention_fold_multi": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "split_kv_deep_rings": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "prerouted_experts": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "finalize_entry_trigger": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "hop_entry_trigger": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "step_commit_v2": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "wide_norm_gate_pdl": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "drafter_kv_glue": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "drafter_kv_fork_before_head": ({(107, 4), (107, 8)}, "lossless-bitwise", "LL"),
+    "splitk_pool_split8": ({(107, 4)}, "lossless-numeric", "LL"),
+    "splitk_frontier_tables": ({(107, 4)}, "lossless-numeric", "LL"),
+    "bf16_half_window": ({(107, 4)}, "lossless-numeric", "LL"),
+    "context_sp_extra_parts": ({(107, 4)}, "lossless-bitwise", "LL"),
+    "tep8_wide64_splitk": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_publish_splitk": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_drafter_wide_gemms": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_fc_shard_wide": ({(107, 8)}, "lossless-numeric", "LL"),
+    "swa_eight_requests": ({(107, 4), (107, 8)}, "lossless-numeric", "LL"),
+    "tep8_ring_buddy_wide": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_ring_buddy_pdl": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_tile_placement": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_router_push": ({(107, 8)}, "lossless-numeric", "LL"),
+    "tep8_router_prewait": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_finalize_transport_64": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_early_multicast_hop": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_direct_hop": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_publish_join": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_pool_programmatic_fork": ({(107, 8)}, "lossless-bitwise", "LL"),
+    "tep8_wide_projection_gathers": ({(107, 8)}, "lossless-numeric", "LL"),
 }
 
 
-def test_the_rule_table_is_the_registry_of_twenty_levers():
+def test_the_rule_table_is_the_lever_registry():
     assert set(RULES) == set(SERVED_AT)
     assert set(RULES) <= DISPATCH.FAST_PATH_NAMES
     for name, (keys, kind, origin) in SERVED_AT.items():
@@ -235,24 +278,85 @@ DENSE = {"drafter_kv_side_chain", "drafter_fc_early_fork", "drafter_preamble_fro
 MIDC = {"wide_direct_transports", "wide_oproj_publish", "wide_finalize_transport"}
 HC = {"packed_prep_append", "windowed_commit_parallel"}
 PREFILL = {"prefill_cutedsl_experts"}
+#: The Vera Rubin low-latency levers (origin LL, max_batch_size up to 8): both sm107 keys, the
+#: TP4 ones, the TP8 ones; the context lever; and the vocabulary-parallel head's sm107 rule.
+VR_LL = {
+    "weight_prefetch_after_join",
+    "next_qkv_prefetch_skip",
+    "swa_one_cluster_block",
+    "swa_prep_split",
+    "swa_eight_requests",
+    "full_attention_fold_multi",
+    "split_kv_deep_rings",
+    "prerouted_experts",
+    "finalize_entry_trigger",
+    "hop_entry_trigger",
+    "step_commit_v2",
+    "wide_norm_gate_pdl",
+    "drafter_kv_glue",
+    "drafter_kv_fork_before_head",
+}
+VR_LL_TEP4 = {"splitk_pool_split8", "splitk_frontier_tables", "bf16_half_window"}
+VR_LL_TEP8 = {
+    "tep8_wide64_splitk",
+    "tep8_publish_splitk",
+    "tep8_drafter_wide_gemms",
+    "tep8_fc_shard_wide",
+    "tep8_ring_buddy_wide",
+    "tep8_ring_buddy_pdl",
+    "tep8_tile_placement",
+    "tep8_router_push",
+    "tep8_router_prewait",
+    "tep8_finalize_transport_64",
+    "tep8_early_multicast_hop",
+    "tep8_direct_hop",
+    "tep8_publish_join",
+    "tep8_pool_programmatic_fork",
+    "tep8_wide_projection_gathers",
+}
+CONTEXT_SP = {"context_sp_extra_parts"}
+VP = {"vocab_parallel_head"}
+#: The low-latency set of an sm107 key at max_batch_size up to 8; over a dense arena the
+#: two-launch side chain yields to ``drafter_kv_side_chain``.
+VR_TEP4 = VR_LL | VR_LL_TEP4 | VP
+VR_TEP8 = VR_LL | VR_LL_TEP8 | VP
+VR_TEP8_DENSE = VR_TEP8 - {"drafter_kv_glue"}
+#: The TP4 paths sm107 TEP8 serves too: rule levers (left out under ``baseline`` there only),
+#: on wherever served; sm103 TEP4 serves seven of them.
+TEP4_PATHS = set(LEVERS.SM107_TEP8_TEP4_PATHS)
+TEP4_PATHS_SM103 = TEP4_PATHS - {"wide_swa_block", "wide_full_attention", "wide_dense_gemms"}
+#: The numeric low-latency levers: an unknown role passes none of their accuracy gates.
+VR_NUMERIC = {name for name in VR_TEP4 | VR_TEP8 if RULES[name].kind.value == "lossless-numeric"}
 
 REGIONS = [
-    pytest.param((107, 8), "agg", (1,), "dense", LL | DENSE, id="ll-agg-tep8-mbs1"),
+    pytest.param(
+        (107, 8),
+        "agg",
+        (1,),
+        "dense",
+        LL | DENSE | VR_TEP8_DENSE | TEP4_PATHS,
+        id="ll-agg-tep8-mbs1",
+    ),
     pytest.param(
         (107, 4),
         "agg",
         (1,),
         "windowed",
-        LL | {"half_window_experts", "wide_finalize_transport"} | PREFILL,
+        LL
+        | {"half_window_experts", "wide_finalize_transport"}
+        | PREFILL
+        | VR_TEP4
+        | CONTEXT_SP
+        | TEP4_PATHS,
         id="ll-agg-tep4-mbs1",
     ),
-    pytest.param((107, 8), "gen", (1,), "windowed", LL, id="gen-tep8-b1"),
+    pytest.param((107, 8), "gen", (1,), "windowed", LL | VR_TEP8 | TEP4_PATHS, id="gen-tep8-b1"),
     pytest.param(
         (107, 4),
         "gen",
         (1,),
         "windowed",
-        LL | {"half_window_experts", "wide_finalize_transport"} | PREFILL,
+        LL | {"half_window_experts", "wide_finalize_transport"} | PREFILL | VR_TEP4 | TEP4_PATHS,
         id="gen-tep4-b1",
     ),
     pytest.param(
@@ -260,7 +364,13 @@ REGIONS = [
         "gen",
         (2, 3, 4),
         "windowed",
-        MIDC | {"wide_router_per_row"} | LL | {"half_window_experts"} | PREFILL,
+        MIDC
+        | {"wide_router_per_row"}
+        | LL
+        | {"half_window_experts"}
+        | PREFILL
+        | VR_TEP4
+        | TEP4_PATHS,
         id="gen-tep4-b2-b4",
     ),
     pytest.param(
@@ -268,7 +378,7 @@ REGIONS = [
         "agg",
         (2, 3, 4),
         "windowed",
-        MIDC | LL | {"half_window_experts"} | PREFILL,
+        MIDC | LL | {"half_window_experts"} | PREFILL | VR_TEP4 | CONTEXT_SP | TEP4_PATHS,
         id="agg-caps-2-4",
     ),
     pytest.param(
@@ -279,7 +389,10 @@ REGIONS = [
         HC
         | MIDC
         | {"incremental_block_offsets", "head_sampler_coop_fold", "half_window_experts"}
-        | PREFILL,
+        | PREFILL
+        | VR_TEP4
+        | CONTEXT_SP
+        | TEP4_PATHS,
         id="agg-caps-6-8",
     ),
     pytest.param(
@@ -287,7 +400,7 @@ REGIONS = [
         "agg",
         (16, 32),
         "windowed",
-        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL,
+        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL | TEP4_PATHS,
         id="agg-mid-high",
     ),
     pytest.param(
@@ -295,7 +408,7 @@ REGIONS = [
         "agg",
         (48, 64),
         "windowed",
-        HC | {"graph_start_qkv_prefetch", "hot_replicas"} | PREFILL,
+        HC | {"graph_start_qkv_prefetch", "hot_replicas"} | PREFILL | TEP4_PATHS,
         id="agg-hc",
     ),
     pytest.param(
@@ -306,7 +419,9 @@ REGIONS = [
         HC
         | MIDC
         | {"incremental_block_offsets", "head_sampler_coop_fold", "half_window_experts"}
-        | PREFILL,
+        | PREFILL
+        | VR_TEP4
+        | TEP4_PATHS,
         id="gen-tep4-b8",
     ),
     pytest.param(
@@ -314,20 +429,35 @@ REGIONS = [
         "gen",
         (16, 32, 64),
         "windowed",
-        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL,
+        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL | TEP4_PATHS,
         id="gen-tep4-b16-b64",
     ),
-    pytest.param((107, 8), "agg", (2, 4), "dense", LL | DENSE, id="agg-tep8-mbs2-4"),
+    pytest.param(
+        (107, 8),
+        "agg",
+        (2, 4),
+        "dense",
+        LL | DENSE | VR_TEP8_DENSE | TEP4_PATHS,
+        id="agg-tep8-mbs2-4",
+    ),
     pytest.param(
         (107, 8),
         "agg",
         (8,),
         "dense",
-        {"incremental_block_offsets", "head_sampler_coop_fold"} | DENSE,
+        {"incremental_block_offsets", "head_sampler_coop_fold"}
+        | DENSE
+        | VR_TEP8_DENSE
+        | TEP4_PATHS,
         id="agg-tep8-mbs8",
     ),
     pytest.param(
-        (107, 4), "ctx", (8, 64), "windowed", {"wide_finalize_transport"} | PREFILL, id="ctx-tep4"
+        (107, 4),
+        "ctx",
+        (8, 64),
+        "windowed",
+        {"wide_finalize_transport"} | PREFILL | CONTEXT_SP | TEP4_PATHS,
+        id="ctx-tep4",
     ),
     pytest.param(
         (103, 8),
@@ -342,11 +472,16 @@ REGIONS = [
         "agg",
         (1, 4, 8),
         "windowed",
-        {"lm_head_inbox", "half_window_experts"},
+        {"lm_head_inbox", "half_window_experts"} | VP | TEP4_PATHS_SM103,
         id="sm103-tep4-low",
     ),
     pytest.param(
-        (103, 4), "agg", (16, 64), "windowed", {"lm_head_inbox", "hot_replicas"}, id="sm103-tep4"
+        (103, 4),
+        "agg",
+        (16, 64),
+        "windowed",
+        {"lm_head_inbox", "hot_replicas"} | VP | TEP4_PATHS_SM103,
+        id="sm103-tep4",
     ),
 ]
 
@@ -360,6 +495,69 @@ def test_region_tables_under_auto(key, role, sizes, arena, expected):
         assert lever_table.paths() == TARGET_PATHS[key].served - {
             name for name, d in lever_table.decisions.items() if not d.on
         }
+
+
+def test_the_vera_rubin_low_latency_deployments():
+    # A TEP8 generation server of eight requests over a windowed arena.
+    tep8 = table((107, 8), 8, "gen", "windowed")
+    assert rule_levers_on(tep8) == (
+        VR_TEP8
+        | TEP4_PATHS
+        | {"incremental_block_offsets", "head_sampler_coop_fold", "windowed_commit_parallel"}
+    )
+    # A TEP4 generation server of three requests; its context server.
+    tep4 = table((107, 4), 3, "gen", "windowed")
+    assert VR_TEP4 <= rule_levers_on(tep4)
+    assert not rule_levers_on(tep4) & CONTEXT_SP
+    ctx = table((107, 4), 64, "ctx", "windowed")
+    assert rule_levers_on(ctx) & (VR_TEP4 | CONTEXT_SP) == CONTEXT_SP
+    # Above eight requests every low-latency lever is off, on either key.
+    for key, role in (((107, 4), "gen"), ((107, 4), "agg"), ((107, 8), "agg")):
+        above = table(key, 9, role, "windowed")
+        assert not rule_levers_on(above) & (VR_TEP4 | VR_TEP8 | CONTEXT_SP), (key, role)
+        assert above.decisions["swa_prep_split"].why == "max_batch_size 9 is above 8"
+
+
+def test_the_vocabulary_parallel_head_rule():
+    for mbs in (1, 8):
+        lever_table = table((107, 4), mbs, "gen", "windowed")
+        assert lever_table.on("vocab_parallel_head")
+        assert lever_table.param("vocab_parallel_head", "MIN_ROWS") == 8
+    assert not table((107, 4), 9, "gen", "windowed").on("vocab_parallel_head")
+    # A context server keeps the fabric memory: the built-in head samples its decode steps.
+    assert not table((107, 4), 8, "ctx", "windowed").on("vocab_parallel_head")
+    sm103 = table((103, 4), 64, "agg", "windowed")
+    assert sm103.on("vocab_parallel_head")
+    assert sm103.param("vocab_parallel_head", "MIN_ROWS") == 16
+    floor = table((107, 4), 4, "gen", "windowed", knobs(vocab_parallel_head__MIN_ROWS=16))
+    assert floor.param("vocab_parallel_head", "MIN_ROWS") == 16
+
+
+def test_the_two_launch_side_chain_yields_to_the_fused_one():
+    dense = table((107, 8), 4, "gen", "dense")
+    assert dense.on("drafter_kv_side_chain") and not dense.on("drafter_kv_glue")
+    assert "yields to drafter_kv_side_chain" in dense.decisions["drafter_kv_glue"].why
+    for key in ((107, 4), (107, 8)):
+        assert table(key, 4, "gen", "windowed").on("drafter_kv_glue"), key
+        assert not table(key, 4, "gen", "paged").on("drafter_kv_glue"), key
+    with pytest.raises(ValueError, match="drafter_kv_glue"):
+        table((107, 8), 4, "gen", "dense", knobs(drafter_kv_glue="on"))
+
+
+def test_the_context_lever_runs_where_context_steps_run():
+    for mbs in (8, 64, None):
+        lever_table = table((107, 4), mbs, "ctx", "windowed")
+        assert lever_table.on("context_sp_extra_parts"), mbs
+        assert lever_table.param("context_sp_extra_parts", "PARTS") == ("router_input", "ce_gather")
+    assert table((107, 4), 8, "agg", "windowed").on("context_sp_extra_parts")
+    assert not table((107, 4), 16, "agg", "windowed").on("context_sp_extra_parts")
+    assert not table((107, 4), 8, "gen", "windowed").on("context_sp_extra_parts")
+    parts = table(
+        (107, 4), 64, "ctx", "windowed", knobs(context_sp_extra_parts__PARTS="router_input")
+    )
+    assert parts.param("context_sp_extra_parts", "PARTS") == ("router_input",)
+    off = table((107, 4), 64, "ctx", "windowed", knobs(context_sp_extra_parts="off"))
+    assert not off.on("context_sp_extra_parts")
 
 
 def test_the_router_per_row_gates():
@@ -395,7 +593,12 @@ def test_sm103_resolves_under_auto_as_under_baseline(key):
 # --------------------------------------------------------------------------
 # The replay knob sets and the ladders
 # --------------------------------------------------------------------------
-R_LL = knobs(head_multimem_gather="on")
+#: What the table gained after the replayed measurements (the Vera Rubin low-latency levers,
+#: the vocabulary-parallel head on sm107 and the TP4 paths sm107 TEP8 serves): a replay of
+#: one of those states turns it off.
+VR_OFF_TEP8 = knobs(**{name: "off" for name in VR_TEP8 | TEP4_PATHS})
+VR_OFF_TEP4 = knobs(**{name: "off" for name in VR_TEP4 | CONTEXT_SP})
+R_LL = {**knobs(head_multimem_gather="on"), **VR_OFF_TEP8}
 R_H = knobs(
     wide_direct_transports="off",
     wide_oproj_publish="off",
@@ -406,12 +609,15 @@ R_H = knobs(
     context_fp8_dense="on",
     context_fp8_attn_gather="on",
 )
-B_LL = knobs(
-    step_loop_on_execution_stream="off",
-    incremental_block_offsets="off",
-    head_sampler_coop_fold="off",
-    graph_start_qkv_prefetch="on",
-)
+B_LL = {
+    **knobs(
+        step_loop_on_execution_stream="off",
+        incremental_block_offsets="off",
+        head_sampler_coop_fold="off",
+        graph_start_qkv_prefetch="on",
+    ),
+    **VR_OFF_TEP4,
+}
 
 
 def test_r_ll_selects_the_low_latency_set():
@@ -433,6 +639,7 @@ def test_r_h_selects_the_high_concurrency_set():
             "hot_replicas",
         }
         | PREFILL
+        | TEP4_PATHS
     )
     assert lever_table.param("windowed_commit_parallel", "MIN_REQUESTS") == 1
     assert lever_table.param("packed_prep_append", "MIN_ROWS") == 33
@@ -462,6 +669,7 @@ def test_b_ll_selects_the_generation_set(mbs):
             "half_window_experts",
         }
         | PREFILL
+        | TEP4_PATHS
     )
 
 
@@ -566,10 +774,13 @@ def test_the_ladder_shapes_resolve_alike_on_agg_and_gen(key, mbs, arm):
         return {n: (d.on, dict(d.params)) for n, d in lever_table.decisions.items()}
 
     agg, gen = selection("agg"), selection("gen")
-    # The router-per-row accuracy gate holds on generation servers only.
+    # The router-per-row accuracy gate holds on generation servers only; the context lever runs
+    # on servers that take context steps, which a generation server does not.
     gated = {"wide_router_per_row"} if gen.get("wide_router_per_row", (False,))[0] else set()
-    assert {n for n in agg if agg[n] != gen[n]} == gated
+    context = CONTEXT_SP if agg.get("context_sp_extra_parts", (False,))[0] else set()
+    assert {n for n in agg if agg[n] != gen[n]} == gated | context
     assert all(not agg[n][0] for n in gated)
+    assert all(not gen[n][0] for n in context)
 
 
 # --------------------------------------------------------------------------
@@ -908,6 +1119,67 @@ SPEC_RETIRED = (
     "TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD",
     "TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH",
     "TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD",
+    "MUSESPARK_OPEN_SPLITK_MAILBOX_V4",
+    "MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM",
+    "MUSESPARK_OPEN_SPLITK_RS",
+    "MUSESPARK_OPEN_SPLITK_RS_ONLY",
+    "MUSESPARK_OPEN_POOL_SPLITK8",
+    "MUSESPARK_OPEN_TEP4_WIDE_GEMMS",
+    "MUSESPARK_OPEN_TEP4_NARROW_GEMMS",
+    "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK",
+    "MUSESPARK_OPEN_TEP8_WIDE64_KERNELS",
+    "MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK",
+    "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS",
+    "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE",
+    "MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS",
+    "MUSESPARK_OPEN_PREFETCH_JOIN",
+    "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH",
+    "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS",
+    "MUSESPARK_OPEN_SWA_CL8",
+    "MUSESPARK_OPEN_TEP8_SWA_CL8",
+    "MUSESPARK_OPEN_SWA_PREP_SPLIT",
+    "MUSESPARK_OPEN_SWA_ONE2",
+    "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI",
+    "MUSESPARK_OPEN_FA_STAGES",
+    "MUSESPARK_OPEN_MR_STAGES",
+    "MUSESPARK_OPEN_BF16_HALF_WINDOW",
+    "MUSESPARK_OPEN_PREROUTED_META",
+    "MUSESPARK_OPEN_TEP8_PREROUTED",
+    "MUSESPARK_OPEN_PREROUTED_SO",
+    "MUSESPARK_OPEN_ROUTER_ROWS_TILING",
+    "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS",
+    "MUSESPARK_OPEN_TEP8_RB_PDL",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_MIN_ROWS",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PREWAIT",
+    "MUSESPARK_OPEN_TEP8_POOL_PROGRAMMATIC_FORK",
+    "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER",
+    "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER",
+    "MUSESPARK_OPEN_FINALIZE_TRIGGER",
+    "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS",
+    "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER",
+    "MUSESPARK_OPEN_TEP8_HOP_DIRECT",
+    "MUSESPARK_OPEN_TEP8_HOP_EARLY",
+    "MUSESPARK_OPEN_TEP8_HOP_MULTICAST",
+    "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS",
+    "MUSESPARK_OPEN_TEP8_HOP_R2",
+    "MUSESPARK_OPEN_TEP8_HOP_R2_MIN_ROWS",
+    "MUSESPARK_OPEN_TEP8_HOP_SMEM_PAD",
+    "MUSESPARK_OPEN_TEP8_JOIN_PDL",
+    "MUSESPARK_OPEN_PUBLISH_JOIN_CLUSTER",
+    "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS",
+    "MUSESPARK_OPEN_STEP_COMMIT_V2",
+    "MUSESPARK_OPEN_CTX_KV_GLUE",
+    "MUSESPARK_OPEN_CTX_KV_FORK_EARLY",
+    "MUSESPARK_OPEN_VP_MIN_ROWS",
+    "MUSESPARK_OPEN_SM107_VOCAB_PARALLEL_HEAD",
+    "MUSESPARK_OPEN_TEP8_EXTRA_PATHS",
+    "MUSESPARK_OPEN_DROP_PATHS",
+    "MUSESPARK_OPEN_FC_SHARD_PREWARM",
+    "MUSESPARK_OPEN_SP_SM107_PARTS",
 )
 
 
@@ -1148,7 +1420,7 @@ def test_the_role():
     assert any("role unknown" in warning for warning in unknown.warnings)
     # Counted as a decoding server; no accuracy gate names an unknown role.
     gen = rule_levers_on(table((107, 4), 4, "gen", "windowed"))
-    assert rule_levers_on(unknown) == gen - {"wide_router_per_row"}
+    assert rule_levers_on(unknown) == (gen - {"wide_router_per_row"} - VR_NUMERIC) | CONTEXT_SP
     assert unknown.decisions["wide_router_per_row"].source == "gate"
 
 

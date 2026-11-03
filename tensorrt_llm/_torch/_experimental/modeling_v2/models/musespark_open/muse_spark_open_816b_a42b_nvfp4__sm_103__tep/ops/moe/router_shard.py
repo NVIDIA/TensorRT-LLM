@@ -35,11 +35,14 @@ to it as well.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm.logger import logger
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -774,9 +777,66 @@ ROWS_MAX_ROWS = 32
 ROWS_PER_PROGRAM = {16: 1, 24: 4, 32: 2}
 
 
+#: ``configure(rows_tiling=...)`` = ``rows:per:experts,...`` (e.g. ``16:2:2,24:4:2,32:4:2``;
+#: sm_107 sets ``16:1:2,24:2:2,32:2:2``) sets ``router_shard_rows``' rows per program and experts
+#: per program at those row counts; None (or a row count not listed) keeps ``ROWS_PER_PROGRAM``
+#: with one expert per program. In the engine the router runs beside the pool GEMM, whose CTAs
+#: hold 128 of the 212 SMs, so fewer, larger programs can finish sooner there than in the
+#: isolated launch ``ROWS_PER_PROGRAM`` was chosen on. Neither count is part of a logit's
+#: summation order (the ``[experts, 8192]`` tile is a register repetition of the ``[1, 8192]``
+#: row layout, which the warp count alone fixes), so every logit keeps its bits.
+ROWS_TILING: dict[int, tuple[int, int]] = {}
+
+
+def _rows_tiling(raw: Optional[str]) -> dict[int, tuple[int, int]]:
+    """``rows:per:experts,...`` as ``{rows: (per, experts)}``; None or empty: no entry.
+
+    Raises:
+        ValueError: for a cell outside 1..32 rows, below one row per program, or with an
+            expert count other than 1, 2, 4 or 8.
+    """
+    out = {}
+    for cell in (c for c in (raw or "").strip().split(",") if c.strip()):
+        rows, per, experts = (int(v) for v in cell.split(":"))
+        if not (1 <= rows <= 32 and per >= 1 and experts in (1, 2, 4, 8)):
+            raise ValueError(f"[musespark_open] router_shard rows_tiling: bad cell {cell!r}")
+        out[rows] = (per, experts)
+    return out
+
+
+def configure(*, rows_tiling: Optional[str] = None) -> None:
+    """Set the tiling ``router_shard_rows`` launches with (``ROWS_TILING``).
+
+    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
+    the built-in tiling (``ROWS_PER_PROGRAM``, one expert per program).
+
+    Args:
+        rows_tiling: ``rows:per:experts,...`` cells (rows per program and experts per program
+            at a row count), or None for none.
+
+    Raises:
+        ValueError: for a malformed cell (``_rows_tiling``); the tiling is then unchanged.
+    """
+    global ROWS_TILING
+    ROWS_TILING = _rows_tiling(rows_tiling)
+    if ROWS_TILING:
+        cells = sorted(ROWS_TILING.items())
+        logger.info(
+            "[musespark_open] router_shard_rows: rows per program / experts per program "
+            + ", ".join(f"{rows} rows {per}/{experts}" for rows, (per, experts) in cells)
+        )
+
+
 def rows_per_program(tokens: int) -> int:
     """Rows each ``router_shard_rows`` program loops over at ``tokens`` rows (2 off the K=7 grid)."""
+    if tokens in ROWS_TILING:
+        return ROWS_TILING[tokens][0]
     return ROWS_PER_PROGRAM.get(tokens, 2)
+
+
+def experts_per_program(tokens: int) -> int:
+    """Expert rows of the weight tile each ``router_shard_rows`` program holds at ``tokens`` rows."""
+    return ROWS_TILING[tokens][1] if tokens in ROWS_TILING else TILE_ROWS
 
 
 class RouterShardRows(OpWrapper):
@@ -852,7 +912,8 @@ class RouterShardRows(OpWrapper):
         local = local_experts(ranks)
         first = rank * local
         per = rows_per_program(tokens)
-        _router_shard_rows_kernel[(triton.cdiv(tokens, per), local // TILE_ROWS)](
+        tile = experts_per_program(tokens)
+        _router_shard_rows_kernel[(triton.cdiv(tokens, per), triton.cdiv(local, tile))](
             hidden_states,
             weight[first : first + local],
             out,
@@ -861,7 +922,7 @@ class RouterShardRows(OpWrapper):
             PER=per,
             EXPERTS=local,
             HIDDEN=HIDDEN,
-            ROWS=TILE_ROWS,
+            ROWS=tile,
             num_warps=num_warps,
             enable_fp_fusion=False,
             launch_pdl=False,

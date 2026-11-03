@@ -408,7 +408,7 @@ write into a multicast inbox that the sampler gathers from (and fires the
 context-K/V fork's head fork point right after that GEMM); ``wide_split_sampler``
 (tep4 on sm_103 only) widens the head to decode steps of 129..1024 rows, which the
 sampler takes on the shipped sampler's 512-thread block (``target_head.widen``);
-``vocab_parallel_head`` (tep4 on sm_103 only) samples and argmaxes decode steps of
+``vocab_parallel_head`` (tep4 on sm_103 and sm_107, tep8 on sm_107) samples and argmaxes decode steps of
 16 rows or more from each rank's own vocabulary shard, without the logits all-gather.
 """
 
@@ -434,6 +434,7 @@ from tensorrt_llm.logger import logger
 
 from . import dispatch as _dispatch
 from . import layers as _layers
+from . import lever_settings as _lever_settings
 from . import weights as _weights
 from .attention import DecodeAttentionPlan
 from .layers import _NO_ALLREDUCE, PostAttnHopCall
@@ -1192,6 +1193,95 @@ _SM107_TEP4_LEVERS = frozenset(
     }
 )
 
+#: The Vera Rubin low-latency levers (origin ``LL``, ``levers.RULES``: on for decode at
+#: ``max_batch_size`` up to 8) both sm107 compositions serve: the dense weight prefetches
+#: joined after their consumer and the next-QKV prefetch skipped on 8-row steps, the
+#: one-cluster sliding-window block, its prep split and its merged split kernel (the TP8 steps of
+#: up to eight requests, and the block's fallback), the full-attention prep fold of two
+#: to four requests, the 20-stage split-KV rings, the prerouted NVFP4 experts, the finalize
+#: and 8-row hop triggers at entry, the 64-byte step-commit descriptors, the PDL norm-gates
+#: of 33..128-row steps, and the drafter's context-K/V side chain in two launches, forked
+#: before the LM-head GEMM.
+_SM107_LL_LEVERS = frozenset(
+    {
+        "weight_prefetch_after_join",
+        "next_qkv_prefetch_skip",
+        "swa_one_cluster_block",
+        "swa_prep_split",
+        "swa_eight_requests",
+        "full_attention_fold_multi",
+        "split_kv_deep_rings",
+        "prerouted_experts",
+        "finalize_entry_trigger",
+        "hop_entry_trigger",
+        "step_commit_v2",
+        "wide_norm_gate_pdl",
+        "drafter_kv_glue",
+        "drafter_kv_fork_before_head",
+    }
+)
+#: The low-latency levers sm107 TEP4 adds: the pool GEMM at split-K 8 and the 1..32-row
+#: tactic tables, the BF16 layers' half expert window, and the router input and expert
+#: all-gather of large context steps on the row shard.
+_SM107_TEP4_LL_LEVERS = frozenset(
+    {
+        "splitk_pool_split8",
+        "splitk_frontier_tables",
+        "bf16_half_window",
+        "context_sp_extra_parts",
+    }
+)
+#: The low-latency levers sm107 TEP8 adds: split-K on 33..64-row QKV and o_proj, on the
+#: pool / unpool slice publication and on the drafter's 2..4-request projections; the drafter
+#: fc shard to 64 rows; the ring-buddy placement to 64
+#: rows, launched with PDL and placed by tile cost; the router push and its pre-wait weight
+#: load; the 64-token finalize transport; the early multicast hop and o_proj's direct
+#: publication into it; the post-FFN join, the pool fork and the wide projection gathers.
+_SM107_TEP8_LL_LEVERS = frozenset(
+    {
+        "tep8_wide64_splitk",
+        "tep8_publish_splitk",
+        "tep8_drafter_wide_gemms",
+        "tep8_fc_shard_wide",
+        "tep8_ring_buddy_wide",
+        "tep8_ring_buddy_pdl",
+        "tep8_tile_placement",
+        "tep8_router_push",
+        "tep8_router_prewait",
+        "tep8_finalize_transport_64",
+        "tep8_early_multicast_hop",
+        "tep8_direct_hop",
+        "tep8_publish_join",
+        "tep8_pool_programmatic_fork",
+        "tep8_wide_projection_gathers",
+    }
+)
+
+#: The tep4 paths sm107 TEP8 serves too, on top of ``_TEP8_PATHS``: the multi-request decode
+#: prep append, the two-to-four-request SWA block and full attention, the split-KV decode FMHA
+#: of five or more requests and its post-attention hop, the drafter hops on the wide one-shot
+#: transport, the vocabulary-parallel verify head, the router GEMM, split-K on 9..64-row
+#: projections and the pool / unpool slice publication. Each path's installer checks its TP8
+#: rank shapes.
+_SM107_TEP8_PATHS = _TEP8_PATHS | frozenset(
+    {
+        "multi_request_prep_append",
+        "wide_swa_block",
+        "wide_full_attention",
+        "multi_request_split_kv",
+        "multi_request_post_attention_hop",
+        "wide_drafter_hops",
+        "vocab_parallel_head",
+        "router_gemm",
+        "wide_dense_gemms",
+        "projection_publish",
+    }
+)
+#: sm107 TEP4 also samples decode steps from each rank's own vocabulary shard
+#: (``ops/spec/head_sampler.vocab_parallel_sample``), bitwise the built-in split sampler by
+#: construction; its rule (``levers.RULES``) bounds it by ``max_batch_size``.
+_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | frozenset({"vocab_parallel_head"})
+
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
 #: the fast paths and levers served and the GPU topology they were validated on, with
 #: DFlash drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
@@ -1202,7 +1292,14 @@ TARGET_PATHS = {
         served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
     ),
     (107, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS | _PREFETCH_LEVERS | _SM107_LEVERS | _SM107_TEP8_LEVERS,
+        served=(
+            _SM107_TEP8_PATHS
+            | _PREFETCH_LEVERS
+            | _SM107_LEVERS
+            | _SM107_TEP8_LEVERS
+            | _SM107_LL_LEVERS
+            | _SM107_TEP8_LL_LEVERS
+        ),
         topology=_dispatch.TWO_TRAYS_OF_4,
         preconditions=(_dispatch.SM107_FUSED_KERNELS,),
     ),
@@ -1218,6 +1315,8 @@ TARGET_PATHS = {
             | _PREFETCH_LEVERS
             | _SM107_LEVERS
             | _SM107_TEP4_LEVERS
+            | _SM107_LL_LEVERS
+            | _SM107_TEP4_LL_LEVERS
         ),
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL, _dispatch.SM107_FUSED_KERNELS),
@@ -1316,6 +1415,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         )
         self._plan = plan
         self._mapping = getattr(model_config, "mapping", None)
+        # Before any installer: the kernel modules read these settings when they build.
+        _lever_settings.apply(plan, _dispatch.sm_of(capability))
         if plan and self._runtime_hooks is None:
             # Every composition serves both executor fast paths
             # (dispatch.TargetPaths); NO_PATHS declares no hooks.

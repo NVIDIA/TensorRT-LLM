@@ -12,15 +12,15 @@ next layer's pre-QKV Gemma RMSNorm.
 
 This entry is that boundary kernel with the gather folded into its load. The
 boundary already splits each row over a cluster of ``C`` CTAs, CTA ``c``
-owning columns ``[c * 8192/C, (c+1) * 8192/C)`` -- for every row count this
-entry takes (1..8, so ``C`` is 16 or 8; and at TP4 9..32, ``C`` = 4) that range
-lies inside one rank's 1024-column (TP8) or 2048-column (TP4) slice. So each
-thread publishes its 16 bytes of this rank's slice
-to one peer and polls exactly the 16 bytes of one peer's slice it is about to
-normalize; no CTA waits on more than one peer, nothing waits for the whole
-gather, and the gathered branch never touches global memory. Rows 9..32 need a
-wide inbox (``ProjectionInbox(..., max_rows=WIDE_ROWS)``): the inbox's rows per
-slot are compiled into the kernel's addressing.
+owning columns ``[c * 8192/C, (c+1) * 8192/C)`` -- for 1..8 rows (``C`` is 16 or
+8) and at TP4 for 9..32 (``C`` = 4) that range lies inside one rank's 1024-column
+(TP8) or 2048-column (TP4) slice; at TP8 for 9..32 rows it spans two. Each
+thread publishes its 16 bytes of this rank's slice to one peer and polls exactly
+the 16 bytes of one peer's slice it is about to normalize; no CTA waits on more
+than one peer (two at TP8 for 9..32 rows), nothing waits for the whole gather,
+and the gathered branch never touches global memory. Rows 9..32 need a wide
+inbox (``ProjectionInbox(..., max_rows=WIDE_ROWS)``): the inbox's rows per slot
+are compiled into the kernel's addressing.
 
 Bit-identical to the built-in gather + boundary: the CTA/thread layout, the
 per-thread arithmetic and the cluster reduction are the boundary kernel's own
@@ -121,9 +121,12 @@ if _AVAILABLE:
         ):
             cluster, threads = boundary_geometry(m)
             super().__init__(m, cluster, threads, gain, post_eps, pre_eps, norm_fp32)
-            # One 8-column vector per thread and one peer per CTA: the layout this
-            # kernel's inbox addressing is written for.
-            if world not in WORLDS or self.iters != 1 or (self.threads * 8) > local_columns(world):
+            # One 8-column vector per thread: the layout this kernel's inbox addressing is
+            # written for. A CTA may span two peers' slices (TP8 at 9..32 rows, four
+            # 2048-column CTAs a row): each thread still picks its one peer from its own
+            # columns (``peer = flat // per_peer``), so every (peer, word) pair is sent and
+            # polled by exactly one thread whatever the CTA geometry.
+            if world not in WORLDS or self.iters != 1 or local_columns(world) % 8:
                 raise ValueError(f"rows={m} gives a boundary geometry this gather cannot feed")
             if capacity not in (MAX_ROWS, WIDE_ROWS) or not 1 <= m <= capacity:
                 raise ValueError(f"rows={m} do not fit an inbox of {capacity} rows per slot")
@@ -720,10 +723,10 @@ unpool_gather_boundary = UnpoolGatherBoundary()
 
 
 def max_rows(inbox: ProjectionInbox) -> int:
-    """The most rows a call on ``inbox`` may carry: its ``max_rows`` where the boundary's CTAs
-    of every such row count stay inside one peer's slice (TP4), else ``MAX_ROWS``."""
+    """The most rows a call on ``inbox`` may carry: its ``max_rows``, at TP4 and at TP8."""
     capacity = getattr(inbox, "max_rows", MAX_ROWS)
-    return capacity if inbox.world == 4 else min(capacity, MAX_ROWS)
+    # TP8 takes a wide inbox's rows too (its 9..32-row CTAs span two slices).
+    return capacity
 
 
 def capture_fits(capture: torch.Tensor, rows: int, device: torch.device) -> bool:

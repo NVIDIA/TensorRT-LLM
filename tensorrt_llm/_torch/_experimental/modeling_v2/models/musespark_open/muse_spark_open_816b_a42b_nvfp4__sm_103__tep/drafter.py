@@ -64,6 +64,8 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             shell.llm.model,
             side_chain=plan.enabled("drafter_kv_side_chain"),
             early_fc=plan.enabled("drafter_fc_early_fork"),
+            glue=plan.enabled("drafter_kv_glue"),
+            fork_before_head=plan.enabled("drafter_kv_fork_before_head"),
             parallel_min_requests=(
                 plan.param("windowed_commit_parallel", "MIN_REQUESTS") if parallel else None
             ),

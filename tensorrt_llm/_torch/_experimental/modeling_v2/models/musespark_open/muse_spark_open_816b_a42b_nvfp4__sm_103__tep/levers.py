@@ -117,6 +117,69 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD": "nothing: this build has no such switch",
         "TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH": "nothing: this build has no such switch",
         "TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD": "nothing: this build has no such switch",
+        "MUSESPARK_OPEN_SPLITK_MAILBOX_V4": "nothing: the sm107 compositions build the split-K mailbox",
+        "MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM": (
+            "nothing: the sm107 compositions build split-K in oversized shared memory"
+        ),
+        "MUSESPARK_OPEN_SPLITK_RS": PREFIX + "SPLITK_POOL_SPLIT8",
+        "MUSESPARK_OPEN_SPLITK_RS_ONLY": PREFIX + "SPLITK_POOL_SPLIT8",
+        "MUSESPARK_OPEN_POOL_SPLITK8": PREFIX + "SPLITK_POOL_SPLIT8",
+        "MUSESPARK_OPEN_TEP4_WIDE_GEMMS": PREFIX + "SPLITK_FRONTIER_TABLES",
+        "MUSESPARK_OPEN_TEP4_NARROW_GEMMS": PREFIX + "SPLITK_FRONTIER_TABLES",
+        "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK": PREFIX + "TEP8_WIDE64_SPLITK",
+        "MUSESPARK_OPEN_TEP8_WIDE64_KERNELS": PREFIX + "TEP8_WIDE64_SPLITK",
+        "MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK": PREFIX + "TEP8_PUBLISH_SPLITK",
+        "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS": PREFIX + "TEP8_DRAFTER_WIDE_GEMMS",
+        "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE": PREFIX + "TEP8_FC_SHARD_WIDE",
+        "MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS": PREFIX + "TEP8_FC_SHARD_WIDE",
+        "MUSESPARK_OPEN_PREFETCH_JOIN": PREFIX + "WEIGHT_PREFETCH_AFTER_JOIN",
+        "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH": PREFIX + "WEIGHT_PREFETCH_AFTER_JOIN",
+        "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS": PREFIX + "NEXT_QKV_PREFETCH_SKIP",
+        "MUSESPARK_OPEN_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
+        "MUSESPARK_OPEN_TEP8_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
+        "MUSESPARK_OPEN_SWA_PREP_SPLIT": PREFIX + "SWA_PREP_SPLIT",
+        "MUSESPARK_OPEN_SWA_ONE2": PREFIX + "SWA_EIGHT_REQUESTS",
+        "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI": PREFIX + "FULL_ATTENTION_FOLD_MULTI",
+        "MUSESPARK_OPEN_FA_STAGES": PREFIX + "SPLIT_KV_DEEP_RINGS",
+        "MUSESPARK_OPEN_MR_STAGES": PREFIX + "SPLIT_KV_DEEP_RINGS",
+        "MUSESPARK_OPEN_BF16_HALF_WINDOW": PREFIX + "BF16_HALF_WINDOW",
+        "MUSESPARK_OPEN_PREROUTED_META": PREFIX + "PREROUTED_EXPERTS",
+        "MUSESPARK_OPEN_TEP8_PREROUTED": PREFIX + "PREROUTED_EXPERTS",
+        "MUSESPARK_OPEN_PREROUTED_SO": "nothing: the experts run trtllm::fp4_block_scale_moe_prerouted",
+        "MUSESPARK_OPEN_ROUTER_ROWS_TILING": "nothing: the sm107 compositions tile the per-row router shard",
+        "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": PREFIX + "TEP8_RING_BUDDY_WIDE",
+        "MUSESPARK_OPEN_TEP8_RB_PDL": PREFIX + "TEP8_RING_BUDDY_PDL",
+        "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT": PREFIX + "TEP8_TILE_PLACEMENT",
+        "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS": PREFIX + "TEP8_TILE_PLACEMENT",
+        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH": PREFIX + "TEP8_ROUTER_PUSH",
+        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_MIN_ROWS": PREFIX + "TEP8_ROUTER_PUSH",
+        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE": PREFIX + "TEP8_ROUTER_PUSH",
+        "MUSESPARK_OPEN_TEP8_ROUTER_PREWAIT": PREFIX + "TEP8_ROUTER_PREWAIT",
+        "MUSESPARK_OPEN_TEP8_POOL_PROGRAMMATIC_FORK": PREFIX + "TEP8_POOL_PROGRAMMATIC_FORK",
+        "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
+        "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
+        "MUSESPARK_OPEN_FINALIZE_TRIGGER": PREFIX + "FINALIZE_ENTRY_TRIGGER",
+        "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": PREFIX + "TEP8_FINALIZE_TRANSPORT_64",
+        "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER": PREFIX + "HOP_ENTRY_TRIGGER",
+        "MUSESPARK_OPEN_TEP8_HOP_DIRECT": PREFIX + "TEP8_DIRECT_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_EARLY": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_MULTICAST": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_R2": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_R2_MIN_ROWS": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_HOP_SMEM_PAD": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
+        "MUSESPARK_OPEN_TEP8_JOIN_PDL": PREFIX + "TEP8_PUBLISH_JOIN",
+        "MUSESPARK_OPEN_PUBLISH_JOIN_CLUSTER": PREFIX + "TEP8_PUBLISH_JOIN",
+        "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS": PREFIX + "WIDE_NORM_GATE_PDL",
+        "MUSESPARK_OPEN_STEP_COMMIT_V2": PREFIX + "STEP_COMMIT_V2",
+        "MUSESPARK_OPEN_CTX_KV_GLUE": PREFIX + "DRAFTER_KV_GLUE",
+        "MUSESPARK_OPEN_CTX_KV_FORK_EARLY": PREFIX + "DRAFTER_KV_FORK_BEFORE_HEAD",
+        "MUSESPARK_OPEN_VP_MIN_ROWS": PREFIX + "VOCAB_PARALLEL_HEAD__MIN_ROWS",
+        "MUSESPARK_OPEN_SM107_VOCAB_PARALLEL_HEAD": PREFIX + "VOCAB_PARALLEL_HEAD",
+        "MUSESPARK_OPEN_TEP8_EXTRA_PATHS": "nothing: the sm107 tep8 composition serves those paths",
+        "MUSESPARK_OPEN_DROP_PATHS": "the " + PREFIX + "<PATH>=off knobs",
+        "MUSESPARK_OPEN_FC_SHARD_PREWARM": "nothing: the sm107 compositions prewarm the drafter fc",
+        "MUSESPARK_OPEN_SP_SM107_PARTS": PREFIX + "CONTEXT_SP_EXTRA_PARTS__PARTS",
     }
 )
 #: Name prefixes only retired switches carry; any other name under them raises too.
@@ -520,6 +583,99 @@ def _router_gate(role: Role, scope: str) -> Gate:
     return Gate(holds, scope)
 
 
+#: The most requests the Vera Rubin low-latency levers (origin ``LL``, sm107 compositions)
+#: were measured on: TEP4 and TEP8 decode of one to eight requests.
+LL_MAX_BATCH = 8
+
+
+def _ll_params() -> Tuple[Param, ...]:
+    return (Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),)
+
+
+def _ll_gate() -> Gate:
+    """Where the numeric low-latency levers passed their accuracy gates."""
+
+    def holds(d: Deployment) -> bool:
+        return (
+            d.sm == 107
+            and d.tp in (4, 8)
+            and d.role in (Role.GEN, Role.AGG)
+            and d.max_batch_size is not None
+            and d.max_batch_size <= LL_MAX_BATCH
+        )
+
+    return Gate(
+        holds,
+        f"sm107 tep4 and tep8 servers of max_batch_size up to {LL_MAX_BATCH}: greedy drift, "
+        "GSM8K and SPEED-Bench acceptance",
+    )
+
+
+def _ll(kind: Kind) -> Rule:
+    """A low-latency lever of decode steps: on while ``max_batch_size`` is at most MAX_BATCH."""
+    gates = (_ll_gate(),) if kind is Kind.NUMERIC else ()
+    return Rule("LL", kind, _at_most("MAX_BATCH"), params=_ll_params(), gates=gates)
+
+
+def _context_workers(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    """On context servers; on aggregated ones only while ``max_batch_size`` is at most MAX_BATCH."""
+    if d.role is Role.GEN:
+        return False, "the server runs no context step"
+    if d.role is Role.AGG:
+        return _at_most("MAX_BATCH", requires_decode=False)(d, t, p)
+    return True, "large context steps of a context server"
+
+
+def _not_on_sm107_tep8(why_off: str, why_on: str) -> RuleFn:
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if (d.sm, d.tp) == (107, 8):
+            return False, why_off
+        return True, why_on
+
+    return rule
+
+
+#: The TP4 paths the sm107 TEP8 composition serves too (``modeling._SM107_TEP8_PATHS``):
+#: on wherever served under ``auto``; under ``baseline`` the upstream sm107 TEP8 composition,
+#: which did not serve them, leaves them out.
+SM107_TEP8_TEP4_PATHS = (
+    "multi_request_prep_append",
+    "wide_swa_block",
+    "wide_full_attention",
+    "multi_request_split_kv",
+    "multi_request_post_attention_hop",
+    "wide_drafter_hops",
+    "router_gemm",
+    "wide_dense_gemms",
+    "projection_publish",
+)
+
+
+def _tep4_path_rule() -> Rule:
+    return Rule(
+        "upstream",
+        Kind.COMPOSITION,
+        _always("its rows, wherever served"),
+        baseline=_not_on_sm107_tep8(
+            "the upstream sm107 tep8 composition does not serve it", "its rows, wherever served"
+        ),
+    )
+
+
+def _drafter_kv_glue(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    if t.on("drafter_kv_side_chain"):
+        return False, "yields to drafter_kv_side_chain, which fuses the same store"
+    return _at_most("MAX_BATCH")(d, t, p)
+
+
+def _vocab_parallel_head(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    if d.sm != 107:
+        return True, "verify heads of 16..1024 rows"
+    # sm107: 151 MiB of fabric buffers per TP4 rank for steps of up to 1024 rows; an engine
+    # that admits more requests (a context worker among them) samples on the built-in head.
+    return _at_most("MAX_BATCH")(d, t, p)
+
+
 #: Every lever whose rule is not the default; every other served lever is on under ``auto``
 #: and ``baseline``.
 RULES: Mapping[str, Rule] = types.MappingProxyType(
@@ -630,6 +786,73 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         ),
         "prefill_cutedsl_experts": Rule(
             "upstream", Kind.COMPOSITION, _always("expert calls of 4096..8192 rows")
+        ),
+        "vocab_parallel_head": Rule(
+            "upstream",
+            Kind.COMPOSITION,
+            _vocab_parallel_head,
+            baseline=_not_on_sm107(
+                "the upstream sm107 compositions sample on the split sampler",
+                "verify heads of 16..1024 rows",
+            ),
+            params=(
+                Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
+                Param("MIN_ROWS", 16, 8, 16, default_for=lambda d: 8 if d.sm == 107 else 16),
+            ),
+        ),
+        **{name: _tep4_path_rule() for name in SM107_TEP8_TEP4_PATHS},
+        # The Vera Rubin low-latency levers.
+        "splitk_pool_split8": _ll(Kind.NUMERIC),
+        "splitk_frontier_tables": _ll(Kind.NUMERIC),
+        "tep8_wide64_splitk": _ll(Kind.NUMERIC),
+        "tep8_publish_splitk": _ll(Kind.NUMERIC),
+        "tep8_drafter_wide_gemms": _ll(Kind.NUMERIC),
+        "tep8_fc_shard_wide": _ll(Kind.NUMERIC),
+        "weight_prefetch_after_join": _ll(Kind.BITWISE),
+        "next_qkv_prefetch_skip": _ll(Kind.BITWISE),
+        "swa_one_cluster_block": _ll(Kind.NUMERIC),
+        "swa_prep_split": _ll(Kind.BITWISE),
+        "swa_eight_requests": _ll(Kind.NUMERIC),
+        "full_attention_fold_multi": _ll(Kind.BITWISE),
+        "split_kv_deep_rings": _ll(Kind.BITWISE),
+        "bf16_half_window": _ll(Kind.NUMERIC),
+        "prerouted_experts": _ll(Kind.BITWISE),
+        "tep8_ring_buddy_wide": _ll(Kind.NUMERIC),
+        "tep8_ring_buddy_pdl": _ll(Kind.BITWISE),
+        "tep8_tile_placement": _ll(Kind.NUMERIC),
+        "tep8_router_push": _ll(Kind.NUMERIC),
+        "tep8_router_prewait": _ll(Kind.BITWISE),
+        "finalize_entry_trigger": _ll(Kind.BITWISE),
+        "tep8_finalize_transport_64": _ll(Kind.BITWISE),
+        "hop_entry_trigger": _ll(Kind.BITWISE),
+        "tep8_early_multicast_hop": _ll(Kind.BITWISE),
+        "tep8_direct_hop": _ll(Kind.BITWISE),
+        "tep8_publish_join": _ll(Kind.BITWISE),
+        "tep8_pool_programmatic_fork": _ll(Kind.BITWISE),
+        "tep8_wide_projection_gathers": _ll(Kind.NUMERIC),
+        "step_commit_v2": _ll(Kind.BITWISE),
+        "wide_norm_gate_pdl": _ll(Kind.BITWISE),
+        "drafter_kv_glue": Rule(
+            "LL",
+            Kind.BITWISE,
+            _drafter_kv_glue,
+            params=_ll_params(),
+            after=("drafter_kv_side_chain",),
+            conflicts=("drafter_kv_side_chain",),
+        ),
+        "drafter_kv_fork_before_head": _ll(Kind.BITWISE),
+        "context_sp_extra_parts": Rule(
+            "LL",
+            Kind.BITWISE,
+            _context_workers,
+            params=(
+                Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
+                Param(
+                    "PARTS",
+                    ("router_input", "ce_gather"),
+                    choices=("shard_routing", "router_input", "ce_gather"),
+                ),
+            ),
         ),
     }
 )

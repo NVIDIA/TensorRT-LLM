@@ -71,9 +71,11 @@ from tensorrt_llm.logger import logger
 
 from ...attention import MuseSparkOpenTepAttention, MuseSparkOpenTepDecodeAttention
 from ...dispatch import LAUNCH_PDL
+from ...ops.attention import swa_block as _swa_ops
 from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
 from ...ops.attention.swa_block import (
+    _ONE2_MAX_REQUESTS,
     MAX_ROWS,
     MULTI_MAX_REQUESTS,
     max_blocks,
@@ -311,8 +313,15 @@ class _SwaBlock:
         n = md.num_seqs
         rows = md.num_tokens
         seq_lens = getattr(md, "seq_lens", None)
+        # swa_block's ``one2`` (swa_eight_requests), read per call: TEP8 layers (2 KV heads) take
+        # up to 8 sequences.
+        cap = (
+            _ONE2_MAX_REQUESTS
+            if _swa_ops._SWA_ONE2 and self.num_key_value_heads == 2
+            else MULTI_MAX_REQUESTS
+        )
         if (
-            not 2 <= n <= MULTI_MAX_REQUESTS
+            not 2 <= n <= cap
             or md.num_generations != n
             or rows % n
             or rows // n > MAX_ROWS
@@ -454,6 +463,7 @@ def install_multi(model) -> int:
         ValueError: if a sliding-window layer does not carry ``swa_block``.
     """
     count = 0
+    one2 = 0
     for layer in model.layers:
         attention = layer.self_attn
         if not attention.is_sliding:
@@ -464,10 +474,28 @@ def install_multi(model) -> int:
                 f"{layer.layer_idx} carries {type(attention).__name__}"
             )
         attention._swa_multi = True
+        if (
+            _swa_ops._SWA_ONE2
+            and attention.num_key_value_heads == 2
+            and hasattr(attention, "_mr_append_min_seqs")
+        ):
+            # swa_block's ``one2``: the one-launch block of 5..8 sequences does its own prep and K/V
+            # append on these layers, so multi_request_prep_append (installed before this) folds
+            # only larger steps here.
+            attention._mr_append_min_seqs = max(
+                attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1
+            )
+            one2 += 1
         count += 1
     logger.info(
         f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
         f"requests of up to {MAX_ROWS} rows each on {count} sliding-window layers"
+        + (
+            f"; swa_eight_requests: also 5..{_ONE2_MAX_REQUESTS} requests on {one2} TEP8 layers "
+            "(one launch; multi_request_prep_append stands down for them)"
+            if one2
+            else ""
+        )
     )
     return count
 

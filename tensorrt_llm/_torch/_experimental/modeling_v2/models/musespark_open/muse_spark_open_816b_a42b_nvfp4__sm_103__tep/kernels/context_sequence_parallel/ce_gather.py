@@ -29,12 +29,14 @@ Ownership and progress (cuFlow):
   one reader: rank ``r``'s block GEMM for ``p``.
 * Publication: the copy completes, then the fenced flag write; acquire: the stream-side
   wait, then the GEMM. The reader resets its flags after its last wait.
-* Visibility: the waits carry no ``CU_STREAM_WAIT_VALUE_FLUSH`` (the device reports
-  ``CAN_FLUSH_REMOTE_WRITES`` = 0). The copied rows are visible to the reader's GEMM
+* Visibility: on a device that reports ``CAN_FLUSH_REMOTE_WRITES`` = 0 the waits
+  carry no ``CU_STREAM_WAIT_VALUE_FLUSH``. The copied rows are visible to the reader's GEMM
   because the sender orders the copy before its fenced flag write on one stream and
   the NVLink peer writes land in the reader's memory before the flag word does. This
   rests on that ordering of the peer-write path, not on a documented acquire of the
-  wait; the unit and in-engine checks under graph replay are bit exact.
+  wait; the unit and in-engine checks under graph replay are bit exact. A device that
+  reports 1 gets the flush on its waits (``_wait_flags``), the documented way to make
+  remote writes visible behind a stream wait there.
 * Consumers: on a step this takes, the view ``gather`` returns never holds this
   rank's own rows (``project`` reads them from the attention input itself), so
   ``project`` must stay its only reader; ``settle`` completes the view in place for
@@ -118,14 +120,43 @@ def _write_value(address: int, value: int) -> None:
     )
 
 
+#: The flag waits' flags per device: ``CU_STREAM_WAIT_VALUE_FLUSH`` is added on a device that
+#: reports ``CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES`` (queried once per device): the flush is
+#: the documented way to make writes that reached the device before the flag visible to the work
+#: behind the wait. A device that reports 0 keeps the plain equal wait exactly.
+_FLUSH_BY_DEVICE = {}
+
+
+def _wait_flags() -> int:
+    index = torch.cuda.current_device()
+    flags = _FLUSH_BY_DEVICE.get(index)
+    if flags is None:
+        err, dev = _cu.cuDeviceGet(index)
+        _check(err)
+        err, can = _cu.cuDeviceGetAttribute(
+            _cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_FLUSH_REMOTE_WRITES, dev
+        )
+        _check(err)
+        flags = int(_cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ)
+        if can:
+            flags |= int(_cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_FLUSH)
+        _FLUSH_BY_DEVICE[index] = flags
+        logger.info(
+            f"[musespark_open] ce_gather: device {index} CAN_FLUSH_REMOTE_WRITES={int(can)}: "
+            f"flag waits {'with' if can else 'without'} CU_STREAM_WAIT_VALUE_FLUSH"
+        )
+    return flags
+
+
 def _wait_value(address: int, value: int) -> None:
-    """``cuStreamWaitValue32`` (equal) on the current stream."""
+    """``cuStreamWaitValue32`` (equal) on the current stream, with ``CU_STREAM_WAIT_VALUE_FLUSH``
+    on a device that reports CAN_FLUSH_REMOTE_WRITES (``_wait_flags``)."""
     _check(
         _cu.cuStreamWaitValue32(
             _cu.CUstream(torch.cuda.current_stream().cuda_stream),
             _cu.CUdeviceptr(address),
             value,
-            _cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ,
+            _wait_flags(),
         )
     )
 

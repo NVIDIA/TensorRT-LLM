@@ -13,11 +13,17 @@ slots per thread), so every rounding happens on the same operands in the same
 order -- and changes only how the partials travel and when dependents start.
 
 At TP8 the wrapped workspace is the fabric one over two trays, whose kernel runs
-a cluster of 8 at up to 16 tokens. At TP4 it is the single-tray IPC workspace,
-whose kernel runs one 512-thread CTA per token (cluster 1): this entry keeps
-its cluster of 8 there and adds the sixteen warp sums of a slot in the
-built-in's order, warp by warp from +0 with no per-CTA subtotal (``flat_sum``),
-so the TP4 result is the built-in TP4 kernel's bit for bit as well.
+a cluster of 8 at up to 16 tokens and one 512-thread CTA per token above. At TP4
+it is the single-tray IPC workspace, whose kernel runs one 512-thread CTA per
+token (cluster 1): this entry keeps its cluster of 8 there and adds the sixteen
+warp sums of a slot in the built-in's order, warp by warp from +0 with no
+per-CTA subtotal (``flat_sum``), so the TP4 result is the built-in TP4 kernel's
+bit for bit as well. A TP8 workspace laid out for more than 16 tokens
+(``TP8_MAX_TOKENS``) builds this kernel twice: its calls of
+1..16 tokens add in the cluster-8 order, its calls of 17..``TP8_MAX_TOKENS``
+flat (``flat``), the built-in TP8 kernel's order at those counts (one CTA per
+token, the same 16 warps and column map), so those are bit for bit the
+built-in's too.
 
 
 * **Publication.** One store per thread to the slot's multicast address: the
@@ -53,8 +59,9 @@ so the TP4 result is the built-in TP4 kernel's bit for bit as well.
 
 Protocol (one-shot Lamport; the slot layout is this workspace's own). Each rank
 owns a receive area of ``2 buffers x ranks source ranks x max_tokens tokens x
-4096`` BF16 (``max_tokens`` is the workspace's layout, ``MAX_TOKENS`` or
-``WIDE_MAX_TOKENS``) filled with the sentinel word ``0x80000000``: a 32-bit
+4096`` BF16 (``max_tokens`` is the workspace's layout: ``MAX_TOKENS``,
+``WIDE_MAX_TOKENS`` at TP4 or ``TP8_MAX_TOKENS`` at TP8) filled with the
+sentinel word ``0x80000000``: a 32-bit
 word that holds it has not arrived. Published words never equal it (``-0``
 halves are cleared). In one call a slot ``(buffer, source, token, column vector)`` has one writer, the
 source rank's thread with that token and column, and one reader, this rank's
@@ -74,7 +81,13 @@ grid is at most ``GRID_STEP`` CTAs. ``2**32`` is a multiple of
 ``2 * GRID_STEP``, so the parity survives the counter's wrap. ``GRID_STEP`` is
 the layout's (``grid_step``): 128 for ``MAX_TOKENS``, 256 for
 ``WIDE_MAX_TOKENS`` (a 32-token call is 256 CTAs of 64 threads and 2 KiB of
-shared memory, resident at once on the devices served).
+shared memory, resident at once on the devices served), and 128, 256 or 512
+for a TP8 layout of ``TP8_MAX_TOKENS`` = 16, 32 or 64 tokens (a 64-token call
+is 512 CTAs in 64 clusters of 8, which must all be resident at once on the
+device served). The two builds of a TP8
+workspace share its receive area and counter: a call of either advances the
+counter by the layout's ``grid_step``, and both map a ``(token, column
+vector)`` slot to the same thread, so the arguments above hold across builds.
 
 Progress: every CTA publishes before it polls, and a publication waits for no
 read, so every slot is written; a stale slot is read again every round with a
@@ -113,7 +126,10 @@ workspace's kernel, memory and counter. The built-in TP4 kernel runs one CTA
 per token at every token count up to its 128, so the TP4 arithmetic above is
 its arithmetic at 17..32 tokens too; at TP8 the built-in switches to one CTA
 per token above 16 tokens, which the cluster-8 order is not, so the wide
-layout is TP4-only.
+layout is TP4-only. A TP8 workspace instead takes its calls of
+17..``TP8_MAX_TOKENS`` itself, on its own layout of that many tokens and the
+flat build (``TP8_MAX_TOKENS`` is ``configure``'s ``tep8_max_tokens``: 16, 32
+or 64, 16 by default; no TP4 workspace uses it).
 """
 
 from __future__ import annotations
@@ -140,6 +156,15 @@ MAX_TOKENS = 16
 WIDE_MAX_TOKENS = 32
 #: The layouts a workspace can have, and the group sizes each serves.
 LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
+#: The built-in TP8 kernel's cluster-8 range; above it the built-in runs one CTA per token.
+CLUSTER8_TOKENS = 16
+#: The layout of a TP8 workspace (``configure``'s ``tep8_max_tokens``: 16, 32 or 64; the
+#: ``tep8_finalize_transport_64`` lever sets 64), whose calls of 17..TP8_MAX_TOKENS tokens add their
+#: slot sums flat, in the built-in one-CTA-per-token order (``flat_sum``, as at TP4; the built-in
+#: runs one CTA per token up to 128). TP4 workspaces ignore it (their 17..32-token calls are
+#: ``serve_wide_calls``'). Kept out of ``LAYOUT_RANK_COUNTS`` (``has_layout``), so a 32-token TP8
+#: layout never makes the TP4 wide layout's entry admit TP8.
+TP8_MAX_TOKENS = 16
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8
@@ -183,6 +208,29 @@ def grid_shift(max_tokens: int = MAX_TOKENS) -> int:
 
 assert grid_shift(MAX_TOKENS) == GRID_SHIFT
 
+
+def has_layout(max_tokens: int, ranks: int) -> bool:
+    """Whether a workspace of a group of ``ranks`` can have the ``max_tokens`` layout.
+
+    ``LAYOUT_RANK_COUNTS``'s layouts, and at TP8 the ``TP8_MAX_TOKENS`` one.
+    """
+    return ranks in LAYOUT_RANK_COUNTS.get(max_tokens, ()) or (
+        ranks == 8 and max_tokens == TP8_MAX_TOKENS
+    )
+
+
+def default_max_tokens(ranks: int) -> int:
+    """The layout of a group of ``ranks`` unless one is asked for: ``TP8_MAX_TOKENS`` at TP8, else ``MAX_TOKENS``."""
+    return TP8_MAX_TOKENS if ranks == 8 else MAX_TOKENS
+
+
+def kernel_cluster(num_tokens: int, ranks: int) -> int:
+    """CTAs per token of the built-in split whose summation order this kernel's build for a
+    ``num_tokens``-token call reproduces: the cluster of 8 at TP8 up to ``CLUSTER8_TOKENS``
+    tokens; one CTA per token above it (the ``flat`` build) and at TP4 (``flat_sum``)."""
+    return CLUSTER if ranks == 8 and num_tokens <= CLUSTER8_TOKENS else 1
+
+
 #: Bytes one ``push`` value occupies in a receiving CTA (one 16-byte ``st.async``).
 _PUSH_BYTES = 16
 
@@ -211,10 +259,39 @@ class Transport:
         return f"{self.publish}/{self.arrival}/{self.reduction}/{self.trigger}"
 
 
-#: The transport ``finalize_transport`` installs.
+#: The transport ``finalize_transport`` installs. ``configure``'s ``trigger`` ``entry`` (the
+#: ``finalize_entry_trigger`` lever) moves its dependent-launch trigger to right after this kernel's
+#: own ``griddepcontrol.wait`` (module docstring), so the unpool's split-K GEMM launches and stages
+#: its weight while this kernel waits for its peers; ``late``, the default, is the built-in's place.
+#: Every value is the same either way: only where the dependents may launch moves.
 DEFAULT = Transport()
 #: The same transport with the trigger at kernel entry.
 ENTRY_TRIGGER = Transport(trigger="entry")
+
+
+def configure(*, tep8_max_tokens: int = 16, trigger: str = "late") -> None:
+    """Set the TP8 workspace layout and the trigger of the transport ``finalize_transport`` builds.
+
+    ``lever_settings.apply`` sets them from the model's plan before any install; a workspace
+    built afterwards takes them (``FinalizeTransportWorkspace``'s defaults).
+
+    Args:
+        tep8_max_tokens: the token layout of a TP8 workspace (``TP8_MAX_TOKENS``): 16, 32 or 64.
+            Above 16 its calls of 17..``tep8_max_tokens`` tokens run the flat build.
+        trigger: the dependent-launch trigger of ``DEFAULT``: ``"late"`` or ``"entry"``
+            (an empty value is ``"late"``).
+
+    Raises:
+        ValueError: if ``tep8_max_tokens`` is not 16, 32 or 64, or ``trigger`` is not a
+            ``Transport`` trigger.
+    """
+    global TP8_MAX_TOKENS, DEFAULT
+    tokens = int(tep8_max_tokens)
+    if tokens not in (16, 32, 64):
+        raise ValueError(f"finalize transport token cap {tokens}: 16, 32 or 64")
+    transport = Transport(trigger=str(trigger).strip() or "late")
+    TP8_MAX_TOKENS = tokens
+    DEFAULT = transport
 
 
 try:
@@ -507,15 +584,22 @@ if HAS_CUTE_DSL:
         slot sums are added flat (``flat_sum``, the built-in cluster-1 order).
         ``max_tokens`` is the receive-area layout (the slab per source rank and
         the arrival counter's step); every statement on a token's values is the
-        same in every layout.
+        same in every layout. ``flat`` builds the TP8 kernel of the calls above
+        ``CLUSTER8_TOKENS`` tokens, adding the slot sums flat as the built-in TP8
+        kernel does at those counts.
         """
 
         def __init__(
-            self, transport: Transport, pdl: bool, ranks: int = 8, max_tokens: int = MAX_TOKENS
+            self,
+            transport: Transport,
+            pdl: bool,
+            ranks: int = 8,
+            max_tokens: int = MAX_TOKENS,
+            flat: bool = False,
         ):
             if ranks not in RANK_COUNTS:
                 raise ValueError(f"the finalize transport serves {RANK_COUNTS} ranks, got {ranks}")
-            if ranks not in LAYOUT_RANK_COUNTS.get(max_tokens, ()):
+            if not has_layout(max_tokens, ranks):
                 raise ValueError(
                     f"the finalize transport has no {max_tokens}-token layout at {ranks} ranks"
                 )
@@ -524,8 +608,10 @@ if HAS_CUTE_DSL:
             self.grid_shift = grid_shift(max_tokens)
             self.grid_step = 1 << self.grid_shift
             # The built-in TP4 kernel runs one CTA per token and adds its warps' sums
-            # from +0 in warp order; TP8's cluster of 8 adds per-CTA totals.
-            self.flat_sum = ranks == 4
+            # from +0 in warp order; TP8's cluster of 8 adds per-CTA totals. ``flat`` builds
+            # the TP8 kernel of 17..max_tokens-token calls, where the built-in TP8 kernel also
+            # runs one CTA per token (the same 16 warps, the same column map).
+            self.flat_sum = ranks == 4 or flat
             self.cluster = CLUSTER
             self.threads = THREADS
             self.warps = THREADS // 32
@@ -870,8 +956,9 @@ if HAS_CUTE_DSL:
         pdl: bool,
         ranks: int = 8,
         max_tokens: int = MAX_TOKENS,
+        flat: bool = False,
     ):
-        kernel = _FinalizeTransportKernel(transport, pdl, ranks, max_tokens)
+        kernel = _FinalizeTransportKernel(transport, pdl, ranks, max_tokens, flat)
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -912,15 +999,19 @@ class FinalizeTransportWorkspace:
     (one tray); the multicast transport uses fabric handles only when the group
     spans nodes, as the post-attention hop's does. ``max_tokens`` is the
     receive-area layout: ``MAX_TOKENS`` at TP8 or TP4, ``WIDE_MAX_TOKENS`` at
-    TP4 only.
+    TP4 only, ``TP8_MAX_TOKENS`` at TP8 only; by default ``default_max_tokens``
+    (the TP8 one at TP8). A TP8 layout above ``CLUSTER8_TOKENS`` tokens also
+    builds the ``flat`` kernel, which runs its calls of ``CLUSTER8_TOKENS + 1``
+    ..``max_tokens`` tokens on the same receive area and counter. ``transport``
+    is ``DEFAULT`` unless one is asked for.
     """
 
     def __init__(
         self,
         legacy,
         mapping: Mapping,
-        transport: Transport = DEFAULT,
-        max_tokens: int = MAX_TOKENS,
+        transport: Optional[Transport] = None,
+        max_tokens: Optional[int] = None,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -934,7 +1025,11 @@ class FinalizeTransportWorkspace:
                 f"the finalize transport serves TP{' or TP'.join(map(str, RANK_COUNTS))}, "
                 f"got TP{mapping.tp_size}"
             )
-        if mapping.tp_size not in LAYOUT_RANK_COUNTS.get(max_tokens, ()):
+        if transport is None:
+            transport = DEFAULT
+        if max_tokens is None:
+            max_tokens = default_max_tokens(mapping.tp_size)
+        if not has_layout(max_tokens, mapping.tp_size):
             raise ValueError(
                 f"the finalize transport has no {max_tokens}-token layout at TP{mapping.tp_size}"
             )
@@ -964,13 +1059,17 @@ class FinalizeTransportWorkspace:
                 raise RuntimeError("the wrapped TP8 workspace is not the fabric one")
             if self.ranks == 4 and (legacy._use_mnnvl or mapping.is_multi_node()):
                 raise RuntimeError("the wrapped TP4 workspace is not the single-tray IPC one")
-            if _legacy._cluster_for_tokens(self.max_tokens, self.ranks) != (
-                CLUSTER if self.ranks == 8 else 1
-            ):
-                raise RuntimeError(
-                    f"the built-in TP{self.ranks} kernel does not split a {self.max_tokens}-token "
-                    "call the way this kernel's order assumes"
-                )
+            # Every call this workspace takes must be split by the built-in kernel the way the
+            # build that runs it adds (``kernel_cluster``): checked at every token count, since a
+            # TP8 layout above CLUSTER8_TOKENS spans both of the built-in's TP8 splits.
+            for tokens in range(1, self.max_tokens + 1):
+                if _legacy._cluster_for_tokens(tokens, self.ranks) != kernel_cluster(
+                    tokens, self.ranks
+                ):
+                    raise RuntimeError(
+                        f"the built-in TP{self.ranks} kernel does not split a {tokens}-token "
+                        "call the way this kernel's order assumes"
+                    )
             if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
                 raise RuntimeError("the finalize transport runs on SM103 or SM107 only")
             size = workspace_bytes(self.ranks, self.max_tokens)
@@ -1008,9 +1107,21 @@ class FinalizeTransportWorkspace:
             self._compiled = _compiled_kernel(
                 self.device.index, transport, self.pdl, self.ranks, self.max_tokens
             )
+            # TP8 calls of 17..max_tokens tokens take the flat-sum build.
+            self._compiled_flat = (
+                _compiled_kernel(
+                    self.device.index, transport, self.pdl, self.ranks, self.max_tokens, True
+                )
+                if self.ranks == 8 and self.max_tokens > CLUSTER8_TOKENS
+                else self._compiled
+            )
             # A dry launch loads the module now, not inside a capture.
             dummy = self.control.data_ptr()
             self._launch(dummy, dummy, dummy, dummy, dummy, 0, HIDDEN, 1, 1.0, 1)
+            if self._compiled_flat is not self._compiled:
+                self._launch(
+                    dummy, dummy, dummy, dummy, dummy, 0, HIDDEN, CLUSTER8_TOKENS + 1, 1.0, 1
+                )
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc
@@ -1021,7 +1132,8 @@ class FinalizeTransportWorkspace:
             ) from error
 
     def _launch(self, gemm, indices, weights, norm, out, rows, row_stride, tokens, eps, dry=0):
-        self._compiled(
+        compiled = self._compiled_flat if tokens > CLUSTER8_TOKENS else self._compiled
+        compiled(
             gemm,
             indices,
             weights,
@@ -1068,6 +1180,12 @@ class FinalizeTransportWorkspace:
             raise ValueError("the finalize transport already serves its wide calls")
         if self.max_tokens >= WIDE_MAX_TOKENS:
             raise ValueError(f"the finalize transport already takes {self.max_tokens} tokens")
+        if self.ranks not in LAYOUT_RANK_COUNTS[WIDE_MAX_TOKENS]:
+            # Checked here, not only by the constructor: ``has_layout`` admits a TP8 workspace of
+            # WIDE_MAX_TOKENS tokens when TP8_MAX_TOKENS is 32, which is not the wide layout.
+            raise ValueError(
+                f"the finalize transport has no {WIDE_MAX_TOKENS}-token wide layout at TP{self.ranks}"
+            )
         self.wide = FinalizeTransportWorkspace(
             self.legacy, mapping, self.transport, WIDE_MAX_TOKENS
         )
@@ -1118,8 +1236,9 @@ class FinalizeAllReduceTransport(OpWrapper):
     """The fused expert finalize + all-reduce of a ``FinalizeTransportWorkspace``.
 
     Returns the ``[num_tokens, 4096]`` BF16 group sum of every rank's partial
-    (calls of 1..16 tokens, and of 17..32 on a TP4 workspace serving its wide
-    calls): per token, each valid expert row ``x`` (slot index in ``[0, R)``)
+    (calls of 1..16 tokens, of 17..32 on a TP4 workspace serving its wide
+    calls, and of 17..``TP8_MAX_TOKENS`` on a TP8 workspace of that layout):
+    per token, each valid expert row ``x`` (slot index in ``[0, R)``)
     scaled by ``w * rsqrt(mean((x * g)^2) + eps)`` times ``x * g`` with
     ``g = 1 + norm``, summed over the slots, rounded to BF16 with ``-0``
     cleared, then summed over the ranks in FP32 in rank order and rounded to BF16.
@@ -1174,7 +1293,8 @@ class FinalizeAllReduceTransport(OpWrapper):
     unchanged; the feature puts a ``FinalizeTransportWorkspace`` in that
     attribute, which runs this kernel for 1..16 tokens (and, with
     ``wide_finalize_transport`` at TP4, the same kernel on a 32-token layout
-    for 17..32 tokens) and the built-in kernel otherwise.
+    for 17..32 tokens; at TP8 with ``TP8_MAX_TOKENS`` above 16, its flat build
+    for 17..``TP8_MAX_TOKENS`` tokens) and the built-in kernel otherwise.
 
     Certified bit for bit against the built-in kernel by its own multi-GPU test
     (8 ranks on two nodes; every cell, every transport variant, tokens 1..16, a
@@ -1187,8 +1307,11 @@ class FinalizeAllReduceTransport(OpWrapper):
     workspace for every token count 17..32 (the wide cells, graph replays and
     bursts mixing both workspaces, a delayed rank, its counter across the wrap,
     its buffer parity). Not certified: more than 32 tokens, or more than 16 at
-    TP8 (served by the built-in kernel). The wide cells (``wide=True``) run at
-    TP4 only.
+    TP8 (served by the built-in kernel unless ``TP8_MAX_TOKENS`` is above 16:
+    the TP8 flat build was checked bit for bit against the built-in TP8 kernel
+    at 8..64 tokens on 8 ranks over two trays, every transport variant, by a
+    standalone benchmark, not by this test, which has no TP8 cell above 16
+    tokens). The wide cells (``wide=True``) run at TP4 only.
     """
 
     def __call__(
@@ -1204,7 +1327,8 @@ class FinalizeAllReduceTransport(OpWrapper):
         if not workspace.serves(num_tokens):
             raise ValueError(
                 f"finalize_allreduce_transport serves 1..{MAX_TOKENS} tokens "
-                f"(1..{WIDE_MAX_TOKENS} on a TP4 workspace serving its wide calls)"
+                f"(1..{WIDE_MAX_TOKENS} on a TP4 workspace serving its wide calls, "
+                f"1..{TP8_MAX_TOKENS} on a TP8 workspace of the TP8 layout)"
             )
         return workspace.finalize(
             gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
@@ -1246,10 +1370,13 @@ class FinalizeAllReduceTransport(OpWrapper):
 finalize_allreduce_transport = FinalizeAllReduceTransport()
 
 
-def log_once_enabled(layers: int, transport: Transport, wide: bool = False) -> None:
-    calls = f"1..{MAX_TOKENS} tokens"
+def log_once_enabled(
+    layers: int, transport: Transport, wide: bool = False, max_tokens: int = MAX_TOKENS
+) -> None:
+    # ``max_tokens``: the installed workspace's layout (``TP8_MAX_TOKENS`` on a TP8 one).
+    calls = f"1..{max_tokens} tokens"
     if wide:
-        calls += f" and, on a second receive area, {MAX_TOKENS + 1}..{WIDE_MAX_TOKENS} tokens"
+        calls += f" and, on a second receive area, {max_tokens + 1}..{WIDE_MAX_TOKENS} tokens"
     logger.info(
         f"[musespark_open] finalize_transport: fused expert finalize + all-reduce of all {layers} layers on the "
         f"{transport.label()} transport (publish/arrival/reduction/trigger) for calls of "

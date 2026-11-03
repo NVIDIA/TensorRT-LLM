@@ -9,13 +9,13 @@ are scaled by the metap multiplier. Above 8 rows the built-in
 rows, 16 K-splits) and the FP32 ``Linear`` above 128 rows, which this stack's torch
 runs in plain TF32 (every weight rounded to 11 bits).
 
-This entry runs the tree's CuTe BF16x3 router GEMM
-(``cute_dsl_kernels/blackwell/bf16x3_router_gemm.Sm100BF16x3RouterGemm``, the kernel
-behind the built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option) and sums its split-K
-partials with the multiplier folded in. The GEMM computes ``W X^T`` on tcgen05: the
-256 experts are the MMA's M dimension (two tiles of 128), the call's rows its N
-dimension (one tile of the next power of two of up to 128 rows, then 128-row
-tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles on a
+This entry runs the CuTe BF16x3 router GEMM ``ops/moe/bf16x3_router_gemm.Sm100BF16x3RouterGemm``
+(the kernel behind the built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option,
+``cute_dsl_kernels/blackwell/bf16x3_router_gemm``, moved into this target with its
+pre-wait build) and sums its split-K partials with the multiplier folded in. The GEMM
+computes ``W X^T`` on tcgen05: the 256 experts are the MMA's M dimension (two tiles of 128),
+the call's rows its N dimension (one tile of the next power of two of up to 128 rows, then
+128-row tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles on a
 device of ``S`` SMs runs ``splits(rows) = S // (2 * t)`` K splits -- 76, 38, 25, 19
 on GB300's 152 SMs, 106, 53, 35, 26 on R200's 212 -- so that its ``2 * t * splits``
 CTAs fill the GPU's SMs in one wave; each CTA owns every ``splits``-th K tile of 64.
@@ -91,9 +91,9 @@ def splits(rows: int, sms: Optional[int] = None) -> int:
 
 
 def _gemm(tile: int):
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.bf16x3_router_gemm import (
-        Sm100BF16x3RouterGemm,
-    )
+    # Imported at the first compile, as before the move; ``compile`` builds with the module's
+    # configured pre-wait setting (``bf16x3_router_gemm.configure``).
+    from .bf16x3_router_gemm import Sm100BF16x3RouterGemm
 
     return Sm100BF16x3RouterGemm.compile(tile, HIDDEN)
 

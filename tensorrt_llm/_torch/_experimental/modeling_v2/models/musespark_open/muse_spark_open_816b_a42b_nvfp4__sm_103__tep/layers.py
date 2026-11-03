@@ -414,6 +414,9 @@ class WideHopCall:
         self.min_rows = max(int(min_rows), _wide.MIN_ROWS)
         #: The joins read ``direct`` off any armed call; the wide op has no direct publication.
         self.direct = None
+        #: ``tep8_direct_hop``: the direct publication of the steps it takes
+        #: (``_build_wide_direct``), or None.
+        self.direct_publication = None
 
     @staticmethod
     def takes_call(*tensors: torch.Tensor) -> bool:
@@ -459,13 +462,31 @@ class WideHopCall:
 
     @contextlib.contextmanager
     def armed(self, rows: Optional[int] = None, residual: Optional[torch.Tensor] = None):
-        """Arm every join with this call for the duration of one decode forward; disarm on any exit."""
+        """Arm every join with this call for the duration of one decode forward; disarm on any exit.
+
+        A step the direct publication (``tep8_direct_hop``) takes also arms it: o_proj then stores
+        into the owners' scatter slots and the joins run the direct consumer; an exception after
+        that resets its transport.
+        """
+        publication = self.direct_publication
+        if publication is not None and (rows is None or not publication.takes(rows)):
+            publication = None
         self.workspace = self.served if rows is None else self.workspace_for(rows)
         for join in self.joins:
             join._armed = self
+        published = False
         try:
+            if publication is not None:
+                publication.arm(rows)
+                published = True
             yield
+        except Exception as error:
+            if published:
+                publication.recover(error)
+            raise
         finally:
+            if publication is not None:
+                publication.disarm()
             for join in self.joins:
                 join._armed = None
             self.workspace = self.served
@@ -504,6 +525,8 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
     _armed: Optional[PostAttnHopCall]
     _o_proj_all_reduce: object
     _direct: Optional[tuple] = None
+    #: ``tep8_direct_hop``: the layer's parity while a wide direct publication is armed, else None.
+    _wide_direct: Optional[int] = None
 
     @classmethod
     def adopt(
@@ -532,6 +555,8 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
             return super()._add_after_rmsnorm_and_norm(residual, branch, eps, next_norm, gain)
         if self._direct is not None:
             return self._consume_published(call, residual, branch, eps, next_norm, gain)
+        if self._wide_direct is not None:
+            return self._consume_wide_direct(call, residual, branch, eps, next_norm, gain)
         alpha, beta = self.coefficients()
         weight = next_norm.weight
         if (
@@ -559,6 +584,40 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
         # A call the hop does not take: the built-in all-reduce, then the built-in join.
         return super()._add_after_rmsnorm_and_norm(
             residual, self._o_proj_all_reduce(branch), eps, next_norm, gain
+        )
+
+    def _consume_wide_direct(self, call, residual, branch, eps, next_norm, gain):
+        """``tep8_direct_hop``: the direct consumer on the slots o_proj scattered into (every peer
+        polls them, so a call it does not take cannot fall back)."""
+        publication = call.direct_publication
+        alpha, beta = self.coefficients()
+        weight = next_norm.weight
+        rows = branch.shape[0] if branch.ndim == 2 else 0
+        if not (
+            publication is not None
+            and gain is None
+            and self._fused_enabled
+            and next_norm.use_gemma
+            and not torch.compiler.is_compiling()
+            and rows == publication.rows
+            and _wide.wide_takes(branch, residual, alpha, beta, weight)
+        ):
+            raise RuntimeError(
+                "[musespark_open] tep8_direct_hop: an armed step reached a join the direct consumer does not "
+                f"take (branch {tuple(branch.shape)}, gain={gain is not None}); every rank polls this call, so it "
+                "cannot fall back"
+            )
+        residual, alpha, beta, weight = _hop.readable(residual, alpha, beta, weight)
+        return publication.consume(
+            self._wide_direct,
+            branch,
+            residual,
+            alpha,
+            beta,
+            weight,
+            eps,
+            next_norm.variance_epsilon,
+            self._preqkv_norm_fp32,
         )
 
     def _consume_published(self, call, residual, branch, eps, next_norm, gain):
@@ -751,11 +810,15 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
             for layer in model.layers
         }
     )
+    mapping = model.layers[0].mapping
+    # The TP8 hop levers (multicast, early launch, the direct publication) serve 8-rank groups; a
+    # TP4 group runs the stock wide hop.
+    tep8 = mapping.tp_size == _hop.MAX_RANKS
     workspace = _wide.shared_wide_workspace(
-        model.layers[0].mapping,
-        multicast=_wide.SERVED_MULTICAST,
+        mapping,
+        multicast=_wide.SERVED_MULTICAST and tep8,
         variants=variants,
-        early_launch=_wide.SERVED_EARLY_LAUNCH,
+        early_launch=_wide.SERVED_EARLY_LAUNCH and tep8,
     )
     # The 8-row hop's call keeps every row count it takes (its wide TP4 transport's too).
     min_rows = (call.wide.max_rows if call.wide is not None else _hop.MAX_ROWS) + 1
@@ -765,9 +828,10 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         workspace.two_shot_rows,
         workspace.early_launch,
         min_rows,
+        r2=workspace.r2,
+        r2_wide=workspace.r2_wide,
+        smem_pad=workspace.smem_pad,
     )
-
-    mapping = model.layers[0].mapping
 
     def wide_factory() -> "_wide.WideHopWorkspace":
         # The construction below is collective; a rank that cannot hold the transport refuses
@@ -786,10 +850,10 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         if reason is not None:
             raise ValueError(reason)
         built = _wide.shared_wide_workspace(
-            model.layers[0].mapping,
-            multicast=_wide.SERVED_MULTICAST,
+            mapping,
+            multicast=_wide.SERVED_MULTICAST and tep8,
             variants=variants,
-            early_launch=_wide.SERVED_EARLY_LAUNCH,
+            early_launch=_wide.SERVED_EARLY_LAUNCH and tep8,
             max_rows=_wide.WIDE_MAX_ROWS,
         )
         logger.info(
@@ -799,7 +863,81 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         )
         return built
 
-    return WideHopCall(workspace, call.joins, wide_factory, min_rows=min_rows)
+    wide_call = WideHopCall(workspace, call.joins, wide_factory, min_rows=min_rows)
+    if _wide.SERVED_DIRECT and tep8:
+        wide_call.direct_publication = _build_wide_direct(model, call, variants)
+    return wide_call
+
+
+def _build_wide_direct(
+    model: MuseSparkOpenModel, call: PostAttnHopCall, variants
+) -> "_wide.DirectPublication":
+    """``tep8_direct_hop``: the direct publication of the wide hop's two-shot (collective).
+
+    Checked on every layer and agreed over the TP group first: an even layer count, eight
+    ranks, and every o_proj on the dense GEMM dispatcher's wide64 split-K (whose kernel has
+    the scatter epilogue).
+
+    Raises:
+        ValueError: on every rank alike, naming what is missing; nothing has been built then.
+    """
+    from .kernels.dense_gemms import dispatcher as dense_gemms
+
+    layers = list(model.layers)
+    mapping = layers[0].mapping
+    reasons = []
+    if len(layers) % 2:
+        reasons.append(f"{len(layers)} layers: the per-layer parity needs an even count")
+    if mapping.tp_size != 8:
+        reasons.append(f"tp_size {mapping.tp_size}: the direct wide hop serves 8 ranks")
+    if not getattr(_wide, "HAS_SCATTER_GEMM", False):
+        reasons.append("no scatter producer (flashinfer's split-K kernel is unavailable)")
+    if "o_proj" not in getattr(dense_gemms, "TEP8_WIDE64_SITES", ()):
+        reasons.append("o_proj is not on the TEP8 wide64 split-K (tep8_wide64_splitk)")
+    if len(call.joins) != len(layers):
+        reasons.append(f"{len(call.joins)} post-attention joins for {len(layers)} layers")
+    dispatchers = []
+    for layer in layers:
+        o_proj = layer.self_attn.o_proj
+        if not isinstance(o_proj, dense_gemms.MuseSparkOpenTepDenseLinear):
+            reasons.append(f"layer {layer.layer_idx}: o_proj is not on the dense GEMM dispatcher")
+            continue
+        dispatcher = o_proj._low_m_gemm_dispatcher
+        if dispatcher.site.role != "o_proj":
+            reasons.append(
+                f"layer {layer.layer_idx}: the dispatcher's role is {dispatcher.site.role}"
+            )
+            continue
+        dispatchers.append(dispatcher)
+    refusal = _tp_agreement.agreed_refusal(
+        mapping,
+        "[musespark_open] tep8_direct_hop: " + " | ".join(reasons) if reasons else None,
+    )
+    if refusal is not None:
+        raise ValueError(refusal)
+    workspace = _wide.WideDirectWorkspace(
+        mapping,
+        multicast=True,
+        variants=variants,
+        early_launch=True,
+        max_rows=64,
+        wide_min_rows=_wide.SERVED_DIRECT_WIDE_MIN_ROWS,
+        smem_pad=_wide.SERVED_DIRECT_PAD,
+        pad_rows=(0, 1024),
+        wait_first=True,
+        fb_layout=True,
+    )
+    publication = _wide.DirectPublication(workspace, dispatchers, call.joins)
+    _wide._DIRECT_PUBLICATION = publication
+    logger.info(
+        "[musespark_open] tep8_direct_hop: o_proj of decode steps of "
+        f"{_wide.SERVED_DIRECT_ROWS[0]}..{_wide.SERVED_DIRECT_ROWS[1]} rows scatters its partial into the "
+        f"owners' slots on all {len(layers)} layers (window stride {workspace.peer_stride} B, feature-block "
+        f"slots, +{workspace.workspace_bytes / 2**20:.1f} MiB fabric per rank); consumer: early, multicast "
+        f"gather, two rows per 512-thread CTA from {_wide.SERVED_DIRECT_WIDE_MIN_ROWS} rows, "
+        f"SMEM pad {_wide.SERVED_DIRECT_PAD} B"
+    )
+    return publication
 
 
 def _build_direct_publish(

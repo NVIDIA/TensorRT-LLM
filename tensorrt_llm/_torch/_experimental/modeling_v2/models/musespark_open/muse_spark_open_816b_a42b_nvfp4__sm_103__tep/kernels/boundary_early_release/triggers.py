@@ -101,6 +101,35 @@ BOUNDARY_TRIGGER = "entry"
 #: When the norm-gate kernel lets the output projection launch: right after its wait.
 NORM_GATE_TRIGGER = "after_wait"
 
+#: ``norm_gate_pdl_max_rows`` (``configure``) raises the row bound of the PDL norm-gate copy from 8
+#: (one request) to N <= 128 on decode steps that ``batch_dense_gemms`` does not serve (it is not
+#: composed: the TEP8 composition's multi-request steps of 16..64 rows). Up to 128 rows the
+#: built-in ``apply_output_gate`` launches exactly the Triton ``_attention_norm_gate_kernel`` (same
+#: grid, num_warps 4) that ``ops/attention/norm_gate`` copies statement for statement, so the result
+#: is bitwise; above 128 the built-in runs the CuTe ``rmsnorm_gate``, which this copy is not, so the
+#: bound is capped at 128. What changes is the launch: PDL with the after-wait trigger, so the
+#: output projection (a split-K GEMM that loads its weight before its own wait) launches early and
+#: pre-stages its weight instead of launching after a plain kernel. 0 (the default): the stock
+#: bound (8).
+_PDL_MAX_ROWS = min(128, _norm_gate.MAX_ROWS)
+
+
+def configure(*, norm_gate_pdl_max_rows: int = 0) -> None:
+    """Set the PDL norm-gate's row bound on decode steps ``batch_dense_gemms`` does not serve.
+
+    ``lever_settings.apply`` sets it from the model's plan before any install. The bound is
+    ``norm_gate_pdl_max_rows`` clamped to ``ops/attention/norm_gate``'s 8 rows at least and 128 at
+    most, so 0 keeps 8.
+    """
+    global _PDL_MAX_ROWS
+    _PDL_MAX_ROWS = min(128, max(_norm_gate.MAX_ROWS, int(norm_gate_pdl_max_rows or 0)))
+    if _PDL_MAX_ROWS > _norm_gate.MAX_ROWS:
+        logger.info(
+            "[musespark_open] boundary_early_release: the PDL norm-gate also takes decode steps of "
+            f"{_norm_gate.MAX_ROWS + 1}..{_PDL_MAX_ROWS} rows where batch_dense_gemms is not "
+            f"composed (norm_gate_pdl_max_rows={_PDL_MAX_ROWS})"
+        )
+
 
 class _NormGatePdl:
     """The output gate of a decode step through ``ops/attention/norm_gate``.
@@ -146,15 +175,23 @@ class _NormGatePdl:
             attention_output, gate, self.o_head_norm.variance_epsilon, trigger
         )
 
+    def _pdl_max_rows(self) -> int:
+        """8 (the stock bound) unless ``norm_gate_pdl_max_rows`` (``configure``) raises it and
+        ``batch_dense_gemms``, which serves the larger steps when composed, is not."""
+        if getattr(self, "_batch_dense_gemms", None) is not None:
+            return _norm_gate.MAX_ROWS
+        return _PDL_MAX_ROWS
+
     def _fits_norm_gate(self, attention_output, gate) -> bool:
-        """Exactly when the built-in method would launch its Triton kernel, at 1-8 rows."""
+        """Exactly when the built-in method would launch its Triton kernel, at 1-8 rows (up to
+        ``_pdl_max_rows`` <= 128, where the built-in still launches that Triton kernel)."""
         return (
             not isinstance(attention_output, Fp4QuantizedTensor)
             and attention_output.is_cuda
             and attention_output.dtype == torch.bfloat16
             and attention_output.ndim == 2
             and attention_output.stride(-1) == 1
-            and 0 < attention_output.shape[0] <= _norm_gate.MAX_ROWS
+            and 0 < attention_output.shape[0] <= self._pdl_max_rows()
             and not torch.compiler.is_compiling()
             and self.head_dim == _norm_gate.HEAD_DIM
             and attention_output.shape[1] % self.head_dim == 0

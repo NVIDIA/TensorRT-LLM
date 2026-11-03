@@ -142,6 +142,12 @@ def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:
     from .kernels.replicated_experts import ring_buddy as _ring_buddy
 
     extra = {"persistent": True} if plan.enabled("persistent_experts") else {}
+    if plan.enabled("wide_persistent_experts"):
+        # As _install_owner_window does: the persistent kernel's wide build serves the 9..16-row calls
+        # over the ring-buddy stack's 64-expert window (the stock install passes it only there).
+        from .ops.moe import persistent_experts as _persistent
+
+        extra["persistent_rows"] = _persistent.WIDE_MAX_ROWS
     if plan.enabled("three_window_placement"):
         extra["windows"] = 3
     if plan.enabled("bf16_routed_experts"):
