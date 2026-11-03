@@ -80,6 +80,8 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/visual_gen/kernels/parallel
   # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
   # GDN fused target verify.
