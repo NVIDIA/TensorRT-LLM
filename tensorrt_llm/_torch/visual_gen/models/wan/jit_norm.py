@@ -5,7 +5,8 @@
 One kernel covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input producer
 and product consumer, order 2 or 4) and the bias / residual add; its parameters (dtypes, order,
 lane layout, mode flags) are all known at the call site. Each combination is compiled with the
-CuTe DSL on first use (cached on disk across processes) and launched on the current torch
+CuTe DSL on first use (cached on disk across processes when flashinfer's CuTe DSL kernel cache
+is installed) and launched on the current torch
 stream, so it is CUDA-graph safe.
 """
 
@@ -269,10 +270,10 @@ def _launch(
 
 
 def _stacked_products(m: list[torch.Tensor], winograd_dtype: torch.dtype) -> tuple[int, int]:
-    """(base pointer, component stride in elements) of the products, which the kernel reads as
-    one stacked buffer [comps, groups, P, C]: consecutive slices of the previous norm's
-    Winograd input buffer in the model; anything else is stacked here (a copy, and ``m`` is
-    replaced by views of it)."""
+    """(base pointer, component stride in elements) of the temporal Winograd conv products,
+    which the kernel reads as one stacked buffer [comps, groups, P, C]. In the model they are
+    consecutive slices of the one buffer the conv wrote; anything else is stacked here: a copy,
+    and the caller's list ``m`` is modified in place to hold views of it."""
     comps = len(m)
     numel = m[0].numel()
     base = m[0].data_ptr()

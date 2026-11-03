@@ -164,7 +164,8 @@ class _Conv:
         self.graph.execute_plan_at_index(feeds, workspace, index, handle=self.handle)
 
     def select(self, key: str, x, w, b, y) -> None:
-        """Pick the plan: the remembered one, else time every plan once and keep the fastest."""
+        """Pick the plan: the remembered one, else benchmark the supported plans and keep the
+        fastest one whose output is finite."""
         self.x_device = x.device
         remembered = _load_choices().get(key)
         if remembered is not None and remembered < self.plan_count:
@@ -178,9 +179,9 @@ class _Conv:
         for index in range(self.plan_count):
             try:
                 workspace = self._build(index)
-                # NaN-filled first: a plan that reports success but writes nothing, or only
-                # part of the output, leaves NaNs behind; a plan that computes garbage makes
-                # its own. One finiteness check covers all three.
+                # NaN-filled first: a plan that reports success but leaves part or all of the
+                # output unwritten leaves NaNs behind, and non-finite results show up too. The
+                # finiteness check catches those; it does not check finite values.
                 y.fill_(float("nan"))
                 self._run(index, workspace, x, w, b, y)
                 torch.cuda.synchronize()

@@ -344,8 +344,8 @@ class Shard:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Send ``send_left`` to the left neighbour and ``send_right`` to the right one;
         returns what they sent back (same shapes), None where there is no neighbour. One
-        batched send/receive for both neighbours on the world group (a batch must use a
-        single group; the peers are addressed by global rank)."""
+        batched send/receive for both neighbours on the shard's process group ``self.pg``
+        (a batch must use a single group; the peers are addressed by global rank)."""
         ops = []
         recv_left = recv_right = None
         if self.left is not None:

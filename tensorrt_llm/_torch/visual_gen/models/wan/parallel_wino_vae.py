@@ -98,6 +98,10 @@ class ParallelWinoVae(ParallelVAEBase):
         return AutoencoderKLOutput(latent_dist=dist_)
 
     def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
+        """The posterior mean of ``x`` ``[B, C, T, H, W]``, encoded across the ranks: every rank
+        of the VAE group calls it with the full pixel tensor and gets the full mean back. The
+        split axis must be a multiple of the spatial compression factor with at least one
+        unit per rank."""
         x_local = self._split_uneven(x, self.vae_backend.config.scale_factor_spatial)
         return self._gather_tensor(self.vae_backend.encode_mode(x_local))
 

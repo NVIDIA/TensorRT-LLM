@@ -65,7 +65,8 @@ def _check_encode_decode(native: WanVAE, fast: WinoVae, frames: int, chunk: int 
         assert torch.isfinite(actual.float()).all()
         # The fused paths drift from native only through last-bit effects (fewer roundings,
         # fp32 reduction order, Winograd transforms), amplified by the random-weight network.
-        # Bitwise equality of each kernel against its reference is in test_wino_vae_kernels.
+        # The per-kernel references are in test_wino_vae_kernels: bitwise where the rounding
+        # order is fixed, error bounds for the Winograd transforms and convs.
         rel = _rel_l2(actual, expected)
         assert rel < 2e-2, f"rel_l2={rel:.3e}"
 

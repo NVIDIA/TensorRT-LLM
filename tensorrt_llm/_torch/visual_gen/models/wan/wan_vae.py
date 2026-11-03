@@ -1704,8 +1704,9 @@ def unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 class WanVAE(nn.Module):
     """Wan VAE implementation compatible with diffusers AutoencoderKLWan.
 
-    Every module class in this file names its child module classes in ``_*_cls`` attributes;
-    a subclass (WinoVae) swaps in its own and keeps the module tree and state dict."""
+    The compositional modules (the model, encoder, decoder, their blocks and the resampler) name
+    their child module classes in ``_*_cls`` attributes; a subclass (WinoVae) swaps in its own
+    and keeps the module tree and state dict."""
 
     _encoder_cls = WanEncoder3d
     _decoder_cls = WanDecoder3d

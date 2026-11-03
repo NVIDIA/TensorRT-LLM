@@ -151,7 +151,8 @@ def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor
 
 
 # ---------------------------------------------------------------------------
-# Temporal Winograd F(2,3): norm kernels that emit / consume the transformed frames
+# Temporal Winograd F(order, 3), order 2 or 4: norm kernels that emit / consume the
+# transformed frames
 # ---------------------------------------------------------------------------
 
 

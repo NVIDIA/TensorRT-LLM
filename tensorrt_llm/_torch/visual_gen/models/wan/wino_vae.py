@@ -1898,10 +1898,10 @@ class WinoVae(WanVAE):
         return self.shard is None and _benchmark_convs(encoder=encoder, frames=frames)
 
     def set_shard(self, shard: Shard | None) -> None:
-        """Run on one spatial slice of the frames: every module exchanges the halo lines it
-        needs with the neighbouring ranks (see :mod:`wino_vae_shard`). The caller splits the
-        latents / pixels along the shard's axis and gathers the outputs. Sharding needs the
-        CuTe DSL kernels: the halo exchange lives in them."""
+        """Run on one spatial slice of the frames, exchanging border lines with the
+        neighbouring ranks (see :mod:`wino_vae_shard`); ``None`` returns to whole frames. The
+        caller passes this rank's slice of the latents / pixels along the shard's axis and
+        gathers the outputs. Requires the CuTe DSL kernels."""
         if shard is not None and not kernels_available():
             raise ValueError("a spatially sharded WinoVae needs the CuTe DSL kernels")
         self.shard = shard
