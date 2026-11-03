@@ -335,6 +335,28 @@ def test_kv_pool_rebalance_rejected_under_helix(is_disagg: bool) -> None:
         )
 
 
+def test_block_reuse_rejected_under_disagg_helix() -> None:
+    """Each disaggregated helix rank holds only its slice of the prompt, so the
+    ranks cannot agree on prefix hashes."""
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with pytest.raises(ValueError, match="disaggregated helix"):
+        KVCacheManagerV2(
+            KvCacheConfig(enable_block_reuse=True),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=1,
+            mapping=mapping,
+            is_disagg=True,
+        )
+
+
 @pytest.mark.parametrize(
     "config_kwargs, connector, match",
     [
@@ -705,13 +727,16 @@ def test_resize_context_rejects_disagg_helix_request(prompt_len: int) -> None:
 
 
 def _rank_batch(
-    victim_id: int = 3, prompt_len: int = 200, decode_group_index: int = 5
+    victim_id: int = 3,
+    prompt_len: int = 200,
+    decode_group_index: int = 5,
+    context_position: int = 64,
 ) -> SimpleNamespace:
     """One CP rank's scheduled batch: a context chunk, a decode step and a
     recompute-paused victim."""
     ctx = SimpleNamespace(
         py_request_id=1,
-        context_current_position=64,
+        context_current_position=context_position,
         context_chunk_size=32,
         prompt_len=prompt_len,
         total_input_len_cp=200,
@@ -747,12 +772,16 @@ def test_helix_schedule_check_passes_identical_ranks() -> None:
 
 @pytest.mark.parametrize(
     "rank1_batch",
-    [_rank_batch(victim_id=4), _rank_batch(decode_group_index=6)],
-    ids=["different_victim", "different_decode_step"],
+    [
+        _rank_batch(victim_id=4),
+        _rank_batch(decode_group_index=6),
+        _rank_batch(context_position=128),
+    ],
+    ids=["different_victim", "different_decode_step", "different_reuse_depth"],
 )
 def test_helix_schedule_check_raises_on_divergence(rank1_batch: SimpleNamespace) -> None:
-    """Ranks that preempt different requests or disagree on a decode step
-    would desynchronize the next CP collective."""
+    """Ranks that preempt different requests, disagree on a decode step or
+    reuse different prefix depths would desynchronize the next CP collective."""
     with pytest.raises(RuntimeError, match="disagree on the schedule"):
         _check_schedules([_rank_batch(), rank1_batch])
 

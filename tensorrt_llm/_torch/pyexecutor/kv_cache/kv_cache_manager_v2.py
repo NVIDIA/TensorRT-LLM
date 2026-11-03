@@ -1969,12 +1969,13 @@ class KVCacheManagerV2(BaseResourceManager):
         self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
         self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
         if self._has_cp_helix:
-            if kv_cache_config.enable_block_reuse:
+            if kv_cache_config.enable_block_reuse and is_disagg:
                 raise ValueError(
                     "KVCacheManagerV2 does not support block reuse with "
-                    "helix context parallelism: a ledger block's bytes span "
-                    "all CP ranks, so publishing it requires a group-wide "
-                    "protocol. Set kv_cache_config.enable_block_reuse=False."
+                    "disaggregated helix context parallelism: each rank "
+                    "holds only its slice of the prompt, so ranks cannot "
+                    "agree on prefix hashes. "
+                    "Set kv_cache_config.enable_block_reuse=False."
                 )
             if is_draft or any(
                 layer.owner is KVCacheLayerOwner.DRAFT for layer in self.layer_specs or ()
@@ -2053,6 +2054,12 @@ class KVCacheManagerV2(BaseResourceManager):
             self._supports_partial_reuse,
             type(self).__name__,
         )
+        if kv_cache_config.enable_block_reuse and self.enable_partial_reuse and self._has_cp_helix:
+            logger.info(
+                "Helix context parallelism reuses whole ledger blocks only; "
+                "forcing enable_partial_reuse=False."
+            )
+            self.enable_partial_reuse = False
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)

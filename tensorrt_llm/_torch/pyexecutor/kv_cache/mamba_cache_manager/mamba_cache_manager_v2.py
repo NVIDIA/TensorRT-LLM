@@ -292,6 +292,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         kv_cache_config = kv_cache_config.model_copy(deep=True)
         if any(mamba_layer_mask) and kv_cache_config.enable_block_reuse:
+            if mapping.has_cp_helix():
+                raise ValueError(
+                    "Block reuse is not supported for models with recurrent "
+                    "state layers under helix context parallelism: state "
+                    "snapshot points are not aligned to ledger blocks. "
+                    "Set kv_cache_config.enable_block_reuse=False."
+                )
             block_reuse_config = kv_cache_config.block_reuse_config
             block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
             if block_reuse_policy == BlockReusePolicy.ALL_REUSABLE:

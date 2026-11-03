@@ -16,6 +16,7 @@ import threading
 import time
 import types
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -61,7 +62,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.bindings.executor import RequestType
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig, RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
@@ -487,6 +488,72 @@ def test_context_model_capacity_profile_uses_real_dummy_requests(
     assert request.context_remaining_length == 256
     assert request.py_csa2_remote_tail_mode is None
     assert request.py_csa2_remote_tail_start is None
+
+
+def _retention(decode_duration_ms=None, range_duration_ms=None) -> KvCacheRetentionConfig:
+    token_range = KvCacheRetentionConfig.TokenRangeRetentionConfig(
+        0,
+        None,
+        80,
+        None if range_duration_ms is None else timedelta(milliseconds=range_duration_ms),
+    )
+    return KvCacheRetentionConfig(
+        [token_range],
+        decode_retention_priority=50,
+        decode_duration_ms=(
+            None if decode_duration_ms is None else timedelta(milliseconds=decode_duration_ms)
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "retention, enable_block_reuse, has_cp_helix, has_transceiver, rejected",
+    [
+        (_retention(decode_duration_ms=100), True, True, False, True),
+        (_retention(range_duration_ms=100), True, True, False, True),
+        (_retention(), True, True, False, False),
+        (_retention(decode_duration_ms=100), False, True, False, False),
+        (_retention(decode_duration_ms=100), True, False, False, False),
+        (_retention(decode_duration_ms=100), True, True, True, False),
+    ],
+    ids=["decode_duration", "range_duration", "priority_only", "no_reuse", "no_helix", "disagg"],
+)
+def test_retention_duration_rejected_with_reuse_under_agg_helix(
+    retention: KvCacheRetentionConfig,
+    enable_block_reuse: bool,
+    has_cp_helix: bool,
+    has_transceiver: bool,
+    rejected: bool,
+) -> None:
+    """Each aggregated helix CP rank would expire a retention duration on its
+    own clock and evict different blocks; priorities alone stay rank-invariant."""
+    executor = types.SimpleNamespace(
+        _configure_csa2_remote_tail=Mock(),
+        _is_kv_manager_v2=True,
+        _kv_connector_moves_kv=False,
+        kv_cache_manager=types.SimpleNamespace(enable_block_reuse=enable_block_reuse),
+        dist=types.SimpleNamespace(
+            mapping=types.SimpleNamespace(has_cp_helix=lambda: has_cp_helix), pp_size=1
+        ),
+        kv_cache_transceiver=(
+            types.SimpleNamespace(pipeline_transfer_enabled=False) if has_transceiver else None
+        ),
+        _validate_token_id_range=Mock(),
+        sampler=Mock(),
+        model_engine=None,
+        _validate_request_budget=Mock(),
+    )
+    request = types.SimpleNamespace(
+        kv_cache_retention_config=retention,
+        py_disaggregated_params=None,
+        sampling_config=None,
+        py_multimodal_data=None,
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="retention duration_ms is not supported"):
+            PyExecutor._validate_request(executor, request)
+    else:
+        PyExecutor._validate_request(executor, request)
 
 
 @pytest.mark.parametrize(
