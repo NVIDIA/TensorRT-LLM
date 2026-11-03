@@ -1314,6 +1314,39 @@ class TestQwen3StreamingMatchesWholeTextParse:
     @pytest.mark.parametrize(
         "chunks",
         [
+            [_QWEN3_WEATHER_CALL + "\nDone."],
+            [_QWEN3_WEATHER_CALL + "Done."],
+            [_QWEN3_WEATHER_CALL, "\nDone."],
+        ],
+        ids=[
+            "newline_text_in_last_increment", "text_in_last_increment",
+            "text_in_later_increment"
+        ],
+    )
+    def test_text_after_the_call_is_dropped_as_in_whole_text_parse(
+            self, sample_tools, chunks):
+        """Text after the end token is not normal text, streamed or whole.
+
+        ``detect_and_parse`` keeps only the text before the first call, so the
+        stream, finish() included, does not surface what follows a call.
+        """
+        parser = Qwen3ToolParser()
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
+        results.append(parser.finish(sample_tools))
+        text = "".join(chunks)
+
+        streamed_text = "".join(result.normal_text for result in results)
+        whole = Qwen3ToolParser().detect_and_parse(text, sample_tools)
+        assert streamed_text == whole.normal_text == ""
+        whole_calls = self._whole_text_calls(text, sample_tools)
+        assert self._streamed_calls(chunks, sample_tools) == whole_calls
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
             [_QWEN3_JSON_OUTPUTS["text_around_calls"]],
             [
                 "Let me check both.\n",
