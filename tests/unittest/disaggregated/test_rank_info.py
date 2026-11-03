@@ -203,3 +203,76 @@ def test_rank_info_represents_cache_element_bytes(
     restored = RankInfo.from_bytes(rank_info.to_bytes())
     assert restored.attention.element_bytes == expected_element_bytes
     assert isinstance(restored.attention.element_bytes, expected_type)
+
+
+def _mamba_rank_info(tp_size=1, tp_rank=0, cp_size=1, cp_rank=0, attention_dp=None):
+    # MambaPolicy reads tp_size / tp_rank / cp_size / cp_rank /
+    # attention.enable_attention_dp.
+    attention = None if attention_dp is None else SimpleNamespace(enable_attention_dp=attention_dp)
+    return SimpleNamespace(
+        tp_size=tp_size, tp_rank=tp_rank, cp_size=cp_size, cp_rank=cp_rank, attention=attention
+    )
+
+
+class TestMambaHelixCP:
+    """MambaPolicy under decode-CP (helix): shard grid and pairing."""
+
+    def test_mamba_tp_helix_grid_is_cp_minor(self):
+        # cp == 1 keeps the plain TP grid; cp > 1 flattens tp*cp CP-minor.
+        assert MambaPolicy._mamba_tp(_mamba_rank_info()) == (1, 0)
+        assert MambaPolicy._mamba_tp(_mamba_rank_info(cp_size=32, cp_rank=5)) == (32, 5)
+        ri = _mamba_rank_info(tp_size=2, tp_rank=1, cp_size=4, cp_rank=3)
+        assert MambaPolicy._mamba_tp(ri) == (8, 7)
+
+    def test_mamba_tp_helix_attention_dp_shards_over_cp(self):
+        # Helix + attention DP (K3 helix_a2a): the CP group shares every
+        # request, so the state stays head-sharded across it; must match the
+        # executor's pool sizing in config_utils.mamba_effective_tp_size.
+        from tensorrt_llm._torch.pyexecutor.config_utils import mamba_effective_tp_size
+
+        ri = _mamba_rank_info(cp_size=16, cp_rank=5, attention_dp=True)
+        assert MambaPolicy._mamba_tp(ri) == (16, 5)
+        mapping = SimpleNamespace(
+            enable_attention_dp=True, tp_size=1, cp_size=16, has_cp_helix=lambda: True
+        )
+        assert mamba_effective_tp_size(mapping) == 16
+        # Attention DP without CP still replicates.
+        assert MambaPolicy._mamba_tp(_mamba_rank_info(tp_size=4, tp_rank=2, attention_dp=True)) == (
+            1,
+            0,
+        )
+
+    def test_equal_width_pairs_only_matching_rank(self):
+        # Regression lock for the fan-in collapse: with equal shard widths the
+        # mapper is a whole-slot copy, so only the same-index sender may pair;
+        # any other sender would overwrite the receiver slot with the wrong heads.
+        for sender_rank in range(2):
+            for gen_cp_rank in range(2):
+                sender_ri = _mamba_rank_info(tp_size=2, tp_rank=sender_rank)
+                peer_ri = _mamba_rank_info(cp_size=2, cp_rank=gen_cp_rank)
+                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                if sender_rank == gen_cp_rank:
+                    assert paired
+                else:
+                    assert not paired
+
+    def test_narrow_to_wide_pairing_follows_covering_tree(self):
+        # Sender grid 2, receiver grid 4: receiver g pairs with sender g // 2.
+        for sender_rank in range(2):
+            for gen_cp_rank in range(4):
+                sender_ri = _mamba_rank_info(tp_size=2, tp_rank=sender_rank)
+                peer_ri = _mamba_rank_info(cp_size=4, cp_rank=gen_cp_rank)
+                paired = MambaPolicy.is_paired(sender_ri, peer_ri)
+                if gen_cp_rank // 2 == sender_rank:
+                    assert paired, (sender_rank, gen_cp_rank)
+                else:
+                    assert not paired, (sender_rank, gen_cp_rank)
+
+    def test_is_paired_unpaired_vs_paired(self):
+        # Unpaired: sender rank 0 is not paired with receiver cp_rank 1
+        sender_ri = _mamba_rank_info(tp_size=2, tp_rank=0)
+        peer_ri = _mamba_rank_info(cp_size=2, cp_rank=1)
+        assert not MambaPolicy.is_paired(sender_ri, peer_ri)
+        # Paired sender
+        paired_ri = _mamba_rank_info(tp_size=2, tp_rank=1)
+        assert MambaPolicy.is_paired(paired_ri, peer_ri)

@@ -1508,9 +1508,12 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
                 persistent=False,
             )
             rotary_dim = self.rotary_emb.rotary_cos_sin.shape[-1]
+            # Zero-filled so that every rank and role starts from identical
+            # buffer bytes; weight manifests and staged-receiver checks hash
+            # and compare buffers byte for byte.
             self.register_buffer(
                 "mrope_rotary_cos_sin_workspace",
-                torch.empty(
+                torch.zeros(
                     (1, model_config.max_num_tokens * rotary_dim * 2),
                     dtype=torch.float32,
                     device="cuda",

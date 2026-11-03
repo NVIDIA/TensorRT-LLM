@@ -139,6 +139,8 @@ class _FmhaCacheKey(NamedTuple):
     # without changing the request shape. Keep those selection regimes apart.
     output_dtype: torch.dtype | None
     output_sf_dtype: torch.dtype | None
+    # The query is the raw projection of a deferred prologue (Fmha.supports_deferred_prologue).
+    deferred_prologue: bool
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -298,6 +300,32 @@ def _describe_fmha_cache_value(fmha: Fmha | None) -> str:
     return type(fmha).__name__
 
 
+def generation_selection_cell(
+    q: torch.Tensor,
+    metadata: TrtllmAttentionMetadata,
+    forward_args: AttentionForwardArgs,
+) -> tuple[int, int]:
+    """(generation requests, generation q_len) of a request at the upper bound of its selection-cache cell.
+
+    A library whose support is monotone in these sizes evaluates it here, so the result holds for every request
+    sharing the cell (see ``Fmha.is_supported``).
+    """
+    num_generations = metadata.num_generations
+    if num_generations <= 0:
+        return 0, 0
+    num_tokens = q.shape[0]
+    if forward_args.attention_input_type == AttentionInputType.mixed:
+        num_tokens -= metadata.num_ctx_tokens
+    q_len = num_tokens // num_generations
+    return (
+        max(
+            num_generations,
+            _normalize_fmha_cache_grid_value(num_generations, _FMHA_CACHE_BATCH_SIZE_GRID),
+        ),
+        max(q_len, _normalize_fmha_cache_grid_value(q_len, _FMHA_CACHE_SEQ_LEN_Q_GRID)),
+    )
+
+
 class FmhaManager:
     """Own the FMHA libraries, dispatch policy, and selection cache for one attention layer."""
 
@@ -308,7 +336,10 @@ class FmhaManager:
         # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
         self.fmha_libs: list[Fmha] = []
-        for fmha_cls in get_enabled_fmha_lib_classes():
+        for fmha_cls in (
+            *getattr(attn, "prepended_fmha_lib_classes", ()),
+            *get_enabled_fmha_lib_classes(),
+        ):
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
@@ -391,6 +422,9 @@ class FmhaManager:
             has_block_sparse_inputs=block_sparse_inputs is not None,
             output_dtype=output_dtype,
             output_sf_dtype=output_sf_dtype,
+            deferred_prologue=(
+                forward_args.kv_append is not None and forward_args.kv_append.fold is not None
+            ),
         )
 
     def select(
@@ -548,4 +582,4 @@ class FmhaManager:
         return None
 
 
-__all__ = ["FmhaManager"]
+__all__ = ["FmhaManager", "generation_selection_cell"]
