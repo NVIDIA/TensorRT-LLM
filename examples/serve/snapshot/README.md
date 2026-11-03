@@ -3,172 +3,273 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Startup And Restore Qualification Probes
+# Standalone Warm-Startup Qualification
 
-This initial harness draft measures an isolated HTTP candidate and compares its
-fresh generation with a cold baseline. It does not implement Snapshot capture,
-the native engine lifecycle, or a standalone host adapter. A successful probe
-does **not** qualify process restore.
+This experiment runs real Snapshot capture and restore without Kubernetes or
+Dynamo. It compares a native `trtllm-serve` cold start with resident and compact
+KV capture. It is not a production controller or a declaration of supported
+restore profiles. A profile passes only after its actual runtime evidence passes.
 
-## What Runs Today
+**Current qualification status:** the adapter builds and its unit tests pass.
+Native-only TP1 and TP2 resident/compact checks passed on B200 GPUs. The available
+test cluster rejected privileged helper creation before capture. No real Snapshot
+restore profile is qualified. See [results and remaining gates](RESULTS.md).
+
+The source/host audit is [#21480](https://github.com/NVIDIA/TensorRT-LLM/pull/21480).
+Snapshot is pinned to
+[`4b1300a82c6676df020c201fa884cc602251e12e`](https://github.com/ai-dynamo/snapshot/tree/4b1300a82c6676df020c201fa884cc602251e12e).
+The compact experiment requires a matching Python/native build with
+[#21221](https://github.com/NVIDIA/TensorRT-LLM/pull/21221) V2 sleep primitives.
+Do not overlay candidate Python onto another revision's wheel.
+
+## Workflow
 
 ```mermaid
 flowchart LR
-    P["Pinned profile + deterministic requests"] --> C["Cold probe"]
-    C --> B["Cold output + timings"]
-    P --> R["Candidate supervisor<br/>cold or externally restored"]
-    B --> R
-    R --> H["Loopback health + fresh generation"]
-    H --> E["PASS / FAIL probe report"]
-    E --> S["Attempt counts + p50/p95"]
-    X["Process/CUDA restore and serving-validity evidence"] -.-> Q["Separate qualification gate<br/>UNTESTED in this draft"]
+    P["Pinned images, model, config<br/>fresh private attempts"]
+    C["Native cold MPI cohort<br/>private deterministic completion"]
+    W["Warmed source cohort<br/>final weights + CUDA graphs"]
+    K{"KV capture policy"}
+    R["Retain resident backing"]
+    D["Native discard / release<br/>retain logical internal owners"]
+    H["Snapshot host adapter<br/>capture + terminate source"]
+    I["Fresh inert destination<br/>process + CUDA restore"]
+    M["Memory-ready"]
+    V["All-rank runtime validation<br/>compact reconstruction if needed"]
+    G["Private generation<br/>cold parity + real graph replay"]
+    E["Profile result + evidence<br/>all attempts + owned cleanup"]
+    P --> C
+    P --> W
+    W --> K
+    K --> R --> H
+    K --> D --> H
+    H --> I --> M --> V --> G --> E
+    C -.->|"baseline outputs"| G
     classDef input fill:#eeeeee,stroke:#555555,color:#111111
-    classDef probe fill:#dcf0df,stroke:#287a3e,color:#111111
-    classDef pending fill:#fff0cd,stroke:#9b6b10,color:#111111
-    class P,B input
-    class C,R,H,E,S probe
-    class X,Q pending
+    classDef snapshot fill:#d9eafa,stroke:#2463a6,color:#111111
+    classDef engine fill:#dcf0df,stroke:#287a3e,color:#111111
+    classDef gate fill:#fff0cd,stroke:#946800,color:#111111
+    class P,E input
+    class H,I snapshot
+    class C,W,R,D,V,G engine
+    class K,M gate
 ```
 
-Gray is input/evidence, green is executable probe behavior and amber is unfinished
-qualification. Solid arrows are data flow. The dashed arrow is a required
-evidence boundary, not an implemented adapter.
+Gray is input/evidence; blue is Snapshot; green is TRTLLM; amber is a policy or
+readiness boundary. Solid arrows show execution order. The dashed arrow supplies
+comparison data. Memory-ready is not serving-ready.
 
-The probe launches the supplied foreground command in a new POSIX process group.
-It requires a numeric loopback address, bounds HTTP time and response size, checks
-deterministic completions, and terminates its owned process group. Every launched
-attempt retains a JSON report, including failures. Existing run directories are
-rejected.
+The host supervisor is outside the worker MPI job and captured process tree.
+Workload containers have no external network and no restart policy. Their HTTP
+endpoint is used only by a private in-container client. Production admission and
+request-drain APIs are intentionally not added here.
 
-Do not use a command that detaches, creates a new session, or restores children
-outside that process group. Container/MPI supervisors must explicitly own their
-complete workload lifetime. The probe cannot prove CRIU or remote cleanup.
+## Components
 
-## Native Cold Baseline
-
-Use a test host with the matching TRTLLM runtime and local model weights. Set
-`LLM_MODELS_ROOT` for model-based tests. Pin the model, tokenizer, quantization,
-TRTLLM/Snapshot builds, container/wheel, CPU/driver/GPU, MPI/transport, graph and
-cache settings in a private `profile.json`. The profile is operator-declared
-JSON, not hardware attestation or the final compatibility-manifest schema.
-
-Create a private `requests.json` with deterministic, non-streaming requests:
-
-```json
-[
-  {
-    "model": "Qwen3-0.6B",
-    "prompt": "The capital of Germany is",
-    "temperature": 0,
-    "max_tokens": 8,
-    "stream": false
-  }
-]
-```
-
-Use the server's actual model name consistently. Launch one frontend; the native
-`--report_addr` path reports the actual port selected by `--port 0`.
-
-```bash
-python scripts/snapshot_probe.py probe \
-  --mode cold --profile profile.json --requests requests.json \
-  --run-dir results/cold-01 --timeout 600 -- \
-  trtllm-serve "$LLM_MODELS_ROOT/Qwen3/Qwen3-0.6B" \
-  --host 127.0.0.1 --port 0 --report_addr '{address}'
-```
-
-Set the intended MPI/TP configuration through the normal serving arguments.
-Record it in the profile. Repeat with fresh run directories for independent
-samples. Never infer multi-GPU execution from a profile label alone.
-
-## Externally Restored Candidate
-
-Use the same probe command with `--mode restore` and
-`--baseline results/cold-01/report.json`. Replace the server command with a
-qualified foreground restore supervisor. It must write the candidate's numeric
-loopback address to the literal `{address}` argument and stay alive while its
-workers run.
-
-There is no bundled restore supervisor in this PR. Do not substitute ordinary
-cold startup and report it as a successful restore. The mode is an operator
-label; every report keeps `snapshot_qualification: UNTESTED`, even when output
-matches. The upstream
-[Snapshot TRTLLM recipe](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/docs/guides/tensorrt-llm.md)
-is a separate Kubernetes/LLM-wrapper reference, not this native supervisor.
-
-Only test disposable, access-controlled workers. This probe is not a public
-admission gate. Keep ordinary traffic out of the test environment.
-
-## Reports And Repeated Runs
-
-`report.json` records the fresh attempt ID, mode, command, declared profile,
-profile/request digests, candidate PID, outputs, failure details, cleanup and
-monotonic timings. Output comparison includes text, finish reason and generated
-token count. `first_completion` is time from launch to the first fully received,
-validated non-streaming completion, not time to first token.
-
-```bash
-python scripts/snapshot_probe.py summarize --output results/summary.json \
-  results/cold-01/report.json results/cold-02/report.json \
-  results/restore-01/report.json results/restore-02/report.json
-```
-
-Use all attempts for the selected profile, including failures. The summary
-requires matching profile/request digests and consistent passing output. It
-rejects duplicate attempt IDs and does not overwrite an existing output file.
-It reports attempted/passed/failed counts by mode and p50/p95 for passing probes
-only, with the sample count and percentile definition. Small sample sets are
-not a performance qualification.
-
-Profile digests establish equality, not compatibility or authenticity. Keep
-resident and compact policy campaigns separate. Retain failures when comparing
-their latency; never hide cold fallback in restore success counts.
-
-Reports and logs can contain prompts, model paths and launcher arguments. Use
-private test data and restrictive parent-directory permissions. Do not include
-tokens or passwords in commands/profiles, or upload raw reports automatically.
-
-## Remaining Qualification Work
-
-| Required experiment/evidence | Status in this draft |
+| File | Responsibility |
 | --- | --- |
-| Cold native HTTP correctness and launch timing | Probe executable; GPU/model execution still required for each profile. |
-| Pinned upstream reference reproduction | UNTESTED; use the upstream recipe and record its distinct runtime. |
-| Source quiescence and termination before restore | UNTESTED; needs host and engine evidence, not an HTTP response. |
-| Process/CUDA restore and no repeated load/transform/graph capture | UNTESTED; needs an instrumented restore supervisor. |
-| KV ownership, scheduler state and graph-required allocations | UNTESTED; memory restoration is insufficient. |
-| Memory-ready, runtime-ready and serving-ready boundaries | UNTESTED; health does not establish these invariants. |
-| Single-node multi-GPU cohort and partial-rank negative tests | UNTESTED; required early, not inferred from single-GPU evidence. |
-| CPU/GPU artifact bytes, capture/I/O/reconstruction and throughput | UNTESTED; do not fabricate these from probe latency. |
-| Multi-node | UNSUPPORTED by the pinned Snapshot workload contract. |
-| Transfer-bearing/cancellation profiles | BLOCKED until their exact physical-safety and reconnect dependencies are qualified. |
+| `build_host.py` | Verify a clean exact Snapshot checkout; build the adapter and run Go unit tests; record image/input identities. |
+| `host_driver/main.go` | Implement Docker-managed containerd `runtime.Runtime`; call pinned Snapshot executors; enforce ownership, compatibility, single-use targets and failure cleanup. |
+| `qualify.py` | Own containers, PageBroker, deadlines, cold/capture/restore attempts, private validation, artifact inventory and retained reports. |
+| `snapshot_observer.py`, `sitecustomize.py` | Observe real load/transform/capture/replay operations without advancing Torch/MPI initialization; park the final native executor before admission. |
+| `private_client.py` | Validate private HTTP completions through the native API or the pinned upstream reference API. |
+| `reference_workload.py` | Run the unchanged upstream LLM/V1 application with its existing benchmark-token hook. |
+| `inventory_artifact.py` | Read root-owned CRIU files through a read-only CPU container; do not weaken checkpoint permissions. |
+| `host_io.py` | Sample the checkpoint filesystem's Linux block-device I/O around host operations; preserve attribution and availability limits. |
 
-This PR establishes probe/reporting infrastructure, not completion of the early
-restore qualification milestone. Production readiness hooks and host operations
-remain separate changes. Neither GMS nor compact KV release is required to begin
-resident-capture investigation.
+The adapter compiles inside Snapshot's agent module because its executor is a
+Go internal package. This is experimental reuse of pinned implementation code,
+not a supported public standalone Snapshot SDK.
 
-## CPU Tests
+## Host Requirements
 
-The tests exercise the actual probe against a subprocess HTTP boundary double.
-The double is not an inference engine or a restore simulator. Coverage includes
-dead supervisors, missing addresses, stalled/dribbling responses, malformed or
-mismatched output, invalid input, incompatible baselines, duplicate evidence,
-cleanup, and CLI operation.
+Use an authorized isolated Linux Docker host. The host helper and PageBroker are
+privileged and can access host processes/devices. Docker-socket access is host-root
+authority. Do not expose this driver as an unauthenticated service or run it on
+unapproved shared infrastructure.
+
+The helper requires host PID/cgroup namespaces, procfs, writable cgroups,
+securityfs, Docker/containerd sockets, the actual Docker storage path, the
+Snapshot binary bundle, private checkpoint storage and shared PageBroker paths.
+Workload containers remain nonprivileged with private PID/network namespaces.
+Their seccomp policy must block io_uring. Only explicitly supplied GPU UUIDs are
+selected; allocate those GPUs before running.
+
+The driver supports Docker's `moby` containerd namespace, not generic containerd.
+Targets use full immutable container and image IDs, an ownership label, a fresh
+control mount and a single-use operation record. Failed destinations are not
+reused. Keep checkpoints private: they contain model and process state.
+
+## Build the Host Adapter
 
 ```bash
-pytest -m cpu_only tests/unittest/scripts/test_snapshot_probe.py
+git clone https://github.com/ai-dynamo/snapshot.git /path/to/snapshot
+git -C /path/to/snapshot checkout --detach 4b1300a82c6676df020c201fa884cc602251e12e
+python examples/serve/snapshot/build_host.py \
+  --snapshot-source /path/to/snapshot \
+  --tag trtllm-snapshot-host:experiment \
+  --evidence /private/results/host-build
 ```
 
-The CPU CI test list includes this target. For a workstation without TRTLLM's
-native test dependencies, isolate only this standard-library test boundary:
+The Dockerfile pins both the Go builder and matching Snapshot agent image by
+digest. The build record contains the driver-file hashes and resulting image ID.
+PageBroker must come from the same Snapshot build, currently
+`ghcr.io/ai-dynamo/snapshot/pagebroker@sha256:bf75b039ca231d2fd81cf41291e1a11e26f3b6628788a8d22ce292327505eac6`.
+The runner checks its resolved immutable ID against this digest.
+
+## Native TP1 and TP2
+
+Use a local immutable Qwen3-0.6B model and one complete matching TRTLLM image.
+Set `LLM_MODELS_ROOT` for model-based tests. Cold, resident and compact attempts
+must use the same image, model, graph shapes and serving configuration.
+Package required FlashInfer/kernel assets in that image before testing. The
+private workload has no network; an on-demand kernel download is a setup failure.
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -c /dev/null \
-  --confcutdir=tests/unittest/scripts -p no:cacheprovider \
-  -o 'markers=cpu_only: CPU-only test' -m cpu_only \
-  tests/unittest/scripts/test_snapshot_probe.py
+python examples/serve/snapshot/qualify.py \
+  --allow-privileged-host-driver \
+  --workload-image sha256:<matching-trtllm-image-id> \
+  --host-image sha256:<built-host-image-id> \
+  --broker-image sha256:<matching-pagebroker-image-id> \
+  --model "$LLM_MODELS_ROOT/Qwen3/Qwen3-0.6B" \
+  --gpu GPU-<allocated-uuid> --tp 1 \
+  --repeats 3 --output /private/results/native-tp1
 ```
 
-That local command does not verify repository-wide fixture integration, GPUs,
-Snapshot or MPI. Run the normal CI path as well.
+Run TP2 independently with two distinct `--gpu` arguments and `--tp 2`.
+Do not infer TP2 success from a TP1 result. The native profile uses MPI, dense
+attention, batch-1 graphs, no prefix reuse, no external KV exposure and no
+HOST/DISK tiers. It retains weights and transformed tensors for both policies.
+Compact uses native resource callbacks; it does not independently unmap a pool.
+It requires positive initial KV bytes and zero remaining backing after release.
+One frontend, no overlap scheduler, no torch.compile/userbuffers and ordinary
+NCCL with symmetric windows disabled are explicit profile guards. MPI uses
+loopback inside the private network namespace; it does not depend on external peers.
+
+The observer records registered weight content/layout/aliases and addresses,
+final graph inventory, logical KV owners, pool geometry and per-tier backing.
+Incidental manifest timestamps are not state identity. After compact release,
+the observer reads raw pool addresses/counters without constructing views from
+unmapped backing. Restore must rebuild valid indices before real graph replay.
+
+The test-only pre-admission boundary is narrower than production lifecycle
+support. It does not claim to drain a server that already has user requests.
+
+### Nonprivileged Native Checks
+
+Use this independent mode to check observers, MPI startup, real graph replay and
+native compact release/materialization without checkpointing a process:
+
+```bash
+python examples/serve/snapshot/qualify.py --native-only \
+  --workload-image sha256:<matching-trtllm-image-id> \
+  --model "$LLM_MODELS_ROOT/Qwen3/Qwen3-0.6B" \
+  --gpu GPU-<allocated-uuid> --tp 1 \
+  --repeats 3 --output /private/results/native-only-tp1
+```
+
+This mode uses no Snapshot helper, PageBroker, CRIU or privileged container. It
+reports `NATIVE_ONLY_PASS` and `process_restore: NOT_RUN`, never a restore PASS.
+Do not use it as a substitute for host approval or process-restore qualification.
+
+## Pinned Upstream Reference
+
+Use the unchanged pinned `docs/guides/tensorrt-llm/app.py` and the upstream
+`1.3.0rc24` image digest, verified by the runner. Pass `--reference-app` in
+addition to the common host/model arguments:
+
+```bash
+python examples/serve/snapshot/qualify.py \
+  --allow-privileged-host-driver \
+  --workload-image nvcr.io/nvidia/tensorrt-llm/release@sha256:16a103b8b1b682d287e8043fc674d23fa52d5b5f2127da913bf6c0643db3a073 \
+  --host-image sha256:<built-host-image-id> \
+  --broker-image sha256:<matching-pagebroker-image-id> \
+  --model "$LLM_MODELS_ROOT/Qwen3/Qwen3-0.6B" \
+  --reference-app /path/to/snapshot/docs/guides/tensorrt-llm/app.py \
+  --gpu GPU-<allocated-uuid> --tp 1 \
+  --repeats 3 --output /private/results/upstream-reference
+```
+
+This reproduces the pinned LLM/V1 application's source checks, compact KV,
+restored semantic generation and captured-memory token on the standalone adapter.
+It uses a read-only local model instead of an online download, and the pinned
+cuInterpose launcher. It does not reproduce Kubernetes deployment orchestration
+or qualify native HTTP/V2 behavior.
+
+## Evidence and Acceptance
+
+Every attempt has fresh IDs and a new directory. Source capture must terminate
+the source; restore creates only an inert placeholder before Snapshot runs.
+A normal cold fallback cannot supply the captured observer state or token.
+
+Native acceptance requires all of the following for every rank:
+
+- Fresh source and restore identities bound to one profile and artifact.
+- Complete host capture/restore, with source termination before destination use.
+- Weight content/layout/alias and graph-visible address checks.
+- Valid logical KV ownership and reconstructed pool/index state.
+- Positive graph replay during fresh private generation, with no repeated model
+  load, transformation walk or graph capture.
+- Exact deterministic completion agreement with the matched cold baseline.
+- No public admission; successful owned-resource cleanup; retained failed evidence.
+
+Reports include capture/restore wall times and structured upstream CPU/CUDA phase
+timing events, runtime reconstruction and observer costs, first correct completion,
+and file hashes/logical/allocated bytes. Known GPU device payloads are identified.
+CPU-only bytes remain unavailable when conventional GPU offload is embedded in
+process images. Do not equate file size with physical disk I/O.
+
+Each host attempt also writes `<operation>-device-io.json`, including on failure.
+The runner samples the checkpoint filesystem's block device before and after the
+operation, using [Linux disk counters](https://docs.kernel.org/block/stat.html).
+Read/write byte deltas cover all host users of that device, not only Snapshot.
+Page-cache hits and deferred writeback can fall outside the device interval.
+The runner does not flush caches, force writeback or sum stacked devices. Use an
+isolated host/device for performance work. Missing counters, network/overlay
+filesystems without a matching device and counter resets report `UNAVAILABLE`,
+not zero I/O; storage-specific counters are required for those filesystems.
+
+Use repeated trials and retain failures. Instrumented timing includes evidence
+collection; report that cost and sample count before drawing performance
+conclusions. A single successful profile does not complete all distributed
+qualification.
+The summary includes attempted/passed counts and nearest-rank p50/p95 for each
+policy; native-cycle samples are separate from restore samples. Small sample
+counts are not a statistically reliable tail-latency estimate.
+
+## Unsupported Profiles and Handoff
+
+The Snapshot pin supports single-node workloads, not multi-node capture/restore.
+Do not emit a simulated multi-node PASS. The multi-node extension requires:
+
+1. An agreed Snapshot host/cohort transaction across nodes and artifact publication.
+2. Frozen rank/GPU/topology compatibility, complete-group failure cleanup and a
+   coordinator outside every participating launcher failure domain.
+3. Cross-node communication reconstruction, peer/membership agreement and explicit
+   readiness coordination before traffic.
+4. Multi-node positive cycles and injected missing-rank, stale-peer, timeout and
+   partial-restore failures on a supported upstream host implementation.
+
+External KV transfer is a separate profile. It requires closed exposure,
+retirement of local copies and remote/provider access, fresh registrations,
+peer discovery and coordinated readiness. Reuse PACT's existing ownership and
+deadline evidence; add the missing restartable cross-owner/cohort adapter.
+Live-request preservation, KV migration and interrupted-transfer resumption are
+not implied by this experiment.
+
+## Tests
+
+The CPU CI list includes the probe and qualification-invariant tests:
+
+```bash
+pytest -m cpu_only tests/unittest/scripts/test_snapshot_probe.py \
+  tests/unittest/scripts/test_snapshot_qualification.py
+```
+
+The Go adapter tests run during `build_host.py`. CPU tests validate reporting,
+ownership checks and invariants; they do not execute CUDA checkpoint/restore.
+Actual profile results require the privileged GPU workflow above.
+
+The optional [low-level HTTP probe](LOW_LEVEL_PROBE.md) remains available for
+isolated launcher checks. Its results intentionally retain
+`snapshot_qualification: UNTESTED`.
