@@ -1051,3 +1051,89 @@ def test_version_metadata_sync_validates_all_files_before_writing(
         generator.sync_schema_version_metadata(tmp_path)
 
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+_EXPERT_LAUNCH = {"dwdp_config": {"dwdp_size": 16}, "cuda_graph_config": None}
+_ATTACHED_LAUNCH = {
+    "dwdp_config": {"dwdp_size": 16, "enable_dense": True},
+    "cuda_graph_config": None,
+    "disable_overlap_scheduler": True,
+}
+_STANDALONE_LAUNCH = {
+    "dwdp_config": _DENSE_ONLY,
+    "cuda_graph_config": None,
+    "tensor_parallel_size": 4,
+    "enable_attention_dp": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("launch", "error"),
+    [
+        (_EXPERT_LAUNCH, None),
+        ({**_EXPERT_LAUNCH, "dwdp_config": {"dwdp_size": 1}}, "dwdp_size > 1"),
+        ({**_EXPERT_LAUNCH, "cuda_graph_config": {}}, "does not support CUDA graphs"),
+        ({**_EXPERT_LAUNCH, "pipeline_parallel_size": 2}, "pipeline and context parallelism"),
+        (_ATTACHED_LAUNCH, None),
+        (
+            {**_ATTACHED_LAUNCH, "tensor_parallel_size": 2, "enable_attention_dp": True},
+            "with tensor",
+        ),
+        ({**_ATTACHED_LAUNCH, "disable_overlap_scheduler": False}, "disable_overlap_scheduler"),
+        ({**_ATTACHED_LAUNCH, "torch_compile_config": {}}, "torch_compile_config=None"),
+        ({**_ATTACHED_LAUNCH, "sleep_config": {}}, "sleep_config=None"),
+        ({**_ATTACHED_LAUNCH, "enable_locality_domains": True}, "enable_locality_domains"),
+        (_STANDALONE_LAUNCH, None),
+        ({**_STANDALONE_LAUNCH, "tensor_parallel_size": 1}, "tensor_parallel_size=1"),
+        ({**_STANDALONE_LAUNCH, "enable_attention_dp": False}, "enable_attention_dp=False"),
+        ({**_STANDALONE_LAUNCH, "cuda_graph_config": {}}, "cuda_graph_config=None"),
+        ({**_STANDALONE_LAUNCH, "lora_config": {}}, "lora_config=None"),
+        ({**_STANDALONE_LAUNCH, "pipeline_parallel_size": 2}, "pipeline_parallel_size=1"),
+    ],
+)
+def test_dwdp_launch_rules_match_runtime(
+    schemas: dict[str, dict], launch: dict[str, object], error: str | None
+) -> None:
+    """Both schemas refuse the values TorchLlmArgs.validate_dwdp_launch() refuses.
+
+    They refuse them at the top level and in each server block of a disaggregated configuration.
+    """
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    if error is None:
+        TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+    else:
+        with pytest.raises(ValueError, match=error):
+            TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(launch) == (error is None), filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: launch}) == (error is None), section
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        {"dwdp_config": {"dwdp_size": 16}},
+        {"dwdp_config": {"dwdp_size": 16, "enable_dense": True}},
+        {"dwdp_config": _DENSE_ONLY},
+    ],
+    ids=["expert", "attached", "standalone"],
+)
+def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
+    schemas: dict[str, dict], launch: dict[str, object]
+) -> None:
+    """The schemas accept a launch that leaves out a field the DWDP rules constrain.
+
+    The field may come from the command line or, in a disaggregated configuration, from the top
+    level, so runtime validation decides.
+    """
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    with pytest.raises(ValueError, match="DWDP"):
+        TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(launch), filename

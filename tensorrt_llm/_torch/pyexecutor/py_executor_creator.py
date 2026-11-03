@@ -257,13 +257,13 @@ class _ExecutorMemoryMonitor:
                 ))
 
 
-def _check_dense_dwdp_launch(llm_args: TorchLlmArgs,
-                             mapping: Mapping) -> Optional[DenseMode]:
+def _check_dense_dwdp_launch(llm_args: TorchLlmArgs) -> Optional[DenseMode]:
     """Run the dense DWDP launch gate if ``dwdp_config.enable_dense`` asks for it.
 
     It runs before the DWDP manager, the standalone dense DWDP manager and the
-    model are built, so a launch that dense DWDP cannot serve fails before the
-    weights load.
+    model are built, so a launch whose host dense DWDP cannot serve fails
+    before the weights load; ``TorchLlmArgs.validate_dwdp_launch`` already
+    refused what the arguments alone rule out.
 
     Returns:
         The mode dense DWDP runs in: attached to expert DWDP
@@ -271,12 +271,12 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs,
         instance. None when dense DWDP is not requested.
 
     Raises:
-        ValueError: Dense DWDP is requested and the launch violates one of its
+        ValueError: Dense DWDP is requested and the host violates one of its
             requirements (see ``validate_dense_gate``).
     """
     dwdp_config = llm_args.dwdp_config
     if dwdp_config is not None and dwdp_config.enable_dense:
-        return validate_dense_gate(llm_args, mapping)
+        return validate_dense_gate(llm_args)
     return None
 
 
@@ -828,36 +828,17 @@ def _create_py_executor(
 
     # The dense DWDP gate runs before the DWDP block below: it picks the dense
     # DWDP mode, attached to expert DWDP or standalone without it, and rejects
-    # a launch that neither mode serves.
-    dense_mode = _check_dense_dwdp_launch(llm_args, mapping)
+    # a launch whose host dense DWDP cannot serve.
+    dense_mode = _check_dense_dwdp_launch(llm_args)
 
     # Initialize DWDP Manager.
     #
-    # DWDP needs every global DWDP rank to be a complete, unsharded model replica
-    # owning one expert slice -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is
-    # only meaningful under that bijection. Disaggregated context workers satisfy
-    # this with TP=1, aggregated serving with full attention DP; everything that
-    # shards a replica across ranks is rejected. Pipeline and context parallelism
-    # are rejected even under attention DP, since pairing ranks that hold
-    # different layers as DWDP peers gives wrong expert weights rather than an
-    # error. The TP check tests `dp_size == tp_size` rather than
-    # `enable_attention_dp` so a future partial attention DP cannot slip through.
+    # TorchLlmArgs.validate_dwdp_launch already made sure that every global
+    # DWDP rank is a complete, unsharded model replica owning one expert slice
+    # -- `dwdp_rank = dwdp_global_rank() % dwdp_size` is only meaningful under
+    # that bijection -- and that the launch runs without CUDA graphs.
     dwdp_manager: Optional[DwdpManager] = None
     if expert_dwdp:
-        if dwdp_config.dwdp_size <= 1:
-            raise ValueError(
-                f"DWDP requires dwdp_size > 1, got {dwdp_config.dwdp_size}.")
-        if mapping.pp_size > 1 or mapping.cp_size > 1:
-            raise ValueError(
-                "DWDP requires each rank to be a complete model replica, so "
-                "pipeline and context parallelism are not supported, but got "
-                f"pp_size={mapping.pp_size}, cp_size={mapping.cp_size}.")
-        if mapping.tp_size > 1 and mapping.dp_size != mapping.tp_size:
-            raise ValueError(
-                "DWDP requires each rank to be a complete model replica: use "
-                "tp_size=1 (disaggregated context worker) or "
-                "enable_attention_dp=True (aggregated serving), but got "
-                f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
         # Only the CuteDSL MoE backends support DWDP (with NVFP4 weights), and
         # AUTO resolves to none of them for the models DWDP serves. Without
         # one, DWDP manages no MoE layer and every rank loads every expert
@@ -869,13 +850,6 @@ def _create_py_executor(
                 "moe_config.backend: CUTEDSL (or CUTEDSL_FC12) with an NVFP4 "
                 "checkpoint, but got "
                 f"moe_config.backend={llm_args.moe_config.backend!r}.")
-        # The host issues the expert prefetch as the MoE layers run, and the
-        # last layers of a pass already prefetch the next pass; a replayed
-        # CUDA graph would bind buffer slots the host schedule does not track.
-        if llm_args.cuda_graph_config is not None:
-            raise ValueError(
-                "DWDP does not support CUDA graphs; set cuda_graph_config=None."
-            )
         dwdp_manager = DwdpManager(config=dwdp_config,
                                    dist=dist,
                                    mapping=mapping)

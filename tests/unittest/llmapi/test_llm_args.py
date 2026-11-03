@@ -6091,3 +6091,135 @@ class TestDwdpConfigModes:
     def test_gather_kernel_takes_register_or_tma_only(self) -> None:
         with pytest.raises(ValidationError, match="gather_kernel"):
             DwdpConfig(copy_mode="gather", gather_kernel="fast")
+
+
+_DWDP_EXPERT = dict(dwdp_size=16)
+_DWDP_ATTACHED = dict(dwdp_size=16, enable_dense=True)
+_DWDP_STANDALONE = dict(enable_experts=False, enable_dense=True)
+_ATTENTION_DP = dict(tensor_parallel_size=16, enable_attention_dp=True)
+
+
+@pytest.mark.cpu_only
+class TestDwdpLaunch:
+    """TorchLlmArgs.validate_dwdp_launch: what DWDP rules out in the arguments.
+
+    Expert DWDP needs a DWDP group of complete model replicas without CUDA
+    graphs; dense DWDP runs attached to it (tensor parallel size 1, the overlap
+    scheduler off) or standalone on an attention-DP instance, and needs eager
+    execution without the features it rules out.
+    """
+
+    @staticmethod
+    def _check(dwdp: dict, **fields: Any) -> None:
+        """Run the validator alone on a launch's arguments, applied unvalidated."""
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            skip_tokenizer_init=True,
+                            cuda_graph_config=None,
+                            disable_overlap_scheduler=True)
+        args.model_copy(update={
+            "dwdp_config": DwdpConfig(**dwdp),
+            **fields
+        }).validate_dwdp_launch()
+
+    def test_building_the_arguments_runs_it(self) -> None:
+        """CUDA graphs, on by default, refuse DWDP when the arguments are built."""
+        with pytest.raises(ValidationError,
+                           match="DWDP does not support CUDA graphs"):
+            TorchLlmArgs(model="/tmp/dummy_model",
+                         skip_tokenizer_init=True,
+                         dwdp_config=DwdpConfig(**_DWDP_ATTACHED))
+
+    @pytest.mark.parametrize(("dwdp", "fields"), [
+        (_DWDP_EXPERT, {}),
+        (_DWDP_EXPERT, _ATTENTION_DP),
+        (_DWDP_EXPERT, dict(disable_overlap_scheduler=False)),
+        (_DWDP_ATTACHED, {}),
+        (_DWDP_STANDALONE, _ATTENTION_DP),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP,
+                                disable_overlap_scheduler=False)),
+    ],
+                             ids=[
+                                 "expert", "expert-attention_dp",
+                                 "expert-overlap_scheduler", "attached",
+                                 "standalone", "standalone-overlap_scheduler"
+                             ])
+    def test_accepted_launches(self, dwdp: dict, fields: dict) -> None:
+        self._check(dwdp, **fields)
+
+    @pytest.mark.parametrize(("dwdp", "fields", "error"), [
+        (dict(dwdp_size=1), {}, "DWDP requires dwdp_size > 1, got 1."),
+        (dict(dwdp_size=1,
+              enable_dense=True), {}, "DWDP requires dwdp_size > 1, got 1."),
+        (_DWDP_EXPERT, dict(pipeline_parallel_size=2),
+         "pipeline and context parallelism are not supported"),
+        (_DWDP_EXPERT, dict(context_parallel_size=2),
+         "pipeline and context parallelism are not supported"),
+        (_DWDP_EXPERT, dict(tensor_parallel_size=2),
+         "use tensor_parallel_size=1 (disaggregated context worker) or "
+         "enable_attention_dp=True (aggregated serving)"),
+        (_DWDP_EXPERT, dict(cuda_graph_config=CudaGraphConfig()),
+         "DWDP does not support CUDA graphs"),
+    ],
+                             ids=[
+                                 "dwdp_size", "attached-dwdp_size",
+                                 "pipeline_parallel", "context_parallel",
+                                 "tensor_parallel", "cuda_graphs"
+                             ])
+    def test_expert_dwdp_needs_whole_replicas_without_cuda_graphs(
+            self, dwdp: dict, fields: dict, error: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            self._check(dwdp, **fields)
+
+    @pytest.mark.parametrize(("dwdp", "fields", "error"), [
+        (_DWDP_ATTACHED, _ATTENTION_DP,
+         "this launch has expert DWDP with tensor_parallel_size=16"),
+        (_DWDP_ATTACHED, dict(disable_overlap_scheduler=False),
+         "this launch has expert DWDP with disable_overlap_scheduler=False"),
+        (_DWDP_STANDALONE, dict(tensor_parallel_size=16),
+         "this launch has no expert DWDP and enable_attention_dp=False"),
+        (_DWDP_STANDALONE, dict(enable_attention_dp=True),
+         "this launch has no expert DWDP and tensor_parallel_size=1"),
+        (_DWDP_STANDALONE,
+         dict(**_ATTENTION_DP, cuda_graph_config=CudaGraphConfig()),
+         "requires cuda_graph_config=None, but cuda_graph_config is set"),
+        (_DWDP_ATTACHED, dict(torch_compile_config=TorchCompileConfig()),
+         "requires torch_compile_config=None, but torch_compile_config is set"),
+        (_DWDP_STANDALONE,
+         dict(**_ATTENTION_DP,
+              prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE),
+         "requires prefill_cuda_graph_backend='disabled', but "
+         "prefill_cuda_graph_backend='breakable'"),
+        (_DWDP_ATTACHED, dict(sleep_config=SleepConfig()),
+         "requires sleep_config=None, but sleep_config is set"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, lora_config=LoraConfig()),
+         "requires lora_config=None, but lora_config is set"),
+        (_DWDP_ATTACHED,
+         dict(speculative_config=MTPDecodingConfig(max_draft_len=1)),
+         "requires speculative_config=None, but speculative_config is set"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, enable_locality_domains=True),
+         "requires enable_locality_domains=False, but "
+         "enable_locality_domains=True"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, pipeline_parallel_size=2),
+         "requires pipeline_parallel_size=1, but pipeline_parallel_size=2"),
+        (_DWDP_STANDALONE, dict(**_ATTENTION_DP, context_parallel_size=2),
+         "requires context_parallel_size=1, but context_parallel_size=2"),
+    ],
+                             ids=[
+                                 "attached-tensor_parallel",
+                                 "attached-overlap_scheduler",
+                                 "standalone-without_attention_dp",
+                                 "standalone-tensor_parallel_1",
+                                 "cuda_graph_config", "torch_compile_config",
+                                 "prefill_cuda_graph_backend", "sleep_config",
+                                 "lora_config", "speculative_config",
+                                 "enable_locality_domains", "pipeline_parallel",
+                                 "context_parallel"
+                             ])
+    def test_dense_dwdp_requirements(self, dwdp: dict, fields: dict,
+                                     error: str) -> None:
+        with pytest.raises(ValueError, match=re.escape(error)) as raised:
+            self._check(dwdp, **fields)
+        message = str(raised.value)
+        assert message.startswith("Dense DWDP (dwdp_config.enable_dense) ")
+        assert message.endswith("Change the launch configuration or set "
+                                "dwdp_config.enable_dense=False.")

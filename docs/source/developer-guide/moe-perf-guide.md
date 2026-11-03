@@ -449,7 +449,7 @@ It runs in one of two modes:
 
 `dwdp_config.copy_mode` picks the transfer of every DWDP copy, the expert prefetch and the dense gathers alike: `per_slice` (one copy-engine copy per slice), `batched` (one batched copy-engine copy per layer) or `gather` (the SM fabric gather kernel, which keeps SMs from the compute kernels while it runs). Left unset, the expert prefetch keeps its usual selection (`per_slice`, `batched` with `contention_opt`, `gather` with the `TRTLLM_DWDP_PREFETCH_GATHER` environment variable, which is deprecated), the dense copies follow it, and dense DWDP without expert DWDP uses `batched`. With `copy_mode: gather`, `dwdp_config.gather_kernel` picks the gather kernel: `register` or `tma` (bulk copies staged in shared memory, SM90 or newer). It replaces the deprecated `TRTLLM_DWDP_GATHER_KERNEL` environment variable, which still applies while `gather_kernel` is unset.
 
-The launch is checked before the model is built. Dense DWDP needs:
+`LLM()` and `trtllm-serve` check these settings when they build the LLM arguments, and each worker checks its host before the model is built. Dense DWDP needs:
 
 - eager execution: no `cuda_graph_config`, `torch_compile_config` or prefill CUDA graphs;
 - no `sleep_config`, `lora_config` or `speculative_config`;

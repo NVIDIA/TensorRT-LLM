@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, NamedTuple, Optional, Set, Tuple, Type,
-                    TypeAlias, TypeVar, Union, get_args, get_origin)
+                    List, Literal, NamedTuple, NoReturn, Optional, Set, Tuple,
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -6085,6 +6085,117 @@ class DwdpConfig(StrictBaseModel):
         return self
 
 
+def _validate_expert_dwdp_launch(args: 'TorchLlmArgs') -> None:
+    """The launch rules of expert DWDP (``TorchLlmArgs.validate_dwdp_launch``).
+
+    Every rank of a DWDP group must be a complete, unsharded model replica
+    that owns one slice of the experts: a disaggregated context worker with
+    tensor parallel size 1, or aggregated serving with attention DP over all
+    of it. Pipeline and context parallelism are rejected even under attention
+    DP, since pairing ranks that hold different layers as DWDP peers gives
+    wrong expert weights rather than an error.
+    """
+    dwdp_size = args.dwdp_config.dwdp_size
+    if dwdp_size <= 1:
+        raise ValueError(f"DWDP requires dwdp_size > 1, got {dwdp_size}.")
+    if args.pipeline_parallel_size > 1 or args.context_parallel_size > 1:
+        raise ValueError(
+            "DWDP requires each rank to be a complete model replica, so "
+            "pipeline and context parallelism are not supported, but got "
+            f"pipeline_parallel_size={args.pipeline_parallel_size}, "
+            f"context_parallel_size={args.context_parallel_size}.")
+    # Attention DP spans the whole tensor-parallel group (Mapping.dp_size).
+    if args.tensor_parallel_size > 1 and not args.enable_attention_dp:
+        raise ValueError(
+            "DWDP requires each rank to be a complete model replica: use "
+            "tensor_parallel_size=1 (disaggregated context worker) or "
+            "enable_attention_dp=True (aggregated serving), but got "
+            f"tensor_parallel_size={args.tensor_parallel_size} without "
+            "attention DP.")
+    # The host issues the expert prefetch as the MoE layers run, and the last
+    # layers of a pass already prefetch the next pass; a replayed CUDA graph
+    # would bind buffer slots the host schedule does not track.
+    if args.cuda_graph_config is not None:
+        raise ValueError(
+            "DWDP does not support CUDA graphs; set cuda_graph_config=None.")
+
+
+#: The two launch shapes dense DWDP runs in; every mode rejection names both.
+_DENSE_DWDP_MODES = (
+    "runs either with expert DWDP (dwdp_config.enable_experts=True, "
+    "dwdp_size > 1, tensor_parallel_size=1, disable_overlap_scheduler=True) or "
+    "without it on an attention-DP instance (dwdp_config.enable_experts=False, "
+    "enable_attention_dp=True, tensor_parallel_size > 1)")
+
+
+def _validate_dense_dwdp_launch(args: 'TorchLlmArgs') -> None:
+    """The launch rules of dense DWDP (``TorchLlmArgs.validate_dwdp_launch``).
+
+    With expert DWDP the dense rows are sharded over the DWDP group, with
+    tensor parallel size 1 and the overlap scheduler off, as expert DWDP runs.
+    Without it every rank of an attention-DP instance (tensor parallel size
+    > 1) holds the same dense weights, so the rows are sharded over the
+    attention-DP group, and the overlap scheduler may stay on. Any other
+    launch is rejected with a message that names both modes, including expert
+    DWDP over an attention-DP instance. In both modes:
+
+    * no ``cuda_graph_config`` or ``torch_compile_config``, and prefill CUDA
+      graphs disabled: the per-layer hooks need eager single-stream execution,
+      since they keep host-side slot state and order the copies and the weight
+      reads with stream events in every forward;
+    * no ``sleep_config``: the moved weights live in the staging slots and the
+      row store, outside the memory pools that sleep and wake-up manage;
+    * no ``lora_config`` or ``speculative_config``: they read layer weights
+      outside the layer's read window;
+    * ``enable_locality_domains`` off: locality domains make ``Linear`` and
+      ``MLA`` keep ``_locality_domain_*`` shard copies of their weights, which
+      dense DWDP does not move, so they would stay replicated;
+    * pipeline and context parallel size 1: every rank of the group holds
+      every layer.
+    """
+
+    def reject_mode(actual: str) -> NoReturn:
+        raise ValueError(
+            f"Dense DWDP (dwdp_config.enable_dense) {_DENSE_DWDP_MODES}, but "
+            f"this launch has {actual}. Change the launch configuration or set "
+            "dwdp_config.enable_dense=False.")
+
+    def reject(requirement: str, actual: str) -> NoReturn:
+        raise ValueError(
+            f"Dense DWDP (dwdp_config.enable_dense) requires {requirement}, "
+            f"but {actual}. Change the launch configuration or set "
+            "dwdp_config.enable_dense=False.")
+
+    tp_size = args.tensor_parallel_size
+    if args.dwdp_config.enable_experts:
+        if tp_size != 1:
+            reject_mode(f"expert DWDP with tensor_parallel_size={tp_size}")
+        if not args.disable_overlap_scheduler:
+            reject_mode("expert DWDP with disable_overlap_scheduler=False")
+    else:
+        if not args.enable_attention_dp:
+            reject_mode("no expert DWDP and enable_attention_dp=False")
+        if tp_size <= 1:
+            reject_mode(f"no expert DWDP and tensor_parallel_size={tp_size}")
+    for name in ("cuda_graph_config", "torch_compile_config"):
+        if getattr(args, name) is not None:
+            reject(f"{name}=None", f"{name} is set")
+    prefill_graphs = args.prefill_cuda_graph_backend
+    if prefill_graphs != PrefillCudaGraphBackend.DISABLED:
+        reject(
+            f"prefill_cuda_graph_backend='{PrefillCudaGraphBackend.DISABLED}'",
+            f"prefill_cuda_graph_backend='{prefill_graphs}'")
+    for name in ("sleep_config", "lora_config", "speculative_config"):
+        if getattr(args, name) is not None:
+            reject(f"{name}=None", f"{name} is set")
+    if args.enable_locality_domains:
+        reject("enable_locality_domains=False", "enable_locality_domains=True")
+    for name in ("pipeline_parallel_size", "context_parallel_size"):
+        size = getattr(args, name)
+        if size != 1:
+            reject(f"{name}=1", f"{name}={size}")
+
+
 class BaseLlmArgs(StrictBaseModel):
     """Base class for the LLM arguments. It contains all the common arguments."""
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
@@ -8557,6 +8668,27 @@ class TorchLlmArgs(BaseLlmArgs):
                 "enable_speculative_beam_history_d2h is incompatible with "
                 "sampler_force_async_worker=True; the speculative path "
                 "bypasses the sampler's async D2H worker.")
+        return self
+
+    @model_validator(mode='after')
+    def validate_dwdp_launch(self) -> 'TorchLlmArgs':
+        """Refuse a DWDP launch that these arguments alone rule out.
+
+        Expert DWDP (``dwdp_config.enable_experts``) and dense DWDP
+        (``dwdp_config.enable_dense``) each constrain the parallel layout and
+        the execution features (``_validate_expert_dwdp_launch``,
+        ``_validate_dense_dwdp_launch``), so a launch they cannot serve fails
+        when its arguments are built, before any worker starts. What only a worker
+        can tell (the host's peer handles, the MPI backend, the gather op, the
+        MoE backend and the model) is checked when the executor is created.
+        """
+        config = self.dwdp_config
+        if config is None:
+            return self
+        if config.enable_experts:
+            _validate_expert_dwdp_launch(self)
+        if config.enable_dense:
+            _validate_dense_dwdp_launch(self)
         return self
 
 

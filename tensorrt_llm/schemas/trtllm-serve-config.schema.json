@@ -6703,6 +6703,160 @@
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_experts": {
+                "const": true
+              }
+            },
+            "required": [],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "context_parallel_size": {
+            "const": 1
+          },
+          "cuda_graph_config": {
+            "type": "null"
+          },
+          "dwdp_config": {
+            "properties": {
+              "dwdp_size": {
+                "minimum": 2
+              }
+            }
+          },
+          "pipeline_parallel_size": {
+            "const": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_dense": {
+                "const": true
+              }
+            },
+            "required": [
+              "enable_dense"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "context_parallel_size": {
+            "const": 1
+          },
+          "cuda_graph_config": {
+            "type": "null"
+          },
+          "enable_locality_domains": {
+            "const": false
+          },
+          "lora_config": {
+            "type": "null"
+          },
+          "pipeline_parallel_size": {
+            "const": 1
+          },
+          "prefill_cuda_graph_backend": {
+            "const": "disabled"
+          },
+          "sleep_config": {
+            "type": "null"
+          },
+          "speculative_config": {
+            "type": "null"
+          },
+          "torch_compile_config": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_dense": {
+                "const": true
+              },
+              "enable_experts": {
+                "const": true
+              }
+            },
+            "required": [
+              "enable_dense"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "const": true
+          },
+          "tensor_parallel_size": {
+            "const": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dwdp_config": {
+            "properties": {
+              "enable_experts": {
+                "const": false
+              }
+            },
+            "required": [
+              "enable_experts"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "dwdp_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "enable_attention_dp": {
+            "const": true
+          },
+          "tensor_parallel_size": {
+            "minimum": 2
+          }
+        }
+      }
+    }
+  ],
   "description": "Static YAML checks only; runtime validation remains authoritative.",
   "properties": {
     "_mpi_session": {
