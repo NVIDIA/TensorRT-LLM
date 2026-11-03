@@ -9,23 +9,30 @@ stream the next graph waits for, so the GPU idles for the whole chain.
 Every such copy in the runtime names its call site with a ``CopySite`` and goes through ``copy``. A model declares a
 ``CopyPlan`` (``copy_plan`` on the model) listing the sites whose copies may be
 
-* deferred (``defer``): a host-to-device copy snapshots its host bytes into pinned staging and a device-to-device copy
-  records its (dst, src); right before the graph replay, ``flush`` issues one upload of [descriptors | data] and one
-  ``trtllm::device_copy_scatter`` launch, which writes every staged host copy and then every device copy. A pack is
-  opened only on a step that replays an already captured graph, so it always reaches the flush;
+* merged (``merge``): a host-to-device copy snapshots its host bytes into pinned staging and a device-to-device copy
+  records its (dst, src). The staged copies go out as one upload of [descriptors | data] and one
+  ``trtllm::device_copy_scatter`` launch, which writes every staged host copy and then every device copy. A merged
+  copy is guaranteed to land before the next barrier: right after a call through a site the plan lists in
+  ``flush_after``, and at the latest at the graph replay, the step's final barrier. A pack is opened only on a step
+  that replays an already captured graph, so it always reaches that final flush;
 * skipped (``skip_unchanged``): a host-to-device copy, tail fill or block-offset gather whose destination already holds
   what it would write is not issued. Each engine keeps one host shadow per destination for this.
 
 A site in neither set, and every site of an engine whose model declares no plan, is ``dst.copy_(src,
 non_blocking=True)``. Model-specific backends name their own sites with their own ``CopySiteEnum``.
 
-Listing a site in ``defer`` asserts that between the call and the replay no device work reads or writes the destination,
-nor, for a device-to-device copy, writes the source (which is read at the flush). Listing it in ``skip_unchanged``
-asserts that nothing but that site writes the destination. Whether a site may be deferred depends on the destination's
-readers, not on the copy: the plan is where the model, which chose those readers, says so. ``TLLM_DEVICE_COPY_CHECK=1``
-verifies the assertions at runtime, at the cost of a device synchronization per check (see ``DeviceCopier``). It
-catches a write of a deferred destination, not a read: an eager reader sees the poison bytes instead and fails
-downstream, so a site with an eager reader in some configuration says which one where it is declared.
+Listing a site in ``merge`` asserts that between the call and the next barrier no device work reads or writes the
+destination, nor, for a device-to-device copy, writes the source (which is read at the flush). A device reader before
+the replay therefore needs a barrier ahead of it: the plan lists, in ``flush_after``, a site whose call precedes that
+reader (typically the copy the reader consumes), and landing earlier than the replay is always valid. Listing a site in
+``skip_unchanged`` asserts that nothing but that site writes the destination. Whether a site may be merged, and where
+the barriers go, depends on the destination's readers, not on the copy: the plan is where the model, which chose those
+readers, says so. Call sites only name themselves.
+
+``TLLM_DEVICE_COPY_CHECK=1`` (``CHECK_MODE``, read once at import) verifies the assertions at runtime, at the cost of a
+device synchronization per check (see ``DeviceCopier``). It catches a write of a merged destination before its flush.
+A read is caught only where the reader asserts it with ``expect_landed`` under ``if device_copy.CHECK_MODE:``;
+elsewhere an early reader sees the poison bytes instead and fails downstream.
 
 Each engine with a plan owns one ``DeviceCopier`` and makes it the active one for its forward (``active``); the module
 functions act on the calling context's copier, so engines on other threads or devices never share one. The attention
@@ -47,7 +54,9 @@ from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._utils import prefer_pinned
 
 CHECK_ENV = "TLLM_DEVICE_COPY_CHECK"
-# Byte written into a deferred copy's destination in check mode, so an early reader sees garbage and an early writer
+#: Whether the plans' assertions are verified at runtime (``TLLM_DEVICE_COPY_CHECK=1``), read once at import.
+CHECK_MODE: bool = os.environ.get(CHECK_ENV, "0") == "1"
+# Byte written into a merged copy's destination in check mode, so an early reader sees garbage and an early writer
 # is caught at the flush.
 _POISON = 0xA5
 
@@ -75,7 +84,7 @@ class CopySite(CopySiteEnum):
     GRAPH_POSITION_IDS = ("graph.position_ids", Direction.D2D)
     # Decoder inputs: host position ids. (The speculative gather and previous-batch tables, and the speculative
     # metadata's batch-index and slot uploads, skip unchanged values for every model through DeviceCopyBuffer or a
-    # host-side comparison, and no plan defers them.)
+    # host-side comparison, and no plan merges them.)
     INPUT_POSITION_IDS = ("inputs.position_ids", Direction.H2D)
     # TrtllmAttentionMetadata.
     ATTN_KV_LENS = ("attn.kv_lens", Direction.H2D)
@@ -89,29 +98,44 @@ class CopySite(CopySiteEnum):
 
 @dataclass(frozen=True)
 class CopyPlan:
-    """The copy sites a model routes through deferral and skipping. Empty by default: every copy is plain."""
+    """The copy sites a model routes through merging and skipping. Empty by default: every copy is plain.
 
-    defer: frozenset[CopySiteEnum] = frozenset()
+    ``merge``: copies staged into the step's pack, landing before the next barrier (see the module docstring).
+    ``flush_after``: barrier sites. Every call through one of them (``copy``, ``fill_tail``, ``inputs_unchanged`` or
+    ``record_inputs``) flushes the open pack right after the call, also when the call itself was skipped as unchanged
+    and on every call when the site is called several times in a step. Any site may be a barrier, merged or not; a
+    plan with barriers but no merged sites has nothing to flush and is rejected.
+    ``skip_unchanged``: host-to-device copies, tail fills and gathers skipped when the destination already holds their
+    values.
+    """
+
+    merge: frozenset[CopySiteEnum] = frozenset()
+    flush_after: frozenset[CopySiteEnum] = frozenset()
     skip_unchanged: frozenset[CopySiteEnum] = frozenset()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "defer", frozenset(self.defer))
-        object.__setattr__(self, "skip_unchanged", frozenset(self.skip_unchanged))
-        for site in self.defer | self.skip_unchanged:
+        for name in ("merge", "flush_after", "skip_unchanged"):
+            object.__setattr__(self, name, frozenset(getattr(self, name)))
+        for site in self.merge | self.flush_after | self.skip_unchanged:
             if not isinstance(site, CopySiteEnum):
                 raise TypeError(f"CopyPlan sites must be CopySiteEnum members, got {site!r}")
-        fills = [site for site in self.defer if site.direction is Direction.FILL]
+        fills = [site for site in self.merge if site.direction is Direction.FILL]
         if fills:
-            raise ValueError(f"fill sites run on the device and cannot be deferred: {fills}")
+            raise ValueError(f"fill sites run on the device and cannot be merged: {fills}")
         device_copies = [site for site in self.skip_unchanged if site.direction is Direction.D2D]
         if device_copies:
             raise ValueError(
                 "device-to-device copies cannot be skipped (their source has no host shadow): "
                 f"{device_copies}"
             )
+        if self.flush_after and not self.merge:
+            raise ValueError(
+                "flush_after barriers flush merged copies, but the plan merges none: "
+                f"{sorted(self.flush_after, key=str)}"
+            )
 
     def __bool__(self) -> bool:
-        return bool(self.defer or self.skip_unchanged)
+        return bool(self.merge or self.skip_unchanged)
 
 
 def copy_plan_of(model: object) -> CopyPlan:
@@ -145,11 +169,17 @@ def _site_name(site: CopySiteEnum) -> str:
 
 
 class _Pack:
-    """One engine's pack of deferred copies (see the module docstring)."""
+    """One engine's pack of merged copies (see the module docstring).
+
+    A step's pack lives in one slot of a ring of pinned staging buffers and in one device staging buffer. Each barrier
+    issues the copies staged since the previous one as a segment ([header | descriptors | data], aligned) appended
+    after the previous segment in the same slot, with its own upload and scatter launch. The ring advances once per
+    step, at ``begin``, which waits only for the upload that last used the slot RING steps ago.
+    """
 
     CAPACITY = 1 << 16
     MAX_DESC = 256
-    # Pinned staging buffers in rotation: a forced flush reopens the pack without waiting on the upload just issued.
+    # Pinned staging buffers in rotation, one per step: a step stages without waiting on the previous steps' uploads.
     RING = 4
     HEADER_BYTES = 16
     DESC_BYTES = 24
@@ -162,30 +192,36 @@ class _Pack:
         ]
         self.events: list[Optional[torch.cuda.Event]] = [None] * self.RING
         self.dev = torch.empty(self.CAPACITY, dtype=torch.uint8, device=device)
+        # A segment's data starts after its header and descriptor area.
         self.data_start = self.HEADER_BYTES + self.DESC_BYTES * self.MAX_DESC
-        self.parity = 0
+        self.slot = self.RING - 1
         self.open = False
         self.check = check
+        # First byte of the current segment in the slot.
+        self.seg = 0
         self.h2d: list[tuple[int, int, int]] = []
         self.d2d: list[tuple[int, int, int]] = []
-        # Bytes every staged device copy reads or writes: a later host copy into them would land out of order.
+        # Bytes every staged device copy of the segment reads or writes: a later host copy into them would land out
+        # of order (the scatter writes the host copies first).
         self.d2d_ranges: list[tuple[int, int]] = []
-        # Check mode: bytes every staged copy writes.
+        # Check mode: bytes every staged copy of the segment writes.
         self.dst_ranges: list[tuple[int, int]] = []
-        # Every tensor a staged copy reads or writes, kept alive until the pack is issued.
+        # Every tensor a staged copy reads or writes, kept alive until its segment is issued.
         self.staged: list[torch.Tensor] = []
         # Check mode: (site, destination) of every staged copy, and (site, source, snapshot) of every device copy.
         self.poisoned: list[tuple[CopySiteEnum, torch.Tensor]] = []
         self.sources: list[tuple[CopySiteEnum, torch.Tensor, torch.Tensor]] = []
-        self.used = self.data_start
+        self.used = self.seg + self.data_start
 
     def begin(self) -> None:
         if self.open:
             self.flush()
-        event = self.events[self.parity]
+        self.slot = (self.slot + 1) % self.RING
+        event = self.events[self.slot]
         if event is not None:
-            # The upload that last read this pinned buffer has run.
+            # The uploads that last read this pinned buffer have run.
             event.synchronize()
+        self.seg = 0
         self._clear()
         self.open = True
 
@@ -197,11 +233,16 @@ class _Pack:
         self.staged.clear()
         self.poisoned.clear()
         self.sources.clear()
-        self.used = self.data_start
+        self.used = self.seg + self.data_start
 
     def writes(self, t: torch.Tensor) -> bool:
         """Whether a staged copy writes any byte of ``t`` (check mode only)."""
         return _overlaps(_byte_range(t), self.dst_ranges)
+
+    def pending_sites(self, t: torch.Tensor) -> list[CopySiteEnum]:
+        """The sites of staged, not yet issued copies that write any byte of ``t`` (check mode only)."""
+        r = _byte_range(t)
+        return [site for site, dst in self.poisoned if _overlaps(r, [_byte_range(dst)])]
 
     def stage(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
         if not dst.is_cuda or dst.numel() != src.numel():
@@ -230,14 +271,16 @@ class _Pack:
                 return False
             # A dtype change converts on the host, as copy_ would on the device.
             src = src.to(dst.dtype).contiguous()
-            self.host[self.parity][offset : offset + nbytes].copy_(src.view(-1).view(torch.uint8))
+            self.host[self.slot][offset : offset + nbytes].copy_(src.view(-1).view(torch.uint8))
             base = dst.data_ptr()
+            # The scatter reads a host copy's bytes at an offset from its segment's start.
+            rel = offset - self.seg
             for row in range(rows):
-                self.h2d.append((base + row * row_stride, offset + row * row_bytes, row_bytes))
+                self.h2d.append((base + row * row_stride, rel + row * row_bytes, row_bytes))
             self.staged.append(dst)
             self.used = offset + nbytes
         else:
-            if len(self.h2d) + len(self.d2d) >= self.MAX_DESC:
+            if self.used > self.CAPACITY or len(self.h2d) + len(self.d2d) >= self.MAX_DESC:
                 return False
             if not (
                 src.is_cuda
@@ -263,52 +306,64 @@ class _Pack:
         for site, dst in self.poisoned:
             if not bool(dst.view(torch.uint8).eq(_POISON).all()):
                 raise RuntimeError(
-                    f"{CHECK_ENV}: the destination of deferred copy {_site_name(site)} was written between the "
-                    "copy and the flush; the plan must not defer this site"
+                    f"{CHECK_ENV}: the destination of merged copy {_site_name(site)} was written between the "
+                    "copy and its flush; the plan must not merge this site, or needs a barrier before that writer"
                 )
         for site, src, snapshot in self.sources:
             if not torch.equal(src, snapshot):
                 raise RuntimeError(
-                    f"{CHECK_ENV}: the source of deferred device copy {_site_name(site)} changed between the copy "
-                    "and the flush; the plan must not defer this site"
+                    f"{CHECK_ENV}: the source of merged device copy {_site_name(site)} changed between the copy "
+                    "and its flush; the plan must not merge this site, or needs a barrier before that writer"
                 )
 
-    def flush(self) -> None:
-        if not self.open:
-            return
-        self.open = False
+    def _issue(self) -> None:
+        """Issue the segment staged since the last barrier and start the next one after it in the same slot."""
         if not self.h2d and not self.d2d:
             return
         if self.check:
             self._verify()
-        host = self.host[self.parity]
+        host, seg = self.host[self.slot], self.seg
         desc = [len(self.h2d), len(self.d2d)] + [
             value for copy in self.h2d + self.d2d for value in copy
         ]
-        host[: 8 * len(desc)].view(torch.int64).copy_(torch.tensor(desc, dtype=torch.int64))
+        host[seg : seg + 8 * len(desc)].view(torch.int64).copy_(
+            torch.tensor(desc, dtype=torch.int64)
+        )
         # Descriptors and data in one upload; the gap between them is unused padding.
-        self.dev[: self.used].copy_(host[: self.used], non_blocking=True)
-        torch.ops.trtllm.device_copy_scatter(self.dev)
-        event = self.events[self.parity]
+        self.dev[seg : self.used].copy_(host[seg : self.used], non_blocking=True)
+        torch.ops.trtllm.device_copy_scatter(self.dev[seg:])
+        event = self.events[self.slot]
         if event is None:
-            event = self.events[self.parity] = torch.cuda.Event()
+            event = self.events[self.slot] = torch.cuda.Event()
         event.record()
-        self.parity = (self.parity + 1) % self.RING
         # The scatter is queued on the current stream: the caching allocator keeps the staged tensors' memory for it.
+        self.seg = (self.used + self.ALIGN - 1) // self.ALIGN * self.ALIGN
         self._clear()
+
+    def barrier(self) -> None:
+        """Issue what is staged; the pack stays open for the rest of the step."""
+        if self.open:
+            self._issue()
+
+    def flush(self) -> None:
+        """Issue what is staged and close the pack (the step's final barrier)."""
+        if not self.open:
+            return
+        self.open = False
+        self._issue()
 
     def discard(self) -> None:
         """Close the pack without issuing it (its step failed)."""
         self.open = False
+        self.seg = 0
         self._clear()
 
     def copy(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> None:
-        """Stage the copy, or flush and copy now when it cannot be staged (which keeps the order)."""
+        """Stage the copy, or issue what is staged and copy now when it cannot be staged (which keeps the order)."""
         if self.stage(site, dst, src):
             return
-        self.flush()
+        self._issue()
         dst.copy_(src, non_blocking=True)
-        self.begin()
 
 
 def _view_key(t: torch.Tensor) -> tuple:
@@ -387,29 +442,41 @@ class _SkipCache:
 
 
 class DeviceCopier:
-    """One engine's deferral pack and skip cache, applied per site as its ``CopyPlan`` says.
+    """One engine's merge pack and skip cache, applied per site as its ``CopyPlan`` says.
 
-    In check mode (``TLLM_DEVICE_COPY_CHECK=1`` when the copier is built), every deferred copy's destination is
-    poisoned at the call and verified untouched at the flush, every deferred device copy's source is verified unchanged
-    at the flush, and every skipped copy or tail fill is verified against the device contents. A failed check raises
-    and names the site. A device read of a deferred destination before the flush is not detected: it reads the poison.
+    In check mode (``CHECK_MODE`` when the copier is built), every merged copy's destination is poisoned at the call and
+    verified untouched when its segment is issued, every merged device copy's source is verified unchanged then, and
+    every skipped copy or tail fill is verified against the device contents. A failed check raises and names the site.
+    A device read of a merged destination before its barrier is detected only by a reader that calls
+    ``expect_landed``; any other early reader reads the poison.
     """
 
     def __init__(self, plan: CopyPlan, device: torch.device) -> None:
         self.plan = plan
-        self.check = os.environ.get(CHECK_ENV, "0") == "1"
-        self._pack = _Pack(device, self.check) if plan.defer else None
+        self.check = CHECK_MODE
+        self._pack = _Pack(device, self.check) if plan.merge else None
         self._skip = _SkipCache() if plan.skip_unchanged else None
         # Site membership by identity: an Enum member hashes through a Python-level __hash__.
-        self._defer_ids = frozenset(map(id, plan.defer))
+        self._merge_ids = frozenset(map(id, plan.merge))
         self._skip_ids = frozenset(map(id, plan.skip_unchanged))
+        self._barrier_ids = frozenset(map(id, plan.flush_after))
 
     def skips(self, site: CopySiteEnum) -> bool:
         return id(site) in self._skip_ids
 
     @property
-    def defers(self) -> bool:
+    def merges(self) -> bool:
         return self._pack is not None
+
+    def _barrier(self) -> None:
+        if self._pack is not None:
+            self._pack.barrier()
+
+    def pending_sites(self, t: torch.Tensor) -> list[CopySiteEnum]:
+        """Check mode: the merged sites whose staged, not yet issued copies write any byte of ``t``."""
+        if self._pack is None or not self._pack.open:
+            return []
+        return self._pack.pending_sites(t)
 
     @property
     def is_open(self) -> bool:
@@ -424,7 +491,7 @@ class DeviceCopier:
             self._pack.flush()
 
     def discard(self) -> None:
-        """Drop the open pack and every shadow: the step failed, so none of its copies may have landed."""
+        """Drop the open pack and every shadow: the step failed, so its copies may not have landed."""
         if self._pack is not None:
             self._pack.discard()
         if self._skip is not None:
@@ -439,6 +506,12 @@ class DeviceCopier:
             )
 
     def copy(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
+        issued = self._copy(site, dst, src)
+        if id(site) in self._barrier_ids:
+            self._barrier()
+        return issued
+
+    def _copy(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
         self._expect(site, src)
         addr = dst.untyped_storage().data_ptr() if self._skip is not None else 0
         if torch.cuda.is_current_stream_capturing():
@@ -458,7 +531,7 @@ class DeviceCopier:
             return False
         # Forget the shadow before issuing, so a copy that fails leaves no record.
         shadow = self._skip.forget(addr) if self._skip is not None else None
-        if id(site) in self._defer_ids and self._pack.open:
+        if id(site) in self._merge_ids and self._pack.open:
             self._pack.copy(site, dst, src)
         else:
             dst.copy_(src, non_blocking=True)
@@ -467,6 +540,11 @@ class DeviceCopier:
         return True
 
     def fill_tail(self, site: CopySiteEnum, buf: torch.Tensor, start: int, value: int) -> None:
+        self._fill_tail(site, buf, start, value)
+        if id(site) in self._barrier_ids:
+            self._barrier()
+
+    def _fill_tail(self, site: CopySiteEnum, buf: torch.Tensor, start: int, value: int) -> None:
         if site.direction is not Direction.FILL:
             raise ValueError(f"{_site_name(site)} is not a fill site")
         skip = self._skip is not None and id(site) in self._skip_ids
@@ -498,6 +576,14 @@ class DeviceCopier:
         False it issues the copy and then calls ``record_inputs``, so a copy that fails leaves no record. ``key=None``
         marks a gather whose inputs the caller does not compare.
         """
+        unchanged = self._inputs_unchanged(site, dst, key, host)
+        if id(site) in self._barrier_ids:
+            self._barrier()
+        return unchanged
+
+    def _inputs_unchanged(
+        self, site: CopySiteEnum, dst: torch.Tensor, key: Optional[tuple], host: torch.Tensor
+    ) -> bool:
         if self._skip is None or id(site) not in self._skip_ids:
             return False
         if key is not None and not torch.cuda.is_current_stream_capturing():
@@ -510,13 +596,14 @@ class DeviceCopier:
         self, site: CopySiteEnum, dst: torch.Tensor, key: Optional[tuple], host: torch.Tensor
     ) -> None:
         """Record the inputs of a gather into ``dst`` the caller has just issued (see ``inputs_unchanged``)."""
-        if self._skip is None or id(site) not in self._skip_ids:
-            return
-        if key is None or torch.cuda.is_current_stream_capturing():
-            # A captured gather reruns on every replay, and an uncompared one leaves nothing to compare with.
-            self._skip.forget_inputs(dst)
-            return
-        self._skip.record_inputs(dst, key, host)
+        if self._skip is not None and id(site) in self._skip_ids:
+            if key is None or torch.cuda.is_current_stream_capturing():
+                # A captured gather reruns on every replay, and an uncompared one leaves nothing to compare with.
+                self._skip.forget_inputs(dst)
+            else:
+                self._skip.record_inputs(dst, key, host)
+        if id(site) in self._barrier_ids:
+            self._barrier()
 
 
 _active: ContextVar[Optional[DeviceCopier]] = ContextVar("trtllm_device_copier", default=None)
@@ -537,7 +624,7 @@ def current() -> Optional[DeviceCopier]:
 
 
 def copy(site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
-    """``dst.copy_(src, non_blocking=True)``, deferred or skipped as the active copier's plan says; True if issued."""
+    """``dst.copy_(src, non_blocking=True)``, merged or skipped as the active copier's plan says; True if issued."""
     copier = _active.get()
     if copier is None:
         dst.copy_(src, non_blocking=True)
@@ -582,6 +669,29 @@ def record_inputs(
         copier.record_inputs(site, dst, key, host)
 
 
+def expect_landed(site: CopySiteEnum, t: torch.Tensor) -> None:
+    """Check mode: assert that no merged copy into ``t`` is still staged, i.e. a barrier precedes this reader.
+
+    ``site`` names the reader's anchor (the site whose ``flush_after`` barrier should have issued the copies) in the
+    error. Call it only under ``if device_copy.CHECK_MODE:``; it raises when check mode is off, so an unguarded call
+    cannot add work to the hot path unnoticed. Without an active copier nothing is staged and it passes.
+    """
+    if not CHECK_MODE:
+        raise RuntimeError(
+            f"expect_landed({_site_name(site)}) is a {CHECK_ENV} assertion; call it under `if device_copy.CHECK_MODE:`"
+        )
+    copier = _active.get()
+    if copier is None:
+        return
+    pending = copier.pending_sites(t)
+    if pending:
+        raise RuntimeError(
+            f"{CHECK_ENV}: a reader anchored at {_site_name(site)} reads bytes that merged copies "
+            f"{sorted({_site_name(p) for p in pending})} have not written yet; the plan needs {_site_name(site)} "
+            "in flush_after, and its call must precede this reader"
+        )
+
+
 def begin() -> None:
     """Open the active copier's pack. Call only when the step will reach ``flush`` (a captured graph's replay)."""
     copier = _active.get()
@@ -595,7 +705,10 @@ def is_open() -> bool:
 
 
 def flush() -> None:
-    """Issue the active open pack (one upload and one scatter launch on the current stream) and close it."""
+    """Issue the active open pack's last segment (one upload and one scatter launch on the current stream) and close it.
+
+    The step's final barrier, at the graph replay.
+    """
     copier = _active.get()
     if copier is not None:
         copier.flush()

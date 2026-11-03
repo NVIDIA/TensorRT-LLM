@@ -4494,13 +4494,13 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
     )
 
 
-#: The step's copies this target defers to the graph replay (one upload and one scatter instead of a chain of copies
-#: the next graph waits on, ~30 us of idle GPU at one request) and skips when unchanged (steady decode re-uploads slot
-#: indices, query lengths and page tables that rarely change). Each entry asserts, for this target's decode step, that
-#: no device work touches the destination before the replay (``defer``) or that nothing else writes it
-#: (``skip_unchanged``); ``TLLM_DEVICE_COPY_CHECK=1`` verifies both.
+#: The step's copies this target merges (one upload and one scatter per barrier instead of a chain of copies the next
+#: graph waits on, ~30 us of idle GPU at one request) and skips when unchanged (steady decode re-uploads slot indices,
+#: query lengths and page tables that rarely change). Each entry asserts, for this target's decode step, that no device
+#: work touches the destination before its barrier (``merge``; the graph replay unless ``flush_after`` adds an earlier
+#: one) or that nothing else writes it (``skip_unchanged``); ``TLLM_DEVICE_COPY_CHECK=1`` verifies both.
 _COPY_PLAN = CopyPlan(
-    defer={
+    merge={
         CopySite.GRAPH_INPUT_IDS,
         CopySite.GRAPH_POSITION_IDS,
         CopySite.INPUT_POSITION_IDS,
@@ -4509,8 +4509,10 @@ _COPY_PLAN = CopyPlan(
         MsaCopySite.N_VALID_BLOCKS,
         MsaCopySite.OUT_CACHE_LOC,
         MsaCopySite.KV_INDICES,
-        # Not BLOCK_TABLE: this target's KV pool has sub-pages, so write_subpage_block_table reads it before the
-        # replay. SEQ_LENS has no such reader because the runtime hooks stage tables on the host.
+        # This target's KV pool has sub-pages, so write_subpage_block_table reads the block table on the device right
+        # after its copy, before the replay: BLOCK_TABLE is a barrier (flush_after below). SEQ_LENS has no such reader
+        # because the runtime hooks stage tables on the host.
+        MsaCopySite.BLOCK_TABLE,
         MsaCopySite.SEQ_LENS,
         MsaCopySite.QO_LENS,
         MsaCopySite.CU_Q_LENS,
@@ -4519,6 +4521,7 @@ _COPY_PLAN = CopyPlan(
         MsaCopySite.Q_INTRA,
         MsaCopySite.KV_LENS_STAGED,
     },
+    flush_after={MsaCopySite.BLOCK_TABLE},
     skip_unchanged={
         CopySite.ATTN_PROMPT_LENS,
         MsaCopySite.SHORT_TABLE,
