@@ -39,6 +39,9 @@ Consumers:
   to block position ``i`` and its global argmax becomes ``prev_{i+1}`` and draft
   token ``i``. :func:`markov_chain_logits` runs the same chain on full-vocab
   or shard logits and also returns the biased logits.
+* :meth:`VocabParallelHead.markov_tokens_v3` -- the same chain for up to 16
+  requests and 16 block positions as one CuTe DSL launch whose CTAs exchange
+  their keys through the TP group's MNNVL multicast workspace.
 
 The pairs travel through one all-reduce (sum) of a zero-padded float32 buffer in
 which each rank writes only its own columns; ``x + 0`` is exact and indices
@@ -389,10 +392,62 @@ class _PairExchange:
     single shard (``all_reduce`` None) publishes its pairs and exchanges nothing.
     """
 
-    def __init__(self, all_reduce: Optional[AllReduce], tp_size: int, tp_rank: int):
+    def __init__(
+        self,
+        all_reduce: Optional[AllReduce],
+        tp_size: int,
+        tp_rank: int,
+        mapping: Optional[Mapping] = None,
+    ):
         self.all_reduce = all_reduce
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        # The TP group whose MNNVL workspace the one-launch Markov chain
+        # (VocabParallelHead.markov_tokens_v3) multicasts over.
+        self.mapping = mapping
+        self._markov_v3 = None
+
+    def multicast_supported(self) -> bool:
+        """Whether this TP group has an MNNVL all-reduce workspace to multicast over."""
+        if self.mapping is None or self.tp_size == 1:
+            return False
+        from ..distributed.ops import MNNVLAllReduce
+
+        workspace = MNNVLAllReduce.allreduce_mnnvl_workspaces.get(self.mapping)
+        return workspace is not None and workspace.get("comm") is not None
+
+    def markov_v3_buffers(self, entries: int):
+        """``(local address, multicast address, state)`` of the CuTe DSL Markov
+        chain's key exchange for ``entries`` (ranks x CTAs per rank): its
+        rotating sets, zero-filled, and this rank's int32 launch state.
+        Allocated collectively on first use, outside graph capture."""
+        if self._markov_v3 is not None:
+            assert self._markov_v3[0] == entries, "the Markov exchange is sized once per process"
+            return self._markov_v3[1:4]
+        assert not torch.cuda.is_current_stream_capturing()
+        from ..distributed.ops import (
+            MNNVLAllReduce,
+            _make_mnnvl_mcast_buffer,
+            use_mnnvl_fabric_handle,
+        )
+        from ..kernels.blackwell.dspark_markov_greedy import NUM_SETS, STATE_WORDS, set_bytes
+
+        words = NUM_SETS * set_bytes(entries) // 4
+        state = torch.zeros((STATE_WORDS,), dtype=torch.int32, device="cuda")
+        comm = MNNVLAllReduce.allreduce_mnnvl_workspaces[self.mapping]["comm"]
+        handle = _make_mnnvl_mcast_buffer(
+            comm, words * 4, self.mapping, use_mnnvl_fabric_handle(self.mapping)
+        )
+        local = handle.get_uc_buffer(self.tp_rank, [words], torch.int32, 0)
+        mcast = handle.get_mc_buffer([words], torch.int32, 0)
+        local.zero_()
+        torch.cuda.synchronize()
+        if hasattr(comm, "Barrier"):
+            comm.Barrier()
+        else:
+            torch.distributed.barrier(group=comm)
+        self._markov_v3 = (entries, local.data_ptr(), mcast.data_ptr(), state, handle)
+        return self._markov_v3[1:4]
 
     def layout(self, rows: int, n_cols: int, device: torch.device) -> _PairLayout:
         max_splits = triton.cdiv(n_cols, _LOCAL_BLOCK_V)
@@ -549,6 +604,7 @@ def tp_pair_exchange(mapping: Mapping, strategy: AllReduceStrategy) -> _PairExch
         AllReduce(mapping, strategy=strategy, dtype=torch.float32),
         mapping.tp_size,
         mapping.tp_rank,
+        mapping,
     )
 
 
@@ -622,7 +678,11 @@ class VocabParallelHead:
             AllReduce(mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.float32),
             mapping.tp_size,
             mapping.tp_rank,
+            mapping,
         )
+        # This rank's rows of the Markov ``markov_w2`` (markov_w2_shard).
+        self._markov_w2_shard: Optional[torch.Tensor] = None
+        self._markov_w2_src_ptr: Optional[int] = None
         logger.info(
             f"Vocab-parallel LM-head token selection: tp={mapping.tp_size}, "
             f"shard={self.shard_width}, vocab={self.vocab_size}"
@@ -715,6 +775,97 @@ class VocabParallelHead:
         return _markov_chain_tokens(
             local_block, first_prev_tokens, markov_w1, w2_rows, self.col_base, self._exchange
         )
+
+    def markov_v3_supported(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        markov_w1: Optional[torch.Tensor],
+        markov_w2: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether :meth:`markov_tokens_v3` serves these operands: BF16 logits
+        and Markov weights (rank a multiple of 32, at most 256), at most 16
+        requests and 16 block positions, an SM100-family device with a CTA per
+        256 shard rows resident at once, and an MNNVL exchange."""
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        if not IS_CUTLASS_DSL_AVAILABLE or markov_w1 is None or markov_w2 is None:
+            return False
+        if not self._exchange.multicast_supported():
+            return False
+        num_reqs, block_size, shard = local_block.shape
+        rank_dim = markov_w1.shape[1]
+        if not (1 <= num_reqs <= 16 and 1 <= block_size <= 16) or shard != self.shard_width:
+            return False
+        if (
+            local_block.dtype != torch.bfloat16
+            or markov_w1.dtype != torch.bfloat16
+            or markov_w2.dtype != torch.bfloat16
+            or local_block.stride(-1) != 1
+            or not markov_w1.is_contiguous()
+            or not markov_w2.is_contiguous()
+            or markov_w2.shape[1] != rank_dim
+            or rank_dim % 32
+            or rank_dim > 256
+            or first_prev_tokens.dtype not in (torch.int32, torch.int64)
+            or first_prev_tokens.stride(0) != 1
+            or markov_w2.data_ptr() % 16
+        ):
+            return False
+        from ..kernels.blackwell.dspark_markov_greedy import ctas_for, smem_bytes
+
+        props = torch.cuda.get_device_properties(local_block.device)
+        return (
+            props.major == 10
+            and ctas_for(shard) <= props.multi_processor_count
+            and smem_bytes(rank_dim) <= props.shared_memory_per_block_optin
+        )
+
+    def markov_tokens_v3(
+        self,
+        local_block: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        markov_w1: torch.Tensor,
+        markov_w2: torch.Tensor,
+    ) -> torch.Tensor:
+        """:meth:`markov_tokens` as one CuTe DSL launch.
+
+        Each CTA keeps its 256 ``markov_w2`` shard rows in shared memory, adds
+        the BF16-rounded bias of every request to the step's shard logits in
+        FP32 and stores its own (value, global index) key into every rank's
+        exchange; every CTA polls all keys of the step (``dspark_markov_greedy``).
+        The bias is an MMA over the Markov rank, so the tokens equal
+        :meth:`markov_tokens` up to near-ties of its BF16 rounding. The caller
+        checks :meth:`markov_v3_supported`.
+        """
+        from ..kernels.blackwell.dspark_markov_greedy import ctas_for, run_dspark_markov_greedy
+
+        num_reqs, block_size, shard = local_block.shape
+        tokens = torch.empty((num_reqs, block_size), dtype=torch.int32, device=local_block.device)
+        tp = self._exchange.tp_size
+        box_uc, box_mc, state = self._exchange.markov_v3_buffers(tp * ctas_for(shard))
+        run_dspark_markov_greedy(
+            local_block,
+            first_prev_tokens,
+            markov_w1,
+            self.markov_w2_shard(markov_w2),
+            tokens,
+            vocab=self.vocab_size,
+            tp=tp,
+            rank=self._exchange.tp_rank,
+            state=state,
+            box_uc=box_uc,
+            box_mc=box_mc,
+            multicast=True,
+        )
+        return tokens
+
+    def markov_w2_shard(self, markov_w2: torch.Tensor) -> torch.Tensor:
+        """This rank's rows of ``markov_w2`` (cached; a contiguous row slice)."""
+        if self._markov_w2_src_ptr != markov_w2.data_ptr():
+            self._markov_w2_shard = markov_w2[self.col_base : self.col_base + self.shard_width]
+            self._markov_w2_src_ptr = markov_w2.data_ptr()
+        return self._markov_w2_shard
 
 
 class VocabShardedLogits:

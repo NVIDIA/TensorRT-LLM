@@ -1285,9 +1285,17 @@ class DSparkWorker(DFlashWorker):
     def _markov_block_tokens(
         self, draft_model, local_block: torch.Tensor, inputs: dict
     ) -> torch.Tensor:
-        return self._vocab_parallel.head.markov_tokens(
-            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+        head = self._vocab_parallel.head
+        args = (
+            local_block,
+            inputs["first_prev_tokens"],
+            draft_model.markov_w1,
+            draft_model.markov_w2,
         )
+        # Up to 16 requests on an MNNVL TP group: the whole chain in one launch.
+        if head.markov_v3_supported(*args):
+            return head.markov_tokens_v3(*args)
+        return head.markov_tokens(*args)
 
     def _refine_block_logits(
         self,
