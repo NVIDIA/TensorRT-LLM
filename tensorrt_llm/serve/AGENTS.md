@@ -20,6 +20,12 @@ Name files and symbols here, never line numbers.
   `make_router(prefix=...)` instead. The composition root sets each serving object on
   `app.state.<bucket>_serving_<endpoint>` before attaching; routers read it from
   `request.app.state`, never from a closure.
+- Serving classes take every dependency as a keyword-only constructor argument without a
+  default; the composition root builds them and puts them on `app.state`. Never read an
+  optional attribute with `getattr(self, ...)` in new serving code: a missing dependency
+  must fail at construction, not fall back silently at request time. Check: the
+  constructor tests in `tests/unittest/serve/api/openai/embeddings/test_serving.py` and its
+  siblings.
 - Model-specific behavior: a hook on `ServingExtension` (`serve/serving_extensions.py`,
   `serve/extensions/`). Do not branch on a model name in a handler.
 - Prompt rendering: `serve/render/` only. Handlers do not call `apply_chat_template`.
