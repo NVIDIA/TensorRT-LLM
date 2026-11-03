@@ -476,13 +476,28 @@ class CuteDslMlaFmha(PhasedFmha):
     ) -> tuple[bool, str]:
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
+        if meta.num_generations <= 0:
+            return False, "CuTe DSL MLA FMHA only supports decode-only batches."
+        seq_len_q = q.shape[0] // meta.num_generations
+        batch_size = meta.num_generations
+        helix_verify_group = seq_len_q > 1 and meta.helix_position_offsets is not None
+        helix_fp8_page64_decode = (
+            meta.helix_position_offsets is not None
+            and seq_len_q == 1
+            and attn.num_heads == 48
+            and meta.tokens_per_block == 64
+            and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
+            and get_sm_version() == 103
+        )
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced, except when no other library reads this
-        # layer's FP4 MLA 128-token KV pages (for example an NVFP4 manager's
-        # FP8 fallback layer); this path slices the generation inputs and
-        # page tables past num_contexts.
+        # overhead is reduced, unless the generation sub-batch has no supported
+        # fallback, or no other library reads this layer's FP4 MLA 128-token KV
+        # pages (for example an NVFP4 manager's FP8 fallback layer). This path
+        # slices the generation inputs and page tables past num_contexts.
         exclusive_page_size = self._page_size_exclusive_to_cute_dsl(meta)
-        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not exclusive_page_size):
+        if meta.num_contexts != 0 and not (
+            helix_verify_group or helix_fp8_page64_decode or exclusive_page_size
+        ):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -498,8 +513,6 @@ class CuteDslMlaFmha(PhasedFmha):
             or getattr(meta, "is_spec_dec_dynamic_tree", False)
         ):
             return False, "CuTe DSL MLA FMHA does not support custom/tree speculative masks."
-        seq_len_q = q.shape[0] // meta.num_generations
-        batch_size = meta.num_generations
         if meta.helix_position_offsets is not None:
             if seq_len_q != 1 and not meta._helix_spec_tokens_valid:
                 # Multi-token decode under helix needs the per-token bound /
@@ -522,19 +535,10 @@ class CuteDslMlaFmha(PhasedFmha):
 
         from tensorrt_llm._torch.autotuner import AutoTuner
 
-        # A multi-token verify group at H=96 has nowhere else to go: TRTLLM-Gen
-        # rejects 64 < num_heads_q < 128 outright, so falling through the perf
-        # gate does not reach a faster kernel, it reaches an executor-init
-        # failure. That makes this a correctness carve-out rather than a perf
-        # tradeoff, so it is decided here instead of being folded into
-        # _PERF_MIN_BATCH_FP8, which stays a pure measured-win table.
-        # Single-token H=96 is already a measured table entry and still goes
-        # through the gate. Helix with seq_len_q > 1 implies
-        # _helix_spec_tokens_valid -- the helix block above returns False
-        # otherwise.
-        helix_h96_verify_group = (
-            attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
-        )
+        # No fallback library supports a multi-token Helix verify group.
+        # Keep its correctness admission separate from the measured-win table;
+        # the metadata checks above and kernel can_implement below still apply.
+        # Other single-token Helix shapes retain the performance gate.
         # The same failure without Helix: an FP8-KV multi-token verify group
         # (e.g. DSpark under attention DP, where every rank keeps all 96 heads)
         # is not in the FP8 perf table, and on SM100/SM103 the next library is
@@ -551,7 +555,15 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
+        # The SM103 precompiled TRTLLM-Gen path can also lack the H=48,
+        # page-64 FP8 single-token kernel. Keep this coverage case separate
+        # from the measured-win table; can_implement remains authoritative.
+        if not (
+            helix_verify_group
+            or fp8_wide_head_verify_group
+            or helix_fp8_page64_decode
+            or exclusive_page_size
+        ):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,

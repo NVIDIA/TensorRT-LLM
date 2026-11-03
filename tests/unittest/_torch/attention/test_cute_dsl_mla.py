@@ -136,6 +136,9 @@ def _select_mla_generation_fmha(
     fp8_kv: bool,
     helix: bool,
     batch_size: int,
+    tokens_per_block: int = 64,
+    kernel_supported: bool = True,
+    num_contexts: int = 0,
 ):
     """Run FmhaManager._select_mla over [CuteDslMlaFmha, TRTLLM-Gen stub] on CPU."""
     from tensorrt_llm._torch.attention.backends.fmha import cute_dsl_mla
@@ -154,7 +157,9 @@ def _select_mla_generation_fmha(
     # The kernel's can_implement needs nvidia-cutlass-dsl; this test covers only
     # the host-side routing in front of it.
     monkeypatch.setattr(
-        CuteDslMlaFmha, "_kernel_can_implement", staticmethod(lambda *args, **kwargs: (True, ""))
+        CuteDslMlaFmha,
+        "_kernel_can_implement",
+        staticmethod(lambda *args, **kwargs: (kernel_supported, "")),
     )
 
     num_tokens = batch_size * seq_len_q
@@ -166,7 +171,7 @@ def _select_mla_generation_fmha(
         layer_idx=0,
     )
     meta = SimpleNamespace(
-        num_contexts=0,
+        num_contexts=num_contexts,
         num_generations=batch_size,
         beam_width=1,
         is_spec_dec_tree=False,
@@ -176,7 +181,7 @@ def _select_mla_generation_fmha(
         kv_cache_manager=SimpleNamespace(
             get_buffers=lambda layer_idx: torch.empty(0, dtype=torch.bfloat16)
         ),
-        tokens_per_block=64,
+        tokens_per_block=tokens_per_block,
     )
     fwd = AttentionForwardArgs(
         attention_input_type=AttentionInputType.generation_only,
@@ -196,6 +201,7 @@ def _select_mla_generation_fmha(
     return "cute_dsl_mla" if selected is cute else "trtllm_gen"
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "sm, num_heads, seq_len_q, fp8_kv, helix, expected",
     [
@@ -209,6 +215,14 @@ def _select_mla_generation_fmha(
         # Helix H=96 verify groups are unchanged.
         (103, 96, 4, True, True, "cute_dsl_mla"),
         (107, 96, 4, True, True, "cute_dsl_mla"),
+        # Helix verify groups also require CuTe DSL with fewer TP-local heads.
+        (103, 48, 6, True, True, "cute_dsl_mla"),
+        (100, 48, 6, True, True, "cute_dsl_mla"),
+        (103, 48, 6, False, True, "cute_dsl_mla"),
+        # The same verify shape without Helix keeps the perf gate.
+        (103, 48, 6, True, False, "trtllm_gen"),
+        # H=48 page-64 single-token Helix needs the coverage path on SM103.
+        (103, 48, 1, True, True, "cute_dsl_mla"),
         # Single-token H=96 is unchanged (measured perf-table entry).
         (103, 96, 1, True, False, "cute_dsl_mla"),
         # Head counts TRTLLM-Gen serves keep the perf gate.
@@ -218,7 +232,7 @@ def _select_mla_generation_fmha(
         (103, 96, 8, False, False, "cute_dsl_mla"),
     ],
 )
-def test_mla_generation_routes_wide_head_fp8_verify_away_from_trtllm_gen(
+def test_mla_generation_routes_verify_groups_to_supported_fmha(
     monkeypatch, sm, num_heads, seq_len_q, fp8_kv, helix, expected
 ) -> None:
     # The perf gate admits single-token H=96 FP8 decode only from batch_size 8.
@@ -420,3 +434,128 @@ def test_page_size_exclusive_to_cute_dsl_needs_a_page_size() -> None:
     meta = SimpleNamespace(tokens_per_block=None, kv_cache_manager=None)
 
     assert not CuteDslMlaFmha._page_size_exclusive_to_cute_dsl(meta)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "page_size, fp8_kv, helix, sm, kernel_supported, expected",
+    [
+        (64, True, True, 103, True, "cute_dsl_mla"),
+        (32, True, True, 103, True, "trtllm_gen"),
+        (128, True, True, 103, True, "trtllm_gen"),
+        (64, False, True, 103, True, "trtllm_gen"),
+        (64, True, False, 103, True, "trtllm_gen"),
+        (64, True, True, 100, True, "trtllm_gen"),
+        (64, True, True, 103, False, "trtllm_gen"),
+    ],
+)
+def test_mla_generation_helix_fp8_page64_coverage(
+    monkeypatch, page_size, fp8_kv, helix, sm, kernel_supported, expected
+) -> None:
+    assert (
+        _select_mla_generation_fmha(
+            monkeypatch,
+            sm=sm,
+            num_heads=48,
+            seq_len_q=1,
+            fp8_kv=fp8_kv,
+            helix=helix,
+            batch_size=1,
+            tokens_per_block=page_size,
+            kernel_supported=kernel_supported,
+        )
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "page, seq_len_q, fp8_kv, helix, supported, expected",
+    [
+        (64, 1, True, True, True, "cute_dsl_mla"),
+        (64, 1, True, True, False, "trtllm_gen"),
+        (32, 1, True, True, True, "trtllm_gen"),
+        (64, 1, False, True, True, "trtllm_gen"),
+        (64, 1, True, False, True, "trtllm_gen"),
+        (64, 6, True, True, True, "cute_dsl_mla"),
+        (32, 6, True, True, True, "cute_dsl_mla"),
+    ],
+)
+def test_mla_generation_mixed_helix_coverage(
+    monkeypatch, page, seq_len_q, fp8_kv, helix, supported, expected
+) -> None:
+    assert (
+        _select_mla_generation_fmha(
+            monkeypatch,
+            sm=103,
+            num_heads=48,
+            seq_len_q=seq_len_q,
+            fp8_kv=fp8_kv,
+            helix=helix,
+            batch_size=2,
+            tokens_per_block=page,
+            kernel_supported=supported,
+            num_contexts=2,
+        )
+        == expected
+    )
+
+
+@pytest.mark.cpu_only
+def test_mla_generation_mixed_page_table_offset(monkeypatch) -> None:
+    page, heads, latent, rope = 64, 48, 512, 64
+    cache = torch.zeros((12, 1, page, 1, latent + rope), dtype=torch.float8_e4m3fn)
+    blocks = torch.arange(12).view(1, 4, 1, 3)
+    lengths = torch.tensor([999, 888, 5, 7], dtype=torch.int32)
+    meta = SimpleNamespace(
+        num_contexts=2,
+        max_num_requests=4,
+        helix_position_offsets=torch.zeros(2, dtype=torch.int32),
+        _helix_spec_tokens_valid=False,
+        kv_cache_manager=SimpleNamespace(get_buffers=lambda _: cache),
+        kv_cache_block_offsets=blocks,
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0]]),
+    )
+    attn = SimpleNamespace(
+        kv_lora_rank=latent,
+        qk_rope_head_dim=rope,
+        qk_nope_head_dim=128,
+        num_heads=heads,
+        q_scaling=1,
+        layer_idx=0,
+        get_local_layer_idx=lambda _: 0,
+    )
+    params = SimpleNamespace(
+        attn=attn,
+        meta=meta,
+        num_requests=2,
+        tokens_per_block=page,
+        sequence_lengths=lengths[2:],
+        workspace=torch.empty(0, dtype=torch.int8),
+        fwd=SimpleNamespace(
+            quant_q_buffer=None,
+            mla_bmm1_scale=torch.ones(2, dtype=torch.float32),
+            mla_bmm2_scale=torch.ones(1, dtype=torch.float32),
+            softmax_stats_tensor=torch.empty((2, heads, 2), dtype=torch.float32),
+        ),
+    )
+    library = CuteDslMlaFmha.__new__(CuteDslMlaFmha)
+    monkeypatch.setattr(library, "_required_workspace_size", lambda *args: 0)
+    monkeypatch.setattr(library, "_split_kv_plan", lambda *args: None)
+    calls = []
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_mla_decode_fp8_blackwell",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+    library._run_mla_decode(
+        torch.zeros((2, heads, latent + rope), dtype=torch.bfloat16),
+        torch.empty((2, heads, latent), dtype=torch.bfloat16),
+        params,
+        torch.float8_e4m3fn,
+    )
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0][4], blocks[0, 2:, 0].T.to(torch.int32))
+    torch.testing.assert_close(calls[0][5], lengths[2:])
+    assert calls[0][14] is params.fwd.softmax_stats_tensor
