@@ -868,8 +868,8 @@ class PerfMetricsMiddleware:
         try:
             await self._app(scope, receive, send_metrics)
         finally:
-            # If the client disconnects after [DONE], Starlette cancels the
-            # StreamingResponse (ASGI spec < 2.4) before the final body reaches
-            # send_metrics. Records exist only for completed requests, so submit them
-            # anyway.
+            # A client that disconnects at [DONE] makes Starlette cancel the
+            # StreamingResponse when the server reports ASGI spec < 2.4 (uvicorn does).
+            # The final body then never reaches send_metrics. Records are appended only
+            # once generation has finished, so submitting them here is safe.
             submit_records_once()

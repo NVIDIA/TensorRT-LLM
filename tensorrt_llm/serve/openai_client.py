@@ -80,6 +80,7 @@ from tensorrt_llm.serve.router import Router
 # msgpack and flagged with the X-TRTLLM-Msgpack header.
 _msgpack_encoder = msgspec.msgpack.Encoder()
 MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+_SSE_DONE_EVENT = b"data: [DONE]\n\n"
 
 # A Responses stream opens with these events before the model emits anything.
 _RESPONSES_OPENING_EVENTS = frozenset((b"response.created", b"response.in_progress"))
@@ -710,7 +711,7 @@ class OpenAIHttpClient(OpenAIClient):
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
             "Response is not streaming"
         )
-        done_event = b"data: [DONE]\n\n"
+        # Also read by the except block below.
         pending = b""
         try:
             last_token_time = start_time
@@ -753,8 +754,9 @@ class OpenAIHttpClient(OpenAIClient):
                     pending = pending[:marker_index]
                 event_end = pending.rfind(event_delimiter)
                 if event_end >= 0:
-                    emit_size = event_end + len(event_delimiter)
-                    ready = pending[:emit_size].removesuffix(done_event)
+                    complete_end = event_end + len(event_delimiter)
+                    # Hold back [DONE]; it is forwarded after on_resp_done.
+                    ready = pending[:complete_end].removesuffix(_SSE_DONE_EVENT)
                     if ready:
                         yield ready
                         pending = pending[len(ready) :]
@@ -780,20 +782,22 @@ class OpenAIHttpClient(OpenAIClient):
 
             if hooks:
                 hooks.on_resp_done(server, request, None)
-            # pending still holds [DONE]. Forward it only after on_resp_done recorded
-            # the request: clients disconnect at [DONE], which cancels this generator.
+            # pending holds the held-back [DONE]. Clients disconnect at [DONE], and that
+            # cancels this generator, so forward it only after on_resp_done has recorded
+            # the request.
             if pending:
                 yield pending
             self._metrics_collector.complete_latency_seconds.observe(
                 get_steady_clock_now_in_seconds() - start_time
             )
-        except aiohttp.ClientError as e:
-            if pending.endswith(done_event):
-                # The request finished; only its trailing metrics event was cut off.
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            if pending.startswith(_SSE_DONE_EVENT):
+                # The upstream broke after [DONE], while its trailing metrics event was
+                # arriving. The client has every token, so end its stream normally.
+                # on_resp_done did not run, so this request is not recorded.
                 logger.warning(f"{self._role} client {server} error after [DONE]: {e}")
-                yield pending
+                yield _SSE_DONE_EVENT
                 return
-            # a client error is expected when the response stream is done if the connector has close=True
             logger.error(f"{self._role} client {server} error: {e}")
             raise
 

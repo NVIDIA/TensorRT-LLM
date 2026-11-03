@@ -408,8 +408,8 @@ async def test_disconnect_after_done_is_ignored():
 
 @pytest.mark.asyncio
 async def test_record_is_submitted_when_stream_is_cancelled_before_final_body():
-    # A client that stops reading at [DONE] disconnects. Starlette then cancels the
-    # StreamingResponse, absorbs the cancellation and returns without the final body.
+    # Starlette absorbs the cancellation, so the middleware only sees the app return
+    # without a final body. This app does the same.
     writer = Mock(spec=PerfMetricsJsonlWriter)
     record = _record()
 
