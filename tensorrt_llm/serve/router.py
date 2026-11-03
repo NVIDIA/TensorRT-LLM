@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import math
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
@@ -52,6 +54,27 @@ ROUTE_AFFINITY_HASH_SEED = b"TensorRT-LLM-route-affinity-v1!!"
 # Leading token-id count folded into the affinity key so pre-tokenized
 # requests (placeholder message content) still key per conversation.
 ROUTE_AFFINITY_TOKEN_PREFIX = 256
+
+# Held placement (LoadBalancingRouter ``max_inflight_per_server``): default
+# longest wait before a held request falls back to the least-loaded server.
+PLACEMENT_HOLD_TIMEOUT_DEFAULT_S = 300.0
+# Request IDs released before their placement arrived are remembered this long
+# (and at most this many) so the late placement is refused instead of leaking.
+PLACEMENT_EARLY_RELEASE_TTL_S = 600.0
+PLACEMENT_EARLY_RELEASE_MAX = 16384
+
+
+class HeldPlacementCancelled(ValueError):
+    """A held placement was released before a server freed up."""
+
+
+@dataclass
+class _HeldPlacement:
+    """One request waiting in the router for a server below the in-flight cap."""
+    exclude_server: Optional[str]
+    num_tokens: int
+    enqueued_at: float
+    future: asyncio.Future
 
 
 class ServerState:
@@ -92,6 +115,11 @@ class ServerState:
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
+
+    def adjust_load_nowait(self, num_requests: int, num_tokens: int) -> None:
+        """Adjust the load without awaiting, for callers that must not yield."""
+        self._num_active_requests += num_requests
+        self._num_active_tokens += num_tokens
 
     async def is_healthy(self) -> bool:
         try:
@@ -752,6 +780,21 @@ class RoundRobinRouter(Router):
 
 
 class LoadBalancingRouter(LoadBalancingMixin, Router):
+    """Join-shortest-queue router over requests (or prompt tokens).
+
+    With ``max_inflight_per_server`` set, a request is placed only on a server
+    with fewer than that many requests in flight. When every server is at the
+    cap the request is held in the router, first come first served, until a
+    finish frees a slot. It then goes to the server with the fewest requests
+    in flight; among equally busy servers, to the one whose oldest in-flight
+    request started last. A request held longer than ``hold_timeout_s``
+    falls back to the least-loaded server. Without the cap, placement is
+    immediate.
+
+    The held path never awaits while it changes routing state, so it does not
+    take ``self._lock``: each of its state changes is atomic with respect to
+    the event loop.
+    """
 
     def __init__(self,
                  server_role: ServerRole,
@@ -759,6 +802,8 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
                  metadata_server_cfg: MetadataServerConfig = None,
                  metadata_server: JsonDictionary = None,
                  use_tokens: bool = False,
+                 max_inflight_per_server: Optional[int] = None,
+                 hold_timeout_s: float = PLACEMENT_HOLD_TIMEOUT_DEFAULT_S,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -766,6 +811,48 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         # The coordinator path cannot retain the request object, so preserve its
         # token weight by disaggregated request ID until /finish arrives.
         self._coord_request_tokens: dict[int, int] = {}
+        if max_inflight_per_server is not None and (
+                isinstance(max_inflight_per_server, bool)
+                or not isinstance(max_inflight_per_server, int)
+                or max_inflight_per_server < 1):
+            raise ValueError("max_inflight_per_server must be a positive "
+                             f"integer, got {max_inflight_per_server!r}")
+        hold_timeout_s = float(hold_timeout_s)
+        if not hold_timeout_s > 0:
+            raise ValueError(
+                f"hold_timeout_s must be positive, got {hold_timeout_s}")
+        self._max_inflight_per_server = max_inflight_per_server
+        self._hold_timeout_s = hold_timeout_s
+        # Held requests in arrival order, keyed like _req_routing_table.
+        self._held: OrderedDict[int, _HeldPlacement] = OrderedDict()
+        # Token weight and start time of each placement made under the cap.
+        self._hold_tokens: dict[int, int] = {}
+        self._hold_started: dict[int, float] = {}
+        self._early_releases: OrderedDict[int, float] = OrderedDict()
+        self._hold_fallbacks = 0
+        self._hold_wait_lat = None
+        if max_inflight_per_server is not None:
+            from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
+            self._hold_wait_lat = PeriodicLatencyLogger(
+                f"router.hold_wait[{server_role}]")
+            logger.info(
+                f"LoadBalancingRouter[{server_role}]: holding requests while "
+                f"every server has >= {max_inflight_per_server} in flight "
+                f"(hold_timeout_s={hold_timeout_s})")
+
+    @property
+    def placement_hold_timeout_s(self) -> Optional[float]:
+        """Longest time a placement may wait, or None if it never waits."""
+        if self._max_inflight_per_server is None:
+            return None
+        return self._hold_timeout_s
+
+    @property
+    def num_held_requests(self) -> int:
+        return len(self._held)
+
+    def has_placement(self, key: int) -> bool:
+        return key in self._req_routing_table
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -773,12 +860,160 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
         self._server_state = new_state
+        if self._max_inflight_per_server is not None:
+            self._dispatch_held()
+
+    # ---- held placement (max_inflight_per_server) -------------------------------
+
+    def _hold_pick_server(self, exclude_server: Optional[str]) -> Optional[str]:
+        """Return a server below the in-flight cap, or None if all are full."""
+        cap = self._max_inflight_per_server
+        eligible = [
+            server for server in self._servers
+            if server != exclude_server and server in self._server_state
+            and self._server_state[server]._num_active_requests < cap
+        ]
+        if not eligible:
+            return None
+        oldest_start: dict[str, float] = {}
+        for key, started in self._hold_started.items():
+            server = self._req_routing_table.get(key)
+            if server is not None and started < oldest_start.get(
+                    server, math.inf):
+                oldest_start[server] = started
+        ranks = {
+            server:
+            (self._server_state[server]._num_active_requests,
+             -oldest_start.get(server, math.inf), self._get_server_load(server))
+            for server in eligible
+        }
+        best = min(ranks.values())
+        tied = [server for server in eligible if ranks[server] == best]
+        server = tied[self._rr_counter % len(tied)]
+        self._rr_counter += 1
+        return server
+
+    def _hold_commit(self, server: str, key: int, num_tokens: int) -> None:
+        if key in self._req_routing_table:
+            # A repeated placement for the same key replaces the old one.
+            self._hold_release(key, dispatch=False)
+        self._server_state[server].adjust_load_nowait(1, num_tokens)
+        self._req_routing_table[key] = server
+        self._hold_tokens[key] = num_tokens
+        self._hold_started[key] = time.monotonic()
+
+    def _hold_release(self, key: int, dispatch: bool = True) -> bool:
+        server = self._req_routing_table.pop(key, None)
+        num_tokens = self._hold_tokens.pop(key, 0)
+        self._hold_started.pop(key, None)
+        if server is None:
+            return False
+        if server in self._server_state:
+            self._server_state[server].adjust_load_nowait(-1, -num_tokens)
+        if dispatch:
+            self._dispatch_held()
+        return True
+
+    def _dispatch_held(self) -> None:
+        """Place held requests, oldest first, while servers have room."""
+        for key, waiter in list(self._held.items()):
+            if waiter.future.done():
+                del self._held[key]
+                continue
+            server = self._hold_pick_server(waiter.exclude_server)
+            if server is None:
+                continue
+            del self._held[key]
+            self._hold_commit(server, key, waiter.num_tokens)
+            waiter.future.set_result(server)
+
+    def _remember_early_release(self, key: int) -> None:
+        now = time.monotonic()
+        self._early_releases[key] = now
+        self._early_releases.move_to_end(key)
+        while self._early_releases and (
+                len(self._early_releases) > PLACEMENT_EARLY_RELEASE_MAX
+                or now - next(iter(self._early_releases.values()))
+                > PLACEMENT_EARLY_RELEASE_TTL_S):
+            self._early_releases.popitem(last=False)
+
+    async def _place_with_hold(self, key: int, exclude_server: Optional[str],
+                               num_tokens: int) -> str:
+        self._validate_servers_available()
+        previous = self._held.pop(key, None)
+        if previous is not None and not previous.future.done():
+            previous.future.set_exception(
+                HeldPlacementCancelled(
+                    f"held placement {key} superseded by a new placement"))
+        waiter = _HeldPlacement(
+            exclude_server=exclude_server,
+            num_tokens=num_tokens,
+            enqueued_at=time.monotonic(),
+            future=asyncio.get_running_loop().create_future())
+        self._held[key] = waiter
+        # Older held requests are served first; this one is placed now only if
+        # a server still has room after them.
+        self._dispatch_held()
+        if waiter.future.done():
+            return waiter.future.result()
+        try:
+            server = await asyncio.wait_for(asyncio.shield(waiter.future),
+                                            timeout=self._hold_timeout_s)
+        except asyncio.TimeoutError:
+            server = self._place_after_hold_timeout(key, waiter)
+        except asyncio.CancelledError:
+            self._abandon_held(key, waiter)
+            raise
+        self._hold_wait_lat.record(time.monotonic() - waiter.enqueued_at)
+        return server
+
+    def _place_after_hold_timeout(self, key: int,
+                                  waiter: _HeldPlacement) -> str:
+        if waiter.future.done():
+            # Placed or released in the same loop turn as the timeout.
+            return waiter.future.result()
+        if self._held.get(key) is waiter:
+            del self._held[key]
+        waiter.future.cancel()
+        server = self._select_least_loaded(waiter.exclude_server)
+        if server is None:
+            raise ValueError(f"No available servers after excluding "
+                             f"{waiter.exclude_server}")
+        self._hold_commit(server, key, waiter.num_tokens)
+        self._hold_fallbacks += 1
+        if self._hold_fallbacks == 1 or self._hold_fallbacks % 100 == 0:
+            logger.warning(
+                f"LoadBalancingRouter[{self._server_role}]: request held "
+                f"{self._hold_timeout_s}s without a server below "
+                f"max_inflight_per_server={self._max_inflight_per_server}; "
+                f"placed on least-loaded {server} "
+                f"(fallbacks={self._hold_fallbacks})")
+        return server
+
+    def _abandon_held(self, key: int, waiter: _HeldPlacement) -> None:
+        """Drop a held placement whose caller was cancelled."""
+        if self._held.get(key) is waiter:
+            del self._held[key]
+        future = waiter.future
+        if not future.done():
+            future.cancel()
+        elif (not future.cancelled() and future.exception() is None
+              and self._req_routing_table.get(key) == future.result()):
+            # A server was assigned just before the cancellation landed.
+            self._hold_release(key)
 
     async def get_next_server(self,
                               request: OpenAIRequest,
                               exclude_server: Optional[str] = None,
                               req_id: Optional[int] = None) -> tuple[str, dict]:
         del req_id
+        if self._max_inflight_per_server is not None:
+            num_tokens = (get_request_num_tokens(request)
+                          if self._use_tokens else 0)
+            server = await self._place_with_hold(id(request), exclude_server,
+                                                 num_tokens)
+            return server, {"server_info": self._server_info.get(server, {})}
+
         self._validate_servers_available()
 
         async with self._lock:
@@ -796,6 +1031,9 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
                              success: bool = True,
                              req_id: Optional[int] = None):
         del session, success, req_id
+        if self._max_inflight_per_server is not None:
+            self._hold_release(id(request))
+            return
         async with self._lock:
             await self._unregister_request(request)
 
@@ -816,8 +1054,17 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
         if req_id is None:
             raise ValueError(
                 "Load-balancing coordinator routing requires a request ID")
-        self._validate_servers_available()
         num_tokens = int((routing_key or {}).get("num_tokens", 0))
+        if self._max_inflight_per_server is not None:
+            if self._early_releases.pop(req_id, None) is not None:
+                raise HeldPlacementCancelled(
+                    f"request {req_id} was released before its placement")
+            server = await self._place_with_hold(req_id, exclude_server,
+                                                 num_tokens)
+            return server, {
+                "server_info": self._server_info.get(server, {})
+            }, req_id
+        self._validate_servers_available()
         async with self._lock:
             server = self._select_least_loaded(exclude_server)
             if server is None:
@@ -833,6 +1080,17 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
     async def finish_request_by_id(self, req_id, success=True):
         del success
         if req_id is None:
+            return
+        if self._max_inflight_per_server is not None:
+            waiter = self._held.pop(req_id, None)
+            if waiter is not None:
+                if not waiter.future.done():
+                    waiter.future.set_exception(
+                        HeldPlacementCancelled(
+                            f"request {req_id} was released while held"))
+                return
+            if not self._hold_release(req_id):
+                self._remember_early_release(req_id)
             return
         async with self._lock:
             server = self._req_routing_table.pop(req_id, None)
@@ -1823,12 +2081,30 @@ class CoordinatorDelegatingRouter(Router):
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
-        body = await self._post_select(payload)
+        hold_timeout_s = getattr(self._local, "placement_hold_timeout_s", None)
+        if hold_timeout_s is None:
+            body = await self._post_select(payload)
+        else:
+            # The coordinator may hold this placement for up to hold_timeout_s
+            # and then places it anyway, so wait that long plus the usual
+            # request timeout. A /select given up here is still held there
+            # (the coordinator handler is not cancelled by a disconnect), so
+            # release it explicitly.
+            try:
+                body = await self._post_select(payload,
+                                               timeout=hold_timeout_s +
+                                               self._request_timeout_s)
+            except (asyncio.CancelledError, asyncio.TimeoutError,
+                    aiohttp.ClientError):
+                self._enqueue_finish(payload["req_id"], False)
+                raise
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
 
-    async def _post_select(self, payload: dict) -> dict:
+    async def _post_select(self,
+                           payload: dict,
+                           timeout: Optional[float] = None) -> dict:
         """POST /select, retrying connection-level failures.
 
         A pooled connection the coordinator closed first fails instantly with
@@ -1841,13 +2117,14 @@ class CoordinatorDelegatingRouter(Router):
         is already overloaded, so retrying would only add load.
         """
         data = msgpack.packb(payload, use_bin_type=True)
+        if timeout is None:
+            timeout = self._request_timeout_s
         for attempt in range(1, COORDINATOR_SELECT_MAX_ATTEMPTS + 1):
             try:
-                async with self.session.post(
-                        f"{self._coordinator_url}/select",
-                        data=data,
-                        headers=_MSGPACK_HEADERS,
-                        timeout=self._request_timeout_s) as resp:
+                async with self.session.post(f"{self._coordinator_url}/select",
+                                             data=data,
+                                             headers=_MSGPACK_HEADERS,
+                                             timeout=timeout) as resp:
                     body = msgpack.unpackb(await resp.read(), raw=False)
                     if resp.status != 200:
                         raise ValueError(
@@ -1872,7 +2149,9 @@ class CoordinatorDelegatingRouter(Router):
         # request path. A fixed worker pool bounds tasks and connections during a
         # coordinator outage; overflow relies on coordinator-side expiration.
         del session
-        req_id = self._request_id(request, req_id)
+        self._enqueue_finish(self._request_id(request, req_id), success)
+
+    def _enqueue_finish(self, req_id: int, success: bool) -> None:
         self._ensure_finish_workers()
         try:
             self._finish_queue.put_nowait((req_id, success))

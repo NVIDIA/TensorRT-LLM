@@ -81,7 +81,9 @@ produces (it gives the canonical ``0x7FFF``), tested per 16-bit half, so a
 word whose two halves arrive in separate stores is not taken half-written.
 And a GEMM cannot read the arrival counter, so the buffer index is a launch
 argument the caller fixes per call site (layer ``l`` uses ``l mod 2``, see
-``PostAttnDirectWorkspace``).
+``PostAttnDirectWorkspace``). At TP4 a second direct transport with 32-row slots
+(``max_rows=WIDE_MAX_ROWS``) takes the 9..32-row calls the same way, on the 4-CTA split
+of the wide hop.
 
 What the direct transport needs from its users, and what checks it. The
 producer must store each output element once and never reduce through its
@@ -106,7 +108,7 @@ from typing import Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1170,7 +1172,8 @@ DIRECT_WATCHDOG_S = 10.0
 #:
 #: * ``(10, 3)``: cuBLAS's choice for the 8-row o_proj, ``[8, 1024] x [1024, 8192]`` BF16.
 #: * ``(10, 7)``: flashinfer's split-K and direct kernels, the o_proj kernels the dense GEMM
-#:   plan names there; cuBLAS's choice on this arch is not one.
+#:   plan names there (the split-K tactics of 9..32 rows on the wide direct transport
+#:   included, ``wide_dense_gemms``); cuBLAS's choice on this arch is not one.
 VALIDATED_PRODUCERS: Dict[Tuple[int, int], FrozenSet[str]] = {
     (10, 3): frozenset({"nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"}),
     (10, 7): frozenset(
@@ -1330,7 +1333,9 @@ if HAS_CUTE_DSL:
         rank's copy. Every slot of the local copy is polled, this rank's own (the
         multicast loopback) included, with the stale-only schedule: one read of every
         slot, then reads of only the slots that still hold a sentinel half, all issued
-        before any is tested. Then every slot is reset.
+        before any is tested. Then every slot is reset. ``max_rows`` is the row capacity
+        of the transport's slots (its slot stride): 8, or ``WIDE_MAX_ROWS`` for the wide
+        direct transport, whose calls of 9..32 rows run the boundary's 4-CTA split.
 
         PDL memory order: before ``griddepcontrol.wait`` the kernel touches shared
         memory and the cluster barrier only. The residual, the coefficients and the
@@ -1352,8 +1357,19 @@ if HAS_CUTE_DSL:
             early_trigger: bool,
             guard_ns: int,
             guard_break: bool,
+            max_rows: int = MAX_ROWS,
         ):
-            super().__init__(ranks, cluster, True, post_eps, pre_eps, norm_fp32, pdl, early_trigger)
+            super().__init__(
+                ranks,
+                cluster,
+                True,
+                post_eps,
+                pre_eps,
+                norm_fp32,
+                pdl,
+                early_trigger,
+                max_rows=max_rows,
+            )
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
 
@@ -1449,7 +1465,7 @@ if HAS_CUTE_DSL:
                 receive_address = receive.toint()
                 values = cute.make_rmem_tensor(cute.make_layout((self.ranks, 4)), Uint32)
                 for p in cutlass.range_constexpr(self.ranks):
-                    address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                    address = receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
                     v0, v1, v2, v3 = _poll_x4(
                         address, Uint32(1), Uint32(0), Uint32(0), Uint32(0), Uint32(0)
                     )
@@ -1468,7 +1484,9 @@ if HAS_CUTE_DSL:
                 while stale != Uint32(0):
                     polled = stale
                     for p in cutlass.range_constexpr(self.ranks):
-                        address = receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot
+                        address = (
+                            receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
+                        )
                         v0, v1, v2, v3 = _poll_x4(
                             address,
                             (polled >> Uint32(p)) & Uint32(1),
@@ -1498,7 +1516,9 @@ if HAS_CUTE_DSL:
                                     stale = Uint32(0)
                 # Retire every slot of this call before this grid can complete.
                 for p in cutlass.range_constexpr(self.ranks):
-                    _direct_reset_x4(receive_address + (buffer * MAX_RANKS + p) * SLAB_BYTES + slot)
+                    _direct_reset_x4(
+                        receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
+                    )
                 # Early trigger: past the last transport access (the hop's early-trigger placement).
                 if cutlass.const_expr(self.pdl and self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
@@ -1594,9 +1614,19 @@ if HAS_CUTE_DSL:
         early_trigger: bool,
         guard_ns: int,
         guard_break: bool,
+        max_rows: int = MAX_ROWS,
     ):
         kernel = _PostAttnConsumerKernel(
-            ranks, cluster, post_eps, pre_eps, norm_fp32, pdl, early_trigger, guard_ns, guard_break
+            ranks,
+            cluster,
+            post_eps,
+            pre_eps,
+            norm_fp32,
+            pdl,
+            early_trigger,
+            guard_ns,
+            guard_break,
+            max_rows,
         )
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1647,6 +1677,14 @@ class PostAttnDirectWorkspace:
     daemon thread reads it every ``watchdog_s`` seconds without waiting for the device and
     logs an error once it is set (0 = no thread). ``reset`` and ``check_producer`` are the
     collective recovery and the producer check (module docstring).
+
+    ``max_rows=WIDE_MAX_ROWS`` builds the wide direct transport (4 ranks only): the same
+    layout with slots of 32 rows, calls of ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows on the
+    boundary's 4-CTA split (``cluster_for_rows``). It is a separate allocation, so its calls
+    and the 8-row transport's interleave freely, and the buffer argument above holds per
+    transport. A producer of fewer rows than a slot holds stores only its own rows (the
+    flashinfer split-K epilogue predicates the M tail) and the consumer resets only those, so
+    calls of different row counts share the buffers.
     """
 
     def __init__(
@@ -1658,6 +1696,7 @@ class PostAttnDirectWorkspace:
         guard_ns: int = DIRECT_GUARD_NS,
         guard_break: bool = False,
         watchdog_s: float = DIRECT_WATCHDOG_S,
+        max_rows: int = MAX_ROWS,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -1674,6 +1713,16 @@ class PostAttnDirectWorkspace:
         self.guard_break = bool(guard_break)
         if self.ranks not in (4, MAX_RANKS):
             raise ValueError(f"the direct hop serves 4 or 8 ranks, got {self.ranks}")
+        if max_rows not in (MAX_ROWS, WIDE_MAX_ROWS) or (
+            max_rows == WIDE_MAX_ROWS and self.ranks != 4
+        ):
+            raise ValueError(
+                f"the direct hop's transport holds {MAX_ROWS} rows, or {WIDE_MAX_ROWS} at 4 "
+                f"ranks; got {max_rows} rows at {self.ranks} ranks"
+            )
+        self.max_rows = int(max_rows)
+        #: The row counts this transport's calls take.
+        self.min_rows = 1 if self.max_rows == MAX_ROWS else MAX_ROWS + 1
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         #: The device's compute capability, which selects ``check_producer``'s validated set.
         self.capability: Optional[Tuple[int, int]] = None
@@ -1687,13 +1736,14 @@ class PostAttnDirectWorkspace:
             if self.capability not in ((10, 3), (10, 7)):
                 raise RuntimeError("the direct hop runs on SM103 or SM107 only")
             use_fabric = mapping.is_multi_node()
-            self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, WORKSPACE_BYTES, mapping, use_fabric
-            )
-            words = WORKSPACE_BYTES // 4
+            nbytes = workspace_bytes(self.max_rows)
+            self._handle = _make_mnnvl_mcast_buffer(self._comm, nbytes, mapping, use_fabric)
+            words = nbytes // 4
             self._receive = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
-            self._slots = self._mc.view(torch.bfloat16).view(BUFFERS, MAX_RANKS, MAX_ROWS, HIDDEN)
+            self._slots = self._mc.view(torch.bfloat16).view(
+                BUFFERS, MAX_RANKS, self.max_rows, HIDDEN
+            )
             with torch.cuda.device(self.device):
                 self._receive.fill_(_DIRECT_SENTINEL_I32)
                 # Pinned host memory: the kernel's guard store reaches the host directly.
@@ -1718,16 +1768,22 @@ class PostAttnDirectWorkspace:
             ).start()
 
     def build_variants(self, variants: Sequence[Tuple[float, float, bool]]) -> None:
-        """Compile and load both splits of each ``(post_eps, pre_eps, norm_fp32)`` not built yet.
+        """Compile and load every split of each ``(post_eps, pre_eps, norm_fp32)`` not built yet.
 
-        Collective: either every rank of the group has them afterwards or every rank raises.
+        The splits some row count of this transport launches: 16 and 8 on the 8-row one, 4 on
+        the wide one. Collective: either every rank of the group has them afterwards or every
+        rank raises.
         """
         from tensorrt_llm._torch.distributed.ops import _mnnvl_workspace_all_succeeded
 
         error: Optional[BaseException] = None
         try:
+            clusters = sorted(
+                {cluster_for_rows(rows) for rows in range(self.min_rows, self.max_rows + 1)},
+                reverse=True,
+            )
             for post_eps, pre_eps, norm_fp32 in variants:
-                for cluster in (16, 8):
+                for cluster in clusters:
                     self._kernel(cluster, post_eps, pre_eps, norm_fp32)
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
@@ -1758,6 +1814,7 @@ class PostAttnDirectWorkspace:
             self.early_trigger,
             self.guard_ns,
             self.guard_break,
+            self.max_rows,
         )
         # A dry launch loads the module now, not inside a capture.
         dummy = self.control.data_ptr()
@@ -1772,8 +1829,9 @@ class PostAttnDirectWorkspace:
         """This rank's ``[rows, 8192]`` BF16 slot of buffer ``parity``, on the multicast address.
 
         Write-only: a store through it reaches every rank's copy; nothing may read it.
+        ``rows`` is a row count this transport's calls take (``min_rows .. max_rows``).
         """
-        if parity not in (0, 1) or not 1 <= rows <= MAX_ROWS:
+        if parity not in (0, 1) or not self.min_rows <= rows <= self.max_rows:
             raise ValueError(f"no slot for parity {parity}, {rows} rows")
         return self._slots[parity, self.rank, :rows]
 
@@ -1904,16 +1962,22 @@ def shared_direct_workspace(
     *,
     variants: Sequence[Tuple[float, float, bool]] = (),
     early_trigger: bool = False,
+    max_rows: int = MAX_ROWS,
 ) -> PostAttnDirectWorkspace:
-    """The one direct workspace of this group and trigger placement, built on first use.
+    """The one direct workspace of this group, trigger placement and row capacity, built on
+    first use.
 
     Collective, like the constructor; a later call gets the same workspace back, with any
-    variant it names built as well.
+    variant it names built as well. ``max_rows=WIDE_MAX_ROWS`` asks for the wide one.
     """
     key = (mapping, bool(early_trigger), _LAUNCH_PDL)
+    if max_rows != MAX_ROWS:
+        key = key + (int(max_rows),)
     workspace = _SHARED_DIRECT.get(key)
     if workspace is None:
-        workspace = PostAttnDirectWorkspace(mapping, variants=variants, early_trigger=early_trigger)
+        workspace = PostAttnDirectWorkspace(
+            mapping, variants=variants, early_trigger=early_trigger, max_rows=max_rows
+        )
         _SHARED_DIRECT[key] = workspace
     else:
         workspace.build_variants(variants)
@@ -1929,10 +1993,12 @@ def consumer_hop_supported(
     parity: int,
     workspace: PostAttnDirectWorkspace,
 ) -> bool:
-    """``hop_supported`` for the consumer: ``published`` must be ``workspace.slot(parity, rows)``."""
+    """``hop_supported`` for the consumer: ``published`` must be ``workspace.slot(parity, rows)``
+    for a row count the workspace's calls take (``min_rows .. max_rows``)."""
     rows = published.shape[0] if published.ndim == 2 else 0
     return (
-        hop_takes(published, residual, alpha, beta, next_weight)
+        workspace.min_rows <= rows
+        and hop_takes(published, residual, alpha, beta, next_weight, workspace.max_rows)
         and hop_layout_ok(residual, alpha, beta, next_weight)
         and parity in (0, 1)
         and published.data_ptr() == workspace.slot(parity, rows).data_ptr()
@@ -1950,17 +2016,66 @@ class PostAttnConsumerHop(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
+        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
+        Cell(why="K = 3 verify width", spec=dict(rows=4)),
+        Cell(why="K = 5 verify width", spec=dict(rows=6)),
+        Cell(why="K = 7 verify width, the one row count the target serves", spec=dict(rows=8)),
+        Cell(
+            why="the second buffer: odd layers publish into parity 1",
+            spec=dict(rows=8, parity=1),
+        ),
+        Cell(
+            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
+            spec=dict(rows=8, norm_fp32=True),
+        ),
+        Cell(
+            why="exact zeros and negative zeros published unchanged (0x80000000 is a payload here)",
+            spec=dict(rows=8, zeros=True),
+        ),
+        Cell(
+            why="cancelling partials: the FP32 rank-order sum differs from other orders",
+            spec=dict(rows=8, cancel=True),
+        ),
+        Cell(
+            why="wide direct transport, two requests at K = 7: the 4-CTA split",
+            spec=dict(rows=16, wide=True),
+        ),
+        Cell(
+            why="wide direct transport, three requests at K = 7, the second buffer",
+            spec=dict(rows=24, wide=True, parity=1),
+        ),
+        Cell(why="wide direct transport, four requests at K = 7", spec=dict(rows=32, wide=True)),
+        Cell(
+            why="wide direct transport, the FP32-residual prenorm ordering",
+            spec=dict(rows=32, wide=True, norm_fp32=True),
+        ),
+        Cell(
+            why="wide direct transport, exact zeros and negative zeros",
+            spec=dict(rows=24, wide=True, zeros=True),
+        ),
+        Cell(
+            why="wide direct transport, cancelling partials",
+            spec=dict(rows=32, wide=True, cancel=True),
+        ),
+    )
+
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
-    the row count the target serves directly (8 at K = 7), from the target's
-    attention-side residual join, after the layer's o_proj GEMM wrote its output
-    into ``published``; layer ``l`` uses parity ``l mod 2``.
+    the row counts the target serves directly (8 at K = 7; with
+    ``wide_oproj_publish`` also 16, 24 and 32 on the wide direct
+    transport at TP4), from the target's attention-side residual join, after the layer's
+    o_proj GEMM wrote its output into ``published``; layer ``l`` uses parity ``l mod 2``.
 
-    Bit-identical to ``post_attn_hop`` on the same partials, gated by its own
+    Bit-identical to ``post_attn_hop`` on the same partials (on the wide direct
+    transport: to ``post_attn_hop`` on its wide transport), gated by its own
     multi-GPU test (both outputs, every cell, a real cuBLAS o_proj as the
-    producer, graph replay with changing inputs, a delayed rank, a long burst,
-    a concurrent poller that records the first non-sentinel value of every
-    word). Ranks 4 and 8. The guard word turns a broken call sequence into a
+    producer and, on the wide transport, flashinfer's wide split-K o_proj tactics,
+    graph replay with changing inputs, a delayed rank, a long burst, calls of mixed
+    row counts on one wide buffer, a concurrent poller that records the first
+    non-sentinel value of every word). Ranks 4 and 8 (the wide transport at 4). The
+    guard word turns a broken call sequence into a
     flag instead of only a hang (tested with ``guard_break``), and the
     workspace's watchdog logs it while the poll still waits. A sequence broken
     between a producer and this op is cleared by the workspace's collective
@@ -1968,7 +2083,8 @@ class PostAttnConsumerHop(OpWrapper):
 
     Loud preconditions: `consumer_hop_supported` must hold. Not certified:
     producers that reduce through their output (split-K through global memory),
-    rows above 8, widths other than 8192; ``check_producer`` accepts only the device's
+    rows above 8 on the 8-row transport or above 32 on the wide one, the wide transport
+    at 8 ranks, widths other than 8192; ``check_producer`` accepts only the device's
     ``VALIDATED_PRODUCERS``.
     """
 
@@ -1989,7 +2105,8 @@ class PostAttnConsumerHop(OpWrapper):
             published, residual, alpha, beta, next_weight, parity, workspace
         ):
             raise ValueError(
-                "post_attn_consumer_hop takes this rank's [1..8, 8192] slot of buffer "
+                f"post_attn_consumer_hop takes this rank's [{workspace.min_rows}.."
+                f"{workspace.max_rows}, 8192] slot of buffer "
                 "`parity` of its workspace as `published`, an FP32 residual of the same "
                 "shape, FP32 alpha/beta and a BF16 weight of 8192, 16-byte aligned; got "
                 f"{published.dtype} {tuple(published.shape)} / {residual.dtype} "
@@ -2049,6 +2166,18 @@ def log_once_direct(
     )
 
 
+def log_once_wide_direct(
+    layers: int, rows: Sequence[int], kernels: str, prefetch_dropped: int = 0
+) -> None:
+    logger.info(
+        "[musespark_open] attention_output_into_hop: o_proj also publishes into the "
+        f"post-attention hop's {WIDE_MAX_ROWS}-row direct transport on the decode steps of "
+        f"{'/'.join(str(r) for r in rows)} rows, all {layers} layers (o_proj {kernels}; the "
+        "wide hop's own publication gone; the o_proj -> pool-weight prefetch dropped at those "
+        f"rows on {prefetch_dropped} layers)"
+    )
+
+
 def log_once_producer(name: str) -> None:
     logger.info(
         f"[musespark_open] attention_output_into_hop: the published o_proj captures {name}, a validated producer"
@@ -2066,6 +2195,39 @@ class PostAttnHop(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    # The decode step of this target at K = 7 carries 8 rows; K = 3 / 5 carry 4 / 6;
+    # one row is the no-speculation step and the only shape on the 16-CTA split.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="no speculation: one row, the 16-CTA cluster split", spec=dict(rows=1)),
+        Cell(why="two rows: the smallest 8-CTA split", spec=dict(rows=2)),
+        Cell(why="K = 3 verify width", spec=dict(rows=4)),
+        Cell(why="K = 5 verify width", spec=dict(rows=6)),
+        Cell(why="K = 7 verify width, the row count the target serves", spec=dict(rows=8)),
+        Cell(
+            why="the FP32-residual prenorm ordering (MUSESPARK_OPEN_PREQKV_NORM_FP32_RESIDUAL)",
+            spec=dict(rows=8, norm_fp32=True),
+        ),
+        Cell(
+            why="exact zeros and negative zeros in every rank's partial",
+            spec=dict(rows=8, zeros=True),
+        ),
+        Cell(
+            why="cancelling partials: the FP32 rank-order sum differs from other orders",
+            spec=dict(rows=8, cancel=True),
+        ),
+        Cell(
+            why="wide transport, two requests at K = 7: the 4-CTA split",
+            spec=dict(rows=16, wide=True),
+        ),
+        Cell(why="wide transport, the smallest wide call", spec=dict(rows=9, wide=True)),
+        Cell(why="wide transport, three requests at K = 7", spec=dict(rows=24, wide=True)),
+        Cell(why="wide transport, four requests at K = 7", spec=dict(rows=32, wide=True)),
+        Cell(
+            why="wide transport, cancelling partials",
+            spec=dict(rows=32, wide=True, cancel=True),
+        ),
+    )
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step

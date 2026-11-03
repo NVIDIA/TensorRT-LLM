@@ -69,6 +69,56 @@ from ...ops.spec.dflash_window_attention import (
 #: Operand dtypes the fused convolution takes; anything else runs the built-in.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
+
+# ---- The drafter preamble computed by the prepare (drafter_preamble_from_commit) ---------
+class DrafterPreamble:
+    """The integer tensors and the residual copy ``windowed_block_decode`` would derive itself.
+
+    Published by the verify fold's prepare (``verify_fold/fold.py``, ``_fold_preamble``)
+    right before the drafter forward, taken by that forward when its inputs are these very
+    tensors (identity), otherwise ignored: ``i32s`` = (``num_ctx.to(int32)``,
+    that ``+ block``, ``slots.to(int32)``, ``query_positions.reshape(-1).to(int32)``),
+    ``residual`` a copy of ``noise``'s bytes (or None).
+    """
+
+    __slots__ = ("num_ctx", "slots", "query_positions", "noise", "i32s", "residual")
+
+    def __init__(self, num_ctx, slots, query_positions, noise, i32s, residual):
+        self.num_ctx = num_ctx
+        self.slots = slots
+        self.query_positions = query_positions
+        self.noise = noise
+        self.i32s = i32s
+        self.residual = residual
+
+
+_PUBLISHED_PREAMBLE = None
+
+
+def publish_preamble(memo: DrafterPreamble) -> None:
+    global _PUBLISHED_PREAMBLE
+    _PUBLISHED_PREAMBLE = memo
+
+
+def _take_preamble(
+    noise_embedding, query_positions, num_ctx_per_req, ctx_cache_batch_idx, B, block_size
+):
+    """The published preamble when this forward's inputs are its tensors, else None; consumed either way."""
+    global _PUBLISHED_PREAMBLE
+    memo, _PUBLISHED_PREAMBLE = _PUBLISHED_PREAMBLE, None
+    if (
+        memo is None
+        or memo.noise is not noise_embedding
+        or memo.query_positions is not query_positions
+        or memo.num_ctx is not num_ctx_per_req
+        or memo.slots is not ctx_cache_batch_idx
+        or num_ctx_per_req.shape[0] != B
+        or query_positions.numel() != B * block_size
+    ):
+        return None
+    return memo
+
+
 #: Block rows on which the PDL chain's conv / merge entry triggers apply when the chain's
 #: install did not record their widths (``_pdl_entry_rows`` / ``_pdl_merge_rows``,
 #: ``chain.entry_rows`` / ``chain.MERGE_ENTRY_ROWS_BY_SM``): one request of K + 1 = 8 rows, whose
@@ -311,10 +361,18 @@ def windowed_block_decode(
     block_size = noise_embedding.shape[1]
     hidden_states = noise_embedding
 
-    cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
-    cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
-    seq_lens_after = cache_seqlens_i32 + block_size
-    query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
+    preamble = _take_preamble(
+        noise_embedding, query_positions, num_ctx_per_req, ctx_cache_batch_idx, B, block_size
+    )
+    if preamble is not None:
+        cache_seqlens_i32, seq_lens_after, cache_batch_idx_i32, query_positions_flat_i32 = (
+            preamble.i32s
+        )
+    else:
+        cache_seqlens_i32 = num_ctx_per_req[:B].to(torch.int32)
+        cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
+        seq_lens_after = cache_seqlens_i32 + block_size
+        query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
 
     residual = None
     has_block_conv = self.has_block_conv
@@ -344,11 +402,15 @@ def windowed_block_decode(
             # The previous layer's hop already applied this layer's input norm.
             hs_normed_flat = prenormed
         elif residual is None:
-            residual = (
-                hidden_states.clone(memory_format=torch.contiguous_format)
-                if hops is not None
-                else hidden_states.clone()
-            )
+            if preamble is not None and preamble.residual is not None:
+                # The noise gather's second output, the same bytes as the clone.
+                residual = preamble.residual
+            else:
+                residual = (
+                    hidden_states.clone(memory_format=torch.contiguous_format)
+                    if hops is not None
+                    else hidden_states.clone()
+                )
             hs_normed_flat = layer.input_layernorm(hs_flat)
         else:
             res_flat = residual.reshape(-1, residual.shape[-1])

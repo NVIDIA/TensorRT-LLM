@@ -3069,6 +3069,8 @@ def _index_mapper_capacity_for(
     is_disagg: bool = False,
     num_reserved_index_slots: int = 1,
     disable_overlap_scheduler: bool = True,
+    prefetch_requests: str = "",
+    prioritize_first_token: str = "",
 ) -> tuple[int, int, int]:
     """Construct a manager and return the three sizes it derives.
 
@@ -3079,6 +3081,11 @@ def _index_mapper_capacity_for(
     would be an out-of-bounds write. The third is the published admission bound
     that ``validate_seq_slot_pool_covers_admission`` checks the seat pool against
     at startup, and it is the capacity minus the reserved dummy slots.
+
+    ``prefetch_requests`` and ``prioritize_first_token`` are the values of
+    ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS`` and
+    ``TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN`` during construction; both are
+    pinned (unset by default) so an exported value cannot change the result.
     """
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     fake_impl = Mock()
@@ -3102,7 +3109,12 @@ def _index_mapper_capacity_for(
         # Pin both diagnostics off: the guard page would add an index slot.
         patch.dict(
             os.environ,
-            {"TRTLLM_KV_GUARD_PAGE": "", "TRTLLM_KV_FRESH_PAGE_FILL": ""},
+            {
+                "TRTLLM_KV_GUARD_PAGE": "",
+                "TRTLLM_KV_FRESH_PAGE_FILL": "",
+                "TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS": prefetch_requests,
+                "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN": prioritize_first_token,
+            },
         ),
         patch(f"{module}.IndexMapper") as index_mapper_cls,
         patch(f"{module}.KVCacheManagerPy", Mock(return_value=fake_impl)),
@@ -3188,6 +3200,57 @@ def test_index_mapper_capacity_covers_the_overlapping_cohorts(
     assert capacity == expected
     assert page_table_capacity == expected
     assert max_admissible_sequences == expected - reserved
+
+
+# (max_batch_size, pp_size, disable_overlap_scheduler, is_disagg, prefetch,
+#  prioritize_first_token, expected capacity) with one reserved slot.
+#
+# TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS=N adds N leases on top of the formula
+# above, for a non-PP disaggregated manager only.
+_PREFETCH_INDEX_MAPPER_CAPACITY_CASES = [
+    pytest.param(2, 1, False, True, "1", "", 6, id="disagg_overlap_on_n1"),
+    pytest.param(2, 1, True, True, "2", "", 7, id="disagg_overlap_off_n2"),
+    pytest.param(1, 1, False, True, "1", "", 4, id="disagg_b1_n1"),
+    pytest.param(2, 1, False, True, "0", "", 5, id="disagg_n0_unchanged"),
+    pytest.param(2, 1, False, False, "1", "", 5, id="aggregated_unchanged"),
+    pytest.param(2, 4, True, True, "1", "", 17, id="pp4_disagg_unchanged"),
+    # The scheduler option that lets a first-token request go ahead of a
+    # running decode turns prefetch off, here as in the seat pool.
+    pytest.param(2, 1, False, True, "1", "1", 5, id="prioritize_first_token_unchanged"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "max_batch_size,pp_size,disable_overlap_scheduler,is_disagg,prefetch,prioritize,expected",
+    _PREFETCH_INDEX_MAPPER_CAPACITY_CASES,
+)
+def test_index_mapper_capacity_adds_the_disagg_gen_prefetch_leases(
+    max_batch_size: int,
+    pp_size: int,
+    disable_overlap_scheduler: bool,
+    is_disagg: bool,
+    prefetch: str,
+    prioritize: str,
+    expected: int,
+) -> None:
+    capacity, page_table_capacity, max_admissible_sequences = _index_mapper_capacity_for(
+        max_batch_size=max_batch_size,
+        pp_size=pp_size,
+        is_disagg=is_disagg,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        prefetch_requests=prefetch,
+        prioritize_first_token=prioritize,
+    )
+    assert capacity == expected
+    assert page_table_capacity == expected
+    assert max_admissible_sequences == expected - 1
+
+
+@pytest.mark.cpu_only
+def test_index_mapper_rejects_an_invalid_prefetch_setting() -> None:
+    with pytest.raises(ValueError, match="TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS"):
+        _index_mapper_capacity_for(max_batch_size=2, is_disagg=True, prefetch_requests="-1")
 
 
 @pytest.mark.parametrize(

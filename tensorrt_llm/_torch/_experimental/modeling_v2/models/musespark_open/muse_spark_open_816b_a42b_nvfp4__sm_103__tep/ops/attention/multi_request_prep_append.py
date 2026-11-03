@@ -63,7 +63,9 @@ grid (``PACKED_GEOMETRY``), each item running the per-head code of a
 one-program-per-(row, head) grid element for element (the same loads, the same
 additions in the same order, the same rounding points and stores), so the bytes
 written do not depend on the geometry. On sm107 the grid is one program per
-(row, head), one warp each (``_multi_request_prep_append_grid_kernel``).
+(row, head), one warp each (``_multi_request_prep_append_grid_kernel``); a call of
+``packed_min_rows`` rows or more (``packed_prep_append``'s MIN_ROWS) takes the
+packed kernel above on either.
 """
 
 from __future__ import annotations
@@ -411,8 +413,10 @@ def _sm_of(index: int) -> int:
     return 10 * major + minor
 
 
-def launch_kind(device: torch.device) -> str:
-    """``LAUNCH_KIND_BY_SM`` for ``device``.
+def launch_kind(device: torch.device, rows: int = 0, packed_min_rows: Optional[int] = None) -> str:
+    """``LAUNCH_KIND_BY_SM`` for ``device``, or ``"packed"`` for a call of at least
+    ``packed_min_rows`` rows (None: never). The packed kernel on ``PACKED_GEOMETRY`` writes
+    the grid kernel's bytes.
 
     Raises:
         ValueError: on a device ``LAUNCH_KIND_BY_SM`` does not list.
@@ -424,6 +428,8 @@ def launch_kind(device: torch.device) -> str:
             f"multi_request_prep_append: no launch for sm{sm} "
             f"(supported: {sorted(LAUNCH_KIND_BY_SM)})"
         )
+    if packed_min_rows is not None and rows >= packed_min_rows:
+        return "packed"
     return kind
 
 
@@ -661,7 +667,7 @@ class MultiRequestPrepAppend(OpWrapper):
     the target then skips. Grid on sm103: the rows * (H + G) (row, head) items in
     row-major order, PACKED_GEOMETRY's items, warps and lanes per program by row count
     (with a prefetch, one program per item); on sm107: (rows, H + G), one warp per
-    program.
+    program, up to 32 rows, and the sm103 grid above.
 
     Bit-identical, gated by its own tests: qkv_out and gate_out against
     preattn_prep; the cache bytes, the E4M3 query bytes, both scale words and
@@ -708,6 +714,7 @@ class MultiRequestPrepAppend(OpWrapper):
         o_scale: float = 1.0,
         enable_pdl: bool = False,
         prefetch: Optional[torch.Tensor] = None,
+        packed_min_rows: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = qkv.shape
         page = kv_pool.shape[2] if kv_pool.dim() == 4 else 0
@@ -770,7 +777,7 @@ class MultiRequestPrepAppend(OpWrapper):
             raise ValueError("multi_request_prep_append: position_ids without a cos/sin table")
         heads = num_q_heads + num_kv_heads
         num_items = rows * heads
-        kind = launch_kind(qkv.device)
+        kind = launch_kind(qkv.device, rows, packed_min_rows)
         pf_base, pf_bytes, pf_chunk = 0, 0, 16
         programs_at_least = 0
         if prefetch is not None:
@@ -916,6 +923,7 @@ class MultiRequestPrepAppend(OpWrapper):
         o_scale: float = 1.0,
         enable_pdl: bool = False,
         prefetch: Optional[torch.Tensor] = None,
+        packed_min_rows: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``preattn_prep.reference`` (float64 between its rounding points), then the same
         in-place writes from its BF16 values.
@@ -997,6 +1005,7 @@ class MultiRequestPrepAppend(OpWrapper):
         o_scale: float = 1.0,
         enable_pdl: bool = False,
         prefetch: Optional[torch.Tensor] = None,
+        packed_min_rows: Optional[int] = None,
     ) -> None:
         """Inputs the kernel takes and answers wrongly, with no error.
 

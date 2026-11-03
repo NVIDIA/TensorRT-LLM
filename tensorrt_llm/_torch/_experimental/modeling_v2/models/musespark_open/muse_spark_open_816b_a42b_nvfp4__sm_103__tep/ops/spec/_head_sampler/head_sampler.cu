@@ -321,6 +321,108 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
     gridDependencyTrigger();
 }
 
+// ---- Cooperative kernel A (head_sampler_coop_fold) ----------------------------------------
+//! Kernel A on a plain BF16 row with the cap computed by every thread of the CTA.
+//!
+//! Grid (numRows, kSplitBlock / VTS); block THREADS >= VTS. The CTA owns virtual threads
+//! vt0 .. vt0 + VTS - 1 (vt0 = blockIdx.y * VTS), i.e. the vectors v = vt0 + t + 1024 j.
+//! Phase 1: all THREADS threads read those vectors (coalesced: VTS consecutive vectors per
+//! j) and store each element's `__fmul_rn(capOf(logit), tempInv)` -- the value kernel A
+//! hands to combineOnlineSoftmax -- in shared memory at [j][t]. Phase 2: thread t < VTS
+//! folds its vectors j = 0, 1, ... in increasing j, each vector's 4 elements in order,
+//! with the same combineOnlineSoftmax calls as splitFoldKernel. Every state is
+//! splitFoldKernel's bit for bit: the same function of the same inputs in the same order;
+//! only who computes the (pure, per-element) cap and where it waits changes.
+//!
+//! PDL: waits on its predecessor before its first global read; with EARLY_TRIGGER it
+//! releases its dependent (kernel B, which itself waits for this grid's completion before
+//! reading the states) right after that wait, so kernel B's launch overlaps this kernel.
+template <int VTS, int THREADS, bool EARLY_TRIGGER>
+__global__ void __launch_bounds__(THREADS) splitFoldCoopKernel(SplitFoldParams p)
+{
+    static_assert(THREADS >= VTS && THREADS % VTS == 0 && kSplitBlock % VTS == 0, "CTA shape");
+    extern __shared__ float4 sCapped[];
+    gridDependencyWait();
+    if constexpr (EARLY_TRIGGER)
+    {
+        gridDependencyTrigger();
+    }
+    int const row = blockIdx.x;
+    int const vt0 = blockIdx.y * VTS;
+    int const vecCount = p.fs.vocabSize / 4;
+    float const tempInv = loadRowParams(p.fs, row).tempInv;
+    uint2 const* plainRow = p.plain + static_cast<size_t>(row) * vecCount;
+    // Vectors of the CTA's first virtual thread: the most any of its threads folds.
+    int const steps = vecCount > vt0 ? (vecCount - vt0 + kSplitBlock - 1) / kSplitBlock : 0;
+    for (int i = threadIdx.x; i < steps * VTS; i += THREADS)
+    {
+        int const j = i / VTS;
+        int const v = vt0 + (i - j * VTS) + j * kSplitBlock;
+        if (v < vecCount)
+        {
+            uint2 const packed = __ldg(plainRow + v);
+            __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+            float4 x;
+            x.x = __fmul_rn(capOf(__bfloat162float(elems[0]), p.cap), tempInv);
+            x.y = __fmul_rn(capOf(__bfloat162float(elems[1]), p.cap), tempInv);
+            x.z = __fmul_rn(capOf(__bfloat162float(elems[2]), p.cap), tempInv);
+            x.w = __fmul_rn(capOf(__bfloat162float(elems[3]), p.cap), tempInv);
+            sCapped[i] = x;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < VTS)
+    {
+        // combineOnlineSoftmax(st, {x, 1, i}) in two passes over the thread's own slots.
+        // Pass 1 carries only the running max (and argmax): `keep = st.max >= x` picks the
+        // branch, and the branch's weight __expf(x - st.max) (keep) or __expf(st.max - x)
+        // depends on the max before the element only, so it is computed here, off the sum's
+        // chain, and stored over x with the branch in its sign bit (the weight is >= 0 or
+        // NaN; negation flips only the sign bit). Pass 2 runs the sum's chain alone:
+        // keep: st.sum + 1.0f * w; otherwise 1.0f + st.sum * w -- the two statements of
+        // combineOnlineSoftmax with b.sum = 1, in the same order.
+        int const vt = vt0 + threadIdx.x;
+        int const mine = vecCount > vt ? (vecCount - vt + kSplitBlock - 1) / kSplitBlock : 0;
+        float runMax = -FLT_MAX;
+        int runArg = 0;
+        for (int j = 0; j < mine; ++j)
+        {
+            int const base = (vt + j * kSplitBlock) * 4;
+            float4 x = sCapped[j * VTS + threadIdx.x];
+            float* xs = reinterpret_cast<float*>(&x);
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                bool const keep = runMax >= xs[e];
+                float const w = keep ? __expf(xs[e] - runMax) : __expf(runMax - xs[e]);
+                runArg = keep ? runArg : base + e;
+                runMax = keep ? runMax : xs[e];
+                xs[e] = keep ? w : -w;
+            }
+            sCapped[j * VTS + threadIdx.x] = x;
+        }
+        float runSum = 0.0f;
+        for (int j = 0; j < mine; ++j)
+        {
+            float4 const x = sCapped[j * VTS + threadIdx.x];
+            float const xs[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                bool const keep = (__float_as_uint(xs[e]) >> 31) == 0u;
+                float const w = fabsf(xs[e]);
+                runSum = keep ? runSum + 1.0f * w : 1.0f + runSum * w;
+            }
+        }
+        p.states[static_cast<size_t>(row) * kSplitBlock + vt] = OnlineSoftmax{runMax, runSum, runArg};
+    }
+    if constexpr (!EARLY_TRIGGER)
+    {
+        __syncthreads();
+        gridDependencyTrigger();
+    }
+}
+
 //! Kernel B: one VB-thread CTA per row (VB = splitVirtualBlock(numRows), the shipped
 //! block of the call). `params.logits` is the BF16 row (gathered or not); the soft cap is
 //! applied on every read.
@@ -1277,6 +1379,88 @@ void foldPlain(at::Tensor const& logits, at::Tensor const& temperatures, at::Ten
     launchFold<false, true>(p, threads, pdl);
 }
 
+// ---- Cooperative kernel A launch (head_sampler_coop_fold) ---------------------------------
+template <int VTS, int THREADS, bool EARLY>
+void launchFoldCoopShape(fs::SplitFoldParams const& p, bool pdl)
+{
+    auto kernel = fs::splitFoldCoopKernel<VTS, THREADS, EARLY>;
+    int const vecCount = p.fs.vocabSize / 4;
+    size_t const smem = static_cast<size_t>((vecCount + fs::kSplitBlock - 1) / fs::kSplitBlock) * VTS * sizeof(float4);
+    // Raised once per instantiation to the widest row this op admits (the walk's limit).
+    static bool const raised = []
+    {
+        size_t const most = static_cast<size_t>(fs::kSplitWalkVectors) * VTS * sizeof(float4);
+        C10_CUDA_CHECK(cudaFuncSetAttribute(fs::splitFoldCoopKernel<VTS, THREADS, EARLY>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(most)));
+        return true;
+    }();
+    (void) raised;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(p.fs.numRows, fs::kSplitBlock / VTS);
+    config.blockDim = dim3(THREADS);
+    config.dynamicSmemBytes = smem;
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, p));
+}
+
+template <bool EARLY>
+void launchFoldCoop(fs::SplitFoldParams const& p, int64_t vts, int64_t threads, bool pdl)
+{
+#define FOLD_COOP_SHAPE(V, T)                                                                                          \
+    if (vts == V && threads == T)                                                                                      \
+    {                                                                                                                  \
+        launchFoldCoopShape<V, T, EARLY>(p, pdl);                                                                      \
+        return;                                                                                                        \
+    }
+    FOLD_COOP_SHAPE(128, 1024)
+    FOLD_COOP_SHAPE(128, 512)
+    FOLD_COOP_SHAPE(64, 1024)
+    FOLD_COOP_SHAPE(64, 512)
+    FOLD_COOP_SHAPE(64, 256)
+    FOLD_COOP_SHAPE(32, 512)
+    FOLD_COOP_SHAPE(32, 256)
+#undef FOLD_COOP_SHAPE
+    TORCH_CHECK(
+        false, "cooperative kernel A: unsupported (virtual threads per CTA, threads) = (", vts, ", ", threads, ")");
+}
+
+//! Cooperative kernel A on a plain BF16 row: the states of foldPlain, bit for bit.
+void foldPlainCoop(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& states,
+    double multiplier, double invCap, double cap, int64_t vts, int64_t threads, bool earlyTrigger, bool pdl)
+{
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
+    at::cuda::CUDAGuard guard(logits.device());
+    fs::SplitFoldParams p;
+    TORCH_CHECK(logits.dim() == 2 && logits.is_contiguous() && logits.size(1) % 4 == 0, "logits [rows, vocab]");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(logits.data_ptr()) % 8 == 0, "logits must be 8-byte aligned");
+    TORCH_CHECK(logits.size(1) / 4 <= fs::kSplitWalkVectors * fs::kSplitBlock, "vocabulary too wide");
+    // The cooperative kernel writes the states of the kSplitBlock virtual block; calls above
+    // kWideBlockMaxRows rows take the narrow block (splitVirtualBlock) and run foldPlain.
+    TORCH_CHECK(fs::splitVirtualBlock(static_cast<int>(logits.size(0))) == fs::kSplitBlock,
+        "cooperative kernel A takes at most ", fs::kWideBlockMaxRows, " rows");
+    checkRowVector(temperatures, "temperatures", at::kFloat, logits.size(0));
+    checkStates(states, logits.size(0));
+    p.fs.temperatures = temperatures.data_ptr<float>();
+    p.fs.numRows = static_cast<int32_t>(logits.size(0));
+    p.fs.vocabSize = static_cast<int32_t>(logits.size(1));
+    p.plain = reinterpret_cast<uint2 const*>(logits.data_ptr());
+    p.cap = softCap(multiplier, invCap, cap);
+    p.states = reinterpret_cast<fs::OnlineSoftmax*>(states.data_ptr());
+    if (earlyTrigger)
+    {
+        launchFoldCoop<true>(p, vts, threads, pdl);
+    }
+    else
+    {
+        launchFoldCoop<false>(p, vts, threads, pdl);
+    }
+}
+
 //! Kernel A with the gather: poll this rank's inbox copy, write `gathered`, reset the
 //! inbox; fold too when `fold`.
 void foldGather(at::Tensor const& inbox, at::Tensor const& gathered, at::Tensor const& temperatures,
@@ -1602,6 +1786,9 @@ TORCH_LIBRARY(musespark_open_head_sampler, m)
     m.def(
         "draw(Tensor logits, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, Tensor? seed, "
         "Tensor? offset, Tensor states, float multiplier, float inv_cap, float cap, bool pdl) -> Tensor");
+    m.def(
+        "fold_plain_coop(Tensor logits, Tensor temperatures, Tensor(a!) states, float multiplier, float inv_cap, "
+        "float cap, int vts, int threads, bool early_trigger, bool pdl) -> ()");
     m.def("ref_fold(Tensor capped, Tensor temperatures, Tensor(a!) states) -> ()");
     m.def("cap(Tensor x, float multiplier, float inv_cap, float cap) -> Tensor");
     m.def("watch(Tensor buf, Tensor(a!) first_seen, int blocks, int timeout_ms) -> ()");
@@ -1629,6 +1816,7 @@ TORCH_LIBRARY_IMPL(musespark_open_head_sampler, CUDA, m)
     m.impl("fold_plain", &foldPlain);
     m.impl("fold_gather", &foldGather);
     m.impl("draw", &draw);
+    m.impl("fold_plain_coop", &foldPlainCoop);
     m.impl("ref_fold", &refFold);
     m.impl("cap", &capRows);
     m.impl("watch", &watch);

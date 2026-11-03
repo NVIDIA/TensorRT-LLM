@@ -32,6 +32,19 @@ columns of the built-in projection by a GEMM of the slice's shape, so they may
 differ from the replicated GEMM's in FP32 summation order (each output one BF16
 rounding of its full-K FP32 dot product either way).
 
+Two levers, given to ``install`` by the plan (the same on every rank):
+
+* ``wide_router_per_row``: the router shard of these steps is
+  ``router_shard_rows``, which gives each row its one-request logits (those the built-in
+  router gives the row when its request decodes alone) in one launch without the split-K
+  reduce. Those are other bits than the built-in 16..32-row launch's, so the routing of
+  a wide step may differ from the built-in path's.
+* ``wide_direct_transports``: ``pool_into_route`` and ``unpool_into_boundary`` also build their
+  wide direct transports (the pool and unpool GEMMs and the router shard publish into
+  the routed kernel's and the boundary's transports on 16..32-row CUDA-graph steps, and on
+  a half-window layer the routed kernel places). Same bits as the tagged wide path given
+  the same router logits.
+
 Every rank takes the same path at every call: the choice reads shapes, dtypes,
 contiguity and construction-time state only.
 """
@@ -79,12 +92,13 @@ def refusal(model: MuseSparkOpenModel):
     return None
 
 
-def install(model: MuseSparkOpenModel) -> int:
+def install(model: MuseSparkOpenModel, router_rows: bool = False, direct: bool = False) -> int:
     """Build the wide route and unpool inboxes and hand them to every layer.
 
     Called after ``moe_prologue.install`` and ``install_router_fork``. The refusal is
     agreed over the TP group before the inboxes (fabric memory, collective) are built.
-    Returns the number of layers installed.
+    ``router_rows`` (``wide_router_per_row``) and ``direct`` (``wide_direct_transports``)
+    are the plan's levers. Returns the number of layers installed.
 
     Raises:
         ValueError: on every rank alike, naming the refusal.
@@ -100,15 +114,24 @@ def install(model: MuseSparkOpenModel) -> int:
     unpool_inbox = ProjectionInbox(
         mapping, row_words=_unpool.local_columns(WORLD) // 2, max_rows=WIDE_MAX_ROWS
     )
+    router_rows, direct = bool(router_rows), bool(direct)
     for layer in layers:
         moe = layer.feed_forward
         moe._wide_inbox = route_inbox
         moe._defer_max_rows = WIDE_MAX_ROWS
+        moe._wide_router_rows = router_rows
+        moe._wide_direct = direct
         layer.add_ffn._gather_inbox_wide = unpool_inbox
+    router = (
+        "router_shard_rows, each row's one-request bits"
+        if router_rows
+        else "router_shard_wide, the built-in bits"
+    )
     logger.info(
         f"[musespark_open] wide_prologue: TP{WORLD} sharded MoE prologue (router shard of "
-        f"{_shard.local_experts(WORLD)} experts, routing in the pool kernel) and fused unpool "
-        f"gather on decode steps of {_shard.WIDE_MIN_ROWS}..{_shard.WIDE_MAX_ROWS} rows "
-        f"on all {len(layers)} layers"
+        f"{_shard.local_experts(WORLD)} experts ({router}), routing in the pool kernel) and fused "
+        f"unpool gather on decode steps of {_shard.WIDE_MIN_ROWS}..{_shard.WIDE_MAX_ROWS} rows "
+        f"on all {len(layers)} layers; wide direct transports "
+        f"{'on' if direct else 'off'} (wide_direct_transports)"
     )
     return len(layers)

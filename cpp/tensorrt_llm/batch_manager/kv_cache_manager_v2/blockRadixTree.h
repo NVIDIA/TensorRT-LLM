@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -348,6 +349,54 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// BlockKeyChainMemo — exact memo of recent block-key chains (opt-in:
+// TLLM_KV_CACHE_MANAGER_V2_KEY_CHAIN_MEMO=1, read once per process).
+//
+// A block key depends only on the reuse scope and the tokens up to the end of that block, so the
+// chain of a prompt is the same in every radix walk of that prompt. One admission walks it
+// several times (shortest-prefill-first probe, first-new-block probe, cache creation), each time
+// paying one SHA-256 per block. The memo keeps the full-block keys of the last few walked
+// sequences together with a copy of their tokens; a later walk reuses the keys of its longest
+// token-for-token equal prefix and hashes only the rest. Only digest-free (plain id) token
+// sequences are memoised, so equal token bits mean equal content. Thread-safe: probes walk the
+// tree concurrently under the manager's shared lock.
+// ---------------------------------------------------------------------------
+[[nodiscard]] bool keyChainMemoEnabled() noexcept;
+
+class BlockKeyChainMemo
+{
+public:
+    struct Entry
+    {
+        BlockKey rootKey;
+        std::vector<uint32_t> tokenBits; // exactly keys.size() full blocks
+        std::vector<BlockKey> keys;
+    };
+
+    struct Hit
+    {
+        std::shared_ptr<Entry const> entry;
+        size_t numBlocks = 0; // leading full blocks whose keys entry->keys supplies
+    };
+
+    explicit BlockKeyChainMemo(int tokensPerBlock, size_t capacity = 32);
+
+    //! The entry sharing the longest prefix of full blocks with `tokens` (digest-free) under
+    //! `rootKey`. numBlocks is 0 when nothing matches.
+    [[nodiscard]] Hit find(BlockKey const& rootKey, TokenIdExt const* tokens, size_t numFullBlocks) const;
+
+    //! Record the chain of `tokens`: the hit's leading keys followed by `newKeys`, the keys of the
+    //! next full blocks. A no-op when there is nothing new.
+    void remember(BlockKey const& rootKey, TokenIdExt const* tokens, Hit const& hit, std::vector<BlockKey> newKeys);
+
+private:
+    size_t mTokensPerBlock;
+    size_t mCapacity;
+    mutable std::mutex mMutex;
+    std::vector<std::shared_ptr<Entry const>> mEntries; // least recently recorded first
+};
+
+// ---------------------------------------------------------------------------
 // BlockRadixTree — the global cache index.
 // next: reuseScope digest → RootBlock.
 // Mirrors Python's BlockRadixTree.
@@ -433,6 +482,9 @@ private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
+    // matchTokenPath for a digest-free sequence, with block keys taken from / recorded in mKeyChainMemo.
+    std::vector<MatchResult> matchTokenPathMemo(
+        ReuseScope const& reuseScope, TokenSpan tokens, bool enablePartialMatch) const;
     // Shorten `matched` to the prefix that is actually reusable. Passing
     // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
     // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
@@ -448,6 +500,8 @@ private:
 
     std::unordered_map<BlockKey, SharedPtr<RootBlock>> mRoots;
     mutable std::vector<BlockKey> mPendingRootErases;
+    // Pure function of (scope, tokens), so it never goes stale as the tree changes.
+    mutable BlockKeyChainMemo mKeyChainMemo;
 };
 
 // ---------------------------------------------------------------------------

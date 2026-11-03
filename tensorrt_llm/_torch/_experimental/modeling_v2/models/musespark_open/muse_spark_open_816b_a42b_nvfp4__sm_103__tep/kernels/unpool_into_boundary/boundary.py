@@ -34,8 +34,15 @@ What this module does:
   last fused layer takes buffer 2, so the next step's first call never lands on
   the buffer the previous call used. The reuse order then rests on the
   transport's own calls, not on the collectives between the steps' boundaries.
+* Steps of two to four requests (``wide_prologue``, TP4): when every fused join holds
+  the wide unpool inbox and its layer the wide direct transports (the
+  ``wide_direct_transports`` lever), the group also gets a transport on the wide layout
+  (``UnpoolDirectWorkspace(max_rows=WIDE_MAX_ROWS)``, its own buffer sequence over the
+  same layers), and a captured forward of 16, 24 or 32 rows arms that one: the unpool
+  GEMM (``wide_dense_gemms``' split-K) writes the layer's wide slot and the join runs the
+  boundary at that row count.
 * Eager steps, other row counts and the last layer (no fused boundary) keep
-  the projection gathers' tagged inbox and path; the two transports never share memory.
+  the projection gathers' tagged inbox and path; the transports never share memory.
 
 The join raises instead of falling back when it is armed and the call is not
 the fused boundary's: its GEMM has already published into every rank's slot,
@@ -52,6 +59,7 @@ import torch
 from ... import dispatch as _tp_agreement
 from ...ops.comm import unpool_direct_boundary as _direct
 from ...ops.comm import unpool_gather_boundary as _unpool
+from ...ops.comm.projection_inbox import WIDE_MAX_ROWS
 from ..dense_gemms.dispatcher import (
     FLASHINFER_FAMILIES,
     DenseGemmDispatcher,
@@ -62,8 +70,10 @@ from ..dense_gemms.dispatcher import (
 )
 from ..projection_gathers.gathers import MuseSparkOpenTepGatedResidual, _require_aligned
 
-#: The one row count the transport is armed for: the K = 7 verify step.
+#: The row count the 8-row transport is armed for: the K = 7 verify step.
 ROWS = 8
+#: The row counts the wide transport is armed for: two to four requests' verify steps.
+WIDE_ROWS = tuple(range(2 * ROWS, WIDE_MAX_ROWS + 1, ROWS))
 
 
 def _publish_copy(slot: torch.Tensor, product: torch.Tensor) -> None:
@@ -105,7 +115,16 @@ class MuseSparkOpenTepDirectGatedResidual(MuseSparkOpenTepGatedResidual):
             branch.dim() == 2
             and branch.shape[1] == _unpool.local_columns(workspace.world)
             and residual.shape[-1] == _unpool.HIDDEN
-            and self._fits_fused(residual, branch, next_norm, gain, alpha, beta)
+            # Above 8 rows the fused join takes the wide inbox's row capacity.
+            and self._fits_fused(
+                residual,
+                branch,
+                next_norm,
+                gain,
+                alpha,
+                beta,
+                self._gather_inbox_wide if rows > ROWS else None,
+            )
         ):
             raise RuntimeError(
                 "[musespark_open] unpool_direct: the post-FFN join was armed for the direct transport but the call "
@@ -152,10 +171,11 @@ class MuseSparkOpenTepDirectGatedResidual(MuseSparkOpenTepGatedResidual):
 
 
 class DirectUnpool:
-    """What ``DecodeTarget`` holds under ``unpool_into_boundary``: the workspace and the sites it arms.
+    """What ``DecodeTarget`` holds under ``unpool_into_boundary``: the workspaces and the sites it arms.
 
     ``sites`` is ``(dispatcher, join, buffer)`` per fused layer, in call order: the
     layer's unpool dispatcher, its post-FFN join and the transport buffer it uses.
+    ``wide_workspace`` (``wide_prologue``) serves the same sites at ``WIDE_ROWS``.
 
     Raises:
         ValueError: if two neighbouring calls of the cycle (the last and the first
@@ -166,26 +186,31 @@ class DirectUnpool:
         self,
         workspace: _direct.UnpoolDirectWorkspace,
         sites: Sequence[Tuple[DenseGemmDispatcher, MuseSparkOpenTepDirectGatedResidual, int]],
+        wide_workspace: Optional[_direct.UnpoolDirectWorkspace] = None,
     ) -> None:
         self.workspace = workspace
+        self.wide_workspace = wide_workspace
         self.sites = tuple(sites)
         _direct.check_buffer_sequence([buffer for _, _, buffer in self.sites])
 
-    @staticmethod
-    def takes(rows: int) -> bool:
-        """Whether a decode forward of ``rows`` rows runs on the direct transport.
+    def takes(self, rows: int) -> bool:
+        """Whether a decode forward of ``rows`` rows runs on a direct transport.
 
-        Exactly 8 rows, inside a CUDA graph capture: every rank captures the same
-        graphs at the same row counts, so every rank arms or none does.
+        Inside a CUDA graph capture: exactly 8 rows, or ``WIDE_ROWS`` with the wide
+        workspace. Every rank captures the same graphs at the same row counts and
+        installs the same workspaces, so every rank arms or none does.
         """
-        return rows == ROWS and torch.cuda.is_current_stream_capturing()
+        if not torch.cuda.is_current_stream_capturing():
+            return False
+        return rows == ROWS or (self.wide_workspace is not None and rows in WIDE_ROWS)
 
     @contextlib.contextmanager
     def armed(self, rows: int):
         """Arm every fused layer for one forward of ``rows`` rows; disarm on any exit."""
+        workspace = self.workspace if rows <= ROWS else self.wide_workspace
         for dispatcher, join, buffer in self.sites:
-            dispatcher.publish = self.workspace.slot(buffer, rows)
-            join._unpool_direct_armed = (self.workspace, buffer)
+            dispatcher.publish = workspace.slot(buffer, rows)
+            join._unpool_direct_armed = (workspace, buffer)
         try:
             yield
         finally:
@@ -278,10 +303,11 @@ def install(
     if reason is not None:
         raise ValueError(reason)
     buffers = _direct.buffer_sequence(len(fused))
-    variants = sorted(
-        {
+
+    def variants_at(rows: int) -> set:
+        return {
             _direct.variant(
-                ROWS,
+                rows,
                 True,
                 layer.post_ffn_norm.variance_epsilon,
                 layers[index + 1].pre_qkv_proj_norm.variance_epsilon,
@@ -292,13 +318,25 @@ def install(
             for index, layer, join, _ in fused
             for capture in ((False, True) if index in captured else (False,))
         }
-    )
+
+    variants = sorted(variants_at(ROWS))
     workspace = _direct.shared_workspace(layers[0].mapping)
+    # The wide layout when wide_prologue gave every fused join its wide unpool inbox and
+    # the layers the wide_direct_transports lever (TP4; construction-time state agreed
+    # over the TP group by wide_prologue.install, the same on every rank).
+    wide = None
+    if all(
+        join._gather_inbox_wide is not None and getattr(layer.feed_forward, "_wide_direct", False)
+        for _, layer, join, _ in fused
+    ):
+        wide = _direct.shared_workspace(layers[0].mapping, max_rows=WIDE_MAX_ROWS)
     # The compile is rank-local; its outcome is agreed too, since the collectives of
     # the installs after this one follow.
     failed: Optional[Exception] = None
     try:
         workspace.build_variants(variants)
+        if wide is not None:
+            wide.build_variants(sorted(set().union(*(variants_at(rows) for rows in WIDE_ROWS))))
     except Exception as error:  # noqa: BLE001 - every failure must reach the agreement
         failed = error
     reason = _tp_agreement.agreed_refusal(
@@ -315,7 +353,14 @@ def install(
         join.__class__ = MuseSparkOpenTepDirectGatedResidual
         join._unpool_direct_armed = None
         sites.append((dispatcher, join, buffer))
-    direct = DirectUnpool(workspace, sites)
+    direct = DirectUnpool(workspace, sites, wide)
     workspace.start_guard_watch()
-    _direct.log_once_enabled(len(sites), describe(plan.kernels).split(", ")[-1], buffers)
+    if wide is not None:
+        wide.start_guard_watch()
+    _direct.log_once_enabled(
+        len(sites),
+        describe(plan.kernels).split(", ")[-1],
+        buffers,
+        WIDE_ROWS if wide is not None else (),
+    )
     return direct

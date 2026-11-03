@@ -84,7 +84,7 @@ from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, Ro
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ...models.modeling_utils import QuantConfig
+from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import (
     PositionalEmbeddingParams,
@@ -863,6 +863,62 @@ def _fused_pre_expert_quant_enabled() -> bool:
         "no",
         "off",
     )
+
+
+def excluded_layer_experts_nvfp4_enabled() -> bool:
+    """Whether the checkpoint's quant-excluded MoE layers run NVFP4 experts.
+
+    Off unless MUSESPARK_OPEN_L061_EXPERTS_NVFP4 is ``1``. When on, the experts
+    of every layer the checkpoint excludes whole (``layers.0.`` /
+    ``layers.61.``) are built on the global NVFP4 leaf and the loader quantizes
+    their BF16 checkpoint tensors at load
+    (``musespark_open_weight_mapper.build_nvfp4_expert_weights_from_bf16``).
+    Attention in those layers stays BF16 through its own ``self_attn``
+    exclusion. MUSESPARK_OPEN_L061_EXPERTS_NVFP4_LAYERS (comma-separated layer
+    indices) limits it to some of those layers. Read at model construction,
+    before any module is built.
+    """
+    return os.environ.get("MUSESPARK_OPEN_L061_EXPERTS_NVFP4", "0").strip() == "1"
+
+
+def unexclude_layer_experts(
+    quant_config: QuantConfig, num_layers: int, layers: Optional[List[int]] = None
+) -> List[int]:
+    """Drop the exclusions that keep whole layers' experts out of quantization.
+
+    Removes every ``exclude_modules`` entry that matches the
+    ``model.layers.N.feed_forward.experts`` of a layer in ``layers`` (every
+    layer when None), so those experts resolve to the global quantization
+    format. Returns the indices of the layers whose experts changed format.
+
+    Raises:
+        ValueError: if a dropped entry was also what excluded some layer's
+            attention, which must stay in the format the checkpoint stores, or
+            the experts of an excluded layer outside ``layers``.
+    """
+    patterns = list(quant_config.exclude_modules or [])
+    selected = set(range(num_layers) if layers is None else layers)
+
+    def matches(entries: List[str], name: str) -> bool:
+        return QuantConfig(exclude_modules=entries).is_module_excluded_from_quantization(name)
+
+    expert_names = [f"model.layers.{index}.feed_forward.experts" for index in range(num_layers)]
+    attention_names = [f"model.layers.{index}.self_attn" for index in range(num_layers)]
+    targets = [name for index, name in enumerate(expert_names) if index in selected]
+    before = [matches(patterns, name) for name in expert_names]
+    attention_before = [matches(patterns, name) for name in attention_names]
+    kept = [entry for entry in patterns if not any(matches([entry], n) for n in targets)]
+    after = [matches(kept, name) for name in expert_names]
+    changed = [index for index in range(num_layers) if before[index] and not after[index]]
+    attention_after = [matches(kept, name) for name in attention_names]
+    if attention_after != attention_before or any(index not in selected for index in changed):
+        raise ValueError(
+            "MuseSparkOpen: dropping the layer exclusions "
+            f"{sorted(set(patterns) - set(kept))} would change the format of more than "
+            f"the experts of layers {sorted(selected)}"
+        )
+    quant_config.exclude_modules = kept
+    return changed
 
 
 @triton.jit
@@ -2942,6 +2998,22 @@ class MuseSparkOpenForCausalLM(
         if quant_config is not None and quant_config.exclude_modules:
             quant_config.exclude_modules = normalize_exclude_modules(quant_config.exclude_modules)
         config = model_config.pretrained_config
+        if (
+            quant_config is not None
+            and quant_config.quant_algo == QuantAlgo.NVFP4
+            and quant_config.exclude_modules
+            and excluded_layer_experts_nvfp4_enabled()
+        ):
+            only = os.environ.get("MUSESPARK_OPEN_L061_EXPERTS_NVFP4_LAYERS", "").strip()
+            layers = unexclude_layer_experts(
+                quant_config,
+                config.num_hidden_layers,
+                [int(item) for item in only.split(",") if item.strip()] if only else None,
+            )
+            logger.info(
+                f"MuseSparkOpen: experts of layers {layers} run NVFP4, quantized from the "
+                f"BF16 checkpoint at load; exclude_modules is now {quant_config.exclude_modules}"
+            )
         assert model_config.mapping.pp_size == 1, (
             "MuseSparkOpen does not support pipeline parallelism"
         )

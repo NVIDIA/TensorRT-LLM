@@ -62,7 +62,8 @@ def test_a_model_without_hooks_gets_the_all_off_default(model):
 
 def test_every_field_defaults_to_off():
     for field in dataclasses.fields(RuntimeHooks):
-        assert getattr(DEFAULT_RUNTIME_HOOKS, field.name) is None, field.name
+        # Object hooks are off as None, flags as False.
+        assert getattr(DEFAULT_RUNTIME_HOOKS, field.name) in (None, False), field.name
 
 
 def test_hooks_declared_as_none_mean_the_default():

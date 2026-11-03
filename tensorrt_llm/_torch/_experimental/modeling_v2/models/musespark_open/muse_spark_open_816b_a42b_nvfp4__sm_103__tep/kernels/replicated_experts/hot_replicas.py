@@ -145,6 +145,8 @@ def eligible(moe, mapping: Mapping) -> Optional[str]:
         return reason
     if _ring_buddy.expert_format(moe) != "nvfp4":
         return "the experts are not the native NVFP4 leaf"
+    if getattr(moe, "experts_quantized_at_load", False):
+        return "the experts were quantized at load; the census covers the checkpoint's NVFP4 layers"
     return None
 
 

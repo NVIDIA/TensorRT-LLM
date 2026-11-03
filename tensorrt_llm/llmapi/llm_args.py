@@ -4282,6 +4282,32 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Optional local ModelOpt NVFP4 checkpoint directory supplying per-layer "
         "K/V global scales. Omit it to use identity global scales.")
+    global_scale: Literal["identity", "fp8_block_amax"] = Field(
+        default="identity",
+        status="prototype",
+        description="NVFP4 global scale for cold pages without ModelOpt scales. "
+        "'identity' (default): global scale 1.0. 'fp8_block_amax': for an FP8 "
+        "active cache, a global scale of 6, so that each 16-value block scale is "
+        "the block's E4M3 absolute maximum itself. It needs no calibration and "
+        "cannot overflow. Requires an FP8 target KV cache; cannot be combined "
+        "with scale_checkpoint_path.")
+    uncompressed_layer_types: List[Literal[
+        "sliding_window", "full_attention"]] = Field(
+            default_factory=list,
+            status="prototype",
+            description=
+            "Attention layer types whose cold pages keep the active-cache "
+            "dtype (copied without quantization). 'sliding_window': layers "
+            "whose attention window is shorter than the longest window in the "
+            "KV cache; 'full_attention': the other Attention layers. Empty "
+            "(default): every Attention layer is quantized.")
+
+    @model_validator(mode='after')
+    def _validate_global_scale_source(self):
+        if self.global_scale != "identity" and self.scale_checkpoint_path:
+            raise ValueError(
+                "global_scale and scale_checkpoint_path are mutually exclusive")
+        return self
 
     def supports_block_reuse(self) -> bool:
         """Block reuse is unchanged because token identity is preserved."""

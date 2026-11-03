@@ -4147,6 +4147,8 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
+        "global_scale": "identity",
+        "uncompressed_layer_types": [],
     }
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()

@@ -39,7 +39,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: The checkpoint's router: 256 experts over the 8192-wide residual.
 EXPERTS = 256
@@ -143,6 +143,26 @@ class RouterShard(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
+            spec=dict(rows=8, num_warps=16),
+        ),
+        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
+        Cell(
+            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
+            spec=dict(rows=3, num_warps=16),
+        ),
+        Cell(
+            why="8 rows without the prepare stream: the 4-warp summation order",
+            spec=dict(rows=8, num_warps=4),
+        ),
+        Cell(
+            why="tep4 K=7 verify: 8 rows, 64 columns per rank (one tray)",
+            spec=dict(rows=8, num_warps=16, ranks=4),
+        ),
+    )
 
     note = """
     The claim the test proves is equality with the built-in kernel's columns
@@ -264,6 +284,22 @@ class RouterShardSide(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="K=7 verify: 8 rows, the served launch (prepare stream, 16 warps)",
+            spec=dict(rows=8, num_warps=16),
+        ),
+        Cell(why="one row at 16 warps (no speculation)", spec=dict(rows=1, num_warps=16)),
+        Cell(
+            why="an odd row count the built-in launches at 1-row tiles (3 rows)",
+            spec=dict(rows=3, num_warps=16),
+        ),
+        Cell(
+            why="8 rows without the prepare stream: the 4-warp summation order",
+            spec=dict(rows=8, num_warps=4),
+        ),
+    )
 
     note = """
     The claim the test proves is equality with ``router_shard`` and with the
@@ -418,6 +454,22 @@ class RouterShardPublish(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="K=7 verify: 8 rows, the served launch (16 warps), four boxes",
+            spec=dict(rows=8, num_warps=16),
+        ),
+        Cell(why="one row at 16 warps: one box", spec=dict(rows=1, num_warps=16)),
+        Cell(
+            why="an odd row count (3 rows): two boxes, the second CTA one row",
+            spec=dict(rows=3, num_warps=16),
+        ),
+        Cell(
+            why="8 rows without the prepare stream: the 4-warp summation order",
+            spec=dict(rows=8, num_warps=4),
+        ),
+    )
 
     note = """
     The claim the test proves is that every box holds ``router_shard``'s logits
@@ -580,6 +632,17 @@ class RouterShardWide(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tep4: two requests' K=7 verify, 16 rows, 64 columns per rank",
+            spec=dict(rows=16, ranks=4),
+        ),
+        Cell(why="tep4: three requests, 24 rows (two token tiles)", spec=dict(rows=24, ranks=4)),
+        Cell(why="tep4: four requests, 32 rows (the wide capacity)", spec=dict(rows=32, ranks=4)),
+        Cell(why="a row count off the K=7 grid (19 rows)", spec=dict(rows=19, ranks=4)),
+        Cell(why="tep8 layout: 16 rows, 32 columns per rank", spec=dict(rows=16, ranks=8)),
+    )
+
     note = """
     The claim the test proves is equality with the built-in router's columns
     ``L r .. L r + L - 1`` at every row count 16..32, for every rank, at EP4 and EP8,
@@ -669,3 +732,189 @@ class RouterShardWide(OpWrapper):
 
 
 router_shard_wide = RouterShardWide()
+
+
+#: ``router_shard_rows`` (``wide_prologue``) launches ``_router_shard_side_kernel``'s statements
+#: with each program looping over ``PER`` consecutive rows of one expert: the weight row is
+#: loaded once per program, and every row's logit is the same ``tl.sum`` over the same
+#: ``[1, 8192]`` tile layout (the warp count alone fixes it), so each row's bits are those
+#: of ``router_shard`` on that row. Placed after every other kernel of this file.
+@triton.jit
+def _router_shard_rows_kernel(
+    hidden_states,
+    weight,
+    output,
+    scale,
+    TOKENS: tl.constexpr,
+    PER: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    first = tl.program_id(0) * PER
+    expert = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    offsets = tl.arange(0, HIDDEN)
+    w = tl.load(
+        weight + expert[:, None] * HIDDEN + offsets[None, :],
+        expert[:, None] < EXPERTS,
+        other=0.0,
+    )
+    for k in tl.static_range(PER):
+        token = first + k
+        if token < TOKENS:
+            x = tl.load(hidden_states + token * HIDDEN + offsets).to(tl.float32)
+            logits = tl.sum(w * x[None, :], axis=1) * scale
+            tl.store(output + token * EXPERTS + expert, logits, expert < EXPERTS)
+
+
+#: Rows a ``router_shard_rows`` call may carry: two to four requests' K=7 verify steps.
+ROWS_MAX_ROWS = 32
+#: Rows per program by row count: the fastest of the bitwise-equal launches on one R200 at
+#: 16 warps (every entry writes the same bits).
+ROWS_PER_PROGRAM = {16: 1, 24: 4, 32: 2}
+
+
+def rows_per_program(tokens: int) -> int:
+    """Rows each ``router_shard_rows`` program loops over at ``tokens`` rows (2 off the K=7 grid)."""
+    return ROWS_PER_PROGRAM.get(tokens, 2)
+
+
+class RouterShardRows(OpWrapper):
+    """The rank's ``L`` router logit columns of up to 32 rows, each row's one-request bits.
+
+    ``router_shard_side``'s statements -- the built-in small-batch router's -- over every row
+    of a 2..4-request decode step: each logit is the one ``router_shard`` computes for that row
+    at the same warp count, i.e. the bits the built-in router gives the row when its request
+    decodes alone (``num_warps = builtin_warps(MAX_ROWS, overlaps)``). The built-in router of a
+    16..32-row step instead takes its TF32x3 tensor-core launch, which ``router_shard_wide``
+    reproduces; this entry trades those bits for the one-request ones in one launch and no
+    reduce. A plain launch (no programmatic dependent launch) into the caller's ``out``, for
+    the router fork's side stream.
+
+    Args:
+        hidden_states: ``[M, 8192]`` BF16, contiguous, ``1 <= M <= 32``.
+        weight: the full router weight ``[256, 8192]`` FP32, contiguous.
+        rank: the expert-parallel rank ``r``; columns ``[L r, L r + L)`` are computed.
+        scale: the metap multiplier, a Python float (applied in FP32 after the sum).
+        num_warps: the warp count of the built-in launch at one request's rows (4 or 16).
+        out: ``[M, L]`` FP32, contiguous, on the input's device; overwritten.
+        ranks: the expert-parallel group size (4 or 8); ``L = local_experts(ranks)``.
+
+    Returns:
+        ``out``.
+    """
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="tep4: two requests' K=7 verify, 16 rows, 64 columns, the served 16 warps",
+            spec=dict(rows=16, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="tep4: three requests, 24 rows (4 rows per program)",
+            spec=dict(rows=24, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="tep4: four requests, 32 rows (the wide capacity, 2 rows per program)",
+            spec=dict(rows=32, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="a row count off the K=7 grid (19 rows, a partial last program)",
+            spec=dict(rows=19, num_warps=16, ranks=4),
+        ),
+        Cell(
+            why="without the prepare stream: the 4-warp summation order",
+            spec=dict(rows=24, num_warps=4, ranks=4),
+        ),
+        Cell(why="tep8 layout: 16 rows, 32 columns", spec=dict(rows=16, num_warps=16, ranks=8)),
+    )
+
+    note = """
+    The claim the test proves is that every row of every rank's output is ``router_shard``'s
+    logit for that row bit for bit -- the built-in small-batch router's columns
+    ``L r .. L r + L - 1`` of that row in a one-request (8-row) call -- at every row count
+    1..32, both warp counts, EP4 and EP8, eagerly and through a CUDA-graph replay on a forked
+    side stream; the cells additionally gate the op against the float64 reference.
+    """
+
+    def __call__(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        tokens = hidden_states.shape[0]
+        local = local_experts(ranks)
+        first = rank * local
+        per = rows_per_program(tokens)
+        _router_shard_rows_kernel[(triton.cdiv(tokens, per), local // TILE_ROWS)](
+            hidden_states,
+            weight[first : first + local],
+            out,
+            scale,
+            TOKENS=tokens,
+            PER=per,
+            EXPERTS=local,
+            HIDDEN=HIDDEN,
+            ROWS=TILE_ROWS,
+            num_warps=num_warps,
+            enable_fp_fusion=False,
+            launch_pdl=False,
+        )
+        return out
+
+    def reference(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> torch.Tensor:
+        """``RouterShard.reference``; ``num_warps`` and ``out`` do not change the values."""
+        del out
+        return router_shard.reference(hidden_states, weight, rank, scale, num_warps, ranks=ranks)
+
+    def is_valid(
+        self,
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        rank: int,
+        scale: float,
+        num_warps: int,
+        out: torch.Tensor,
+        ranks: int = 4,
+    ) -> None:
+        """Dense row-major operands; 1..32 rows; a built-in warp count."""
+        if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
+            raise ValueError(f"hidden_states must be 2-D BF16, got {hidden_states.dtype}")
+        if not hidden_states.is_contiguous() or hidden_states.shape[1] != HIDDEN:
+            raise ValueError(f"hidden_states must be contiguous [M, {HIDDEN}]")
+        rows = hidden_states.shape[0]
+        if not 1 <= rows <= ROWS_MAX_ROWS:
+            raise ValueError(f"1..{ROWS_MAX_ROWS} rows, got {rows}")
+        if weight.dtype != torch.float32 or tuple(weight.shape) != (EXPERTS, HIDDEN):
+            raise ValueError(f"weight must be FP32 [{EXPERTS}, {HIDDEN}]")
+        if not weight.is_contiguous():
+            raise ValueError("weight must be contiguous")
+        if ranks not in RANK_COUNTS:
+            raise ValueError(f"ranks must be one of {RANK_COUNTS}, got {ranks}")
+        if not 0 <= rank < ranks:
+            raise ValueError(f"rank must be in [0, {ranks}), got {rank}")
+        if num_warps not in WARP_COUNTS:
+            raise ValueError(f"num_warps must be one of {WARP_COUNTS}, got {num_warps}")
+        local = local_experts(ranks)
+        if out.dtype != torch.float32 or tuple(out.shape) != (rows, local):
+            raise ValueError(f"out must be FP32 [{rows}, {local}]")
+        if not out.is_contiguous() or out.device != hidden_states.device:
+            raise ValueError("out must be contiguous, on the input's device")
+
+
+router_shard_rows = RouterShardRows()

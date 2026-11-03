@@ -143,6 +143,14 @@ class RuntimeHooks:
     step_input_stager: Optional[StepInputStagerSource] = None
     # The speculative sampler's store update and host copy in one launch (see SamplerStoreWriter).
     sampler_store_writer: Optional[SamplerStoreWriter] = None
+    # Run the overlap executor loop with the execution stream as its thread's current stream.
+    # By default the forward runs on the execution stream and the sampler and the next
+    # step's input preparation on the thread's own stream, ordered by two cross-stream
+    # waits per step (the sampler waits for the forward, the next forward waits for the
+    # sampler); on one stream the same work runs in the same host order with no
+    # cross-stream wait between two forwards. Every dependency the waits expressed holds
+    # on one stream, so only overlap between the two streams is given up.
+    step_loop_on_execution_stream: bool = False
 
 
 DEFAULT_RUNTIME_HOOKS = RuntimeHooks()

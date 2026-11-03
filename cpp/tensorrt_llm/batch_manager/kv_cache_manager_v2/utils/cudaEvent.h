@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cuda.h>
 #include <deque>
 #include <functional>
@@ -378,15 +379,44 @@ private:
 // Wait for all events on the given stream, skipping nulls and issuing one wait per distinct
 // event. Mirrors Python's stream_wait_events(), which converts to set() before iterating.
 // Waiting does not consume an event, so raw CUevent values suffice and a caller-owned
-// CachedCudaEvent need not outlive the call.
-inline void streamWaitEvents(CudaStream stream, std::vector<CUevent> events)
+// CachedCudaEvent need not outlive the call. With stream-ordered events enabled (below), waits
+// that stream order already implies are not issued.
+void streamWaitEvents(CudaStream stream, std::vector<CUevent> events);
+
+// ---------------------------------------------------------------------------
+// Stream-ordered events (opt-in: TLLM_KV_CACHE_MANAGER_V2_STREAM_ORDERED_EVENTS=1, read once).
+//
+// Every CachedCudaEvent record is registered with the identity of the stream it was recorded on
+// (cuStreamGetId) and a process-wide sequence number, both taken under the mutex that also
+// covers the cuEventRecord, so two registered records on one stream compare in stream order.
+// CUDA streams execute in order, which gives two rules:
+//   - a stream never needs to wait for an event recorded earlier on that same stream;
+//   - of several events recorded on one stream, the latest one completes last.
+// streamWaitEvents(), CachedCudaEvent::waitInStream() and mergeEvents() apply them: they skip
+// waits that the first rule makes redundant, keep only the latest event per stream, and
+// mergeEvents() also drops events that have already completed before it falls back to a
+// temporary merge stream. The GPU orderings that result are the same as without the rules.
+// Records on the NULL / legacy / per-thread default streams, or on a stream whose identity
+// cannot be read, are never elided.
+//
+// Typical effect: a request's pages are written and released on one execution stream, so when
+// a cache is closed every page's finish events reduce to that stream's latest event (no
+// temporary stream per page), and a later resume on the same stream issues no per-page waits.
+// ---------------------------------------------------------------------------
+[[nodiscard]] bool streamOrderedEventsEnabled() noexcept;
+
+//! Counters of the stream-ordered event paths (only counted while enabled), for tests and
+//! diagnostics. A wait helper adds every non-null handle it is given (duplicates included) to
+//! either waitsIssued or waitsElided.
+struct StreamOrderedEventCounters
 {
-    events.erase(std::remove(events.begin(), events.end(), nullptr), events.end());
-    std::sort(events.begin(), events.end());
-    events.erase(std::unique(events.begin(), events.end()), events.end());
-    for (CUevent h : events)
-        cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), h, 0));
-}
+    uint64_t waitsIssued = 0;
+    uint64_t waitsElided = 0;
+    uint64_t mergesWithoutStream = 0;
+    uint64_t mergesWithStream = 0;
+};
+
+[[nodiscard]] StreamOrderedEventCounters streamOrderedEventCounters() noexcept;
 
 // ---------------------------------------------------------------------------
 // CachedCudaStream — pooled non-blocking CUstream.

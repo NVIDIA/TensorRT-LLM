@@ -101,6 +101,11 @@ WIDE_MAX_ROWS = 1024
 INBOX_ROWS = 8
 #: Threads per CTA of kernel A (8 CTAs per row).
 FOLD_THREADS = 128
+#: (virtual threads, threads) per CTA of the cooperative kernel A (``fold_plain_coop``,
+#: early trigger) that ``SplitSample`` runs on calls of at most ``coop_max_rows`` rows
+#: (``head_sampler_coop_fold``): every thread of the CTA computes the soft cap, and the
+#: states are ``fold_plain``'s bit for bit on the 1024-thread virtual block.
+COOP_FOLD_SHAPE = (32, 512)
 #: A poll waiting longer than this traps: a peer that never published. The trap ends the
 #: CUDA context (where the built-in NCCL all-gather would keep waiting), so any skew between
 #: two ranks' LM-head GEMMs above it -- a debugger or profiler pausing one rank, a host stall --
@@ -252,7 +257,10 @@ class SplitSample(OpWrapper):
     Metadata consumed: none. Two launches (kernel A grid (rows, V / 128) x 128
     threads; kernel B grid rows x V threads, V = ``virtual_threads(rows)``: 1024
     up to 128 rows, 512 above), both with programmatic dependent launch when
-    ``pdl``; each waits on its predecessor before its first global read.
+    ``pdl``; each waits on its predecessor before its first global read. A call
+    of at most ``coop_max_rows`` rows (and at most 128) runs kernel A as
+    ``fold_plain_coop`` (``COOP_FOLD_SHAPE``, early trigger), whose states are
+    ``fold_plain``'s bit for bit.
 
     Call site: the target DFlash worker's ``_sample_tokens_for_batch`` under
     the ``split_sampler`` fast path (``target_head.py``), on non-greedy batches with the fused
@@ -293,11 +301,19 @@ class SplitSample(OpWrapper):
         soft_cap: float,
         states: torch.Tensor,
         pdl: bool = False,
+        coop_max_rows: int = 0,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
-        torch.ops.musespark_open_head_sampler.fold_plain(
-            logits, temperatures, states, m, inv, cap, FOLD_THREADS, pdl
-        )
+        if logits.shape[0] <= min(coop_max_rows, MAX_ROWS):
+            # Kernel A with the cap computed by the whole CTA: fold_plain's states on the
+            # 1024-thread virtual block (up to MAX_ROWS rows).
+            torch.ops.musespark_open_head_sampler.fold_plain_coop(
+                logits, temperatures, states, m, inv, cap, *COOP_FOLD_SHAPE, True, pdl
+            )
+        else:
+            torch.ops.musespark_open_head_sampler.fold_plain(
+                logits, temperatures, states, m, inv, cap, FOLD_THREADS, pdl
+            )
         return torch.ops.musespark_open_head_sampler.draw(
             logits, temperatures, top_ks, top_ps, min_ps, seed, offset, states, m, inv, cap, pdl
         )
@@ -315,10 +331,11 @@ class SplitSample(OpWrapper):
         soft_cap: float,
         states: torch.Tensor,
         pdl: bool = False,
+        coop_max_rows: int = 0,
     ) -> torch.Tensor:
         """The built-in head: the processor's soft cap, then the shipped fused sampler.
 
-        ``states`` and ``pdl`` are ignored.
+        ``states``, ``pdl`` and ``coop_max_rows`` are ignored.
         """
         capped = reference_capped(logits, multiplier, soft_cap)
         return torch.ops.trtllm.fused_sample_from_logits(
@@ -338,6 +355,7 @@ class SplitSample(OpWrapper):
         soft_cap: float,
         states: torch.Tensor,
         pdl: bool = False,
+        coop_max_rows: int = 0,
     ) -> None:
         if logits.dtype != torch.bfloat16 or logits.dim() != 2:
             raise ValueError("logits must be BF16 [rows, vocab]")
@@ -348,6 +366,8 @@ class SplitSample(OpWrapper):
             raise ValueError("vocab must be a multiple of 4 and at most 4 * 64 * 1024")
         if states.numel() < state_words(rows):
             raise ValueError("states is smaller than new_states(rows)")
+        if coop_max_rows < 0:
+            raise ValueError("coop_max_rows must be 0 (off) or a row count")
 
 
 split_sample = SplitSample()

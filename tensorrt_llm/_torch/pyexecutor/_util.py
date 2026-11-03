@@ -4107,8 +4107,15 @@ def validate_kv_cache_compression_compatibility(
             f"{guidance}")
     mode = spec_config.spec_dec_mode
     if config.algorithm == "quantization_for_cold_page":
-        supported = mode.is_mtp_eagle_one_model() or mode.is_eagle3_one_model()
-        guidance = "one-model MTP-EAGLE or EAGLE3"
+        # A DFlash drafter without a separate draft KVCM keeps its context K/V
+        # in worker-owned buffers, so the codec only ever sees target pages.
+        dflash_without_draft_kvcm = (
+            mode.is_dflash()
+            and not should_use_separate_draft_kv_cache(spec_config))
+        supported = (mode.is_mtp_eagle_one_model()
+                     or mode.is_eagle3_one_model() or dflash_without_draft_kvcm)
+        guidance = ("one-model MTP-EAGLE or EAGLE3, or DFlash without a "
+                    "separate draft KV cache")
     else:
         supported = mode.is_mtp_one_model() or mode.is_eagle3_one_model()
         guidance = "one-model MTP or EAGLE3"

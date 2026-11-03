@@ -52,10 +52,11 @@ so the TP4 result is the built-in TP4 kernel's bit for bit as well.
   for its peers.
 
 Protocol (one-shot Lamport; the slot layout is this workspace's own). Each rank
-owns a receive area of ``2 buffers x 8 source ranks x 16 tokens x 4096`` BF16
-filled with the sentinel word ``0x80000000``: a 32-bit word that holds it has
-not arrived. Published words never equal it (``-0`` halves are cleared). In
-one call a slot ``(buffer, source, token, column vector)`` has one writer, the
+owns a receive area of ``2 buffers x ranks source ranks x max_tokens tokens x
+4096`` BF16 (``max_tokens`` is the workspace's layout, ``MAX_TOKENS`` or
+``WIDE_MAX_TOKENS``) filled with the sentinel word ``0x80000000``: a 32-bit
+word that holds it has not arrived. Published words never equal it (``-0``
+halves are cleared). In one call a slot ``(buffer, source, token, column vector)`` has one writer, the
 source rank's thread with that token and column, and one reader, this rank's
 thread with that token and column, which writes the sentinel back once it has
 the value -- before its grid completes, hence before this rank publishes its
@@ -70,7 +71,10 @@ call completed (its ``griddepcontrol.wait`` returned and every kernel between
 two calls waits on its predecessor before completing) and before its own CTA
 arrived, so it reads ``GRID_STEP * n + k`` with ``0 <= k < GRID_STEP``. The
 grid is at most ``GRID_STEP`` CTAs. ``2**32`` is a multiple of
-``2 * GRID_STEP``, so the parity survives the counter's wrap.
+``2 * GRID_STEP``, so the parity survives the counter's wrap. ``GRID_STEP`` is
+the layout's (``grid_step``): 128 for ``MAX_TOKENS``, 256 for
+``WIDE_MAX_TOKENS`` (a 32-token call is 256 CTAs of 64 threads and 2 KiB of
+shared memory, resident at once on the devices served).
 
 Progress: every CTA publishes before it polls, and a publication waits for no
 read, so every slot is written; a stale slot is read again every round with a
@@ -101,7 +105,15 @@ between two calls waits on its predecessor before it completes.
 
 ``FinalizeTransportWorkspace.finalize`` has the built-in workspace's signature
 and input contract (its validation is the built-in's): calls of 1..16 tokens
-run this kernel, larger ones the built-in workspace it wraps.
+run this kernel, larger ones the built-in workspace it wraps. At TP4 a
+workspace can also carry a second one laid out for ``WIDE_MAX_TOKENS`` (its own
+receive area, arrival counter and kernel build; ``serve_wide_calls``), which
+then runs the calls of 17..32 tokens; the 1..16-token calls keep the first
+workspace's kernel, memory and counter. The built-in TP4 kernel runs one CTA
+per token at every token count up to its 128, so the TP4 arithmetic above is
+its arithmetic at 17..32 tokens too; at TP8 the built-in switches to one CTA
+per token above 16 tokens, which the cluster-8 order is not, so the wide
+layout is TP4-only.
 """
 
 from __future__ import annotations
@@ -112,7 +124,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -124,6 +136,10 @@ HIDDEN = 4096
 TOP_K = 8
 #: Tokens per call this kernel serves: the built-in's cluster-8 range at TP8.
 MAX_TOKENS = 16
+#: Tokens per call of the wide layout (four requests at K = 7), TP4 only.
+WIDE_MAX_TOKENS = 32
+#: The layouts a workspace can have, and the group sizes each serves.
+LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8
@@ -137,9 +153,14 @@ BUFFERS = 2
 SLAB_BYTES = MAX_TOKENS * HIDDEN * 2
 
 
-def workspace_bytes(ranks: int) -> int:
-    """Bytes of one rank's receive area for a group of ``ranks``."""
-    return BUFFERS * ranks * SLAB_BYTES
+def slab_bytes(max_tokens: int = MAX_TOKENS) -> int:
+    """Bytes of one source rank's slab of one buffer in a ``max_tokens`` layout."""
+    return max_tokens * HIDDEN * 2
+
+
+def workspace_bytes(ranks: int, max_tokens: int = MAX_TOKENS) -> int:
+    """Bytes of one rank's receive area for a group of ``ranks`` in a ``max_tokens`` layout."""
+    return BUFFERS * ranks * slab_bytes(max_tokens)
 
 
 #: Control words: 0 the buffer index and 1 the counter of the built-in-style
@@ -149,6 +170,19 @@ CONTROL_WORDS = 4
 GRID_STEP = 128
 GRID_SHIFT = 7
 assert GRID_STEP == 1 << GRID_SHIFT and GRID_STEP >= MAX_TOKENS * CLUSTER
+
+
+def grid_shift(max_tokens: int = MAX_TOKENS) -> int:
+    """``log2`` of what one call adds to the ``red`` counter in a ``max_tokens`` layout.
+
+    The smallest power of two of at least the layout's largest grid
+    (``max_tokens * CLUSTER`` CTAs): ``GRID_SHIFT`` for ``MAX_TOKENS``.
+    """
+    return (max_tokens * CLUSTER - 1).bit_length()
+
+
+assert grid_shift(MAX_TOKENS) == GRID_SHIFT
+
 #: Bytes one ``push`` value occupies in a receiving CTA (one 16-byte ``st.async``).
 _PUSH_BYTES = 16
 
@@ -379,6 +413,8 @@ if HAS_CUTE_DSL:
 
         ranks: int
         multicast: bool
+        #: One source rank's slab of one buffer; a wider layout sets its own.
+        slab_bytes: int = SLAB_BYTES
 
         def slot_offset(self, token, column):
             """Byte offset of ``(token, column vector)`` inside one source slab."""
@@ -386,7 +422,7 @@ if HAS_CUTE_DSL:
 
         def slab_offset(self, buffer, source):
             """Byte offset of ``source``'s slab of ``buffer`` in a receive area."""
-            return (Int64(buffer) * self.ranks + Int64(source)) * SLAB_BYTES
+            return (Int64(buffer) * self.ranks + Int64(source)) * self.slab_bytes
 
         def publish(self, own, buffer, slot, rank, mcast, peers):
             """Store this rank's four words into slot ``rank`` of every rank's buffer."""
@@ -437,7 +473,7 @@ if HAS_CUTE_DSL:
             while stale != Uint32(0):
                 polled = stale
                 for p in cutlass.range_constexpr(self.ranks):
-                    address = receive + (Int64(buffer) * self.ranks + p) * SLAB_BYTES + slot
+                    address = receive + (Int64(buffer) * self.ranks + p) * self.slab_bytes + slot
                     v0, v1, v2, v3 = _poll_x4(
                         address,
                         (polled >> Uint32(p)) & Uint32(1),
@@ -459,7 +495,7 @@ if HAS_CUTE_DSL:
         def retire(self, buffer, slot, rank, receive):
             """Write the sentinel back into every peer slot this thread consumed."""
             for p in range(self.ranks):
-                address = receive + (Int64(buffer) * self.ranks + p) * SLAB_BYTES + slot
+                address = receive + (Int64(buffer) * self.ranks + p) * self.slab_bytes + slot
                 _reset_x4(address, Uint32(rank != p))
 
     class _FinalizeTransportKernel(LamportExchange):
@@ -469,12 +505,24 @@ if HAS_CUTE_DSL:
         each thread owns one 16-byte column vector of that slice for all 8
         slots -- the built-in kernel's map. ``ranks`` is the TP size; at TP4 the
         slot sums are added flat (``flat_sum``, the built-in cluster-1 order).
+        ``max_tokens`` is the receive-area layout (the slab per source rank and
+        the arrival counter's step); every statement on a token's values is the
+        same in every layout.
         """
 
-        def __init__(self, transport: Transport, pdl: bool, ranks: int = 8):
+        def __init__(
+            self, transport: Transport, pdl: bool, ranks: int = 8, max_tokens: int = MAX_TOKENS
+        ):
             if ranks not in RANK_COUNTS:
                 raise ValueError(f"the finalize transport serves {RANK_COUNTS} ranks, got {ranks}")
+            if ranks not in LAYOUT_RANK_COUNTS.get(max_tokens, ()):
+                raise ValueError(
+                    f"the finalize transport has no {max_tokens}-token layout at {ranks} ranks"
+                )
             self.ranks = ranks
+            self.slab_bytes = slab_bytes(max_tokens)
+            self.grid_shift = grid_shift(max_tokens)
+            self.grid_step = 1 << self.grid_shift
             # The built-in TP4 kernel runs one CTA per token and adds its warps' sums
             # from +0 in warp order; TP8's cluster of 8 adds per-CTA totals.
             self.flat_sum = ranks == 4
@@ -658,10 +706,10 @@ if HAS_CUTE_DSL:
                             _store_control(control_address, current ^ Uint32(1))
                     else:
                         counter = _load_control(control_address + 8)
-                        snapshot[0] = Int32((counter >> Uint32(GRID_SHIFT)) & Uint32(1))
+                        snapshot[0] = Int32((counter >> Uint32(self.grid_shift)) & Uint32(1))
                         amount = Uint32(1)
                         if block == 0:
-                            amount = Uint32(GRID_STEP + 1) - Uint32(blocks)
+                            amount = Uint32(self.grid_step + 1) - Uint32(blocks)
                         _red_add(control_address + 8, amount)
 
                 gains = []
@@ -816,8 +864,14 @@ if HAS_CUTE_DSL:
     _POINTER_ALIGNMENTS = (16, 4, 4) + (16,) * (len(_POINTER_DTYPES) - 3)
 
     @functools.lru_cache(maxsize=32)
-    def _compiled_kernel(device_index: int, transport: Transport, pdl: bool, ranks: int = 8):
-        kernel = _FinalizeTransportKernel(transport, pdl, ranks)
+    def _compiled_kernel(
+        device_index: int,
+        transport: Transport,
+        pdl: bool,
+        ranks: int = 8,
+        max_tokens: int = MAX_TOKENS,
+    ):
+        kernel = _FinalizeTransportKernel(transport, pdl, ranks, max_tokens)
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -845,19 +899,29 @@ class FinalizeTransportWorkspace:
     """This transport's memory and state for one TP4 or TP8 group, in front of a built-in workspace.
 
     ``finalize`` has the built-in ``FinalizeIpcWorkspace.finalize`` signature and
-    input contract: calls of 1..16 tokens run this module's kernel, every other
-    call the wrapped built-in workspace (whose own protocol state is separate,
-    so the two interleave freely; every rank routes a call alike because the
-    choice depends on ``num_tokens`` only). Construction is collective over the
-    group (multicast allocation, sentinel fill, kernel compilation and a dry
-    launch) and either succeeds on every rank or raises on every rank.
+    input contract: calls of 1..``max_tokens`` tokens run this module's kernel,
+    calls of the wide workspace's range (``serve_wide_calls``, TP4) run its
+    kernel, and every other call the wrapped built-in workspace (each has its
+    own protocol state, so they interleave freely; every rank routes a call
+    alike because the choice depends on ``num_tokens`` only). Construction is
+    collective over the group (multicast allocation, sentinel fill, kernel
+    compilation and a dry launch) and either succeeds on every rank or raises
+    on every rank.
 
     The wrapped workspace is the TP8 fabric one (two trays) or the TP4 IPC one
     (one tray); the multicast transport uses fabric handles only when the group
-    spans nodes, as the post-attention hop's does.
+    spans nodes, as the post-attention hop's does. ``max_tokens`` is the
+    receive-area layout: ``MAX_TOKENS`` at TP8 or TP4, ``WIDE_MAX_TOKENS`` at
+    TP4 only.
     """
 
-    def __init__(self, legacy, mapping: Mapping, transport: Transport = DEFAULT):
+    def __init__(
+        self,
+        legacy,
+        mapping: Mapping,
+        transport: Transport = DEFAULT,
+        max_tokens: int = MAX_TOKENS,
+    ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
@@ -870,10 +934,19 @@ class FinalizeTransportWorkspace:
                 f"the finalize transport serves TP{' or TP'.join(map(str, RANK_COUNTS))}, "
                 f"got TP{mapping.tp_size}"
             )
+        if mapping.tp_size not in LAYOUT_RANK_COUNTS.get(max_tokens, ()):
+            raise ValueError(
+                f"the finalize transport has no {max_tokens}-token layout at TP{mapping.tp_size}"
+            )
         self.legacy = legacy
         self.transport = transport
         self.ranks = mapping.tp_size
         self.rank = mapping.tp_rank
+        self.max_tokens = int(max_tokens)
+        self.slab_bytes = slab_bytes(self.max_tokens)
+        self.grid_step = 1 << grid_shift(self.max_tokens)
+        #: The workspace of the calls above ``max_tokens`` (``serve_wide_calls``), or None.
+        self.wide: Optional["FinalizeTransportWorkspace"] = None
         self.pdl = _pdl_enabled()
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
         self._comm = _get_mnnvl_workspace_comm(mapping)
@@ -891,9 +964,16 @@ class FinalizeTransportWorkspace:
                 raise RuntimeError("the wrapped TP8 workspace is not the fabric one")
             if self.ranks == 4 and (legacy._use_mnnvl or mapping.is_multi_node()):
                 raise RuntimeError("the wrapped TP4 workspace is not the single-tray IPC one")
+            if _legacy._cluster_for_tokens(self.max_tokens, self.ranks) != (
+                CLUSTER if self.ranks == 8 else 1
+            ):
+                raise RuntimeError(
+                    f"the built-in TP{self.ranks} kernel does not split a {self.max_tokens}-token "
+                    "call the way this kernel's order assumes"
+                )
             if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
                 raise RuntimeError("the finalize transport runs on SM103 or SM107 only")
-            size = workspace_bytes(self.ranks)
+            size = workspace_bytes(self.ranks, self.max_tokens)
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, size, mapping, mapping.is_multi_node()
             )
@@ -925,7 +1005,9 @@ class FinalizeTransportWorkspace:
         )
         error = None
         try:
-            self._compiled = _compiled_kernel(self.device.index, transport, self.pdl, self.ranks)
+            self._compiled = _compiled_kernel(
+                self.device.index, transport, self.pdl, self.ranks, self.max_tokens
+            )
             # A dry launch loads the module now, not inside a capture.
             dummy = self.control.data_ptr()
             self._launch(dummy, dummy, dummy, dummy, dummy, 0, HIDDEN, 1, 1.0, 1)
@@ -955,14 +1037,41 @@ class FinalizeTransportWorkspace:
             cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream),
         )
 
-    @staticmethod
-    def takes(num_tokens) -> bool:
-        """Whether a call of ``num_tokens`` runs this kernel (else the built-in workspace)."""
+    def takes(self, num_tokens) -> bool:
+        """Whether a call of ``num_tokens`` runs this workspace's own kernel."""
         return (
             isinstance(num_tokens, int)
             and not isinstance(num_tokens, bool)
-            and 1 <= num_tokens <= MAX_TOKENS
+            and 1 <= num_tokens <= self.max_tokens
         )
+
+    def serves(self, num_tokens) -> bool:
+        """Whether a call of ``num_tokens`` runs this kernel or the wide workspace's, not the built-in."""
+        return self.takes(num_tokens) or (self.wide is not None and self.wide.takes(num_tokens))
+
+    def serve_wide_calls(self, mapping: Mapping) -> "FinalizeTransportWorkspace":
+        """Run calls of ``max_tokens + 1..WIDE_MAX_TOKENS`` tokens on a second workspace (collective).
+
+        The second workspace has the ``WIDE_MAX_TOKENS`` layout, the same transport
+        and the same wrapped built-in workspace, and its own receive area, arrival
+        counter and kernel build; this workspace's calls of 1..``max_tokens``
+        tokens keep its own. TP4 only (``LAYOUT_RANK_COUNTS``). Returns the
+        second workspace.
+
+        Raises:
+            ValueError: at a group size without the wide layout, or when this
+                workspace already serves its wide calls or already takes them.
+            RuntimeError: if the second workspace could not be built on some rank
+                (on every rank).
+        """
+        if self.wide is not None:
+            raise ValueError("the finalize transport already serves its wide calls")
+        if self.max_tokens >= WIDE_MAX_TOKENS:
+            raise ValueError(f"the finalize transport already takes {self.max_tokens} tokens")
+        self.wide = FinalizeTransportWorkspace(
+            self.legacy, mapping, self.transport, WIDE_MAX_TOKENS
+        )
+        return self.wide
 
     def finalize(
         self,
@@ -973,8 +1082,15 @@ class FinalizeTransportWorkspace:
         eps: float,
         num_tokens: int,
     ) -> torch.Tensor:
-        """``FinalizeIpcWorkspace.finalize``, with 1..16 tokens on this transport."""
+        """``FinalizeIpcWorkspace.finalize``, with 1..``max_tokens`` tokens on this transport.
+
+        Calls the wide workspace takes go to it, every other call to the built-in.
+        """
         if not self.takes(num_tokens):
+            if self.wide is not None and self.wide.takes(num_tokens):
+                return self.wide.finalize(
+                    gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
+                )
             return self.legacy.finalize(
                 gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
             )
@@ -1001,22 +1117,64 @@ class FinalizeTransportWorkspace:
 class FinalizeAllReduceTransport(OpWrapper):
     """The fused expert finalize + all-reduce of a ``FinalizeTransportWorkspace``.
 
-    Returns the ``[num_tokens, 4096]`` BF16 group sum of every rank's partial:
-    per token, each valid expert row ``x`` (slot index in ``[0, R)``) scaled by
-    ``w * rsqrt(mean((x * g)^2) + eps)`` times ``x * g`` with ``g = 1 + norm``,
-    summed over the slots, rounded to BF16 with ``-0`` cleared, then summed over
-    the ranks in FP32 in rank order and rounded to BF16.
+    Returns the ``[num_tokens, 4096]`` BF16 group sum of every rank's partial
+    (calls of 1..16 tokens, and of 17..32 on a TP4 workspace serving its wide
+    calls): per token, each valid expert row ``x`` (slot index in ``[0, R)``)
+    scaled by ``w * rsqrt(mean((x * g)^2) + eps)`` times ``x * g`` with
+    ``g = 1 + norm``, summed over the slots, rounded to BF16 with ``-0``
+    cleared, then summed over the ranks in FP32 in rank order and rounded to BF16.
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="no speculation: one token", spec=dict(tokens=1)),
+        Cell(why="DFlash2 K=7 verify: 8 tokens", spec=dict(tokens=8)),
+        Cell(
+            why="the widest call on this kernel (the ring-buddy decode bound)", spec=dict(tokens=16)
+        ),
+        Cell(
+            why="every slot of a token on one rank, none on the others",
+            spec=dict(tokens=8, placement="concentrated"),
+        ),
+        Cell(
+            why="ring-buddy placement: each slot on its owner or successor",
+            spec=dict(tokens=8, placement="buddy"),
+        ),
+        Cell(
+            why="exact and negative zeros in the rows, tokens with no valid slot",
+            spec=dict(tokens=8, zeros=True),
+        ),
+        Cell(
+            why="invalid slots and cancelling rows: the rank-order sum is observable",
+            spec=dict(tokens=8, invalid=True, cancel=True),
+        ),
+        Cell(
+            why="wide TP4 layout: three requests at K=7, 24 tokens",
+            spec=dict(tokens=24, placement="buddy", wide=True),
+        ),
+        Cell(
+            why="wide TP4 layout: four requests at K=7, 32 tokens, its widest call",
+            spec=dict(tokens=32, placement="buddy", wide=True),
+        ),
+        Cell(
+            why="wide TP4 layout: zeros, negative zeros and a token with no valid slot",
+            spec=dict(tokens=24, zeros=True, wide=True),
+        ),
+        Cell(
+            why="wide TP4 layout: invalid slots and cancelling rows",
+            spec=dict(tokens=32, invalid=True, cancel=True, wide=True),
+        ),
+    )
 
     note = """
     Metadata consumed: ``indices`` (the expert op's ``[tokens, 8]`` row map,
     read through one function, ``select_row``) and the routing weights. Call
     site: the built-in MoE's ``workspace.finalize`` once per layer per step,
     unchanged; the feature puts a ``FinalizeTransportWorkspace`` in that
-    attribute, which runs this kernel for 1..16 tokens and the built-in kernel
-    otherwise.
+    attribute, which runs this kernel for 1..16 tokens (and, with
+    ``wide_finalize_transport`` at TP4, the same kernel on a 32-token layout
+    for 17..32 tokens) and the built-in kernel otherwise.
 
     Certified bit for bit against the built-in kernel by its own multi-GPU test
     (8 ranks on two nodes; every cell, every transport variant, tokens 1..16, a
@@ -1025,8 +1183,12 @@ class FinalizeAllReduceTransport(OpWrapper):
     its dependents before it writes their inputs) and against `reference`
     within a band; the alternation of the two receive buffers by the counter's
     parity is checked white-box; at TP4 (4 ranks on one tray) the same test
-    against the built-in TP4 IPC kernel (cluster 1). Not certified: more than
-    16 tokens (served by the built-in kernel).
+    against the built-in TP4 IPC kernel (cluster 1), and there the wide
+    workspace for every token count 17..32 (the wide cells, graph replays and
+    bursts mixing both workspaces, a delayed rank, its counter across the wrap,
+    its buffer parity). Not certified: more than 32 tokens, or more than 16 at
+    TP8 (served by the built-in kernel). The wide cells (``wide=True``) run at
+    TP4 only.
     """
 
     def __call__(
@@ -1039,8 +1201,11 @@ class FinalizeAllReduceTransport(OpWrapper):
         num_tokens: int,
         workspace: FinalizeTransportWorkspace,
     ) -> torch.Tensor:
-        if not FinalizeTransportWorkspace.takes(num_tokens):
-            raise ValueError(f"finalize_allreduce_transport serves 1..{MAX_TOKENS} tokens")
+        if not workspace.serves(num_tokens):
+            raise ValueError(
+                f"finalize_allreduce_transport serves 1..{MAX_TOKENS} tokens "
+                f"(1..{WIDE_MAX_TOKENS} on a TP4 workspace serving its wide calls)"
+            )
         return workspace.finalize(
             gemm2_output, indices, routing_weights, norm_weight, eps, num_tokens
         )
@@ -1081,9 +1246,12 @@ class FinalizeAllReduceTransport(OpWrapper):
 finalize_allreduce_transport = FinalizeAllReduceTransport()
 
 
-def log_once_enabled(layers: int, transport: Transport) -> None:
+def log_once_enabled(layers: int, transport: Transport, wide: bool = False) -> None:
+    calls = f"1..{MAX_TOKENS} tokens"
+    if wide:
+        calls += f" and, on a second receive area, {MAX_TOKENS + 1}..{WIDE_MAX_TOKENS} tokens"
     logger.info(
         f"[musespark_open] finalize_transport: fused expert finalize + all-reduce of all {layers} layers on the "
         f"{transport.label()} transport (publish/arrival/reduction/trigger) for calls of "
-        f"1..{MAX_TOKENS} tokens; the built-in kernel above that"
+        f"{calls}; the built-in kernel above that"
     )
