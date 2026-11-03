@@ -2886,7 +2886,8 @@ class PyExecutor:
     @property
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
+            not self.disagg.has_retiring_gen_receives
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -6606,7 +6607,8 @@ class PyExecutor:
         if pending.control_requires_drain:
             drained = (len(self.active_requests) == 0
                        and len(self.waiting_queue) == 0
-                       and not self._has_pending_connector_transfers())
+                       and not self._has_pending_connector_transfers()
+                       and not self.disagg.has_retiring_gen_receives)
             if self.enable_attention_dp and self.dist.world_size != 1:
                 # Attention-DP ranks drain independently (per-rank queues), and
                 # the retire below issues attention-DP gathers that every rank
@@ -7964,7 +7966,8 @@ class PyExecutor:
         # on `shutdown_event`.
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown
-                and not self._has_pending_connector_transfers())
+                and not self._has_pending_connector_transfers()
+                and not self.disagg.has_retiring_gen_receives)
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -10666,6 +10669,8 @@ class PyExecutor:
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest) -> None:
+        if self.disagg.defer_gen_termination(request) is True:
+            return
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
@@ -10871,9 +10876,18 @@ class PyExecutor:
             if (not (context_waiting or generation_waiting)
                     or supports_idle_cancel(request) is not True):
                 continue
+            if (generation_waiting
+                    and id(request) in self._held_transfer_failures()):
+                # Progress retirement without replacing the earlier executor error.
+                if self.disagg.request_cancellation(request):
+                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                continue
             # Even an unsubmitted CTX request may be in the transceiver's
             # peer-info wait set. Cancel there before a late ready can revive it.
-            if not self.disagg.request_cancellation(request):
+            logically_cancelled = (generation_waiting and
+                                   self.disagg.cancel_gen_logically(request))
+            if not logically_cancelled and not self.disagg.request_cancellation(
+                    request):
                 continue
             handled_cancel_ids.add(cancel_id)
             if request.state == LlmRequestState.DISAGG_TRANS_ERROR:
@@ -10936,6 +10950,17 @@ class PyExecutor:
             # until get_finished confirms that the blocks are no longer used.
             return False
         if self.kv_cache_transceiver is None:
+            return True
+
+        if (request.is_generation_only_request
+                and id(request) in self._held_transfer_failures()
+                and self.kv_cache_transceiver.
+                supports_idle_request_cancellation(request) is True):
+            if self.disagg.request_cancellation(request):
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            return False
+
+        if self.disagg.cancel_gen_logically(request):
             return True
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)

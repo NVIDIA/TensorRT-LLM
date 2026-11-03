@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
+from coordinator_harness import CoordinatorHarness
+from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
@@ -22,7 +24,12 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import BindKvCacheT
 from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, Failed
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
-from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    AgentResult,
+    KVRecvTask,
+    RxSession,
+    TransferWorker,
+)
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
@@ -135,7 +142,13 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     transceiver._send_reqs = {}
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
+    transceiver._mapping = SimpleNamespace(enable_attention_dp=True, pp_size=1)
+    transceiver._dist = engine.dist
     transceiver.kv_transfer_timeout_ms = 1000
+    worker = object.__new__(TransferWorker)
+    worker._retirement_watchdog = RetirementWatchdog(Mock(), clock=lambda: 0.0)
+    worker._config = SimpleNamespace(rx_timeout_s=1.0)
+    transceiver._transfer_worker = worker
     engine.kv_cache_transceiver = transceiver
     engine._disagg_coordinator = DisaggTransferCoordinator(
         transceiver=transceiver,
@@ -655,9 +668,217 @@ def _published_receive(
     transceiver = executor.kv_cache_transceiver
     transceiver._recv_sessions[request.py_request_id] = session
     transceiver._recv_reqs[request.py_request_id] = request
+    transceiver._ever_had_recv_session = True
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
     request.py_kv_transfer_start_time = 12.0
     return session, aux
+
+
+@pytest.mark.parametrize("boundary", ["early", "post_batch"])
+@pytest.mark.parametrize("settled_before_cancel", [False, True])
+def test_parked_executor_failure_precedes_generation_cancellation(
+    executor: PyExecutor, boundary: str, settled_before_cancel: bool
+) -> None:
+    """Preserve an executor error while cancellation progresses physical retirement.
+
+    Args:
+        executor: Real executor cancellation and error paths with controlled resources.
+        boundary: Executor cancellation boundary to exercise.
+        settled_before_cancel: Whether physical evidence arrives before cancellation.
+    """
+    request = _request(1)
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    session, aux = _published_receive(executor, request)
+    message = "executor failure before cancellation"
+    executor._handle_errors(message, requests=[request], charge_budget=False)
+    assert executor._held_transfer_failures() == {id(request): (request, message)}
+    assert not request.is_finished
+    assert executor.responses == {}
+    executor.resource_manager.free_resources.assert_not_called()
+
+    def settle() -> None:
+        """Supply safe completion evidence for both retained receive resources."""
+        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+        session.process_aux_agent_result(0, AgentResult.SUCCESS)
+
+    def cancel() -> None:
+        """Use the selected production cancellation boundary."""
+        if boundary == "early":
+            executor._cancel_waiting_disagg_requests([])
+        else:
+            executor._handle_canceled_requests()
+
+    if settled_before_cancel:
+        settle()
+    _abort(executor, request, repeats=2)
+    cancel()
+    assert executor.active_requests == [request]
+    assert set(executor.canceled_req_ids) == {1}
+    assert not request.is_finished_due_to_cancellation
+    assert executor.responses == {}
+    assert executor.disagg._retiring_gen_receives == {}
+    executor.resource_manager.free_resources.assert_not_called()
+    if not settled_before_cancel:
+        executor._sweep_transfer_held_failures()
+        assert executor._held_transfer_failures() == {id(request): (request, message)}
+        assert executor.responses == {}
+        aux.free_slot.assert_not_called()
+        executor.resource_manager.free_resources.assert_not_called()
+        settle()
+    executor.disagg.reap_gen_receives(0)
+    cancel()
+    executor._sweep_transfer_held_failures()
+    executor._flush_pending_transfer_responses()
+
+    assert executor.active_requests == []
+    assert executor._held_transfer_failures() == {}
+    (response,) = executor.responses[1]
+    assert response.error_msg == message
+    assert not request.is_finished_due_to_cancellation
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+    cancel()
+    executor.disagg.reap_gen_receives(0)
+    executor._sweep_transfer_held_failures()
+    executor._flush_pending_transfer_responses()
+    assert len(executor.responses[1]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    aux.free_slot.assert_called_once_with(0)
+
+
+def test_parked_native_failure_waits_for_physical_cancel_completion(
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A C++ cancellation acknowledgment is not proof that its receive has retired.
+
+    Args:
+        executor: Real executor cancellation and parked-failure handling.
+        monkeypatch: Enables the native in-flight cancellation policy.
+    """
+    transceiver = object.__new__(BindKvCacheTransceiver)
+    transceiver.impl = SimpleNamespace(cancel_request=Mock(return_value=True))
+    transceiver._supports_inflight_request_cancellation = True
+    executor.kv_cache_transceiver = transceiver
+    executor.disagg._transceiver = transceiver
+    monkeypatch.setattr(coordinator_mod, "is_disagg_inflight_cancel_enabled", lambda: True)
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    message = "executor failure before native receive cancellation"
+    executor._handle_errors(message, requests=[request], charge_budget=False)
+    _abort(executor, request)
+
+    executor._handle_canceled_requests()
+    executor._sweep_transfer_held_failures()
+
+    transceiver.impl.cancel_request.assert_called_once_with(request)
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert executor.canceled_req_ids == [1]
+    assert executor.active_requests == [request]
+    assert executor._held_transfer_failures() == {id(request): (request, message)}
+    assert executor.responses == {}
+    executor.resource_manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("boundary", ["early", "post_batch"])
+@pytest.mark.parametrize("expires", [False, True], ids=["settles", "grace-expires"])
+def test_parked_failure_closes_unpublished_receive_admission(
+    executor: PyExecutor, boundary: str, expires: bool
+) -> None:
+    """Keep the original failure while an unpublished CUDA claim drains within its grace.
+
+    Args:
+        executor: Real executor error and cancellation paths with controlled resources.
+        boundary: Executor cancellation boundary to exercise.
+        expires: Whether the local access remains unproven until its grace expires.
+    """
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor.active_requests = [request]
+    executor._fatal_error = None
+    clock = [0.0]
+    containment = Mock()
+    watchdog = RetirementWatchdog(containment, clock=lambda: clock[0])
+    transceiver = executor.kv_cache_transceiver
+    transceiver._transfer_worker._retirement_watchdog = watchdog
+    transceiver.request_and_receive_async = Mock()
+    ready = Mock(spec=["query"])
+    ready.query.return_value = False
+    executor.disagg._defer_unready_gen_receives = True
+    executor.disagg._unpublished_gen_receives[1] = (request, ready)
+    message = "executor failure before unpublished receive cancellation"
+    executor._handle_errors(message, requests=[request], charge_budget=False)
+    assert executor._held_transfer_failures() == {id(request): (request, message)}
+
+    def cancel() -> None:
+        """Use the selected production cancellation boundary."""
+        if boundary == "early":
+            executor._cancel_waiting_disagg_requests([])
+        else:
+            executor._handle_canceled_requests()
+
+    _abort(executor, request, repeats=2)
+    cancel()
+    assert executor.disagg._unpublished_gen_receives == {}
+    assert executor.disagg._retiring_gen_receives == {}
+    assert transceiver._recv_reqs == {1: request}
+    assert transceiver.has_inflight_transfer(request)
+    assert executor.active_requests == [request]
+    assert not request.is_finished_due_to_cancellation
+    assert executor.responses == {}
+    executor.resource_manager.free_resources.assert_not_called()
+
+    clock[0] = 0.75
+    _abort(executor, request, repeats=2)
+    cancel()
+    executor.disagg.poll_gen_transfers()
+    executor._sweep_transfer_held_failures()
+    assert len(watchdog._owners) == 1
+    assert watchdog.fatal is None
+    assert executor._held_transfer_failures() == {id(request): (request, message)}
+    assert executor.responses == {}
+    transceiver.request_and_receive_async.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
+
+    clock[0] = 1.01 if expires else 0.9
+    watchdog.progress()
+    ready.query.return_value = True
+    cancel()
+    executor.disagg.poll_gen_transfers()
+    executor._sweep_transfer_held_failures()
+    executor._flush_pending_transfer_responses()
+    if expires:
+        assert watchdog.fatal is not None
+        assert watchdog.fatal.started_at == 0.0
+        assert watchdog.fatal.deadline == 1.0
+        containment.assert_called_once_with(watchdog.fatal)
+        assert executor.active_requests == [request]
+        assert executor._held_transfer_failures() == {id(request): (request, message)}
+        assert transceiver._recv_reqs == {1: request}
+        assert executor.responses == {}
+        executor.resource_manager.free_resources.assert_not_called()
+    else:
+        containment.assert_not_called()
+        assert executor.active_requests == []
+        assert executor._held_transfer_failures() == {}
+        assert transceiver._recv_reqs == {}
+        assert not transceiver._cancelled_receive_fences
+        (response,) = executor.responses[1]
+        assert response.error_msg == message
+        executor.resource_manager.free_resources.assert_called_once_with(request)
+        watchdog.require_retired()
+        watchdog.stop()
+        cancel()
+        executor.disagg.poll_gen_transfers()
+        executor._sweep_transfer_held_failures()
+        executor._flush_pending_transfer_responses()
+        assert len(executor.responses[1]) == 1
+        executor.resource_manager.free_resources.assert_called_once_with(request)
+    assert not request.is_finished_due_to_cancellation
+    assert executor.disagg._retiring_gen_receives == {}
+    transceiver.request_and_receive_async.assert_not_called()
 
 
 @pytest.mark.parametrize("failure_first", [False, True], ids=["cancel-first", "failure-first"])
@@ -694,7 +915,7 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     _abort(executor, request)
     cancel()
     assert not session.resources_drained()
-    assert executor.canceled_req_ids == [1]
+    assert executor.canceled_req_ids == ([1] if failure_first else [])
     executor.resource_manager.free_resources.assert_not_called()
     aux.free_slot.assert_not_called()
     if not failure_first:
@@ -705,9 +926,19 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     assert session.status is expected_status
     assert isinstance(handle.poll(), expected_outcome)
     cancel()
-    assert executor.active_requests == [request]
-    assert not request.is_finished
-    assert executor.responses == {}
+    if failure_first:
+        assert executor.active_requests == [request]
+        assert not request.is_finished
+        assert executor.responses == {}
+    else:
+        if boundary == "post_batch":
+            executor._handle_responses()
+        executor._flush_pending_transfer_responses()
+        assert executor.active_requests == []
+        assert request.is_finished_due_to_cancellation
+        (response,) = executor.responses[request.py_request_id]
+        assert response.error_msg is None
+        assert executor.disagg._retiring_gen_receives == {1: request}
     aux.free_slot.assert_not_called()
     executor.resource_manager.free_resources.assert_not_called()
 
@@ -715,6 +946,8 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
     assert session.resources_drained()
     if poll_first:
         executor.disagg.reap_gen_receives(0)
+    elif not failure_first:
+        assert executor.disagg.request_cancellation(request)
     cancel()
     assert executor.canceled_req_ids == []
     assert session.status is expected_status
@@ -723,8 +956,8 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
         assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
         assert not request.is_finished_due_to_cancellation
         executor.disagg.reap_gen_receives(0)
-    elif boundary == "post_batch":
-        executor._handle_responses()
+    else:
+        executor.disagg.reap_gen_receives(0)
     executor._flush_pending_transfer_responses()
 
     assert executor.active_requests == []
@@ -748,12 +981,12 @@ def test_receive_outcome_does_not_depend_on_cancellation_cleanup_order(
 def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
     executor: PyExecutor, last_resource: str
 ) -> None:
-    """Neither KV nor AUX completion alone permits cancelled receive reuse."""
+    """Respond immediately, but neither KV nor AUX alone permits destination reuse."""
     request = _request(1)
     executor.active_requests = [request]
     session, aux = _published_receive(executor, request)
     handle = TaskHandle(session, session._kv_tasks[0], token_end=8)
-    _abort(executor, request)
+    _abort(executor, request, repeats=2)
 
     def complete(resource: str) -> None:
         """Deliver terminal evidence for one of the session's two resources."""
@@ -769,26 +1002,295 @@ def test_worker_cancel_retains_published_kv_and_aux_until_both_settle(
             complete(resource)
         executor._cancel_waiting_disagg_requests([])
         executor._flush_pending_transfer_responses()
-        assert executor.active_requests == [request]
-        assert executor.canceled_req_ids == [1]
+        executor.disagg.poll_gen_transfers()
+        assert executor.active_requests == []
+        assert executor.canceled_req_ids == []
+        assert executor.disagg._retiring_gen_receives == {1: request}
         assert request.py_kv_transfer_start_time == 12.0
         assert session.status is SessionStatus.CANCELLED
         assert isinstance(handle.poll(), Cancelled)
-        assert executor.responses == {}
+        (response,) = executor.responses[request.py_request_id]
+        assert response.error_msg is None
+        assert request.is_finished_due_to_cancellation
         executor.sampler.release_request.assert_not_called()
         executor.resource_manager.free_resources.assert_not_called()
         aux.free_slot.assert_not_called()
 
     complete(last_resource)
-    executor._cancel_waiting_disagg_requests([])
+    executor.disagg.poll_gen_transfers()
     _assert_released_once(executor, request)
+    assert executor.disagg._retiring_gen_receives == {}
     assert isinstance(handle.poll(), Cancelled)
     assert not executor.kv_cache_transceiver._recv_sessions
     aux.free_slot.assert_called_once_with(0)
     complete(last_resource)
+    _abort(executor, request)
     executor._cancel_waiting_disagg_requests([])
+    executor.disagg.poll_gen_transfers()
     executor._flush_pending_transfer_responses()
     executor.resource_manager.free_resources.assert_called_once_with(request)
+
+
+def test_settled_receive_waits_for_terminal_response_before_request_release(
+    executor: PyExecutor,
+) -> None:
+    """Receive polling cannot remove response routing before cancellation is delivered."""
+    request = _request(1)
+    executor.active_requests = [request]
+    session, _ = _published_receive(executor, request)
+    _abort(executor, request)
+    executor._cancel_waiting_disagg_requests([])
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+
+    executor.disagg.poll_gen_transfers()
+
+    assert executor.responses == {}
+    assert executor.disagg._retiring_gen_receives == {1: request}
+    executor.resource_manager.free_resources.assert_not_called()
+    executor._flush_pending_transfer_responses()
+    (response,) = executor.responses[1]
+    assert response.error_msg is None
+    executor.resource_manager.free_resources.assert_not_called()
+    executor.disagg.poll_gen_transfers()
+    _assert_released_once(executor, request)
+
+
+def test_peer_notification_error_does_not_delay_logical_cancellation(executor: PyExecutor) -> None:
+    """Retry peer notification while the accepted cancellation retains its physical claims."""
+    request = _request(1)
+    executor.active_requests = [request]
+    session, aux = _published_receive(executor, request)
+    notify = session._receiver.send_cancel_to_senders
+    notify.side_effect = RuntimeError("peer notification unavailable")
+    _abort(executor, request)
+
+    executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+
+    assert request.is_finished_due_to_cancellation
+    assert executor.active_requests == []
+    assert executor.disagg._retiring_gen_receives == {1: request}
+    (response,) = executor.responses[1]
+    assert response.error_msg is None
+    notify.assert_called_once_with(1, {"ctx"})
+    executor.resource_manager.free_resources.assert_not_called()
+    aux.free_slot.assert_not_called()
+
+    executor.disagg.poll_gen_transfers()
+    assert len(executor.responses[1]) == 1
+    executor.resource_manager.free_resources.assert_not_called()
+    notify.reset_mock()
+    notify.side_effect = lambda _rid, endpoints: set(endpoints)
+    executor.disagg.poll_gen_transfers()
+    executor.disagg.poll_gen_transfers()
+    assert [call.args for call in notify.call_args_list if call.args[1]] == [(1, {"ctx"})]
+    assert len(executor.responses[1]) == 1
+    executor.resource_manager.free_resources.assert_not_called()
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    executor.disagg.poll_gen_transfers()
+    _assert_released_once(executor, request)
+    aux.free_slot.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize("expires", [False, True], ids=["settles", "grace-expires"])
+def test_cancelled_unpublished_receive_retains_local_fence_with_fixed_grace(
+    executor: PyExecutor, expires: bool
+) -> None:
+    """A logical cancel closes publication without freeing an unfinished local CUDA access.
+
+    Args:
+        executor: Real cancellation and retirement path with controlled resources.
+        expires: Whether the admission fence remains unproven past its grace.
+    """
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor.active_requests = [request]
+    clock = [0.0]
+    containment = Mock()
+    watchdog = RetirementWatchdog(containment, clock=lambda: clock[0])
+    transceiver = executor.kv_cache_transceiver
+    transceiver._transfer_worker._retirement_watchdog = watchdog
+    transceiver.request_and_receive_async = Mock()
+    ready = Mock(spec=["query"])
+    ready.query.return_value = False
+    executor.disagg._defer_unready_gen_receives = True
+    executor.disagg._unpublished_gen_receives[1] = (request, ready)
+    _abort(executor, request)
+
+    executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+
+    assert request.is_finished_due_to_cancellation
+    assert executor.active_requests == []
+    assert executor.disagg._unpublished_gen_receives == {}
+    assert executor.disagg._retiring_gen_receives == {1: request}
+    assert transceiver.has_inflight_transfer(request)
+    assert not transceiver.check_gen_transfer_complete()
+    assert transceiver._recv_reqs == {1: request}
+    (response,) = executor.responses[1]
+    assert response.error_msg is None
+    executor.resource_manager.free_resources.assert_not_called()
+
+    clock[0] = 0.75
+    _abort(executor, request, repeats=2)
+    executor._cancel_waiting_disagg_requests([])
+    executor.disagg.poll_gen_transfers()
+    assert len(watchdog._owners) == 1
+    assert watchdog.fatal is None
+    assert len(executor.responses[1]) == 1
+    transceiver.request_and_receive_async.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
+
+    clock[0] = 1.01 if expires else 0.9
+    watchdog.progress()
+    ready.query.return_value = True
+    executor.disagg.poll_gen_transfers()
+    if expires:
+        assert watchdog.fatal is not None
+        assert watchdog.fatal.started_at == 0.0
+        assert watchdog.fatal.deadline == 1.0
+        containment.assert_called_once_with(watchdog.fatal)
+        assert transceiver._recv_reqs == {1: request}
+        assert executor.disagg._retiring_gen_receives == {1: request}
+        executor.resource_manager.free_resources.assert_not_called()
+    else:
+        containment.assert_not_called()
+        assert transceiver._recv_reqs == {}
+        assert transceiver.check_gen_transfer_complete()
+        _assert_released_once(executor, request)
+        watchdog.require_retired()
+        watchdog.stop()
+    transceiver.request_and_receive_async.assert_not_called()
+
+
+@pytest.mark.parametrize("query_raises", [False, True], ids=["not-ready", "query-error"])
+def test_cancelled_receive_shutdown_preserves_roots_until_fence_settles(
+    executor: PyExecutor, query_raises: bool
+) -> None:
+    """Shutdown must not discard an unready or unobservable local CUDA claim.
+
+    Args:
+        executor: Real cancellation path with controlled teardown boundaries.
+        query_raises: Whether CUDA completion cannot currently be queried.
+    """
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor.active_requests = [request]
+    transceiver = executor.kv_cache_transceiver
+    worker = transceiver._transfer_worker
+    worker.request_shutdown = Mock()
+    worker.shutdown = Mock()
+    unrelated_root = object()
+    transceiver._send_reqs[2] = unrelated_root
+    ready = Mock(spec=["query"])
+    ready.query.return_value = False
+    if query_raises:
+        ready.query.side_effect = RuntimeError("CUDA completion query failed")
+    executor.disagg._defer_unready_gen_receives = True
+    executor.disagg._unpublished_gen_receives[1] = (request, ready)
+    _abort(executor, request)
+
+    executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+
+    assert request.is_finished_due_to_cancellation
+    (response,) = executor.responses[1]
+    assert response.error_msg is None
+    expected = "CUDA completion query failed" if query_raises else "still owns destination memory"
+    with pytest.raises(RuntimeError, match=expected):
+        transceiver.shutdown()
+    assert not getattr(transceiver, "_shutdown_complete", False)
+    assert transceiver._recv_reqs == {1: request}
+    assert transceiver._send_reqs == {2: unrelated_root}
+    assert transceiver._cancelled_receive_fences[1][0] is ready
+    assert executor.disagg._retiring_gen_receives == {1: request}
+    executor.resource_manager.free_resources.assert_not_called()
+    worker.shutdown.assert_not_called()
+
+    ready.query.side_effect = None
+    ready.query.return_value = True
+    transceiver.shutdown()
+    transceiver.shutdown()
+
+    assert transceiver._shutdown_complete
+    assert not transceiver._cancelled_receive_fences
+    assert not transceiver._recv_reqs
+    assert not transceiver._send_reqs
+    worker.shutdown.assert_called_once_with()
+    worker._retirement_watchdog.require_retired()
+    worker._retirement_watchdog.stop()
+
+
+def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last logical result must not stop background receive retirement.
+
+    Args:
+        executor: Executor retaining one real published receive session.
+        monkeypatch: Isolates the queue and CUDA control-action boundary.
+    """
+    request = _request(1)
+    executor.active_requests = [request]
+    session, _ = _published_receive(executor, request)
+    _abort(executor, request)
+    executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+    executor.is_shutdown = True
+    assert not executor.should_stop_processing
+    executor.control_requests = [SimpleNamespace(control_requires_drain=True)]
+    synchronize = Mock(side_effect=AssertionError("control ran before receive retirement"))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.synchronize", synchronize
+    )
+    executor._handle_control_request()
+    synchronize.assert_not_called()
+    executor.control_requests.clear()
+    executor.is_shutdown = False
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = MagicMock()
+    executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=([], {})))
+    fetch = Mock(return_value=[])
+    monkeypatch.setattr(executor.executor_request_queue, "get_from_request_queue", fetch)
+
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, 0)
+
+    fetch.assert_called_once_with(timedelta(0))
+    executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    executor.disagg.poll_gen_transfers()
+    executor.is_shutdown = True
+    assert executor.should_stop_processing
+    _assert_released_once(executor, request)
+
+
+def test_adp_receive_retirement_snapshot_keeps_empty_peer_live() -> None:
+    """Reuse the existing ADP vote so an empty rank cannot stop a peer's retirement."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    ranks = [
+        CoordinatorHarness(dist=group.rank(rank), enable_attention_dp=True) for rank in range(2)
+    ]
+    request = _request(1)
+    request.finish_by_reason(FinishReason.CANCELLED)
+    ranks[1].coordinator._retiring_gen_receives[1] = request
+
+    assert group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced()) == [False, False]
+
+    assert all(rank.coordinator.has_retiring_gen_receives for rank in ranks)
+    assert [len(rank.dist.calls) for rank in ranks] == [1, 1]
+    assert ranks[0].dist.calls[0] == ("tp_allgather", {"error_ids": [], "blocked_ids": []})
+    assert ranks[1].dist.calls[0] == (
+        "tp_allgather",
+        {"error_ids": [], "blocked_ids": [], "retiring_gen_receives": True},
+    )
+    ranks[1].coordinator._retiring_gen_receives.clear()
+    group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
+    assert not any(rank.coordinator.has_retiring_gen_receives for rank in ranks)
+    assert [len(rank.dist.calls) for rank in ranks] == [2, 2]
 
 
 class _ReachedScheduler(Exception):
@@ -831,7 +1333,10 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
 
     transceiver.prepare_context_requests.assert_called_once_with([])
     transceiver.request_and_receive_async.assert_not_called()
-    ready.query.assert_not_called()
+    if context:
+        ready.query.assert_not_called()
+    else:
+        ready.query.assert_called()
     assert executor.active_requests == [healthy]
     assert not healthy.is_finished
     _assert_released_once(executor, cancelled)

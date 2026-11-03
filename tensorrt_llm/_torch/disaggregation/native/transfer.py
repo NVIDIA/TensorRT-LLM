@@ -4611,6 +4611,24 @@ class TransferWorker:
             retirement_watchdog=getattr(self, "_retirement_watchdog", None),
         )
 
+    def create_receive_retirement(self, request_id: int) -> RetirementDeadline:
+        """Track an unpublished destination's local access during cancellation.
+
+        Args:
+            request_id: Executor-local identity of the retained destination.
+
+        Returns:
+            An owner using the existing receive grace and containment watchdog.
+
+        Raises:
+            RuntimeError: Physical retirement enforcement is not configured.
+        """
+        if self._retirement_watchdog is None:
+            raise RuntimeError("receive retirement requires an ownership watchdog")
+        return self._retirement_watchdog.create_owner(
+            request_id, "receive", self._config.rx_timeout_s
+        )
+
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params
         assert params is not None
