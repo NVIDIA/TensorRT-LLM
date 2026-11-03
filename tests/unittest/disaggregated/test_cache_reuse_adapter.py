@@ -27,6 +27,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, LocalLayer
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 pytestmark = pytest.mark.cpu_only
 
@@ -197,9 +198,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     cache = SimpleNamespace(
         num_committed_tokens=256,
         reuse_status=[
-            SimpleNamespace(endpoint=256, complete=True),
-            SimpleNamespace(endpoint=256, complete=encoder_hit),
-            SimpleNamespace(endpoint=256, complete=False),
+            SimpleNamespace(endpoint=256, complete=True, policy=ReusePolicy.REQUIRED),
+            SimpleNamespace(endpoint=256, complete=encoder_hit, policy=ReusePolicy.OPTIONAL),
+            SimpleNamespace(endpoint=256, complete=False, policy=ReusePolicy.OPTIONAL),
         ],
         get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
     )
@@ -231,6 +232,47 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     manager.enable_block_reuse = True
     manager.kv_cache_map.clear()
     assert adapter.get_cached_token_count_per_layer_group(req, groups) == [0, 0, 0]
+
+
+def test_v2_receive_skips_the_claimed_sinks_of_a_missing_window():
+    transceiver, req = _build_transceiver_for_kv_slice(
+        0, 513, tokens_per_block=128, is_generation_only=True
+    )
+    # Mixed-precision KV: the low-precision history, then the high-precision group with one
+    # sink token and a 66-token window whose pages were missing at resume.
+    groups = [
+        AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1),
+        AttentionLayerGroup(pool_group_idx=1, kv_head_num_per_rank=1, sliding_window_size=66),
+    ]
+    pages = [[10, 11, 12, 13, 14], [20, -1, -1, 23, 24]]
+    cache = SimpleNamespace(
+        num_committed_tokens=512,
+        reuse_status=[
+            SimpleNamespace(endpoint=512, complete=True, policy=ReusePolicy.REQUIRED),
+            SimpleNamespace(endpoint=512, complete=False, policy=ReusePolicy.SINK_REQUIRED_ONLY),
+        ],
+        get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
+    )
+    manager = SimpleNamespace(
+        enable_block_reuse=True,
+        tokens_per_block=128,
+        kv_cache_map={0: cache},
+        kv_cache_manager_py_config=SimpleNamespace(
+            layers=[
+                SimpleNamespace(layer_id=0, num_sink_tokens=0),
+                SimpleNamespace(layer_id=1, num_sink_tokens=1),
+            ]
+        ),
+        layer_to_pool_mapping_dict={0: 0, 1: 1},
+    )
+    adapter = _CacheReuseAdapterV2(manager)
+    transceiver._reuse_adapter = adapter
+    transceiver._page_table.layer_groups = groups
+    # The claimed sink page is shared with other requests; only the fresh window is received.
+    assert adapter.get_cached_token_count_per_layer_group(req, groups) == [512, 128]
+    received = transceiver._create_chunk(req).block_ids_per_layer_groups
+    for actual, expected in zip(received, [[-1, -1, -1, -1, 14], [-1, -1, -1, 23, 24]]):
+        np.testing.assert_array_equal(actual, expected)
 
 
 class TestCreateKvSliceBlockSpan:

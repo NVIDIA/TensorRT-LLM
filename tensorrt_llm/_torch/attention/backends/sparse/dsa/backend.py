@@ -21,7 +21,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
+from ..mixed_precision_high_rows import (
+    overlay_mixed_precision_high_rows,
+    restore_mixed_precision_high_rows,
+)
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -190,6 +193,10 @@ class DSATrtllmAttention(TrtllmAttention):
             page_index_scale, layer_offset = (
                 metadata.kv_cache_manager.get_primary_pool_page_index_params(local_layer_idx)
             )
+            if metadata.mixed_precision_high_restore is not None:
+                self._restore_mixed_precision_high_rows(
+                    metadata, local_layer_idx, page_index_scale, layer_offset
+                )
             total_kv_tokens = metadata.num_ctx_mla_kv_tokens
             if total_kv_tokens <= 0:
                 raise RuntimeError("NVFP4 DSA context has no active KV tokens")
@@ -285,6 +292,43 @@ class DSATrtllmAttention(TrtllmAttention):
             return compact_indices, None
 
         return topk_indices_global, None
+
+    def _restore_mixed_precision_high_rows(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        local_layer_idx: int,
+        page_index_scale: int,
+        layer_offset: int,
+    ) -> None:
+        """Fill fresh last-N high pages from the NVFP4 pool, decoded as the sparse read decodes them."""
+        requests, positions = metadata.mixed_precision_high_restore
+        tokens_per_block = metadata._cached_tokens_per_block
+        global_indices = torch.ops.trtllm.convert_req_index_to_global(
+            requests,
+            metadata._cached_block_table_ctx,
+            positions.view(-1, 1),
+            tokens_per_block,
+            1,
+            page_index_scale * tokens_per_block,
+            layer_offset,
+        )
+        rows = torch.empty(
+            (positions.numel(), 1, metadata.kv_cache_manager.head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=positions.device,
+        )
+        torch.ops.trtllm.nvfp4_mla_kv_cache_gather(
+            metadata.host_kv_cache_pool_pointers,
+            metadata.host_kv_cache_pool_mapping,
+            global_indices,
+            rows,
+            torch.empty_like(global_indices),
+            self._nvfp4_mla_kv_scale_quant_orig,
+            local_layer_idx,
+            metadata.kv_cache_manager.mla_kv_cache_residual_dim,
+            metadata._cached_num_pool_tokens,
+        )
+        restore_mixed_precision_high_rows(self, metadata, rows, requests, positions)
 
     def _remap_topk_to_global(
         self,

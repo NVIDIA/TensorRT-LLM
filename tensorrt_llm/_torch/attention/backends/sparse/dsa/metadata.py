@@ -20,6 +20,10 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
 from tensorrt_llm.logger import logger
 
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_restore_rows,
+    take_mixed_precision_high_restore,
+)
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
 from .indexer import (
@@ -98,6 +102,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Mixed-precision high page tables; -1 = not in the high pool.
     mixed_precision_high_block_table = None
     draft_mixed_precision_high_block_table = None
+    # (batch rows, positions) of the fresh last-N high rows this forward restores, or None.
+    mixed_precision_high_restore = None
+    draft_mixed_precision_high_restore = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -454,6 +461,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
         self._fill_mixed_precision_high_block_tables()
+        # Restoring requests fill their fresh last-N high rows in this forward; MTP layers on the
+        # draft manager restore their own.
+        if self.mixed_precision_high_block_table is not None:
+            self.mixed_precision_high_restore = mixed_precision_high_restore_rows(
+                take_mixed_precision_high_restore(self, self.kv_cache_manager, cached_token_lens)
+            )
+        if self.draft_mixed_precision_high_block_table is not None:
+            self.draft_mixed_precision_high_restore = mixed_precision_high_restore_rows(
+                take_mixed_precision_high_restore(
+                    self, self.draft_kv_cache_manager, cached_token_lens
+                )
+            )
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
@@ -476,6 +495,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.swap_for_draft(
             "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
         )
+        self.swap_for_draft("mixed_precision_high_restore", self.draft_mixed_precision_high_restore)
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.

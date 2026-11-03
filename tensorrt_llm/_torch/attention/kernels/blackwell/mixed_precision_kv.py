@@ -171,11 +171,13 @@ class _PagedMixedPrecisionKV:
             low_page = cutlass.Int64(tables[0, request, page])
             high_page = cutlass.Int64(tables[1, request, page])
             if cutlass.const_expr(self.write):
-                self.codec.encode(
-                    view_row,
-                    low[low_page, kv, offset, head, None],
-                    group,
-                )
+                # Restoring high pages from the low pool passes no low pages.
+                if low_page >= 0:
+                    self.codec.encode(
+                        view_row,
+                        low[low_page, kv, offset, head, None],
+                        group,
+                    )
                 if high_page >= 0:
                     high_row = high[high_page, kv, offset, head, None]
                     _copy_native(
