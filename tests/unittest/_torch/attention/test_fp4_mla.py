@@ -2802,9 +2802,12 @@ def _assert_fp4_mla_attention_decode_accuracy(
         )
 
         monkeypatch.setenv(host_4x.MIN_PAIRS_ENV, "0")
-        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch, fp4_mla_twostream
 
         monkeypatch.setenv(fp4_mla_dispatch.MIN_KV_4X_ENV, "0")
+        # the plain-4x tests exercise the split mode on short caches: keep the two-stream split off unless a test
+        # enables it through ``env`` (the two-stream tests do)
+        monkeypatch.setenv(fp4_mla_twostream.TWOSTREAM_ENV, "0")
     for name, value in (env or {}).items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv(
@@ -3171,7 +3174,7 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> No
         packed_queries=True,
         enable_4x=True,
         # the test page table is short: lift the split-mode KV floor so the multi-wave call enters the 4x envelope
-        env={host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"},
+        env={host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0", "TRTLLM_FP4_MLA_TWOSTREAM": "1"},
     )
     assert ("4x", 115) in calls and ("2x", 13) in calls, calls
 
