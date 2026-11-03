@@ -1372,8 +1372,11 @@ def _interior(phys: torch.Tensor, geo) -> torch.Tensor:
 @pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
 @pytest.mark.parametrize("axis", ["h", "w"])
 @pytest.mark.parametrize("order", [2, 4])
-def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None:
-    """Producer: Winograd inputs into halo frames; consumer: products from halo frames; both bitwise."""
+@pytest.mark.parametrize("mode", ["producer", "consumer", "both"])
+def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int, mode: str) -> None:
+    """The temporal Winograd norm with halo frames gives the compact layout's bits: writing the
+    Winograd inputs into halo frames (producer), reading the products from halo frames
+    (consumer), or both."""
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
 
     gen = torch.Generator(device="cuda").manual_seed(C)
@@ -1386,103 +1389,49 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
     in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     cache = rnd(2, P, C)
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    m_ref = [rnd(T // order, P, C).to(torch.float16) for _ in range(order + 2)]
     geo = _halo_geometry(H, W, axis)
 
-    # Producer with a Winograd-input geometry.
-    s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        x,
-        None,
-        residual,
-        in_bias,
-        cache,
-        gamma,
-        None,
-        C**0.5,
-        T,
-        order=order,
-        fp16_inputs=True,
-        return_sum=True,
-    )
-    d_phys = torch.full(
-        (order + 2, T // order, geo.frame, C), 7.0, dtype=torch.float16, device="cuda"
-    )
-    s, tail, d = jit_norm.wino_norm_silu(
-        x,
-        None,
-        residual,
-        in_bias,
-        cache,
-        gamma,
-        None,
-        C**0.5,
-        T,
-        order=order,
-        fp16_inputs=True,
-        inputs_geometry=geo,
-        return_sum=True,
-    )
-    assert d.shape == d_phys.shape
+    def norm(x, m, products_geometry=None, inputs_geometry=None):
+        return jit_norm.wino_norm_silu(
+            x,
+            m,
+            residual,
+            in_bias,
+            cache,
+            gamma,
+            None,
+            C**0.5,
+            T,
+            order=order,
+            fp16_inputs=True,
+            products_geometry=products_geometry,
+            inputs_geometry=inputs_geometry,
+            return_sum=True,
+        )
+
+    if mode == "producer":
+        s_ref, tail_ref, d_ref = norm(x, None)
+        s, tail, d = norm(x, None, inputs_geometry=geo)
+    else:
+        s_ref, tail_ref, d_ref = norm(None, m_ref)
+        m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))  # halo positions: a sentinel
+        out_geo = geo if mode == "both" else None
+        s, tail, d = norm(None, m_phys, products_geometry=geo, inputs_geometry=out_geo)
     assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref)
-    assert torch.equal(_interior(d, geo), d_ref)
-
-    # Consumer with a products geometry (halo positions hold a sentinel).
-    m_ref = [rnd(T // order, P, C).to(torch.float16) for _ in range(order + 2)]
-    s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        None,
-        m_ref,
-        residual,
-        in_bias,
-        cache,
-        gamma,
-        None,
-        C**0.5,
-        T,
-        order=order,
-        fp16_inputs=True,
-        return_sum=True,
-    )
-    m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
-    s, tail, d = jit_norm.wino_norm_silu(
-        None,
-        m_phys,
-        residual,
-        in_bias,
-        cache,
-        gamma,
-        None,
-        C**0.5,
-        T,
-        order=order,
-        fp16_inputs=True,
-        products_geometry=geo,
-        return_sum=True,
-    )
-    assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref) and torch.equal(d, d_ref)
-
-    # Both at once: products with halos in, Winograd inputs with halos out.
-    s, tail, d = jit_norm.wino_norm_silu(
-        None,
-        m_phys,
-        residual,
-        in_bias,
-        cache,
-        gamma,
-        None,
-        C**0.5,
-        T,
-        order=order,
-        fp16_inputs=True,
-        products_geometry=geo,
-        inputs_geometry=geo,
-        return_sum=True,
-    )
-    assert torch.equal(s, s_ref) and torch.equal(_interior(d, geo), d_ref)
+    if mode == "consumer":
+        assert torch.equal(d, d_ref)
+    else:
+        assert d.shape == (order + 2, T // order, geo.frame, C)
+        assert torch.equal(_interior(d, geo), d_ref)
 
 
 @cuda_op
 @pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
 @pytest.mark.parametrize("axis", ["h", "w"])
-def test_rows_and_add_bias_and_residual_geometry_match_plain(C: int, axis: str) -> None:
+def test_rows_geometry_matches_plain(C: int, axis: str) -> None:
+    """The row norm into halo frames writes the compact result's bits at the logical
+    positions and leaves the halo positions alone."""
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
 
     gen = torch.Generator(device="cuda").manual_seed(C)
@@ -1493,8 +1442,6 @@ def test_rows_and_add_bias_and_residual_geometry_match_plain(C: int, axis: str) 
     geo = _halo_geometry(H, W, axis)
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     bias = (0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-
-    # Row norm into halo frames.
     x = rnd(T * P, C)
     residual = rnd(T * P, C)
     s_ref, y_ref = jit_norm.rms_norm_silu_rows(
@@ -1518,19 +1465,30 @@ def test_rows_and_add_bias_and_residual_geometry_match_plain(C: int, axis: str) 
     edge = halo[:, 0] if axis == "h" else halo[:, :, 0]
     assert torch.all(edge == 7.0), "halo positions must stay untouched"
 
-    # Combine from halo products (plain and zero-padded output).
-    m_ref = [rnd(T, P, C).to(torch.float16) for _ in range(6)]
-    T4 = 4
-    m_ref = [mk[:1] for mk in m_ref]  # one group of four frames
-    bias_c = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    res = rnd(T4, P, C)
-    for pad in (0, 1):
-        ref = jit_norm.add_bias_and_residual(None, list(m_ref), bias_c, res, T4, H, W, pad, pad)
-        m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
-        got = jit_norm.add_bias_and_residual(
-            None, m_phys, bias_c, res, T4, H, W, pad, pad, products_geometry=geo
-        )
-        assert torch.equal(got, ref)
+
+@cuda_op
+@pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
+@pytest.mark.parametrize("axis", ["h", "w"])
+@pytest.mark.parametrize("pad", [0, 1])
+def test_add_bias_and_residual_geometry_matches_plain(C: int, axis: str, pad: int) -> None:
+    """The bias + residual add from products in halo frames gives the compact layout's bits,
+    plain and with the zero-padded output."""
+    from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
+
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    H, W, T = 6, 10, 4  # one group of four frames
+    P = H * W
+    bf = torch.bfloat16
+    geo = _halo_geometry(H, W, axis)
+    m_ref = [torch.randn(1, P, C, generator=gen, device="cuda").half() for _ in range(6)]
+    bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    res = torch.randn(T, P, C, generator=gen, device="cuda").to(bf)
+    ref = jit_norm.add_bias_and_residual(None, list(m_ref), bias, res, T, H, W, pad, pad)
+    m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
+    got = jit_norm.add_bias_and_residual(
+        None, m_phys, bias, res, T, H, W, pad, pad, products_geometry=geo
+    )
+    assert torch.equal(got, ref)
 
 
 def _peer(comps: int, groups: int, h: int, w: int, axis: str, C: int, dtype, lower: bool):
@@ -1561,33 +1519,52 @@ def _untouched(buf: torch.Tensor, axis: str, line: int) -> bool:
     return bool(torch.all(other == 7.0))
 
 
+def _push_case(C: int, axis: str, order: int, one_line: bool):
+    """Inputs of the border-push tests: frames ``x [T, P, C]``, the norm's history and gamma,
+    and the halo layout. ``one_line``: the shard is a single line along the split axis, so
+    the same line goes to both neighbours."""
+    gen = torch.Generator(device="cuda").manual_seed(C + order)
+    T = 2 * order
+    H, W = (6, 10) if not one_line else (1, 10) if axis == "h" else (6, 1)
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(torch.bfloat16)  # noqa: E731
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
+    return T, H, W, rnd(T, H * W, C), rnd(2, H * W, C), gamma, _halo_geometry(H, W, axis)
+
+
+def _border_lines(phys: torch.Tensor, geo, axis: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """The first and last logical line along the split axis of ``[.., rows, cols, C]``
+    frames."""
+    rows = slice(geo.row0, geo.row0 + geo.height)
+    cols = slice(geo.col0, geo.col0 + geo.width)
+    if axis == "h":
+        return phys[..., geo.row0, cols, :], phys[..., geo.row0 + geo.height - 1, cols, :]
+    return phys[..., rows, geo.col0, :], phys[..., rows, geo.col0 + geo.width - 1, :]
+
+
+_PUSH_CASES = pytest.mark.parametrize(
+    "C,axis,order,one_line",
+    [
+        (C, axis, order, one_line)
+        for C in (256, 48)
+        for axis in ("h", "w")
+        for order in (2, 4)
+        for one_line in (False, True)
+    ],
+)
+
+
 @cuda_op
-@pytest.mark.parametrize("C", [256, 48])
-@pytest.mark.parametrize("axis", ["h", "w"])
-@pytest.mark.parametrize("order", [2, 4])
-@pytest.mark.parametrize("one_line", [False, True])
-def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line: bool) -> None:
-    """The kernel stores the border lines of its Winograd / row output into the neighbours'
-    buffers (here: local stand-ins with their own layout) and nothing else; the host-side
-    copy writes the same lines. ``one_line``: the shard is a single line along the split
-    axis, so the same line goes to both neighbours."""
+@_PUSH_CASES
+def test_winograd_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line: bool) -> None:
+    """The norm kernel stores the border lines of its Winograd output into the neighbours'
+    buffers (local stand-ins with their own layout) and nothing else; the host-side push
+    writes the same lines."""
     from dataclasses import replace
 
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import DirectFrames, push_border
 
-    gen = torch.Generator(device="cuda").manual_seed(C + order)
-    T = 2 * order
-    H, W = (6, 10) if not one_line else (1, 10) if axis == "h" else (6, 1)
-    P = H * W
-    bf = torch.bfloat16
-    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
-    geo = _halo_geometry(H, W, axis)
-    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    x = rnd(T, P, C)
-    cache = rnd(2, P, C)
-
-    # Winograd inputs: [order + 2, T / order, positions, C] fp16.
+    T, H, W, x, cache, gamma, geo = _push_case(C, axis, order, one_line)
     comps, groups = order + 2, T // order
     bl, left, got_l, line_l = _peer(comps, groups, H, W, axis, C, torch.float16, lower=True)
     br, right, got_r, line_r = _peer(comps, groups, H, W, axis, C, torch.float16, lower=False)
@@ -1609,29 +1586,35 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
         return_sum=False,
     )
     phys = d.view(comps, groups, geo.rows, geo.cols, C)
-    if axis == "h":
-        first = phys[:, :, geo.row0, geo.col0 : geo.col0 + W]
-        last = phys[:, :, geo.row0 + H - 1, geo.col0 : geo.col0 + W]
-    else:
-        first = phys[:, :, geo.row0 : geo.row0 + H, geo.col0]
-        last = phys[:, :, geo.row0 : geo.row0 + H, geo.col0 + W - 1]
+    first, last = _border_lines(phys, geo, axis)
     assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
     assert _untouched(bl, axis, line_l) and _untouched(br, axis, line_r)
-    # The host-side push (one component at a time) writes the same lines.
     bl.fill_(7.0)
     br.fill_(7.0)
-    for k in range(comps):
+    for k in range(comps):  # the host-side push, one component at a time
         one = replace(push, left=push.left[k : k + 1], right=push.right[k : k + 1])
         push_border(one, phys[k], geo)
     assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
 
-    # Rows: [T, positions, C] bf16 into a frame-buffer window of T frames.
+
+@cuda_op
+@_PUSH_CASES
+def test_row_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line: bool) -> None:
+    """The row norm into a frame-buffer window of T frames stores its border lines into the
+    neighbours' buffers and nothing else."""
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import DirectFrames
+
+    T, H, W, x, _, gamma, geo = _push_case(C, axis, order, one_line)
+    bf = torch.bfloat16
     bl, left, got_l, line_l = _peer(1, T, H, W, axis, C, bf, lower=True)
     br, right, got_r, line_r = _peer(1, T, H, W, axis, C, bf, lower=False)
     out = torch.full((T * geo.frame, C), 7.0, dtype=bf, device="cuda")
     push = DirectFrames(out.view(1, T, geo.rows, geo.cols, C), None, axis, left, right).push()
     jit_norm.rms_norm_silu_rows(
-        x.view(T * P, C),
+        x.view(T * H * W, C),
         gamma,
         None,
         C**0.5,
@@ -1640,18 +1623,24 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
         out_geometry=replace(geo, push=push),
         return_sum=False,
     )
-    phys = out.view(1, T, geo.rows, geo.cols, C)
-    if axis == "h":
-        first = phys[:, :, geo.row0, geo.col0 : geo.col0 + W]
-        last = phys[:, :, geo.row0 + H - 1, geo.col0 : geo.col0 + W]
-    else:
-        first = phys[:, :, geo.row0 : geo.row0 + H, geo.col0]
-        last = phys[:, :, geo.row0 : geo.row0 + H, geo.col0 + W - 1]
+    first, last = _border_lines(out.view(1, T, geo.rows, geo.cols, C), geo, axis)
     assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
     assert _untouched(bl, axis, line_l) and _untouched(br, axis, line_r)
-    # A window in the middle of a deeper buffer: only its groups are addressed.
-    bl.fill_(7.0)
-    br.fill_(7.0)
-    deep = DirectFrames(out.view(1, T, geo.rows, geo.cols, C), None, axis, left, right)
+
+
+@cuda_op
+@pytest.mark.parametrize("axis", ["h", "w"])
+def test_push_of_a_window_addresses_its_frames(axis: str) -> None:
+    """A window in the middle of a deeper buffer pushes into the matching frames of the
+    neighbours' buffers."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import DirectFrames
+
+    C, T, H, W = 48, 4, 6, 10
+    geo = _halo_geometry(H, W, axis)
+    _, left, _, _ = _peer(1, T, H, W, axis, C, torch.bfloat16, lower=True)
+    _, right, _, _ = _peer(1, T, H, W, axis, C, torch.bfloat16, lower=False)
+    out = torch.zeros((1, T, geo.rows, geo.cols, C), dtype=torch.bfloat16, device="cuda")
+    deep = DirectFrames(out, None, axis, left, right)
     narrow = deep.push(1, T - 2)
-    assert narrow.left.shape[1] == T - 2 and narrow.left.data_ptr() == push.left[:, 1].data_ptr()
+    assert narrow.left.shape[1] == T - 2
+    assert narrow.left.data_ptr() == deep.push().left[:, 1].data_ptr()

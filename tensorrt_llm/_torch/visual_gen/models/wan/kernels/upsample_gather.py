@@ -260,6 +260,38 @@ def can_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
     )
 
 
+def _check_temp(temp: torch.Tensor, batch: int, frames: int) -> None:
+    """The packed conv output is a channels-last bf16 / fp16 ``[B*T, 4*Cout, H+1, W+1]``."""
+    if temp.dim() != 4 or temp.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("temp must be a bf16 or fp16 [B*T, 4*Cout, H+1, W+1] tensor")
+    if not temp.is_contiguous(memory_format=torch.channels_last):
+        raise ValueError("temp must be channels-last")
+    if temp.shape[0] != batch * frames or temp.shape[1] % 4:
+        raise ValueError("temp must hold B*T frames of 4*Cout channels")
+
+
+def _check_shortcut(
+    s: torch.Tensor,
+    dtype: torch.dtype,
+    batch: int,
+    height: int,
+    width: int,
+    expanded: tuple[int, int],
+    want: tuple[int, int],
+) -> None:
+    """The DupUp3D shortcut is a channels-last-3d ``[B, Cin, Tr, H, W]`` of ``dtype`` whose
+    expansion ``(Tr * factor_t, Cin * repeats)`` = ``expanded`` matches ``want`` = ``(T +
+    crop, 4 * Cout * factor_t)``."""
+    if s.dim() != 5 or s.dtype != dtype:
+        raise ValueError("shortcut must be a 5D tensor of temp's dtype")
+    if not s.is_contiguous(memory_format=torch.channels_last_3d):
+        raise ValueError("shortcut must be channels_last_3d")
+    if s.shape[0] != batch or tuple(s.shape[3:]) != (height, width):
+        raise ValueError("shortcut spatial mismatch")
+    if expanded != want:
+        raise ValueError("shortcut frames or channels do not match")
+
+
 def upsample_gather(
     temp: torch.Tensor,
     shortcut: torch.Tensor | None,
@@ -276,12 +308,7 @@ def upsample_gather(
     Cin, Tr, H, W]`` channels_last_3d, ``Tr * factor_t == T + crop``, ``Cin * repeats == 4 *
     Cout * factor_t``) added while writing; ``crop`` leading output frames of the shortcut's
     expansion are dropped (the first chunk). All inputs must be 16-byte aligned."""
-    if temp.dim() != 4 or temp.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError("temp must be a bf16 or fp16 [B*T, 4*Cout, H+1, W+1] tensor")
-    if not temp.is_contiguous(memory_format=torch.channels_last):
-        raise ValueError("temp must be channels-last")
-    if temp.shape[0] != batch * frames or temp.shape[1] % 4:
-        raise ValueError("temp must hold B*T frames of 4*Cout channels")
+    _check_temp(temp, batch, frames)
     cout = temp.shape[1] // 4
     height, width = temp.shape[2] - 1, temp.shape[3] - 1
     if shortcut is None:
@@ -289,18 +316,11 @@ def upsample_gather(
         factor_t, repeats, crop = 1, 1, 0
     if height < 1 or width < 1 or not can_upsample_gather(cout, factor_t, repeats):
         raise ValueError("unsupported upsample gather shape")
-    cin = 0
     if shortcut is not None:
-        s = shortcut
-        if s.dim() != 5 or s.dtype != temp.dtype:
-            raise ValueError("shortcut must be a 5D tensor of temp's dtype")
-        if not s.is_contiguous(memory_format=torch.channels_last_3d):
-            raise ValueError("shortcut must be channels_last_3d")
-        if s.shape[0] != batch or tuple(s.shape[3:]) != (height, width):
-            raise ValueError("shortcut spatial mismatch")
-        if s.shape[2] * factor_t != frames + crop or s.shape[1] * repeats != cout * factor_t * 4:
-            raise ValueError("shortcut frames or channels do not match")
-        cin = s.shape[1]
+        expanded = (shortcut.shape[2] * factor_t, shortcut.shape[1] * repeats)
+        want = (frames + crop, cout * factor_t * 4)
+        _check_shortcut(shortcut, temp.dtype, batch, height, width, expanded, want)
+    cin = shortcut.shape[1] if shortcut is not None else 0
     check_bias(bias, cout, temp.dtype, "Cout")
     check_aligned(16, temp=temp, shortcut=shortcut, bias=bias)
     out = torch.empty(

@@ -201,7 +201,7 @@ def _avg_down_add_kernel(
     return compile_cached("trtllm_wan_vae_frame_ops", name, compile_fn, [__file__])
 
 
-def avg_down_add(
+def _check_avg_down_add(
     x: torch.Tensor,
     r: torch.Tensor,
     out_height: int,
@@ -211,13 +211,8 @@ def avg_down_add(
     factor_s: int,
     group_size: int,
     pad_t: int,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``
-    contiguous 16-byte aligned bf16 with ``P == out_height * factor_s * in_width``, ``pad_t``
-    zero frames in front of ``r``; ``bias`` (contiguous ``[Cout]`` bf16) is the downsample
-    conv's bias when that conv ran without it. ``group_size`` must divide ``factor_t *
-    factor_s^2``. Returns ``y`` like ``x``."""
+) -> None:
+    """The operand rules of :func:`avg_down_add`."""
     for name, t in (("x", x), ("r", r)):
         if t.dtype != torch.bfloat16 or not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous bf16")
@@ -245,6 +240,30 @@ def avg_down_add(
             "avg_down_add needs cin * factor == cout * group_size, group_size dividing factor "
             "and channel counts that are multiples of 8"
         )
+
+
+def avg_down_add(
+    x: torch.Tensor,
+    r: torch.Tensor,
+    out_height: int,
+    out_width: int,
+    in_width: int,
+    factor_t: int,
+    factor_s: int,
+    group_size: int,
+    pad_t: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``
+    contiguous 16-byte aligned bf16 with ``P == out_height * factor_s * in_width``, ``pad_t``
+    zero frames in front of ``r``; ``bias`` (contiguous ``[Cout]`` bf16) is the downsample
+    conv's bias when that conv ran without it. ``group_size`` must divide ``factor_t *
+    factor_s^2``. Returns ``y`` like ``x``."""
+    _check_avg_down_add(
+        x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t
+    )
+    out_frames, out_positions, cout = x.shape
+    cin = r.shape[2]
     check_bias(bias, cout, torch.bfloat16, "Cout")
     check_aligned(16, x=x, r=r, bias=bias)
     y = torch.empty_like(x)

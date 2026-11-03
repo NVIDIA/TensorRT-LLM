@@ -112,8 +112,7 @@ class _Conv:
         self.w = self.graph.tensor(
             name="W", dim=list(w.shape), stride=list(w.stride()), data_type=dt
         )
-        y_out = y
-        y = self.graph.conv_fprop(
+        conv = self.graph.conv_fprop(
             image=self.x,
             weight=self.w,
             padding=list(padding),
@@ -122,16 +121,14 @@ class _Conv:
         )
         self.b = None
         if has_bias:
-            cout = w.shape[0]
-            bias_dim = [1, cout] + [1] * (x.dim() - 2)
+            bias_dim = [1, w.shape[0]] + [1] * (x.dim() - 2)
             self.b = self.graph.tensor(
                 name="B", dim=bias_dim, stride=self._bias_stride(bias_dim), data_type=dt
             )
-            y = self.graph.bias(input=y, bias=self.b)
-        y.set_output(True).set_data_type(dt).set_dim(list(y_out.shape)).set_stride(
-            list(y_out.stride())
-        )
-        self.y = y
+            conv = self.graph.bias(input=conv, bias=self.b)
+        # The graph's output node, laid out like the caller's output tensor y.
+        self.y = conv.set_output(True).set_data_type(dt).set_dim(list(y.shape))
+        self.y.set_stride(list(y.stride()))
         self.graph.validate()
         self.graph.build_operation_graph()
         self.graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
@@ -167,45 +164,54 @@ class _Conv:
         """Pick the plan: the remembered one, else benchmark the supported plans and keep the
         fastest one whose output is finite."""
         self.x_device = x.device
-        remembered = _load_choices().get(key)
-        if remembered is not None and remembered < self.plan_count:
-            try:
-                self.workspace = self._build(remembered)
-                self.plan = remembered
-                return
-            except Exception:  # noqa: BLE001 - a stale plan index from another cuDNN build
-                pass
+        if self._restore(_load_choices().get(key)):
+            return
         best = None
         for index in range(self.plan_count):
-            try:
-                workspace = self._build(index)
-                # NaN-filled first: a plan that reports success but leaves part or all of the
-                # output unwritten leaves NaNs behind, and non-finite results show up too. The
-                # finiteness check catches those; it does not check finite values.
-                y.fill_(float("nan"))
-                self._run(index, workspace, x, w, b, y)
-                torch.cuda.synchronize()
-            except Exception:  # noqa: BLE001 - plans the engine cannot build/run are skipped
-                continue
-            if not torch.isfinite(y).all():
-                continue
-            # warm, then time a few launches
-            for _ in range(2):
-                self._run(index, workspace, x, w, b, y)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(5):
-                self._run(index, workspace, x, w, b, y)
-            torch.cuda.synchronize()
-            dt = (time.perf_counter() - t0) / 5
-            if best is None or dt < best[0]:
-                best = (dt, index, workspace)
+            timed = self._time_plan(index, x, w, b, y)
+            if timed is not None and (best is None or timed[0] < best[0]):
+                best = (*timed, index)
         if best is None:
             raise RuntimeError("cuDNN frontend: no plan produced a finite output")
-        _, self.plan, self.workspace = best
+        _, self.workspace, self.plan = best
         _save_choice(key, self.plan)
         # The caller's output must hold the chosen plan's result, not the last candidate's.
         self._run(self.plan, self.workspace, x, w, b, y)
+
+    def _restore(self, remembered: int | None) -> bool:
+        """Take the plan remembered for this key, if it still builds."""
+        if remembered is None or remembered >= self.plan_count:
+            return False
+        try:
+            self.workspace = self._build(remembered)
+        except Exception:  # noqa: BLE001 - a stale plan index from another cuDNN build
+            return False
+        self.plan = remembered
+        return True
+
+    def _time_plan(self, index: int, x, w, b, y) -> tuple[float, torch.Tensor] | None:
+        """``(seconds per launch, workspace)`` of plan ``index``, or None when it cannot build or
+        run or leaves a non-finite output."""
+        try:
+            workspace = self._build(index)
+            # NaN-filled first: a plan that reports success but leaves part or all of the
+            # output unwritten leaves NaNs behind, and non-finite results show up too. The
+            # finiteness check catches those; it does not check finite values.
+            y.fill_(float("nan"))
+            self._run(index, workspace, x, w, b, y)
+            torch.cuda.synchronize()
+        except Exception:  # noqa: BLE001 - plans the engine cannot build/run are skipped
+            return None
+        if not torch.isfinite(y).all():
+            return None
+        for _ in range(2):  # warm, then time a few launches
+            self._run(index, workspace, x, w, b, y)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(5):
+            self._run(index, workspace, x, w, b, y)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t0) / 5, workspace
 
 
 _convs: dict[tuple, _Conv] = {}

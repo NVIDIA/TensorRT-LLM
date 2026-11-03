@@ -512,35 +512,16 @@ def rms_norm_silu_rows(
     With ``out_geometry`` the rows are ``frames`` frames of ``height * width`` positions and
     ``out`` holds frames with halo rows / columns (``[frames * rows * cols, C]``); only the
     logical positions are written."""
+    _check_rows(x=x, residual=residual, gamma=gamma, bias=bias, in_bias=in_bias, out=out)
     rows, channels = x.shape
-    for name, t in (
-        ("x", x),
-        ("residual", residual),
-        ("gamma", gamma),
-        ("bias", bias),
-        ("in_bias", in_bias),
-        ("out", out),
-    ):
-        if t is not None and t.dtype is not torch.bfloat16:
-            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
-    if channels % _VEC:
-        raise ValueError("channels must be a multiple of 8")
-    if out_geometry is not None and out_geometry.identity:
-        out_geometry = None
-    height = width = 0
-    if out_geometry is not None:
-        height, width = out_geometry.height, out_geometry.width
-        if out is None or rows != frames * height * width:
-            raise ValueError("out_geometry needs a destination and frames * height * width rows")
-        if out.shape[0] != frames * out_geometry.frame:
-            raise ValueError("out does not match out_geometry")
-    else:
-        frames = 1
-    device = x.device.index
-    opts = dict(device=x.device, dtype=torch.bfloat16)
-    y = out if out is not None else torch.empty((rows, channels), **opts)
+    out_geometry, frames = _rows_geometry(out_geometry, out, rows, frames)
+    height, width = (out_geometry.height, out_geometry.width) if out_geometry else (0, 0)
+    out_rows = frames * out_geometry.frame if out_geometry is not None else rows
+    y = _destination(out, (out_rows, channels), x.device)
     want_sum = return_sum and residual is not None
-    out_sum = torch.empty((rows, channels), **opts) if want_sum else None
+    out_sum = (
+        torch.empty((rows, channels), device=x.device, dtype=torch.bfloat16) if want_sum else None
+    )
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         fp16_winograd=False,
@@ -561,7 +542,7 @@ def rms_norm_silu_rows(
     )
     _launch(
         variant,
-        device,
+        x.device.index,
         x=x,
         m_ptr=0,
         d=None,
@@ -609,45 +590,13 @@ def add_bias_and_residual(
     products carry halo rows / columns around their ``height`` x ``width`` logical positions.
     ``out``: a contiguous bf16 destination of the result's shape on the input's device,
     written and returned."""
-    if (x is None) == (m is None):
-        raise ValueError("exactly one of x and m")
-    if products_geometry is not None and products_geometry.identity:
-        products_geometry = None
-    if products_geometry is not None and (
-        x is not None
-        or (products_geometry.height, products_geometry.width) != (height, width)
-        or m[0].shape[1] != products_geometry.frame
-    ):
-        raise ValueError("products_geometry must describe the products' frames")
+    products_geometry = _add_input_geometry(x, m, products_geometry, height, width)
     src = x if x is not None else m[0]
     channels = src.shape[2]
-    positions = height * width
-    if products_geometry is None and src.shape[1] != positions:
-        raise ValueError("height * width must equal the position count")
-    device = src.device.index
-    order, m_ptr, stride = 1, 0, 0
-    fp16_winograd = False
-    if m is not None:
-        order = len(m) - 2
-        if order not in (2, 4) or frames % order:
-            raise ValueError(
-                "m must hold order + 2 tensors (order 2 or 4) and T must be divisible by the order"
-            )
-        fp16_winograd = m[0].dtype == torch.float16
-        m_ptr, stride = _stacked_products(m, m[0].dtype)
+    order, m_ptr, stride = _products_layout(m, frames) if m is not None else (1, 0, 0)
+    fp16_winograd = m is not None and m[0].dtype == torch.float16
     padded = pad_h > 0 or pad_w > 0
-    shape = (frames, (height + pad_h) * (width + pad_w), channels)
-    if out is None:
-        y = torch.empty(shape, device=src.device, dtype=torch.bfloat16)
-    elif (
-        tuple(out.shape) != shape
-        or out.dtype != torch.bfloat16
-        or not out.is_contiguous()
-        or out.device != src.device
-    ):
-        raise ValueError(f"out must be a contiguous bf16 {list(shape)} tensor on {src.device}")
-    else:
-        y = out
+    y = _destination(out, (frames, (height + pad_h) * (width + pad_w), channels), src.device)
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         fp16_winograd=fp16_winograd,
@@ -666,7 +615,7 @@ def add_bias_and_residual(
     )
     _launch(
         variant,
-        device,
+        src.device.index,
         x=x,
         m_ptr=m_ptr,
         d=None,
@@ -681,7 +630,7 @@ def add_bias_and_residual(
         out_sum=None,
         y_tail=None,
         y=y,
-        positions=positions,
+        positions=height * width,
         channels=channels,
         frames=frames,
         height=height,
@@ -692,3 +641,80 @@ def add_bias_and_residual(
         in_geo=products_geometry,
     )
     return y
+
+
+def _check_rows(**tensors: torch.Tensor | None) -> None:
+    """The row kernel's operands are bf16 (absent ones None) with a channel count that is a
+    multiple of 8 (``x`` is ``[N, C]``)."""
+    for name, t in tensors.items():
+        if t is not None and t.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
+    if tensors["x"].shape[1] % _VEC:
+        raise ValueError("channels must be a multiple of 8")
+
+
+def _rows_geometry(
+    geometry: FrameGeometry | None, out: torch.Tensor | None, rows: int, frames: int
+) -> tuple[FrameGeometry | None, int]:
+    """``(geometry, frames)`` of a row call: no geometry (and one frame) for plain rows or an
+    identity layout, else checked against the destination and the row count."""
+    if geometry is None or geometry.identity:
+        return None, 1
+    if out is None or rows != frames * geometry.height * geometry.width:
+        raise ValueError("out_geometry needs a destination and frames * height * width rows")
+    if out.shape[0] != frames * geometry.frame:
+        raise ValueError("out does not match out_geometry")
+    return geometry, frames
+
+
+def _add_input_geometry(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    geometry: FrameGeometry | None,
+    height: int,
+    width: int,
+) -> FrameGeometry | None:
+    """The products' halo layout of an add call (None for compact input), after checking
+    that exactly one of ``x`` / ``m`` is given and that the input matches ``height x width``."""
+    if (x is None) == (m is None):
+        raise ValueError("exactly one of x and m")
+    if geometry is not None and geometry.identity:
+        geometry = None
+    if geometry is not None and (
+        x is not None
+        or (geometry.height, geometry.width) != (height, width)
+        or m[0].shape[1] != geometry.frame
+    ):
+        raise ValueError("products_geometry must describe the products' frames")
+    src = x if x is not None else m[0]
+    if geometry is None and src.shape[1] != height * width:
+        raise ValueError("height * width must equal the position count")
+    return geometry
+
+
+def _products_layout(m: list[torch.Tensor], frames: int) -> tuple[int, int, int]:
+    """``(order, base address, component stride)`` of the temporal Winograd products."""
+    order = len(m) - 2
+    if order not in (2, 4) or frames % order:
+        raise ValueError(
+            "m must hold order + 2 tensors (order 2 or 4) and T must be divisible by the order"
+        )
+    m_ptr, stride = _stacked_products(m, m[0].dtype)
+    return order, m_ptr, stride
+
+
+def _destination(
+    out: torch.Tensor | None, shape: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    """``out`` after checking it is a contiguous bf16 ``shape`` tensor on ``device``, or a new
+    one."""
+    if out is None:
+        return torch.empty(shape, device=device, dtype=torch.bfloat16)
+    if (
+        tuple(out.shape) != tuple(shape)
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.device != device
+    ):
+        raise ValueError(f"out must be a contiguous bf16 {list(shape)} tensor on {device}")
+    return out

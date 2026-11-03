@@ -86,8 +86,9 @@ from .wino_vae_shard import DirectFrames, Shard, push_border
 
 # One slot of the causal-conv cache list threaded through a chunked encode / decode: the
 # conv's history frames ``[B, C, 0..2, H, W]``; the conv itself when it keeps them in its
-# frame buffer (``_FrameBuffer.history`` hands them over); the ``"Rep"``
-# sentinel of the resampler's time conv; None before the first chunk.
+# frame buffer (``_FrameBuffer.history`` hands them over); ``"Rep"`` (the native Wan marker,
+# kept as is): the upsample time conv's first chunk passed through unconvolved, so its next
+# chunk starts from zero history; None before the first chunk.
 CacheEntry: TypeAlias = "torch.Tensor | WinoVaeCausalConv3d | Literal['Rep'] | None"
 
 
@@ -294,20 +295,26 @@ def _patchify_channels_last(x: torch.Tensor, patch_size: int) -> torch.Tensor:
     return y.view(b, t, hp, wp, c * p * p).permute(0, 4, 1, 2, 3)
 
 
-def materialize(x: "torch.Tensor | DeferredSum") -> torch.Tensor:
+def materialize(x: "torch.Tensor | DeferredSum", out: torch.Tensor | None = None) -> torch.Tensor:
     """``x`` as a tensor. A :class:`DeferredSum` is added up here: one add_bias_and_residual
     kernel pass, or eager adds where the kernel does not apply (batched input, kernels
-    unavailable).
-    Winograd products only exist when the kernels ran, so they always take the kernel."""
+    unavailable). Winograd products only exist when the kernels ran, so they always take the
+    kernel.
+
+    ``out``: a channels-last destination of ``x``'s shape (e.g. a conv's frame-buffer window),
+    written and returned. The kernel writes the sum there directly; a plain tensor, or the
+    eager fallback's sum, is copied in."""
     if not isinstance(x, DeferredSum):
-        return x
+        return x if out is None else out.copy_(x)
     if _can_fuse(x):
         h, w = x.shape[-2:]
-        return frames_to_video(_add_bias_and_residual(x, 0, 0), h, w)
+        y = _add_bias_and_residual(x, 0, 0, out=frames_view(out) if out is not None else None)
+        return out if out is not None else frames_to_video(y, h, w)
     s = apply_in_bias(x.source, x.bias)
     if x.residual is not None:
         s = s + x.residual
-    return _channels_last_3d_if_needed(s)
+    s = _channels_last_3d_if_needed(s)
+    return s if out is None else out.copy_(s)
 
 
 def materialize_padded_2d(x: DeferredSum) -> torch.Tensor:
@@ -351,7 +358,8 @@ class WinogradInputs:
 
 def _history_frames(entry: CacheEntry) -> torch.Tensor | Literal["Rep"] | None:
     """A ``feat_cache`` entry as the history-frame tensor the eager and Winograd paths read:
-    a conv that left itself there (frame-buffer path) hands over its two history frames."""
+    a conv that left itself there (frame-buffer path) hands over its two history frames; the
+    ``"Rep"`` marker (zero history next) and None pass through."""
     return entry.frame_buffer.history() if isinstance(entry, WinoVaeCausalConv3d) else entry
 
 
@@ -401,32 +409,20 @@ class WinoVaeRMSNorm(WanRMSNorm):
         conv frame-buffer window; with ``out_geometry`` its frames carry halo lines and the
         logical positions are written). ``return_sum``: return ``(s, SiLU(norm(s)))``."""
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-        in_bias = None
-        if isinstance(x, DeferredSum):
-            src = x.source if isinstance(x.source, torch.Tensor) else None
-            if (
-                src is not None
-                and x.residual is not None
-                and self.channel_first
-                and rms_norm_silu_supported(src)
-                and rms_norm_silu_supported(x.residual)
-            ):
-                s, y = add_rms_norm_silu(
-                    src,
-                    x.residual,
-                    self.gamma,
-                    bias,
-                    self.scale,
-                    in_bias=x.bias,
-                    out=out,
-                    out_geometry=out_geometry,
-                    return_sum=return_sum,
-                )
-                return (s, y) if return_sum else y
-            if src is not None and x.residual is None and not return_sum:
-                x, in_bias = src, x.bias  # the kernel adds the deferred bias while reading
-            else:
-                x = materialize(x)
+        if isinstance(x, DeferredSum) and self._fuses_residual(x):
+            s, y = add_rms_norm_silu(
+                x.source,
+                x.residual,
+                self.gamma,
+                bias,
+                self.scale,
+                in_bias=x.bias,
+                out=out,
+                out_geometry=out_geometry,
+                return_sum=return_sum,
+            )
+            return (s, y) if return_sum else y
+        x, in_bias = self._plain_input(x, return_sum)
         if self.channel_first and rms_norm_silu_supported(x):
             y = rms_norm_silu(
                 x,
@@ -440,6 +436,29 @@ class WinoVaeRMSNorm(WanRMSNorm):
         else:
             y = _copy_into(out, F.silu(self.forward(apply_in_bias(x, in_bias))), out_geometry)
         return (x, y) if return_sum else y
+
+    def _fuses_residual(self, x: DeferredSum) -> bool:
+        """Whether one add_rms_norm_silu pass takes ``x`` (a tensor source plus a residual)."""
+        return (
+            isinstance(x.source, torch.Tensor)
+            and x.residual is not None
+            and self.channel_first
+            and rms_norm_silu_supported(x.source)
+            and rms_norm_silu_supported(x.residual)
+        )
+
+    @staticmethod
+    def _plain_input(
+        x: "torch.Tensor | DeferredSum", return_sum: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(tensor, deferred bias or None)`` for the plain norm: a deferred sum that is only
+        a tensor plus a bias keeps the bias for the kernel to add while reading (when the sum
+        itself is not needed); anything else is added up first."""
+        if not isinstance(x, DeferredSum):
+            return x, None
+        if isinstance(x.source, torch.Tensor) and x.residual is None and not return_sum:
+            return x.source, x.bias
+        return materialize(x), None
 
     def norm_silu_winograd(
         self,
@@ -659,13 +678,15 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         self,
         in_channels: int,
         out_channels: int,
+        # (T, H, W); an int applies to all three axes (nn.Conv3d normalizes to a 3-tuple).
         kernel_size: int | tuple[int, int, int],
         stride: int | tuple[int, int, int] = 1,
         padding: int | tuple[int, int, int] = 0,
     ) -> None:
         super().__init__(in_channels, out_channels, kernel_size, stride, padding)
-        # The Winograd, frame-buffer and single-frame paths take dense unit-stride convs.
-        self._unit_stride = (
+        # Stride 1 and no dilation on every axis, one group: the only convs the Winograd,
+        # frame-buffer and single-frame paths take.
+        self._dense_unit_stride = (
             self.stride == (1, 1, 1) and self.dilation == (1, 1, 1) and self.groups == 1
         )
         # When set, forward() leaves the bias out; the caller hands it to the consumer kernel.
@@ -793,7 +814,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         )
 
     def buffer_eligible(self, x: "torch.Tensor | DeferredSum") -> bool:
-        return x.shape[0] == 1 and self.kernel_size[0] == 3 and self._unit_stride
+        return x.shape[0] == 1 and self.kernel_size[0] == 3 and self._dense_unit_stride
 
     def _derived_weight(self, key: tuple, build: Callable[[], Any]) -> Any:
         """A tensor derived from the weight, built on first use and rebuilt when the weight
@@ -826,7 +847,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
             and frames >= 2
             and frames % 2 == 0
             and self.kernel_size == (3, 3, 3)
-            and self._unit_stride
+            and self._dense_unit_stride
         )
 
     def spatial_eligible(
@@ -1034,7 +1055,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
             self.kernel_size[0] == 3
             and self._padding[4] == 2
             and x.shape[0] == 1
-            and self._unit_stride
+            and self._dense_unit_stride
             and (cache_x is None or cache_x.shape[2] <= 2)
             and self.spatial_eligible(x.shape[3], x.shape[4], _SPATIAL_TILE_STACKED_K)
         )
@@ -1069,13 +1090,9 @@ class WinoVaeResample(WanResample):
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
         super().__init__(dim, mode, upsample_out_dim)
         self._packed: tuple[tuple, torch.Tensor, torch.Tensor | None] | None = None
-        # Downsample conv biases left out of the convs; the owning block's shortcut-add kernel
-        # adds ``pending_bias``: the space conv's (downsample2d, and the first chunk of
-        # downsample3d), or the time conv's with the space conv's folded through its taps
-        # (later downsample3d chunks). Only a block that takes ``pending_bias`` may enable the
-        # deferral.
+        # When set, the downsample modes run their convs bias-free and return a DeferredSum
+        # carrying the bias for the caller to add (the owning block's shortcut-add kernel).
         self.defer_bias_to_consumer = False
-        self.pending_bias: torch.Tensor | None = None
         self._time_bias: tuple[tuple, torch.Tensor] | None = None
         self.shard: Shard | None = None
         if mode == "upsample3d":
@@ -1120,11 +1137,12 @@ class WinoVaeResample(WanResample):
         x = materialize(x)
         if prepadded:
             batch_size, frames = 1, x.shape[0]
-            y = self._downsample_space(x, batch_size, prepadded=True)
+            y, bias = self._downsample_space(x, batch_size, prepadded=True)
         else:
             batch_size, frames = x.shape[0], x.shape[2]
-            y = self._downsample_space(_video_to_frames_2d(x), batch_size)
-        return self._downsample_time(y, batch_size, frames, feat_cache, feat_idx)
+            y, bias = self._downsample_space(_video_to_frames_2d(x), batch_size)
+        y, bias = self._downsample_time(y, bias, batch_size, frames, feat_cache, feat_idx)
+        return DeferredSum(y, bias=bias) if bias is not None else y
 
     def _upsample_space(
         self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
@@ -1196,26 +1214,39 @@ class WinoVaeResample(WanResample):
         batch_size, channels, frames, height, width = x.shape
         idx = feat_idx[0]
         if feat_cache[idx] is None:
+            # "Rep": the first chunk passes through unconvolved; the next one starts from zero
+            # history.
             feat_cache[idx] = "Rep"
             feat_idx[0] += 1
             return materialize(x)
-        fuse_interleave = kernels_available() and batch_size == 1
-        self.time_conv.defer_bias = fuse_interleave
-        if fuse_interleave and self.shard is None:
-            x = self._time_conv_buffered(x, feat_cache, idx, (height, width))
+        # The time conv makes 2C channels per input frame: the two output frames of each input
+        # frame, side by side. The interleave kernel puts them in time order and adds the conv's
+        # bias in the same pass (batch 1, kernels available); the conv then runs bias-free.
+        fused = kernels_available() and batch_size == 1
+        self.time_conv.defer_bias = fused
+        if fused and self.shard is None:
+            y = self._time_conv_buffered(x, feat_cache, idx, (height, width))
         else:
-            x = self._time_conv_eager(materialize(x), feat_cache, idx)
+            y = self._time_conv_eager(materialize(x), feat_cache, idx)
         feat_idx[0] += 1
+        return self._interleave_time(y, fused, channels, frames, height, width)
 
-        if fuse_interleave:
-            # Interleave the two channel halves along time and add the time conv's bias.
+    def _interleave_time(
+        self, y: torch.Tensor, fused: bool, channels: int, frames: int, height: int, width: int
+    ) -> torch.Tensor:
+        """The time conv output ``[B, 2C, T, H, W]`` as ``[B, C, 2T, H, W]``: channel half ``k``
+        of input frame ``t`` becomes output frame ``2t + k``. One copy either way: the
+        interleave kernel (which also adds the deferred bias), or ``torch.stack`` (the bias
+        already in ``y``)."""
+        if fused:
             from .kernels.frame_ops import interleave_bias
 
-            u = frames_view(_channels_last_3d_if_needed(x))
+            u = frames_view(_channels_last_3d_if_needed(y))
             return frames_to_video(interleave_bias(u, self.time_conv.bias), height, width)
-        x = x.reshape(batch_size, 2, channels, frames, height, width)
-        x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-        return x.reshape(batch_size, channels, frames * 2, height, width)
+        batch_size = y.shape[0]
+        halves = y.reshape(batch_size, 2, channels, frames, height, width)  # a view
+        y = torch.stack((halves[:, 0], halves[:, 1]), 3)  # the copy
+        return y.reshape(batch_size, channels, frames * 2, height, width)
 
     def _time_conv_buffered(
         self,
@@ -1226,14 +1257,12 @@ class WinoVaeResample(WanResample):
     ) -> torch.Tensor:
         """The time conv of a chunk on its frame buffer: ``x`` is added up (or copied) into the
         buffer window, the conv reads the history in place, and the cache entry becomes the
-        conv. After the ``"Rep"`` sentinel the buffer starts a clip (zero history)."""
+        conv. After the ``"Rep"`` marker the buffer starts a clip (zero history)."""
         tc = self.time_conv
         entry = feat_cache[idx]
-        window = tc.buffer_begin(None if isinstance(entry, str) else entry, x.shape[2], x, spatial)
-        if isinstance(x, DeferredSum) and _can_fuse(x):
-            _add_bias_and_residual(x, 0, 0, out=frames_view(window))
-        else:
-            window.copy_(materialize(x))
+        # "Rep" (the previous chunk passed through unconvolved): start a clip, zero history.
+        window = tc.buffer_begin(None if entry == "Rep" else entry, x.shape[2], x, spatial)
+        materialize(x, out=window)
         feat_cache[idx] = tc
         return tc.buffer_conv(x.shape[2])
 
@@ -1243,25 +1272,23 @@ class WinoVaeResample(WanResample):
         """The time conv of a chunk with its history prepended by copy; the chunk's last frames
         become the cache entry."""
         entry = _history_frames(feat_cache[idx])
+        # "Rep": the previous chunk passed through unconvolved, so this one has zero history.
+        zero_history = isinstance(entry, str) and entry == "Rep"
         cache_x = x[:, :, -CACHE_T:, :, :]
-        if cache_x.shape[2] < 2 and entry != "Rep":
-            cache_x = torch.cat(
-                [_to_device_if_needed(entry[:, :, -1, :, :].unsqueeze(2), cache_x.device), cache_x],
-                dim=2,
-            )
-        if cache_x.shape[2] < 2 and entry == "Rep":
-            cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
-        y = self.time_conv(x) if entry == "Rep" else self.time_conv(x, entry)
+        if cache_x.shape[2] < 2:
+            prev = torch.zeros_like(cache_x) if zero_history else entry[:, :, -1:, :, :]
+            cache_x = torch.cat([_to_device_if_needed(prev, cache_x.device), cache_x], dim=2)
+        y = self.time_conv(x) if zero_history else self.time_conv(x, entry)
         feat_cache[idx] = cache_x
         return y
 
     def _downsample_space(
         self, x_4d: torch.Tensor, batch_size: int, *, prepadded: bool = False
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The stride-2 3x3 conv of the downsample modes on frames ``[B*T, C, H, W]``, after its
         zero pad (the shard's pad under sharding), or on an input that already carries the zero
-        row and column (``prepadded``). When the owning residual down block consumes the bias
-        (``defer_bias_to_consumer``), the conv runs bias-free and leaves it in ``pending_bias``."""
+        row and column (``prepadded``). Returns ``(frames, bias not yet added or None)``: with
+        ``defer_bias_to_consumer`` the conv runs bias-free and hands its bias back."""
         if prepadded:
             x_4d = _channels_last_2d_if_needed(x_4d)
             if self.shard is not None:
@@ -1277,20 +1304,9 @@ class WinoVaeResample(WanResample):
             and kernels_available()
             and batch_size == 1
         )
-        self._set_pending_bias(conv.bias if defer else None)
         if defer:
-            return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding)
-        return conv(x_4d)
-
-    def _set_pending_bias(self, bias: torch.Tensor | None) -> None:
-        # A plain attribute: nn.Module would register an assigned Parameter (the conv's bias)
-        # as a parameter of this module.
-        object.__setattr__(self, "pending_bias", bias)
-
-    def take_pending_bias(self) -> torch.Tensor | None:
-        bias = self.pending_bias
-        self._set_pending_bias(None)
-        return bias
+            return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding), conv.bias
+        return conv(x_4d), None
 
     def _time_conv_bias(self, bias: torch.Tensor) -> torch.Tensor:
         """``time_conv``'s bias with the downsample conv's bias folded through its taps:
@@ -1310,16 +1326,18 @@ class WinoVaeResample(WanResample):
     def _downsample_time(
         self,
         x: torch.Tensor,
+        bias: torch.Tensor | None,
         batch_size: int,
         frames: int,
         feat_cache: list[CacheEntry] | None,
         feat_idx: list[int] | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """The space step's frames ``[B*T, C, H, W]`` back as video ``[B, C, T, H, W]``, then
         the downsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one):
         the first chunk is cached as is, later chunks run the stride-2 time conv against the
-        cached last frame. With a deferred space-conv bias, the time conv runs without bias
-        and its own bias, with the space conv's folded in, is left in ``pending_bias``."""
+        cached last frame. ``bias``: the space conv's bias not yet added (or None). Returns
+        ``(video, bias not yet added)``: with a deferred space-conv bias the time conv runs
+        bias-free too and hands back its own bias with the space conv's folded in."""
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
         x = _channels_last_3d_if_needed(x_5d)
 
@@ -1331,16 +1349,15 @@ class WinoVaeResample(WanResample):
             else:
                 cache_x = x[:, :, -1:, :, :]
                 x_in = torch.cat([feat_cache[idx][:, :, -1:, :, :], x], dim=2)
-                bias = self.take_pending_bias()
                 if bias is not None:
                     tc = self.time_conv
                     x = F.conv3d(x_in, tc.weight, None, tc.stride)
-                    self._set_pending_bias(self._time_conv_bias(bias))
+                    bias = self._time_conv_bias(bias)
                 else:
                     x = self.time_conv(x_in)
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
-        return x
+        return x, bias
 
 
 def _norm_into_buffer(
@@ -1725,33 +1742,40 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
                 x = self.downsampler(materialize(x), feat_cache=feat_cache, feat_idx=feat_idx)
         else:
             x = materialize(x)
-        x = _channels_last_3d_if_needed(x)
-        # The downsample convs' bias, when they ran without it.
-        bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
-        dup = self.avg_shortcut
-        if kernels_available() and x.shape[0] == 1:
-            from .kernels.frame_ops import avg_down_add
+        # The downsampler hands back its convs' bias when they ran without it.
+        bias = None
+        if isinstance(x, DeferredSum):
+            x, bias = x.source, x.bias
+        return self._add_shortcut(_channels_last_3d_if_needed(x), residual, bias)
 
-            residual = _channels_last_3d_if_needed(residual)
-            t_in = residual.shape[2]
-            pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
-            h_out, w_out = x.shape[-2:]
-            y = avg_down_add(
-                frames_view(x),
-                frames_view(residual),
-                h_out,
-                w_out,
-                residual.shape[-1],
-                dup.factor_t,
-                dup.factor_s,
-                dup.group_size,
-                pad_t,
-                bias,
-            )
-            return frames_to_video(y, h_out, w_out)
-        if bias is not None:
-            x = x + bias.view(1, -1, 1, 1, 1)
-        return _channels_last_3d_if_needed(x + dup(residual))
+    def _add_shortcut(
+        self, x: torch.Tensor, residual: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """``x (+ bias) + AvgDown3D(residual)``: one avg_down_add kernel pass (batch 1, kernels
+        available), else eager adds."""
+        dup = self.avg_shortcut
+        if not (kernels_available() and x.shape[0] == 1):
+            if bias is not None:
+                x = x + bias.view(1, -1, 1, 1, 1)
+            return _channels_last_3d_if_needed(x + dup(residual))
+        from .kernels.frame_ops import avg_down_add
+
+        residual = _channels_last_3d_if_needed(residual)
+        pad_t = (dup.factor_t - residual.shape[2] % dup.factor_t) % dup.factor_t
+        h_out, w_out = x.shape[-2:]
+        y = avg_down_add(
+            frames_view(x),
+            frames_view(residual),
+            h_out,
+            w_out,
+            residual.shape[-1],
+            dup.factor_t,
+            dup.factor_s,
+            dup.group_size,
+            pad_t,
+            bias,
+        )
+        return frames_to_video(y, h_out, w_out)
 
 
 def _conv_in(
@@ -2180,6 +2204,14 @@ class WinoVae(WanVAE):
         finally:
             torch.backends.cudnn.benchmark = prev_benchmark
 
+    def _assemble_video(self, chunks: list[torch.Tensor]) -> torch.Tensor:
+        """The eager path's video from its decoded chunks: concatenated along time,
+        unpatchified, channels-last, clamped to [-1, 1]."""
+        out = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=2)
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return torch.clamp(_channels_last_3d_if_needed(out), min=-1.0, max=1.0)
+
     def fold_latent_affine(self, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> None:
         """Fold the latent de-normalization into ``decode``: ``latents_mean`` and
         ``latents_std`` are per-channel (``z_dim`` elements each); afterwards ``decode(z)``
@@ -2251,11 +2283,7 @@ class WinoVae(WanVAE):
                     f"decoder produced {frames_done} frames for a {out.shape[2]}-frame output"
                 )
         else:
-            out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks, dim=2)
-            if self.config.patch_size is not None:
-                out = unpatchify(out, patch_size=self.config.patch_size)
-            out = _channels_last_3d_if_needed(out)
-            out = torch.clamp(out, min=-1.0, max=1.0)
+            out = self._assemble_video(out_chunks)
 
         self.clear_cache()
         if not return_dict:
