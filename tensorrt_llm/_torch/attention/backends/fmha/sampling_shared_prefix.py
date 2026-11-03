@@ -455,9 +455,13 @@ class _Grouping:
     of the merge. Prefix and tail tables are in ``perm`` order (the rows of a
     group are contiguous there); the KV write page is in batch order.
 
-    A grouping stays valid while the batch keeps the same rows, each with the
-    same first page and the same number of full pages before its current
+    A grouping stays valid while the batch keeps the same rows, the block
+    table still holds every page it read (each row's pages up to its last
+    one), and each row keeps the same number of full pages before its current
     token: block tables only grow, so nothing it holds can change otherwise.
+    The page check catches a row whose pages changed without any length
+    changing: a new request in a recycled slot, or pages released and
+    allocated again (preemption, resume from a lower cache tier).
     Between two page boundaries only the last-page lengths and the write slots
     move, and those are derived per step from the KV lengths. When rows cross a
     page boundary, the groups and the prefix tables stay valid unless a
@@ -477,8 +481,6 @@ class _Grouping:
     num_rows: int
     table_rows: np.ndarray
     """[rows] int64: host block-table row of each batch row."""
-    first_pages: np.ndarray
-    """[rows] int64: first pool page of each row (cache validation)."""
     private_from: np.ndarray
     """[rows] int64: index of the page holding the row's first token of this step
     (the current token when ``q_len`` is 1). Pages before it may be shared."""
@@ -662,7 +664,6 @@ def _build_grouping(
         prefix_version=version,
         num_rows=rows,
         table_rows=table_rows,
-        first_pages=first_pages,
         private_from=private_from,
         num_groups=num_groups,
         num_sharing=num_sharing,
@@ -1253,6 +1254,8 @@ class _SamplingState:
     """Set for the metadata of a captured batch size."""
     plan: Optional[_SamplingPlan] = None
     grouping: Optional[_Grouping] = None
+    grouping_pages: Optional[np.ndarray] = None
+    """[rows, pages] host block-table entries ``grouping`` was built from."""
     table_rows_key: Optional[tuple] = None
     table_rows: Optional[np.ndarray] = None
     prefix_wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
@@ -1615,6 +1618,25 @@ def _sampling_table_rows(
     return state.table_rows
 
 
+def _pages_unchanged(
+    saved: Optional[np.ndarray], offsets: np.ndarray, table_rows: np.ndarray, last_pages: np.ndarray
+) -> bool:
+    """Whether the host block table still holds every page a grouping read.
+
+    Args:
+        saved: [rows, pages] block-table entries the grouping was built from.
+        offsets: [table rows, max pages] the host block table of the pool.
+        table_rows: [rows] block-table row of each batch row.
+        last_pages: [rows] the grouping's last page index of each row; entries past it
+            were not read and may change.
+    """
+    if saved is None or saved.shape[0] != table_rows.size:
+        return False
+    width = saved.shape[1]
+    read = np.arange(width) <= last_pages[:, None]
+    return bool(((offsets[table_rows, :width] == saved) | ~read).all())
+
+
 def _eager_fused(q_len: int) -> bool:
     """Whether eager batches use the fused kernel (the layer shape is known and supported)."""
     if _model_shape is None:
@@ -1779,18 +1801,13 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
     private_from = (kv_lens - q_len) // tokens_per_block
     last_pages = (kv_lens - 1) // tokens_per_block
     offsets = host_offsets.numpy()[state.pool_index, :, 0, :]
-    first_pages = np.clip(
-        offsets[table_rows, 0].astype(np.int64) * state.page_scale // state.page_div,
-        0,
-        state.num_pages - 1,
-    )
     grouping = state.grouping
     same_rows = (
         grouping is not None
         and grouping.num_rows == rows
         and grouping.q_len == q_len
         and np.array_equal(grouping.table_rows, table_rows)
-        and np.array_equal(grouping.first_pages, first_pages)
+        and _pages_unchanged(state.grouping_pages, offsets, table_rows, grouping.last_pages)
     )
     if (
         not same_rows
@@ -1799,8 +1816,10 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         or (check and grouping.check_pages is None)
     ):
         width = int(last_pages.max()) + 1
+        # Fancy indexing copies: the snapshot does not follow later table writes.
+        host_pages = offsets[table_rows, :width]
         pages_all = np.clip(
-            offsets[table_rows, :width].astype(np.int64) * state.page_scale // state.page_div,
+            host_pages.astype(np.int64) * state.page_scale // state.page_div,
             0,
             state.num_pages - 1,
         )
@@ -1827,6 +1846,7 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
             q_len=q_len,
         )
         state.grouping = grouping
+        state.grouping_pages = host_pages
     if eager:
         sharing_rows = rows - grouping.num_placeholder_rows
         profile = _group_profile(grouping, tokens_per_block, q_len)

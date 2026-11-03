@@ -543,6 +543,79 @@ def test_sampling_plan_reads_kv_manager_v2_block_table():
     ]
 
 
+@pytest.mark.parametrize("new_request_ids", [True, False], ids=["new_requests", "same_requests"])
+def test_sampling_plan_follows_new_pages_in_recycled_slots(new_request_ids):
+    """Rows whose slots, first pages and lengths stay the same but whose private pages
+    change get a new grouping: new requests in recycled slots (``new_requests``), or
+    the same requests with their pages released and allocated again (``same_requests``,
+    e.g. preemption). The plan must match one built from scratch for the new tables."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.fmha import sampling_shared_prefix as lib
+
+    tpb, max_blocks = 4, 4
+    host = torch.zeros(1, 2, 2, max_blocks, dtype=torch.int32)
+
+    class _Manager(SimpleNamespace):  # weak-referenceable, like the real managers
+        pass
+
+    def _meta(request_ids, slot_of, caches):
+        manager = _Manager(
+            layer_offsets={0: 0},
+            kv_factor=1,
+            max_beam_width=1,
+            index_mapper=SimpleNamespace(get_index=lambda rid: slot_of[rid]),
+            layer_to_pool_mapping_dict={0: 0},
+            get_layer_page_index_scale=lambda layer_idx: 1,
+            get_buffers=lambda layer, kv_layout: torch.empty(64, 1),
+        )
+        return SimpleNamespace(
+            fmha_plan_caches=caches,
+            kv_cache_manager=manager,
+            host_kv_cache_block_offsets=host,
+            # 10 tokens: pages 0-1 full and shared, page 2 holds the current token.
+            kv_lens_runtime=torch.tensor([10, 10]),
+            tokens_per_block=tpb,
+            num_generations=2,
+            num_tokens=2,
+            request_ids=request_ids,
+            is_cuda_graph=False,
+        )
+
+    host[0, 0, 0, :3] = torch.tensor([5, 6, 7])
+    host[0, 1, 0, :3] = torch.tensor([5, 6, 8])
+    caches = {}
+    lib._plan_sampling_step(_meta([101, 102], {101: 0, 102: 1}, caches))
+    plan = caches[lib.SAMPLING_KEY].plan
+    assert plan.tail_indices.tolist() == [7, 8]
+
+    # The slots are reused and the prompt pages hit the reuse cache, but each row's
+    # current-token page is a newly allocated one.
+    host[0, 0, 0, :3] = torch.tensor([5, 6, 30])
+    host[0, 1, 0, :3] = torch.tensor([5, 6, 31])
+    request_ids = [201, 202] if new_request_ids else [101, 102]
+    slot_of = dict(zip(request_ids, (0, 1)))
+    lib._plan_sampling_step(_meta(request_ids, slot_of, caches))
+    state = caches[lib.SAMPLING_KEY]
+    fresh_caches = {}
+    lib._plan_sampling_step(_meta(request_ids, slot_of, fresh_caches))
+    fresh = fresh_caches[lib.SAMPLING_KEY].plan
+    assert state.plan.tail_indices.tolist() == [30, 31]
+    assert state.grouping.write_page.tolist() == [30, 31]
+    assert state.plan.prefix_indices.tolist() == fresh.prefix_indices.tolist()
+    assert state.plan.tail_indices.tolist() == fresh.tail_indices.tolist()
+    assert (
+        state.grouping.write_page.tolist()
+        == fresh_caches[lib.SAMPLING_KEY].grouping.write_page.tolist()
+    )
+
+    # Entries past a row's last page were never read: changing them keeps the grouping.
+    version = state.grouping.version
+    host[0, 0, 0, 3] = 40
+    lib._plan_sampling_step(_meta(request_ids, slot_of, caches))
+    assert state.grouping.version == version
+
+
 def test_sampling_grouping_pads_groups_and_demotes_surplus_sharing_groups():
     """A CUDA graph batch gets a fixed number of prefix groups: the sharing
     groups that save the most page reads, the placeholder group (also without
