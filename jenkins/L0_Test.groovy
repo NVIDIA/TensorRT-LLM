@@ -1858,7 +1858,8 @@ def getPytestBaseCommandLine(
     String pytestUtil = "",
     List<String> extraArgs = [],
     int containerPortStart = 0,
-    int containerPortNum = 0
+    int containerPortNum = 0,
+    String clusterName = ""
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -1870,8 +1871,8 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
-    // GB200 stages run on gcp-iad, which needs the gIB NCCL network plugin over IB.
-    if (stageName.startsWith("GB200")) {
+    // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
         extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
     }
     // Pass stage name to perf sanity tests for OpenSearch tracking
@@ -2514,6 +2515,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
+                    0,
+                    0,
+                    partition.clusterName,
                 )
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
