@@ -92,13 +92,16 @@ def test_dispatch_matches_cpp(m: int, snapshots: int):
     assert torch.equal(upd, ref_upd.view(m, HIDDEN))
 
 
-@pytest.mark.parametrize("raw, persistent", [("per_token", False), ("1", True), ("split", True)])
+@pytest.mark.parametrize(
+    "raw, persistent",
+    [("per_token", False), ("1", True), ("split", True), ("persistent", True)],
+)
 def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
-    """``KIMI_K3_ATTN_RES_TOPOLOGY``: ``split`` stays an alias of ``1``; ``persistent`` and unknown
+    """``KIMI_K3_ATTN_RES_TOPOLOGY``: ``split`` and ``persistent`` are aliases of ``1``; unknown
     values fail loudly instead of silently measuring the default."""
     monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, raw)
     assert mkl._read_persistent_attn_res() is persistent
-    for bad in ("persistent", "on"):
+    for bad in ("on", "per-token"):
         monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, bad)
         with pytest.raises(ValueError):
             mkl._read_persistent_attn_res()
@@ -239,7 +242,7 @@ def _kda_mixer_taking_mxfp8(max_rows: int):
 def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     """The producer predicate and the verify routing share one batch condition: plain
     single-token decode and context batches get no MXFP8 input, and neither does a mixer whose
-    fused q/k/v/g projection was not declared to take one."""
+    fused q/k/v/g projection was not declared to take one, nor a padded batch."""
     from types import SimpleNamespace
 
     mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
@@ -256,3 +259,5 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
     assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
     assert not mixer.takes_prequantized_input(16, metadata(1, 16, 4))
+    # CUDA-graph padding: more rows than the batch's tokens, so the mixer would not use it.
+    assert not mixer.takes_prequantized_input(16, metadata(0, 12, 3))

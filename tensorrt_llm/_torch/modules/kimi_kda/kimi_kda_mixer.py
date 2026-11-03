@@ -485,11 +485,13 @@ class KimiKDALinearAttention(nn.Module):
     def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
         """Whether :meth:`forward` on ``num_rows`` rows consumes their MXFP8 form
         (``prequantized_input``): verify-only batches (:meth:`_is_verify_only_batch`) outside
-        the breakable CUDA graph, whose fused q/k/v/g projection takes a prequantized operand
-        for that many rows."""
+        the breakable CUDA graph, without padding rows (the operand must cover exactly the
+        batch's tokens), whose fused q/k/v/g projection takes a prequantized operand for that
+        many rows. The producer and :meth:`forward` both decide by this method."""
         return (
             self._qkvg_takes_prequantized is not None
             and self._is_verify_only_batch(attn_metadata)
+            and attn_metadata.num_tokens == num_rows
             and not (self.register_to_config and is_in_breakable_cuda_graph())
             and self._qkvg_takes_prequantized(num_rows)
         )
@@ -606,8 +608,7 @@ class KimiKDALinearAttention(nn.Module):
                     # The MXFP8 input covers every row of a verify-only batch.
                     prequantized_input=(
                         prequantized_input
-                        if self._is_verify_only_batch(attn_metadata)
-                        and num_tokens == hidden_states.shape[0]
+                        if self.takes_prequantized_input(hidden_states.shape[0], attn_metadata)
                         else None
                     ),
                 )

@@ -368,8 +368,9 @@ kernel's token range on the persistent kernel (one CTA per SM looping over token
 2 <= N <= 9). The default, ``per_token``, leaves them unfused. See ``_attn_res_kernel``.
 
 The decode kernel serves every shape up to its token limit, so ``split`` is the only topology:
-``persistent`` (the persistent kernel at every shape) is not accepted, and the per-token ceiling
-is the decode kernel's limit (``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` is not read).
+``persistent`` (formerly the persistent kernel at every shape) is accepted as another alias of
+``1`` with a warning, and the per-token ceiling is the decode kernel's limit
+(``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` is not read).
 
 Off by default because the persistent kernel measures as no-regression on
 NVFP4 but as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, through a
@@ -384,15 +385,16 @@ _UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
 def _read_persistent_attn_res() -> bool:
     raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
     if raw == "persistent":
-        raise ValueError(
-            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=persistent is no longer supported: the decode kernel "
-            "serves the shapes up to its token limit; use '1' (persistent above it) or 'per_token'"
+        logger.warning(
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=persistent is treated as '1': the decode kernel serves "
+            "the shapes up to its token limit and the persistent kernel the larger ones"
         )
-    if raw not in ("per_token", "1", "split"):
+    if raw not in ("per_token", "1", "split", "persistent"):
         # Loudly: a mistyped A/B arm that silently fell back to the default would
         # measure one side twice and report no difference.
         raise ValueError(
-            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be 'per_token', '1' or 'split', got {raw!r}"
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be 'per_token', '1', 'split' or 'persistent', "
+            f"got {raw!r}"
         )
     if _UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV in os.environ:
         logger.warning(
@@ -450,6 +452,7 @@ def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResK
             return _AttnResKernel.DECODE
     if _PERSISTENT_ATTN_RES_ENABLED and hidden == 7168 and 2 <= num_candidates <= 9:
         return _AttnResKernel.PERSISTENT
+    _note_attn_res_fusion("attn_res+norm/select", False, num_tokens, hidden, num_candidates)
     return _AttnResKernel.UNFUSED
 
 
@@ -2598,7 +2601,10 @@ class KimiLinearModel(DecoderModel):
             ):
                 capture = (spec_metadata, self.layers[i - 1].layer_idx)
             if i == self.helix_a2a_first_layer:
-                # Rows are rank-replicated up to here: keep this rank's chunk.
+                # Rows are rank-replicated up to here: keep this rank's chunk. hidden_states is a
+                # tensor, never a _DeferredMoEResidual: token_sliced implies is_moe and every layer
+                # from the first sliced one on is sliced, so the layers before it are dense and
+                # only MoE layers defer their residual update.
                 hidden_states = self.helix_a2a.scatter_rows(hidden_states, num_tokens)
                 block_residual = self.helix_a2a.scatter_rows(block_residual, num_tokens)
             hidden_states, num_snapshots = layer(
