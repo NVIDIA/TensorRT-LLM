@@ -1461,8 +1461,13 @@ class Qwen2VisionModelBase(nn.Module):
                 model_class(model_config.pretrained_config.vision_config),
                 self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
-            self.model_config = self.model_config.with_encoder_attention_backend(
+            vision_config = self.model_config.with_encoder_attention_backend(
                 "vision")
+            if vision_config is not self.model_config:
+                # The encoder keeps no KV cache, and FlashInfer rejects FP8
+                # KV-cache quantization without one.
+                vision_config.quant_config = QuantConfig()
+            self.model_config = vision_config
             self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
                 model_class(self.model_config), self.model_dtype)
         else:
