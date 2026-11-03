@@ -684,6 +684,15 @@ class TestRequestedReasoningEffort:
         assert self._render(request).startswith("Reasoning Effort: Max|")
         assert request.chat_template_kwargs is None
 
+    def test_an_explicit_null_effort_is_not_passed(self) -> None:
+        # A null sets the field without asking for a level, so it counts as no effort.
+        request = chat_request(reasoning_effort=None)
+        assert "reasoning_effort" in request.model_fields_set
+
+        assert self._render(request).startswith("Reasoning Effort: Max|")
+        assert request.chat_template_kwargs is None
+        assert request.injected_chat_template_kwargs is None
+
     def test_an_effort_in_chat_template_kwargs_wins(self) -> None:
         request = chat_request(
             reasoning_effort="high", chat_template_kwargs={"reasoning_effort": "low"}
