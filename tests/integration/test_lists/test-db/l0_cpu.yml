@@ -50,6 +50,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_decode_view.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_launch.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pool_layout.py
+  - unittest/_torch/moe/test_marlin_swiglu_bias.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
@@ -106,6 +107,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
   - unittest/_torch/models/test_minimax_m3.py::test_validate_sparse_attention_runtime_config_backend_selection
+  - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_experts_default_to_marlin_on_ada_and_hopper
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_cache_fused_layout_validation
   - unittest/_torch/models/test_minimax_m3.py::test_nvfp4_reload_preserves_attention_scale_storage
   - unittest/_torch/models/test_minimax_m3.py::test_validate_fused_projection_requires_quantized_main_kv_cache

@@ -111,6 +111,25 @@ _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
+    "quant_algo,sm,expected",
+    [
+        (QuantAlgo.MIXED_PRECISION, 90, {"moe_config": {"backend": "MARLIN"}}),
+        (QuantAlgo.MXFP8, 90, {"moe_config": {"backend": "MARLIN"}}),
+        (QuantAlgo.NVFP4, 89, {"moe_config": {"backend": "MARLIN"}}),
+        (QuantAlgo.MIXED_PRECISION, 100, {}),
+        (None, 90, {}),
+    ],
+)
+def test_nvfp4_experts_default_to_marlin_on_ada_and_hopper(
+    monkeypatch: pytest.MonkeyPatch, quant_algo: QuantAlgo | None, sm: int, expected: dict
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
+    llm_args = SimpleNamespace(quant_config=QuantConfig(quant_algo=quant_algo))
+    assert modeling_minimaxm3.MiniMaxM3ForCausalLM.get_model_defaults(llm_args) == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
     "layout, expected",
     [
         ("packed", True),
