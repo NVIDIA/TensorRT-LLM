@@ -1339,7 +1339,8 @@ def _device_code_md5() -> str | None:
         return None
     code = [line.rstrip() for line in lines[begin + 1 : end]]
     code = [line for line in code if line and not line.lstrip().startswith("#")]
-    return hashlib.md5("\n".join(code).encode()).hexdigest()
+    # A fingerprint of the kernel source, not a security hash.
+    return hashlib.md5("\n".join(code).encode(), usedforsecurity=False).hexdigest()
 
 
 def producer_key(rows: int, tactic: SplitKTactic, use_pdl: bool = True) -> tuple:
