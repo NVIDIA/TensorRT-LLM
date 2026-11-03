@@ -3296,6 +3296,46 @@ def test_selfsampling_topk_16bit_rejects_deterministic(dtype: torch.dtype) -> No
         ss_host.warmup_prefill(512, 8192, deterministic=True, dtype=dtype)
 
 
+@pytest.mark.parametrize("dtype", list(_DTYPE_IDS), ids=list(_DTYPE_IDS.values()))
+def test_selfsampling_topk_varlen_ready_matches_launcher_cache(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype
+) -> None:
+    """varlen_ready is True exactly when run_varlen reuses a compiled launcher: after a call with
+    the same rows, row stride, k, envelope, next_n, compression, dtype and det, and not for
+    another row stride, envelope or det, nor without max_seq_len."""
+    for name in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, name, {})
+    rows, width, stride, top_k, next_n, compress_ratio = 4, 8000, 8192, 512, 2, 4
+    logits = torch.randn((rows, stride), device=_DEV).to(dtype)[:, :width]
+    kv_lens = torch.full((rows // next_n,), width * compress_ratio, dtype=torch.int32, device=_DEV)
+    out = torch.empty((rows, top_k), dtype=torch.int32, device=_DEV)
+    options = {"next_n": next_n, "compress_ratio": compress_ratio}
+    envelope = width * compress_ratio
+
+    assert not ss_host.varlen_ready(logits, out, max_seq_len=envelope, **options)
+    ss_host.run_varlen(logits, kv_lens, out, max_seq_len=envelope, **options)
+    torch.cuda.synchronize()
+    assert ss_host.varlen_ready(logits, out, max_seq_len=envelope, **options)
+    assert ss_host.varlen_ready(logits[:0], out[:0], max_seq_len=envelope, **options)
+    assert not ss_host.varlen_ready(logits, out, **options)
+    assert not ss_host.varlen_ready(
+        logits, out, max_seq_len=envelope - 64 * compress_ratio, **options
+    )
+    other_stride = torch.zeros((rows, stride + 64), device=_DEV, dtype=dtype)[:, :width]
+    assert not ss_host.varlen_ready(other_stride, out, max_seq_len=envelope, **options)
+    assert not ss_host.varlen_ready(
+        logits, out, max_seq_len=envelope, deterministic=True, **options
+    )
+    if dtype == torch.float32:
+        ss_host.run_varlen(
+            logits, kv_lens, out, max_seq_len=envelope, deterministic=True, **options
+        )
+        torch.cuda.synchronize()
+        assert ss_host.varlen_ready(
+            logits, out, max_seq_len=envelope, deterministic=True, **options
+        )
+
+
 def test_selfsampling_topk_varlen_cache_dtype_device_isolation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

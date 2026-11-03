@@ -1718,7 +1718,8 @@ _REG_CODE_RADIX_FORCE = None
 
 # Launcher caches, one per logits dtype. FP32 key: (rows, npad, k, n_env, next_n, cr, packed
 # device profile[, det]); the 16-bit keys insert the device index before the profile (cold
-# compilation runs on that device), and the FP16 key ends with the two code-radix switches.
+# compilation runs on that device). No key holds the code-radix switches; clear the 16-bit
+# caches after changing them.
 _VARLEN_CACHE = {}
 _VARLEN_CACHE_BF16: dict[tuple[int, ...], tuple] = {}
 _VARLEN_CACHE_FP16: dict[tuple[int, ...], tuple] = {}
@@ -4105,6 +4106,45 @@ def prefill_ready(
     return True
 
 
+def varlen_ready(
+    logits: torch.Tensor,
+    indices: torch.Tensor,
+    next_n: int = 1,
+    compress_ratio: int = 1,
+    max_seq_len: int | None = None,
+    deterministic: bool = False,
+) -> bool:
+    """True iff ``run_varlen(logits, kv_lens, indices, next_n, compress_ratio,
+    max_seq_len=max_seq_len, deterministic=deterministic)`` without a workspace would
+    launch without compiling: the launcher key it looks up (rows, row stride, k,
+    envelope, next_n, compression, device profile, dtype, det) is cached and the
+    device's default workspace exists, so a caller can route around the engine under
+    CUDA graph capture. Host-only. Without ``max_seq_len`` run_varlen reads
+    ``kv_lens.max()`` on the host, so the answer is False."""
+    if logits.dim() != 2 or indices.dim() != 2:
+        return False
+    num_rows = logits.shape[0]
+    if num_rows == 0:
+        return True
+    low = logits.dtype in _DTYPES_16BIT
+    if max_seq_len is None or logits.dtype not in _DTYPE_TAG or (low and deterministic):
+        return False
+    nn = _index(next_n)
+    cr = _index(compress_ratio)
+    d = logits.get_device()
+    if nn < 1 or num_rows % nn or cr not in (1, 4) or not 0 <= d < _GVR_MAX_DEV:
+        return False
+    npad = logits.stride(0) if num_rows > 1 else logits.shape[1]
+    n_env = min(max(int(max_seq_len) >> (0 if cr == 1 else 2), 1), npad)
+    k = indices.shape[1]
+    profile = _device_profile_key(d)
+    if low:
+        key = (num_rows, npad, k, n_env, nn, cr, d, profile)
+    else:
+        key = (num_rows, npad, k, n_env, nn, cr, profile) + ((True,) if deterministic else ())
+    return key in _varlen_cache_for(logits.dtype) and d in _ws_hot
+
+
 __all__ = [
     "route",
     "route_static",
@@ -4116,6 +4156,7 @@ __all__ = [
     "run_varlen",
     "run_prefill",
     "prefill_ready",
+    "varlen_ready",
     "warmup_varlen",
     "warmup_prefill",
     "workspace_bytes",
