@@ -28,8 +28,30 @@ namespace fusedSampling
 namespace
 {
 
+//! Logits a stats thread loads before folding any of them, so their latencies overlap.
+constexpr int kStatsLoadsInFlight = 4;
+
+static_assert(kSmallBatchSplits <= 32, "one warp merges the slices' online-softmax partials");
+
+//! The row's online-softmax statistics: the merge of its slices' partials, one a lane of the
+//! calling warp (identity past the last slice). Every lane returns the merged state.
+__device__ inline OnlineSoftmax mergeSplitStats(float const* rowProbs, int lane)
+{
+    OnlineSoftmax stats = lane < kSmallBatchSplits ? reinterpret_cast<OnlineSoftmax const*>(rowProbs)[lane]
+                                                   : OnlineSoftmax{-FLT_MAX, 0.0f, 0};
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        OnlineSoftmax const other{__shfl_xor_sync(0xffffffffu, stats.max, offset),
+            __shfl_xor_sync(0xffffffffu, stats.sum, offset), __shfl_xor_sync(0xffffffffu, stats.argmax, offset)};
+        stats = combineOnlineSoftmax(stats, other);
+    }
+    return stats;
+}
+
 //! Several CTAs independently reduce contiguous vocabulary slices and leave their
-//! online-softmax partials at the start of the output row.
+//! online-softmax partials at the start of the output row. A thread folds its logits in
+//! index order, `kStatsLoadsInFlight` of them loaded ahead of the fold.
 template <typename T>
 __global__ void smallBatchSplitStatsKernel(FusedSamplingParams params)
 {
@@ -44,7 +66,23 @@ __global__ void smallBatchSplitStatsKernel(FusedSamplingParams params)
     T const* rowLogits = static_cast<T const*>(params.logits) + static_cast<size_t>(row) * vocabSize;
 
     OnlineSoftmax local{-FLT_MAX, 0.0f, begin};
-    for (int i = begin + tid; i < end; i += blockDim.x)
+    int const stride = blockDim.x;
+    int i = begin + tid;
+    for (; i + (kStatsLoadsInFlight - 1) * stride < end; i += kStatsLoadsInFlight * stride)
+    {
+        float logits[kStatsLoadsInFlight];
+#pragma unroll
+        for (int u = 0; u < kStatsLoadsInFlight; ++u)
+        {
+            logits[u] = toFloat(rowLogits[i + u * stride]);
+        }
+#pragma unroll
+        for (int u = 0; u < kStatsLoadsInFlight; ++u)
+        {
+            local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(logits[u], rp.tempInv), 1.0f, i + u * stride});
+        }
+    }
+    for (; i < end; i += stride)
     {
         local = combineOnlineSoftmax(local, OnlineSoftmax{__fmul_rn(toFloat(rowLogits[i]), rp.tempInv), 1.0f, i});
     }
@@ -75,17 +113,16 @@ __global__ void smallBatchSplitOutputKernel(FusedSamplingParams params)
     int const splitBegin = static_cast<int>(static_cast<long long>(vocabSize) * split / kSmallBatchSplits);
     int const splitEnd = static_cast<int>(static_cast<long long>(vocabSize) * (split + 1) / kSmallBatchSplits);
     __shared__ OnlineSoftmax sRowStats;
-    if (tid == 0)
+    if (tid < 32)
     {
-        OnlineSoftmax rowStats = reinterpret_cast<OnlineSoftmax const*>(rowProbs)[0];
-        for (int other = 1; other < kSmallBatchSplits; ++other)
+        OnlineSoftmax const rowStats = mergeSplitStats(rowProbs, tid);
+        if (tid == 0)
         {
-            rowStats = combineOnlineSoftmax(rowStats, reinterpret_cast<OnlineSoftmax const*>(rowProbs)[other]);
-        }
-        sRowStats = rowStats;
-        if (split == 0)
-        {
-            *reinterpret_cast<OnlineSoftmax*>(rowProbs + kMergedStatsOffset) = rowStats;
+            sRowStats = rowStats;
+            if (split == 0)
+            {
+                *reinterpret_cast<OnlineSoftmax*>(rowProbs + kMergedStatsOffset) = rowStats;
+            }
         }
     }
     __syncthreads();

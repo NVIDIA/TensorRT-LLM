@@ -33,6 +33,31 @@ namespace
 {
 
 constexpr int32_t kBlockSize = 1024;
+//! Consecutive tiles a pass loads before reducing any of them, their sums folded in one block
+//! reduction: a 248320-token row is 16 such groups on the aligned path instead of 61 tiles.
+constexpr int32_t kTilesInFlight = 4;
+
+//! Per-tile sums of a group of tiles, reduced over the block together.
+template <int32_t TILES>
+struct TileSums
+{
+    float v[TILES];
+};
+
+template <int32_t TILES>
+struct TileSumsOp
+{
+    __device__ __forceinline__ TileSums<TILES> operator()(TileSums<TILES> const& a, TileSums<TILES> const& b) const
+    {
+        TileSums<TILES> r;
+#pragma unroll
+        for (int32_t k = 0; k < TILES; ++k)
+        {
+            r.v[k] = a.v[k] + b.v[k];
+        }
+        return r;
+    }
+};
 
 struct Float2SumOp
 {
@@ -93,17 +118,22 @@ __device__ __forceinline__ void loadResidual(
     }
 }
 
-template <int32_t BLOCK_SIZE, int32_t VEC_SIZE>
+//! A tile is BLOCK_SIZE x VEC_SIZE consecutive probabilities, thread t holding VEC_SIZE of them
+//! from t x VEC_SIZE (coalesced). Both passes walk the row TILES tiles at a time: all of a
+//! group's loads are issued before any of its sums is formed, and the group's per-tile sums
+//! take one block reduction. The inverse-CDF search keeps its tile order and the scan of the
+//! one tile the threshold falls in.
+template <int32_t BLOCK_SIZE, int32_t VEC_SIZE, int32_t TILES>
 __global__ void __launch_bounds__(BLOCK_SIZE) chainSpeculativeSamplingKernel(ChainSpeculativeSamplingParams params)
 {
-    using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    using BlockReduceTiles = cub::BlockReduce<TileSums<TILES>, BLOCK_SIZE>;
     using BlockReducePair = cub::BlockReduce<float2, BLOCK_SIZE>;
     using BlockReduceInt = cub::BlockReduce<int32_t, BLOCK_SIZE>;
     using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
 
     __shared__ union
     {
-        typename BlockReduce::TempStorage reduce;
+        typename BlockReduceTiles::TempStorage reduceTiles;
         typename BlockReducePair::TempStorage reducePair;
         typename BlockReduceInt::TempStorage reduceInt;
         typename BlockScan::TempStorage scan;
@@ -113,7 +143,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) chainSpeculativeSamplingKernel(Cha
     __shared__ float sU;
     __shared__ bool sTargetOnly;
     __shared__ float sTotal;
-    __shared__ float sTileSum[2];
+    __shared__ float sTileSum[2][TILES];
     __shared__ int32_t sWinner;
     __shared__ int32_t sLastValid;
 
@@ -155,23 +185,36 @@ __global__ void __launch_bounds__(BLOCK_SIZE) chainSpeculativeSamplingKernel(Cha
     float const* target = params.targetProbs + (row * (numDraft + 1) + pos) * vocabSize;
     float const* draft = pos < numDraft ? params.draftProbs + (row * numDraft + pos) * vocabSize : nullptr;
     uint32_t const tileSize = BLOCK_SIZE * VEC_SIZE;
+    uint32_t const groupSize = tileSize * TILES;
 
     // x: target mass, y: residual mass.
     float2 sums = make_float2(0.0f, 0.0f);
-    for (uint32_t base = tid * VEC_SIZE; base < vocabSize; base += tileSize)
+    for (uint32_t groupBase = 0; groupBase < vocabSize; groupBase += groupSize)
     {
-        float t[VEC_SIZE];
-        loadProbs<VEC_SIZE>(target, base, vocabSize, t);
-        float d[VEC_SIZE] = {};
+        float t[TILES][VEC_SIZE];
+        float d[TILES][VEC_SIZE] = {};
+#pragma unroll
+        for (int32_t k = 0; k < TILES; ++k)
+        {
+            loadProbs<VEC_SIZE>(target, groupBase + k * tileSize + tid * VEC_SIZE, vocabSize, t[k]);
+        }
         if (draft != nullptr)
         {
-            loadProbs<VEC_SIZE>(draft, base, vocabSize, d);
+#pragma unroll
+            for (int32_t k = 0; k < TILES; ++k)
+            {
+                loadProbs<VEC_SIZE>(draft, groupBase + k * tileSize + tid * VEC_SIZE, vocabSize, d[k]);
+            }
         }
 #pragma unroll
-        for (int32_t j = 0; j < VEC_SIZE; ++j)
+        for (int32_t k = 0; k < TILES; ++k)
         {
-            sums.x += t[j];
-            sums.y += fmaxf(t[j] - d[j], 0.0f);
+#pragma unroll
+            for (int32_t j = 0; j < VEC_SIZE; ++j)
+            {
+                sums.x += t[k][j];
+                sums.y += fmaxf(t[k][j] - d[k][j], 0.0f);
+            }
         }
     }
     float2 const blockSums = BlockReducePair(tempStorage.reducePair).Reduce(sums, Float2SumOp{});
@@ -189,33 +232,86 @@ __global__ void __launch_bounds__(BLOCK_SIZE) chainSpeculativeSamplingKernel(Cha
     float prefix = 0.0f;
     int32_t localLastValid = -1;
     int32_t parity = 0;
-    for (uint32_t tileBase = 0; tileBase < vocabSize; tileBase += tileSize, parity ^= 1)
+    for (uint32_t groupBase = 0; groupBase < vocabSize; groupBase += groupSize, parity ^= 1)
     {
-        uint32_t const base = tileBase + tid * VEC_SIZE;
-        float value[VEC_SIZE];
-        loadResidual<VEC_SIZE>(target, draft, targetOnly, base, vocabSize, value);
+        float value[TILES][VEC_SIZE];
+        int32_t tileLastValid[TILES];
+        TileSums<TILES> mine;
 #pragma unroll
-        for (int32_t j = 0; j < VEC_SIZE; ++j)
+        for (int32_t k = 0; k < TILES; ++k)
         {
-            if (value[j] > 0.0f)
-            {
-                localLastValid = static_cast<int32_t>(base + j);
-            }
-        }
-        float const tileSum = BlockReduce(tempStorage.reduce).Sum(value);
-        if (tid == 0)
-        {
-            sTileSum[parity] = tileSum;
-        }
-        __syncthreads();
-        if (prefix + sTileSum[parity] > threshold)
-        {
-            float inclusive[VEC_SIZE];
-            BlockScan(tempStorage.scan).InclusiveSum(value, inclusive);
+            uint32_t const base = groupBase + k * tileSize + tid * VEC_SIZE;
+            loadResidual<VEC_SIZE>(target, draft, targetOnly, base, vocabSize, value[k]);
+            tileLastValid[k] = -1;
+            mine.v[k] = 0.0f;
 #pragma unroll
             for (int32_t j = 0; j < VEC_SIZE; ++j)
             {
-                if (value[j] > 0.0f && prefix + inclusive[j] > threshold)
+                if (value[k][j] > 0.0f)
+                {
+                    tileLastValid[k] = static_cast<int32_t>(base + j);
+                }
+                mine.v[k] += value[k][j];
+            }
+        }
+        TileSums<TILES> const groupSums = BlockReduceTiles(tempStorage.reduceTiles).Reduce(mine, TileSumsOp<TILES>{});
+        if (tid == 0)
+        {
+#pragma unroll
+            for (int32_t k = 0; k < TILES; ++k)
+            {
+                sTileSum[parity][k] = groupSums.v[k];
+            }
+        }
+        __syncthreads();
+        // The tiles in order: the first whose sum carries the prefix past the threshold is
+        // scanned; the ones before it only add to the prefix.
+        int32_t hit = -1;
+#pragma unroll
+        for (int32_t k = 0; k < TILES; ++k)
+        {
+            if (hit < 0)
+            {
+                if (prefix + sTileSum[parity][k] > threshold)
+                {
+                    hit = k;
+                }
+                else
+                {
+                    prefix += sTileSum[parity][k];
+                }
+            }
+        }
+#pragma unroll
+        for (int32_t k = 0; k < TILES; ++k)
+        {
+            if (hit < 0 || k <= hit)
+            {
+                localLastValid = max(localLastValid, tileLastValid[k]);
+            }
+        }
+        if (hit >= 0)
+        {
+            float hitValue[VEC_SIZE];
+#pragma unroll
+            for (int32_t k = 0; k < TILES; ++k)
+            {
+                if (k == hit)
+                {
+#pragma unroll
+                    for (int32_t j = 0; j < VEC_SIZE; ++j)
+                    {
+                        hitValue[j] = value[k][j];
+                    }
+                }
+            }
+            uint32_t const base = groupBase + hit * tileSize + tid * VEC_SIZE;
+            float inclusive[VEC_SIZE];
+            BlockScan(tempStorage.scan).InclusiveSum(hitValue, inclusive);
+#pragma unroll
+            for (int32_t j = 0; j < VEC_SIZE; ++j)
+            {
+                if (hitValue[j] > 0.0f && prefix + inclusive[j] > threshold)
                 {
                     atomicMin(&sWinner, static_cast<int32_t>(base + j));
                     break;
@@ -224,7 +320,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE) chainSpeculativeSamplingKernel(Cha
             __syncthreads();
             break;
         }
-        prefix += sTileSum[parity];
     }
 
     if (sWinner == static_cast<int32_t>(vocabSize))
@@ -269,11 +364,11 @@ void invokeChainSpeculativeSampling(ChainSpeculativeSamplingParams const& params
         && isAligned(params.draftProbs, sizeof(float4));
     if (vectorized)
     {
-        chainSpeculativeSamplingKernel<kBlockSize, 4><<<grid, block, 0, stream>>>(params);
+        chainSpeculativeSamplingKernel<kBlockSize, 4, kTilesInFlight><<<grid, block, 0, stream>>>(params);
     }
     else
     {
-        chainSpeculativeSamplingKernel<kBlockSize, 1><<<grid, block, 0, stream>>>(params);
+        chainSpeculativeSamplingKernel<kBlockSize, 1, kTilesInFlight><<<grid, block, 0, stream>>>(params);
     }
     sync_check_cuda_error(stream);
 }

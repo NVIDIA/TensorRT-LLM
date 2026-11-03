@@ -31,9 +31,12 @@ constexpr int kNarrowBlock = 512;
 constexpr int kWideBlock = 1024;
 constexpr int kWideBlockMaxRows = 128;
 
-//! Large-vocabulary probability-producing small batches use several CTAs per row.
+//! Large-vocabulary probability-producing small batches use several CTAs per row. A slice
+//! pass is bound by its threads' load latency, not bandwidth: a 248320-token vocabulary
+//! leaves a thread 15 logits at 32 slices (61 at 8), and a warp merges the slices'
+//! partials in one shuffle reduction.
 constexpr int kSmallBatchSplitBlock = 512;
-constexpr int kSmallBatchSplits = 8;
+constexpr int kSmallBatchSplits = 32;
 constexpr int kSmallBatchSplitMaxRows = 32;
 constexpr int kSmallBatchSplitMinVocab = 65536;
 
