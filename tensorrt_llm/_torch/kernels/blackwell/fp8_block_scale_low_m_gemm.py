@@ -2985,9 +2985,8 @@ class _ShapeTables:
     #: for buckets without an entry.
     mid_m_tuned: dict
     mid_m_default: dict
-    #: (N, K) -> largest M for which :func:`max_m_for` selects this GEMM (its cross-over with
-    #: the architecture's default FP8 block-scale GEMM); ``default_max_m`` for other shapes
-    #: whose grid fits in one wave, none for the rest.
+    #: (N, K) -> largest M for which :func:`can_run` selects this GEMM; ``default_max_m`` for
+    #: other shapes.
     max_m: dict
     default_max_m: int
     #: (N, K) -> largest M of the low-M kernel (mid-M kernel above); ``LOW_M_MAX`` otherwise.
@@ -2999,84 +2998,160 @@ class _ShapeTables:
 # ``fp8_swap_ab_gemm`` (with its quantization), both standalone and behind a latency-bound
 # kernel with PDL; every measured shape wins up to M = 128.
 _SM100_TABLES = _ShapeTables(
-    low_m_tuned={},
-    mid_m_tuned={},
-    mid_m_default={},
+    low_m_tuned={
+        # KDA fused q/k/v/g (helix16 shard)
+        (3072, 7168, 8): (5, 12, 4, 4, 4),
+        (3072, 7168, 16): (4, 8, 4, 4, 2),
+        (3072, 7168, 32): (5, 8, 4, 8, 4),
+        (3072, 7168, 64): (5, 4, 4, 8, 4),
+        # MoE latent down
+        (3584, 7168, 8): (4, 14, 4, 4, 4),
+        (3584, 7168, 16): (4, 8, 4, 4, 2),
+        (3584, 7168, 32): (4, 8, 4, 8, 2),
+        (3584, 7168, 64): (4, 4, 4, 8, 4),
+        # MoE latent up
+        (7168, 3584, 8): (2, 14, 4, 4, 4),
+        (7168, 3584, 16): (2, 8, 4, 4, 2),
+        (7168, 3584, 32): (2, 8, 4, 8, 2),
+        (7168, 3584, 64): (2, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix16 shard)
+        (7168, 768, 8): (1, 6, 4, 4, 4),
+        (7168, 768, 16): (1, 6, 4, 8, 4),
+        (7168, 768, 32): (1, 6, 4, 8, 4),
+        (7168, 768, 64): (1, 4, 4, 8, 2),
+        # MLA fused q_a / kv_a (2112 rows)
+        (2176, 7168, 8): (6, 10, 4, 4, 4),
+        (2176, 7168, 16): (6, 8, 4, 8, 4),
+        (2176, 7168, 32): (6, 8, 4, 8, 4),
+        (2176, 7168, 64): (6, 4, 4, 8, 4),
+        # MLA q_b
+        (18432, 1536, 8): (1, 12, 4, 4, 4),
+        (18432, 1536, 16): (1, 12, 4, 4, 2),
+        (18432, 1536, 32): (1, 8, 4, 8, 2),
+        (18432, 1536, 64): (1, 4, 4, 8, 2),
+    },
+    mid_m_tuned={
+        (3072, 7168, 224): (4, 4),
+        (3072, 7168, 256): (4, 3),
+        (3584, 7168, 224): (3, 4),
+        (3584, 7168, 256): (3, 3),
+        (7168, 3584, 224): (2, 3),
+        (7168, 3584, 256): (2, 3),
+        (2176, 7168, 128): (6, 4),
+        (2176, 7168, 192): (6, 4),
+        (2176, 7168, 224): (4, 4),
+        (2176, 7168, 256): (6, 3),
+        (12288, 7168, 192): (1, 3),
+        (12288, 7168, 224): (1, 3),
+        (12288, 7168, 256): (1, 3),
+        (7168, 6144, 256): (2, 3),
+    },
+    mid_m_default={
+        (3072, 7168): (4, 4),
+        (3584, 7168): (4, 4),
+        (7168, 3584): (2, 4),
+        (7168, 768): (1, 4),
+        (2176, 7168): (5, 4),
+        (18432, 1536): (1, 4),
+        (12288, 7168): (1, 4),
+        (7168, 6144): (2, 4),
+    },
     max_m={
-        (768, 7168): 224,
-        (1536, 7168): 224,
-        (2176, 7168): 192,
         (3072, 7168): 224,
-        (3584, 7168): 192,
-        (6144, 7168): 192,
+        (3584, 7168): 224,
+        (7168, 3584): 144,
         (7168, 768): 192,
-        (7168, 1536): 160,
-        (7168, 6144): 160,
-        (7168, 12288): 160,
-        (12288, 7168): 160,
+        (2176, 7168): 224,
         (18432, 1536): 224,
+        (12288, 7168): 128,
+        (7168, 6144): 128,
     },
     default_max_m=128,
-    low_m_cutover={},
+    # Large weights on fewer than all SMs, where the in-kernel quantization of a 64-token tile
+    # is exposed: the mid-M kernel is faster above 32 tokens.
+    low_m_cutover={
+        (12288, 7168): 32,
+        (7168, 6144): 32,
+    },
 )
 
-# SM107: measured tactics, low-/mid-M cut-overs and cross-overs with
-# ``fp8_quantize_1x128_cutedsl_ue8m0`` + ``cute_dsl_mxfp8_gemm_rubin``; other shapes are not
-# selected.
+# SM107, tuned on Rubin (212 SMs) for the Kimi-K3 decode projections with cold weights (rotated
+# over 1.5 GiB): each tactic scores the mean CUDA-graph per-call time of back-to-back launches
+# with and without PDL. Low-M kernel, per mma_n bucket timed at M = mma_n: a split_k sweep with
+# the heuristic ring sizes, then quant warps / groups and x / b ring depths around the three
+# best splits; mid-M kernel, per mma_n bucket: split_k x b_stages. With 212 SMs the best split
+# is larger than on GB300 for the small-N weights. The M limits are the largest M up to which
+# this GEMM ran at least 5% faster than ``fp8_quantize_1x128_cutedsl_ue8m0`` + the autotuned
+# ``cute_dsl_mxfp8_gemm_rubin`` at every measured M (and, for the helix weights, not slower on
+# the mean of the times with and without PDL); other shapes stop at 32 tokens.
 _SM107_TABLES = _ShapeTables(
     low_m_tuned={
+        # KDA fused q/k/v/g (dep16)
         (49152, 7168, 8): (1, 8, 4, 4, 4),
         (49152, 7168, 16): (1, 8, 4, 8, 4),
         (49152, 7168, 32): (1, 8, 4, 8, 4),
         (49152, 7168, 64): (1, 4, 4, 8, 4),
+        # KDA / MLA o_proj (dep16)
         (7168, 12288, 8): (3, 8, 4, 4, 4),
         (7168, 12288, 16): (3, 8, 4, 8, 4),
         (7168, 12288, 32): (3, 8, 4, 8, 4),
         (7168, 12288, 64): (3, 4, 4, 8, 4),
+        # MLA output gate / shared-expert gate_up (dep16)
         (12288, 7168, 8): (2, 8, 4, 4, 4),
         (12288, 7168, 16): (2, 8, 4, 8, 4),
         (12288, 7168, 32): (2, 8, 4, 8, 4),
         (12288, 7168, 64): (2, 4, 4, 8, 4),
+        # shared-expert down (dep16)
         (7168, 6144, 8): (6, 8, 4, 4, 4),
         (7168, 6144, 16): (3, 8, 4, 8, 4),
         (7168, 6144, 32): (3, 8, 4, 8, 4),
         (7168, 6144, 64): (3, 4, 4, 8, 4),
+        # MLA q_b
         (18432, 1536, 8): (2, 4, 4, 4, 4),
         (18432, 1536, 16): (2, 4, 4, 8, 4),
         (18432, 1536, 32): (1, 8, 4, 8, 4),
         (18432, 1536, 64): (1, 4, 4, 8, 4),
+        # MoE latent down
         (3584, 7168, 8): (8, 7, 4, 4, 4),
         (3584, 7168, 16): (8, 4, 4, 8, 4),
         (3584, 7168, 32): (5, 8, 4, 8, 4),
         (3584, 7168, 64): (6, 4, 4, 8, 2),
+        # MoE latent up
         (7168, 3584, 8): (7, 4, 4, 4, 4),
         (7168, 3584, 16): (6, 4, 4, 8, 4),
         (7168, 3584, 32): (6, 5, 4, 8, 4),
         (7168, 3584, 64): (3, 4, 4, 8, 4),
+        # KDA fused q/k/v/g (helix16 shard)
         (3072, 7168, 8): (7, 8, 4, 4, 4),
         (3072, 7168, 16): (7, 4, 4, 8, 4),
         (3072, 7168, 32): (6, 8, 4, 8, 4),
         (3072, 7168, 64): (6, 4, 4, 8, 2),
+        # MLA fused q_a / kv_a (2112 rows)
         (2176, 7168, 8): (10, 4, 4, 4, 4),
         (2176, 7168, 16): (7, 8, 4, 8, 4),
         (2176, 7168, 32): (8, 4, 4, 8, 4),
         (2176, 7168, 64): (8, 7, 4, 8, 4),
+        # MLA output gate (helix16 shard)
         (768, 7168, 8): (14, 4, 4, 4, 4),
         (768, 7168, 16): (14, 4, 4, 8, 4),
         (768, 7168, 32): (10, 6, 4, 8, 4),
         (768, 7168, 64): (16, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix16 shard)
         (7168, 768, 8): (3, 2, 2, 4, 4),
         (7168, 768, 16): (3, 2, 2, 8, 4),
         (7168, 768, 32): (1, 6, 4, 8, 4),
         (7168, 768, 64): (2, 3, 3, 8, 4),
+        # KDA fused q/k/v/g (helix8 shard)
         (6144, 7168, 8): (3, 4, 4, 4, 4),
         (6144, 7168, 16): (3, 8, 4, 8, 4),
         (6144, 7168, 32): (3, 8, 4, 8, 4),
         (6144, 7168, 64): (3, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix8 shard)
         (7168, 1536, 8): (4, 3, 3, 4, 4),
         (7168, 1536, 16): (4, 3, 3, 8, 4),
         (7168, 1536, 32): (2, 6, 4, 8, 4),
         (7168, 1536, 64): (2, 4, 4, 8, 4),
+        # MLA output gate (helix8 shard)
         (1536, 7168, 8): (12, 5, 4, 4, 4),
         (1536, 7168, 16): (7, 8, 4, 8, 4),
         (1536, 7168, 32): (8, 7, 4, 8, 4),
