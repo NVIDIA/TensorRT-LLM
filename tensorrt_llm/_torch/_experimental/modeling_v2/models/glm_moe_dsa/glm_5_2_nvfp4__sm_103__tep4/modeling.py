@@ -50,6 +50,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.speculative import (
@@ -3652,9 +3653,18 @@ class PrefillTarget:
             k_pool = md.kv_cache_manager.get_indexer_k_cache_buffers(i)
             core._indexer_write_k(md, k_pool, k_pre, rows)
             if tc and not skip_ctx:
+                # With MLA chunked prefill and at least `q_split_threshold` context queries, the
+                # engine plans the chunks for this rank's share of the queries only
+                # (`indexer_prefill_q_split`); the other ranks' top-k rows are gathered after
+                # the loop, as the engine's own indexer does.
+                q_split = getattr(md, "indexer_prefill_q_split", None)
                 for chunk in md.indexer_prefill_chunks:
                     n_k = chunk.k_token_end - chunk.k_token_start
-                    if n_k <= 0 or chunk.token_end <= chunk.token_start:
+                    if chunk.token_end <= chunk.token_start:
+                        continue
+                    if n_k <= 0:
+                        # No compressed KV for these queries: no valid index, as the engine.
+                        topk_buf[chunk.token_start : chunk.token_end].fill_(-1)
                         continue
                     if n_k > core._ix_topk_pre_compiled.max_columns:
                         # A K block wider than any built so far (a long cached prefix, or packed
@@ -3671,15 +3681,23 @@ class PrefillTarget:
                         core.idx_dim,
                     )
                     cs = torch.reshape(cs, [-1])
-                    # The window vectors are indexed by absolute context token, not by position
-                    # within the chunk.
-                    for lo, hi in _tile_bounds(chunk.token_start, chunk.token_end, n_k):
-                        ks, ke = chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
+                    # The window vectors hold one entry per query of this chunk: they are
+                    # indexed by position within the chunk, not by context token.
+                    t0 = chunk.token_start
+                    assert chunk.cu_seqlen_ks.shape[0] == chunk.token_end - t0
+                    for lo, hi in _tile_bounds(t0, chunk.token_end, n_k):
+                        ks = chunk.cu_seqlen_ks[lo - t0 : hi - t0]
+                        ke = chunk.cu_seqlen_ke[lo - t0 : hi - t0]
                         logits = fp8_mqa_logits(q_fp8[lo:hi], (ck, cs), weights[lo:hi], ks, ke)
                         cute_dsl_indexer_topk_prefill(
                             logits, ks, ke, topk_buf[lo:hi],
                             top_k=core.idx_topk, compiled=core._ix_topk_pre_compiled,
                         )  # fmt: skip
+                if q_split is not None:
+                    q_lo, q_hi, q_sizes = q_split
+                    topk_buf[: sum(q_sizes)] = allgather(
+                        topk_buf[q_lo:q_hi], md.mapping, dim=0, sizes=q_sizes
+                    )
             if gen and not skip_gen:
                 core._indexer_decode(
                     md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p
