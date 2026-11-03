@@ -307,7 +307,7 @@ def rope_write_kv_paged(
     page_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """One launch: NeoX RoPE on the Q heads of packed QKV (in place) and the step's rotated K and
-    its V into the paged pool; the pool and Q end as after ``rope_qkv_inplace`` followed by
+    its V into the paged pool; the pool and Q end as after NeoX RoPE on Q and K followed by
     ``write_kv_paged`` (only the K columns of ``qkv`` stay unrotated).
 
     Args:

@@ -13,89 +13,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared-prompt generation attention for ``n``-sample requests.
+"""Shared-prompt generation attention for ``n``-sample requests with speculative decoding (SM90).
 
-Requires KV cache manager V2 (``use_kv_cache_manager_v2=True``, the default). A
-batch served by another manager, or with ``beam_width > 1``, is declined and
-runs the regular kernel.
+The children of an ``n``-sample request (``beam_width == 1``) are independent requests that map
+the same leading prompt pages when KV-cache block reuse lets them share the parent's blocks. The
+regular decode kernel reads that prompt once per child; for a long prompt the shared prefix
+dominates the step.
 
-The children of an ``n``-sample request (``beam_width == 1``) are independent
-requests that map the same leading prompt pages when KV-cache block reuse lets
-them share the parent's blocks. The regular decode kernel reads that prompt once
-per child; for a long prompt the shared prefix dominates the step.
+This library splits a generation step into two parts and merges them by log-sum-exp. Rows whose
+block tables start with identical pages form a group; the group's common full pages are read once
+for all of its queries (``Fa4Prefix``, FlashAttention-4, no mask: every shared token precedes every
+query), and every row attends its own remaining pages (``Fa4Tail``, causal). The step's K/V is
+written into the row's own pages at ``kv_len - q_len + j``, exactly as the regular kernel does, so
+the two paths are interchangeable step by step. Kernels: ``sampling_shared_prefix_fa4``.
 
-This library splits a generation step into two parts and merges them with the
-standard log-sum-exp recombination (``merge_states``). Rows whose block tables start with identical
-pages form a group; the group's common full pages are read once for all of its
-queries (one FlashInfer paged-prefill call, no causal mask) and every row
-attends to its own remaining pages (partial prompt block and generated tokens)
-with a paged decode call. The two states are merged. The current
-token's K/V is written into the row's own block at ``kv_len - 1``, exactly as
-the regular kernel does, so the two paths are interchangeable step by step.
+Scope: generation-only batches with a linear draft (``q_len = 1 + K`` tokens per row, ``q_len >=
+MIN_Q_LEN``) of a dense GQA/MHA model on SM90, bf16 paged KV cache of KV cache manager V2, no
+sliding window, sinks, custom masks, beam search or tree drafts. Every other batch is declined and
+the regular kernel runs. The draft layers run on the same metadata with the draft KV manager
+swapped in and are declined.
 
-Scope: generation-only batches of a dense GQA/MHA model with an unquantized
-bf16/fp16 paged KV cache (manager V2), no sliding window, sinks,
-custom masks, or tree speculative decoding. Mixed context+generation batches fall
-back to the regular library. The per-step planning (page table of the prompt,
-tail length) is host work driven from ``TrtllmAttentionMetadata.prepare``,
-which keeps the captured CUDA graph free of host synchronization.
+Planning (grouping, the prefix request tables) is host work in ``TrtllmAttentionMetadata.prepare``
+(``plan_step``); the groups change only when the batch's requests or their shared pages do. Each
+batch size owns fixed-address device tables, refreshed with a few asynchronous copies when the
+groups change, so a CUDA graph captured with this library serves any batch of its size: rows
+without a shared prefix, and sharing groups beyond the ``MAX_GROUPS_ENV`` capacity, are attended
+through the tail call alone. A sharing group is kept only if the size gate (``COST_MODEL``) says
+reading its prefix once pays; an eager batch without any such group is declined.
 
-An eager batch is declined (the regular
-kernel runs) unless sharing pays: ``sharing_pays`` requires wide groups with a
-long enough shared prefix (``TLLM_SAMPLING_SHARED_PREFIX_MIN_GROUP``, default 4;
-``TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS``, default: the cost model's break-even for
-the layer shape, 5000 when it is unknown), because for short prompts the regular kernel
-is faster. Under CUDA graphs the same decision picks
-between two graph variants per batch size (``resolve_graph_variant``, part of
-the graph key).
+Under the overlap scheduler the host KV length can exceed the true (device) length by up to K, so
+the host page tables only bound the work: the tail tables and the write positions come from the
+device KV lengths. Rejected drafts need no handling, their stale K/V is overwritten by the next step.
 
-Under CUDA graphs the n-sample path is captured for every generation batch
-size of two or more rows, and runs through the fused Triton kernel of
-``sampling_shared_prefix_fused`` (prefix and tail kernels on two streams plus a reduce per
-layer, no FlashInfer plan or run;
-``TLLM_SAMPLING_SHARED_PREFIX_FUSED=0`` selects the FlashInfer calls) when the head
-layout and dtype allow it. Each captured batch size owns fixed-address buffers:
-the prefix call is planned for a fixed number of groups (up to
-``TLLM_SAMPLING_SHARED_PREFIX_MAX_GROUPS`` sharing groups plus one placeholder
-group for the rows without a shared prefix, padded with empty groups), the
-tail call for one entry per row, and the per-step indices (KV write page and
-slot, group order, placeholder mask, tail last-page lengths) live in fixed
-device buffers. ``prepare`` refreshes them before every replay with a few
-asynchronous host-to-device copies, and re-plans the FlashInfer work lists
-only when the groups or a page count change. The captured kernels read
-nothing else that changes between steps, so any batch of the captured size is
-served: surplus sharing groups and rows without a shared prefix are attended
-through the tail call alone.
-
-Speculative decoding (``n``-sample path only): with a linear draft of K tokens
-every generation row carries ``q_len = 1 + K`` tokens. The prefix call stacks the
-``q_len`` queries of every row of a group against the shared pages (no mask:
-every shared token precedes every query); the tail is a causal FlashInfer prefill
-with ``q_len`` queries per row over the row's own pages; the K/V of the step's
-tokens are written at ``kv_len - q_len + j``. Under the overlap scheduler the
-host KV length can exceed the true (device) length by up to K, so the host page
-tables only bound the work: the write positions and the tail's last-page
-lengths come from the device KV lengths (the latter may be zero or negative,
-which FlashInfer's unsigned length arithmetic handles). Rejected drafts need no
-handling, their stale K/V is overwritten by the next step. Captured spec steps run
-through the fused kernel too (``TLLM_SAMPLING_SHARED_PREFIX_FUSED_SPEC=0`` keeps the
-FlashInfer calls): its prefix tiles stack the ``q_len`` queries of every row of a
-group, its tail tile holds a row's ``q_len`` tokens causally and persists their K/V.
-Whether the library pays is decided by a cost model of the layer shape
-(``COST_MODEL``, ``min_shared_tokens``), not a fixed prompt length. The draft layers run
-on the same metadata with the draft KV manager swapped in and are declined.
-The check mode (``TLLM_SAMPLING_SHARED_PREFIX_CHECK``) covers single-token steps only.
-
-RoPE: a module that applies RoPE itself hands no ``pos_embd_params`` to the
-backend and the library sees rotated Q/K. A module that fuses RoPE into the
-attention op (Qwen2, Llama, ...) hands them over, and the library then rotates the
-Q and K heads of the packed QKV in place before anything else runs
-(``rope_qkv_inplace``), reading the op's own cos/sin table at the device position
-``kv_len - q_len + j``, which is what the op does before its K write. Supported
-for ``n``-sample steps with NeoX-style rotation, no scaling or linear scaling
-and a full or partial rotary dim that is a power of two; every other rotary
-variant (yarn, llama3, long/dynamic scaling, mRoPE, GPT-J interleaving) is
-declined and the regular kernel runs.
+RoPE: a module that applies RoPE itself hands no ``pos_embd_params`` to the backend and the library
+sees rotated Q/K. A module that fuses RoPE into the attention op (Qwen2, Llama, ...) hands them
+over, and the library then rotates Q and the step's K while writing them (``rope_write_kv_paged``),
+reading the op's own cos/sin table at the device position ``kv_len - q_len + j``. Supported for
+NeoX-style rotation, no scaling or linear scaling and a full or partial rotary dim that is a power
+of two; every other rotary variant is declined and the regular kernel runs.
 
 Opt in with ``TLLM_FMHA_LIBS=+sampling_shared_prefix``.
 """
@@ -103,12 +58,11 @@ Opt in with ``TLLM_FMHA_LIBS=+sampling_shared_prefix``.
 from __future__ import annotations
 
 import dataclasses
-import itertools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
 import torch
@@ -118,7 +72,6 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
     PredefinedAttentionMask,
 )
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
@@ -126,30 +79,13 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
-
-if IS_FLASHINFER_AVAILABLE:
-    import flashinfer
-
-    from .sampling_shared_prefix_fused import (
-        MAX_QUERIES_PER_TILE,
-        CtxPrefix,
-        Fa4Prefix,
-        Fa4Tail,
-        FusedWorkspace,
-        ctx_prefix_supported,
-        default_prefix_splits,
-        fa4_prefix_splits,
-        fa4_prefix_supported,
-        fused_sampling_attention,
-    )
-    from .sampling_shared_prefix_kernels import (
-        merge_scatter,
-        rope_qkv_inplace,
-        step_last_len,
-        step_slots,
-        write_kv_gather_q,
-        write_kv_gather_q_spec,
-    )
+from .sampling_shared_prefix_fa4 import (
+    Fa4Prefix,
+    Fa4Tail,
+    fa4_prefix_splits,
+    fa4_sampling_attention,
+    fa4_supported,
+)
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -158,203 +94,41 @@ if TYPE_CHECKING:
     )
 
 LIB_NAME = "sampling_shared_prefix"
-"""Registry name; also the key of the per-metadata plan state in
-``TrtllmAttentionMetadata.fmha_plan_caches``."""
+"""Registry name."""
 
 SAMPLING_KEY = LIB_NAME + "_sampling"
-"""Key of the per-metadata plan state of the n-sample path in
-``TrtllmAttentionMetadata.fmha_plan_caches``."""
+"""Key of the per-metadata plan state in ``TrtllmAttentionMetadata.fmha_plan_caches``."""
 
-BACKEND_ENV = "TLLM_SAMPLING_SHARED_PREFIX_BACKEND"
-"""FlashInfer prefill backend for the prefix call. Default ``fa2``, the kernel
-family the TRTLLM FlashInfer backend pins for paged prefill; ``fa3`` or
-``auto`` select the Hopper kernels."""
-DEFAULT_BACKEND = "fa2"
+MIN_Q_LEN = 4
+"""Fewest query tokens per row (1 + draft tokens). The FA4 prefix tile needs the queries of a whole
+group; the library is measured with drafts of 3 and 8 tokens."""
 MAX_GROUPS_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MAX_GROUPS"
-DEFAULT_MAX_GROUPS = 64
-"""Sharing groups the prefix call of a captured n-sample batch can hold (capped
-at half the rows). The FlashInfer work list and its float workspace grow with
-it; the rows of further groups are attended through the tail call alone."""
-MIN_SHARED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS"
-DEFAULT_MIN_SHARED_TOKENS = 5000
-"""Smallest shared prompt prefix (tokens per sharing row) for the n-sample library when
-the layer shape is not known; normally ``min_shared_tokens`` follows the cost model
-(``COST_MODEL``). Below the threshold the library's extra work costs more GPU time than
-re-reading the shared pages (earlier Qwen3-1.7B GQA 16/8 measurement: ~0.92-0.98x at
-600-1600 tokens, ~1.02-1.19x at 4000, 1.5-1.6x at 8000)."""
-SPEC_MIN_SHARED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_SPEC_MIN_SHARED_TOKENS"
-COST_MODEL = {
-    # q_len == 1 (plain n-sample decode)
-    "decode": dict(
-        base_us_per_byte=9.0e-8, lib_us_per_query_dim=1.49e-8, lib_extra_us_per_row=0.61
-    ),
-    # q_len > 1 (speculative decoding, TRTLLM-Gen multi-token kernel); prefix on the Triton tile
-    "spec": dict(base_us_per_byte=5.2e-8, lib_us_per_query_dim=1.13e-8, lib_extra_us_per_row=0.30),
-    # q_len > 1; prefix on the TRTLLM-Gen context kernel (``CtxPrefix``)
-    "spec_ctx": dict(
-        base_us_per_byte=5.2e-8, lib_us_per_query_dim=7.0e-9, lib_extra_us_per_row=0.39
-    ),
-}
-"""Cost model of the n-sample library, per layer, per row, per shared prompt token ``L``.
-Fitted to Nsight Systems / A-B-B-A decode steps of 128 rows in 4 groups of 32, MHA 20/20
-heads, head_dim 128, bf16 KV, GB200, KV cache manager V2, CUDA graphs, prompts of 600 /
-1600 / 4000 / 6500 tokens, EAGLE-3 K=8 (``spec``) and without speculation (``decode``):
-
-* the regular kernel re-reads the shared pages for every row (from L2):
-  ``base_us_per_byte * kv_bytes_per_token * L`` with ``kv_bytes_per_token = 4 * kv_heads *
-  head_dim`` (spec: 114 / 174 / 335 us per layer at L = 600 / 1600 / 4000; the plain
-  decode kernel is ~1.8x costlier per byte at 128 rows);
-* the fused kernel reads them once per group, but its tensor-core work grows with every
-  query: ``lib_us_per_query_dim * q_len * heads * head_dim * L``, plus a fixed
-  ``lib_extra_us_per_row`` for the partial states and the tail tile (the private pages are
-  read by both and cancel).
-
-Step time with the library minus without it, per layer, is then a straight line in
-``L``. Spec (q_len 9), decode window right after the prompt (Nsight): +13 / -8 / -55 /
--113 us per layer at the four lengths (+3.4% / -1.9% / -8.5% / -12.8% of the step), i.e.
-``lib_extra_us_per_row`` 0.21 and a break-even of ~1250 tokens. Over a whole generation
-of 1024 new tokens the advantage shrinks, because the private tail (read by both
-kernels, and slower in the fused one) grows to ~1000 tokens: the A-B-B-A tokens/s of the
-library over the regular kernel is 0.97 / 0.96 / 1.03 / 1.08 at 600 / 1600 / 4000 / 6500.
-The spec constants were refit for the single-purpose-launch kernel and the context-kernel prefix.
-Per-layer slopes from a CUDA-graph microbenchmark (GB200, MHA 20/20, d128, q_len 9, 45 cells: 3 groups x
-40, 6 x 20 and 1 x 40 rows, 150-4000 prompt tokens, 300-1800 tail tokens), with R rows, P shared and T tail
-tokens: TRTLLM-Gen decode ``5.35e-4 R P + 1.43e-3 R T``, Triton prefix ``2.61e-4 R P + 1.40e-3 R T``, context
-kernel prefix ``1.61e-4 R P + 1.42e-3 R T`` us (the tail terms agree; the private pages are streamed once
-either way). The slopes give ``base_us_per_byte`` 5.2e-8 (5.35e-4 / 10240 B) and ``lib_us_per_query_dim``
-1.13e-8 (Triton) / 7.0e-9 (context kernel, ~2.1x the tensor throughput). The microbenchmark's INTERCEPTS
-are not usable: it puts +40 us on the TRTLLM-Gen decode call that the same kernel does not have inside
-the model (183 us per layer at 600 + 850 tokens in Nsight, against 234 us in the microbenchmark), and it
-leaves out the rotary, gather and merge kernels. ``lib_extra_us_per_row`` is therefore fitted to Nsight
-Systems steps of the real model (EAGLE-3 K=8, 3 groups x 40 rows, tails ~850 tokens): the library's GPU
-time per step minus the regular kernel's is +1.08 ms at 600 shared tokens (+26 us per layer) and -7.0 ms at
-4000 (-171 us per layer), i.e. break-even ~1050 tokens, and the whole-generation A-B-B-A tokens/s ratios of
-the library against the regular kernel agree (0.94 / 1.02-1.04 / 1.13-1.16 / 1.38 at 600 / 1600 / 4000 /
-6500 tokens, default gate and forced). That gives 0.39 us per row (context kernel) and 0.30 (Triton prefix).
-Below ~96 rows the gate stays off (``DEFAULT_SPEC_MIN_ROWS``: one group of 40 rows measured 0.9-1.0x of the
-regular kernel up to 1600 shared tokens, 1.2x at 4000). GQA keeps no spec model (never measured faster than
-the regular kernel). Plain decode (whole generation): 0.99x / 1.24x / 1.68x / 1.97x tokens/s at the
-same lengths, break-even ~700 tokens. For GQA with several query heads per KV head the regular
-kernel reads fewer bytes while the fused kernel's work is unchanged, so the break-even
-moves out or, for q_len 9, never arrives (microbench, 16/8 heads: 1.15-1.55x slower per
-layer at 600-6500 tokens). The constants are fits to those cells, not laws; the
-``q_len`` scaling of the query term follows the flop count and the fixed term was not
-measured across ``q_len`` within a family. ``TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS``
-and ``TLLM_SAMPLING_SHARED_PREFIX_SPEC_MIN_SHARED_TOKENS`` replace the model by a fixed
-threshold (0 always on, a very large value off)."""
-
-SPEC_MIN_ROWS_ENV = "TLLM_SAMPLING_SHARED_PREFIX_SPEC_MIN_ROWS"
-DEFAULT_SPEC_MIN_ROWS = 96
-"""Fewest sharing rows for the library with speculative decoding. The prefix grid has
-one program set per (group, KV head), so a batch of a few groups leaves SMs idle while
-the regular kernel parallelises over rows: EAGLE-3 K=8, MHA 20/20, 64 rows in 2 groups
-of 32 at 4000 prompt tokens measured 0.96x tokens/s (128 rows in 4 groups: 1.03x)."""
+DEFAULT_MAX_GROUPS = 8
+"""Sharing groups the prefix call of a batch size can hold (capped at half the rows). FA4 launches
+blocks for every padded request, so the padded group count stays small; the rows of further groups
+are attended through the tail call alone."""
 MIN_GROUP_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MIN_GROUP"
-DEFAULT_MIN_GROUP = 4
-"""Smallest number of rows sharing a prefix for the n-sample library to be used;
-reading the prompt once instead of ``n`` times only pays for wide groups."""
-FUSED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_FUSED"
-"""Set to 0 to run captured n-sample batches through the FlashInfer prefix/tail calls instead
-of the fused Triton kernel (``sampling_shared_prefix_fused``)."""
-PREFIX_KERNEL_ENV = "TLLM_SAMPLING_SHARED_PREFIX_PREFIX_KERNEL"
-"""``auto`` (default) serves the shared pages of captured n-sample batches through the TRTLLM-Gen
-context kernel where it exists (SM100/SM103, bf16, head_dim 64/128), through FlashAttention-4 on SM90
-(``Fa4Prefix``) and through the Triton prefix kernel elsewhere; ``triton`` forces the Triton kernel
-(see ``CtxPrefix``)."""
-TAIL_KERNEL_ENV = "TLLM_SAMPLING_SHARED_PREFIX_TAIL_KERNEL"
-"""``auto`` (default) serves the private pages of captured n-sample batches through FlashAttention-4
-whenever the shared pages are (``Fa4Tail``, SM90); ``triton`` keeps the Triton tail launch. On H100
-(Qwen2.5-7B, 120 rows) FA4's tensor-core decode tile reads a row's private pages faster than the
-Triton tail program, which covers every (row, KV head) with one CUDA-core-bound program."""
-FA4_PREFIX_MAX_GROUPS = 8
-"""Default sharing-group capacity of a captured batch on the FlashAttention-4 prefix path: FA4 launches
-blocks for every padded request, so the padded group count stays small. Further groups are attended
-through the tail call alone."""
-CHECK_ENV = "TLLM_SAMPLING_SHARED_PREFIX_CHECK"
-"""Set to 1 to synchronize after every stage of the step and validate the
-sampling attention output against a dense reference. Debugging aid:
-it serializes the GPU and must stay off for measurements."""
+DEFAULT_MIN_GROUP = 2
+"""Fewest rows of a sharing group."""
+MIN_SHARED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS"
+"""Fixed smallest shared prefix (tokens) of a sharing group; replaces the cost model. 0 keeps
+every group, a very large value none."""
 
-# Split-KV partial results of the prefix call. FlashInfer recommends 128 MB
-# and raises (rather than overflows) if a plan needs more.
-_FLOAT_WORKSPACE_BYTES = 128 * 1024 * 1024
-_float_workspace: Dict[torch.device, torch.Tensor] = {}
+COST_MODEL = dict(mha_min_saved_bytes=8.0e6, gqa_min_saved_bytes=0.0)
+"""Size gate of a sharing group on H100: the group shares its prefix when the KV bytes it saves per
+layer, ``(rows - 1) * shared tokens * kv_bytes_per_token`` (``group_saved_bytes``), reach the
+threshold of its attention type (MHA: as many KV heads as query heads; GQA otherwise).
 
-
-def _partial_out_dtype(dtype: torch.dtype) -> torch.dtype:
-    """Output dtype of the FlashInfer calls whose results are merged afterwards.
-
-    FlashInfer cannot write fp32 outputs. A bf16 partial output adds a second
-    bf16 rounding on top of the one of the merged result, which leaves the
-    step measurably less accurate than a single decode kernel (about 1.3x its
-    RMS error against exact attention). fp16 keeps three more mantissa bits,
-    so the merged result carries the error of one bf16 rounding. A normalized
-    attention output is a convex combination of V rows, so it fits in fp16
-    whenever every V entry does (|v| < 65504).
-    """
-    return torch.float16 if dtype == torch.bfloat16 else dtype
-
-
-def _check_enabled() -> bool:
-    return os.environ.get(CHECK_ENV, "0") == "1"
-
-
-def _backend_from_env() -> str:
-    value = os.environ.get(BACKEND_ENV, "").strip()
-    return value or DEFAULT_BACKEND
-
-
-def _get_float_workspace(device: torch.device, nbytes: int = 0) -> torch.Tensor:
-    """Shared FlashInfer float workspace, at least ``nbytes`` large. Every wrapper
-    runs on the same stream sequentially, so one buffer per device serves all plan
-    states. A larger request allocates a new buffer; wrappers created earlier are
-    pointed at it by ``_sampling_wrappers`` before their next plan."""
-    workspace = _float_workspace.get(device)
-    if workspace is None or workspace.numel() < nbytes:
-        workspace = torch.empty(
-            max(nbytes, _FLOAT_WORKSPACE_BYTES), dtype=torch.uint8, device=device
-        )
-        _float_workspace[device] = workspace
-    return workspace
-
-
-class _PlanKey:
-    """Per-layer shape family a FlashInfer wrapper is planned for."""
-
-    __slots__ = ("num_heads", "num_kv_heads", "head_dim", "dtype", "sm_scale", "q_len")
-
-    def __init__(
-        self,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        sm_scale: float,
-        q_len: int = 1,
-    ):
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.dtype = dtype
-        self.sm_scale = sm_scale
-        self.q_len = q_len
-        """Query tokens per generation row (1 + draft tokens under speculative decoding)."""
-
-    def _tuple(self):
-        return (
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            self.dtype,
-            self.sm_scale,
-            self.q_len,
-        )
-
-    def __eq__(self, other) -> bool:
-        return isinstance(other, _PlanKey) and self._tuple() == other._tuple()
-
-    def __hash__(self) -> int:
-        return hash(self._tuple())
+Measured per layer with CUDA graphs on H100 (SM90): the library with every group sharing against
+the same launches with every group demoted to the tail, 888 cases of 4-120 rows in groups of 2-80
+rows, 32-6,400 shared and 256-2,048 private tokens, 3 and 8 draft tokens, for MHA 20/20 and GQA
+28/4 heads of 128. With MHA, sharing loses up to 12 us per layer on small groups with short
+prefixes (2-12 rows, up to a few hundred tokens) and saves up to 700 us on wide groups with long
+ones; the threshold that loses least summed over the MHA cases is 7.2-10.2 MB (8 MB: 54 us over
+444 cases, at most 7.8 us in one case).
+GQA reads a fifth of the bytes per token and its savings and losses are small (-4 to +110 us);
+sharing every group loses least (74 us over 444 cases, at most 4.2 us). Other head layouts are
+not measured and take the rule of their attention type."""
 
 
 def _is_v2_manager(kv_cache_manager) -> bool:
@@ -421,21 +195,18 @@ def has_active_plan(metadata: "TrtllmAttentionMetadata") -> bool:
 def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     """Per-step host planning, called from ``TrtllmAttentionMetadata.prepare``.
 
-    Groups the rows that share leading prompt pages and derives the page tables
+    Groups the rows that share leading prompt pages and derives the prefix tables
     from the host block offsets the manager just filled. Runs before any forward
     of the step, so under CUDA graphs it precedes capture and replay.
     """
-    if metadata.is_cuda_graph and not getattr(metadata, "shared_prefix_graph", True):
-        # The graph variant captured with the regular kernel (see resolve_graph_variant).
-        return
-    sampling_state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
-    if sampling_state is not None:
-        sampling_state.plan = None
+    state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
+    if state is not None:
+        state.plan = None
     if sampling_metadata_eligible(metadata):
         _plan_sampling_step(metadata)
-        return
-    if sampling_state is not None and sampling_state.captured:
-        # A graph captured with the n-sample path would replay stale buffers.
+        state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
+    if state is not None and state.captured and state.plan is None:
+        # A graph captured with this library would replay stale tables.
         raise RuntimeError(
             f"{LIB_NAME}: CUDA graph metadata captured with the n-sample path no longer "
             "satisfies its preconditions."
@@ -443,49 +214,39 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
 
 
 # --------------------------------------------------------------------------- #
-# n-sample requests (beam_width == 1, KV cache manager V2)
+# Grouping
 # --------------------------------------------------------------------------- #
 @dataclass
 class _Grouping:
-    """Row grouping of one batch composition and the page tables derived from it.
+    """Row grouping of one batch composition and the prefix tables derived from it.
 
     Rows whose block tables start with the same full pages form a sharing group
     that reads those pages once (``prefix``); every other row joins a single
     placeholder group whose prefix call runs over one token and is masked out
-    of the merge. Prefix and tail tables are in ``perm`` order (the rows of a
-    group are contiguous there); the KV write page is in batch order.
+    of the merge. The prefix tables are in ``perm`` order (the rows of a group
+    are contiguous there).
 
     A grouping stays valid while the batch keeps the same rows, the block
     table still holds every page it read (each row's pages up to its last
-    one), and each row keeps the same number of full pages before its current
-    token: block tables only grow, so nothing it holds can change otherwise.
-    The page check catches a row whose pages changed without any length
-    changing: a new request in a recycled slot, or pages released and
-    allocated again (preemption, resume from a lower cache tier).
-    Between two page boundaries only the last-page lengths and the write slots
-    move, and those are derived per step from the KV lengths. When rows cross a
-    page boundary, the groups and the prefix tables stay valid unless a
-    group's shared run was cut by its members' full pages (``capped_keys``)
-    and that limit moved; otherwise only the tail tables are rebuilt
-    (``_refresh_tail``) and ``prefix_version`` stays.
-
-    Host arrays are numpy (the planner runs every step and numpy's per-call
-    cost is a fraction of torch's); the FlashInfer plan inputs are zero-copy
-    torch views of them.
+    one), and each row keeps the same number of full pages before its first
+    token of the step: block tables only grow, so nothing it holds can change
+    otherwise. The page check catches a row whose pages changed without any
+    length changing: a new request in a recycled slot, or pages released and
+    allocated again (preemption, resume from a lower cache tier). When rows
+    cross a page boundary the groups stay valid unless a group's shared run
+    was cut by its members' full pages (``capped_keys``) and that limit moved.
     """
 
     version: int
-    """Changes whenever any table changes."""
-    prefix_version: int
     """Changes whenever the groups or the prefix tables change."""
     num_rows: int
     table_rows: np.ndarray
     """[rows] int64: host block-table row of each batch row."""
     private_from: np.ndarray
-    """[rows] int64: index of the page holding the row's first token of this step
-    (the current token when ``q_len`` is 1). Pages before it may be shared."""
+    """[rows] int64: index of the page holding the row's first token of this step.
+    Pages before it may be shared."""
     q_len: int
-    """Query tokens per row: 1, or 1 + draft tokens under speculative decoding."""
+    """Query tokens per row: 1 + draft tokens."""
     last_pages: np.ndarray
     """[rows] int64: index of the page holding the row's last token of this step."""
     num_groups: int
@@ -507,33 +268,22 @@ class _Grouping:
     """[keys] int64: smallest full-page count of each key's rows."""
     shared_g: np.ndarray
     """[rows] int64, grouped order: shared pages of the row's group."""
-    max_group_rows: int
-    qo_indptr: torch.Tensor
-    """[num_groups + 1] int32 host."""
-    prefix_indptr: torch.Tensor
-    prefix_indices: torch.Tensor
-    prefix_last_page_len: torch.Tensor
+    qo_indptr: np.ndarray
+    """[num_groups + 1] int32: query-token range of each group."""
+    prefix_indptr: np.ndarray
+    """[num_groups + 1] int32: page range of each group in ``prefix_indices``."""
+    prefix_indices: np.ndarray
+    """int32: the groups' shared pages, then one placeholder page per non-sharing group."""
+    prefix_last_page_len: np.ndarray
+    """[num_groups] int32: tokens in each group's last prefix page."""
     prefix_empty: np.ndarray
     """[rows] bool, grouped order: the row sits in the placeholder group."""
-    blocks_g: np.ndarray
-    """[rows] int64, grouped order: pages up to and including the current token."""
-    tail_indptr: torch.Tensor
-    tail_indices: torch.Tensor
-    write_page: np.ndarray
-    """[rows] int64, batch order: pool page of the current token."""
-    base_len: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
-    """[rows] int32, grouped order: first position of the row's last host page,
-    ``(blocks - 1) * tokens_per_block``. The device KV length minus it is the
-    last page length the tail call reads (zero or negative when the host
-    overestimated the length by a whole page)."""
-    check_pages: Optional[torch.Tensor] = None
-    """[rows, pages] int64 full page tables; only kept in check mode."""
 
 
-def _indptr(counts: np.ndarray) -> torch.Tensor:
+def _indptr(counts: np.ndarray) -> np.ndarray:
     indptr = np.zeros(counts.size + 1, dtype=np.int32)
     np.cumsum(counts, out=indptr[1:])
-    return torch.from_numpy(indptr)
+    return indptr
 
 
 def _build_grouping(
@@ -545,22 +295,21 @@ def _build_grouping(
     *,
     max_sharing_groups: Optional[int],
     padded_groups: Optional[int],
-    keep_check_pages: bool,
-    q_len: int = 1,
+    q_len: int,
+    group_pays: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
 ) -> _Grouping:
-    """Group rows by common leading pages and build the prefix and tail tables.
+    """Group rows by common leading pages and build the prefix tables.
 
     Two rows share a prefix when their block tables start with the same pool
     page. A group's shared pages are the longest common run of full pages that
-    lie entirely before every member's current token; everything after that
-    run, the current token's page included, stays private to the row.
+    lie entirely before every member's first token of the step; everything after
+    that run stays private to the row.
 
     Args:
         pages_all: [rows, pages] int64 page tables covering every row's pages.
         kv_lens: [rows] int64, >= q_len; the KV length including this step's
             ``q_len`` tokens (the host value; under speculative decoding it may
-            exceed the true length by up to the draft length, so every page the
-            true length can need must be in ``pages_all``).
+            exceed the true length by up to the draft length).
         q_len: query tokens per row.
         max_sharing_groups: keep at most this many sharing groups (those that
             save the most page reads; ties go to the lower first page); the
@@ -569,6 +318,8 @@ def _build_grouping(
             many groups: the sharing groups, the placeholder group (possibly
             without rows) and empty padding groups. Without one, the
             placeholder group exists only when it has rows.
+        group_pays: ``(rows, shared tokens)`` of the candidate groups -> which of
+            them share; the rows of the others join the placeholder group.
     """
     i64 = np.int64
     pages_all = np.asarray(pages_all, dtype=i64)
@@ -576,8 +327,7 @@ def _build_grouping(
     table_rows = np.asarray(table_rows, dtype=i64)
     rows, width = pages_all.shape
     row_ids = np.arange(rows, dtype=i64)
-    num_blocks = (kv_lens + tokens_per_block - 1) // tokens_per_block
-    last_pages = num_blocks - 1
+    last_pages = (kv_lens + tokens_per_block - 1) // tokens_per_block - 1
     private_from = np.maximum(kv_lens - q_len, 0) // tokens_per_block
 
     first_pages = pages_all[:, 0].copy()
@@ -592,7 +342,7 @@ def _build_grouping(
     shared = np.zeros(num_keys, dtype=i64)
     capped_keys = np.zeros(0, dtype=i64)
     if multi.any():
-        # Compare one page past the cap as well (the current token's page,
+        # Compare one page past the cap as well (the page of the step's first token,
         # which every row has): a run that also covers it may grow with the cap.
         span = int(cap[multi].max()) + 1
         cols = pages_all[:, :span]
@@ -606,6 +356,8 @@ def _build_grouping(
         capped_keys = np.flatnonzero(multi & (common > cap))
 
     sharing = np.flatnonzero(shared > 0)
+    if group_pays is not None and sharing.size:
+        sharing = sharing[group_pays(members[sharing], shared[sharing] * tokens_per_block)]
     if max_sharing_groups is not None and sharing.size > max_sharing_groups:
         saved = shared[sharing] * (members[sharing] - 1)
         sharing = sharing[np.argsort(-saved, kind="stable")[:max_sharing_groups]]
@@ -618,7 +370,6 @@ def _build_grouping(
     in_sharing = row_group < num_sharing
     row_shared = np.where(in_sharing, shared[key_of_row], 0)
     perm = np.argsort(row_group, kind="stable")
-    is_identity = bool((perm == row_ids).all())
 
     group_sizes = members[sharing]
     group_shared = shared[sharing]
@@ -647,324 +398,50 @@ def _build_grouping(
         sizes = np.concatenate(
             [group_sizes, [num_placeholder_rows], np.zeros(extra - 1, dtype=i64)]
         )
-    num_groups = num_sharing + extra
-    prefix_indices = np.concatenate([sharing_pages, np.full(extra, placeholder_page, dtype=i64)])
-    prefix_last_page_len = np.concatenate(
-        [np.full(num_sharing, tokens_per_block, dtype=np.int32), np.ones(extra, dtype=np.int32)]
-    )
-
-    blocks_g = num_blocks[perm]
-    shared_g = row_shared[perm]
-    pages_g = pages_all[perm]
-    block_ids = np.arange(width, dtype=i64)
-    in_tail = (block_ids >= shared_g[:, None]) & (block_ids < blocks_g[:, None])
-
     return _Grouping(
         version=version,
-        prefix_version=version,
         num_rows=rows,
         table_rows=table_rows,
         private_from=private_from,
-        num_groups=num_groups,
+        q_len=q_len,
+        last_pages=last_pages,
+        num_groups=num_sharing + extra,
         num_sharing=num_sharing,
         num_placeholder_rows=num_placeholder_rows,
         shared_tokens=int((group_shared * group_sizes).sum()) * tokens_per_block,
         perm=perm,
-        is_identity=is_identity,
+        is_identity=bool((perm == row_ids).all()),
         key_of_row=key_of_row,
         capped_keys=capped_keys,
         key_caps=cap,
-        shared_g=shared_g,
-        max_group_rows=int(sizes.max()) if sizes.size else 0,
+        shared_g=row_shared[perm],
         qo_indptr=_indptr(sizes * q_len),
         prefix_indptr=_indptr(np.concatenate([group_shared, np.ones(extra, dtype=i64)])),
-        prefix_indices=torch.from_numpy(prefix_indices.astype(np.int32)),
-        prefix_last_page_len=torch.from_numpy(prefix_last_page_len),
+        prefix_indices=np.concatenate(
+            [sharing_pages, np.full(extra, placeholder_page, dtype=i64)]
+        ).astype(np.int32),
+        prefix_last_page_len=np.concatenate(
+            [np.full(num_sharing, tokens_per_block, dtype=np.int32), np.ones(extra, dtype=np.int32)]
+        ),
         prefix_empty=~in_sharing[perm],
-        blocks_g=blocks_g,
-        tail_indptr=_indptr(blocks_g - shared_g),
-        tail_indices=torch.from_numpy(pages_g[in_tail].astype(np.int32)),
-        write_page=pages_all[row_ids, private_from],
-        q_len=q_len,
-        last_pages=last_pages,
-        base_len=((blocks_g - 1) * tokens_per_block).astype(np.int32),
-        check_pages=torch.from_numpy(pages_all) if keep_check_pages else None,
     )
 
 
-def _refresh_tail(
-    grouping: _Grouping,
-    version: int,
-    pages_all: np.ndarray,
-    kv_lens: np.ndarray,
-    tokens_per_block: int,
-    *,
-    keep_check_pages: bool,
+def _advance(
+    grouping: _Grouping, private_from: np.ndarray, last_pages: np.ndarray
 ) -> Optional[_Grouping]:
-    """Rebuild only the tail tables of ``grouping`` after rows crossed a page
-    boundary, or return None when the groups themselves may have changed."""
-    q_len = grouping.q_len
-    private_from = np.maximum(kv_lens - q_len, 0) // tokens_per_block
-    last_pages = (kv_lens - 1) // tokens_per_block
+    """``grouping`` after its rows crossed a page boundary, or None when the groups
+    themselves may have changed (a capped shared run may have grown)."""
     if grouping.capped_keys.size:
         caps = grouping.key_caps.copy()
-        caps[grouping.capped_keys] = pages_all.shape[1]
+        caps[grouping.capped_keys] = int(last_pages.max()) + 1
         np.minimum.at(caps, grouping.key_of_row, private_from)
         if not np.array_equal(caps[grouping.capped_keys], grouping.key_caps[grouping.capped_keys]):
             return None
-    perm = grouping.perm
-    blocks_g = last_pages[perm] + 1
-    shared_g = grouping.shared_g
-    in_tail = (np.arange(pages_all.shape[1]) >= shared_g[:, None]) & (
-        np.arange(pages_all.shape[1]) < blocks_g[:, None]
-    )
-    return dataclasses.replace(
-        grouping,
-        version=version,
-        private_from=private_from,
-        last_pages=last_pages,
-        blocks_g=blocks_g,
-        tail_indptr=_indptr(blocks_g - shared_g),
-        tail_indices=torch.from_numpy(pages_all[perm][in_tail].astype(np.int32)),
-        write_page=pages_all[np.arange(pages_all.shape[0]), private_from],
-        base_len=((blocks_g - 1) * tokens_per_block).astype(np.int32),
-        check_pages=torch.from_numpy(pages_all) if keep_check_pages else None,
-    )
+    return dataclasses.replace(grouping, private_from=private_from, last_pages=last_pages)
 
 
-@dataclass
-class _SamplingPlan:
-    """Host-side description of one n-sample generation step, shared by all layers.
-
-    Rows are generation rows. Prefix and tail tensors are in ``perm`` order (the
-    rows of a group are contiguous there), so one permuted copy of the queries
-    serves both attention calls; the KV write indices are in batch order.
-    """
-
-    step: int
-    grouping: _Grouping
-    kv_lens: np.ndarray
-    """[rows] int64 (>= 1), batch order."""
-    tokens_per_block: int
-    check_kv_lens: Optional[torch.Tensor] = None
-
-    @property
-    def tail_last_page_len_np(self) -> np.ndarray:
-        """[rows] int32, grouped order: filled length of each row's last page."""
-        last = (self.kv_lens[self.grouping.perm] - 1) % self.tokens_per_block + 1
-        return last.astype(np.int32)
-
-    @property
-    def write_slot_np(self) -> np.ndarray:
-        """[rows] int64, batch order: slot of the current token inside its page."""
-        return (self.kv_lens - 1) % self.tokens_per_block
-
-    @property
-    def tail_last_page_len(self) -> torch.Tensor:
-        return torch.from_numpy(self.tail_last_page_len_np)
-
-    @property
-    def write_slot(self) -> torch.Tensor:
-        return torch.from_numpy(self.write_slot_np)
-
-    @property
-    def num_rows(self) -> int:
-        return self.grouping.num_rows
-
-    @property
-    def q_len(self) -> int:
-        return self.grouping.q_len
-
-    @property
-    def num_groups(self) -> int:
-        return self.grouping.num_groups
-
-    @property
-    def shared_tokens(self) -> int:
-        return self.grouping.shared_tokens
-
-    @property
-    def perm(self) -> Optional[torch.Tensor]:
-        """None when the batch is already in grouped order."""
-        return None if self.grouping.is_identity else torch.from_numpy(self.grouping.perm)
-
-    @property
-    def qo_indptr(self) -> torch.Tensor:
-        return self.grouping.qo_indptr
-
-    @property
-    def prefix_indptr(self) -> torch.Tensor:
-        return self.grouping.prefix_indptr
-
-    @property
-    def prefix_indices(self) -> torch.Tensor:
-        return self.grouping.prefix_indices
-
-    @property
-    def prefix_last_page_len(self) -> torch.Tensor:
-        return self.grouping.prefix_last_page_len
-
-    @property
-    def prefix_empty(self) -> torch.Tensor:
-        return torch.from_numpy(self.grouping.prefix_empty)
-
-    @property
-    def has_empty(self) -> bool:
-        return self.grouping.num_placeholder_rows > 0
-
-    @property
-    def tail_indptr(self) -> torch.Tensor:
-        return self.grouping.tail_indptr
-
-    @property
-    def tail_indices(self) -> torch.Tensor:
-        return self.grouping.tail_indices
-
-    @property
-    def write_page(self) -> torch.Tensor:
-        return torch.from_numpy(self.grouping.write_page)
-
-    @property
-    def check_pages(self) -> Optional[torch.Tensor]:
-        return self.grouping.check_pages
-
-
-@dataclass
-class _SamplingDevice:
-    """Device copies of an eager step's index tensors, made by the first layer."""
-
-    step: int
-    perm: Optional[torch.Tensor]
-    prefix_empty: Optional[torch.Tensor]
-    """[rows] bool in grouped order, None when every group has a shared prefix."""
-    write_page: Optional[torch.Tensor]
-    write_slot: Optional[torch.Tensor]
-    """Host-derived write indices of single-token steps (None with draft tokens,
-    whose positions come from the device KV lengths)."""
-    shared: Optional[torch.Tensor] = None
-    """[rows] int64, grouped order: shared pages of each row (draft-token steps)."""
-    last_len: Optional[torch.Tensor] = None
-    """[rows] int32, grouped order: last-page length of each row's tail, from the
-    device KV lengths (draft-token steps)."""
-
-
-class _PlanWorkspace:
-    """FlashInfer integer workspace shared by every wrapper of one role and shape.
-
-    ``plan`` fills the page-locked buffer on the host and copies it to the
-    device buffer asynchronously, and ``run`` reads the device buffer. All
-    wrappers of a role run on one stream, one step at a time, so they can share
-    both buffers as long as (a) a wrapper re-plans whenever another one planned
-    into the buffer after it (``owner``) and (b) the host does not overwrite the
-    page-locked buffer before the previous copy out of it executed (``copied``).
-    """
-
-    _INT_WORKSPACE_BYTES = 8 * 1024 * 1024
-
-    def __init__(self, device: torch.device):
-        self.int_buffer = torch.empty(self._INT_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        self.pinned_buffer = torch.empty(
-            self._INT_WORKSPACE_BYTES, dtype=torch.uint8, pin_memory=prefer_pinned()
-        )
-        self.copied = torch.cuda.Event()
-        self.pending = False
-        self.owner = 0
-
-    def bind(self, wrapper: Any) -> None:
-        # FlashInfer 0.6 keeps the integer workspace in these two attributes;
-        # reset_workspace_buffer() would allocate a fresh page-locked buffer.
-        for attr in ("_int_workspace_buffer", "_pin_memory_int_workspace_buffer"):
-            if not hasattr(wrapper, attr):
-                raise RuntimeError(f"{LIB_NAME}: unexpected FlashInfer wrapper without {attr}.")
-        wrapper._int_workspace_buffer = self.int_buffer
-        wrapper._pin_memory_int_workspace_buffer = self.pinned_buffer
-
-    def before_plan(self) -> None:
-        if self.pending:
-            self.copied.synchronize()
-
-    def after_plan(self) -> int:
-        self.copied.record()
-        self.pending = True
-        self.owner = next(_PLAN_TOKENS)
-        return self.owner
-
-
-_PLAN_TOKENS = itertools.count(1)
-_plan_workspaces: Dict[tuple, _PlanWorkspace] = {}
-
-
-def _plan_workspace(device: torch.device, role: str, key: _PlanKey) -> _PlanWorkspace:
-    workspace = _plan_workspaces.get((device, role, key))
-    if workspace is None:
-        workspace = _PlanWorkspace(device)
-        _plan_workspaces[(device, role, key)] = workspace
-    return workspace
-
-
-_graph_float_workspace: Dict[torch.device, torch.Tensor] = {}
-
-
-def _get_graph_float_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
-    """Float workspace of the CUDA graph wrappers, at least ``nbytes`` large.
-
-    Under CUDA graphs FlashInfer always splits the KV and reserves partial
-    results for its padded work list, so the requirement grows with the
-    captured batch. A larger request allocates a new buffer for the wrappers
-    created from then on; earlier wrappers (and the graphs captured with them)
-    keep the buffer they were created with.
-    """
-    workspace = _graph_float_workspace.get(device)
-    if workspace is None or workspace.numel() < nbytes:
-        workspace = torch.empty(
-            max(nbytes, _FLOAT_WORKSPACE_BYTES), dtype=torch.uint8, device=device
-        )
-        _graph_float_workspace[device] = workspace
-    return workspace
-
-
-def _prefill_split_bytes(key: _PlanKey, total_rows: int, batch_size: int, num_sms: int) -> int:
-    """Upper bound of the float workspace a CUDA-graph FA2 prefill plan reserves.
-
-    Mirrors FlashInfer's ``PrefillSplitQOKVIndptr`` under CUDA graphs: the query
-    tile follows from the longest possible request (``total_rows - batch_size
-    + 1`` rows), the work list is padded to ``max(2 * SMs / kv_heads, tiles)``,
-    and every padded entry reserves a ``tile x head_dim`` fp32 partial output
-    plus its LSE per query head.
-    """
-    gqa = key.num_heads // key.num_kv_heads
-    max_qo = (total_rows - batch_size + 1) * gqa
-    tile = 128 if max_qo > 64 else (64 if max_qo > 16 else 16)
-    tiles = -(-total_rows * gqa // tile) + batch_size - 1
-    padded = max((2 * num_sms) // key.num_kv_heads, tiles)
-    return key.num_heads * padded * tile * (key.head_dim + 1) * 4
-
-
-def _graph_float_workspace_bytes(
-    key: _PlanKey, rows: int, groups: int, device: torch.device
-) -> int:
-    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
-    prefix = _prefill_split_bytes(key, rows * key.q_len, groups, num_sms)
-    if key.q_len > 1:
-        # Speculative decoding: the tail is a causal prefill with q_len queries per row.
-        # Use the original formula but note that in practice FlashInfer's SM90 kernel
-        # needs this full workspace (reducing it below ~128MB causes internal OOB on SM90).
-        tail = _prefill_split_bytes(key, rows * key.q_len, rows, num_sms)
-    elif key.num_heads != key.num_kv_heads:
-        tail = _prefill_split_bytes(key, rows, rows, num_sms)
-    else:
-        # Decode kernel: one fp32 partial row per query head and padded work
-        # item, the work list bounded by the resident CTAs of the device.
-        tail = key.num_heads * max(rows, 32 * num_sms) * (key.head_dim + 1) * 4
-    return max(prefix, tail) + (1 << 20)
-
-
-_AUX_INT32 = 3
-"""Per-row int32 vectors at the head of the page section of ``_GraphBuffers``:
-tail last-page lengths, ``base_len`` and shared page counts."""
-
-
-def _ctx_tables(
+def _prefix_tables(
     grouping: _Grouping,
     tokens_per_block: int,
     chunk_tokens: int,
@@ -972,7 +449,7 @@ def _ctx_tables(
     max_pages: int,
     splits: int = 1,
 ) -> tuple:
-    """Request tables of the context-kernel prefix call (``CtxPrefix``).
+    """Request tables of the prefix call (``Fa4Prefix``).
 
     Every group with query rows becomes one request per ``chunk_tokens`` query tokens, each
     over the group's shared pages; the rest of the ``num_requests`` entries are empty. With
@@ -981,10 +458,12 @@ def _ctx_tables(
     near-equal runs of the group's pages (possibly empty).
     Returns ``(block_tables, seq_lens, cum_q, cum_kv)`` as int32 arrays.
     """
-    qo = grouping.qo_indptr.numpy()
-    pages_ptr = grouping.prefix_indptr.numpy()
-    pages = grouping.prefix_indices.numpy()
-    last = grouping.prefix_last_page_len.numpy()
+    from .flash_attn4_generation import MIN_SPLIT_TOKENS
+
+    qo = grouping.qo_indptr
+    pages_ptr = grouping.prefix_indptr
+    pages = grouping.prefix_indices
+    last = grouping.prefix_last_page_len
     block_tables = np.zeros((num_requests, max_pages), dtype=np.int32)
     seq_lens = np.zeros((num_requests,), dtype=np.int32)
     cum_q = np.zeros((num_requests + 1,), dtype=np.int32)
@@ -1001,8 +480,6 @@ def _ctx_tables(
             kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
             if splits > 1:
                 # Runs of at least MIN_SPLIT_TOKENS: a short prompt uses fewer (non-empty) runs.
-                from .flash_attn4_generation import MIN_SPLIT_TOKENS
-
                 per = max(-(-count // splits), -(-MIN_SPLIT_TOKENS // tokens_per_block))
                 lo = min(split * per, count)
                 hi = min(lo + per, count)
@@ -1013,8 +490,8 @@ def _ctx_tables(
             for start in range(q0, q1, chunk_tokens):
                 if request >= num_requests:
                     raise RuntimeError(
-                        f"{LIB_NAME}: the step needs more context-kernel requests than the "
-                        f"{num_requests} its CUDA graph buffers hold."
+                        f"{LIB_NAME}: the step needs more prefix requests than the "
+                        f"{num_requests} its buffers hold."
                     )
                 block_tables[request, :count] = pages[first:stop]
                 seq_lens[request] = kv_len
@@ -1027,217 +504,133 @@ def _ctx_tables(
 
 
 @dataclass
-class _GraphBuffers:
-    """Fixed-address step inputs of one captured batch size.
+class _StepBuffers:
+    """Fixed-address step inputs of one batch size.
 
-    A page-locked staging buffer feeds the device buffer that the captured
-    graph reads with one asynchronous copy per step; ``prepare`` issues it, so
-    it precedes the replay on the stream. The buffer is int64: the write page,
-    write slot and group order (``rows`` each, the index dtype of the
-    gather/scatter kernels), followed by an int32 view (FlashInfer's index
-    dtype) holding the tail last-page lengths and the prefix and tail page
-    indices of a regrouping step, which the wrappers' plans copy into their
-    own buffers.
+    The grouping's row order, shared page counts, placeholder mask and the prefix
+    request tables live in device tensors that a captured graph reads; ``upload``
+    stages them in page-locked buffers and copies them asynchronously whenever the
+    groups change (``prepare`` issues it, so it precedes the replay on the stream).
+    The tail tables are rebuilt on the device every step (``Fa4Tail.build_tables``).
     """
 
     rows: int
     num_groups: int
-    prefix_capacity: int
-    tail_capacity: int
-    staging: torch.Tensor
-    device: torch.Tensor
-    rows_staging: torch.Tensor
-    rows_device: torch.Tensor
-    pages_staging: torch.Tensor
-    pages_device: torch.Tensor
-    empty_staging: torch.Tensor
+    prefix: Fa4Prefix
+    tail: Fa4Tail
+    perm: torch.Tensor
+    """[rows] int64: batch row of each grouped position."""
+    shared: torch.Tensor
+    """[rows] int32, grouped order: shared pages of the row's group."""
     empty: torch.Tensor
     """[rows] bool, grouped order: the row's prefix state is a placeholder."""
+    staging: tuple
     copied: torch.cuda.Event
-    meta_offset: int
-    """Offset (int32 units) of the group tables inside ``pages_device``."""
-    fused_prefix_indices: torch.Tensor
-    fused_tail_indices: torch.Tensor
     pending: bool = False
     uploaded_version: int = -1
-    uploaded_prefix_version: int = -1
-    prefix_slice: tuple = (0, 0)
-    tail_slice: tuple = (0, 0)
-    ctx: Optional[Any] = None
-    """``CtxPrefix`` serving the shared pages through the TRTLLM-Gen context kernel, if enabled."""
-    fa4_tail: Optional[Any] = None
-    """``Fa4Tail`` serving the private pages through FlashAttention-4, if enabled (with ``Fa4Prefix``)."""
-    ctx_staging: Optional[tuple] = None
-    uploaded_ctx_version: int = -1
 
     @classmethod
     def create(
-        cls, rows: int, num_groups: int, max_pages: int, device: torch.device
-    ) -> "_GraphBuffers":
-        prefix_capacity = (num_groups - 1) * max_pages + num_groups
-        tail_capacity = rows * max_pages
+        cls,
+        rows: int,
+        q_len: int,
+        shape: tuple,
+        max_groups: int,
+        max_pages: int,
+        tokens_per_block: int,
+        device: torch.device,
+    ) -> "_StepBuffers":
+        from .flash_attn4_generation import generation_splits
+
+        num_heads, num_kv_heads, head_dim = shape
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        num_groups = min(max_groups, rows // 2) + 1
+        tokens = rows * q_len
+        splits = fa4_prefix_splits(rows, q_len, num_heads, num_kv_heads, num_sms)
+        prefix = Fa4Prefix(
+            tokens,
+            num_heads,
+            head_dim,
+            q_len,
+            Fa4Prefix.num_requests_for(num_groups, tokens, q_len) * splits,
+            max_pages,
+            torch.bfloat16,
+            device,
+            tokens_per_block,
+            splits=splits,
+        )
+        tail = Fa4Tail(
+            rows,
+            q_len,
+            num_heads,
+            head_dim,
+            max_pages,
+            torch.bfloat16,
+            device,
+            splits=generation_splits(rows, num_heads, num_kv_heads, q_len, num_sms),
+        )
+        perm = torch.zeros((rows,), dtype=torch.int64, device=device)
+        shared = torch.zeros((rows,), dtype=torch.int32, device=device)
+        empty = torch.zeros((rows,), dtype=torch.bool, device=device)
         pinned = prefer_pinned()
-        # The group tables of the fused kernel follow the page indices.
-        meta_offset = _AUX_INT32 * rows + prefix_capacity + tail_capacity
-        meta_offset += meta_offset % 2
-        meta_len = 3 * num_groups + rows + 3
-        size = 3 * rows + (meta_offset + meta_len + 1) // 2
-        staging = torch.zeros((size,), dtype=torch.int64, pin_memory=pinned)
-        device_buffer = torch.zeros((size,), dtype=torch.int64, device=device)
+        staging = tuple(
+            torch.zeros(t.shape, dtype=t.dtype, pin_memory=pinned)
+            for t in (perm, shared, empty, *prefix.table_arrays())
+        )
         return cls(
             rows=rows,
             num_groups=num_groups,
-            prefix_capacity=prefix_capacity,
-            tail_capacity=tail_capacity,
+            prefix=prefix,
+            tail=tail,
+            perm=perm,
+            shared=shared,
+            empty=empty,
             staging=staging,
-            device=device_buffer,
-            rows_staging=staging[: 3 * rows],
-            rows_device=device_buffer[: 3 * rows],
-            pages_staging=staging[3 * rows :].view(torch.int32),
-            pages_device=device_buffer[3 * rows :].view(torch.int32),
-            empty_staging=torch.zeros((rows + 128,), dtype=torch.bool, pin_memory=pinned),
-            empty=torch.zeros((rows + 128,), dtype=torch.bool, device=device),
             copied=torch.cuda.Event(),
-            meta_offset=meta_offset,
-            fused_prefix_indices=torch.zeros(
-                (prefix_capacity + 64,), dtype=torch.int32, device=device
-            ),
-            fused_tail_indices=torch.zeros((tail_capacity + 64,), dtype=torch.int32, device=device),
         )
 
-    def _meta(self, start: int, length: int) -> torch.Tensor:
-        return self.pages_device[self.meta_offset + start : self.meta_offset + start + length]
-
-    @property
-    def group_qo_indptr(self) -> torch.Tensor:
-        return self._meta(0, self.num_groups + 1)
-
-    @property
-    def group_prefix_indptr(self) -> torch.Tensor:
-        return self._meta(self.num_groups + 1, self.num_groups + 1)
-
-    @property
-    def group_prefix_last_page_len(self) -> torch.Tensor:
-        return self._meta(2 * self.num_groups + 2, self.num_groups)
-
-    @property
-    def row_tail_indptr(self) -> torch.Tensor:
-        return self._meta(3 * self.num_groups + 2, self.rows + 1)
-
-    @property
-    def write_page(self) -> torch.Tensor:
-        return self.rows_device[: self.rows]
-
-    @property
-    def write_slot(self) -> torch.Tensor:
-        return self.rows_device[self.rows : 2 * self.rows]
-
-    @property
-    def perm(self) -> torch.Tensor:
-        return self.rows_device[2 * self.rows :]
-
-    @property
-    def tail_last_page_len(self) -> torch.Tensor:
-        return self.pages_device[: self.rows]
-
-    @property
-    def base_len(self) -> torch.Tensor:
-        return self.pages_device[self.rows : 2 * self.rows]
-
-    @property
-    def shared(self) -> torch.Tensor:
-        return self.pages_device[2 * self.rows : 3 * self.rows]
-
-    @property
-    def prefix_indices(self) -> torch.Tensor:
-        return self.pages_device[self.prefix_slice[0] : self.prefix_slice[1]]
-
-    @property
-    def tail_indices(self) -> torch.Tensor:
-        return self.pages_device[self.tail_slice[0] : self.tail_slice[1]]
-
-    def upload(self, plan: _SamplingPlan) -> None:
-        """Stage the step's indices and copy them to the device buffers."""
-        grouping = plan.grouping
-        rows = self.rows
+    def upload(self, grouping: _Grouping) -> None:
+        """Stage the grouping's tables and copy them to the device buffers."""
         if self.pending:
-            # The previous step's copies out of the staging buffers must have run.
+            # The previous copies out of the staging buffers must have run.
             self.copied.synchronize()
-        row_staging = self.rows_staging.numpy()
-        page_staging = self.pages_staging.numpy()
-        row_staging[:rows] = grouping.write_page
-        row_staging[rows : 2 * rows] = plan.write_slot_np
-        page_staging[:rows] = plan.tail_last_page_len_np
-        count = _AUX_INT32 * rows
-        if grouping.version != self.uploaded_version:
-            page_staging[rows : 2 * rows] = grouping.base_len
-            page_staging[2 * rows : 3 * rows] = grouping.shared_g
-            num_prefix = grouping.prefix_indices.numel()
-            num_tail = grouping.tail_indices.numel()
-            if num_prefix > self.prefix_capacity or num_tail > self.tail_capacity:
-                raise RuntimeError(
-                    f"{LIB_NAME}: step needs {num_prefix} prefix / {num_tail} tail pages but the "
-                    f"CUDA graph buffers hold {self.prefix_capacity} / {self.tail_capacity}."
-                )
-            page_staging[count : count + num_prefix] = grouping.prefix_indices.numpy()
-            self.prefix_slice = (count, count + num_prefix)
-            count += num_prefix
-            page_staging[count : count + num_tail] = grouping.tail_indices.numpy()
-            self.tail_slice = (count, count + num_tail)
-            count += num_tail
-        if grouping.prefix_version != self.uploaded_prefix_version:
-            row_staging[2 * rows :] = grouping.perm
-            self.empty_staging.numpy()[:rows] = grouping.prefix_empty
-            self.empty.copy_(self.empty_staging, non_blocking=True)
-        groups = self.num_groups
-        meta = page_staging[self.meta_offset :]
-        meta[: groups + 1] = grouping.qo_indptr.numpy()
-        meta[groups + 1 : 2 * groups + 2] = grouping.prefix_indptr.numpy()
-        meta[2 * groups + 2 : 3 * groups + 2] = grouping.prefix_last_page_len.numpy()
-        meta[3 * groups + 2 : 3 * groups + 3 + rows] = grouping.tail_indptr.numpy()
-        used = 3 * rows + (count + 1) // 2
-        self.device[:used].copy_(self.staging[:used], non_blocking=True)
-        meta_start = 3 * rows + self.meta_offset // 2
-        meta_stop = meta_start + (3 * groups + rows + 4) // 2
-        self.device[meta_start:meta_stop].copy_(
-            self.staging[meta_start:meta_stop], non_blocking=True
+        prefix = self.prefix
+        host = (
+            grouping.perm,
+            grouping.shared_g,
+            grouping.prefix_empty,
+            *_prefix_tables(
+                grouping,
+                prefix.tokens_per_block,
+                prefix.chunk_tokens,
+                prefix.num_requests,
+                prefix.block_tables.shape[1],
+                splits=prefix.splits,
+            ),
         )
-        if grouping.version != self.uploaded_version:
-            # The fused kernel reads the page lists from fixed addresses.
-            lo, hi = self.prefix_slice
-            self.fused_prefix_indices[: hi - lo].copy_(self.pages_device[lo:hi])
-            lo, hi = self.tail_slice
-            self.fused_tail_indices[: hi - lo].copy_(self.pages_device[lo:hi])
-        if self.ctx is not None and grouping.prefix_version != self.uploaded_ctx_version:
-            self._upload_ctx_tables(grouping)
+        devices = (self.perm, self.shared, self.empty, *prefix.table_arrays())
+        for staging, device, values in zip(self.staging, devices, host):
+            staging.numpy()[...] = values
+            device.copy_(staging, non_blocking=True)
         self.copied.record()
         self.pending = True
         self.uploaded_version = grouping.version
-        self.uploaded_prefix_version = grouping.prefix_version
 
-    def enable_ctx(self, ctx: Any) -> None:
-        self.ctx = ctx
-        pinned = prefer_pinned()
-        self.ctx_staging = tuple(
-            torch.zeros(t.shape, dtype=torch.int32, pin_memory=pinned) for t in ctx.table_arrays()
-        )
 
-    def _upload_ctx_tables(self, grouping: _Grouping) -> None:
-        """Rewrite the context kernel's request tables (changes only with the groups)."""
-        ctx = self.ctx
-        assert ctx is not None and self.ctx_staging is not None
-        tables = _ctx_tables(
-            grouping,
-            ctx.tokens_per_block,
-            ctx.chunk_tokens,
-            ctx.num_requests,
-            ctx.block_tables.shape[1],
-            splits=getattr(ctx, "splits", 1),
-        )
-        for staging, device, host in zip(self.ctx_staging, ctx.table_arrays(), tables):
-            staging.numpy()[...] = host
-            device.copy_(staging, non_blocking=True)
-        self.uploaded_ctx_version = grouping.prefix_version
+@dataclass
+class _SamplingPlan:
+    """Host-side description of one n-sample generation step, shared by all layers."""
+
+    step: int
+    grouping: _Grouping
+
+    @property
+    def num_rows(self) -> int:
+        return self.grouping.num_rows
+
+    @property
+    def q_len(self) -> int:
+        return self.grouping.q_len
 
 
 @dataclass
@@ -1250,41 +643,21 @@ class _SamplingState:
     """The KV-cache manager the plan describes. The draft layers of one-model
     speculative decoding run on this metadata with the draft manager swapped in;
     they must not use the target's plan."""
-    graph: Optional[_GraphBuffers] = None
-    """Set for the metadata of a captured batch size."""
+    buffers: Optional[_StepBuffers] = None
     plan: Optional[_SamplingPlan] = None
     grouping: Optional[_Grouping] = None
     grouping_pages: Optional[np.ndarray] = None
     """[rows, pages] host block-table entries ``grouping`` was built from."""
     table_rows_key: Optional[tuple] = None
     table_rows: Optional[np.ndarray] = None
-    prefix_wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
-    tail_wrappers: Dict[_PlanKey, Any] = field(default_factory=dict)
-    planned_step: Dict[_PlanKey, int] = field(default_factory=dict)
-    planned_tokens: Dict[_PlanKey, tuple] = field(default_factory=dict)
-    """Graph wrappers: (prefix version, prefix owner token, grouping version,
-    tail owner token) of their last plans, to skip re-planning while nothing
-    changed."""
-    device: Optional[_SamplingDevice] = None
     step_counter: int = 0
     grouping_counter: int = 0
     captured: bool = False
-    slots_step: int = -1
-    """Step whose slot indices ``step_slots`` last wrote (CUDA graph batches)."""
-    slots_captured: bool = False
-    fused_workspace: Optional[Any] = None
+    tables_step: int = -1
+    """Step whose tail tables ``Fa4Tail.build_tables`` last wrote."""
+    tables_captured: bool = False
     logged: bool = False
     ran: bool = False
-
-
-def _max_groups_from_env() -> int:
-    value = os.environ.get(MAX_GROUPS_ENV)
-    if value is None or not value.strip():
-        return DEFAULT_MAX_GROUPS
-    groups = int(value)
-    if groups < 1:
-        raise ValueError(f"{MAX_GROUPS_ENV} must be >= 1, got {groups}.")
-    return groups
 
 
 def _int_env(name: str, default: int) -> int:
@@ -1296,267 +669,38 @@ def _int_env(name: str, default: int) -> int:
 
 _model_shape: Optional[tuple] = None
 """(heads, kv_heads, head_dim) of the attention layers that can use the library, set
-when a layer reports itself available; the spec cost model needs it."""
+when a layer reports itself available; the buffers and the cost model need it."""
 
 
-CTX_MIN_Q_LEN = 4
-"""Fewest query tokens per row for the context-kernel prefix. Measured against the Triton prefix per
-layer (GB200, MHA 20/20, 3 groups x 40 rows, 1000-token tails, 1600 / 4000 shared tokens): q_len 1
-0.95x / 0.92x (a group is then 40 queries, too small a tile for the kernel), q_len 4 1.02x / 1.06x,
-q_len 9 1.08x / 1.18x."""
+def group_saved_bytes(rows: np.ndarray, tokens: np.ndarray, shape: tuple) -> np.ndarray:
+    """KV bytes per layer that sharing groups of ``rows`` rows and ``tokens`` shared tokens do not
+    read again: every row but one would read the shared prefix (K and V, bf16)."""
+    _, num_kv_heads, head_dim = shape
+    rows = np.asarray(rows, dtype=np.float64)
+    tokens = np.asarray(tokens, dtype=np.float64)
+    return (rows - 1) * tokens * (4 * num_kv_heads * head_dim)
 
 
-def _ctx_prefix_enabled(head_dim: int, q_len: int) -> bool:
-    """Whether captured batches take the shared pages through the context kernel (``CtxPrefix``)."""
-    if q_len < CTX_MIN_Q_LEN:
-        return False
-    if os.environ.get(PREFIX_KERNEL_ENV, "auto").strip().lower() == "triton":
-        return False
-    if not IS_FLASHINFER_AVAILABLE or not torch.cuda.is_available():
-        return False
-    return ctx_prefix_supported(head_dim, torch.bfloat16) or fa4_prefix_supported(
-        head_dim, torch.bfloat16
-    )
+def _min_saved_bytes(shape: tuple) -> float:
+    num_heads, num_kv_heads, _ = shape
+    key = "mha_min_saved_bytes" if num_heads == num_kv_heads else "gqa_min_saved_bytes"
+    return COST_MODEL[key]
 
 
-def _fa4_prefix_active(head_dim: int, q_len: int) -> bool:
-    """Whether the context-kernel slot is served by FlashAttention-4 (SM90)."""
-    return _ctx_prefix_enabled(head_dim, q_len) and not ctx_prefix_supported(
-        head_dim, torch.bfloat16
-    )
+def _group_filter(q_len: int) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """Which candidate groups ``(rows, shared tokens)`` share: the env threshold if set, else the
+    cost model (``COST_MODEL``); never a group below the minimum size."""
+    min_group = _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP)
+    fixed = os.environ.get(MIN_SHARED_ENV, "").strip()
+    shape = _model_shape
 
+    def pays(rows: np.ndarray, tokens: np.ndarray) -> np.ndarray:
+        wide = rows >= min_group
+        if fixed:
+            return wide & (tokens >= int(fixed))
+        return wide & (group_saved_bytes(rows, tokens, shape) >= _min_saved_bytes(shape))
 
-def break_even_tokens(q_len: int, num_heads: int, num_kv_heads: int, head_dim: int) -> float:
-    """Shared prompt tokens per row above which the library beats the regular kernel
-    for ``q_len`` tokens per row (see ``COST_MODEL``); infinity if it never does."""
-    if q_len == 1:
-        cost = COST_MODEL["decode"]
-    elif num_kv_heads != num_heads:
-        return math.inf  # GQA with draft tokens: never measured faster than the regular kernel
-    else:
-        cost = COST_MODEL["spec_ctx" if _ctx_prefix_enabled(head_dim, q_len) else "spec"]
-    saved_per_token = cost["base_us_per_byte"] * 4 * num_kv_heads * head_dim - (
-        cost["lib_us_per_query_dim"] * q_len * num_heads * head_dim
-    )
-    if saved_per_token <= 0:
-        return math.inf
-    return cost["lib_extra_us_per_row"] / saved_per_token
-
-
-def min_shared_tokens(q_len: int) -> float:
-    """Smallest shared prefix (tokens per row) for the library: the env override of the
-    family, else the cost model, else (layer shape unknown) the conservative default."""
-    name = MIN_SHARED_ENV if q_len == 1 else SPEC_MIN_SHARED_ENV
-    value = os.environ.get(name)
-    if value is not None and value.strip():
-        return int(value)
-    if _model_shape is None:
-        return DEFAULT_MIN_SHARED_TOKENS if q_len == 1 else math.inf
-    return break_even_tokens(q_len, *_model_shape)
-
-
-SPEC_GROUP_MODEL = dict(
-    gain_us_per_token=0.0446,
-    gain_us_per_token_sq=2.9e-6,
-    batch_us=33.0,
-    group_us=7.0,
-    reference_rows=120,
-)
-"""Per-layer saving of the context-kernel path over the regular kernel for a speculative batch of
-``reference_rows`` rows (MHA 20/20, d128, q_len 9, GB200), by group::
-
-    saving = sum_g rows_g * (a * P_g + b * P_g^2) / reference_rows
-             - batch_us * rows / reference_rows - group_us * groups
-
-The regular kernel's cost of re-reading a prefix is convex in its length (the prefix is served from L2
-until it no longer fits: 27 us per 1000 tokens between 600 and 1600, 51 between 1600 and 4000), so the
-gain is quadratic in ``P_g`` and a batch is judged group by group, not by its mean prompt length.
-``a``, ``b`` and ``batch_us`` solve the three Nsight points of the model (3 groups x 40 rows, tails ~850:
-the library minus the regular kernel's GPU time per layer is -26 us at 600 shared tokens, +25 at 1600,
-+171 at 4000, i.e. -53.8 + 0.0446 P + 2.9e-6 P^2, of which ``batch_us`` is the fixed cost of the rotary,
-gather, merge and context-kernel launches after removing 3 groups of ``group_us``); ``group_us`` is the
-per-group cost measured in the microbenchmark (3 groups x 40 vs 6 x 20 rows, same bytes: +20 us for 3 more
-groups). Held-out ABBA checks (not used in the fit): 4x32 and 6x20 rows of mixed lengths lost 5.3% and
-6.7% with the mean-length gate (model: -4 and -11 us per layer -> declined), 6x20 rows at 4000 tokens
-gained 14.6% (model +150 us), 4x32 at 1600 +/-0 (+15 us)."""
-
-
-def spec_batch_saving_us(group_profile, num_rows: int) -> float:
-    """Per-layer saving of the context-kernel path for ``(rows, shared tokens)`` per group; see
-    ``SPEC_GROUP_MODEL``."""
-    m = SPEC_GROUP_MODEL
-    gain = sum(
-        rows * (m["gain_us_per_token"] * tokens + m["gain_us_per_token_sq"] * tokens * tokens)
-        for rows, tokens in group_profile
-    )
-    ref = m["reference_rows"]
-    return gain / ref - m["batch_us"] * num_rows / ref - m["group_us"] * len(group_profile)
-
-
-def sharing_pays(
-    num_rows: int,
-    sharing_rows: int,
-    num_sharing_groups: int,
-    shared_tokens_per_row: float,
-    q_len: int = 1,
-    group_profile=None,
-) -> bool:
-    """Size gate of the n-sample path: whether reading the shared prompt once pays.
-
-    ``sharing_rows`` rows form ``num_sharing_groups`` groups whose common prefix
-    is ``shared_tokens_per_row`` tokens long on average. The library is used
-    when at least half the rows share, the groups are wide enough, and the
-    prefix is long enough (see ``MIN_SHARED_ENV`` / ``MIN_GROUP_ENV``); otherwise
-    the regular generation kernel is faster. With draft tokens on the context-kernel
-    path and ``group_profile`` (``(rows, shared tokens)`` per sharing group), the
-    prefix test is the group-wise cost model ``spec_batch_saving_us`` > 0 instead
-    of the mean length (unless the env fixes a threshold).
-    """
-    if num_sharing_groups <= 0 or sharing_rows <= 0:
-        return False
-    if q_len > 1 and sharing_rows < _int_env(SPEC_MIN_ROWS_ENV, DEFAULT_SPEC_MIN_ROWS):
-        return False
-    structure = (
-        2 * sharing_rows >= num_rows
-        and sharing_rows >= _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP) * num_sharing_groups
-    )
-    if not structure:
-        return False
-    if (
-        q_len > 1
-        and group_profile
-        and not os.environ.get(SPEC_MIN_SHARED_ENV, "").strip()
-        and _model_shape is not None
-        and _model_shape[0] == _model_shape[1]
-        and _ctx_prefix_enabled(_model_shape[2], q_len)
-    ):
-        return spec_batch_saving_us(group_profile, num_rows) > 0
-    return shared_tokens_per_row >= min_shared_tokens(q_len)
-
-
-FUSED_PREFIX_SPLITS = _int_env("TLLM_SAMPLING_SHARED_PREFIX_SPLITS", 0)
-"""Split-K factor of each group's shared pages in the fused kernel (fixed at capture); 0 picks it
-from the grid size (``default_prefix_splits``)."""
-FUSED_TAIL_SPLITS = 1
-CTX_TAIL_SPLITS = 1
-CTX_TAIL_MAX_SPLITS = 8
-CTX_TAIL_SPLITS_ENV = "TLLM_SAMPLING_SHARED_PREFIX_CTX_TAIL_SPLITS"
-"""Split-K of the private pages on the context-kernel path: 0 (default) picks it from the grid
-(``ctx_tail_splits``), a positive value fixes it."""
-
-
-def ctx_tail_splits(num_requests: int, num_kv_heads: int, num_sms: int) -> int:
-    """Splits of each row's private pages on the context-kernel path, fixed at capture.
-
-    One (row, KV head) program streams a row's private pages. At 120 rows x 4 KV heads that is
-    ~3.6 programs per SM and one split is best (``CTX_TAIL_SPLITS``), but a batch of a few rows
-    leaves most SMs idle: on H100 (Qwen2.5-7B, K=3, 4 padded rows, 16 programs) the tail launch
-    took 36 us per layer against 18 us for FlashAttention-4 over the whole row. Split only a grid that
-    fills less than half the SMs, up to one wave, capped at ``CTX_TAIL_MAX_SPLITS``: splitting a grid of
-    one to two waves (2 splits at 16-60 rows) measured 5-8% slower tail+merge per step, splitting 1-15
-    rows 30-60% faster.
-    """
-    fixed = _int_env(CTX_TAIL_SPLITS_ENV, 0)
-    if fixed > 0:
-        return fixed
-    programs = max(num_requests * num_kv_heads, 1)
-    if 2 * programs > num_sms:
-        return CTX_TAIL_SPLITS
-    return max(CTX_TAIL_SPLITS, min(CTX_TAIL_MAX_SPLITS, -(-num_sms // programs)))
-
-
-CTX_TAIL_BLOCK = 128
-CTX_TAIL_WARPS = 4
-"""Tail launch of the context-kernel path, which runs alone (the prefix launch is a separate, faster
-kernel): one split, 128-token tiles, 4 warps measured best for the streaming tail by itself (192 us
-at 120 rows x 1000 tokens, MHA 20/20: 6.4 TB/s)."""
-FUSED_GROUP_ROWS = 32
-"""Rows per group served by one program per KV head; larger groups loop inside it."""
-
-
-FUSED_SPEC_ENV = "TLLM_SAMPLING_SHARED_PREFIX_FUSED_SPEC"
-"""Set to 0 to keep speculative steps (``q_len`` > 1) on the FlashInfer prefix/tail calls."""
-
-
-def fused_supported(
-    num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, q_len: int = 1
-) -> bool:
-    """Whether captured n-sample batches can use the fused Triton kernel.
-
-    The kernel holds the ``q_len`` tokens of a row and the GQA group of a KV head
-    in one tile (see ``MAX_QUERIES_PER_TILE``).
-    """
-    return (
-        _int_env(FUSED_ENV, 1) != 0
-        and (q_len == 1 or _int_env(FUSED_SPEC_ENV, 1) != 0)
-        and head_dim in (64, 128)
-        and num_kv_heads > 0
-        and num_heads % num_kv_heads == 0
-        and 1 <= q_len <= 16
-        and q_len * (num_heads // num_kv_heads) <= MAX_QUERIES_PER_TILE
-        and dtype in (torch.bfloat16, torch.float16)
-    )
-
-
-_variant_memo: list = [None, None, None, 0, 0]
-"""Last decision of ``resolve_graph_variant``: first request, last request,
-number of requests, gate settings, variant. Consecutive steps of one batch hit
-it, which keeps the per-step host cost of the decision negligible."""
-
-
-def resolve_graph_variant(batch) -> int:
-    """CUDA graph variant for a generation batch: 1 uses the library, 0 the regular kernel.
-
-    Part of the graph key, because a captured graph records one kernel sequence.
-    Decided from the requests alone (children of one n-sample request share its
-    prompt), before the batch is planned. Either variant is correct for any
-    batch; this only picks the faster one. A batch that keeps the same first and
-    last request and size as the previous call reuses its decision.
-    """
-    requests = batch.generation_requests
-    if not requests:
-        return 0
-    q_len = 1 + len(getattr(requests[0], "py_draft_tokens", None) or ())
-    if q_len > 1 and not _eager_fused(q_len):
-        # Speculative steps that the fused kernel cannot serve would need FlashInfer's
-        # captured tail call: its split-KV plan (the work list is padded) follows the
-        # host lengths, and FlashInfer returns wrong output when the true lengths are
-        # shorter (overlap scheduler). The regular kernel serves those captured steps.
-        return 0
-    gate = (
-        _int_env(MIN_GROUP_ENV, DEFAULT_MIN_GROUP),
-        min_shared_tokens(q_len),
-        q_len,
-    )
-    memo = _variant_memo
-    if (
-        memo[0] is requests[0]
-        and memo[1] is requests[-1]
-        and memo[2] == len(requests)
-        and memo[3] == gate
-    ):
-        return memo[4]
-    groups: Dict[int, list] = {}
-    for request in requests:
-        info = getattr(request, "_shared_prefix_info", None)
-        if info is None:
-            owner = request.parent_request_id if request.is_child else request.py_request_id
-            info = (owner, request.py_prompt_len)
-            request._shared_prefix_info = info
-        entry = groups.get(info[0])
-        if entry is None:
-            groups[info[0]] = [1, info[1]]
-        else:
-            entry[0] += 1
-    rows = len(requests)
-    wide = [entry for entry in groups.values() if entry[0] > 1]
-    sharing_rows = sum(entry[0] for entry in wide)
-    tokens = sum(entry[0] * entry[1] for entry in wide)
-    per_row = tokens / sharing_rows if sharing_rows else 0.0
-    profile = [(entry[0], float(entry[1])) for entry in wide]
-    variant = int(sharing_pays(rows, sharing_rows, len(wide), per_row, q_len, profile))
-    _variant_memo[:] = [requests[0], requests[-1], len(requests), gate, variant]
-    return variant
+    return pays
 
 
 def sampling_metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
@@ -1566,8 +710,7 @@ def sampling_metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
     hold on every replay of a CUDA graph that was captured with this path.
     """
     return (
-        IS_FLASHINFER_AVAILABLE
-        and metadata.beam_width == 1
+        metadata.beam_width == 1
         and metadata.num_generations > 1
         and metadata.num_contexts == 0
         and not metadata.is_cross
@@ -1637,118 +780,24 @@ def _pages_unchanged(
     return bool(((offsets[table_rows, :width] == saved) | ~read).all())
 
 
-def _eager_fused(q_len: int) -> bool:
-    """Whether eager batches use the fused kernel (the layer shape is known and supported)."""
-    if _model_shape is None:
-        return False
-    num_heads, num_kv_heads, head_dim = _model_shape
-    return fused_supported(num_heads, num_kv_heads, head_dim, torch.bfloat16, q_len)
-
-
-def _group_profile(grouping: "_Grouping", tokens_per_block: int, q_len: int) -> list:
-    """``(rows, shared tokens)`` of each sharing group of a grouping (see ``SPEC_GROUP_MODEL``)."""
-    qo = grouping.qo_indptr.numpy()
-    pages = grouping.prefix_indptr.numpy()
-    return [
-        (int(qo[g + 1] - qo[g]) // q_len, float(int(pages[g + 1] - pages[g]) * tokens_per_block))
-        for g in range(grouping.num_sharing)
-    ]
-
-
-def _maybe_enable_ctx_prefix(
-    graph: _GraphBuffers, metadata: "TrtllmAttentionMetadata", rows: int, q_len: int
-) -> None:
-    """Serve the shared pages of this captured batch size through the context kernel, if it can."""
-    if _model_shape is None:
-        return
-    num_heads, num_kv_heads, head_dim = _model_shape
-    device = metadata.kv_cache_block_offsets.device
-    if not (
-        fused_supported(num_heads, num_kv_heads, head_dim, torch.bfloat16, q_len)
-        and _ctx_prefix_enabled(head_dim, q_len)
-    ):
-        return
-    tokens = rows * q_len
-    max_pages = int(metadata.host_kv_cache_block_offsets.size(-1))
-    tokens_per_block = int(metadata.tokens_per_block)
-    max_kv_len = int(metadata.max_seq_len or max_pages * tokens_per_block)
-    fa4 = _fa4_prefix_active(head_dim, q_len)
-    if fa4 and os.environ.get(TAIL_KERNEL_ENV, "auto").strip().lower() != "triton":
-        from .flash_attn4_generation import generation_splits
-
-        graph.fa4_tail = Fa4Tail(
-            rows,
-            q_len,
-            num_heads,
-            head_dim,
-            max_pages,
-            torch.bfloat16,
-            device,
-            splits=generation_splits(
-                rows,
-                num_heads,
-                num_kv_heads,
-                q_len,
-                torch.cuda.get_device_properties(device).multi_processor_count,
-            ),
-        )
-    if fa4:
-        # Split prefix states are merged by the FA4-tail merge only.
-        splits = (
-            fa4_prefix_splits(
-                rows,
-                q_len,
-                num_heads,
-                num_kv_heads,
-                torch.cuda.get_device_properties(device).multi_processor_count,
-            )
-            if graph.fa4_tail is not None
-            else 1
-        )
-        ctx = Fa4Prefix(
-            tokens,
-            num_heads,
-            head_dim,
-            q_len,
-            Fa4Prefix.num_requests_for(graph.num_groups, tokens, q_len) * splits,
-            max_pages,
-            max_kv_len,
-            torch.bfloat16,
-            device,
-            tokens_per_block,
-            splits=splits,
-        )
-    else:
-        ctx = CtxPrefix(
-            tokens,
-            num_heads,
-            head_dim,
-            q_len,
-            CtxPrefix.num_requests_for(graph.num_groups, tokens, q_len),
-            max_pages,
-            max_kv_len,
-            torch.bfloat16,
-            device,
-            tokens_per_block,
-        )
-    graph.enable_ctx(ctx)
-
-
 def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
-    """Plan an n-sample generation step: group the rows and derive the page tables.
+    """Plan an n-sample generation step: group the rows and derive the prefix tables.
 
-    Eager batches without any sharing group are declined (the regular kernel
+    An eager batch whose sharing groups do not pay is declined (the regular kernel
     runs). A CUDA graph batch is always planned, because its graph is captured
     with this path: rows without a shared prefix take the placeholder group.
     """
-    state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
     rows = metadata.num_generations
+    q_len = _sampling_q_len(metadata, rows)
+    if q_len < MIN_Q_LEN or _model_shape is None:
+        return
+    device = metadata.kv_cache_block_offsets.device
+    if not fa4_supported(_model_shape[2], torch.bfloat16, device):
+        return
+    state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
     tokens_per_block = int(metadata.tokens_per_block)
     host_offsets = metadata.host_kv_cache_block_offsets
     assert host_offsets is not None
-    q_len = _sampling_q_len(metadata, rows)
-    if q_len == 0:
-        return
     if state is None:
         kv_cache_manager = metadata.kv_cache_manager
         first_layer = min(kv_cache_manager.layer_offsets)
@@ -1763,41 +812,30 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         )
         metadata.fmha_plan_caches[SAMPLING_KEY] = state
     eager = not metadata.is_cuda_graph
-    if state.graph is not None and rows != state.graph.rows:
+    buffers = state.buffers
+    if buffers is not None and (rows != buffers.rows or q_len != buffers.tail.q_len):
         if not eager:
             raise RuntimeError(
-                f"{LIB_NAME}: CUDA graph metadata planned for {state.graph.rows} rows got {rows}."
+                f"{LIB_NAME}: CUDA graph metadata planned for {buffers.rows} rows got {rows}."
             )
-        state.graph = None  # an eager batch changed size: new fixed-address buffers below
-    if state.graph is None and (not eager or _eager_fused(q_len)):
-        # Captured batches and, when the fused kernel can serve the shape, eager ones too: the
-        # fused kernel reads its tables from fixed device buffers and never calls FlashInfer (whose
-        # FA2 kernels return zeros for heads with extremely negative logits, e.g. Qwen2.5-7B).
-        max_groups = _max_groups_from_env()
-        if (
-            os.environ.get(MAX_GROUPS_ENV) is None
-            and _model_shape is not None
-            and _fa4_prefix_active(_model_shape[2], q_len)
-        ):
-            max_groups = FA4_PREFIX_MAX_GROUPS
-        num_groups = min(max_groups, rows // 2) + 1
-        state.graph = _GraphBuffers.create(
-            rows, num_groups, int(host_offsets.size(-1)), metadata.kv_cache_block_offsets.device
+        buffers = None  # an eager batch changed shape: new fixed-address buffers below
+    if buffers is None:
+        buffers = state.buffers = _StepBuffers.create(
+            rows,
+            q_len,
+            _model_shape,
+            _int_env(MAX_GROUPS_ENV, DEFAULT_MAX_GROUPS),
+            int(host_offsets.size(-1)),
+            tokens_per_block,
+            device,
         )
-        _maybe_enable_ctx_prefix(state.graph, metadata, rows, q_len)
-    graph = state.graph
+        state.grouping = None
     state.step_counter += 1
 
-    check = _check_enabled()
     kv_lens = np.maximum(metadata.kv_lens_runtime[:rows].numpy(), q_len).astype(np.int64)
-    if eager and int(kv_lens.max()) < min_shared_tokens(q_len):
-        # No row has a prefix long enough for the size gate: decline before the (host
-        # heavy) grouping, which otherwise runs for every eager batch of a short prompt.
-        return
     table_rows = _sampling_table_rows(state, metadata, rows)
     # Pages that may be shared end before the row's first token of this step; the
-    # row's own pages run to the page of its last token (one page further when
-    # the step's tokens cross a page boundary).
+    # row's own pages run to the page of its last token.
     private_from = (kv_lens - q_len) // tokens_per_block
     last_pages = (kv_lens - 1) // tokens_per_block
     offsets = host_offsets.numpy()[state.pool_index, :, 0, :]
@@ -1812,543 +850,46 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
     if (
         not same_rows
         or not np.array_equal(grouping.private_from, private_from)
-        or (q_len > 1 and not np.array_equal(grouping.last_pages, last_pages))
-        or (check and grouping.check_pages is None)
+        or not np.array_equal(grouping.last_pages, last_pages)
     ):
         width = int(last_pages.max()) + 1
         # Fancy indexing copies: the snapshot does not follow later table writes.
         host_pages = offsets[table_rows, :width]
-        pages_all = np.clip(
-            host_pages.astype(np.int64) * state.page_scale // state.page_div,
-            0,
-            state.num_pages - 1,
-        )
-        state.grouping_counter += 1
-        refreshed = None
-        if same_rows:
-            refreshed = _refresh_tail(
-                grouping,
+        advanced = _advance(grouping, private_from, last_pages) if same_rows else None
+        if advanced is None:
+            pages_all = np.clip(
+                host_pages.astype(np.int64) * state.page_scale // state.page_div,
+                0,
+                state.num_pages - 1,
+            )
+            state.grouping_counter += 1
+            advanced = _build_grouping(
                 state.grouping_counter,
+                table_rows,
                 pages_all,
                 kv_lens,
                 tokens_per_block,
-                keep_check_pages=check,
+                max_sharing_groups=buffers.num_groups - 1,
+                padded_groups=buffers.num_groups,
+                q_len=q_len,
+                group_pays=_group_filter(q_len),
             )
-        grouping = refreshed or _build_grouping(
-            state.grouping_counter,
-            table_rows,
-            pages_all,
-            kv_lens,
-            tokens_per_block,
-            max_sharing_groups=None if graph is None else graph.num_groups - 1,
-            padded_groups=None if graph is None else graph.num_groups,
-            keep_check_pages=check,
-            q_len=q_len,
-        )
-        state.grouping = grouping
+        grouping = state.grouping = advanced
         state.grouping_pages = host_pages
-    if eager:
-        sharing_rows = rows - grouping.num_placeholder_rows
-        profile = _group_profile(grouping, tokens_per_block, q_len)
-        if not sharing_pays(
-            rows,
-            sharing_rows,
-            grouping.num_sharing,
-            grouping.shared_tokens / max(sharing_rows, 1),
-            q_len,
-            profile,
-        ):
-            return
+    if eager and grouping.num_sharing == 0:
+        # No group passes the size gate: the library would only add its fixed cost.
+        return
 
-    state.plan = _SamplingPlan(
-        step=state.step_counter,
-        grouping=grouping,
-        kv_lens=kv_lens,
-        tokens_per_block=tokens_per_block,
-        check_kv_lens=torch.from_numpy(kv_lens) if check else None,
-    )
-    state.device = None
-    if graph is not None:
-        # Between page boundaries only the write slots and last-page lengths
-        # move; the graph derives them from the device KV lengths (step_slots).
-        if grouping.version != graph.uploaded_version:
-            graph.upload(state.plan)
-        for key in state.prefix_wrappers:
-            _plan_graph_wrappers(state, key, metadata)
+    state.plan = _SamplingPlan(step=state.step_counter, grouping=grouping)
+    if grouping.version != buffers.uploaded_version:
+        buffers.upload(grouping)
     if not state.logged:
         state.logged = True
         logger.info(
             f"{LIB_NAME}: n-sample step with {rows} rows in {grouping.num_sharing} sharing "
             f"groups ({grouping.num_placeholder_rows} rows without a shared prefix), "
-            f"{grouping.shared_tokens} prompt tokens read once per group"
-            + ("" if graph is None else f", CUDA graph with {graph.num_groups} prefix groups")
-        )
-
-
-def _sampling_device(
-    state: _SamplingState, device: torch.device, metadata: "TrtllmAttentionMetadata"
-) -> _SamplingDevice:
-    """Device copies of an eager step's index tensors, made by the first layer with one transfer."""
-    plan = state.plan
-    assert plan is not None
-    cached = state.device
-    if cached is not None and cached.step == plan.step:
-        return cached
-    rows = plan.num_rows
-    if plan.q_len > 1:
-        grouping = plan.grouping
-        parts = [
-            torch.from_numpy(grouping.perm),
-            torch.from_numpy(grouping.shared_g),
-            torch.from_numpy(grouping.base_len.astype(np.int64)),
-        ]
-        if plan.has_empty:
-            parts.append(plan.prefix_empty.to(torch.int64))
-        packed = torch.cat(parts).to(device)
-        perm = packed[:rows]
-        base_len = packed[2 * rows : 3 * rows]
-        last_len = torch.empty((rows,), dtype=torch.int32, device=device)
-        step_last_len(metadata.kv_lens_cuda_runtime[:rows], perm, base_len, last_len)
-        state.device = _SamplingDevice(
-            step=plan.step,
-            perm=perm,
-            prefix_empty=(packed[3 * rows : 4 * rows] != 0) if plan.has_empty else None,
-            write_page=None,
-            write_slot=None,
-            shared=packed[rows : 2 * rows],
-            last_len=last_len,
-        )
-        return state.device
-    parts = [plan.write_page, plan.write_slot]
-    if plan.perm is not None:
-        parts.append(plan.perm)
-    if plan.has_empty:
-        parts.append(plan.prefix_empty.to(torch.int64))
-    packed = torch.cat(parts).to(device)
-    perm = packed[2 * rows : 3 * rows] if plan.perm is not None else None
-    empty = None
-    if plan.has_empty:
-        start = (3 if plan.perm is not None else 2) * rows
-        empty = packed[start : start + rows] != 0
-    state.device = _SamplingDevice(
-        step=plan.step,
-        perm=perm,
-        prefix_empty=empty,
-        write_page=packed[:rows],
-        write_slot=packed[rows : 2 * rows],
-    )
-    return state.device
-
-
-def _plan_prefix(
-    wrapper: Any,
-    plan: _SamplingPlan,
-    key: _PlanKey,
-    tokens_per_block: int,
-    indices: torch.Tensor,
-) -> None:
-    grouping = plan.grouping
-    wrapper.plan(
-        grouping.qo_indptr,
-        grouping.prefix_indptr,
-        indices,
-        grouping.prefix_last_page_len,
-        key.num_heads,
-        key.num_kv_heads,
-        key.head_dim,
-        tokens_per_block,
-        causal=False,
-        sm_scale=key.sm_scale,
-        q_data_type=key.dtype,
-        kv_data_type=key.dtype,
-        o_data_type=_partial_out_dtype(key.dtype),
-        max_token_per_sequence=grouping.max_group_rows * grouping.q_len,
-    )
-
-
-_tail_qo_indptrs: Dict[tuple, torch.Tensor] = {}
-
-
-def _tail_qo_indptr(rows: int, q_len: int) -> torch.Tensor:
-    """[rows + 1] int32 host: ``q_len`` queries per row of the tail call."""
-    indptr = _tail_qo_indptrs.get((rows, q_len))
-    if indptr is None:
-        indptr = torch.arange(rows + 1, dtype=torch.int32) * q_len
-        _tail_qo_indptrs[(rows, q_len)] = indptr
-    return indptr
-
-
-def _plan_tail(
-    wrapper: Any,
-    plan: _SamplingPlan,
-    key: _PlanKey,
-    tokens_per_block: int,
-    indices: torch.Tensor,
-) -> None:
-    if key.q_len > 1:
-        # Speculative decoding: q_len causal queries per row over the row's own
-        # pages. The kernel reads the last-page lengths from device buffers that
-        # carry the true KV lengths (the host lengths here only shape the plan).
-        wrapper.plan(
-            _tail_qo_indptr(plan.num_rows, key.q_len),
-            plan.grouping.tail_indptr,
-            indices,
-            plan.tail_last_page_len,
-            key.num_heads,
-            key.num_kv_heads,
-            key.head_dim,
-            tokens_per_block,
-            causal=True,
-            sm_scale=key.sm_scale,
-            q_data_type=key.dtype,
-            kv_data_type=key.dtype,
-            o_data_type=_partial_out_dtype(key.dtype),
-            max_token_per_sequence=key.q_len,
-            # A split-KV plan fixes its chunks from the host lengths, which under the
-            # overlap scheduler can be a page ahead of the true device lengths; the
-            # kernel then returns wrong output (visible for heads that attend to the
-            # step's last few positions, e.g. Qwen2.5). An eager plan must not split.
-            # CUDA graph plans cannot (see ``resolve_graph_variant``).
-            **({} if getattr(wrapper, "_use_cuda_graph", False) else {"disable_split_kv": True}),
-        )
-        return
-    wrapper.plan(
-        plan.grouping.tail_indptr,
-        indices,
-        plan.tail_last_page_len,
-        key.num_heads,
-        key.num_kv_heads,
-        key.head_dim,
-        tokens_per_block,
-        q_data_type=key.dtype,
-        kv_data_type=key.dtype,
-        o_data_type=_partial_out_dtype(key.dtype),
-        sm_scale=key.sm_scale,
-    )
-
-
-def _sampling_wrappers(
-    state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata", device: torch.device
-) -> tuple[Any, Any]:
-    """FlashInfer prefix (prefill) and tail (decode) wrappers of an eager layer
-    shape, planned once per step."""
-    plan = state.plan
-    assert plan is not None
-    prefix = state.prefix_wrappers.get(key)
-    tail = state.tail_wrappers.get(key)
-    prefix_ws = _plan_workspace(device, "prefix", key)
-    tail_ws = _plan_workspace(device, "tail", key)
-    # FlashInfer splits the KV of an eager prefill too and reserves its partial
-    # results in the float workspace: size it from the plan instead of hoping that
-    # 128 MB suffice (many query tokens x heads overflow it and abort the step).
-    workspace = _get_float_workspace(
-        device, _graph_float_workspace_bytes(key, plan.num_rows, plan.num_groups, device)
-    )
-    if prefix is not None and prefix._float_workspace_buffer is not workspace:
-        for wrapper in (prefix, tail):
-            wrapper._float_workspace_buffer = workspace
-    if prefix is None:
-        prefix = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace, "HND", backend=_backend_from_env()
-        )
-        if key.q_len > 1:
-            tail = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace, "HND", backend=_backend_from_env()
-            )
-        else:
-            tail = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace, "HND", use_tensor_cores=key.num_heads != key.num_kv_heads
-            )
-        prefix_ws.bind(prefix)
-        tail_ws.bind(tail)
-        state.prefix_wrappers[key] = prefix
-        state.tail_wrappers[key] = tail
-    if state.planned_step.get(key) != plan.step:
-        tokens_per_block = int(metadata.tokens_per_block)
-        prefix_ws.before_plan()
-        _plan_prefix(prefix, plan, key, tokens_per_block, plan.prefix_indices)
-        prefix_ws.after_plan()
-        tail_ws.before_plan()
-        _plan_tail(tail, plan, key, tokens_per_block, plan.tail_indices)
-        tail_ws.after_plan()
-        state.planned_step[key] = plan.step
-    if key.q_len > 1:
-        # The plan copied the host last-page lengths; the kernel must read the
-        # lengths derived from the device KV lengths instead.
-        device_state = state.device
-        assert device_state is not None and device_state.last_len is not None
-        tail._paged_kv_last_page_len_buf = device_state.last_len
-    return prefix, tail
-
-
-def _plan_graph_wrappers(
-    state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
-) -> None:
-    """Plan the CUDA graph wrappers of a layer shape for the current step.
-
-    ``plan`` rewrites the wrappers' fixed-address index buffers and work lists;
-    the replayed kernels read them. The work lists depend only on page counts:
-    the prefix call is re-planned when the groups change (``prefix_version``),
-    the tail call when any row's page count changes (``version``), and either
-    one when another wrapper planned into its shared integer workspace since.
-    The last-page lengths reach the tail call through the uploaded step buffer.
-    """
-    plan = state.plan
-    graph = state.graph
-    assert plan is not None and graph is not None
-    prefix = state.prefix_wrappers[key]
-    tail = state.tail_wrappers[key]
-    device = graph.rows_device.device
-    prefix_ws = _plan_workspace(device, "prefix", key)
-    tail_ws = _plan_workspace(device, "tail", key)
-    grouping = plan.grouping
-    planned = state.planned_tokens.get(key, (-1, 0, -1, 0))
-    tokens_per_block = int(metadata.tokens_per_block)
-    if planned[:2] != (grouping.prefix_version, prefix_ws.owner):
-        prefix_ws.before_plan()
-        _plan_prefix(prefix, plan, key, tokens_per_block, graph.prefix_indices)
-        planned = (grouping.prefix_version, prefix_ws.after_plan()) + planned[2:]
-    if planned[2:] != (grouping.version, tail_ws.owner):
-        tail_ws.before_plan()
-        _plan_tail(tail, plan, key, tokens_per_block, graph.tail_indices)
-        planned = planned[:2] + (grouping.version, tail_ws.after_plan())
-    state.planned_tokens[key] = planned
-    state.planned_step[key] = plan.step
-
-
-def _graph_wrappers(
-    state: _SamplingState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
-) -> tuple[Any, Any]:
-    """CUDA graph wrappers of a layer shape, created on the eager warmup forward
-    that precedes capture and planned for the current step."""
-    plan = state.plan
-    graph = state.graph
-    assert plan is not None and graph is not None
-    prefix = state.prefix_wrappers.get(key)
-    if prefix is not None and state.planned_step.get(key) == plan.step:
-        return prefix, state.tail_wrappers[key]
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"{LIB_NAME}: FlashInfer plan requested during CUDA graph capture; the capture "
-            "warmup must run this layer shape first."
-        )
-    if prefix is None:
-        device = graph.rows_device.device
-        workspace = _get_graph_float_workspace(
-            device, _graph_float_workspace_bytes(key, graph.rows, graph.num_groups, device)
-        )
-        groups = graph.num_groups
-        prefix = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace,
-            "HND",
-            backend=_backend_from_env(),
-            use_cuda_graph=True,
-            qo_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
-            paged_kv_indptr_buf=torch.zeros((groups + 1,), dtype=torch.int32, device=device),
-            paged_kv_indices_buf=torch.zeros(
-                (graph.prefix_capacity,), dtype=torch.int32, device=device
-            ),
-            paged_kv_last_page_len_buf=torch.zeros((groups,), dtype=torch.int32, device=device),
-        )
-        if key.q_len > 1:
-            tail = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                workspace,
-                "HND",
-                backend=_backend_from_env(),
-                use_cuda_graph=True,
-                qo_indptr_buf=torch.zeros((graph.rows + 1,), dtype=torch.int32, device=device),
-                paged_kv_indptr_buf=torch.zeros(
-                    (graph.rows + 1,), dtype=torch.int32, device=device
-                ),
-                paged_kv_indices_buf=torch.zeros(
-                    (graph.tail_capacity,), dtype=torch.int32, device=device
-                ),
-                paged_kv_last_page_len_buf=graph.tail_last_page_len,
-            )
-        else:
-            tail = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace,
-                "HND",
-                use_cuda_graph=True,
-                use_tensor_cores=key.num_heads != key.num_kv_heads,
-                paged_kv_indptr_buffer=torch.zeros(
-                    (graph.rows + 1,), dtype=torch.int32, device=device
-                ),
-                paged_kv_indices_buffer=torch.zeros(
-                    (graph.tail_capacity,), dtype=torch.int32, device=device
-                ),
-                paged_kv_last_page_len_buffer=graph.tail_last_page_len,
-            )
-        _plan_workspace(device, "prefix", key).bind(prefix)
-        _plan_workspace(device, "tail", key).bind(tail)
-        state.prefix_wrappers[key] = prefix
-        state.tail_wrappers[key] = tail
-    _plan_graph_wrappers(state, key, metadata)
-    return prefix, state.tail_wrappers[key]
-
-
-def sampling_attention(
-    pool: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    out: torch.Tensor,
-    prefix_wrapper: Any,
-    tail_wrapper: Any,
-    *,
-    write_page: Optional[torch.Tensor],
-    write_slot: Optional[torch.Tensor],
-    perm: Optional[torch.Tensor],
-    prefix_empty: Optional[torch.Tensor],
-    q_len: int = 1,
-    kv_lens: Optional[torch.Tensor] = None,
-    shared: Optional[torch.Tensor] = None,
-    tokens_per_block: int = 0,
-) -> None:
-    """One layer of the n-sample path on planned wrappers.
-
-    Writes the current token's K/V, runs the prefix and tail calls on the
-    grouped queries, merges the two states and writes ``out`` in batch order.
-    Every launch has a fixed shape and reads its indices from the given
-    tensors, so the call can be captured in a CUDA graph and replayed after
-    the wrappers and index tensors were refreshed in place.
-
-    Args:
-        pool: [pages, 2, kv_heads, tokens_per_block, head_dim] layer KV pool (HND).
-        q: [rows, heads, head_dim]; k, v: [rows, kv_heads, head_dim], batch order.
-        out: [rows, heads, head_dim] output, batch order.
-        write_page, write_slot: [rows] page and slot of each row's current token.
-        perm: [rows] batch row of each grouped position, or None when the batch
-            is in grouped order.
-        prefix_empty: [rows] bool in grouped order, or None: rows whose prefix
-            state is a placeholder and must not contribute.
-        q_len: query tokens per row. With speculative decoding (``q_len`` > 1)
-            ``q``, ``k``, ``v`` and ``out`` hold ``rows * q_len`` tokens, row
-            major; the tokens of a row sit at ``kv_lens - q_len + j``, ``kv_lens``
-            being the device KV lengths in batch order, and are written into
-            the pages of the row's tail table (``shared`` pages precede it). The
-            tail call is then a causal prefill over the row's own pages.
-    """
-    rows, num_heads, head_dim = q.shape
-    # 1. Persist the current token's K/V in the row's own block and gather the
-    # queries into group order (one kernel).
-    if q_len > 1:
-        assert kv_lens is not None and shared is not None
-        q_grouped = write_kv_gather_q_spec(
-            pool,
-            q,
-            k,
-            v,
-            kv_lens,
-            perm,
-            tail_wrapper._paged_kv_indptr_buf,
-            shared,
-            tail_wrapper._paged_kv_indices_buf,
-            q_len,
-            tokens_per_block,
-        )
-    else:
-        q_grouped = write_kv_gather_q(pool, q, k, v, write_page, write_slot, perm)
-
-    # 2. Shared prefix: the queries of each group against its common pages.
-    partial_dtype = _partial_out_dtype(q.dtype)
-    prefix_out = torch.empty((rows, num_heads, head_dim), dtype=partial_dtype, device=q.device)
-    prefix_lse = torch.empty((rows, num_heads), dtype=torch.float32, device=q.device)
-    prefix_wrapper.run(q_grouped, pool, out=prefix_out, lse=prefix_lse, return_lse=True)
-
-    # 3. Private remainder of every row (current token included), in the same row order.
-    tail_out = torch.empty_like(prefix_out)
-    tail_lse = torch.empty_like(prefix_lse)
-    tail_wrapper.run(q_grouped, pool, out=tail_out, lse=tail_lse, return_lse=True)
-
-    # 4. Merge the two states and write the result back in batch order (one
-    # kernel); placeholder rows take the tail state alone.
-    merge_scatter(prefix_out, prefix_lse, tail_out, tail_lse, out, perm, prefix_empty, q_len)
-
-
-def merge_states(
-    out_a: torch.Tensor,
-    lse_a: torch.Tensor,
-    out_b: torch.Tensor,
-    lse_b: torch.Tensor,
-    a_empty: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Combine two normalized attention states over disjoint key sets.
-
-    ``out_*`` is [rows, heads, head_dim], ``lse_*`` is [rows, heads] in base 2.
-    Rows flagged in ``a_empty`` ([rows] bool) take state ``b`` alone. Returns fp32.
-    """
-    if a_empty is not None:
-        lse_a = lse_a.masked_fill(a_empty.view(-1, 1), float("-inf"))
-        out_a = out_a.masked_fill(a_empty.view(-1, 1, 1), 0.0)
-    lse_a = lse_a.float()
-    lse_b = lse_b.float()
-    peak = torch.maximum(lse_a, lse_b)
-    w_a = torch.exp2(lse_a - peak)
-    w_b = torch.exp2(lse_b - peak)
-    numerator = out_a.float() * w_a.unsqueeze(-1) + out_b.float() * w_b.unsqueeze(-1)
-    return numerator / (w_a + w_b).unsqueeze(-1)
-
-
-_CHECK_STATS = {"calls": 0, "worst": 0.0, "floor": 0.0}
-_CHECK_ROWS = 4
-_CHECK_TOL = 5e-2
-"""Largest per-head error, relative to that head's largest output magnitude. bf16
-rounding of the two partial outputs stays near 1e-2; a wrong page or position
-gives tens of percent."""
-
-
-def _check_sampling_output(
-    plan: _SamplingPlan,
-    pool: torch.Tensor,
-    q: torch.Tensor,
-    merged: torch.Tensor,
-    *,
-    num_kv_heads: int,
-    sm_scale: float,
-    tokens_per_block: int,
-    layer_idx: int,
-) -> None:
-    """Compare a few rows of the merged output with dense attention over the
-    row's whole page table (shared and private pages alike)."""
-    assert plan.check_pages is not None and plan.check_kv_lens is not None
-    rows, num_heads, head_dim = q.shape
-    group = num_heads // num_kv_heads
-    picks = sorted({0, rows // 3, (2 * rows) // 3, rows - 1})[:_CHECK_ROWS]
-    worst = 0.0
-    for row in picks:
-        kv_len = int(plan.check_kv_lens[row])
-        num_blocks = (kv_len + tokens_per_block - 1) // tokens_per_block
-        pages = plan.check_pages[row, :num_blocks].to(pool.device)
-        kv = pool[pages].permute(0, 3, 1, 2, 4).reshape(-1, 2, num_kv_heads, head_dim)[:kv_len]
-        q_row = q[row].float().view(num_kv_heads, group, head_dim)
-        scores = torch.einsum("kgd,tkd->kgt", q_row, kv[:, 0].float()) * sm_scale
-        expected = torch.einsum(
-            "kgt,tkd->kgd", torch.softmax(scores, dim=-1), kv[:, 1].float()
-        ).reshape(num_heads, head_dim)
-        scale = expected.abs().amax(dim=-1).clamp(min=1e-3)
-        err = float(((merged[row] - expected).abs().amax(dim=-1) / scale).max())
-        worst = max(worst, err)
-        # Noise floor of a plain bf16 attention (torch SDPA) against the same reference.
-        k_rep = kv[:, 0].transpose(0, 1).repeat_interleave(group, dim=0).unsqueeze(0)
-        v_rep = kv[:, 1].transpose(0, 1).repeat_interleave(group, dim=0).unsqueeze(0)
-        sdpa = torch.nn.functional.scaled_dot_product_attention(
-            q[row].view(1, num_heads, 1, head_dim).to(kv.dtype), k_rep, v_rep, scale=sm_scale
-        ).view(num_heads, head_dim)
-        floor = float(((sdpa.float() - expected).abs().amax(dim=-1) / scale).max())
-        _CHECK_STATS["floor"] = max(_CHECK_STATS["floor"], floor)
-    _CHECK_STATS["calls"] += 1
-    _CHECK_STATS["worst"] = max(_CHECK_STATS["worst"], worst)
-    if worst > _CHECK_TOL:
-        raise RuntimeError(
-            f"{LIB_NAME} check: n-sample attention disagrees with the dense reference at layer "
-            f"{layer_idx}: max relative diff {worst:.4f} (rows {picks} of {rows})"
-        )
-    if _CHECK_STATS["calls"] % 500 == 1:
-        logger.info(
-            f"{LIB_NAME} check: {_CHECK_STATS['calls']} layer calls checked, worst relative diff "
-            f"so far {_CHECK_STATS['worst']:.2e} (plain bf16 SDPA vs the same reference: "
-            f"{_CHECK_STATS['floor']:.2e})"
+            f"{grouping.shared_tokens} prompt tokens read once per group, "
+            f"{buffers.num_groups} prefix groups"
         )
 
 
@@ -2358,7 +899,7 @@ def _rotary_dim(attn: "TrtllmAttention") -> int:
 
 def _fused_rope_supported(attn: "TrtllmAttention") -> bool:
     """Whether the rotary embedding the attention op would apply is one that
-    ``rope_qkv_inplace`` reproduces (see the module docstring)."""
+    ``rope_write_kv_paged`` reproduces (see the module docstring)."""
     if int(attn.position_embedding_type) != int(PositionEmbeddingType.rope_gpt_neox):
         return False
     rope = attn.rope_params
@@ -2382,7 +923,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
-        self._pool_views: Dict[int, torch.Tensor] = {}
+        self._pool_views: dict[int, torch.Tensor] = {}
         # (pool index, scale, divisor) of this layer; fixed for the manager lifetime.
         self._layout: Optional[tuple[int, int, int]] = None
         # The KV-cache manager the cached pool views and layout belong to. The
@@ -2399,8 +940,6 @@ class SamplingSharedPrefixFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
-        if not IS_FLASHINFER_AVAILABLE:
-            return False
         if (
             getattr(attn, "is_mla_enable", False)
             or getattr(attn, "sparse_params", None) is not None
@@ -2413,7 +952,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         head_dim = getattr(attn, "head_dim", 0)
         num_heads = getattr(attn, "num_heads", 0)
         num_kv_heads = getattr(attn, "num_kv_heads", 0) or 0
-        if head_dim not in (64, 128, 256):
+        if head_dim not in (64, 128):
             return False
         if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
             return False
@@ -2467,7 +1006,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
             return False
         if forward_args.out_scale is not None or forward_args.output_sf is not None:
             return False
-        if q.dtype not in (torch.bfloat16, torch.float16):
+        if q.dtype != torch.bfloat16:
             return False
         window = forward_args.attention_window_size
         if (
@@ -2477,7 +1016,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         ):
             return False
         sampling_state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
-        # prepare() declines batches without a shared prefix.
+        # prepare() declines batches the library does not serve.
         if sampling_state is None or sampling_state.plan is None:
             return False
         # The plan describes the target model's KV cache. The draft layers of
@@ -2505,26 +1044,26 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         qkv = params.qkv_input
         if qkv is None:
             raise RuntimeError(f"{type(self).__name__} requires packed QKV input.")
-        self._run_sampling_generation(params, qkv)
-
-    def _run_sampling_generation(self, params: FmhaParams, qkv: torch.Tensor) -> None:
         attn = params.attn
         metadata = params.meta
         state: Optional[_SamplingState] = metadata.fmha_plan_caches.get(SAMPLING_KEY)
-        if state is None or state.plan is None:
+        if state is None or state.plan is None or state.buffers is None:
             raise RuntimeError(
                 f"{type(self).__name__}: no n-sample step plan; "
                 "TrtllmAttentionMetadata.prepare() must run before the forward."
             )
         plan = state.plan
+        buffers = state.buffers
         num_heads = attn.num_heads
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
-        rows = params.num_tokens
-        if rows != plan.num_rows * plan.q_len:
+        rows = plan.num_rows
+        q_len = plan.q_len
+        tokens = params.num_tokens
+        if tokens != rows * q_len:
             raise RuntimeError(
-                f"{type(self).__name__}: {rows} generation tokens do not match the planned "
-                f"{plan.num_rows} rows of {plan.q_len}."
+                f"{type(self).__name__}: {tokens} generation tokens do not match the planned "
+                f"{rows} rows of {q_len}."
             )
         self._bind_manager(metadata)
         if self._layout is None:
@@ -2535,230 +1074,75 @@ class SamplingSharedPrefixFmha(PhasedFmha):
                 f"{attn.layer_idx} uses (pool, scale, divisor) {self._layout} but the plan was "
                 f"built for {(state.pool_index, state.page_scale, state.page_div)}."
             )
-
-        sm_scale = 1.0 / (math.sqrt(head_dim) * attn.q_scaling)
-        q_len = plan.q_len
-        key = _PlanKey(num_heads, num_kv_heads, head_dim, qkv.dtype, sm_scale, q_len)
+        tail = buffers.tail
+        if tail.out.shape[1:] != (num_heads, head_dim):
+            raise RuntimeError(
+                f"{type(self).__name__}: the step buffers were sized for (heads, head_dim) "
+                f"{tuple(tail.out.shape[1:])} (the first model that reported the library available) "
+                f"but layer {attn.layer_idx} has {(num_heads, head_dim)}."
+            )
         pool = self._pool_view(metadata)
-        graph = state.graph
-        shared: Optional[torch.Tensor] = None
-        fused = graph is not None and fused_supported(
-            num_heads, num_kv_heads, head_dim, qkv.dtype, q_len
-        )
-        # SM90 (H100): FlashInfer BatchPrefillWithPagedKVCacheWrapper crashes for
-        # spec-decode tail (q_len>1) at large batch sizes; force Triton fused path for
-        # spec steps on SM90 regardless of TLLM_SAMPLING_SHARED_PREFIX_FUSED setting.
-        if not fused and q_len > 1 and graph is not None:
-            import torch as _torch
+        kv_lens = metadata.kv_lens_cuda_runtime[:rows]
+        capturing = torch.cuda.is_current_stream_capturing()
+        # Once per step, and recorded by the capture itself: an eager warmup forward of
+        # the same step does not put it in the graph.
+        if state.tables_step != plan.step or (capturing and not state.tables_captured):
+            tail.build_tables(
+                metadata.kv_cache_block_offsets[state.pool_index, :rows, 0],
+                buffers.perm,
+                buffers.shared,
+                kv_lens,
+                int(metadata.kv_cache_manager.kv_factor),
+                int(metadata.tokens_per_block),
+            )
+            state.tables_step = plan.step
+            state.tables_captured = capturing
+        if capturing:
+            state.captured = True
 
-            cc = _torch.cuda.get_device_capability(qkv.device)
-            if cc == (9, 0):
-                fused = True
-        if graph is not None:
-            if fused:
-                prefix_wrapper = tail_wrapper = None
-            else:
-                prefix_wrapper, tail_wrapper = _graph_wrappers(state, key, metadata)
-            capturing = torch.cuda.is_current_stream_capturing()
-            # Once per step, and recorded by the capture itself: an eager
-            # warmup forward of the same step does not put it in the graph.
-            if state.slots_step != plan.step or (capturing and not state.slots_captured):
-                if q_len > 1:
-                    step_last_len(
-                        metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                        graph.perm,
-                        graph.base_len,
-                        graph.tail_last_page_len,
-                    )
-                    if graph.fa4_tail is not None:
-                        graph.fa4_tail.build_tables(
-                            metadata.kv_cache_block_offsets[state.pool_index, : plan.num_rows, 0],
-                            graph.perm,
-                            graph.shared,
-                            metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                            int(metadata.kv_cache_manager.kv_factor),
-                            int(metadata.tokens_per_block),
-                        )
-                else:
-                    step_slots(
-                        metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                        graph.perm,
-                        graph.write_slot,
-                        graph.tail_last_page_len,
-                        int(metadata.tokens_per_block),
-                    )
-                state.slots_step = plan.step
-                state.slots_captured = capturing
-            write_page, write_slot = graph.write_page, graph.write_slot
-            shared = graph.shared
-            perm: Optional[torch.Tensor] = graph.perm
-            prefix_empty: Optional[torch.Tensor] = graph.empty
-            if capturing:
-                state.captured = True
-        else:
-            indices = _sampling_device(state, qkv.device, metadata)
-            prefix_wrapper, tail_wrapper = _sampling_wrappers(state, key, metadata, qkv.device)
-            write_page, write_slot = indices.write_page, indices.write_slot
-            perm, prefix_empty = indices.perm, indices.prefix_empty
-            shared = indices.shared
+        from .flash_attn4_generation import rope_write_kv_paged
 
-        q_size = num_heads * head_dim
-        kv_size = num_kv_heads * head_dim
-        fa4_tail = None
-        if fused:
-            ctx = graph.ctx
-            fa4_tail = graph.fa4_tail
-            if ctx is not None and (
-                qkv.dtype != ctx.q.dtype
-                or (getattr(ctx, "tokens", ctx.q.shape[0]), *ctx.q.shape[1:])
-                != (rows, num_heads, head_dim)
-            ):
-                ctx = None
-            if ctx is None or fa4_tail is None or fa4_tail.out.dtype != qkv.dtype:
-                fa4_tail = None
         rope = PositionEmbeddingType(attn.position_embedding_type).is_rope()
-        if rope and fa4_tail is not None:
-            # RoPE and the step's K/V into the rows' private pages in one launch (the K
-            # columns of qkv stay unrotated; only the pool is read for K from here on).
-            from .flash_attn4_generation import rope_write_kv_paged
-
-            rope_write_kv_paged(
-                qkv,
-                attn.rotary_cos_sin,
-                pool,
-                fa4_tail.table,
-                metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                rotary_dim=_rotary_dim(attn),
-                q_len=q_len,
-                page_lens=fa4_tail.tail_lens,
-            )
-        elif rope:
-            rope_qkv_inplace(
-                qkv,
-                attn.rotary_cos_sin,
-                metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                rotary_dim=_rotary_dim(attn),
-                q_len=q_len,
-            )
-        q = qkv[:, :q_size].view(rows, num_heads, head_dim)
-        k = qkv[:, q_size : q_size + kv_size].view(rows, num_kv_heads, head_dim)
-        v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(rows, num_kv_heads, head_dim)
+        # RoPE on Q (in place) and K, and the step's K/V into the rows' private pages, in one
+        # launch; only the pool is read for K/V from here on.
+        rope_write_kv_paged(
+            qkv,
+            attn.rotary_cos_sin if rope else None,
+            pool,
+            tail.table,
+            kv_lens,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rotary_dim=_rotary_dim(attn) if rope else head_dim,
+            q_len=q_len,
+            page_lens=tail.tail_lens,
+        )
         output = params.output
         if output is None:
             raise RuntimeError(f"{type(self).__name__} requires an output tensor.")
-        out_view = output.view(rows, num_heads, head_dim)
-        if fused:
-            assert graph is not None
-            group_rows = min(FUSED_GROUP_ROWS, plan.num_rows)
-            if ctx is not None:
-                prefix_splits = 0
-                tail_kwargs = dict(
-                    tail_splits=ctx_tail_splits(
-                        rows // q_len,
-                        num_kv_heads,
-                        torch.cuda.get_device_properties(qkv.device).multi_processor_count,
-                    ),
-                    block_nt=CTX_TAIL_BLOCK,
-                    tail_num_warps=CTX_TAIL_WARPS,
-                    ctx=ctx,
-                    fa4_tail=fa4_tail,
-                    fa4_tail_kv_written=rope and fa4_tail is not None,
-                )
-            else:
-                prefix_splits = FUSED_PREFIX_SPLITS or default_prefix_splits(
-                    graph.num_groups,
-                    num_kv_heads,
-                    group_rows,
-                    q_len,
-                    num_heads // num_kv_heads,
-                    torch.cuda.get_device_properties(qkv.device).multi_processor_count,
-                )
-                tail_kwargs = dict(tail_splits=FUSED_TAIL_SPLITS)
-            slots = prefix_splits + tail_kwargs["tail_splits"]
-            workspace = state.fused_workspace
-            # Eager batches change their grouping, and so the split count, from step to step:
-            # the arena views must cover both the slots and the query tokens of this step.
-            if workspace is None or workspace.m.shape[1] < rows or workspace.m.shape[0] < slots:
-                state.fused_workspace = FusedWorkspace.shared(
-                    rows, num_heads, head_dim, slots, qkv.device
-                )
-            fused_sampling_attention(
-                pool,
-                q,
-                k,
-                v,
-                out_view,
-                perm=perm,
-                group_qo_indptr=graph.group_qo_indptr,
-                prefix_indptr=graph.group_prefix_indptr,
-                prefix_indices=graph.fused_prefix_indices,
-                prefix_last_page_len=graph.group_prefix_last_page_len,
-                prefix_empty=prefix_empty,
-                tail_indptr=graph.row_tail_indptr,
-                tail_indices=graph.fused_tail_indices,
-                tail_last_page_len=graph.tail_last_page_len,
-                write_page=write_page,
-                write_slot=write_slot,
-                sm_scale=sm_scale,
-                num_groups=graph.num_groups,
-                q_len=q_len,
-                max_group_rows=group_rows,
-                workspace=state.fused_workspace,
-                prefix_splits=prefix_splits,
-                **tail_kwargs,
-            )
-        else:
-            sampling_attention(
-                pool,
-                q,
-                k,
-                v,
-                out_view,
-                prefix_wrapper,
-                tail_wrapper,
-                write_page=write_page,
-                write_slot=write_slot,
-                perm=perm,
-                prefix_empty=prefix_empty,
-                q_len=q_len,
-                kv_lens=metadata.kv_lens_cuda_runtime[: plan.num_rows],
-                shared=shared,
-                tokens_per_block=int(metadata.tokens_per_block),
-            )
+        fa4_sampling_attention(
+            pool,
+            qkv[:, : num_heads * head_dim].view(tokens, num_heads, head_dim),
+            None,
+            None,
+            output.view(tokens, num_heads, head_dim),
+            perm=buffers.perm,
+            prefix_empty=buffers.empty,
+            prefix=buffers.prefix,
+            tail=tail,
+            sm_scale=1.0 / (math.sqrt(head_dim) * attn.q_scaling),
+        )
         if not state.ran:
             state.ran = True
             logger.info(f"{LIB_NAME}: first n-sample attention call (layer {attn.layer_idx})")
-        # Check mode reads device values, which CUDA graph capture forbids; the
-        # eager warmup that precedes every capture is checked instead.
-        if (
-            plan.check_pages is not None
-            and plan.q_len == 1
-            and not torch.cuda.is_current_stream_capturing()
-        ):
-            _check_sampling_output(
-                plan,
-                pool,
-                q,
-                out_view.float(),
-                num_kv_heads=num_kv_heads,
-                sm_scale=sm_scale,
-                tokens_per_block=int(metadata.tokens_per_block),
-                layer_idx=attn.layer_idx,
-            )
 
 
 __all__ = [
     "LIB_NAME",
     "SamplingSharedPrefixFmha",
+    "group_saved_bytes",
     "has_active_plan",
-    "merge_states",
     "plan_step",
-    "sampling_attention",
     "sampling_metadata_eligible",
 ]
