@@ -2376,21 +2376,29 @@ class KvCacheCreator:
             backend = getattr(draft_model, "dflash_attention_backend", None)
         return backend
 
+    def _loaded_standalone_dspark_drafter(self):
+        """The loaded standalone DSpark drafter, whose declarations decide how
+        it reads its context, or None (DFlash keeps its configured backend)."""
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if spec_dec_mode.is_dflash() or not spec_dec_mode.is_dspark():
+            return None
+        return getattr(self._model_engine.model, "draft_model", None)
+
     def _unified_drafter_reads_paged_kv(self, backend: Optional[str]) -> bool:
         """Whether the drafter's block attention reads its context KV from the
         manager's pages at this run's page size.
 
-        A loaded drafter declares it; without one, only the TRTLLM backend pages.
+        A loaded DSpark drafter declares it; otherwise only TRTLLM pages.
         """
-        draft_model = getattr(self._model_engine.model, "draft_model", None)
-        if draft_model is None:
+        drafter = self._loaded_standalone_dspark_drafter()
+        if drafter is None:
             return backend == "TRTLLM"
-        return draft_model.reads_managed_ctx_pages(self._tokens_per_block)
+        return drafter.reads_managed_ctx_pages(self._tokens_per_block)
 
     def _unified_drafter_reads_helix_pages(self) -> bool:
         """Whether the loaded drafter reads a context sharded over helix CP."""
-        draft_model = getattr(self._model_engine.model, "draft_model", None)
-        return draft_model is not None and draft_model.reads_helix_sharded_ctx_pages
+        drafter = self._loaded_standalone_dspark_drafter()
+        return drafter is not None and drafter.reads_helix_sharded_ctx_pages
 
     def _unified_target_manager_cls_supported(self) -> bool:
         """Whether the target's manager class can hold the drafter's layers.
