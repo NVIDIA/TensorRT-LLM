@@ -115,6 +115,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     {
         beam.resize(numLc); // default-constructs to monostate
     }
+    mActiveAllocationGroups = manager.lifeCycles().activeGroups();
 
     mEnableSwaScratchReuse = manager.isSwaScratchReuseEnabled();
     mScratchSlots.resize(manager.storage().numLifeCycles());
@@ -501,7 +502,8 @@ void KvCache::activate()
     }
 }
 
-bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<LifeCycleId>> optionalReuseGroups)
+bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<LifeCycleId>> optionalReuseGroups,
+    std::optional<std::vector<AllocationGroupId>> activeAllocationGroups)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
@@ -519,6 +521,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
     auto const apiLock = mManager->lockExclusive();
+    auto const targetGroups = activeAllocationGroups.has_value()
+        ? mManager->lifeCycles().activeGroups(*activeAllocationGroups)
+        : mActiveAllocationGroups;
+    _validateActiveGroups(targetGroups);
     if (mNeverResumed)
     {
         _selectOptionalGroups(optionalReuseGroups.value_or(std::vector<LifeCycleId>{}));
@@ -530,7 +536,14 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kHotLevel);
-    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
+    float utilization = 0.f;
+    for (LifeCycleId lc{0}; lc < targetGroups.size(); ++lc)
+    {
+        if (targetGroups[lc])
+        {
+            utilization = std::max(utilization, utilizations[mManager->storage().getPoolGroupIndex(lc)]);
+        }
+    }
     if (utilization > mManager->config().maxUtilForResume)
     {
         return false;
@@ -567,12 +580,20 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     TypedVec<LifeCycleId, std::optional<Slot>> deferredSlots(numLc);
     TypedVec<LifeCycleId, std::vector<BlockOrdinal>> privateOrdinals(numLc);
     TypedVec<LifeCycleId, std::vector<Slot>> privateSlots(numLc);
+    TypedVec<LifeCycleId, std::vector<Slot>> freshFixedSlots(numLc);
     auto releasePrivateSlots = FuncGuard(
         [&]()
         {
             for (LifeCycleId lc{0}; lc < numLc; ++lc)
             {
                 for (auto& slot : privateSlots[lc])
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        storageMgr.releaseSlot(lc, kHotLevel, std::move(slot));
+                    }
+                }
+                for (auto& slot : freshFixedSlots[lc])
                 {
                     if (slot.hasValidSlot())
                     {
@@ -597,6 +618,10 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             bool isSsm = mManager->lifeCycles().isSsm(lc);
+            if (!targetGroups[lc])
+            {
+                continue;
+            }
             auto const& lifeCycle = mManager->lifeCycles()[lc];
             if (_needsFreshPrefixPages(lc))
             {
@@ -615,6 +640,20 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             {
                 // Every SSM policy needs one writable state slot, independent of prefix length.
                 numSlotsNeeded[lc] += 1;
+            }
+        }
+    }
+
+    if (!mNeverResumed)
+    {
+        for (auto lc : mManager->lifeCycles().ssmLifeCycleIds())
+        {
+            if (targetGroups[lc])
+            {
+                for (auto const& beam : mSsmBlocks)
+                {
+                    numSlotsNeeded[lc] += blockPageIsNull(beam[lc]) ? 1 : 0;
+                }
             }
         }
     }
@@ -666,6 +705,12 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
                     // Python uses pop() here: reserve one slot for deferred copy, then treat the rest as scratch.
                     deferredSlots[lc] = std::move(tmpSlots[lc].back());
                     tmpSlots[lc].pop_back();
+                }
+
+                if (!mNeverResumed && mManager->lifeCycles().isSsm(lc))
+                {
+                    freshFixedSlots[lc] = std::move(tmpSlots[lc]);
+                    continue;
                 }
 
                 // Remaining slots are scratch slots.
@@ -850,6 +895,8 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             mBlocks[lastOrdinal].treeBlock = nullptr;
     }
 
+    _installFixedSlots(freshFixedSlots);
+
     if (mNeverResumed && _shouldRecordStats())
     {
         for (auto const& [lc, byLevel] : optionalReusedByLevel)
@@ -884,10 +931,120 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
     bool const firstActivation = mNeverResumed;
     mNeverResumed = false;
     mStatus = Status::ACTIVE;
+    mActiveAllocationGroups = targetGroups;
     if (!firstActivation && _shouldRecordStats())
     {
         mManager->recordRequestResumed();
     }
+    return true;
+}
+
+void KvCache::_validateActiveGroups(LifeCycleRegistry::ActiveGroups const& groups) const
+{
+    for (auto lc : mManager->lifeCycles().ssmLifeCycleIds())
+    {
+        if (!groups[lc])
+        {
+            TLLM_CHECK_WITH_INFO(std::all_of(mSsmBlocks.begin(), mSsmBlocks.end(),
+                                     [lc](auto const& beam) { return blockPageIsNull(beam[lc]); }),
+                "Cannot deactivate an allocation group that still holds pages");
+        }
+    }
+}
+
+void KvCache::_installFixedSlots(TypedVec<LifeCycleId, std::vector<Slot>>& slots)
+{
+    std::vector<CUevent> readyEvents;
+    for (auto const& groupSlots : slots)
+    {
+        for (auto const& slot : groupSlots)
+        {
+            readyEvents.push_back(slot.readyEvent.handle());
+        }
+    }
+    streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(readyEvents));
+    for (auto lc : mManager->lifeCycles().ssmLifeCycleIds())
+    {
+        auto& groupSlots = slots[lc];
+        if (groupSlots.empty())
+        {
+            continue;
+        }
+        for (BeamIndex beam{0}; beam < mBeamWidth; ++beam)
+        {
+            if (blockPageIsNull(mSsmBlocks[beam][lc]))
+            {
+                TLLM_CHECK_DEBUG(!groupSlots.empty());
+                auto page = makeShared<UncommittedPage>(*this, kBadBlockOrdinal, lc, kHotLevel, beam);
+                page->setSlot(groupSlots.back());
+                mSsmBlocks[beam][lc] = page->lock(*this, beam, kBadBlockOrdinal, lc, /*skipWait=*/true);
+                groupSlots.pop_back();
+            }
+        }
+        TLLM_CHECK_DEBUG(groupSlots.empty());
+    }
+}
+
+bool KvCache::activateGroups(std::vector<AllocationGroupId> const& groups)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    TLLM_CHECK_WITH_INFO(isActive(), "activate_groups requires an ACTIVE KvCache");
+    if (mBatch != nullptr)
+    {
+        throw LogicError("A KvCache in a Batch cannot activate groups; remove it from the Batch first");
+    }
+    auto targetGroups = mActiveAllocationGroups;
+    for (auto const id : groups)
+    {
+        targetGroups[mManager->lifeCycles().getId(id)] = true;
+    }
+    auto& storage = mManager->storage();
+    TypedVec<LifeCycleId, SlotCount> counts(storage.numLifeCycles(), 0);
+    for (auto lc : mManager->lifeCycles().ssmLifeCycleIds())
+    {
+        if (targetGroups[lc])
+        {
+            for (auto const& beam : mSsmBlocks)
+            {
+                counts[lc] += blockPageIsNull(beam[lc]) ? 1 : 0;
+            }
+        }
+    }
+    if (std::any_of(counts.begin(), counts.end(), [](SlotCount count) { return count != 0; }))
+    {
+        TypedVec<LifeCycleId, std::vector<Slot>> slots(storage.numLifeCycles());
+        auto releaseSlots = FuncGuard(
+            [&]()
+            {
+                for (LifeCycleId lc{0}; lc < slots.size(); ++lc)
+                {
+                    for (auto& slot : slots[lc])
+                    {
+                        if (slot.hasValidSlot())
+                        {
+                            storage.releaseSlot(lc, kHotLevel, std::move(slot));
+                        }
+                    }
+                }
+            });
+        try
+        {
+            MigrationRecorder const migrate
+                = [this](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& movedSlots,
+                      CacheLevel source, CacheLevel target)
+            { _recordMigratedSlots(pages, movedSlots, source, target); };
+            DropRecorder const drop = [this](std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+            { _recordDroppedPages(pages, level); };
+            slots = storage.newGpuSlots(counts, migrate, drop);
+        }
+        catch (OutOfPagesError const&)
+        {
+            return false;
+        }
+        _installFixedSlots(slots);
+    }
+    mActiveAllocationGroups = std::move(targetGroups);
     return true;
 }
 
@@ -975,8 +1132,15 @@ void KvCache::suspend()
                                                                 : mSsmBlocks[ap.beamIdx][ap.lcId];
             // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
             auto& lock = std::get<SharedPageLock>(bp);
-            auto holder = lock.page()->hold();
-            bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
+            if (mManager->lifeCycles().suspendPolicy(ap.lcId) == SuspendPolicy::kRelease)
+            {
+                bp = std::monostate{};
+            }
+            else
+            {
+                auto holder = lock.page()->hold();
+                bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
+            }
         }
         // Free scratch slots inside scope — unlock() needs finishEvent().
         // Mirrors Python: _free_scratch_slots() inside `with self._record_event()`.

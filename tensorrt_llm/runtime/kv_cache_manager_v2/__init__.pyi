@@ -284,6 +284,10 @@ class AllocationUnit(enum.Enum):
     TOKEN_BLOCK = 0
     FIXED = 1
 
+class SuspendPolicy(enum.Enum):
+    HOLD = 0
+    RELEASE = 1
+
 @dataclass(slots=True)
 class AllocationGroupConfig:
     """One independently owned allocation group with an explicit lifecycle."""
@@ -293,6 +297,8 @@ class AllocationGroupConfig:
     sliding_window_size: int | None = None
     num_sink_tokens: int | None = None
     reuse_policy: ReusePolicy = ...
+    initially_active: bool = True
+    suspend_policy: SuspendPolicy = ...
 
 @dataclass(slots=True, frozen=True)
 class BufferConfig:
@@ -479,6 +485,7 @@ class KVCacheDesc:
     history_length: int
     beam_width: int = 1
     prompt_length: int = 0
+    active_allocation_groups: list[AllocationGroupId] | None = None
 
 @dataclass(slots=True)
 class BatchDesc:
@@ -851,6 +858,7 @@ class _KVCache:
         cuda_stream: CudaStream | None = None,
         is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
+        active_allocation_groups: Sequence[AllocationGroupId] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
 
@@ -858,12 +866,23 @@ class _KVCache:
         it belongs to a :class:`Batch`, for the same reason as :meth:`suspend` -- locking
         writes page indices through the batch's row. A member is resumed before it joins.
 
+        ``active_allocation_groups`` selects deferred groups in addition to initially active
+        groups. ``None`` preserves the last successful selection; an empty sequence selects
+        only initially active groups. A held group cannot be deselected. Released groups
+        receive fresh storage whose contents the caller must initialize before use.
+
         Takes no sparse cache arena lease: that follows membership, so a request receiving
         its history costs the GPU cache nothing until it is seated.
 
         ``is_decoding`` is accepted and ignored. Resuming no longer distinguishes a decoding
         request; the parameter is kept so callers that still pass it keep working, and goes
         with the full sparse attention support.
+        """
+    def activate_groups(self, groups: Sequence[AllocationGroupId]) -> bool:
+        """Allocate additional groups of an active cache outside a Batch.
+
+        Returns False without changing the selection when capacity is unavailable. The
+        caller initializes newly allocated memory on the cache stream before inference.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:

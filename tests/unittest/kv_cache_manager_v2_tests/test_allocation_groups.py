@@ -55,6 +55,83 @@ def test_allocation_groups_survive_config_replace_and_copy():
     )
 
 
+def test_allocation_lifetime_fields_survive_copy_and_descriptor_equality():
+    group = kv.AllocationGroupConfig(
+        31,
+        kv.AllocationUnit.FIXED,
+        reuse_policy=kv.ReusePolicy.PRIVATE,
+        initially_active=False,
+        suspend_policy=kv.SuspendPolicy.RELEASE,
+    )
+    cloned = copy.deepcopy(group)
+    assert not cloned.initially_active
+    assert cloned.suspend_policy == kv.SuspendPolicy.RELEASE
+    desc = kv.KVCacheDesc(32, 16, active_allocation_groups=[31])
+    assert copy.deepcopy(desc) == desc
+    assert desc.active_allocation_groups == [31]
+    assert desc != kv.KVCacheDesc(32, 16)
+    desc.active_allocation_groups = []
+    assert desc == kv.KVCacheDesc(32, 16, active_allocation_groups=[])
+    desc.active_allocation_groups = None
+    assert desc == kv.KVCacheDesc(32, 16)
+
+
+@requires_cuda
+def test_deferred_group_is_released_while_held_groups_keep_their_slots():
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=16 << 20)],
+        layers=[
+            kv.AttentionLayerConfig(
+                layer_id=layer,
+                buffers=[
+                    kv.BufferConfig(role="state", size=4096 << layer, allocation_group_id=group)
+                ],
+            )
+            for layer, group in enumerate((101, 202, 303))
+        ],
+        allocation_groups=[
+            kv.AllocationGroupConfig(
+                group,
+                kv.AllocationUnit.FIXED,
+                reuse_policy=kv.ReusePolicy.PRIVATE,
+                initially_active=group != 303,
+                suspend_policy=kv.SuspendPolicy.RELEASE if group == 303 else kv.SuspendPolicy.HOLD,
+            )
+            for group in (101, 202, 303)
+        ],
+        constraints=[kv.BatchDesc([kv.KVCacheDesc(0, 0, active_allocation_groups=[303])])],
+        commit_min_snapshot=True,
+        max_util_for_resume=1.0,
+    )
+    manager = kv.KVCacheManager(config)
+    stream = torch.cuda.Stream()
+    cache = manager.create_kv_cache()
+    try:
+        groups = [manager.get_buffer_group_id(layer, "state") for layer in range(3)]
+        pool = manager.get_life_cycle_pool_group_indices()[groups[2]]
+        before = manager.get_storage_statistics()[pool].free
+        assert cache.resume(stream.cuda_stream)
+        held = [cache.get_ssm_block_base_index(group) for group in groups[:2]]
+        assert cache.get_ssm_block_base_index(groups[2]) == -1
+        assert manager.get_storage_statistics()[pool].free == before
+        assert cache.activate_groups([303])
+        assert cache.get_ssm_block_base_index(groups[2]) >= 0
+        assert manager.get_storage_statistics()[pool].free == before - 1
+        cache.suspend()
+        assert manager.get_storage_statistics()[pool].free == before
+        assert cache.resume(stream.cuda_stream)
+        assert [cache.get_ssm_block_base_index(group) for group in groups[:2]] == held
+        assert cache.get_ssm_block_base_index(groups[2]) >= 0
+        cache.suspend()
+        assert cache.resume(stream.cuda_stream, active_allocation_groups=[])
+        assert cache.get_ssm_block_base_index(groups[2]) == -1
+        assert manager.get_storage_statistics()[pool].free == before
+    finally:
+        cache.close()
+        manager.shutdown()
+
+
 def _pool_layout(manager: kv.KVCacheManager) -> tuple:
     return tuple(
         (

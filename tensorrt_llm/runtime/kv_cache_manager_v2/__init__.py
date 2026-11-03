@@ -57,6 +57,7 @@ DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIO
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AllocationGroupConfig = _cpp.AllocationGroupConfig
 AllocationUnit = _cpp.AllocationUnit
+SuspendPolicy = _cpp.SuspendPolicy
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 ReusePolicy = _cpp.ReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
@@ -227,6 +228,7 @@ __all__ = [
     "AllocationGroupConfig",
     "AllocationGroupId",
     "AllocationUnit",
+    "SuspendPolicy",
     "AttentionLayerConfig",
     "ReusePolicy",
     "BAD_PAGE_INDEX",

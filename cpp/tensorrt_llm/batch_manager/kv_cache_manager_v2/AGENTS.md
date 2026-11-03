@@ -104,6 +104,22 @@ lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
 (`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
 These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
 `LayerGroupId` remains a lifecycle alias for legacy APIs.
+
+Explicit allocation groups may defer allocation with `initiallyActive=false` and
+release their storage on suspension with `suspendPolicy=RELEASE`. Both options
+require a `PRIVATE FIXED` group. `resume(activeAllocationGroups=...)` selects
+additional deferred groups; omission preserves the last successful selection,
+and an empty list selects only initially active groups. `activateGroups()` adds
+groups to an active cache outside a `Batch`. Both operations leave the selection
+unchanged when capacity is unavailable. A group whose pages are still held
+cannot be deselected.
+
+The caller initializes fresh state and completes any fold into held state on
+the cache stream before suspension. Released pages lose ownership inside the
+finish-event scope, so their slots cannot be used by another stream before that
+work completes. Resume restores held pages and allocates selected released
+groups afresh; their bytes have no preserved meaning. `KVCacheDesc` carries the
+same additional-group selection for capacity constraints and typical sizing.
 The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
 documentation only: uniform layers retain their results, while a split layer
 fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,
@@ -122,8 +138,8 @@ KVCM supports independent policies for callers that provide those indices.
 The sparse fetch path configured by `sparseCache` still uses one group per layer;
 its setup uses the checked layer lookup and rejects split layers.
 
-SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
-groups; iterate `ssmLifeCycleIds()` for working state and use
+Implicit SSM lifecycles are deduplicated by policy; explicit fixed groups retain
+independent identities. Iterate `ssmLifeCycleIds()` for working state and use
 `requiredSsmLifeCycleId()` only for prefix pruning.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed

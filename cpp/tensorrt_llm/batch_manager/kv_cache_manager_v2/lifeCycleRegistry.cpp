@@ -70,10 +70,13 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
     {
         explicitGroups.emplace(group.allocationGroupId, &group);
     }
-    auto const appendLifeCycle = [this](LifeCycle const& lc)
+    auto const appendLifeCycle
+        = [this](LifeCycle const& lc, bool initiallyActive = true, SuspendPolicy suspendPolicy = SuspendPolicy::kHold)
     {
         LifeCycleId const id = mLifeCycleList.size();
         mLifeCycleList.push_back(lc);
+        mInitiallyActive.push_back(initiallyActive);
+        mSuspendPolicies.push_back(suspendPolicy);
         if (std::holds_alternative<SsmLifeCycle>(lc))
         {
             mSsmLifeCycleIds.push_back(id);
@@ -98,8 +101,9 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
                 AllocationGroupId const id = *buffer.allocationGroupId;
                 if (mAllocationGroupIdMap.find(id) == mAllocationGroupIdMap.end())
                 {
-                    mAllocationGroupIdMap[id]
-                        = appendLifeCycle(makeLifeCycle(*explicitGroups.at(id), config.tokensPerBlock));
+                    auto const& group = *explicitGroups.at(id);
+                    mAllocationGroupIdMap[id] = appendLifeCycle(
+                        makeLifeCycle(group, config.tokensPerBlock), group.initiallyActive, group.suspendPolicy);
                 }
             }
             else
@@ -136,6 +140,17 @@ LifeCycleId LifeCycleRegistry::getId(AllocationGroupId id) const
     auto const found = mAllocationGroupIdMap.find(id);
     TLLM_CHECK_WITH_INFO(found != mAllocationGroupIdMap.end(), "Unknown allocation_group_id %d", id.value());
     return found->second;
+}
+
+LifeCycleRegistry::ActiveGroups LifeCycleRegistry::activeGroups(
+    std::vector<AllocationGroupId> const& additionalGroups) const
+{
+    auto result = mInitiallyActive;
+    for (auto const id : additionalGroups)
+    {
+        result[getId(id)] = true;
+    }
+    return result;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

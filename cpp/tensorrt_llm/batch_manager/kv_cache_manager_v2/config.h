@@ -152,6 +152,12 @@ enum class AllocationUnit
     kFixed,
 };
 
+enum class SuspendPolicy
+{
+    kHold,
+    kRelease,
+};
+
 struct AllocationGroupConfig
 {
     AllocationGroupId allocationGroupId;
@@ -159,6 +165,10 @@ struct AllocationGroupConfig
     std::optional<int> slidingWindowSize;
     std::optional<int> numSinkTokens;
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+    //! False defers allocation until the caller selects this PRIVATE FIXED group.
+    bool initiallyActive = true;
+    //! RELEASE discards a PRIVATE FIXED group's contents after its cache-stream work finishes.
+    SuspendPolicy suspendPolicy = SuspendPolicy::kHold;
 
     void validate() const;
 };
@@ -419,6 +429,8 @@ struct KVCacheDesc
     // so the split has to be modelled explicitly.
     int beamWidth = 1;
     int promptLength = 0;
+    //! Additional deferred groups needed by this request; absent means initially active groups only.
+    std::optional<std::vector<AllocationGroupId>> activeAllocationGroups;
 
     void validate() const
     {
@@ -432,7 +444,7 @@ struct KVCacheDesc
     bool operator==(KVCacheDesc const& other) const noexcept
     {
         return capacity == other.capacity && historyLength == other.historyLength && beamWidth == other.beamWidth
-            && promptLength == other.promptLength;
+            && promptLength == other.promptLength && activeAllocationGroups == other.activeAllocationGroups;
     }
 
     bool operator!=(KVCacheDesc const& other) const noexcept

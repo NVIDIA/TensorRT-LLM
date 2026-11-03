@@ -429,4 +429,41 @@ TEST(KvCacheManagerV2ConfigTest, MultipleRequiredFixedGroupsAreRejectedBeforeMat
     EXPECT_THROW(createStorageConfig(config), std::runtime_error);
 }
 
+TEST(KvCacheManagerV2ConfigTest, DeferredAllocationAndSuspendPoliciesAreExplicit)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{10},
+        .allocationUnit = AllocationUnit::kFixed,
+        .reusePolicy = ReusePolicy::PRIVATE,
+        .initiallyActive = false,
+        .suspendPolicy = SuspendPolicy::kRelease}};
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].allocationGroupId = AllocationGroupId{10};
+    ASSERT_NO_THROW(config.validate());
+    LifeCycleRegistry const registry(config);
+    auto const group = registry.getId(AllocationGroupId{10});
+    EXPECT_FALSE(registry.activeGroups()[group]);
+    EXPECT_TRUE(registry.activeGroups({AllocationGroupId{10}})[group]);
+    EXPECT_EQ(registry.suspendPolicy(group), SuspendPolicy::kRelease);
+    EXPECT_THROW(registry.activeGroups({AllocationGroupId{11}}), std::runtime_error);
+
+    auto invalid = config;
+    invalid.allocationGroups[0].allocationUnit = AllocationUnit::kTokenBlock;
+    EXPECT_THROW(invalid.validate(), std::runtime_error);
+    invalid = config;
+    invalid.allocationGroups[0].reusePolicy = ReusePolicy::REQUIRED;
+    EXPECT_THROW(invalid.validate(), std::runtime_error);
+    invalid = config;
+    invalid.allocationGroups[0].suspendPolicy = static_cast<SuspendPolicy>(99);
+    EXPECT_THROW(invalid.validate(), std::runtime_error);
+    invalid = config;
+    invalid.constraints
+        = {BatchDesc{{KVCacheDesc{.activeAllocationGroups = std::vector<AllocationGroupId>{AllocationGroupId{99}}}}}};
+    EXPECT_THROW(invalid.validate(), std::runtime_error);
+
+    LifeCycleRegistry const legacy(makeConfig());
+    EXPECT_TRUE(legacy.activeGroups()[LifeCycleId{0}]);
+    EXPECT_EQ(legacy.suspendPolicy(LifeCycleId{0}), SuspendPolicy::kHold);
+}
+
 } // namespace

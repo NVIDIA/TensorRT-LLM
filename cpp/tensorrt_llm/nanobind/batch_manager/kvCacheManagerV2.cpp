@@ -69,6 +69,17 @@ namespace tensorrt_llm::nanobind::batch_manager
 namespace
 {
 
+std::vector<kv::AllocationGroupId> allocationGroupIds(std::vector<int> const& values)
+{
+    std::vector<kv::AllocationGroupId> ids;
+    ids.reserve(values.size());
+    for (int value : values)
+    {
+        ids.emplace_back(value);
+    }
+    return ids;
+}
+
 //! A scratch range paired with the slots covering it.
 //!
 //! KvCache reports the two separately, through getSwaScratchRange() and getScratchSlots().
@@ -1794,17 +1805,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("TOKEN_BLOCK", kv::AllocationUnit::kTokenBlock)
         .value("FIXED", kv::AllocationUnit::kFixed);
 
+    nb::enum_<kv::SuspendPolicy>(m, "SuspendPolicy")
+        .value("HOLD", kv::SuspendPolicy::kHold)
+        .value("RELEASE", kv::SuspendPolicy::kRelease);
+
     nb::class_<kv::AllocationGroupConfig>(m, "AllocationGroupConfig")
         .def(
             "__init__",
             [](kv::AllocationGroupConfig* group, int allocationGroupId, kv::AllocationUnit allocationUnit,
-                std::optional<int> slidingWindowSize, std::optional<int> numSinkTokens, kv::ReusePolicy reusePolicy)
+                std::optional<int> slidingWindowSize, std::optional<int> numSinkTokens, kv::ReusePolicy reusePolicy,
+                bool initiallyActive, kv::SuspendPolicy suspendPolicy)
             {
                 new (group) kv::AllocationGroupConfig{kv::AllocationGroupId{allocationGroupId}, allocationUnit,
-                    slidingWindowSize, numSinkTokens, reusePolicy};
+                    slidingWindowSize, numSinkTokens, reusePolicy, initiallyActive, suspendPolicy};
             },
             nb::arg("allocation_group_id"), nb::arg("allocation_unit"), nb::arg("sliding_window_size") = std::nullopt,
-            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED,
+            nb::arg("initially_active") = true, nb::arg("suspend_policy") = kv::SuspendPolicy::kHold)
         .def_prop_rw(
             "allocation_group_id",
             [](kv::AllocationGroupConfig const& group) { return group.allocationGroupId.value(); },
@@ -1812,7 +1829,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("allocation_unit", &kv::AllocationGroupConfig::allocationUnit)
         .def_rw("sliding_window_size", &kv::AllocationGroupConfig::slidingWindowSize)
         .def_rw("num_sink_tokens", &kv::AllocationGroupConfig::numSinkTokens)
-        .def_rw("reuse_policy", &kv::AllocationGroupConfig::reusePolicy) DEF_COPY(kv::AllocationGroupConfig);
+        .def_rw("reuse_policy", &kv::AllocationGroupConfig::reusePolicy)
+        .def_rw("initially_active", &kv::AllocationGroupConfig::initiallyActive)
+        .def_rw("suspend_policy", &kv::AllocationGroupConfig::suspendPolicy) DEF_COPY(kv::AllocationGroupConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(
@@ -1873,12 +1892,39 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
-        .def(nb::init<int, int, int, int>(), nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1,
-            nb::arg("prompt_length") = 0)
+        .def(
+            "__init__",
+            [](kv::KVCacheDesc* desc, int capacity, int historyLength, int beamWidth, int promptLength,
+                std::optional<std::vector<int>> groups)
+            {
+                new (desc) kv::KVCacheDesc{capacity, historyLength, beamWidth, promptLength,
+                    groups.has_value() ? std::optional{allocationGroupIds(*groups)} : std::nullopt};
+            },
+            nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1, nb::arg("prompt_length") = 0,
+            nb::arg("active_allocation_groups") = nb::none())
         .def_rw("capacity", &kv::KVCacheDesc::capacity)
         .def_rw("history_length", &kv::KVCacheDesc::historyLength)
         .def_rw("beam_width", &kv::KVCacheDesc::beamWidth)
         .def_rw("prompt_length", &kv::KVCacheDesc::promptLength)
+        .def_prop_rw(
+            "active_allocation_groups",
+            [](kv::KVCacheDesc const& desc) -> std::optional<std::vector<int>>
+            {
+                if (!desc.activeAllocationGroups.has_value())
+                {
+                    return std::nullopt;
+                }
+                std::vector<int> values;
+                for (auto const id : *desc.activeAllocationGroups)
+                {
+                    values.push_back(id.value());
+                }
+                return values;
+            },
+            [](kv::KVCacheDesc& desc, std::optional<std::vector<int>> groups) {
+                desc.activeAllocationGroups
+                    = groups.has_value() ? std::optional{allocationGroupIds(*groups)} : std::nullopt;
+            })
         .def("__eq__",
             [](kv::KVCacheDesc const& self, nb::handle other)
             {
@@ -2077,7 +2123,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             // support is merged and its callers stop passing it; it is here only so this
             // change stands alone.
             [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding,
-                std::optional<std::vector<int>> groups)
+                std::optional<std::vector<int>> groups, std::optional<std::vector<int>> activeGroups)
             {
                 (void) isDecoding;
                 std::optional<CUstream> optStream;
@@ -2092,11 +2138,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         selected->push_back(kv::LifeCycleId{group});
                     }
                 }
+                auto active
+                    = activeGroups.has_value() ? std::optional{allocationGroupIds(*activeGroups)} : std::nullopt;
                 nb::gil_scoped_release rel;
-                return self.resume(optStream, std::move(selected));
+                return self.resume(optStream, std::move(selected), std::move(active));
             },
             nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none(),
-            nb::arg("optional_reuse_groups") = nb::none())
+            nb::arg("optional_reuse_groups") = nb::none(), nb::arg("active_allocation_groups") = nb::none())
+        .def(
+            "activate_groups",
+            [](kv::KvCache& self, std::vector<int> const& groups)
+            { return self.activateGroups(allocationGroupIds(groups)); },
+            nb::arg("groups"), nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_page_priorities",
             [](kv::KvCache const& self, int layerGroupId, int beamIndex)

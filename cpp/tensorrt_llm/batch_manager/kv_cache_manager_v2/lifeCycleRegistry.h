@@ -195,6 +195,16 @@ public:
     //! Look up an explicitly named allocation group; equal policies do not share this identity.
     LifeCycleId getId(AllocationGroupId id) const;
 
+    using ActiveGroups = TypedVec<LifeCycleId, uint8_t>;
+
+    //! Resolve a request's initially active and explicitly selected allocation groups.
+    ActiveGroups activeGroups(std::vector<AllocationGroupId> const& additionalGroups = {}) const;
+
+    SuspendPolicy suspendPolicy(LifeCycleId id) const
+    {
+        return mSuspendPolicies.at(id);
+    }
+
     // Number of unique life cycles.
     [[nodiscard]] LifeCycleId size() const noexcept
     {
@@ -310,12 +320,17 @@ private:
             TLLM_CHECK_WITH_INFO(
                 toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size() + mAllocationGroupIdMap.size(),
                 "corrupted life cycle registry");
+            TLLM_CHECK_WITH_INFO(
+                mInitiallyActive.size() == mLifeCycleList.size() && mSuspendPolicies.size() == mLifeCycleList.size(),
+                "corrupted allocation group policy registry");
         }
     }
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
     std::map<AllocationGroupId, LifeCycleId> mAllocationGroupIdMap;
+    ActiveGroups mInitiallyActive;
+    TypedVec<LifeCycleId, SuspendPolicy> mSuspendPolicies;
     std::vector<LifeCycleId> mSsmLifeCycleIds;
 };
 

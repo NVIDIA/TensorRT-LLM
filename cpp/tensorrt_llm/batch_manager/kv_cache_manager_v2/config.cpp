@@ -37,6 +37,11 @@ void AllocationGroupConfig::validate() const
     TLLM_CHECK_WITH_INFO(reusePolicy == ReusePolicy::REQUIRED || reusePolicy == ReusePolicy::PRIVATE
             || reusePolicy == ReusePolicy::OPTIONAL,
         "AllocationGroupConfig: unknown reuse_policy");
+    TLLM_CHECK_WITH_INFO(suspendPolicy == SuspendPolicy::kHold || suspendPolicy == SuspendPolicy::kRelease,
+        "AllocationGroupConfig: unknown suspend_policy");
+    TLLM_CHECK_WITH_INFO((initiallyActive && suspendPolicy == SuspendPolicy::kHold)
+            || (allocationUnit == AllocationUnit::kFixed && reusePolicy == ReusePolicy::PRIVATE),
+        "AllocationGroupConfig: deferred activation and RELEASE suspension require a PRIVATE FIXED group");
     if (allocationUnit == AllocationUnit::kFixed)
     {
         TLLM_CHECK_WITH_INFO(!slidingWindowSize.has_value() && !numSinkTokens.has_value(),
@@ -251,6 +256,30 @@ void KVCacheManagerConfig::validateAllocationGroups() const
     }
     TLLM_CHECK_WITH_INFO(requiredFixedGroups <= 1,
         "KVCacheManagerConfig: multiple REQUIRED fixed allocation groups are not supported by prefix matching");
+
+    auto validateBatch = [&](BatchDesc const& batch)
+    {
+        for (auto const& request : batch.kvCaches)
+        {
+            if (request.activeAllocationGroups.has_value())
+            {
+                for (auto const id : *request.activeAllocationGroups)
+                {
+                    TLLM_CHECK_WITH_INFO(groups.count(id) != 0,
+                        "KVCacheManagerConfig: request descriptor references undeclared allocation_group_id %d",
+                        id.value());
+                }
+            }
+        }
+    };
+    for (auto const& batch : constraints)
+    {
+        validateBatch(batch);
+    }
+    if (typicalStep.has_value())
+    {
+        validateBatch(*typicalStep);
+    }
 }
 
 void KVCacheManagerConfig::validate() const

@@ -295,10 +295,19 @@ public:
     //
     // Refused while the cache belongs to a Batch: locking pages writes through the bound
     // Span, which is the Batch's staged row, so a member is resumed before it joins.
+    // activeAllocationGroups adds deferred groups to the initially active set. nullopt
+    // preserves the last successful selection; an empty vector selects only the initial set.
+    // A group with held pages cannot be deselected. Fresh pages require caller initialization.
     bool resume(std::optional<CUstream> stream = std::nullopt,
-        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt,
+        std::optional<std::vector<AllocationGroupId>> activeAllocationGroups = std::nullopt);
 
-    // Suspend: detach from CUDA stream, unlock pages → PageHolder.
+    //! Allocate additional deferred groups atomically. The caller initializes their contents before use.
+    //! The cache must be active and outside a Batch. Returns false when slots are unavailable.
+    bool activateGroups(std::vector<AllocationGroupId> const& groups);
+
+    // Suspend: hold pages or release them according to each allocation group's policy.
+    // The caller finishes any work that preserves released state on the cache stream first.
     //
     // Refused while the cache belongs to a Batch, for the reason resume() is.
     //
@@ -660,6 +669,9 @@ private:
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
+    void _installFixedSlots(TypedVec<LifeCycleId, std::vector<Slot>>& slots);
+    void _validateActiveGroups(LifeCycleRegistry::ActiveGroups const& groups) const;
+
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.
@@ -856,6 +868,7 @@ private:
 
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
+    LifeCycleRegistry::ActiveGroups mActiveAllocationGroups;
     bool mNeverResumed = true;
 
     PendingStats mPendingStats;

@@ -2058,6 +2058,13 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
 {
     TypedVec<LifeCycleId, SlotCount> numSlots(numLifeCycles(), 0);
     int sysBlocks = batch.systemPromptLength / tokensPerBlock;
+    std::vector<LifeCycleRegistry::ActiveGroups> activeGroups;
+    activeGroups.reserve(batch.kvCaches.size());
+    for (auto const& request : batch.kvCaches)
+    {
+        activeGroups.push_back(
+            mLifeCycles.activeGroups(request.activeAllocationGroups.value_or(std::vector<AllocationGroupId>{})));
+    }
 
     for (auto const& [lcIdx, lc] : mLifeCycles)
     {
@@ -2066,9 +2073,12 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
             // SSM: one dedicated block per request per beam, never shared.
             // _appendBeams() gives every beam its own recurrent-state slot.
             size_t ssmBlocks = 0;
-            for (auto const& kv : batch.kvCaches)
+            for (size_t request = 0; request < batch.kvCaches.size(); ++request)
             {
-                ssmBlocks += static_cast<size_t>(std::max(1, kv.beamWidth));
+                if (activeGroups[request][lcIdx])
+                {
+                    ssmBlocks += static_cast<size_t>(std::max(1, batch.kvCaches[request].beamWidth));
+                }
             }
             numSlots[lcIdx] += slotCountValueFromSize(ssmBlocks);
             continue;
