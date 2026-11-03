@@ -1995,7 +1995,7 @@ def test_normalization_does_not_compile_after_startup(
         pytest.fail("Raw-pixel normalization compiled after encoder startup")
 
     monkeypatch.setattr(
-        modeling_multimodal_utils._normalize_vision_pixels_kernel, "_do_compile", unexpected_compile
+        modeling_multimodal_utils._lookup_vision_pixels_kernel, "_do_compile", unexpected_compile
     )
     for count in (256, 1536, 4096 * 1536):
         pixels = torch.arange(count, device="cuda", dtype=torch.int32).to(torch.uint8)

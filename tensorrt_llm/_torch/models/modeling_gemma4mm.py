@@ -726,6 +726,9 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         input_features = None
         input_features_mask = None
         vision_normalizations: dict[str, VisionNormalization] = {}
+        # The lookup table is built from the processor's own settings. Rather than check whether
+        # request mm_processor_kwargs are compatible with it, requests that set any (and
+        # mixed-modality requests) keep host normalization.
         device_normalize = (
             allow_device_normalize
             and not inputs.get("mm_processor_kwargs")
@@ -965,6 +968,20 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 # ---------------------------------------------------------------------------
 
 
+def _normalize_vision_patches(
+    pixel_values: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    normalization: VisionNormalization,
+) -> torch.Tensor:
+    """Normalize raw uint8 RGB patches on their device, keeping padding patches at zero."""
+    pixel_values = normalize_vision_pixels(pixel_values.reshape(-1, 3, 1), normalization).reshape(
+        pixel_values.shape
+    )
+    if position_ids is not None:
+        pixel_values.masked_fill_((position_ids == -1).all(dim=-1, keepdim=True), 0)
+    return pixel_values
+
+
 class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
     """Shared multimodal encoder flow for Gemma4 conditional generation models."""
 
@@ -1137,13 +1154,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             if pixel_values is not None:
                 image_position_ids = image_data.get("image_position_ids")
                 if "vision_normalization" in image_data:
-                    pixel_values = normalize_vision_pixels(
-                        pixel_values.reshape(-1, 3, 1), image_data["vision_normalization"]
-                    ).reshape(pixel_values.shape)
-                    if image_position_ids is not None:
-                        pixel_values.masked_fill_(
-                            (image_position_ids == -1).all(dim=-1, keepdim=True), 0
-                        )
+                    pixel_values = _normalize_vision_patches(
+                        pixel_values, image_position_ids, image_data["vision_normalization"]
+                    )
                 pixel_values_list.append(pixel_values)
                 if image_position_ids is not None:
                     image_position_ids_list.append(image_position_ids)
@@ -1162,13 +1175,9 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             if video_pixel_values is not None:
                 video_position_ids = video_data.get("image_position_ids")
                 if "vision_normalization" in video_data:
-                    video_pixel_values = normalize_vision_pixels(
-                        video_pixel_values.reshape(-1, 3, 1), video_data["vision_normalization"]
-                    ).reshape(video_pixel_values.shape)
-                    if video_position_ids is not None:
-                        video_pixel_values.masked_fill_(
-                            (video_position_ids == -1).all(dim=-1, keepdim=True), 0
-                        )
+                    video_pixel_values = _normalize_vision_patches(
+                        video_pixel_values, video_position_ids, video_data["vision_normalization"]
+                    )
                 video_pixel_values_list.append(video_pixel_values)
                 if video_position_ids is not None:
                     video_position_ids_list.append(video_position_ids)

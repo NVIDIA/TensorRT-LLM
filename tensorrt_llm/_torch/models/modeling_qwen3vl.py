@@ -456,6 +456,8 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                     ("video", "pixel_values_videos"),
                 )
             ):
+                # The processor returned non-uint8 pixels even with rescale and normalize off, so
+                # the device lookup table cannot be applied. Rerun it with the host settings.
                 processor_kwargs["do_rescale"] = host_do_rescale
                 processor_kwargs.pop("do_normalize")
                 return self.processor(**processor_kwargs)

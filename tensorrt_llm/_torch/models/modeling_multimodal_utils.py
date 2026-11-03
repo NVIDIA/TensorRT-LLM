@@ -81,12 +81,13 @@ def vision_normalization_from_processor(
 
 
 @functools.lru_cache(maxsize=32)
-def _vision_normalization_table(
+def _vision_pixel_lookup_table(
     normalization: VisionNormalization,
     device: torch.device,
     channels: int,
     default_dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Precompute processor outputs for every uint8 value of each channel."""
     values = torch.arange(256, dtype=default_dtype,
                           device="cpu").expand(channels, 1, -1)
     image_mean, image_std = normalization.image_mean, normalization.image_std
@@ -108,9 +109,8 @@ def _vision_normalization_table(
 
 
 @triton.jit(do_not_specialize=["count", "channel_stride", "channels"])
-def _normalize_vision_pixels_kernel(source, table, target, count,
-                                    channel_stride, channels,
-                                    BLOCK: tl.constexpr):
+def _lookup_vision_pixels_kernel(source, table, target, count, channel_stride,
+                                 channels, BLOCK: tl.constexpr):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pixels = tl.load(source + offsets, offsets < count, other=0).to(tl.int32)
     channel = (offsets // channel_stride) % channels
@@ -137,7 +137,7 @@ def normalize_vision_pixels(
     if not channels or not channel_stride:
         return pixel_values.to(normalization.out_dtype)
     # Match the producer's intermediate precision when rebuilding the table.
-    table = _vision_normalization_table(
+    table = _vision_pixel_lookup_table(
         normalization, pixel_values.device, channels,
         normalization.compute_dtype or torch.get_default_dtype())
     if not pixel_values.is_cuda:
@@ -149,17 +149,17 @@ def normalize_vision_pixels(
                               dtype=normalization.out_dtype,
                               memory_format=torch.contiguous_format)
     if pixel_values.numel():
-        _normalize_vision_pixels_kernel[(triton.cdiv(
-            pixel_values.numel(), 1024), )](
-                pixel_values.contiguous(),
-                table,
-                output,
-                pixel_values.numel(),
-                channel_stride,
-                channels,
-                BLOCK=1024,
-                num_warps=4,
-            )
+        grid = (triton.cdiv(pixel_values.numel(), 1024), )
+        _lookup_vision_pixels_kernel[grid](
+            pixel_values.contiguous(),
+            table,
+            output,
+            pixel_values.numel(),
+            channel_stride,
+            channels,
+            BLOCK=1024,
+            num_warps=4,
+        )
     return output
 
 
