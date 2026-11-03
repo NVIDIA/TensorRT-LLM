@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     _INDEXER_MQA_LOGITS_ELEM_BUDGET,
     F,
@@ -21,11 +23,65 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     maybe_execute_in_parallel,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .full_query_policy import fp8_full_query_weight_cache_limit
 
 
 class RubinIndexer(Indexer):
+    def __init__(
+        self,
+        quant_config: Optional[QuantConfig],
+        pos_embd_params: Optional[PositionalEmbeddingParams],
+        mla_params: Optional[MLAParams],
+        skip_create_weights_in_init: bool,
+        sparse_params: DSAParams,
+        dtype: Optional[torch.dtype],
+        compress_ratio: int = 1,
+        layer_idx: int = 0,
+        aux_stream: Optional[torch.cuda.Stream] = None,
+        *,
+        projection_free: bool = False,
+    ) -> None:
+        use_rubin_gvr = (
+            not projection_free
+            and sparse_params.enable_heuristic_topk
+            and sparse_params.use_self_sampling_topk
+            and IS_CUTLASS_DSL_AVAILABLE
+            and torch.cuda.is_available()
+            and get_sm_version() == 107
+            and sparse_params.index_topk == 2048
+            and compress_ratio == 1
+        )
+        super().__init__(
+            quant_config,
+            pos_embd_params,
+            mla_params,
+            skip_create_weights_in_init,
+            replace(sparse_params, enable_heuristic_topk=False) if use_rubin_gvr else sparse_params,
+            dtype,
+            compress_ratio,
+            layer_idx,
+            aux_stream,
+            projection_free=projection_free,
+        )
+        if use_rubin_gvr:
+            self._enable_heuristic_topk = True
+            self._use_self_sampling_topk = True
+            # Each CUDA graph runs the same eager forward before capture,
+            # warming the shared GVR launcher's exact rows/stride/envelope key.
+            self.top_k = TopK(
+                self.index_topk,
+                prefill_implementation=TopKImplementation.CUDA_RADIX,
+                decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+                compress_ratio=self.compress_ratio,
+                gvr_self_sampling=True,
+                gvr_deterministic=sparse_params.gvr_deterministic_topk,
+            )
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
