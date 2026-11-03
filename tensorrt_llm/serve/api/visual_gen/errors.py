@@ -15,7 +15,7 @@
 """The VisualGen 422 renderer.
 
 Shared by the route-level (``RequestValidationError``) and handler-level
-(``ValidationError``) entry points. Private module.
+(``ValidationError``) entry points. Internal to the VisualGen serving package.
 """
 
 from http import HTTPStatus

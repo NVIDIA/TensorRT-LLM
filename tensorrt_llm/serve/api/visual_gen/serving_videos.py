@@ -36,6 +36,8 @@ from tensorrt_llm.serve.api.visual_gen.serving_base import VisualGenBaseServing
 from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE, parse_visual_gen_params
 
 if TYPE_CHECKING:
+    # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
+    # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm._utils import AdjustedSteadyClock
     from tensorrt_llm.visual_gen.params import VisualGenParams
     from tensorrt_llm.visual_gen.visual_gen import VisualGen, VisualGenResult
@@ -53,7 +55,6 @@ def _video_content_type(suffix: str) -> str:
 # File suffixes the GET /v1/videos/{id}/content and DELETE
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
-
 
 # Reference fields whose multipart text form is a JSON object, not a scalar.
 _REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
