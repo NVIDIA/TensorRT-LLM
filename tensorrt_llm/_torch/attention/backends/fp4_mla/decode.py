@@ -12,6 +12,8 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version
 
 from . import decode_4x as _decode_4x
+from . import decode_twostream as _decode_twostream
+from . import fp4_mla_dispatch as _dispatch
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -1270,21 +1272,63 @@ def run_fp4_mla_attention_decode(
                 )
 
         if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
-            # 4x sub-selection: inside its static envelope it replaces the 2x packed kernel; otherwise
-            # fall through to the packed path unchanged.
+            # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
+            # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
+            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself may use
+            # the step's longest live KV when a graph runner provides it (Fp4MlaState.kv_regime_max_kv).
+            from . import fp4_mla_cutedsl_4x_host as _host_4x
+
             max_kv_len_4x = max_pages * metadata.page_size
-            reason_4x = _decode_4x._fp4_mla_cutedsl_4x_reason(
-                num_heads=num_heads,
-                query_len=query_len_per_seq,
+            strategy = _dispatch.choose_decode_strategy(
                 num_requests=num_gen_seqs,
-                max_kv_len=max_kv_len_4x,
-                device=q.device,
-                helix_kv_bounds=helix_kv_bounds,
-                softmax_stats_tensor=softmax_stats_tensor,
-                v_packed=core_v_packed,
+                query_len=query_len_per_seq,
+                num_heads=num_heads,
+                rows_per_seq=packed_rows_per_seq,
+                kv_capacity=max_kv_len_4x,
+                sm_count=_get_sm_count(q.device),
+                envelope_reason=_host_4x.envelope_reason_static,
+                live_max_kv=getattr(metadata.fp4_mla_state, "kv_regime_max_kv", None),
+                helix=helix_kv_bounds is not None,
+                softmax_stats=softmax_stats_tensor is not None,
+                v_packed=core_v_packed is not None,
+                four_x_enabled=True,
             )
-            _decode_4x._fp4_mla_4x_record(reason_4x, num_gen_seqs, query_len_per_seq, max_kv_len_4x)
-            if reason_4x is None:
+            _decode_4x._fp4_mla_4x_record(
+                None if strategy.path != _dispatch.PATH_2X else strategy.reason,
+                num_gen_seqs,
+                query_len_per_seq,
+                max_kv_len_4x,
+                tag=strategy.record_tag,
+            )
+            if strategy.path == _dispatch.PATH_TWO_STREAM:
+                _decode_twostream.run_cutedsl_twostream_decode(
+                    cutedsl_kernel,
+                    metadata,
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    num_requests_2x=strategy.num_requests_2x,
+                    rows_per_seq=packed_rows_per_seq,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    run_4x=_decode_4x._run_cutedsl_4x_decode,
+                    run_2x=_run_cutedsl_packed_decode,
+                )
+                return
+            if strategy.path == _dispatch.PATH_4X:
                 _decode_4x._run_cutedsl_4x_decode(
                     q_fp4,
                     q_sf,
