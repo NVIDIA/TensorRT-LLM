@@ -2638,7 +2638,7 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ks = spec_metadata.request_top_ks[start:end]
         top_ps = spec_metadata.request_top_ps[start:end]
         min_ps = spec_metadata.request_min_ps[start:end]
-        if spec_metadata.draft_temperature_only:
+        if getattr(spec_metadata, "draft_temperature_only", False):
             # Device-side fills: CUDA graph capture rejects host-scalar copies.
             top_ks = torch.full_like(top_ks, torch.iinfo(torch.int32).max)
             top_ps = torch.ones_like(top_ps)
@@ -2973,7 +2973,10 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            use_block = spec_metadata.rejection_sample_method == "block"
+            # getattr: the metadata stand-ins of the sampler tests predate
+            # these fields.
+            use_block = getattr(spec_metadata, "rejection_sample_method",
+                                "standard") == "block"
             if use_block and is_ragged:
                 logger.warning_once(
                     "rejection_sample_method='block' does not support ragged "

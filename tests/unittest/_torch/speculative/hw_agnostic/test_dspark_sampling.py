@@ -265,7 +265,7 @@ def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
 
 @pytest.mark.cpu_only
 def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> None:
-    """Argmax drafts and drafters without a head keep the DFlash block sampler and the greedy chain."""
+    """Argmax drafts and drafters without a head keep the DFlash hook: refine, then the block sampler."""
     generator = torch.Generator().manual_seed(3)
     worker = _worker()
     drafter = _drafter(generator)
@@ -274,22 +274,47 @@ def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> Non
     sampled, greedy = _metadata(B), _metadata(B)
     greedy.wants_advanced_draft_sampling = False
     no_head = types.SimpleNamespace(has_markov_head=False)
+
+    # Argmax drafts of a drafter with a head: the DFlash hook, which applies the greedy chain.
     with patch.object(
         DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
-    ) as base_hook:
+    ) as hook:
         assert worker._sample_block_draft_tokens(drafter, base, None, inputs, greedy, 0, B) == (
             "dflash",
             V,
         )
-        assert worker._sample_block_draft_tokens(no_head, base, None, inputs, sampled, 0, B) == (
-            "dflash",
-            V,
+        hook.assert_called_once()
+
+    # No head, sampled drafts: the real DFlash hook, unrefined logits straight into the block sampler.
+    calls = []
+    with (
+        patch.object(
+            SpecWorkerBase,
+            "_sample_from_logits_with_probs",
+            staticmethod(_cpu_sampler(generator, calls)),
+        ),
+        patch.object(DSparkWorker, "_apply_dspark_markov_bias") as bias,
+    ):
+        tokens, vocab = worker._sample_block_draft_tokens(
+            no_head, base, None, inputs, sampled, 0, B
         )
-        assert base_hook.call_count == 2
+    bias.assert_not_called()
+    assert len(calls) == 1 and tokens.shape == (B, K) and vocab == V
+    assert sampled.draft_probs_last_dim == V
+
+    # Head and sampled drafts: the ancestral walk, one draw per position, no greedy chain.
+    calls = []
+    with patch.object(DSparkWorker, "_apply_dspark_markov_bias") as bias:
         tokens, _ = _sample_with(
-            _cpu_sampler(generator), worker, drafter, base, inputs["first_prev_tokens"], sampled
+            _cpu_sampler(generator, calls),
+            worker,
+            drafter,
+            base,
+            inputs["first_prev_tokens"],
+            sampled,
         )
-        assert base_hook.call_count == 2 and tokens.shape == (B, K)
+    bias.assert_not_called()
+    assert len(calls) == K and tokens.shape == (B, K)
 
 
 @pytest.mark.parametrize("num_contexts", [0, 2])
