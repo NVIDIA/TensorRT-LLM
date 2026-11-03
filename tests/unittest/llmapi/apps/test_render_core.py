@@ -46,6 +46,7 @@ from tensorrt_llm.serve.render import (
 from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
 
 from .render_helpers import (
+    EFFORT_TEMPLATE,
     KIMI_K3,
     LLAMA,
     QWEN3,
@@ -650,6 +651,112 @@ class TestRenderConversation:
         result = asyncio.run(run())
         assert result.text.endswith("<|im_start|>assistant\n<tool_call>")
         assert result.prefix_applied is True
+
+
+class TestRequestedReasoningEffort:
+    """A chat request's ``reasoning_effort`` reaches the renderer as a template kwarg."""
+
+    @staticmethod
+    def _render(request, chat_template: str = EFFORT_TEMPLATE) -> str:
+        tokenizer = make_tokenizer(chat_template=chat_template)
+        return render_chat(request, resources(tokenizer), tokenize=False).text
+
+    @pytest.mark.parametrize(
+        ("effort", "rendered"),
+        # "High" validates into Harmony's ReasoningEffort, whose values are capitalized.
+        [("low", "Low"), ("high", "High"), ("High", "High")],
+    )
+    def test_a_requested_effort_reaches_the_template(self, effort, rendered) -> None:
+        request = chat_request(reasoning_effort=effort)
+
+        assert self._render(request).startswith(f"Reasoning Effort: {rendered}|")
+
+    def test_an_unset_effort_is_not_passed(self) -> None:
+        # The field has a default (Harmony's LOW); the template must not see it.
+        request = chat_request()
+
+        assert self._render(request).startswith("Reasoning Effort: Max|")
+        assert request.chat_template_kwargs is None
+
+    def test_none_is_not_passed(self) -> None:
+        request = chat_request(reasoning_effort="none")
+
+        assert self._render(request).startswith("Reasoning Effort: Max|")
+        assert request.chat_template_kwargs is None
+
+    def test_an_effort_in_chat_template_kwargs_wins(self) -> None:
+        request = chat_request(
+            reasoning_effort="high", chat_template_kwargs={"reasoning_effort": "low"}
+        )
+
+        assert self._render(request).startswith("Reasoning Effort: Low|")
+        # The client's own key stays subject to the unused-kwargs guard.
+        assert request.injected_chat_template_kwargs is None
+
+    def test_a_template_that_does_not_read_the_effort_still_renders(self, monkeypatch) -> None:
+        from tensorrt_llm.inputs.chat_template_guard import (
+            ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR,
+        )
+
+        monkeypatch.delenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, raising=False)
+        request = chat_request(reasoning_effort="high")
+
+        assert self._render(request, SERVER_TEMPLATE) == (
+            "SERVER:hello world|this is a test|get the weather|"
+        )
+
+    def test_kimi_k3_maps_the_effort_onto_its_own_kwarg(self) -> None:
+        # The kimi_k3 extension derives `thinking_effort` from the field; the generic key is not
+        # added beside it.
+        res = resources(
+            make_tokenizer(chat_template="{{ thinking_effort }}|{{ reasoning_effort is defined }}"),
+            model_type="kimi_k3",
+            extension=serving_extensions.get_serving_extension("kimi_k3"),
+        )
+
+        rendered = render_chat(chat_request(reasoning_effort="high"), res, tokenize=False)
+
+        assert rendered.text == "high|False"
+
+    def test_harmony_takes_the_effort_from_the_request_field(self, monkeypatch) -> None:
+        from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
+
+        from .render_helpers import use_harmony_vocab
+
+        use_harmony_vocab(monkeypatch)
+        request = chat_request(
+            reasoning_effort="high", chat_template_kwargs={"reasoning_effort": "low"}
+        )
+
+        assert render_chat(request, harmony_resources()).token_ids == (
+            tokenize_harmony_chat_request(chat_request(reasoning_effort="high"))
+        )
+
+    def test_the_deepseek_v41_tokenizer_gets_the_effort(self) -> None:
+        # The renderer is the tokenizer's own Python code; the wrapped tokenizer only encodes.
+        from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+        res = resources(
+            DeepseekV41Tokenizer(SimpleNamespace()),
+            model_type="deepseek_v41_text",
+            extension=serving_extensions.get_serving_extension("deepseek_v41_text"),
+            custom_tokenizer="deepseek_v41",
+        )
+
+        def render(chat_template_kwargs=None, **fields) -> str:
+            request = chat_request(
+                messages=[{"role": "user", "content": "q"}],
+                # V4.1 states an effort only in thinking mode.
+                chat_template_kwargs={"thinking": True, **(chat_template_kwargs or {})},
+                **fields,
+            )
+            return render_chat(request, res, tokenize=False).text
+
+        assert "Reasoning Effort: 62 (range 1-100" in render(reasoning_effort="medium")
+        assert "Reasoning Effort: 75 (range 1-100" in render()  # the tokenizer's default
+        assert "Reasoning Effort: 100 (range 1-100" in render(
+            {"reasoning_effort": "max"}, reasoning_effort="low"
+        )
 
 
 class TestFingerprint:

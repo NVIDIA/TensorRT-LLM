@@ -26,6 +26,7 @@ from tensorrt_llm.serve.render import RenderResources, render_chat
 from tensorrt_llm.serve.router_utils import KV_CACHE_HASH_ALGO_DEFAULT
 
 from .render_helpers import (
+    EFFORT_TEMPLATE,
     KIMI_K3,
     SERVER_TEMPLATE,
     WEATHER_TOOL,
@@ -451,6 +452,26 @@ class TestRouterWriteBack:
         sent = request.model_dump(mode="json", exclude_unset=True)["messages"][1]
         assert [item["id"] for item in sent["tool_calls"]] == ["c1"]
 
+    def test_a_worker_rendering_the_forwarded_request_renders_the_requested_effort(self) -> None:
+        # The router renders the request for routing and forwards it; a context worker that is
+        # not given the router's ids renders it again.
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        effort_tokenizer = make_tokenizer(chat_template=EFFORT_TEMPLATE)
+        built = _Router.build(effort_tokenizer, ["server1"])
+        try:
+            request = chat_request(reasoning_effort="high")
+
+            routed = built._tokenize(request)[0]
+
+            assert request.prompt_token_ids is None  # no worker reported a fingerprint
+            sent = ChatCompletionRequest(**request.model_dump(mode="json", exclude_unset=True))
+            on_worker = render_chat(sent, resources(effort_tokenizer))
+            assert on_worker.text.startswith("Reasoning Effort: High|")
+            assert on_worker.token_ids == routed
+        finally:
+            built._test_patcher.stop()
+
     def test_a_harmony_router_renders_without_loading_a_tokenizer(self) -> None:
         # Harmony renders ids itself. A client that sends the served name, with no tokenizer
         # directory configured, must not make the router try to load a tokenizer for it.
@@ -843,3 +864,47 @@ class TestResponsesInputTokens:
         )
         assert with_template == expected.token_ids
         assert with_template != without
+
+
+class TestChatRoute:
+    @pytest.mark.parametrize(
+        ("fields", "rendered"),
+        [({"reasoning_effort": "high"}, "High"), ({}, "Max")],
+        ids=["requested", "unset"],
+    )
+    def test_the_prompt_carries_the_requested_reasoning_effort(
+        self, tmp_path, fields, rendered
+    ) -> None:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from tensorrt_llm.tokenizer import TransformersTokenizer
+
+        from .openai_server_stub import make_stub_openai_server
+
+        captured = {}
+
+        def generate_async(*, inputs, **kwargs):
+            captured["inputs"] = inputs
+            return SimpleNamespace(prompt_token_ids=[1], finished=True)
+
+        tokenizer = make_tokenizer(chat_template=EFFORT_TEMPLATE)
+        server = make_stub_openai_server(
+            tmp_path,
+            "m",
+            SimpleNamespace(model_type=MODEL_TYPE, vocab_size=len(tokenizer)),
+            generate_async,
+            tokenizer=TransformersTokenizer(tokenizer),
+        )
+        server.await_disconnected = mock.AsyncMock()
+        server._create_chat_response = mock.AsyncMock(
+            return_value=SimpleNamespace(model_dump=lambda: {})
+        )
+        app = FastAPI()
+        app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+        body = {"model": "m", "messages": [{"role": "user", "content": "hello world"}], **fields}
+
+        response = TestClient(app).post("/v1/chat/completions", json=body)
+
+        assert response.status_code == 200, response.text
+        assert captured["inputs"]["prompt"] == f"Reasoning Effort: {rendered}|hello world|"
