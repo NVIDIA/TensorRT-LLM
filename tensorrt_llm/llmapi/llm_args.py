@@ -815,6 +815,10 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
     LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
 
 
+# Public attention backends a multimodal encoder can select.
+EncoderAttentionBackend = Literal["VANILLA", "TRTLLM", "FLASHINFER"]
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -829,20 +833,19 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
-    encoder_attention_backend: dict[str, Literal[
-        "VANILLA", "TRTLLM", "FLASHINFER"]] | None = Field(
-            default=None,
-            description=
-            ("TensorRT-LLM attention backend for each logical multimodal encoder, "
-             "for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, "
-             "and FLASHINFER. Image and video share the vision encoder. Only encoders "
-             "using TensorRT-LLM Attention support this option; encoders using fixed "
-             "attention reject overrides at initialization. Omitted entries retain "
-             "their model-specific defaults and the language model's attn_backend "
-             "is unchanged. Unsupported encoders or backends raise an error."),
-            status="prototype",
-            telemetry=False,
-        )
+    encoder_attention_backend: dict[str, EncoderAttentionBackend] | None = Field(
+        default=None,
+        description=
+        ("TensorRT-LLM attention backend for each logical multimodal encoder, "
+         "for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, "
+         "and FLASHINFER. Image and video share the vision encoder. Only encoders "
+         "using TensorRT-LLM Attention support this option; encoders using fixed "
+         "attention reject overrides at initialization. Omitted entries retain "
+         "their model-specific defaults and the language model's attn_backend "
+         "is unchanged. Unsupported encoders or backends raise an error."),
+        status="prototype",
+        telemetry=False,
+    )
 
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,

@@ -240,9 +240,16 @@ def _validate_encoder_attention_backend_enabled(
     """Reject selections for encoders that the effective model config omits."""
     if mm_config is None or not mm_config.encoder_attention_backend:
         return
+    if disable_mm_encoder:
+        # Text-only runs, such as trtllm-bench without --modality, reuse
+        # serving configs. A skipped encoder never applies the selection, and
+        # models that ignore disable_mm_encoder still build it with the setting.
+        logger.info(
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True")
+        return
     for encoder in mm_config.encoder_attention_backend:
-        if disable_mm_encoder or getattr(pretrained_config, f"{encoder}_config",
-                                         None) is None:
+        if getattr(pretrained_config, f"{encoder}_config", None) is None:
             raise ValueError(
                 f"The {encoder} encoder is not enabled in the model config")
 

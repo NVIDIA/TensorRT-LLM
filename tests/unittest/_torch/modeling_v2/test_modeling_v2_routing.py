@@ -50,6 +50,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
     MTPDecodingConfig,
+    MultimodalConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
 )
@@ -1331,6 +1332,15 @@ def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
 def test_qwen4_exp_piecewise_prefill_cuda_graph_falls_back():
     config = _model_config(_qwen4_exp_config())
     _declined(config, dict(prefill_cuda_graph_backend="piecewise"), match="piecewise")
+
+
+@pytest.mark.usefixtures("_qwen4_exp_sm")
+def test_qwen4_exp_encoder_attention_backend_falls_back():
+    """The target's own vision tower would ignore it; the built-in model applies it."""
+    config = _model_config(_qwen4_exp_config())
+    selected = MultimodalConfig(encoder_attention_backend={"vision": "TRTLLM"})
+    _declined(config, dict(multimodal_config=selected), match="encoder_attention_backend")
+    _claimed(config, dict(multimodal_config=MultimodalConfig(encoder_attention_backend={})))
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")
