@@ -49,7 +49,8 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
-from .anti_alias_activation_cuda import install_fused_activations
+from .kernels.anti_alias_activation_cuda import install_fused_activations
+from .kernels.vae_swiglu_quack import fuse_vae_swiglu
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -79,7 +80,6 @@ from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, single_gpu_sm100
-from .vae_swiglu_quack import fuse_vae_swiglu
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
@@ -104,7 +104,7 @@ def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3, *, fused_kernels: boo
             module.to(torch.float16)
     if fused_kernels:
         # Imported here: it pulls in QuACK's CuTe epilogue frontend.
-        from .vae_qk_epilogue import install_vae_qk_epilogue
+        from .kernels.vae_qk_epilogue import install_vae_qk_epilogue
 
         install_vae_qk_epilogue(vae.decoder)
         fuse_vae_swiglu(vae.decoder)

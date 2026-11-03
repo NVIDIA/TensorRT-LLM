@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
     launch_minimax_h3_qk_norm_rope,
 )

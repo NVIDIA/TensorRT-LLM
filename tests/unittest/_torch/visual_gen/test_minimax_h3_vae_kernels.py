@@ -24,7 +24,7 @@ import torch.nn.functional as F
 vae_module = pytest.importorskip("diffusers.models.autoencoders.autoencoder_kl_minimax_h3")
 from diffusers.models.activations import SwiGLU  # noqa: E402
 
-import tensorrt_llm._torch.visual_gen.models.minimax_h3.vae_swiglu_quack as vae_swiglu  # noqa: E402
+import tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.vae_swiglu_quack as vae_swiglu  # noqa: E402
 from tensorrt_llm._utils import get_sm_version  # noqa: E402
 
 requires_sm100 = pytest.mark.skipif(
@@ -93,7 +93,7 @@ def _reference(attn, hidden_states, cos, sin):
 
 @requires_sm100
 def test_vae_qk_epilogue_matches_fp64_reference():
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.vae_qk_epilogue import (
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.vae_qk_epilogue import (
         prepare_vae_qk_epilogue,
         vae_qk,
     )
@@ -118,7 +118,7 @@ def test_vae_qk_epilogue_matches_fp64_reference():
 def test_decoder_attention_matches_stock_processor():
     """Each decoder attention with q/k from the epilogue GEMM against Diffusers' processor under the
     pipeline's fp16 autocast."""
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.vae_qk_epilogue import (
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.vae_qk_epilogue import (
         MiniMaxH3VideoQKEpilogueAttnProcessor,
         install_vae_qk_epilogue,
     )

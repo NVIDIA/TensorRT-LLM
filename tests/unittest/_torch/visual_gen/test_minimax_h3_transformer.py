@@ -33,7 +33,6 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
-from tensorrt_llm._torch.visual_gen.models.minimax_h3 import gated_mlp_quack
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
@@ -1397,13 +1396,13 @@ def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPat
     ).to("cuda")
     _initialize_weights(model, scale=0.1)
     calls: list[int] = []
-    op = gated_mlp_quack.gate_up_swiglu_quack_h3
+    op = h3.gate_up_swiglu_quack_h3
 
     def tracked(*args: object, **kwargs: object) -> torch.Tensor:
         calls.append(1)
         return op(*args, **kwargs)
 
-    monkeypatch.setattr(gated_mlp_quack, "gate_up_swiglu_quack_h3", tracked)
+    monkeypatch.setattr(h3, "gate_up_swiglu_quack_h3", tracked)
     hidden_states = torch.randn(7, 32, dtype=torch.bfloat16, device="cuda")
     with torch.inference_mode():
         for ff in _ff_modules(model):

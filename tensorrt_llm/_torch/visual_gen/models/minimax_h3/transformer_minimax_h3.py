@@ -37,7 +37,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
@@ -47,9 +47,9 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
-from .gated_mlp_quack import MiniMaxH3GatedMLP
-from .native_ops import load_ops
+from .kernels.fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .kernels.gated_mlp_quack import gate_up_swiglu_quack_h3
+from .kernels.native_ops import load_ops
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -170,7 +170,7 @@ class MiniMaxH3Attention(Attention):
             bias=False,
             # H3 rotates a leading split-half region and passes the tail through, which
             # the shared fused kernel does not implement; the flag drives H3's own kernel
-            # (fused_rope.py) through the override of forward() below.
+            # (kernels/fused_rope.py) through the override of forward() below.
             fuse_qk_norm_rope=True,
             interleave=False,
             config=model_config,
@@ -331,6 +331,15 @@ class MiniMaxH3Attention(Attention):
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
+
+
+class MiniMaxH3GatedMLP(GatedMLP):
+    """``GatedMLP`` whose fused BF16 gate/up GEMM + SwiGLU runs as ``gate_up_swiglu_quack_h3``."""
+
+    def _fused_gate_up_swiglu_bf16(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape
+        output = gate_up_swiglu_quack_h3(x.reshape(-1, input_shape[-1]), self.gate_up_proj.weight)
+        return output.reshape(*input_shape[:-1], output.shape[-1])
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -629,7 +638,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         self._cute_norm1 = self._fused_adaln and single_gpu_sm100(model_config)
         self._cuda_grnm = self._cute_norm1 and hidden_size == 5376
         if self._cute_norm1:
-            from . import norm_scale_shift_cute  # noqa: F401  (registers the op)
+            from .kernels import norm_scale_shift_cute  # noqa: F401  (registers the op)
         if self._cuda_grnm:
             load_ops()
 
@@ -1005,7 +1014,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         """
         if not single_gpu_sm100(self.model_config):
             return
-        from .qk_epilogue import QK_EPILOGUE_EPS, MiniMaxH3QKEpilogue
+        from .kernels.qk_epilogue import QK_EPILOGUE_EPS, MiniMaxH3QKEpilogue
 
         rotary_dim = 6 * self.rope.inv_freq.numel()
         device = torch.device("cuda", torch.cuda.current_device())

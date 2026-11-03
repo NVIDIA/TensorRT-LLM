@@ -18,7 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3 import gated_mlp_quack
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels import gated_mlp_quack
 from tensorrt_llm._utils import get_sm_version
 
 

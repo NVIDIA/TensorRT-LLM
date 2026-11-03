@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused anti-aliased SnakeBeta activation of the MiniMax-H3 BigVGAN audio decoder: Diffusers'
 ``MiniMaxH3AudioActivation1d`` (2x upsample, SnakeBeta, 2x downsample, 12-tap filters, replicate padding) in one
-kernel, ``torch.ops.vg_minimax_h3.anti_alias_snake_beta`` (``csrc/antiAliasActivation.cu``)."""
+kernel, ``torch.ops.vg_minimax_h3.anti_alias_snake_beta`` (``../csrc/antiAliasActivation.cu``)."""
 
 import torch
 from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (

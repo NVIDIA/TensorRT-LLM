@@ -39,7 +39,9 @@ ROTARY_DIM = 6 * ROPE_FREQ_DIM
 
 def _epilogue_class():
     """Imported inside the tests: the module builds QuACK's SM100 epilogue at import."""
-    from tensorrt_llm._torch.visual_gen.models.minimax_h3.qk_epilogue import MiniMaxH3QKEpilogue
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.qk_epilogue import (
+        MiniMaxH3QKEpilogue,
+    )
 
     return MiniMaxH3QKEpilogue
 

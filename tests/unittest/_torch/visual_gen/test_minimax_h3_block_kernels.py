@@ -17,12 +17,12 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_adaln import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_adaln import (
     h3_gate_res_norm_mod,
     h3_norm_mod,
 )
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.native_ops import load_ops
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.norm_scale_shift_cute import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.native_ops import load_ops
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.norm_scale_shift_cute import (
     rmsnorm_indexed_scale_shift_op,
 )
 from tensorrt_llm._utils import get_sm_version

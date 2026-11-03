@@ -20,7 +20,7 @@ from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # n
 )
 
 import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae as parallel_vae  # noqa: E402
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.anti_alias_activation_cuda import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.anti_alias_activation_cuda import (  # noqa: E402
     install_fused_activations,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae import (  # noqa: E402

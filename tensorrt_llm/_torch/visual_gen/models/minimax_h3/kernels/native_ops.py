@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-H3's native ops (``csrc/``, built into ``libth_visual_gen_minimax_h3.so``) and their fake kernels."""
+"""MiniMax-H3's native ops (``../csrc/``, built into ``libth_visual_gen_minimax_h3.so``) and their fake kernels."""
 
 import functools
 from typing import Any

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiniMax-H3 ``GatedMLP`` with its BF16 gate/up GEMM + SwiGLU epilogue at a fixed QuACK config.
+"""MiniMax-H3's BF16 gate/up GEMM + SwiGLU epilogue at a fixed QuACK config.
 
 ``GatedMLP``'s opt-in path runs QuACK's SM100 ``gemm_act`` at QuACK's default config; H3 runs it at
 ``gemm_act_config``: 256x256 tiles on a 2x1 cluster, the dynamic persistent scheduler and
@@ -22,8 +22,6 @@
 import functools
 
 import torch
-
-from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 
 
 @functools.cache
@@ -70,10 +68,3 @@ def gate_up_swiglu_quack_h3(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
 @gate_up_swiglu_quack_h3.register_fake
 def _(x, weight):
     return x.new_empty((x.shape[0], weight.shape[0] // 2))
-
-
-class MiniMaxH3GatedMLP(GatedMLP):
-    def _fused_gate_up_swiglu_bf16(self, x: torch.Tensor) -> torch.Tensor:
-        input_shape = x.shape
-        output = gate_up_swiglu_quack_h3(x.reshape(-1, input_shape[-1]), self.gate_up_proj.weight)
-        return output.reshape(*input_shape[:-1], output.shape[-1])
