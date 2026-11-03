@@ -265,14 +265,14 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
 # layer, so each row pairs the request with an environment and an algorithm that
 # make its family eligible. A single (algorithm, SM) shared by all four does not
 # exist: FP8 block scales is Cutlass on SM90 and DeepGemm / TRTLLM-Gen on SM100,
-# and CuteDSL only claims NVFP4.
+# and CuteDSL serves no FP8 block scales.
 @pytest.mark.parametrize(
     "backend,sm,quant_algo,expected_moe_cls",
     [
         ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaHopperFp8BlockScalesImpl"),
         ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TrtllmTrtllmGenFp8BlockScalesImpl"),
         ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaFp8BlockScalesImpl"),
-        ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),
+        ("CUTEDSL", 100, QuantAlgo.NVFP4, "TrtllmCutedslGroupedGemmNvfp4Impl"),
     ],
     ids=[
         "cutlass_sm90_fp8_block",

@@ -170,22 +170,12 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     # clamped SwiGlu constants the checkpoint carries (alpha 1.702, beta 1.0,
     # clamp limit 7.0). The default target at tp1 holds every expert whole; on
     # more ranks it holds an expert window (moe_ep) and an intermediate slice
-    # (moe_tp), which is what the cells after the first three cover. `intermediate` is
+    # (moe_tp), which is what its cells in this entry's test cover. `intermediate` is
     # the slice's real width and `intermediate_pad` the width every rank
     # declares (see the default target's weights.py).
-    _GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)
+    GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)
 
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="the gpt-oss target's own call: router entry point, all 128 experts local",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **_GPT_OSS,
-            ),
-        ),
         Cell(
             why="one token -- the decode row count, where the routing has a single row to place",
             spec=dict(
@@ -193,7 +183,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 routed_by_kernel=True,
                 local_expert_offset=0,
                 local_num_experts=128,
-                **_GPT_OSS,
+                **GPT_OSS,
             ),
         ),
         Cell(
@@ -203,77 +193,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 routed_by_kernel=False,
                 local_expert_offset=32,
                 local_num_experts=32,
-                **_GPT_OSS,
-            ),
-        ),
-        Cell(
-            why="default ep4: the kernel routes all 128 ids and runs this rank's window of 32",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=64,
-                local_num_experts=32,
-                **_GPT_OSS,
-            ),
-        ),
-        Cell(
-            why="default ep8: the kernel routes all 128 ids and runs this rank's window of 16",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=112,
-                local_num_experts=16,
-                **_GPT_OSS,
-            ),
-        ),
-        Cell(
-            why="default moe_tp2: 1440 intermediate columns padded to 1536",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **{**_GPT_OSS, "intermediate": 1440, "intermediate_pad": 1536},
-            ),
-        ),
-        Cell(
-            why="default moe_tp4, ranks 0-2: 768 intermediate columns, no padding",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **{**_GPT_OSS, "intermediate": 768, "intermediate_pad": 768},
-            ),
-        ),
-        Cell(
-            why="default moe_tp4, rank 3: 576 real columns inside a 768-wide operand",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **{**_GPT_OSS, "intermediate": 576, "intermediate_pad": 768},
-            ),
-        ),
-        Cell(
-            why="default moe_tp8, ranks 0-6: 384 intermediate columns, no padding",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **{**_GPT_OSS, "intermediate": 384, "intermediate_pad": 384},
-            ),
-        ),
-        Cell(
-            why="default moe_tp8, rank 7: 192 real columns inside a 384-wide operand",
-            spec=dict(
-                tokens=64,
-                routed_by_kernel=True,
-                local_expert_offset=0,
-                local_num_experts=128,
-                **{**_GPT_OSS, "intermediate": 192, "intermediate_pad": 384},
+                **GPT_OSS,
             ),
         ),
     )

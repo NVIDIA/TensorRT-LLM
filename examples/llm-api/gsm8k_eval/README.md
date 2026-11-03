@@ -141,16 +141,6 @@ nothing and contacts no server; its summary names the model those replies came f
 evaluator identifies a model only by its served name, so it cannot detect different weights
 served under an unchanged name.
 
-## The first-100 CI job
-
-`tests/integration/defs/accuracy/test_nvfp4_serving_gsm8k.py` is the QA/LR job for the Beam
-aggregated recipe (`examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml`) on four
-GB300 GPUs. It stages its inputs below `LLM_MODELS_ROOT`, renders the recipe, checks the
-hardware and runs this evaluator in managed mode with the first 100 questions, the recipe's
-`max_batch_size` as concurrency, the 45-minute test timeout as budget and the installed
-criterion of at least 95 correct answers (`gsm8k_first100/criterion.json`, bound to this
-manifest). Its results go to `<--output-dir>/nvfp4_serving_gsm8k_first100`.
-
 ## Comparability
 
 The prompt, request fields, scorer and manifest are those of the first-100 GSM8K job used

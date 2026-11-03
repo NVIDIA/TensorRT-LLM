@@ -10,7 +10,6 @@ checkpoint is included. Router projection and selection use FP32; packed NVFP4 e
 weights execute with the native GEMM path. Diagnostic host checks are opt-in through
 the shared ModelingV2 validation setting and must agree across ranks.
 
-This extraction includes production code only. The accompanying test suite is staged
-separately for review. Standard serving registration and documentation are separate
-integration changes. Speculative decoding, FP8 KV cache, disaggregated serving, CUDA
+This integration includes the StairCase implementation and tests, standard serving
+registration, and the public GSM8K evaluator. Speculative decoding, FP8 KV cache, disaggregated serving, CUDA
 graphs and overlap scheduling are not supported by this extracted target.

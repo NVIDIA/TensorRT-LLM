@@ -34,7 +34,12 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -46,12 +51,12 @@ class _StubModel(MultimodalModelMixin):
         self._tokens_per_image = tokens_per_image
         self.encoder_call_count = 0
         self.encoder_call_stream_id = None
-        self.encoder_mm_item_order = None
+        self.encoder_item_metadata = None
 
     def encode_multimodal_inputs(self, multimodal_params, **kwargs) -> torch.Tensor:
         self.encoder_call_count += 1
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
-        self.encoder_mm_item_order = multimodal_params[0].mm_item_order
+        self.encoder_item_metadata = multimodal_params[0].item_metadata
         pv = multimodal_params[0].multimodal_data["image"]["pixel_values"]
         assert pv.device.type == "cuda", (
             "pixel_values should be on CUDA after to_device in the helper."
@@ -90,15 +95,7 @@ class _CacheStubModel(_StubModel):
         self.encoder_call_count += 1
         self.last_encoder_batch_size = len(multimodal_params)
         self.encoder_call_stream_id = torch.cuda.current_stream().cuda_stream
-        total_rows = sum(
-            sum(
-                param.multimodal_data.get(
-                    "multimodal_embedding_lengths",
-                    [self._tokens_per_image],
-                )
-            )
-            for param in multimodal_params
-        )
+        total_rows = sum(sum(param.get_item_layout()[1]) for param in multimodal_params)
         return torch.full(
             (total_rows, self._hidden_size),
             float(self.encoder_call_count),
@@ -120,6 +117,9 @@ def _make_request(request_id: int, num_tokens: int) -> LlmRequest:
                 "pixel_values": pixel_values,
             },
             "multimodal_embed_mask_cumsum": cumsum,
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0)], output_embedding_lengths=[num_tokens]
+            ),
         },
     )
 
@@ -141,7 +141,9 @@ def _make_cacheable_request(
         py_multimodal_data={
             "image": {"pixel_values": torch.randn(3, 32, 32)},
             "multimodal_embed_mask_cumsum": torch.arange(1, num_tokens + 1, dtype=torch.int64),
-            "multimodal_embedding_lengths": [num_tokens],
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0)], output_embedding_lengths=[num_tokens]
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_hashes=[item_hash],
@@ -169,7 +171,10 @@ def _make_two_item_cacheable_request(
                 "image_sizes": [[32, 32]] * len(item_hashes),
             },
             "multimodal_embed_mask_cumsum": torch.arange(1, num_tokens + 1, dtype=torch.int64),
-            "multimodal_embedding_lengths": [tokens_per_item] * len(item_hashes),
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", i) for i in range(len([tokens_per_item] * len(item_hashes)))],
+                output_embedding_lengths=[tokens_per_item] * len(item_hashes),
+            ),
             "mm_processor_kwargs_hash": "kwargs-a",
         },
         multimodal_hashes=item_hashes,
@@ -337,18 +342,14 @@ def test_cross_iter_prefetch_materializes_on_side_stream(monkeypatch):
 
     model = _StubModel(hidden_size=8, tokens_per_image=4)
     req = _make_request(request_id=0, num_tokens=4)
-    expected_item_order = [
-        {"modality": "image", "index": 0},
-        {"modality": "video", "index": 0},
-    ]
-    req.py_mm_item_order = expected_item_order
+    expected_item_metadata = req.py_multimodal_params.item_metadata
 
     n = maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=max_prefetch_ahead)
 
     assert n == 1
     assert model.encoder_call_count == 1
     assert model.encoder_call_stream_id == aux_stream.cuda_stream
-    assert model.encoder_mm_item_order == expected_item_order
+    assert model.encoder_item_metadata is expected_item_metadata
     embedding = req.py_multimodal_data.get("multimodal_embedding")
     assert isinstance(embedding, torch.Tensor)
     assert embedding.shape == (4, 8)

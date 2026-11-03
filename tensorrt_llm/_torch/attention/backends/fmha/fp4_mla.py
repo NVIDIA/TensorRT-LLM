@@ -112,10 +112,16 @@ class Fp4MlaFmha(PhasedFmha):
         state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
-        if state.v_scale_pool is None:
-            raise RuntimeError("FP4 MLA requires the V-scale pool.")
-
         attention_input_type = forward_args.attention_input_type
+        context_only_cache = (
+            getattr(metadata.kv_cache_manager, "fp4_mla_context_only_cache", False) is True
+        )
+        if state.v_scale_pool is None and not (
+            context_only_cache and attention_input_type == AttentionInputType.context_only
+        ):
+            # Only a disaggregated context worker omits the V scales, and it
+            # runs context attention only.
+            raise RuntimeError("FP4 MLA requires the V-scale pool.")
         if attention_input_type == AttentionInputType.context_only:
             if k is None or v is None:
                 raise RuntimeError("FP4 MLA context requires expanded K and V tensors.")

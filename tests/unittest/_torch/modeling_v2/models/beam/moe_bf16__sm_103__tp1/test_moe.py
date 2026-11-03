@@ -43,7 +43,12 @@ from pathlib import Path
 import pytest
 import torch
 
-import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+try:
+    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+except ModuleNotFoundError as exc:
+    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
+        raise
+    builtin_beam = None  # The standard-serving implementation is a separate PR.
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
     swiglu_fp32,
 )
@@ -384,6 +389,8 @@ def loggable(calls: list[dict]) -> list[dict]:
 
 def builtin_beam_forbidden():
     """The built-in Beam modeling must not run while the component does."""
+    if builtin_beam is None:
+        return support.builtin_forbidden([])
     return support.builtin_forbidden(
         [
             (builtin_beam.BeamMoE, "forward"),
@@ -414,15 +421,16 @@ def test_moe_constructs_alone() -> None:
         raise AssertionError(f"{type(self).__name__} constructed")
 
     with pytest.MonkeyPatch.context() as mp:
-        for cls in (
-            builtin_beam.BeamForCausalLM,
-            builtin_beam.BeamModel,
-            builtin_beam.BeamDecoderLayer,
-            builtin_beam.BeamMoE,
-            builtin_beam.BeamRouter,
-            builtin_beam.BeamSwiGLU,
-        ):
-            mp.setattr(cls, "__init__", refuse)
+        if builtin_beam is not None:
+            for cls in (
+                builtin_beam.BeamForCausalLM,
+                builtin_beam.BeamModel,
+                builtin_beam.BeamDecoderLayer,
+                builtin_beam.BeamMoE,
+                builtin_beam.BeamRouter,
+                builtin_beam.BeamSwiGLU,
+            ):
+                mp.setattr(cls, "__init__", refuse)
         moe = BeamMoeBf16Sm103Tp1(moe_config(), LAYER_IDX, device="cuda")
     assert isinstance(moe.gate, BeamMoeRouterBf16Sm103Tp1)
     assert len(moe.experts) == 256

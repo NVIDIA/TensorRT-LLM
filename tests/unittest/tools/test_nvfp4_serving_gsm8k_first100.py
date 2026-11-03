@@ -12,14 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests of the public GSM8K evaluator and its first-100 CI qualification job.
+"""CPU tests of the public GSM8K protocol and durable result records.
 
-They cover the public protocol (frozen manifest, prompt, request fields, scorer, count
-selection and the pinned test-split inventory), the durable results and their resume rules,
-the verdict and the CI regression criterion on synthetic boundary cases, the test-db context and
-its TIMEOUT conversion, the explicit trigger (an untriggered run reads no input and starts no
-server), existing-endpoint and managed-server runs against fakes, the lifecycle of owned server
-processes, the command line and the client's import isolation. No GPU, checkpoint, dataset
+Cover prompt construction, request fields, scoring, question selection, the pinned split
+inventory, reply classification, and ledger resume rules. No GPU, checkpoint, dataset
 download or model server is used.
 """
 
@@ -523,3 +519,23 @@ def test_ledger_moves_an_interrupted_last_line_aside(tmp_path):
         f.write("{corrupt\n" + json.dumps(_record(problems[1])) + "\n")
     with pytest.raises(records.LedgerError, match="unreadable"):
         _ledger(path, problems).load()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        1,
+        "text",
+        {"choices": [None]},
+        {"choices": [{"message": []}]},
+        {"choices": [{"message": "text"}]},
+        {"choices": [{"message": None}]},
+    ],
+)
+def test_non_object_reply_is_recorded_as_error(payload):
+    status, error, fields = records.interpret_reply(200, json.dumps(payload))
+    assert status == records.ERROR
+    assert error.startswith("malformed reply:")
+    assert fields == {"http_status": 200}

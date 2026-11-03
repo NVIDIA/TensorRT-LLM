@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from ..._router_index import NoTarget
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -26,6 +26,11 @@ def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
     The target runs at most ``model.MAX_NUM_TOKENS`` tokens per call (the attention op's
     measured step size), so ``max_num_tokens`` must lie in ``[1, MAX_NUM_TOKENS]``.
     """
+    if llm_args is not None:
+        if getattr(llm_args, "cuda_graph_config", None) is not None:
+            return "CUDA graphs are not supported by this eager Beam target"
+        if not getattr(llm_args, "disable_overlap_scheduler", True):
+            return "the overlap scheduler is not supported by this eager Beam target"
     if llm_args is None or getattr(llm_args, "max_num_tokens", None) is None:
         return None
     from .full_model_nvfp4__sm_103__tp4.model import MAX_NUM_TOKENS
@@ -35,14 +40,9 @@ def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
     return None
 
 
+@routes("BeamForCausalLM")
 def route(
-    pretrained_config: Any,
-    mapping: Any,
-    compute_capability: Tuple[int, int],
-    spec_config: Optional[Any],
-    kv_cache_quant_algo: Optional[Any],
-    model_config: Optional[ModelConfig] = None,
-    llm_args: Optional[TorchLlmArgs] = None,
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
@@ -52,6 +52,10 @@ def route(
     overrides. No additional engine choice in ``model_config`` or ``llm_args`` selects a
     different target.
     """
+    pretrained_config = model_config.pretrained_config
+    mapping = model_config.mapping
+    spec_config = model_config.spec_config
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     shape = (
         pretrained_config.num_hidden_layers,
         pretrained_config.hidden_size,
@@ -65,7 +69,11 @@ def route(
         mapping.moe_ep_size,
         bool(mapping.enable_attention_dp),
     )
+    refusal = engine_refusal(llm_args)
     quant_algo = _quant_algo(pretrained_config)
+    if quant_algo is None:
+        algo = getattr(model_config.quant_config, "quant_algo", None)
+        quant_algo = getattr(algo, "value", algo)
     if (
         compute_capability == (10, 3)
         and shape == (52, 5120, 256)
@@ -73,7 +81,7 @@ def route(
         and quant_algo == "NVFP4"
         and spec_config is None
         and kv_cache_quant_algo is None
-        and engine_refusal(llm_args) is None
+        and refusal is None
     ):
         from .full_model_nvfp4__sm_103__tp4.layout import check_checkpoint, checkpoint_dir_of
 
@@ -89,7 +97,7 @@ def route(
         f"compute capability {compute_capability}, config shape {shape}, quantization "
         f"{quant_algo}, layout (world, tp, pp, moe_tp, moe_ep, attention_dp) {layout}, "
         f"speculative decoding {type(spec_config).__name__ if spec_config is not None else 'off'}; "
-        f"KV cache {kv_cache_quant_algo or 'bf16'}; "
+        f"KV cache {kv_cache_quant_algo or 'bf16'}; engine: {refusal or 'supported'}; "
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
         "TP4/EP1, PP1, with BF16 KV cache and without attention DP or speculative decoding"
     )

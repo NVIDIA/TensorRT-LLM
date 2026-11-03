@@ -7,6 +7,7 @@ from .beam.checkpoint_loader import (BEAM_NVFP4_CHECKPOINT_FORMAT,
 from .hf.afmoe_weight_mapper import AfmoeHfWeightMapper
 from .hf.checkpoint_loader import HfCheckpointLoader
 from .hf.config_loader import HfConfigLoader
+from .hf.cosmos3_edge_weight_mapper import Cosmos3EdgeHfWeightMapper
 from .hf.cosmos3_weight_mapper import Cosmos3HfWeightMapper
 from .hf.gemma3_weight_mapper import Gemma3HfWeightMapper
 from .hf.gemma4_weight_mapper import Gemma4HfWeightMapper
@@ -43,6 +44,7 @@ __all__ = [
     "Gemma4HfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
     "MXCheckpointLoader", "Qwen3VLHfWeightMapper", "Cosmos3HfWeightMapper",
-    "Qwen4ExpHfWeightMapper", "Glm5NextHfWeightMapper",
-    "BEAM_NVFP4_CHECKPOINT_FORMAT", "beam_nvfp4_checkpoint_loader"
+    "Cosmos3EdgeHfWeightMapper", "Qwen4ExpHfWeightMapper",
+    "Glm5NextHfWeightMapper", "BEAM_NVFP4_CHECKPOINT_FORMAT",
+    "beam_nvfp4_checkpoint_loader"
 ]

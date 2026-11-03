@@ -87,10 +87,6 @@ public:
     // Prevent the page from being dropped (returns/creates a PageHolder).
     SharedPtr<PageHolder> hold();
 
-    //! Return the lock destination for read-only use, preserving pages already at the hot GPU level.
-    //! Cold sparse pages use host memory; callers must force writable pages to GPU.
-    [[nodiscard]] CacheLevel queryLockLevel() const;
-
     // Acquire a shared lock at the current level. The caller handles any migration.
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
     SharedPageLock lock(
@@ -198,17 +194,6 @@ public:
     WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
 };
 
-//! Identifies one live SharedPageLock independently of the lock object's address.
-struct LockOwner
-{
-    KvCache* kvCache;
-    BeamIndex beamIndex;
-    BlockOrdinal ordinal;
-    LifeCycleId lifeCycle;
-
-    bool operator==(LockOwner const&) const = default;
-};
-
 // ---------------------------------------------------------------------------
 // UniqPageLock — locks a page to prevent eviction (LOCKED status).
 // Owns finish events from all SharedPageLocks it issued.
@@ -232,31 +217,19 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
-    //! Validate complete sparse history for every owner and prepare non-allocating completion updates.
-    void prepareSparseOffload(KvCache const& requestingCache);
-
-    //! Validate a locked host page and prepare non-allocating completion updates for shared promotion.
-    void prepareSparsePromotion();
-
-    //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
-    void recordMigrationEvent(CachedCudaEvent const& event);
-
-    //! Publish a GPU/host handoff to every owner and return the fenced source slot. Caller holds the API lock.
-    [[nodiscard]] Slot moveToCacheLevel(CacheLevel destination, Slot&& slot);
-
-    std::vector<LockOwner> const& owners() const noexcept
-    {
-        return mOwners;
-    }
-
     SharedPtr<PageHolder> holder;
     std::vector<CachedCudaEvent> finishEvents;
+};
 
-private:
-    friend class SharedPageLock;
-    void removeOwner(LockOwner const& owner);
-
-    std::vector<LockOwner> mOwners;
+// ---------------------------------------------------------------------------
+// LockOwner — identifies who holds a SharedPageLock.
+// ---------------------------------------------------------------------------
+struct LockOwner
+{
+    KvCache* kvCache;
+    BeamIndex beamIndex;
+    BlockOrdinal ordinal;
+    LifeCycleId lifeCycle;
 };
 
 // ---------------------------------------------------------------------------
@@ -297,7 +270,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BatchedLockTarget — page, owner, and intended storage level for a lock.
+// BatchedLockTarget — one page to lock, named by beam, ordinal and life cycle.
 // ---------------------------------------------------------------------------
 struct BatchedLockTarget
 {
@@ -305,7 +278,6 @@ struct BatchedLockTarget
     BeamIndex beamIndex;
     BlockOrdinal ordinal;
     LifeCycleId lifeCycle;
-    CacheLevel cacheLevel = kHotLevel;
 };
 
 // ---------------------------------------------------------------------------
@@ -318,7 +290,7 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
 // ---------------------------------------------------------------------------
 // ScratchSlotLock — manages a scratch slot for SWA prefill memory reuse.
 // Wraps a Slot with owner (KvCache) and lifecycle references.
-// GPU-only: on destruction, releases the slot back to the GPU storage pool.
+// On destruction, releases the slot back to the hot storage pool.
 // Mirrors _page.py::ScratchSlotLock.
 // ---------------------------------------------------------------------------
 class ScratchSlotLock

@@ -688,6 +688,8 @@ private:
     std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelAutotuned(
         FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
     {
+        configurePaddedMlaTile(options, optionsFromArgs);
+
         // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103
         // changed autotuner choices without fixing a known failure mode on those GPUs.
         if (mSM != kSM_107)
@@ -712,6 +714,57 @@ private:
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
         limitCgaSmemReductionCtasKv(options);
         return {options, optionsFromArgs, ctaDim};
+    }
+
+    static void configurePaddedMlaTile(FmhaOptions& options, FmhaOptionsFromArgs& optionsFromArgs)
+    {
+        if (!options.mIsMlaGen || options.mSelectsGroupedMla || tg::isArchHopper(options.mCudaArch)
+            || options.mHeadDimV != 512 || (options.mHeadDimQk != 576 && options.mHeadDimQk != 512))
+        {
+            return;
+        }
+        int const numHeads = options.mNumHeadsQPerKv;
+        TLLM_CHECK_WITH_INFO(numHeads > 0, "The MLA Q heads per KV head must be positive.");
+        // Power-of-two groups of at least eight heads already have legal Q tiles.
+        if (numHeads >= 64 || (numHeads >= 8 && (numHeads & (numHeads - 1)) == 0))
+        {
+            return;
+        }
+        bool const isSparse = isTokenSparse(options.mSparseType);
+        // These selections already contain the whole head group in a legal Q8/Q16/Q64 tile.
+        if ((!isSparse && numHeads <= 16) || (isSparse && numHeads > 32))
+        {
+            return;
+        }
+        // The tree-mask path has its own grouping constraints and keeps its existing selection.
+        if (options.mIsCustomSpecDecodingGen && numHeads > 32)
+        {
+            return;
+        }
+
+        int paddedTileSizeQ = 8;
+        while (paddedTileSizeQ < numHeads)
+        {
+            paddedTileSizeQ *= 2;
+        }
+        bool const useSwapsMmaAb = paddedTileSizeQ <= 32;
+        options.mFmhaKernelType
+            = useSwapsMmaAb ? FmhaKernelType::SwapsMmaAbForGeneration : FmhaKernelType::KeepsMmaAbForGeneration;
+        options.mTileSizeQ = paddedTileSizeQ;
+        options.mTileSizeKv = 128;
+        options.mClusterDimX = 1;
+        options.mHeadDimPerCtaV = options.mHeadDimV;
+        options.mGroupsHeadsQ = true;
+        options.mSingleTokenQPerCta = true;
+        if (!isDisabled(options.mMultiCtasKvMode))
+        {
+            options.mMultiCtasKvMode
+                = useSwapsMmaAb ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::GmemReductionWithSeparateKernel;
+        }
+        // Supply the complete tile selection before CTA geometry is computed. The manual path
+        // still derives staging, MMA, softmax and launch parameters from the real head counts.
+        options.mEnablesAutoTuner = false;
+        optionsFromArgs.mIsTileSizeQSet = true;
     }
 
     void limitCgaSmemReductionCtasKv(FmhaOptions& options) const

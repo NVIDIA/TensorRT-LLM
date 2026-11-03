@@ -70,10 +70,16 @@ def interpret_reply(
         return ERROR, f"HTTP {http_status}: {text[:2000]}", fields
     try:
         payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("reply must be an object")
         choices = payload["choices"]
         if not isinstance(choices, list) or len(choices) != 1:
             raise ValueError(f"expected one choice, got {choices!r:.200}")
+        if not isinstance(choices[0], dict):
+            raise ValueError("choice must be an object")
         message = choices[0]["message"]
+        if not isinstance(message, dict):
+            raise ValueError("message must be an object")
         content = message.get("content")
         reasoning = message.get("reasoning_content")
         if reasoning is None:

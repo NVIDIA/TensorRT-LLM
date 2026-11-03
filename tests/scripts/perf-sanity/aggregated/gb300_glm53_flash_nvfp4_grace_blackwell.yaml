@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5.3-Flash NVFP4 (nvidia/GLM-5.3-Flash-NVFP4: NVFP4 routed experts and
+# dense layers; attention and the MTP layer stay unquantized) on one 4xGB300
+# tray, TP4 / EP4, MTP3, at concurrency 16 and then 1. Same engine settings as
+# the FP8 tp4_mtp3 case in gb300_glm53_flash_fp8_grace_blackwell.yaml, except:
+#   kv_cache_config.dtype  fp8, which the checkpoint's kv_cache_quant_algo
+#                          selects anyway; written out so the perf DB records it.
+#   moe_config.backend     TRTLLM. `AUTO` resolves this checkpoint to CUTLASS;
+#                          TRTLLM-Gen is the faster NVFP4 MoE on Blackwell.
+# The accepted draft length is pinned to 2.384 of 3, as in the FP8 case.
+#
+# glm53_flash_nvfp4_tp4_mtp3_isl13312_osl33 is the workload of the NVFP4
+# checkpoint's published TensorRT-LLM numbers (PR #20454: ISL 13312 / OSL 33,
+# MTP3, TP4 / EP4, max_num_tokens 16384, TRTLLM MoE,
+# TRTLLM_LOW_M_GEMM_BACKEND=auto, concurrency 8 and 1), with the engine shape
+# of the FP8 isl13312_osl33 case.
+metadata:
+  model_name: glm_5.3_flash_nvfp4
+  supported_gpus:
+  - GB300
+hardware:
+  gpus_per_node: 4
+server_configs:
+- name: glm53_flash_nvfp4_tp4_mtp3_8k1k
+  model_name: glm_5.3_flash_nvfp4
+  server_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.384
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  pipeline_parallel_size: 1
+  max_batch_size: 32
+  max_num_tokens: 8192
+  max_seq_len: 9344
+  trust_remote_code: true
+  enable_attention_dp: false
+  enable_chunked_prefill: true
+  disable_overlap_scheduler: false
+  disable_mm_encoder: true
+  print_iter_log: true
+  enable_iter_perf_stats: true
+  stream_interval: 20
+  num_postprocess_workers: 4
+  scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 12, 16, 20, 24, 28, 32]
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.6
+    dtype: fp8
+    tokens_per_block: 128
+  moe_config:
+    backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 3
+  # con16 runs first, so the slow first requests of a fresh server (aggregated
+  # clients send no warmup request) fall in its longer window, not in con1's.
+  client_configs:
+  - name: con16_iter5_8k1k
+    concurrency: 16
+    iterations: 5
+    isl: 8192
+    osl: 1024
+    backend: openai
+  - name: con1_iter10_8k1k
+    concurrency: 1
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    backend: openai
+- name: glm53_flash_nvfp4_tp4_mtp3_isl13312_osl33
+  model_name: glm_5.3_flash_nvfp4
+  server_env_var: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.384
+    TRTLLM_LOW_M_GEMM_BACKEND=auto
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  pipeline_parallel_size: 1
+  max_batch_size: 16
+  max_num_tokens: 16384
+  max_seq_len: 16384
+  trust_remote_code: true
+  enable_attention_dp: false
+  enable_chunked_prefill: true
+  disable_overlap_scheduler: false
+  disable_mm_encoder: true
+  print_iter_log: true
+  enable_iter_perf_stats: true
+  stream_interval: 20
+  num_postprocess_workers: 4
+  scheduler_config:
+    capacity_scheduler_policy: MAX_UTILIZATION
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 16]
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.6
+    dtype: fp8
+    tokens_per_block: 128
+  moe_config:
+    backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 3
+  # con8 runs first, so the slow first requests of a fresh server fall in its
+  # longer window, not in con1's.
+  client_configs:
+  - name: con8_iter20_isl13312_osl33
+    concurrency: 8
+    iterations: 20
+    isl: 13312
+    osl: 33
+    backend: openai
+  - name: con1_iter10_isl13312_osl33
+    concurrency: 1
+    iterations: 10
+    isl: 13312
+    osl: 33
+    backend: openai
