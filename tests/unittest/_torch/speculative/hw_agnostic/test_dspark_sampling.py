@@ -573,9 +573,14 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
 
 
 @_needs_cuda
+@pytest.mark.parametrize(
+    "mode", [AdvancedSamplingMode.FULL, AdvancedSamplingMode.NO_TOPK], ids=["fused", "flashinfer"]
+)
 @pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
-def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
-    """The seeded sampler draws the emitted token from the normalized residual.
+def test_block_verify_emitted_token_follows_the_residual(
+    case: str, mode: AdvancedSamplingMode
+) -> None:
+    """The seeded sampler of either backend draws the emitted token from the normalized residual.
 
     Each case pins the accepted length regardless of the uniforms, so thousands
     of rows that differ only in their RNG offset sample one known distribution:
@@ -585,7 +590,7 @@ def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
     generator = torch.Generator().manual_seed(51)
     vocab, rows = 64, 20_000
     worker = _worker()
-    meta = _metadata(rows, vocab=vocab, mode=AdvancedSamplingMode.FULL, device="cuda")
+    meta = _metadata(rows, vocab=vocab, mode=mode, device="cuda")
     target = torch.softmax(torch.randn(1, K + 1, vocab, generator=generator), -1)
     if case == "all_rejected":
         target[:, :, 0] = 0.0
