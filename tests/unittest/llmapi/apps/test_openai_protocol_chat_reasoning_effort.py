@@ -15,8 +15,9 @@
 """ChatCompletionRequest accepts every OpenAI reasoning effort, and harmony maps each one.
 
 OpenAI's reasoning efforts are none, minimal, low, medium, high, xhigh and max. Harmony
-(gpt-oss) has three levels, so "minimal" takes its lowest and "xhigh" its highest, on the
-chat completions and the responses routes alike.
+(gpt-oss) has three levels, so "minimal" takes its lowest and "xhigh" and "max" its highest,
+and "none" takes the harmony adapter's default level, on the chat completions and the
+responses routes alike.
 """
 
 import typing
@@ -29,9 +30,9 @@ from openai_harmony import ReasoningEffort, Role
 from pydantic import ValidationError
 
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
-from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
+from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter, maybe_transform_reasoning_effort
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
-from tensorrt_llm.serve.responses_utils import _construct_harmony_messages
+from tensorrt_llm.serve.responses_utils import _construct_harmony_messages, _render_for_completion
 
 from .openai_server_stub import make_stub_openai_server
 
@@ -180,15 +181,51 @@ def test_harmony_chat_prompt_gets_the_mapped_level(effort, level):
     assert adapter.reasoning_effort is level
 
 
-@pytest.mark.parametrize(
-    "effort, level", [("minimal", ReasoningEffort.LOW), ("xhigh", ReasoningEffort.HIGH)]
-)
-def test_responses_harmony_system_message_gets_the_mapped_level(effort, level):
-    request = ResponsesRequest.model_validate(
+def _responses_request(effort) -> ResponsesRequest:
+    return ResponsesRequest.model_validate(
         {"model": "m", "input": "hi", "reasoning": {"effort": effort}}
     )
 
-    system_message = _construct_harmony_messages(request, prev_response=None)[0]
 
+def _responses_system_effort(effort) -> ReasoningEffort | None:
+    system_message = _construct_harmony_messages(_responses_request(effort), prev_response=None)[0]
     assert system_message.author.role == Role.SYSTEM
-    assert system_message.content[0].reasoning_effort is level
+    return system_message.content[0].reasoning_effort
+
+
+@pytest.mark.parametrize(
+    "effort, level",
+    [
+        ("minimal", ReasoningEffort.LOW),
+        ("xhigh", ReasoningEffort.HIGH),
+        ("max", ReasoningEffort.HIGH),
+    ],
+)
+def test_responses_harmony_system_message_gets_the_mapped_level(effort, level):
+    assert _responses_system_effort(effort) is level
+
+
+def test_responses_none_effort_takes_the_harmony_adapter_default(harmony_vocab):
+    assert _responses_system_effort("none") is get_harmony_adapter().default_reasoning_effort
+
+
+def _reasoning_lines(token_ids: list[int]) -> list[str]:
+    prompt = get_harmony_adapter().encoding.decode(token_ids)
+    return [line for line in prompt.split("\n") if line.startswith("Reasoning:")]
+
+
+@pytest.mark.parametrize("effort", OPENAI_EFFORTS)
+def test_chat_and_responses_give_harmony_the_same_effort(harmony_vocab, effort):
+    chat_lines = _reasoning_lines(
+        tokenize_harmony_chat_request(
+            _request(reasoning_effort=effort), harmony_adapter=get_harmony_adapter()
+        )
+    )
+    responses_lines = _reasoning_lines(
+        _render_for_completion(
+            _construct_harmony_messages(_responses_request(effort), prev_response=None)
+        )
+    )
+
+    assert len(chat_lines) == 1, chat_lines
+    assert responses_lines == chat_lines
