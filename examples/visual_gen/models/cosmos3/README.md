@@ -281,6 +281,8 @@ every mode. `extra_params.sigma_grid` selects a grid explicitly for base
 | `"diffusers"` | The Diffusers UniPC shifted-linear flow grid | Used; mode default when omitted |
 
 Selecting a linear grid does not change the shift: pass `flow_shift` with it.
+A `flow_shift` so extreme that the grid's sigmas are not finite, strictly
+decreasing and below 1 is rejected with an error before denoising starts.
 To sample the way the Cosmos framework does, request its grid and shift
 explicitly; the examples below select that schedule, they do not change any
 default:

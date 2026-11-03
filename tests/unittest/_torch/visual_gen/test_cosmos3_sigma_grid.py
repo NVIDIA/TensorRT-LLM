@@ -731,6 +731,59 @@ class TestRepeatedLeadingTimesteps:
         assert torch.equal(_trajectory(scheduler), first)
 
 
+class TestUnusableSigmas:
+    """A shift whose programmed sigmas UniPC cannot step through is rejected when the
+    scheduler is programmed, before the first step; usable extreme shifts still run."""
+
+    @pytest.mark.parametrize(
+        ("native_flow_schedule", "sigma_grid", "mode_karras", "flow_shift", "steps"),
+        [
+            # Leading levels [1 - 1e-6, 1.0, ...]: the second level rounds to 1.
+            (False, "diffusers", None, 1e6, 35),
+            # The shift cancels catastrophically and the first level exceeds 1.
+            (False, "diffusers", None, 1e-12, 35),
+            # The second level rises and the third returns to the first level's value.
+            (False, "diffusers", None, 1e6, 4),
+            # The second level rises above the first.
+            (False, "diffusers", None, 1e5, 35),
+            # Grids sampled without a selection: V2V's flow grid and Edge's native flow grid.
+            (False, None, False, 1e6, 35),
+            (True, None, None, 1e6, 35),
+        ],
+    )
+    def test_extreme_shift_is_rejected(
+        self, native_flow_schedule, sigma_grid, mode_karras, flow_shift, steps
+    ):
+        policy, base = _policy(native_flow_schedule=native_flow_schedule)
+        schedule = _resolve(
+            policy, sigma_grid=sigma_grid, flow_shift=flow_shift, mode_karras=mode_karras
+        )
+        scheduler = policy.set_flow_shift(
+            base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
+        )
+        with pytest.raises(ValueError, match="cannot step through"):
+            policy.set_timesteps(scheduler, steps, device="cpu", schedule=schedule)
+
+    @pytest.mark.parametrize(
+        ("sigma_grid", "flow_shift"),
+        [("diffusers", 1e-9), ("diffusers", 1e3), ("native", 1e-9), ("native", 300.0)],
+    )
+    def test_usable_extreme_shift_runs(self, sigma_grid, flow_shift):
+        policy, base = _policy()
+        schedule = _resolve(policy, sigma_grid=sigma_grid, flow_shift=flow_shift)
+        assert torch.isfinite(_trajectory(_programmed(policy, base, schedule, 35))).all()
+
+    def test_non_flow_sigmas_may_exceed_one(self):
+        base = UniPCMultistepScheduler.from_config(
+            {**BASE_UNIPC_CONFIG, "use_flow_sigmas": False, "use_karras_sigmas": False}
+        )
+        policy = Cosmos3SamplingPolicy.from_scheduler(base)
+        schedule = _resolve(policy)
+        assert schedule.grid == "scheduler_config"
+        scheduler = _programmed(policy, base, schedule, 35)
+        assert scheduler.sigmas[0] > 1.0
+
+
 def _bare_pipeline(policy, base) -> Cosmos3OmniMoTPipeline:
     pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
     pipeline.sampling = policy
