@@ -933,3 +933,40 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
     )
     for r in results:
         assert r is True
+
+
+@torch.inference_mode()
+def run_nccl_symmetric_unregistered_input(tensor_parallel_size: int,
+                                          num_tokens: int, hidden_size: int,
+                                          num_calls: int) -> bool:
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.NCCL_SYMMETRIC).cuda()
+    for call in range(num_calls):
+        gen = torch.Generator(device="cuda").manual_seed(call)
+        shards = torch.randn((tensor_parallel_size, num_tokens, hidden_size),
+                             generator=gen,
+                             device="cuda").to(torch.bfloat16)
+        # A plain allocation: below the registration threshold it stays outside the NCCL window.
+        out = allreduce(shards[rank].clone())
+        ref = shards.float().sum(dim=0)
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=0.125)
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="Requires at least 4 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
+def test_nccl_symmetric_unregistered_small_input(mpi_pool_executor):
+    """NCCL_SYMMETRIC on a small input outside the NCCL window returns the plain sum on every call."""
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_nccl_symmetric_unregistered_input,
+        *zip(*[(tensor_parallel_size, 7, 4096, 300)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True

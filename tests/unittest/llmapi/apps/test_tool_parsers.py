@@ -4801,6 +4801,38 @@ class TestMiniMaxM2ToolParser:
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
 
+    @pytest.mark.parametrize("chunk_size", [1, 4, 9])
+    def test_parse_streaming_increment_small_chunks(self, sample_tools,
+                                                    chunk_size):
+        """Test that small streamed chunks yield the same calls as one-shot parsing."""
+        text = ('<minimax:tool_call>\n'
+                '<invoke name="get_weather">\n'
+                '<parameter name="location">NYC</parameter>\n'
+                '<parameter name="unit">celsius</parameter>\n'
+                '</invoke>\n'
+                '<invoke name="search_web">\n'
+                '<parameter name="query">news</parameter>\n'
+                '</invoke>\n'
+                '</minimax:tool_call>')
+        parser = MiniMaxM2ToolParser()
+        names = {}
+        arguments = {}
+        for i in range(0, len(text), chunk_size):
+            result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                      sample_tools)
+            for call in result.calls:
+                if call.name:
+                    names.setdefault(call.tool_index, []).append(call.name)
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+
+        assert names == {0: ["get_weather"], 1: ["search_web"]}
+        assert json.loads(arguments[0]) == {
+            "location": "NYC",
+            "unit": "celsius"
+        }
+        assert json.loads(arguments[1]) == {"query": "news"}
+
     def test_supports_structural_tag(self, parser):
         """Test that supports_structural_tag returns False."""
         assert parser.supports_structural_tag() is False
@@ -4853,6 +4885,26 @@ class TestMiniMaxM2ToolParser:
         assert "Hello!" in result.normal_text
         names = [c.name for c in result.calls if c.name]
         assert "get_weather" in names
+
+    def test_streaming_prefix_in_same_chunk_not_repeated(self, sample_tools):
+        """Test text sent with the tool token is streamed only once."""
+        parser = MiniMaxM2ToolParser()
+        chunks = [
+            "I'll check the weather in Paris for you.<minimax:tool_call>",
+            '<invoke name="get_weather">',
+            '<parameter name="location">Paris</parameter>',
+            '</invoke>',
+            '</minimax:tool_call>',
+        ]
+        normal_text = ""
+        names = []
+        for chunk in chunks:
+            result = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += result.normal_text
+            names += [c.name for c in result.calls if c.name]
+
+        assert normal_text == "I'll check the weather in Paris for you."
+        assert names == ["get_weather"]
 
 
 # ============================================================================
@@ -6667,6 +6719,73 @@ class TestConfigureParserSpecialTokenDecoding:
 
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
+
+    @pytest.mark.parametrize(
+        "reasoning_parser, tool_parser, with_tools, skip, spaces",
+        [
+            ("kimi_k3", "kimi_k3", True, False, False),
+            ("kimi_k3", None, False, False, False),
+            (None, "deepseek_v32", True, False, True),
+            (None, "deepseek_v32", False, True, True),
+            (None, None, True, True, True),
+        ],
+    )
+    def test_the_responses_route_applies_it(self, monkeypatch, reasoning_parser,
+                                            tool_parser, with_tools, skip,
+                                            spaces) -> None:
+        """/v1/responses detokenizes for the parsers as chat completions does.
+
+        Without it Kimi-K3's tags arrive with their special tokens dropped or
+        spaced apart, and its tool calls reach the client as message text.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        import tensorrt_llm.serve.openai_server as server_module
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        async def fake_preprocess(**kwargs):
+            return [1, 2, 3], SamplingParams()
+
+        monkeypatch.setattr(server_module, "responses_api_request_preprocess",
+                            fake_preprocess)
+        submitted = []
+
+        def generate_async(*, sampling_params, **kwargs):
+            submitted.append(sampling_params)
+            raise RuntimeError("stop after submission")
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.enable_store = False
+        server.use_harmony = False
+        server.tokenizer = None
+        server.model_config = None
+        server.processor = None
+        server.multimodal_server_config = None
+        server.chat_template = None
+        server.tool_parser = tool_parser
+        server.metrics_collector = None
+        server.conversation_store = None
+        server.generator = SimpleNamespace(args=SimpleNamespace(
+            reasoning_parser=reasoning_parser, num_postprocess_workers=0),
+                                           generate_async=generate_async)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        tools = [{
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object"
+            }
+        }] if with_tools else None
+        request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+
+        asyncio.run(server.openai_responses(request, raw_request))
+
+        (sampling_params, ) = submitted
+        assert sampling_params.skip_special_tokens is skip
+        assert sampling_params.spaces_between_special_tokens is spaces
 
 
 # ============================================================================

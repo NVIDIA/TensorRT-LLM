@@ -403,11 +403,14 @@ def is_mla(config):
 
 
 def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
-    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path.
+
+    Hybrid linear-attention models (Kimi K3) compose the FP4 MLA cache layout
+    with their recurrent-state lifecycle in ``MambaHybridCacheManagerV2``.
+    """
     return (is_mla(model_config.pretrained_config)
             and model_config.attn_backend == "TRTLLM"
-            and model_config.sparse_attention_config is None
-            and not is_hybrid_linear(model_config.pretrained_config))
+            and model_config.sparse_attention_config is None)
 
 
 def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:

@@ -52,7 +52,7 @@ class PplxDeciderGatedDeltaNet(Qwen3NextGatedDeltaNet):
         if decider_cu_seqlens_i32 is None or decider_cu_seqlens_i64 is None:
             raise ValueError("pplx-decider requires packed sequence boundaries")
 
-        mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states)
+        mixed_qkv, z, a, b, ba_ready = self._compute_tokenwise_inputs(hidden_states)
         mixed_qkv_t = extract_transpose_prefill_slice(
             mixed_qkv,
             mixed_qkv.shape[0],
@@ -66,6 +66,8 @@ class PplxDeciderGatedDeltaNet(Qwen3NextGatedDeltaNet):
             query_start_loc=decider_cu_seqlens_i32,
             activation=self.activation,
         )
+        if ba_ready is not None:
+            ba_ready.wait()
         query, key, value, log_gate, beta = fused_gdn_post_conv(
             mixed_qkv_t,
             None,

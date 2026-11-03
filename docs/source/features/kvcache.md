@@ -293,7 +293,7 @@ This isolation is enforced entirely by the block-key hash: the salt is mixed int
 
 When working with multimodal models (e.g., vision-language models), the KV cache system needs to identify which cached blocks correspond to which multimodal inputs (images, videos, etc.). By default, the system uses content-based hashing to generate unique identifiers for each multimodal input. However, this approach has limitations for cache management across sessions, as the same content must be re-processed to generate the same hash.
 
-You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 returns the item digest as a hexadecimal string, including for items with UUIDs.
+You can provide custom UUID strings for your multimodal data using the `multi_modal_uuids` parameter when creating requests. Both cache managers compute the item digest from **both** the UUID and content together for correctness. V1 returns the original UUID in the KV cache event's `mm_keys[].hash` field when one is supplied. V2 always returns the derived digest in `mm_keys[].hash` and adds the original identity in the optional `mm_keys[].uuid` field.
 
 **Usage Example:**
 
@@ -312,16 +312,23 @@ prompt = TextPrompt(
 
 - **Cache Correctness**: When a UUID is provided, the cache key is computed from both the UUID and content together using `BLAKE3(UUID || Content)`. This ensures different content always produces different cache entries, even with the same UUID.
 - **User Isolation**: Same content with different UUIDs produces different cache entries, enabling per-user or per-session cache isolation.
-- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID for V1, or the item digest for V2. V2 consumers can use the same digest that appears in its cache-key token sequence.
+- **Stable Event Identifiers**: `get_kv_cache_events()` returns the original UUID in V1's `hash` field. V2 returns the item digest in `hash` and the original UUID in the optional `uuid` field.
 - **Partial UUID Support**: You can provide UUIDs for some items and use `None` for others to fall back to content-only hashing.
 - **Cross-Modality Support**: Different modalities (images, videos) can each have their own UUIDs.
 
 **UUID Format:**
 
 - Can be any string (e.g., "image-123", "user-session-img-a", database keys)
-- Original UUID strings are preserved in request metadata and returned in V1 KV cache events
+- Original UUID strings are preserved in request metadata and returned in KV cache events
 
-V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence.
+V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, optional `uuid` is the externally supplied identity, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest and UUID with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence. Clients that require the externally supplied identity must read `uuid`; truncating or otherwise deriving an identity from `hash` does not recover the UUID.
+
+For multimodal blocks, the optional `BlockStored.trtllm_image_routing` extension
+provides the routing format version and token-ID offset. The extension can accompany
+video and audio keys as well as image keys; the OpenEngine capability flag advertises
+only the currently validated image-routing support. See the
+[OpenEngine image routing contract](source:tensorrt_llm/grpc/openengine/README.md#image-routing-metadata)
+for capability requirements and consumer handling.
 
 
 ### Enable Offloading to Host Memory
@@ -400,14 +407,16 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`, or over the
 `/kv_cache_events` endpoint of `trtllm-serve`.
 
+Reset does not flush buffered events; they are published at a subsequent iteration boundary.
+
 #### Streaming path (prototype)
 
 Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local native event source, converts the events to
-wire structs and enqueues one batch at the iteration boundary. A background thread performs
-msgpack encoding and socket I/O.
+LLM API. Each emitting rank drains its local native event source, converts the events to wire
+structs and attempts to enqueue a batch at iteration boundaries and when a prefix-cache reset
+completes. A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -426,18 +435,31 @@ kv_cache_config = KvCacheConfig(
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
+A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or
+removed events. A populated reset also emits `BlockRemoved` for previously published resident
+blocks before `AllBlocksCleared`; consumers should accept both even though the reset marker
+already invalidates the whole index. Each rank attempts to enqueue its reset events without
+waiting for another inference iteration, including while inference is idle or paused, and
+without a cross-rank event gather. Publishing happens asynchronously. A successfully
+published marker is retained in bounded replay history and does not change the engine
+lifetime ID.
+Orderly engine shutdown also clears the reuse tree and queues a final `AllBlocksCleared`
+before publisher teardown.
+The best-effort delivery guarantees below apply to reset and shutdown events too.
+
 Streaming exposes only the full-block residency information external routers need, using the
-attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
-centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
-contained and avoiding Python callbacks from native cache operations.
+attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and
+`AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping
+internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
 **Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
-in `block_hashes[i]`, using the `hash` and `start_offset` fields defined above. This payload
-support does not establish end-to-end multimodal-aware routing compatibility. The final
-identity and normalization contract will be revisited separately after
-[Dynamo #15095](https://github.com/ai-dynamo/dynamo/pull/15095) and
-[TensorRT-LLM #19529](https://github.com/NVIDIA/TensorRT-LLM/pull/19529) merge.
+in `block_hashes[i]`, using the `hash`, `start_offset`, and optional `uuid` fields defined
+above. As in buffered V2 events, `hash` remains the item digest; `uuid` preserves the
+externally supplied identity without changing block hashes. An absent UUID is omitted
+from the wire payload. This payload support does not establish end-to-end
+multimodal-aware routing compatibility; consumers must support the same identity and
+normalization contract.
 
 **Endpoint convention.** Every attention-DP rank binds `base_port + rank` using its
 **global** rank, so `N` ranks occupy `[base_port, base_port + N - 1]` cluster-wide and
@@ -453,18 +475,23 @@ have no port, each rank appends a `_dp<rank>` suffix instead.
 
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
-`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored` or `BlockRemoved` — carrying int64 block hashes derived from the V2 radix block
-keys. This is the format documented for custom router backends; it differs from vLLM's
-positional-array encoding of the individual events, though the batch envelope is positional in
-both.
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key:
+`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64
+block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional
+fields. This is the format documented for custom router backends; it differs from vLLM's
+positional-array encoding of the individual events, though the batch envelope is positional
+in both.
 
 **Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
 (```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
 treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
 producer-side safety-cap drop is reported in the producer's logs and counters but does not
-create a sequence gap.
+create a sequence gap. If the last batch is dropped while the engine remains idle, a
+subscriber cannot detect its sequence gap until a later batch arrives. The
+[Dynamo TensorRT-LLM sidecar](https://github.com/ai-dynamo/dynamo/blob/e5a2ef3fcc2cc6e12a9185e39c98141a983eaeab/lib/llm/src/kv_router/publisher/zmq_listener.rs#L183-L208)
+currently logs source sequence gaps without automatically resynchronizing, so a lost reset
+marker can leave its routing index stale even after later events arrive.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and

@@ -59,6 +59,9 @@ LMBENCHMARK_SHA = "c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb"
 LMBENCHMARK_SCRIPT = ""
 _LMBENCHMARK_PACKAGE = "benchmark"
 _LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
+_LMBENCHMARK_INSTALL_SPEC = (
+    f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
+)
 CsvMetrics: TypeAlias = dict[str, int | float]
 _SERVER_HOST = "0.0.0.0"
 _SERVER_START_MAX_ATTEMPTS = 5
@@ -993,7 +996,7 @@ try:
     dist = importlib.metadata.distribution(package)
 except importlib.metadata.PackageNotFoundError:
     raise SystemExit(
-        "LMBenchmark package is not installed. Install requirements-dev.txt before running tests. "
+        "LMBenchmark package is not installed after fixture setup. "
         f"Expected {{script_in_package}}."
     )
 
@@ -1022,9 +1025,18 @@ print(
 
 @pytest.fixture(scope="module")
 def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
-    """Verify and resolve the preinstalled LMBenchmark script used by this module."""
+    """Install and resolve the pinned LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
+    # Retry installs that fail early on transient network errors; the timeout
+    # already bounds a stalled install.
+    for attempt in range(3):
+        try:
+            llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
     LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
     return llm_venv
 
