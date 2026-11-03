@@ -8,7 +8,7 @@ attention_config:
   backend: TRTLLM
   sparse_attention_config:
     algorithm: vsa
-    vsa_sparsity: 0.9
+    vsa_sparsity: 0.8
 compilation_config:
   skip_warmup: true
   resolutions:

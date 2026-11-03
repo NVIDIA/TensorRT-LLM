@@ -554,9 +554,7 @@ def test_public_visual_gen_lists_minimax_h3() -> None:
     from tensorrt_llm import VisualGen
 
     assert "MiniMaxAI/MiniMax-H3" in VisualGen.supported_models()
-    assert (
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree" in VisualGen.supported_models()
-    )
+    assert "FastVideo/FastVideo-FastH3-8-Step-V2" in VisualGen.supported_models()
 
 
 def test_modular_manifest_preserves_pipeline_metadata(tmp_path: Path) -> None:
@@ -1092,7 +1090,7 @@ def test_default_generation_steps_match_reference_app() -> None:
     "manifest, expected_steps",
     [
         (None, 28),
-        ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 5}, 5),
+        ({"schema_version": "fasth3-inference-contract-v1", "num_inference_steps": 9}, 9),
         ({"schema_version": "fasth3-inference-contract-v1"}, 28),
         ({"schema_version": "other-model-v1", "num_inference_steps": 5}, 28),
     ],
@@ -1110,13 +1108,48 @@ def test_fasth3_generation_steps_follow_inference_contract(
     assert pipeline.default_generation_params["num_inference_steps"] == expected_steps
 
 
+def test_fasth3_v2_trained_schedule() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.scheduler = MiniMaxH3Scheduler(shift=10.0)
+    pipeline.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
+    pipeline._fastvideo_inference = {
+        "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+        "video_scheduler_shift": 10.0,
+        "audio_scheduler_shift": 3.0,
+    }
+    pipeline.post_load_weights()
+    pipeline._set_timesteps(9)
+    base = torch.tensor([0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0])
+    for scheduler, shift in ((pipeline.scheduler, 10.0), (pipeline.audio_scheduler, 3.0)):
+        expected = shift * base / (1 + (shift - 1) * base)
+        torch.testing.assert_close(scheduler.sigmas.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(scheduler.timesteps.cpu(), 1 - expected[:-1], rtol=0, atol=0)
+        assert len(scheduler.timesteps) == 8
+    with pytest.raises(ValueError, match="9 sigma-grid points"):
+        pipeline._set_timesteps(8)
+    pipeline.scheduler.set_shift(12.0)
+    with pytest.raises(ValueError, match="video_scheduler_shift"):
+        pipeline._set_timesteps(9)
+    pipeline._fastvideo_inference = {}
+    pipeline._set_timesteps(28)
+    assert len(pipeline.scheduler.timesteps) == 27
+
+
+@pytest.mark.parametrize("steps", [[], [999, 999], [999, 1000], [1001, 500], [999, 0]])
+def test_fasth3_rejects_invalid_dmd_steps(steps: list[int]) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline._fastvideo_inference = {"dmd_denoising_steps": steps}
+    with pytest.raises(ValueError, match="strictly decreasing"):
+        pipeline._set_timesteps(len(steps) + 1)
+
+
 def test_hf_download_is_scoped_to_the_supported_h3_components(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
-    model = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
-    revision = "5ea076f"
+    model = "FastVideo/FastVideo-FastH3-8-Step-V2"
+    revision = "3da2ddf"
 
     def _capture_partial_download(
         model: str,
@@ -1174,9 +1207,9 @@ def test_hf_download_is_scoped_to_the_supported_h3_components(
 @pytest.mark.parametrize(
     "attention_kwargs,expected_backend,expected_sparsity",
     [
-        ({}, "TRTLLM", 0.9),
-        ({"backend": "TRTLLM"}, "TRTLLM", 0.9),
-        ({"backend": "CUTEDSL"}, "CUTEDSL", 0.9),
+        ({}, "TRTLLM", 0.8),
+        ({"backend": "TRTLLM"}, "TRTLLM", 0.8),
+        ({"backend": "CUTEDSL"}, "CUTEDSL", 0.8),
         (
             {
                 "backend": "CUTEDSL",
@@ -1208,8 +1241,9 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(
         json.dumps(
             {
                 "schema_version": "fasth3-inference-contract-v1",
-                "model_id": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
-                "num_inference_steps": 5,
+                "model_id": "FastVideo/FastVideo-FastH3-8-Step-V2",
+                "num_inference_steps": 9,
+                "vsa_sparsity": 0.8,
             }
         ),
         encoding="utf-8",
@@ -1236,7 +1270,7 @@ def test_fasth3_manifest_metadata_controls_pipeline_defaults(
     pipeline.load_standard_components(
         str(tmp_path), torch.device("cpu"), skip_components=list(PipelineComponent)
     )
-    assert pipeline.default_generation_params["num_inference_steps"] == 5
+    assert pipeline.default_generation_params["num_inference_steps"] == 9
 
     config.attention = AttentionConfig(backend="VANILLA")
     with pytest.raises(ValueError, match="FastH3 requires VSA"):

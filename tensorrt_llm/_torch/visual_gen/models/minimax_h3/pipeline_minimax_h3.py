@@ -174,7 +174,7 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
     "MiniMaxH3ModularPipeline",
     hf_ids=[
         "MiniMaxAI/MiniMax-H3",
-        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
     ],
     defaults={"workflow": "fl2va"},
     download_patterns=[
@@ -496,7 +496,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise ValueError("FastH3 requires VSA with the TRTLLM or CUTEDSL attention backend.")
         sparse = attention.sparse_attention_config
         if sparse is None:
-            sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.9))
+            sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.8))
         elif sparse.algorithm != "vsa":
             raise ValueError("FastH3 requires the vsa sparse attention algorithm.")
         config.attention = AttentionConfig.model_validate(
@@ -621,12 +621,42 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
-        if self.scheduler is not None:
+        # Distilled checkpoints carry their trained shifts in the scheduler configs.
+        if self.scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
-        if self.audio_scheduler is not None:
+        if self.audio_scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
         if self.vae is not None and self.device.type == "cuda":
             _prepare_vae_decoder(self.vae)
+
+    def _set_timesteps(self, num_inference_steps: int) -> None:
+        manifest = getattr(self, "_fastvideo_inference", {})
+        steps = manifest.get("dmd_denoising_steps")
+        if steps is None:
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+            return
+        if (
+            not steps
+            or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
+            or any(left <= right for left, right in zip(steps, steps[1:]))
+        ):
+            raise ValueError("FastH3 DMD steps must be strictly decreasing integers in (0, 1000].")
+        if num_inference_steps != len(steps) + 1:
+            raise ValueError(
+                f"FastH3 requires {len(steps) + 1} sigma-grid points for {len(steps)} forwards."
+            )
+        base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
+        for scheduler, shift_key in (
+            (self.scheduler, "video_scheduler_shift"),
+            (self.audio_scheduler, "audio_scheduler_shift"),
+        ):
+            shift = float(scheduler.shift)
+            if shift_key in manifest and shift != float(manifest[shift_key]):
+                raise ValueError(f"FastH3 {shift_key} disagrees with the checkpoint scheduler.")
+            # Shift each modality's trained noise clock once; explicit sigmas are not shifted.
+            sigmas = shift * base / (1 + (shift - 1) * base)
+            scheduler.set_timesteps(sigmas=sigmas, device=self.device)
 
     def torch_compile(self) -> None:
         super().torch_compile()
@@ -1269,8 +1299,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             condition_latents=condition_latents,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self._set_timesteps(num_inference_steps)
         # The denoise loop indexes both schedules with one counter, and
         # set_timesteps collapses float32 duplicates, so unequal lengths would
         # silently truncate a stream instead of failing.

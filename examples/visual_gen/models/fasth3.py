@@ -20,7 +20,7 @@ import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
 
-FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
+FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
 
 
 def main() -> None:
@@ -49,7 +49,6 @@ def main() -> None:
     params.height = 768
     params.width = 1344
     params.num_frames = 124
-    params.num_inference_steps = 5
     params.seed = 42
 
     output = visual_gen.generate(

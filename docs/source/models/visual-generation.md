@@ -38,7 +38,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
-| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | Text-to-Video (with Audio, 4-step distilled) |
+| `FastVideo/FastVideo-FastH3-8-Step-V2` | Text-to-Video (with Audio, 8-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -193,11 +193,14 @@ are not supported. See the
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
 - FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
-  distilled 4-step checkpoint. Model-specific VSA is the supported inference path
+  distilled 8-step V2 checkpoint. Model-specific VSA is the supported inference path
   for this checkpoint and is selected by default with the TRTLLM backend and the
-  checkpoint's sparsity (90% for this release). Explicit incompatible backends
+  checkpoint's sparsity (80% for V2). Explicit incompatible backends
   or sparse attention algorithms are rejected. Dense attention omits the trained
   compression gate and is not equivalent to this checkpoint's VSA inference.
+  The example reads nine sigma-grid points (eight transformer forwards) from
+  `fastvideo_inference.json` and uses its trained DMD ladder with video/audio
+  scheduler shifts of 10/3. Changing only the step count is not equivalent.
   For single-GPU text-to-video with audio, see
   `fasth3-bf16-trtllm-vsa-1gpu.yaml`. To use CUTEDSL instead, set
   `attention_config.backend: CUTEDSL` in that config.
