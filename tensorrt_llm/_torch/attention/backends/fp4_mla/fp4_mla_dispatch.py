@@ -41,7 +41,6 @@ Environment:
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Callable, NamedTuple, Optional
 
@@ -141,9 +140,13 @@ def choose_decode_strategy(
     if not four_x_enabled:
         return two_x("TRTLLM_FP4_MLA_CUTEDSL_4X=0")
     if forced == PATH_2X:
-        return DecodeStrategy(PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None)
+        return DecodeStrategy(
+            PATH_2X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
+        )
     if forced == "auto" and kv_decision < min_kv_4x():
-        return two_x(f"KV {kv_decision} < {min_kv_4x()}: the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV})")
+        return two_x(
+            f"KV {kv_decision} < {min_kv_4x()}: the 2x packed kernel has the lower fixed cost ({MIN_KV_4X_ENV})"
+        )
     reason = envelope_reason(
         num_heads=num_heads,
         query_len=query_len,
@@ -157,7 +160,9 @@ def choose_decode_strategy(
     if reason is not None:
         return two_x(reason)
     if forced == PATH_4X:
-        return DecodeStrategy(PATH_4X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None)
+        return DecodeStrategy(
+            PATH_4X, 0, f"forced by {DECODE_PATH_ENV}", kv_decision, "forced", None
+        )
     plan = plan_two_stream(
         num_requests=num_requests,
         rows_per_request=rows_per_seq,
@@ -176,10 +181,27 @@ def choose_decode_strategy(
             v_packed=True,
         )
         if prefix_reason is not None:
-            plan = plan._replace(r2=0, reason=f"4x prefix of {plan.num_requests_4x} requests outside the envelope: {prefix_reason}")
+            plan = plan._replace(
+                r2=0,
+                reason=f"4x prefix of {plan.num_requests_4x} requests outside the envelope: {prefix_reason}",
+            )
     if plan.enabled:
-        return DecodeStrategy(PATH_TWO_STREAM, plan.r2, plan.reason, kv_decision, kv_source if forced == "auto" else "forced", plan)
-    return DecodeStrategy(PATH_4X, 0, plan.reason if forced == "auto" else f"forced {forced}; {plan.reason}", kv_decision, kv_source if forced == "auto" else "forced", plan)
+        return DecodeStrategy(
+            PATH_TWO_STREAM,
+            plan.r2,
+            plan.reason,
+            kv_decision,
+            kv_source if forced == "auto" else "forced",
+            plan,
+        )
+    return DecodeStrategy(
+        PATH_4X,
+        0,
+        plan.reason if forced == "auto" else f"forced {forced}; {plan.reason}",
+        kv_decision,
+        kv_source if forced == "auto" else "forced",
+        plan,
+    )
 
 
 def describe(strategy: DecodeStrategy) -> str:

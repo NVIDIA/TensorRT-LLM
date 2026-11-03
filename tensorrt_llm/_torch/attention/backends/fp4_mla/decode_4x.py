@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Four-CTA-cluster (4x) decode dispatch: envelope decision, optional dispatch recorder, split-mode workspaces and the runner.
+"""Four-CTA-cluster (4x) decode dispatch: envelope decision, optional dispatch recorder, split-mode workspaces, runner.
 
 The kernel (``fp4_mla_cutedsl_4x``) is the four-CTA-cluster variant of the FP4 MLA decode (256 packed rows of one
 request per cluster, two CTA pairs splitting the KV tiles and exchanging P over DSMEM; same FP4 operands as the
-two-CTA packed kernel). ``run_fp4_mla_attention_decode`` hands it the packed-Q decode calls inside its static envelope when ``TRTLLM_FP4_MLA_CUTEDSL_4X=1`` and keeps the
-packed 2x path for everything else (``fp4_mla_cutedsl_4x_host.envelope_reason_static``)."""
+two-CTA packed kernel). ``run_fp4_mla_attention_decode`` hands it the packed-Q decode calls inside its static
+envelope when ``TRTLLM_FP4_MLA_CUTEDSL_4X=1`` and keeps the packed 2x path for everything else
+(``fp4_mla_cutedsl_4x_host.envelope_reason_static``)."""
 
 from __future__ import annotations
 

@@ -130,9 +130,9 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
-# four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel (256 packed
-# [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P over
-# DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
+# four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel
+# (256 packed [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P
+# over DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
 # MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static). Default off.
 FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
 # Packed decode: each request owns a 128-row-padded block of [query token, head]

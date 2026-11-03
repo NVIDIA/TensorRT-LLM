@@ -2743,7 +2743,10 @@ def _assert_fp4_mla_attention_decode_accuracy(
         )
 
         monkeypatch.setenv(host_4x.MIN_PAIRS_ENV, "0")
-        from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch, fp4_mla_twostream
+        from tensorrt_llm._torch.attention.backends.fp4_mla import (
+            fp4_mla_dispatch,
+            fp4_mla_twostream,
+        )
 
         monkeypatch.setenv(fp4_mla_dispatch.MIN_KV_4X_ENV, "0")
         # the plain-4x tests exercise the split mode on short caches: keep the two-stream split off unless a test
@@ -3029,8 +3032,16 @@ def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
 @pytest.mark.parametrize(
     "query_len_per_seq,seq_lens,forced_r2",
     [
-        (4, [131, 512, 2100, 300, 1024, 777, 4096, 64], 2),  # 8 requests: 6 on the 4x arm (12 pairs), 2 on the 2x arm
-        (2, [131, 512, 2100, 300, 1024, 777, 4096, 64, 9, 3000], 3),  # q2: 128-row m-tiles, 3 requests on the 2x arm
+        (
+            4,
+            [131, 512, 2100, 300, 1024, 777, 4096, 64],
+            2,
+        ),  # 8 requests: 6 on the 4x arm (12 pairs), 2 on the 2x arm
+        (
+            2,
+            [131, 512, 2100, 300, 1024, 777, 4096, 64, 9, 3000],
+            3,
+        ),  # q2: 128-row m-tiles, 3 requests on the 2x arm
     ],
     ids=["q4-r2", "q2-r3"],
 )
@@ -3071,7 +3082,9 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_matches_reference(
         env={ts.TWOSTREAM_R2_ENV: str(forced_r2)},
     )
     assert calls, "no decode call recorded"
-    assert all(call in (("4x", len(seq_lens) - forced_r2), ("2x", forced_r2)) for call in calls), calls
+    assert all(call in (("4x", len(seq_lens) - forced_r2), ("2x", forced_r2)) for call in calls), (
+        calls
+    )
     assert ("4x", len(seq_lens) - forced_r2) in calls and ("2x", forced_r2) in calls, calls
 
 
@@ -3121,8 +3134,12 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> No
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
 )
-@pytest.mark.parametrize("forced_path,expect", [("4x", ("4x", 128)), ("2x", ("2x", 128))], ids=["force-4x", "force-2x"])
-def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(monkeypatch, forced_path: str, expect) -> None:
+@pytest.mark.parametrize(
+    "forced_path,expect", [("4x", ("4x", 128)), ("2x", ("2x", 128))], ids=["force-4x", "force-2x"]
+)
+def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(
+    monkeypatch, forced_path: str, expect
+) -> None:
     """TRTLLM_FP4_MLA_DECODE_PATH forces the plain paths even where the dispatcher would split."""
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
@@ -3151,7 +3168,10 @@ def test_fp4_mla_attention_decode_cutedsl_dispatch_forced_path(monkeypatch, forc
         query_len_per_seq=4,
         packed_queries=True,
         enable_4x=True,
-        env={fp4_mla_dispatch.DECODE_PATH_ENV: forced_path, host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"},
+        env={
+            fp4_mla_dispatch.DECODE_PATH_ENV: forced_path,
+            host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0",
+        },
     )
     assert calls and all(call == expect for call in calls), calls
 
