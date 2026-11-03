@@ -31,6 +31,7 @@ Every tensor arrives as a lazy safetensors slice, so only the rank-local
 expert range and the rank's attention shard are ever materialized.
 """
 
+import math
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ....modules.linear import FP8BlockScalesLinearMethod
 from ...modeling_musespark_open import (
     PERCEPTION_KEY_PREFIXES,
     excluded_layer_experts_nvfp4_enabled,
@@ -344,8 +346,126 @@ def _slice_experts(
     return value[expert_start:expert_end]
 
 
+#: Edge of the square weight-scale block of the block-FP8 projections.
+FP8_WEIGHT_BLOCK = 128
+#: Largest finite E4M3 magnitude.
+E4M3_MAX = 448.0
+#: Floor on a block's amax before its scale is derived, the same as
+#: ``resmooth_to_fp8_e8m0`` (and DeepGEMM's ``per_block_cast_to_fp8``).
+FP8_AMAX_FLOOR = 1e-4
+
+
+def _quantize_block_fp8_ue8m0(
+    weight: torch.Tensor, device: Optional[torch.device] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a BF16 ``[N, K]`` weight once, to E4M3 with power-of-two 128x128 block scales.
+
+    Returns ``(q, scale)``: ``q`` is ``[N, K]`` float8_e4m3fn and ``scale`` is
+    ``[N/128, K/128]`` float32 holding ``2**ceil(log2(max(amax, 1e-4) / 448))``
+    per block, so ``q * scale`` approximates the weight. That is exactly the
+    scale ``resmooth_to_fp8_e8m0`` derives at ``post_load_weights``, and it
+    makes that resmooth value-preserving: above the amax floor the largest
+    ``|q|`` of a block lies in ``[224, 448]``, so resmooth either keeps the
+    scale or (when that maximum rounded to exactly 224) halves it and doubles
+    ``q``, both exact; at the floor both derive the floor's scale. ``q`` and
+    the scales may change there, ``q * scale`` never does.
+    Quantizing with an FP32 ``amax / 448`` scale instead would round every
+    weight a second time inside resmooth.
+
+    ``ceil(log2(x))`` comes from ``frexp`` (exact: ``x = m * 2**e`` with
+    ``m`` in ``[0.5, 1)`` gives ``e - 1`` when ``m == 0.5`` and ``e``
+    otherwise) and the scale is assembled from its exponent bits, so no
+    transcendental's rounding can move a block to the neighbouring power of
+    two. ``x >= 1e-4 / 448`` keeps every exponent in the normal range.
+
+    Runs on ``device`` (default CUDA), one matrix at a time; the peak is the
+    BF16 copy, one FP32 copy divided and clamped in place, and the E4M3
+    result, under 1 GB for the largest (q_gate, ``[16384, 8192]``).
+    Quantize-then-shard equals shard-then-quantize whenever every shard
+    boundary is a multiple of 128, which ``_check_fp8_projection_linear``
+    in the model enforces at boot.
+    """
+    block = FP8_WEIGHT_BLOCK
+    if weight.dim() != 2 or weight.shape[0] % block or weight.shape[1] % block:
+        raise ValueError(
+            f"MuseSparkOpen block-FP8 weights must be 2-D with both dims multiples of {block}, "
+            f"got {tuple(weight.shape)}"
+        )
+    if weight.dtype != torch.bfloat16:
+        raise ValueError(f"MuseSparkOpen block-FP8 weights come from BF16, got {weight.dtype}")
+    rows, cols = weight.shape
+    blocked = (rows // block, block, cols // block, block)
+    bf16 = weight.to(device if device is not None else torch.device("cuda")).contiguous()
+    blocks = bf16.view(blocked)
+    # max(|w|) as max(max, -min): exact in BF16, with no |w| temporary.
+    amax = torch.maximum(blocks.amax(dim=(1, 3)), blocks.amin(dim=(1, 3)).neg()).float()
+    if not bool(torch.isfinite(amax).all()):
+        raise ValueError("MuseSparkOpen block-FP8 quantization met a non-finite weight")
+    mantissa, exponent = torch.frexp(amax.clamp_min_(FP8_AMAX_FLOOR).div_(E4M3_MAX))
+    exponent = exponent - (mantissa == 0.5).to(exponent.dtype)
+    scale = ((exponent + 127) << 23).view(torch.float32)
+    del blocks, amax, mantissa
+    q = bf16.float()
+    del bf16
+    q.view(blocked).div_(scale[:, None, :, None]).clamp_(-E4M3_MAX, E4M3_MAX)
+    return q.to(torch.float8_e4m3fn), scale
+
+
+def _is_fp8_block_linear(module) -> bool:
+    return isinstance(getattr(module, "quant_method", None), FP8BlockScalesLinearMethod)
+
+
+def _linear_entry(module, weight: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """The ``load_weights`` entry for one BF16 checkpoint weight of ``module``.
+
+    Keyed on the module's quant method, not on any env: a block-FP8 Linear
+    (MUSESPARK_OPEN_FP8_PROJECTIONS) gets the weight quantized once by
+    ``_quantize_block_fp8_ue8m0`` plus its scales, everything else the BF16
+    weight exactly as before. Each rank quantizes the full tensor and
+    ``load_shard`` slices it afterwards.
+    """
+    if _is_fp8_block_linear(module):
+        q, scale = _quantize_block_fp8_ue8m0(weight)
+        return {"weight": q, "weight_scale": scale}
+    return {"weight": weight}
+
+
+def _load_entries(module, entries: List[Dict[str, torch.Tensor]]) -> None:
+    """``module.load_weights(entries)``, refusing a BF16 entry for a block-FP8 Linear.
+
+    ``copy_weight`` casts a mismatched source to the parameter's dtype without
+    a word, so a BF16 weight would land in an E4M3 parameter with no scale.
+    After the load, and before ``post_load_weights`` re-lays ``weight_scale``
+    out as packed UE8M0 int32 for DeepGEMM, the parameters must be E4M3
+    weights with FP32 ``[N/128, K/128]`` scales.
+    """
+    fp8 = _is_fp8_block_linear(module)
+    if fp8:
+        for entry in entries:
+            if entry["weight"].dtype != torch.float8_e4m3fn or "weight_scale" not in entry:
+                raise ValueError(
+                    "MuseSparkOpen: a block-FP8 Linear needs E4M3 weights with block scales, "
+                    f"got a {entry['weight'].dtype} weight"
+                )
+    module.load_weights(entries)
+    if not fp8:
+        return
+    expected_scale = tuple(math.ceil(dim / FP8_WEIGHT_BLOCK) for dim in module.weight.shape)
+    if (
+        module.weight.dtype != torch.float8_e4m3fn
+        or module.weight_scale.dtype != torch.float32
+        or tuple(module.weight_scale.shape) != expected_scale
+    ):
+        raise ValueError(
+            "MuseSparkOpen: block-FP8 Linear loaded as weight "
+            f"{module.weight.dtype}{tuple(module.weight.shape)}, scale "
+            f"{module.weight_scale.dtype}{tuple(module.weight_scale.shape)}; expected E4M3 and "
+            f"FP32 {expected_scale}"
+        )
+
+
 def _load_linear(module, weight: torch.Tensor) -> None:
-    module.load_weights([{"weight": weight}])
+    _load_entries(module, [_linear_entry(module, weight)])
 
 
 def _copy_param(param: torch.nn.Parameter, value: torch.Tensor) -> None:
@@ -567,13 +687,12 @@ def load_layer(
     q_gate = head_interleaved_q_gate(
         q_weight, gate_weight, config.num_attention_heads, config.head_dim
     )
-    layer.self_attn.qkv_proj.load_weights(
-        [
-            {"weight": q_gate},
-            {"weight": k_weight},
-            {"weight": v_weight},
-        ]
-    )
+    # Block-FP8 (MUSESPARK_OPEN_FP8_PROJECTIONS) quantizes q_gate, k and v
+    # separately, after both interleaves: one 128-row block of q_gate is one
+    # head's 64 query rows plus its 64 gate rows, and every rank's shard is
+    # whole blocks (TP4: 32 + 2 + 2 scale rows).
+    qkv_proj = layer.self_attn.qkv_proj
+    _load_entries(qkv_proj, [_linear_entry(qkv_proj, w) for w in (q_gate, k_weight, v_weight)])
     layer.self_attn.prepare_qkv_weight_layout()
     del q_weight, gate_weight, q_gate
 

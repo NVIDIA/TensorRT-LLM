@@ -66,6 +66,11 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
   instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
+- ``MUSESPARK_OPEN_FP8_PROJECTIONS`` (default off; context workers only): serve the
+  qkv, o, pool and unpool projections as block-FP8 DeepGEMM Linears, quantized once
+  at load to 128x128 power-of-two (UE8M0) scales. ``all`` (or ``1``) names all four;
+  a ``+``-joined subset such as ``qkv+pool`` names just those. Refused on the
+  modeling_v2 (generation) path.
 
 Default-on switches read as disabled for the values ``0``/``false``/``no``/
 ``off``.
@@ -74,7 +79,7 @@ Default-on switches read as disabled for the values ``0``/``false``/``no``/
 import contextlib
 import copy
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -82,7 +87,7 @@ import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSparkOpenConfig
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -871,6 +876,104 @@ def _finalize_bf16_out_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+#: The projections MUSESPARK_OPEN_FP8_PROJECTIONS can name, in the order the boot line lists them.
+FP8_PROJECTION_NAMES = ("qkv", "o", "pool", "unpool")
+_FP8_PROJECTIONS_OFF = ("", "0", "off", "false", "no")
+_FP8_PROJECTIONS_ALL = ("1", "all", "on", "true", "yes")
+#: The largest step the DeepGEMM warmup compiles every layout for:
+#: ``deep_gemm_jit_warmup_buckets`` clamps its walk at 8192 rows, so a larger
+#: qkv/o step would compile mid-serve (nvcc under the GIL stalls every rank).
+_FP8_PROJECTIONS_MAX_NUM_TOKENS = 8192
+
+
+def _resolve_fp8_projections() -> Tuple[str, ...]:
+    """The projections MUSESPARK_OPEN_FP8_PROJECTIONS serves as block-FP8 Linears.
+
+    Empty (off) when unset or ``0``/``off``/``false``/``no``. ``all`` (or
+    ``1``/``on``/``true``/``yes``) names all four of ``FP8_PROJECTION_NAMES``;
+    anything else must be a ``+``-joined subset of them, e.g. ``qkv+pool``.
+    Returned in ``FP8_PROJECTION_NAMES`` order whatever order was written.
+
+    Raises ``ValueError`` for an unknown or empty token. Rank 0 logs the
+    resolved set and layer count (``_log_fp8_projections``). Resolved once,
+    before any layer is built.
+    """
+    raw = os.environ.get("MUSESPARK_OPEN_FP8_PROJECTIONS", "").strip().lower()
+    if raw in _FP8_PROJECTIONS_OFF:
+        return ()
+    if raw in _FP8_PROJECTIONS_ALL:
+        return FP8_PROJECTION_NAMES
+    tokens = [token.strip() for token in raw.split("+")]
+    unknown = [token for token in tokens if token not in FP8_PROJECTION_NAMES]
+    if unknown:
+        raise ValueError(
+            f"MUSESPARK_OPEN_FP8_PROJECTIONS={raw!r}: unknown projection(s) {unknown}; expected "
+            f"'all' or a '+'-joined subset of {'/'.join(FP8_PROJECTION_NAMES)}"
+        )
+    return tuple(name for name in FP8_PROJECTION_NAMES if name in tokens)
+
+
+def _check_fp8_projections_supported(
+    model_config: ModelConfig, names: Sequence[str], sm_version: Optional[int] = None
+) -> None:
+    """Refuse, at boot, every configuration the block-FP8 projections are not built for.
+
+    Raises ``ValueError``. ``sm_version`` defaults to this device's.
+
+    - The modeling_v2 path (``modeling_v2_target``): the generation worker's
+      dense GEMMs and projection gathers read these weights as BF16. Its class
+      subclasses the omni wrapper and so builds this decoder too; refusing here
+      turns a leaked env into a failed boot instead of a wrong one.
+    - Anything outside the SM100 family, and non-BF16 activations: the path is
+      DeepGEMM ``fp8_swap_ab_gemm``, which takes BF16 input.
+    - ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT=1`` with qkv: its
+      ``prepare_weight_layout`` already refuses any non-BF16, quantized QKV at
+      load; this fails the same combination before 62 layers are built, with
+      the reason.
+    - ``use_cute_dsl_blockscaling_mm``: it consumes FP32 scales, not the UE8M0
+      layout loaded here.
+    - LoRA: the adapters assume the unquantized projection.
+    - ``max_num_tokens`` above ``_FP8_PROJECTIONS_MAX_NUM_TOKENS``.
+    """
+    pretrained_config = model_config.pretrained_config
+    target = getattr(model_config, "modeling_v2_target", None)
+    if target is not None:
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS is a context-worker switch: the modeling_v2 path "
+            f"({getattr(target, '__name__', target)}) reads these projections as BF16"
+        )
+    if sm_version is None:
+        sm_version = get_sm_version()
+    if not is_sm_100f(sm_version):
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS needs DeepGEMM on an SM100-family GPU, got "
+            f"SM{sm_version}"
+        )
+    if getattr(pretrained_config, "torch_dtype", None) != torch.bfloat16:
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS needs BF16 activations, got "
+            f"{getattr(pretrained_config, 'torch_dtype', None)}"
+        )
+    if "qkv" in names and os.getenv("MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT", "0") == "1":
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS with qkv cannot combine with "
+            "MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT=1, whose row layout takes a plain BF16 QKV weight"
+        )
+    if getattr(model_config, "use_cute_dsl_blockscaling_mm", False):
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS serves DeepGEMM with UE8M0 scales; "
+            "use_cute_dsl_blockscaling_mm selects a different block-FP8 GEMM"
+        )
+    if getattr(model_config, "lora_config", None) is not None:
+        raise ValueError("MUSESPARK_OPEN_FP8_PROJECTIONS does not support LoRA")
+    if model_config.max_num_tokens > _FP8_PROJECTIONS_MAX_NUM_TOKENS:
+        raise ValueError(
+            f"MUSESPARK_OPEN_FP8_PROJECTIONS needs max_num_tokens <= "
+            f"{_FP8_PROJECTIONS_MAX_NUM_TOKENS} (got {model_config.max_num_tokens}): the DeepGEMM "
+            "warmup walk stops there, so larger steps would compile kernels mid-serve"
+        )
 
 
 #: The largest batch whose router and pool projection run on two streams:
@@ -2289,7 +2392,11 @@ class MuseSparkOpenMoE(nn.Module):
         """Shard small BF16 ``[tokens, hidden]`` projections, then gather columns.
 
         The workspace is shared across layers in CUDA execution order. Larger
-        batches and compiled execution retain the original replicated Linear.
+        batches and compiled execution retain the original replicated Linear,
+        and so does a module whose weight is not BF16
+        (MUSESPARK_OPEN_FP8_PROJECTIONS): the sharded branch slices
+        ``module.weight`` straight into a BF16 GEMM, which an E4M3 weight and
+        its separate block scales cannot feed.
         """
         if (
             workspace is None
@@ -2298,6 +2405,7 @@ class MuseSparkOpenMoE(nn.Module):
             or hidden_states.ndim != 2
             or not 0 < hidden_states.shape[0] <= 8
             or not hidden_states.is_contiguous()
+            or module.weight.dtype != torch.bfloat16
         ):
             return module(hidden_states)
         from ..modules.low_m_gemm import apply_low_m_gemm
@@ -3158,6 +3266,92 @@ def assert_supported_spec_config(spec_config: Any) -> None:
     )
 
 
+#: Block edge of the FP8 weight scales (128x128), and so every shard boundary's alignment.
+_FP8_BLOCK = 128
+
+
+def fp8_projection_linears(layer: "MuseSparkOpenDecoderLayer") -> Dict[str, Linear]:
+    """One decoder layer's four MUSESPARK_OPEN_FP8_PROJECTIONS candidates, by switch name."""
+    return {
+        "qkv": layer.self_attn.qkv_proj,
+        "o": layer.self_attn.o_proj,
+        "pool": layer.feed_forward.pooler,
+        "unpool": layer.feed_forward.unpooler,
+    }
+
+
+def _check_fp8_projection_linear(layer_idx: int, name: str, linear: Linear) -> None:
+    """Refuse a projection the block-FP8 load cannot shard or that is already quantized."""
+    where = f"MUSESPARK_OPEN_FP8_PROJECTIONS: layer {layer_idx} {name}"
+    quant_config = linear.quant_config
+    if quant_config is not None and quant_config.layer_quant_mode.has_any_quant(
+        exclude_kv_cache=True
+    ):
+        raise ValueError(
+            f"{where} is already quantized by the checkpoint ({quant_config.quant_algo}); "
+            "the switch only converts BF16 projections"
+        )
+    if linear.use_cute_dsl_blockscaling_mm or linear.disable_deep_gemm:
+        raise ValueError(f"{where} opts out of DeepGEMM, which the UE8M0 weight layout needs")
+    # Every TP shard boundary must fall on a 128 block: the loader quantizes the
+    # full tensor and load_shard then slices weight and scales in step.
+    bounds = [(0, linear.in_features), (0, linear.out_features)]
+    if isinstance(linear.tp_sharding, tuple):
+        bounds.append(linear.tp_sharding)
+    elif isinstance(linear.tp_sharding, dict):
+        bounds.extend(linear.tp_sharding.values())
+    for offset, size in (linear.fused_weight_shard_indices_mapping or {}).values():
+        bounds.append((offset, offset + size))
+    misaligned = [bound for bound in bounds if bound[0] % _FP8_BLOCK or bound[1] % _FP8_BLOCK]
+    if misaligned:
+        raise ValueError(f"{where} has shard bounds {misaligned} off the {_FP8_BLOCK}-row blocks")
+
+
+def convert_fp8_projections(
+    layers: Sequence["MuseSparkOpenDecoderLayer"], names: Sequence[str]
+) -> int:
+    """Give the named projections of every layer a block-FP8 quant config.
+
+    Layer ``i`` of ``layers`` is decoder layer ``i``. Each converted Linear gets
+    ``QuantConfig(FP8_BLOCK_SCALES)``, keeping the KV-cache algorithm it carried,
+    and ``_weights_created = False``, the same mechanism the checkpoint
+    exclusion pass uses: ``__post_init__`` then calls ``create_weights`` on every
+    module, which re-derives the quant method (``FP8BlockScalesLinearMethod``)
+    and allocates E4M3 weights plus FP32 scales, so no BF16 copy of a converted
+    projection is ever loaded. ``Attention.create_weights`` reaches ``o_proj``
+    through ``o_proj.create_weights()``, which recreates only the weights: the
+    MNNVL ``o_proj.all_reduce`` pinned in ``MuseSparkOpenAttention.__init__``
+    survives. The attention module's own quant config (FP8 KV only) is not
+    touched, so ``_use_quantize_output`` stays False and the attention output
+    stays BF16. Returns the number of converted layers.
+    """
+    converted = 0
+    for layer_idx, layer in enumerate(layers):
+        linears = fp8_projection_linears(layer)
+        for name in names:
+            linear = linears[name]
+            _check_fp8_projection_linear(layer_idx, name, linear)
+            linear.quant_config = QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                kv_cache_quant_algo=getattr(linear.quant_config, "kv_cache_quant_algo", None),
+            )
+            linear._weights_created = False
+        converted += 1
+    return converted
+
+
+def _log_fp8_projections(names: Sequence[str], converted: int, num_layers: int) -> None:
+    """Rank 0's boot line naming the block-FP8 projections and how many layers carry them.
+
+    For example ``MuseSparkOpen FP8 projections: qkv+o+pool+unpool layers=62/62
+    (MUSESPARK_OPEN_FP8_PROJECTIONS)``.
+    """
+    logger.info(
+        f"MuseSparkOpen FP8 projections: {'+'.join(names)} layers={converted}/{num_layers} "
+        "(MUSESPARK_OPEN_FP8_PROJECTIONS)"
+    )
+
+
 # No @register_auto_model here on purpose. The checkpoint's only architecture
 # string is "MuseSparkOpenOmniForCausalLM", and it now names
 # MuseSparkOpenOmniForConditionalGeneration in modeling_musespark_open_omni, which
@@ -3193,6 +3387,11 @@ class MuseSparkOpenForCausalLM(
             "MuseSparkOpen does not support pipeline parallelism"
         )
         assert_supported_spec_config(getattr(model_config, "spec_config", None))
+        # Resolved and refused before any layer is built; applied by
+        # apply_quant_config_exclude_modules, which __post_init__ runs.
+        fp8_projections = _resolve_fp8_projections()
+        if fp8_projections:
+            _check_fp8_projections_supported(model_config, fp8_projections)
         super().__init__(
             MuseSparkOpenModel(model_config),
             model_config,
@@ -3202,6 +3401,36 @@ class MuseSparkOpenForCausalLM(
         self.logits_processor = MuseSparkOpenLogitsProcessor(
             logit_multiplier=config.metap_multiplier, soft_cap=config.output_soft_cap_temp
         )
+        self._fp8_projections = fp8_projections
+
+    def apply_quant_config_exclude_modules(self):
+        """The checkpoint's exclusion pass, then MUSESPARK_OPEN_FP8_PROJECTIONS.
+
+        The only hook where the switch can take effect. ``__post_init__`` runs
+        this pass and then ``create_weights`` on every module, and the base
+        pass resets qkv/o to a KV-only config because the checkpoint excludes
+        ``self_attn`` (pool/unpool are built with no quant config at all), so a
+        conversion made any earlier would be undone and one made later would
+        find BF16 weights already created. The omni wrapper is a plain
+        ``PreTrainedModel`` and runs no second pass. Only the first
+        ``num_hidden_layers`` entries of ``self.model.layers``, the target
+        decoder layers, convert; no drafter layer does.
+        """
+        super().apply_quant_config_exclude_modules()
+        names = getattr(self, "_fp8_projections", ())
+        if not names:
+            return
+        num_layers = self.config.num_hidden_layers
+        converted = convert_fp8_projections(self.model.layers[:num_layers], names)
+        # Pin the 1x128 activation quantization to the CUDA kernel. Unpinned, the
+        # AutoTuner picks between two separate implementations independently on
+        # every rank and only at the tuned M values, so numerics could differ by
+        # rank and by boot; the CUDA kernel is the one every untuned M runs.
+        from ..custom_ops.torch_custom_ops import pin_fp8_1x128_quant_tactic
+
+        pin_fp8_1x128_quant_tactic("cuda")
+        if self.model_config.mapping.rank == 0:
+            _log_fp8_projections(names, converted, num_layers)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:
