@@ -2639,16 +2639,34 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[start:end]
         min_ps = spec_metadata.request_min_ps[start:end]
         if getattr(spec_metadata, "draft_temperature_only", False):
-            # Device-side fills: CUDA graph capture rejects host-scalar copies.
-            top_ks = torch.full_like(top_ks, torch.iinfo(torch.int32).max)
-            top_ps = torch.ones_like(top_ps)
-            min_ps = torch.zeros_like(min_ps)
+            top_ks, top_ps, min_ps = SpecWorkerBase._unfiltered_sampling_params(
+                spec_metadata.advanced_sampling_mode, temperatures)
         if repeat > 1:
             temperatures, top_ks, top_ps, min_ps = [
-                t.repeat_interleave(repeat)
+                None if t is None else t.repeat_interleave(repeat)
                 for t in (temperatures, top_ks, top_ps, min_ps)
             ]
         return temperatures, top_ks, top_ps, min_ps
+
+    @staticmethod
+    def _unfiltered_sampling_params(
+        advanced_sampling_mode: AdvancedSamplingMode,
+        temperatures: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor],
+               Optional[torch.Tensor]]:
+        """Per-row ``(top_ks, top_ps, min_ps)`` that apply no filter.
+
+        The fused kernel reads its per-row disable values (device-side fills:
+        CUDA graph capture rejects host-scalar copies); the flashinfer ops skip
+        the kernel of a ``None`` filter, so the draw is the temperature-only
+        softmax on either backend.
+        """
+        if not advanced_sampling_mode.is_fused:
+            return None, None, None
+        return (torch.full_like(temperatures,
+                                torch.iinfo(torch.int32).max,
+                                dtype=torch.int32),
+                torch.ones_like(temperatures), torch.zeros_like(temperatures))
 
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
@@ -3036,22 +3054,17 @@ class SpecWorkerBase(nn.Module, ABC):
         uniforms = counter_uniforms(seed, offset, num_drafts)
 
         def sample_emitted(weights: torch.Tensor) -> torch.Tensor:
-            # Device-side fills: CUDA graph capture rejects host-scalar copies.
+            mode = spec_metadata.advanced_sampling_mode
             ones = torch.ones(weights.shape[0],
                               dtype=torch.float32,
                               device=weights.device)
-            no_top_k = torch.full_like(ones,
-                                       torch.iinfo(torch.int32).max,
-                                       dtype=torch.int32)
-            return self._sample_from_logits(
-                spec_metadata.advanced_sampling_mode,
-                weights.log(),
-                ones,
-                no_top_k,
-                ones,
-                torch.zeros_like(ones),
-                seed=seed,
-                offset=offset)
+            return self._sample_from_logits(mode,
+                                            weights.log(),
+                                            ones,
+                                            *self._unfiltered_sampling_params(
+                                                mode, ones),
+                                            seed=seed,
+                                            offset=offset)
 
         return block_verify(draft_tokens,
                             draft_probs,

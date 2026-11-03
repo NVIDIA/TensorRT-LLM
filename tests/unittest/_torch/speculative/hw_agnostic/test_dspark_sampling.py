@@ -77,7 +77,7 @@ def _metadata(
     min_p: float = 0.0,
     temperature_only: bool = False,
     method: str = "standard",
-    mode: Optional[AdvancedSamplingMode] = None,
+    mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL,
     device: str = "cpu",
 ) -> types.SimpleNamespace:
     batch = num_contexts + num_gens
@@ -389,13 +389,24 @@ def test_sampled_drafts_use_the_draft_sampling_parameters(
             assert torch.equal(call["offset"], expected_offset)
 
 
+@pytest.mark.parametrize(
+    "mode", [AdvancedSamplingMode.FULL, AdvancedSamplingMode.NO_TOPK], ids=["fused", "flashinfer"]
+)
 @pytest.mark.cpu_only
-def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
-    meta = _metadata(B, temperature=0.6, top_k=20, top_p=0.9, min_p=0.1, temperature_only=True)
+def test_draft_sampling_params_temperature_only_keeps_the_temperature(
+    mode: AdvancedSamplingMode,
+) -> None:
+    meta = _metadata(
+        B, temperature=0.6, top_k=20, top_p=0.9, min_p=0.1, temperature_only=True, mode=mode
+    )
     temps, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
     torch.testing.assert_close(temps, torch.full((2 * (B - 1),), 0.6))
-    assert (top_ks == INT32_MAX).all() and top_ks.dtype == torch.int32
-    assert (top_ps == 1.0).all() and (min_ps == 0.0).all()
+    if mode.is_fused:
+        assert (top_ks == INT32_MAX).all() and top_ks.dtype == torch.int32
+        assert (top_ps == 1.0).all() and (min_ps == 0.0).all()
+    else:
+        # No filter kernel runs on the flashinfer path, top-p's at p = 1 included.
+        assert top_ks is None and top_ps is None and min_ps is None
     meta.draft_temperature_only = False
     _, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
     assert (top_ks == 20).all()
@@ -420,8 +431,18 @@ def _capture(fn: Callable[[], Any]) -> tuple[torch.cuda.CUDAGraph, Any]:
 
 
 @_needs_cuda
-@pytest.mark.parametrize("temperature_only", [True, False])
-def test_sampled_block_captures_in_a_cuda_graph(temperature_only: bool) -> None:
+@pytest.mark.parametrize(
+    "temperature_only, mode",
+    [
+        (True, AdvancedSamplingMode.FULL),
+        (False, AdvancedSamplingMode.FULL),
+        (True, AdvancedSamplingMode.NO_TOPK),
+    ],
+    ids=["temperature_only", "filtered", "temperature_only-flashinfer"],
+)
+def test_sampled_block_captures_in_a_cuda_graph(
+    temperature_only: bool, mode: AdvancedSamplingMode
+) -> None:
     generator = torch.Generator().manual_seed(31)
     vocab, num_gens = 4096, 6
     worker = _worker()
@@ -435,7 +456,7 @@ def test_sampled_block_captures_in_a_cuda_graph(temperature_only: bool) -> None:
         temperature=0.8,
         top_p=0.9,
         temperature_only=temperature_only,
-        mode=AdvancedSamplingMode.FULL,
+        mode=mode,
         device="cuda",
     )
     # The last request is CUDA-graph padding: it routes to the scratch row and
