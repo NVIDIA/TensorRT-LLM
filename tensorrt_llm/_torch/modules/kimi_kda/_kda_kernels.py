@@ -721,6 +721,7 @@ class KDAKernelDispatch:
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
         sm_reserve: int = 0,
+        snapshot: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run prefill on raw Q/K/V and gate/beta logits.
 
@@ -729,7 +730,13 @@ class KDAKernelDispatch:
 
         ``sm_reserve`` SMs are left out of the optimized kernels' persistent
         grids for a kernel that runs concurrently with prefill.
+
+        ``snapshot = (pool, rows, chunks)`` (optimized indexed path only) also
+        stores each selected sequence's state after its first ``64 * chunks[b]``
+        tokens into ``pool[rows[b]]`` (``trtllm::kda_prefill``).
         """
+        if snapshot is not None and state_pool is None:
+            raise RuntimeError("KDA prefill state snapshots require the optimized prefill path")
         if state_pool is not None:
             if self.prefill_kernel_path != "optimized" or initial_state is not None:
                 raise ValueError("Indexed prefill requires FlashInfer and no dense initial state")
@@ -754,6 +761,7 @@ class KDAKernelDispatch:
                 seq_order,
                 cu_chunks,
                 sm_reserve,
+                *(snapshot or (None, None, None)),
             )
             return out, None
 
