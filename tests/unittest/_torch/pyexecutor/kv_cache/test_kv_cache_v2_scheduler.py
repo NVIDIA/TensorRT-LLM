@@ -1320,6 +1320,37 @@ class TestKVCacheFailuresGen:
         assert ids(out.generation_requests) == [0, 1]
         assert ids(out.recompute_paused_requests) == [99]
 
+    def test_wait_restarts_after_the_request_is_torn_down(self):
+        """A request torn down while it waits starts a fresh wait once it is back."""
+        fits = {0}
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return req.request_id in fits or (req.request_id == 0 and 1 in freed_request_ids)
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        with patch.dict("os.environ", {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": "1"}):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(99)]
+        # While 99 is in flight it is neither a victim nor scheduled.
+        in_flight = {99}
+
+        out = sched.schedule_request(reqs, in_flight)
+        assert ids(out.generation_requests) == [0]
+
+        # 0 is blocked first in its pass, so it tears down the waiting request.
+        fits.clear()
+        out = sched.schedule_request(reqs, in_flight)
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.recompute_paused_requests) == [1]
+
+        # Blocked again once it is back, 1 waits instead of tearing down 99.
+        fits.add(0)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.recompute_paused_requests == []
+
     def test_first_generation_request_recompute_pauses_gpu_only(self):
         """In a GPU-only pool the first generation request of a pass still tears
         down a request suspended in an earlier pass, which is the only way out
