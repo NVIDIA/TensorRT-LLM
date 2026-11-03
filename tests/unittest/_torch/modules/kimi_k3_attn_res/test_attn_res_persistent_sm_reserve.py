@@ -36,11 +36,25 @@ def test_sm_reserve_keeps_results(num_tokens: int, num_snapshots: int, with_add:
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     op = torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd
     ref = op(layer, addend, block, *weights, EPS, EPS)
-    for reserve in (16, sms - 1, sms + 7):
+    for reserve in (16, sms - 1):
         out = op(layer, addend, block, *weights, EPS, EPS, reserve)
         assert torch.equal(out[1], ref[1]), reserve
         if with_add:
             assert torch.equal(out[0], ref[0]), reserve
+
+
+@pytest.mark.parametrize("reserve_offset", [None, 0, 7])
+def test_sm_reserve_out_of_range_is_rejected(reserve_offset):
+    """Like ``cute_dsl_utils.set_sm_reserve``: negative or >= the SM count fails loudly."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    reserve = -1 if reserve_offset is None else sms + reserve_offset
+    layer = _rows(300, 1, HIDDEN, seed=1)
+    block = _rows(4, 300, 1, HIDDEN, seed=3)
+    weights = [_rows(HIDDEN, seed=s) for s in (4, 5, 6)]
+    with pytest.raises(RuntimeError, match="sm_reserve"):
+        torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd(
+            layer, None, block, *weights, EPS, EPS, reserve
+        )
 
 
 def test_model_passes_the_sm_reserve(monkeypatch):
