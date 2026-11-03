@@ -84,8 +84,12 @@ The config folder can be overridden with:
 
 ### Current Naming Pattern
 
-VisualGen family YAMLs currently use underscore-separated names with a hardware
-suffix, for example:
+VisualGen family YAMLs use model-based names. Hardware-specific recipes may
+include a hardware suffix. Recipes shared across GPU architectures use a
+platform-neutral name, such as `ltx2.yaml`; supported GPUs are listed in
+`metadata.supported_gpus`.
+
+Examples:
 
 - `wan21_t2v_14b_blackwell.yaml`
 - `wan22_i2v_a14b_blackwell.yaml`
@@ -232,7 +236,7 @@ Important:
 1. **Locate (or create) the family YAML** under
    `tests/scripts/perf-sanity/visual_gen/`. Use an existing file if the model
    family already has one; otherwise create a new file following the naming
-   pattern `<family>_<hardware>.yaml`.
+   guidance above.
 
 2. **Add a `server_configs` entry.** Each entry needs a unique `name`, a
    `model_path` (or rely on `metadata.model_name`), a `server_config` block,
