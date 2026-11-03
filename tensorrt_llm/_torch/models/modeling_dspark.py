@@ -3646,7 +3646,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # residual add and the RMSNorm after it.
     _tp_fusions = True
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+    def __init__(
+        self,
+        draft_config,
+        *,
+        dflash_attention_backend: str = "AUTO",
+        context_kv_only: bool = False,
+    ):
         cfg = draft_config.pretrained_config
         # Pin the backbone instead of relying on the model_type-derived name
         # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
@@ -3654,6 +3660,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         cfg.architectures = ["K3DsparkForCausalLM"]
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
         self._init_dspark_heads(cfg)
+        self.context_kv_only = context_kv_only
 
         attn0 = self.model.layers[0].self_attn
         self.qk_nope_head_dim = attn0.qk_nope_head_dim
@@ -3687,6 +3694,29 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.softmax_scale = (mscale * mscale) / math.sqrt(
             self.qk_nope_head_dim + self.qk_rope_head_dim
         )
+        if context_kv_only:
+            self._keep_context_kv_modules()
+
+    def _keep_context_kv_modules(self) -> None:
+        """Drop every module the context KV build does not read.
+
+        A disaggregated context server only stores the drafter's context KV:
+        the target hidden states through ``fc`` / ``hidden_norm``, then each
+        layer's ``kv_a_proj_with_mqa`` and ``kv_a_layernorm`` plus RoPE
+        (``precompute_context_kv``). Construction runs under meta init, so the
+        dropped modules never allocate device memory.
+        """
+        backbone = self.draft_model_full.model
+        backbone.embed_tokens = None
+        backbone.norm = None
+        for layer in backbone.layers:
+            layer.mlp = None
+            layer.input_layernorm = None
+            layer.post_attention_layernorm = None
+            for name in ("q_a_proj", "q_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj"):
+                setattr(layer.self_attn, name, None)
+        self.draft_model_full.lm_head = None
+        self.lm_head = None
 
     # -- shape / buffers ---------------------------------------------------
 
@@ -4025,9 +4055,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._use_fused_qk_norm_rope = False
 
         # Split kv_b_proj into the absorption operands once. K absorbs into the
-        # query, V un-absorbs the attention output.
+        # query, V un-absorbs the attention output. Block decode only.
         nh = attn0.num_heads_tp
-        for a in layers_attn:
+        for a in layers_attn if not self.context_kv_only else ():
             w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
             a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
             a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
@@ -4319,12 +4349,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ones use ``fc`` / ``hidden_norm`` / ``norm``. Everything below that is
         already HF-standard MLA.
         """
-        weights, _ = self._take_dspark_head_weights(weights)
         renames = {
             "context_proj.weight": "fc.weight",
             "context_norm.weight": "hidden_norm.weight",
             "final_norm.weight": "norm.weight",
         }
+        if self.context_kv_only:
+            # Only the tensors _keep_context_kv_modules left a home for.
+            weights = {renames.get(k, k): v for k, v in weights.items()}
+            weights = {
+                k: v
+                for k, v in weights.items()
+                if k in self.WRAPPER_OWNED_WEIGHTS
+                or ".self_attn.kv_a_proj_with_mqa." in k
+                or ".self_attn.kv_a_layernorm." in k
+            }
+            return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        weights, _ = self._take_dspark_head_weights(weights)
         weights = {renames.get(k, k): v for k, v in weights.items()}
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
@@ -4335,7 +4376,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         the target's, so adopting the target's would feed the block decode
         embeddings it was not distilled against -- silently, at some acceptance
         cost. The GQA drafters ship no embedding and keep the base behavior.
+        A context-KV-only drafter has no LM head.
         """
+        if self.context_kv_only:
+            return
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
 
@@ -4637,6 +4681,14 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     Returns:
         The draft ``nn.Module`` for this drafter.
     """
+    context_kv_only = model_config.spec_config.context_kv_only
+    if context_kv_only and (
+        draft_is_embedded_in_target(model_config) or not is_mla(draft_config.pretrained_config)
+    ):
+        raise ValueError(
+            "speculative_config.context_kv_only is implemented for standalone MLA DSpark "
+            "drafters only."
+        )
     if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
@@ -4670,6 +4722,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
+            context_kv_only=context_kv_only,
         )
     else:
         drafter_cls = GQADSparkForCausalLM

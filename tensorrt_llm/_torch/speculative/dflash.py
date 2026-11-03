@@ -2024,19 +2024,27 @@ class DFlashWorker(SpecWorkerBase):
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 self._rebuild_batch_to_slot(spec_metadata.request_ids)
 
-        inputs = self.prepare_1st_drafter_inputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            num_accepted_tokens=num_accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            draft_model=draft_model,
-            total_target_tokens=total_target_tokens,
+        # A context-KV-only drafter (disaggregated context server) stores the
+        # prompt's drafter context above and never drafts.
+        drafts = not draft_model.context_kv_only
+        inputs = (
+            self.prepare_1st_drafter_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model,
+                total_target_tokens=total_target_tokens,
+            )
+            if drafts
+            else None
         )
 
-        if num_gens > 0:
+        vocab_size = None
+        if num_gens > 0 and drafts:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
@@ -2140,13 +2148,14 @@ class DFlashWorker(SpecWorkerBase):
                     )
 
         else:
-            gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+            # Padding rows of a context-KV-only drafter get the same zero
+            # placeholder as context requests.
+            gen_draft_tokens = torch.zeros((num_gens, K), dtype=torch.int32, device="cuda")
 
         # Context requests are not drafted by the block worker (zero placeholder
         # token); fill their draft-prob slot rows with a one-hot placeholder so
         # they are a legal distribution when they become gen requests next iter.
-        gen_vocab = vocab_size if num_gens > 0 else None
-        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, vocab_size)
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")

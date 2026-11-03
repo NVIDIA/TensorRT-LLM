@@ -507,6 +507,10 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
+    # True for a drafter built for a disaggregated context server: it only
+    # stores the context KV and holds no modules for the block decode.
+    context_kv_only = False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""

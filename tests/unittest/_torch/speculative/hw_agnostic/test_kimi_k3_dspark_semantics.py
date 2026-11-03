@@ -593,7 +593,10 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
     pretrained = _tiny_config(True, mask_token_id=None)
     pretrained.dspark_noise_token_id = mask_id
     spec = SimpleNamespace(
-        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+        mask_token_id=mask_id,
+        attention_backend="VANILLA",
+        draft_is_embedded_in_target=False,
+        context_kv_only=False,
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -1030,13 +1033,15 @@ def _tiny_mla_weights(seed=11):
     return w
 
 
-def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM"):
+def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
     model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="TRTLLM")
     drafter = MLADSparkForCausalLM(
-        model_config, dflash_attention_backend=dflash_attention_backend
+        model_config,
+        dflash_attention_backend=dflash_attention_backend,
+        context_kv_only=context_kv_only,
     ).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -1838,3 +1843,76 @@ def test_gqa_dspark_auto_still_degrades(monkeypatch):
     model_config = ModelConfig(pretrained_config=_tiny_config(True), attn_backend="VANILLA")
     drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
     assert drafter.dflash_attention_backend == "VANILLA"
+
+
+# ---------------------------------------------------------------------------
+# Context-KV-only drafter (disaggregated context server).
+# ---------------------------------------------------------------------------
+
+
+@needs_cuda
+def test_context_kv_only_drafter_keeps_only_the_context_kv_path():
+    weights = _tiny_mla_weights()
+    full = _build_mla_drafter(weights)
+    ctx = _build_mla_drafter(weights, context_kv_only=True)
+
+    backbone = ctx.draft_model_full.model
+    assert backbone.embed_tokens is None and backbone.norm is None
+    assert ctx.lm_head is None and ctx.markov_w1 is None
+    for layer in backbone.layers:
+        attn = layer.self_attn
+        assert layer.mlp is None
+        assert attn.q_b_proj is None and attn.kv_b_proj is None and attn.o_proj is None
+        assert attn.kv_a_proj_with_mqa is not None and attn.kv_a_layernorm is not None
+
+    def param_bytes(module):
+        return sum(p.numel() * p.element_size() for p in module.parameters())
+
+    kept = (MLA_HIDDEN * MLA_HIDDEN * NUM_CAPTURE + MLA_HIDDEN) * 2 + MLA_LAYERS * (
+        MLA_LATENT * MLA_HIDDEN + MLA_KV_LORA
+    ) * 2
+    assert param_bytes(ctx) == kept
+    assert param_bytes(ctx) < param_bytes(full) / 4
+
+    torch.manual_seed(0)
+    captured = torch.randn(37, MLA_HIDDEN * NUM_CAPTURE, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(5, 42, device="cuda")
+
+    def latents(drafter):
+        latent, v = drafter.precompute_context_kv(
+            drafter.project_target_hidden(captured), positions
+        )
+        assert v is None
+        return latent
+
+    assert torch.equal(latents(ctx), latents(full))
+
+
+def test_context_kv_only_is_rejected_for_a_drafter_that_drafts_elsewhere():
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    for embedded, kv_lora_rank in ((False, None), (True, MLA_KV_LORA)):
+        spec = SimpleNamespace(
+            context_kv_only=True,
+            attention_backend="AUTO",
+            draft_is_embedded_in_target=embedded,
+        )
+        model_config = SimpleNamespace(spec_config=spec)
+        pretrained = SimpleNamespace(kv_lora_rank=kv_lora_rank, qk_rope_head_dim=MLA_ROPE)
+        draft_config = SimpleNamespace(pretrained_config=pretrained)
+        with pytest.raises(ValueError, match="standalone MLA DSpark"):
+            _build_dspark_draft(model_config, draft_config, None, None)
+
+
+def test_context_kv_only_requires_disaggregated_serving():
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    creator = object.__new__(KvCacheCreator)
+    creator._speculative_config = SimpleNamespace(context_kv_only=True)
+    creator._is_disagg = True
+    creator._validate_context_kv_only()
+    creator._is_disagg = False
+    with pytest.raises(ValueError, match="context_kv_only"):
+        creator._validate_context_kv_only()
+    creator._speculative_config = None
+    creator._validate_context_kv_only()

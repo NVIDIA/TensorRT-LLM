@@ -1047,6 +1047,7 @@ class KvCacheCreator:
                     "ranks only in the chunked-context path. Set "
                     "enable_chunked_prefill=True on a GPU that supports it "
                     "for MLA.")
+        self._validate_context_kv_only()
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -1054,6 +1055,14 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
+
+    def _validate_context_kv_only(self) -> None:
+        """A drafter that never drafts belongs on a disaggregated context server."""
+        if (getattr(self._speculative_config, "context_kv_only", False)
+                and not self._is_disagg):
+            raise ValueError(
+                "speculative_config.context_kv_only is for the context servers "
+                "of disaggregated serving.")
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -2343,7 +2352,8 @@ class KvCacheCreator:
             return "the target uses different KV cache geometry across layers"
         if self._llm_args.kv_cache_compression_config is not None:
             return "KV cache compression is enabled"
-        if getattr(self._kv_cache_config, "mixed_precision_kv", None) is not None:
+        if getattr(self._kv_cache_config, "mixed_precision_kv",
+                   None) is not None:
             return "mixed-precision KV is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback.

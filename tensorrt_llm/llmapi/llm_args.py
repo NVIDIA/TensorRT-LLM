@@ -3853,6 +3853,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
 
+    context_kv_only: bool = Field(
+        default=False,
+        description=
+        "Set on the context servers of disaggregated serving with a standalone "
+        "MLA DSpark drafter. A context server never drafts: it builds the "
+        "drafter's context KV from the target hidden states during prefill. "
+        "With this set it loads only what that needs (the context projection "
+        "and each drafter layer's latent projection and norm) and emits "
+        "placeholder draft tokens. Requires disaggregated serving.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
