@@ -15,12 +15,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     PREFILL_MAX_ROWS,
     AbsorbedBmmRunner,
     build,
+    build_decode_fp8_q_base,
     build_prefill,
     build_prefill_fp8_q_base,
+    build_v_b_mxf8_side,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_absorbed_bmm import (  # noqa: E402, E501
     cute_dsl_absorbed_bmm as op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
+    self_attn_prefill_act_quant_mxf8 as quant,
+)  # noqa: E402, E501
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
@@ -85,20 +90,21 @@ def _prefill(kernel: str) -> AbsorbedBmmRunner:
 SENTINEL_BYTE = 0xA5
 
 
-def _check_fp8_cell(rows: int, seed: int) -> None:
+def _check_fp8_cell(rows: int, seed: int, decode: bool = False) -> None:
     """The e4m3 bytes K-B writes are exactly the bf16 prefill K-B's output converted the
     way the rope/append kernel converts it (nearest, saturating): same kernel, same
     accumulation, only the epilogue differs. The rope tail of each head (`[..., 512:]`)
     and the rows past M stay as they were."""
     lay = LAYOUTS["k_b"]
     a, weight, out_bf16, _ = _build("k_b", rows, seed)
-    op(a, weight, out_bf16, _prefill("k_b"))
+    dev = torch.cuda.current_device()
+    op(a, weight, out_bf16, build("k_b", _group(rows), dev) if decode else _prefill("k_b"))
     quant = torch.full(
         (rows + CANARY_ROWS, lay.heads, lay.out_row), SENTINEL_BYTE, dtype=torch.uint8,
         device="cuda",
     )  # fmt: skip
     out = quant[:rows, :, : lay.n].transpose(0, 1)
-    runner = _prefill("k_b_fp8")
+    runner = build_decode_fp8_q_base(_group(rows), dev) if decode else _prefill("k_b_fp8")
     assert rows in runner.rows
     with validating(op):
         assert op(a, weight, out, runner) is out, "the op writes `out` and returns it"
@@ -114,11 +120,45 @@ def _check_fp8_cell(rows: int, seed: int) -> None:
     assert bool((quant[rows:] == SENTINEL_BYTE).all()), "the kernel wrote past the last row"
 
 
+#: o_proj's decode operand the V-B side output writes, one for the module: the kernels bake
+#: its addresses in, so it must outlive them.
+_X8: dict = {}
+
+
+def _check_x8_cell(rows: int, seed: int) -> None:
+    """The V-B's bf16 output is the plain decode cell's, bit for bit, and its side output is
+    the activation quant's bytes of that output read token-major as `[M, 4096]`."""
+    dev = torch.cuda.current_device()
+    if not _X8:
+        _X8["operand"] = (
+            torch.zeros(64, 4096, dtype=torch.uint8, device="cuda"),
+            torch.full((quant.sf_bytes(64, 4096),), 127, dtype=torch.uint8, device="cuda"),
+        )
+        _X8.update({g: build_v_b_mxf8_side(g, dev, _X8["operand"]) for g in ("m_le_8", "m_ge_16")})
+    a, weight, out, parent = _build("v_b", rows, seed)
+    with validating(op):
+        assert op(a, weight, out, _X8[_group(rows)]) is out
+    plain = torch.empty_like(parent)
+    op(a, weight, plain[:rows, :, :256].transpose(0, 1), build("v_b", _group(rows), dev))
+    torch.cuda.synchronize()
+    assert torch.equal(parent[:rows], plain[:rows]), "the bf16 output differs from the plain cell"
+    act = parent[:rows].reshape(rows, 4096).contiguous()
+    want_q, want_sf = quant.reference(act)
+    xq, sf = _X8["operand"]
+    assert torch.equal(xq[:rows], want_q), f"{int((xq[:rows] != want_q).sum())} bytes differ"
+    got = quant.dequantize(xq[:rows].contiguous(), sf, rows, 4096)
+    assert torch.equal(got, quant.dequantize(want_q, want_sf, rows, 4096)), "scales differ"
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     kernel, rows = cell.spec["kernel"], cell.spec["rows"]
+    if cell.spec.get("x8"):
+        _check_x8_cell(rows, zlib.crc32(cell.why.encode()) % 2**31)
+        return
     if cell.spec.get("fp8"):
-        _check_fp8_cell(rows, zlib.crc32(cell.why.encode()) % 2**31)
+        seed = zlib.crc32(cell.why.encode()) % 2**31
+        _check_fp8_cell(rows, seed, bool(cell.spec.get("decode")))
         return
     if cell.spec.get("prefill"):
         runner = _prefill(kernel)

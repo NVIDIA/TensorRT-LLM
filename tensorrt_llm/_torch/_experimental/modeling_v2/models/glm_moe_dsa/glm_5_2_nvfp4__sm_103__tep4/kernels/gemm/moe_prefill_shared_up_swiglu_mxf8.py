@@ -14,7 +14,7 @@ as the served epilogue converts it (round to nearest), then ``s = silu(g)`` and
 ``bf16(s * u)`` in FP32: ``s`` is the rows SwiGLU's ``g / (1 + exp(-g))`` (same precise
 exp), with the IEEE divide's result produced branch-free (``silu_nr``: rcp.approx + one
 FMA residual correction + three exact special cases), proven bit-identical for all 65536
-BF16 ``g``.  The GEMM mainloop is DKG's, unchanged (same K order;
+BF16 ``g``.  The GEMM mainloop is the CuTe DSL example's, unchanged (same K order;
 the 256x128 tile serves up to ``SMALL_MAX_ROWS``, the bytes do not depend on the tile);
 only the weight's rows are permuted (``interleave_gate_up``): MXF8 block scales run along
 K, so a row permutation permutes whole quantized rows and leaves every product and partial
@@ -30,12 +30,12 @@ rows 16b..16b+15, then up rows 16b..16b+15, b = 0..31 -- so a thread's subtile h
 16 gate and the 16 matching up values of output columns 16b..16b+15 (b = subtile column /
 32).  It stores them with two 16-byte stores to ``out[row, 16b:16b+16]`` (rows >= T are
 skipped); there is no C staging in SMEM and no TMA store.  Everything before the epilogue
-is DKG's ``Sm100BlockScaledPersistentDenseGemmKernel.kernel`` verbatim (from
+is the CuTe DSL example's ``Sm100BlockScaledPersistentDenseGemmKernel.kernel`` verbatim (from
 ``dense_blockscaled_gemm_persistent.py``).
 
-:pattern: glm-ctx-shared-up-swiglu-mxf8
-:device: SM100+ (Blackwell)
-:shape: runtime T; A e4m3 [T, 6144] + blocked e8m0 SFA, B e4m3 [1024, 6144] (interleaved),
+Pattern: glm-ctx-shared-up-swiglu-mxf8
+Device: SM100+ (Blackwell)
+Shape: runtime T; A e4m3 [T, 6144] + blocked e8m0 SFA, B e4m3 [1024, 6144] (interleaved),
     out BF16 [T, 512]
 """
 
@@ -58,7 +58,7 @@ from cutlass.cute.runtime import (
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
 from . import self_attn_prefill_projections_mxf8 as _proj
 
-_bs = _proj._bs  # DKG's dense block-scaled persistent GEMM example module
+_bs = _proj._bs  # the CuTe DSL dense block-scaled persistent GEMM example module
 cpasync = _bs.cpasync
 tcgen05 = _bs.tcgen05
 pipeline = _bs.pipeline

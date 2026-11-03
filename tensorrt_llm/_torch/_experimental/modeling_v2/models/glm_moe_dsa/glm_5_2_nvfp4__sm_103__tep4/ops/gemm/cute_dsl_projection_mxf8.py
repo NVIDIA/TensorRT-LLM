@@ -28,6 +28,9 @@ ENTRIES: dict[str, str] = {
     # slice of the intermediate.
     "dense_gate_up": "dense_gate_up_mxf8",
     "dense_down": "dense_down_mxf8",
+    # The MTP module's replicated eh_proj on context rows; A is the operand the two input
+    # norms write (`cute_dsl_mtp_eh_norm_cat_mxf8`).
+    "mtp_eh": "mtp_eh_proj_mxf8",
 }
 #: A weight in MXF8: e4m3 bytes `[N, K]` and its blocked e8m0 scales.
 QuantizedWeight = _kernel.QuantizedWeight
@@ -97,6 +100,7 @@ class CuteDslProjectionMxf8(OpWrapper):
         kv_b_v8   [M,  512] x [4096,  512]   A pre-quantized, e4m3 out
         dense_gate_up  [M, 6144] x [6144, 6144]
         dense_down     [M, 3072] x [6144, 3072]
+        mtp_eh         [M, 12288] x [6144, 12288]
 
     The pre-quantized entries take `x` as contiguous uint8 e4m3 bytes and `sfa` its blocked
     e8m0 scales (K padded to 128 for the layout; None means every block at 2^0).
@@ -175,6 +179,14 @@ class CuteDslProjectionMxf8(OpWrapper):
         Cell(
             why="dense_down at 7310 rows on the SwiGLU's operand, no bf16 activation",
             spec=dict(kernel="dense_down", rows=7310, pre=True, x_is_pre=True),
+        ),
+        Cell(
+            why="mtp_eh at 65 rows through its own activation quant",
+            spec=dict(kernel="mtp_eh", rows=65),
+        ),
+        Cell(
+            why="mtp_eh at 7310 rows on the input norms' operand, no bf16 concat",
+            spec=dict(kernel="mtp_eh", rows=7310, pre=True, x_is_pre=True),
         ),
     )
 

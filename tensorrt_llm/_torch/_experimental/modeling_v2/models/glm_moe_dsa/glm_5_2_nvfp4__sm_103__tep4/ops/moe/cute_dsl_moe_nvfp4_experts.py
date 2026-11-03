@@ -17,6 +17,8 @@ importable module.
 
 from __future__ import annotations
 
+import functools
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -39,6 +41,7 @@ from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _US
 
 from ...kernels.moe import moe_gather_grouped_gemm_act_fusion as _gg1
 from ...kernels.moe import moe_grouped_gemm_finalize_fusion as _gg2
+from ...kernels.moe import moe_grouped_gemm_finalize_fusion_dyn as _gg2_dyn
 from ...kernels.moe import moe_prefill_nvfp4_pair as _pair
 from ...kernels.moe.moe_utils import cute_tensor_from_torch as _ctf
 from .cute_dsl_moe_routing import LOCAL_EXPERTS, TILE, TOP_K, allocate_maps, max_tiles
@@ -295,10 +298,127 @@ def _fc2(
     )
 
 
+#: Rows of the dynamic FC2's A box: every M-tile of a launch of <= 64 tokens holds <= 64
+#: valid rows (one per token per expert), so the freed SMEM becomes pipeline depth.
+DYN_A_ROWS = 64
+#: The dynamic FC2 serves launches of up to this many tokens.
+DYN_MAX_ROWS = 64
+#: Bytes per call site's counter: two int32 words, padded.
+DYN_SLOT_BYTES = 16
+
+
+@cute.jit
+def _fc2_dyn(
+    a_ptr,
+    b_ptr,
+    sfa_ptr,
+    sfb_ptr,
+    out_ptr: cutlass.Int64,
+    tile_idx_ptr: cutlass.Int64,
+    bias_ptr: cutlass.Int64,
+    perm_idx_ptr: cutlass.Int64,
+    token_scales_ptr: cutlass.Int64,
+    alpha_ptr: cutlass.Int64,
+    mn_limit_ptr: cutlass.Int64,
+    num_tiles_m_ptr: cutlass.Int64,
+    dyn_ptr: cutlass.Int64,
+    stream,
+    k: cutlass.Constexpr,
+    n: cutlass.Constexpr,
+    ll: cutlass.Constexpr,
+    rows: cutlass.Constexpr,
+    topk: cutlass.Constexpr,
+    max_tiles_m: cutlass.Constexpr,
+    mma_tiler_n: cutlass.Constexpr,
+    mma_tiler_k: cutlass.Constexpr,
+    use_blkred: cutlass.Constexpr,
+    blkred_bufs: cutlass.Constexpr,
+    has_bias: cutlass.Constexpr,
+    use_bias_smem: cutlass.Constexpr,
+    epi_subtile_n: cutlass.Constexpr,
+    raster_along_m: cutlass.Constexpr,
+    num_sms: cutlass.Constexpr,
+    a_rows: cutlass.Constexpr,
+    ab_stage_cap: cutlass.Constexpr,
+):
+    """`_fc2` on the copy with dynamic tile assignment: after its first tile by CTA index,
+    each persistent CTA takes the next tile from the two-word counter at `dyn_ptr` (zero
+    before the first launch, reset by every launch's last CTA), so the SMs that get more
+    DRAM service take more tiles. Same operands as `_fc2`."""
+    kk = k // 2
+    a = cute.make_tensor(a_ptr, cute.make_layout((kk, rows, 1), stride=(1, kk, kk * rows)))
+    b = cute.make_tensor(b_ptr, cute.make_layout((kk, n, ll), stride=(1, kk, kk * n)))
+    sfa = cute.make_tensor(
+        sfa_ptr,
+        cute.make_layout(
+            (512, k // SF_ATOM_K, rows // SF_ATOM_MN, 1),
+            stride=(
+                1,
+                512,
+                512 * (k // SF_ATOM_K),
+                512 * (k // SF_ATOM_K) * (rows // SF_ATOM_MN),
+            ),
+        ),
+    )
+    sfb = cute.make_tensor(
+        sfb_ptr,
+        cute.make_layout(
+            (512, k // SF_ATOM_K, n // SF_ATOM_MN, ll),
+            stride=(
+                1,
+                512,
+                512 * (k // SF_ATOM_K),
+                512 * (k // SF_ATOM_K) * (n // SF_ATOM_MN),
+            ),
+        ),
+    )
+    _gg2_dyn.host_function(
+        a,
+        b,
+        sfa,
+        sfb,
+        out_ptr,
+        tile_idx_ptr,
+        bias_ptr,
+        perm_idx_ptr,
+        token_scales_ptr,
+        alpha_ptr,
+        mn_limit_ptr,
+        k,
+        n,
+        topk,
+        num_tiles_m_ptr,
+        max_tiles_m,
+        mma_tiler_n,
+        mma_tiler_k,
+        use_blkred,
+        blkred_bufs,
+        has_bias,
+        use_bias_smem,
+        epi_subtile_n,
+        raster_along_m,
+        num_sms,
+        dyn_ptr,
+        True,
+        a_rows,
+        ab_stage_cap,
+        stream,
+    )
+
+
+def _streams(join) -> tuple:
+    """`join` as a tuple of streams: None, one stream, or several."""
+    if join is None:
+        return ()
+    return tuple(join) if isinstance(join, (tuple, list)) else (join,)
+
+
 @dataclass(frozen=True)
 class CompiledDecodeExperts:
     """The decode pair, compiled once for a row capacity. `bias` is the zero fp32
-    `[experts, 2 * inter]` operand both GEMMs declare and neither reads."""
+    `[experts, 2 * inter]` operand both GEMMs declare and neither reads. `fc2_dyn` is FC2
+    with dynamic tile assignment and `dyn_ctr` its per-call-site counters (`dyn_slots`
+    rows of two int32 words), or None."""
 
     fc1: object
     fc2: object
@@ -307,6 +427,8 @@ class CompiledDecodeExperts:
     inter: int
     experts: int
     max_rows: int
+    fc2_dyn: object = None
+    dyn_ctr: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -334,6 +456,7 @@ def build_decode(
     inter: int,
     experts: int,
     max_rows: int,
+    dyn_slots: int = 0,
 ) -> CompiledDecodeExperts:
     """Compile FC1 and FC2 once, for up to `max_rows` rows. Call at load; nothing is
     launched.
@@ -347,6 +470,11 @@ def build_decode(
     directly instead would rebuild their IR on every call (150 builds per forward, the
     first inside the capture). Raises if a compile fails: the routed experts have no
     stock path for these packed weights.
+
+    `dyn_slots > 0` also compiles FC2 with dynamic tile assignment for launches of up to
+    `DYN_MAX_ROWS` tokens, with that many call-site counters: each call passes its own
+    slot (`dyn_slot`), and two launches on one slot must not overlap. At 40-47 active
+    experts on B300: -8.3 .. -10.2 % per FC2.
     """
     dev = out.device
     n_fc1 = 2 * inter
@@ -417,7 +545,47 @@ def build_decode(
             False,
             sms,
         )
-    return CompiledDecodeExperts(fc1, fc2, bias, hidden, inter, experts, int(max_rows))
+        fc2_dyn = dyn_ctr = None
+        if dyn_slots > 0:
+            # Zeroed once; every launch's last CTA resets its slot's words.
+            dyn_ctr = torch.zeros((dyn_slots, DYN_SLOT_BYTES // 4), dtype=torch.int32, device=dev)
+            fc2_dyn = cute.compile(
+                _fc2_dyn,
+                _act_ptr(c.data_ptr()),
+                _act_ptr(scratch),
+                _e4m3_ptr(sfc.data_ptr()),
+                _e4m3_ptr(scratch),
+                cutlass.Int64(out.data_ptr()),
+                cutlass.Int64(maps["tile_idx_to_expert_idx"].data_ptr()),
+                cutlass.Int64(bias.data_ptr()),
+                cutlass.Int64(maps["permuted_idx_to_expanded_idx"].data_ptr()),
+                cutlass.Int64(scratch),
+                cutlass.Int64(scratch),
+                cutlass.Int64(maps["tile_idx_to_mn_limit"].data_ptr()),
+                cutlass.Int64(maps["num_non_exiting_tiles"].data_ptr()),
+                cutlass.Int64(dyn_ctr.data_ptr()),
+                stream,
+                inter,
+                hidden,
+                experts,
+                cap_m,
+                TOP_K,
+                max_rows * TOP_K,
+                MMA_TILER_N,
+                MMA_TILER_K,
+                False,
+                1,
+                False,
+                False,
+                0,
+                False,
+                sms,
+                DYN_A_ROWS,
+                0,
+            )
+    return CompiledDecodeExperts(
+        fc1, fc2, bias, hidden, inter, experts, int(max_rows), fc2_dyn, dyn_ctr
+    )
 
 
 def _run_pair(
@@ -469,9 +637,10 @@ def _run_pair(
         cap,
         rest_n_sfc(n_fc1 // 2),
     )
-    if join is not None:
-        # The shared expert's partial must be in `out` before FC2 adds to it.
-        torch.cuda.current_stream().wait_stream(join)
+    for side in _streams(join):
+        # The shared expert's partial must be in `out` before FC2 adds to it. (Not named
+        # `stream`: that is the CUDA stream the FC2 launch below takes.)
+        torch.cuda.current_stream().wait_stream(side)
     gg2(
         c4,
         fc2_w.view(f4).view(experts, hidden, inter // 2).permute(0, 2, 1),
@@ -509,6 +678,7 @@ def _run_decode(
     c,
     sfc,
     join,
+    dyn_slot=None,
 ) -> None:
     """The compiled handles take only the runtime arguments, in signature order."""
     stream = cutlass_torch.current_stream()
@@ -530,10 +700,11 @@ def _run_decode(
         cutlass.Int64(maps["num_non_exiting_tiles"].data_ptr()),
         stream,
     )
-    if join is not None:
-        # The shared expert's partial must be in `out` before FC2 adds to it.
-        torch.cuda.current_stream().wait_stream(join)
-    compiled.fc2(
+    for side in _streams(join):
+        # The shared expert's partial must be in `out` before FC2 adds to it. (Not named
+        # `stream`: that is the CUDA stream the FC2 launch below takes.)
+        torch.cuda.current_stream().wait_stream(side)
+    fc2_args = (
         _act_ptr(c.data_ptr()),
         _act_ptr(fc2_w.data_ptr()),
         _e4m3_ptr(sfc.data_ptr()),
@@ -546,8 +717,12 @@ def _run_decode(
         cutlass.Int64(alpha2.data_ptr()),
         cutlass.Int64(maps["tile_idx_to_mn_limit"].data_ptr()),
         cutlass.Int64(maps["num_non_exiting_tiles"].data_ptr()),
-        stream,
     )
+    if dyn_slot is not None and compiled.fc2_dyn is not None and xq.shape[0] <= DYN_MAX_ROWS:
+        ctr = compiled.dyn_ctr.data_ptr() + int(dyn_slot) * DYN_SLOT_BYTES
+        compiled.fc2_dyn(*fc2_args, cutlass.Int64(ctr), stream)
+    else:
+        compiled.fc2(*fc2_args, stream)
 
 
 def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> CompiledPairExperts:
@@ -685,8 +860,9 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
     / `alpha2` fp32 `[64]`, the per-expert dequant products. `out` bf16 `[rows, 6144]`
     holds zeros or a partial (the shared expert's) that FC2 adds onto. `c` / `sfc` are
     the FC1 output scratch (`allocate_decode_c` or `allocate_pair_c`, `allocate_sfc`).
-    `join`, when given, is a stream the current stream waits for between FC1 and FC2:
-    the stream writing the shared expert's partial into `out`.
+    `join`, when given, is a stream (or a tuple of them) the current stream waits for
+    between FC1 and FC2: the stream writing the shared expert's partial into `out`, and the
+    one running the decode L2 prefetch.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -705,6 +881,14 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
             why="64 decode rows accumulating onto a partial written on another stream",
             spec=dict(pair=False, rows=64, offset=192, accumulate=True),
         ),
+        Cell(
+            why="one decode row on FC2 with dynamic tile assignment",
+            spec=dict(pair=False, rows=1, offset=64, dyn_slot=0),
+        ),
+        Cell(
+            why="the full decode batch on the dynamic FC2, accumulating onto a joined partial",
+            spec=dict(pair=False, rows=64, offset=0, accumulate=True, dyn_slot=3),
+        ),
         Cell(why="65 rows, the first prefill count: N128", spec=dict(pair=True, rows=65, offset=0)),
         Cell(
             why="513 rows on the prefill pair, N128, an FC1 output global scale other than 1",
@@ -719,8 +903,11 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
     )
 
     note = """
-    The target builds the decode pair once for 8192 rows (`build_decode`) and the
-    prefill pair once (`build_prefill_pair`). Up to 64 rows take the decode pair; 65..8192
+    The target builds the decode pair once for 8192 rows (`build_decode`, with one
+    dynamic-FC2 slot per trunk layer: a layer's decode FC2 runs at most once per forward)
+    and the prefill pair once (`build_prefill_pair`). Launches of up to 64 tokens pass
+    their layer's `dyn_slot`; the dynamic FC2's atomics add a token's terms in another
+    order, as the static kernel's already do run to run. Up to 64 rows take the decode pair; 65..8192
     take the prefill pair when it built, else the decode pair. There is no stock path:
     the weights are packed for these kernels alone.
 
@@ -752,10 +939,14 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         out: torch.Tensor,
         c: torch.Tensor,
         sfc: torch.Tensor,
-        join: torch.cuda.Stream | None,
+        join: torch.cuda.Stream | tuple | None,
         compiled: CompiledDecodeExperts | CompiledPairExperts,
+        dyn_slot: int | None = None,
     ) -> torch.Tensor:
-        run = _run_pair if isinstance(compiled, CompiledPairExperts) else _run_decode
+        if isinstance(compiled, CompiledPairExperts):
+            run = _run_pair
+        else:
+            run = functools.partial(_run_decode, dyn_slot=dyn_slot)
         run(
             compiled,
             xq,
@@ -792,8 +983,9 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         out: torch.Tensor,
         c: torch.Tensor,
         sfc: torch.Tensor,
-        join: torch.cuda.Stream | None,
+        join: torch.cuda.Stream | tuple | None,
         compiled: CompiledDecodeExperts | CompiledPairExperts,
+        dyn_slot: int | None = None,
     ) -> torch.Tensor:
         """Dequantize, gather, fp32 GEMMs (TF32 off), fp32 SwiGLU, the intermediate
         requantized through `fp4_quantize.reference` with `norm_const` as its global
@@ -836,8 +1028,9 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         out: torch.Tensor,
         c: torch.Tensor,
         sfc: torch.Tensor,
-        join: torch.cuda.Stream | None,
+        join: torch.cuda.Stream | tuple | None,
         compiled: CompiledDecodeExperts | CompiledPairExperts,
+        dyn_slot: int | None = None,
     ) -> None:
         # The decode pair reads every operand through a raw pointer: nothing checks a
         # shape, a stride or a capacity, and FC2 adds into whatever `out` points at.
@@ -853,6 +1046,10 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
             assert 1 <= rows <= compiled.max_rows, (
                 f"the decode pair is compiled for up to {compiled.max_rows} rows, got {rows}"
             )
+            if dyn_slot is not None and compiled.fc2_dyn is not None:
+                assert 0 <= dyn_slot < compiled.dyn_ctr.shape[0], (
+                    f"dyn_slot must be in 0..{compiled.dyn_ctr.shape[0] - 1}, got {dyn_slot}"
+                )
         u8, e4, f32 = torch.uint8, torch.float8_e4m3fn, torch.float32
         for name, t, shape, dtype in (
             ("xq", xq, (rows, hidden // 2), u8),

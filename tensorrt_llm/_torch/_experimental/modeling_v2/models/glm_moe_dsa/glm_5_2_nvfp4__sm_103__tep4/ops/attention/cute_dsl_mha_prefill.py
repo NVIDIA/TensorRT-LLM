@@ -27,9 +27,11 @@ fp8_head_scales = _kernel.fp8_head_scales
 
 #: The fp8 handles' kernel options: P converted to e4m3 four values per register, and on the
 #: MXF8-O handle an epilogue that holds a whole O chunk in registers, hands it back to the MMA,
-#: then rounds and block-scales it with packed converts. Same output bytes as without them.
-_FP8_VARIANT = {"cvt4": True}
-_Q8_VARIANT = {"cvt4": True, "epi_fast": True}
+#: then rounds and block-scales it with packed converts; and tail-first Q tiling, each
+#: request's partial 256-row tile pair first (its causal kv loop the shortest, the others' up
+#: to the shift shorter). Same output bytes as without them.
+_FP8_VARIANT = {"cvt4": True, "tail_first": True}
+_Q8_VARIANT = {"cvt4": True, "epi_fast": True, "tail_first": True}
 
 
 def sf_bytes(rows: int) -> int:

@@ -14,6 +14,11 @@ compiled object per group (dynamic layouts).  Output is
 bit-identical to ``torch.bmm`` at every cell.  One grid covers every head and
 the input, weight and output keep their serving strides (no copy on the decode
 path).
+
+``build(active_m=M, mxf8_side=Mxf8SideOutput(...))``: the same cell whose epilogue also
+writes the BF16 output as MXF8 (e4m3 + blocked e8m0 scales, the ``self_attn_prefill_act_quant_mxf8``
+rule) into the decode o_proj launcher's activation scratch, so o_proj's GEMM runs without its own
+act-quant launch.  The BF16 output is unchanged; kernel names gain ``_x8``.
 """
 
 from collections.abc import Callable
@@ -27,8 +32,18 @@ from . import _swapped_dense_gemm_persistent as _swappeddensegemmpersistent
 from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
 
 GemmSchedule = _swappeddensegemmpersistent.GemmSchedule
-WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
-
+try:
+    from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
+except ImportError:
+    from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
+WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = (
+    _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
+)
+try:
+    from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
+except ImportError:
+    from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
+Mxf8SideOutput = _kbbmm.Mxf8SideOutput
 BatchedGemmAbi = _kbbmm.BatchedGemmAbi
 make_persistent_build = _kbbmm.make_build
 
@@ -124,13 +139,14 @@ def rows_of_group(group: str) -> tuple[int, ...]:
 
 
 @lru_cache(maxsize=None)
-def _build_factory(group: str):
+def _build_factory(group: str, mxf8_side: Mxf8SideOutput | None = None):
     rows = rows_of_group(group)
     return make_persistent_build(
         make_abi(rows[-1]),
         _SCHEDULE_BY_GROUP[group],
         pdl_role=WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE,
         m_rows_allowed=rows,
+        mxf8_side=mxf8_side,
     )
 
 
@@ -138,6 +154,7 @@ def build(
     *,
     active_m: int = _ACTIVE_M,
     schedule_group: str | None = None,
+    mxf8_side: Mxf8SideOutput | None = None,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], object]:
     """Registry factory.
 
@@ -145,6 +162,8 @@ def build(
     thereby the schedule group; ``schedule_group`` (optional) must agree with
     the cell -- a disagreement is a routing fault and raises.  The runtime
     passes ``{"active_m": M}`` only.
+    ``mxf8_side``: the MXF8 side-output variant (module docstring); its buffers are
+    ``[rows_max >= M, 4096]``.
     """
     group = schedule_group_for_m(int(active_m))
     if schedule_group is not None and schedule_group != group:
@@ -152,4 +171,13 @@ def build(
             f"{ABI.module_name}: schedule_group={schedule_group!r} does not serve "
             f"active_m={active_m} (expected {group!r})"
         )
-    return _build_factory(group)()
+    if mxf8_side is not None and (
+        mxf8_side.k_cols != _NUM_HEADS * _OUTPUT_FEATURES
+        or mxf8_side.l_cols != _OUTPUT_FEATURES
+        or mxf8_side.rows_max < max(rows_of_group(group))
+    ):
+        raise ValueError(
+            f"{ABI.module_name}: MXF8 side output must be [>= {max(rows_of_group(group))}, "
+            f"{_NUM_HEADS * _OUTPUT_FEATURES}] with head stride {_OUTPUT_FEATURES}; got {mxf8_side}"
+        )
+    return _build_factory(group, mxf8_side)()

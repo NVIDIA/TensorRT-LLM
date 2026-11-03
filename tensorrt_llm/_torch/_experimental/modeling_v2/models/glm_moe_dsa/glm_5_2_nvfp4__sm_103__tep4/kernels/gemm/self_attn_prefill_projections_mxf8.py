@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2 context-step projections (kv_a, q_b, o_proj; the MoE shared expert's gate|up and
-down; the dense MLP's gate|up and down) as MXF8 block-scaled GEMMs.
+down; the dense MLP's gate|up and down; the MTP module's eh_proj) as MXF8 block-scaled GEMMs.
 
 On B300 the context step's BF16 projection GEMMs sit at the 1.08 kW power cap; e4m3
 operands with hardware block scaling (tcgen05 ``kind::mxf8f6f4``, e8m0 scale per 32
@@ -31,11 +31,12 @@ zero-fills the last block's upper half for A and B, and the weight is quantized
 zero-padded to 640 columns, whose blocked scale layout is the one the kernel
 derives for K = 576 (5 k-groups).
 
-:pattern: glm-ctx-proj-mxf8
-:device: SM100+ (Blackwell)
-:shape: runtime M; (N, K) = kv_a (2624, 6144), q_b (4096, 2048), o_proj (6144, 4096),
+Pattern: glm-ctx-proj-mxf8
+Device: SM100+ (Blackwell)
+Shape: runtime M; (N, K) = kv_a (2624, 6144), q_b (4096, 2048), o_proj (6144, 4096),
     kv_b_expand_k (4096, 576), kv_b_expand_v512 (4096, 512), shared_up (1024, 6144),
-    shared_down (6144, 512), dense_gate_up (6144, 6144), dense_down (6144, 3072)
+    shared_down (6144, 512), dense_gate_up (6144, 6144), dense_down (6144, 3072),
+    mtp_eh_proj (6144, 12288)
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ _SF_ALIGN = 32
 
 
 class GlmMxf8Gemm(_bs.Sm100BlockScaledPersistentDenseGemmKernel):
-    """The DKG block-scaled persistent GEMM taking tensors (uint8 storage for the e4m3 /
+    """The CuTe DSL block-scaled persistent GEMM taking tensors (uint8 storage for the e4m3 /
     e8m0 operands) and a runtime ``(m, n, k)``; A, B K-major, C row-major."""
 
     @cute.jit
@@ -138,6 +139,9 @@ ABIS: dict[str, Mxf8Abi] = {
     "dense_gate_up_mxf8": Mxf8Abi("dense_gate_up_mxf8", 6_144, 6_144),
     # Dense MLP down, [T, 3072] -> [T, 6144]; A is the SwiGLU's MXF8 operand.
     "dense_down_mxf8": Mxf8Abi("dense_down_mxf8", 6_144, 3_072),
+    # MTP eh_proj at context row counts (replicated on every rank), [T, 12288] -> [T, 6144];
+    # A is concat(enorm(e), hnorm(h)) written as MXF8 by ``mtp_eh_norm_cat_mxf8``.
+    "mtp_eh_proj_mxf8": Mxf8Abi("mtp_eh_proj_mxf8", 6_144, 12_288),
 }
 
 # (mma tiler (M, N), cluster (M, N)).  256x256 2-CTA was the best tile at every op at
@@ -162,6 +166,7 @@ SMALL_TILE_MAX_ROWS: dict[str, int] = {
     "shared_down_mxf8": 1_024,
     "dense_gate_up_mxf8": 1_024,
     "dense_down_mxf8": 1_024,
+    "mtp_eh_proj_mxf8": 1_024,
 }
 
 Compiled = Callable[..., object]

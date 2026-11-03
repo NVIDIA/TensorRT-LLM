@@ -26,6 +26,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from dataclasses import dataclass
 from typing import Any, Literal, Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -41,6 +42,7 @@ from cutlass.cutlass_dsl import Constexpr, Int32, const_expr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..common import cvt_ptx
+from ..common import self_attn_prefill_act_quant_mxf8 as _mxf8
 
 """
 A high-performance persistent batched dense GEMM example for the NVIDIA Blackwell SM100 architecture
@@ -187,7 +189,17 @@ def _compute_stages(
 
 # ---------------------------------------------------------------------------
 # GLM-owned TMA-store epilogue: library path for every C dtype, exact
-# FP32 -> BF16 -> E4M3 word-packed path for Float8E4M3FN (FP8 q-base).
+# FP32 -> BF16 -> E4M3 word-packed path for Float8E4M3FN (FP8 q-base), and the
+# BF16 store plus an MXF8 side output for a kernel carrying ``glm_mxf8_side``
+# (decode V-B writing o_proj's MXF8 operand next to its BF16 output): once the
+# BF16 subtile is in shared memory (after the proxy fence and named barrier that
+# precede the TMA store), the epilogue threads read it back in 8-element chunks
+# along M and write it with the ``self_attn_prefill_act_quant_mxf8`` rule
+# (``mxf8_quant_store_x8``) to a fixed row-major ``[rows_max, k_cols]`` e4m3
+# buffer and its blocked e8m0 scales.  In the swapped orientation the GEMM's M is
+# the output column (32 consecutive M = one scale block), N the token row, L the
+# head.  Same BF16 values, same quant function: the bytes equal the standalone
+# quant of the BF16 output.
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +223,25 @@ def epilogue_tma_store(
     acc_pipeline: pipeline.PipelineAsync,
     c_pipeline: pipeline.PipelineTmaStore,
 ) -> pipeline.PipelineState:
-    """Dispatch: exact double-round for FP8 C, else the library epilogue."""
+    """Dispatch: exact double-round for FP8 C, the BF16 store plus an MXF8 side output for
+    a kernel carrying ``glm_mxf8_side``, else the library epilogue."""
+    if const_expr(getattr(gemm_kernel, "glm_mxf8_side", None) is not None):
+        return epilogue_tma_store_mxf8_side(
+            gemm_kernel,
+            epi_tidx,
+            warp_idx,
+            tma_atom_c,
+            tCtAcc_base,
+            sC,
+            tCgC_base,
+            epi_tile,
+            num_tiles_executed,
+            epilogue_op,
+            mma_tile_coord_mnl,
+            acc_consumer_state,
+            acc_pipeline,
+            c_pipeline,
+        )
     if const_expr(gemm_kernel.c_dtype is cutlass.Float8E4M3FN):
         return epilogue_tma_store_fp8_word_packed(
             gemm_kernel,
@@ -397,6 +427,201 @@ def epilogue_tma_store_fp8_word_packed(
     return acc_consumer_state
 
 
+@dataclass(frozen=True)
+class Mxf8SideOutput:
+    """Where the MXF8 side output of a swapped GEMM goes (compile-time constants).
+
+    ``q_addr`` / ``sf_addr``: device addresses of a persistent ``[rows_max, k_cols]`` uint8
+    e4m3 buffer and its blocked e8m0 scale buffer (``self_attn_prefill_act_quant_mxf8``
+    layout, >= ``sf_bytes(rows_max, k_cols)``).  They are baked into the kernel, so the
+    buffers must outlive it and never move -- the decode MXF8 projection launcher's own
+    activation scratch, allocated once (CUDA-graph replays see the same addresses).
+    Output element ``(m, n, l)`` of the GEMM (swapped: ``m`` = column within head ``l``,
+    ``n`` = token row) is column ``l * l_cols + m`` of row ``n``.  Rows ``>= rows_max`` are
+    not written; rows past the call's active rows hold the quantized zero-filled tail
+    (never stored by the consumer GEMM)."""
+
+    q_addr: int
+    sf_addr: int
+    k_cols: int
+    l_cols: int
+    rows_max: int
+
+    def __post_init__(self) -> None:
+        if self.q_addr % 16 or self.sf_addr % 16:
+            raise ValueError("MXF8 side output buffers must be 16-byte aligned")
+        if self.k_cols % 128 or self.l_cols % 32:
+            raise ValueError(
+                "MXF8 side output needs k_cols % 128 == 0 and l_cols % 32 == 0"
+            )
+
+
+@cute.jit
+def _mxf8_side_store_subtile(
+    sC_sub: cute.Tensor,
+    epi_tidx: Int32,
+    m0: Int32,
+    n0: Int32,
+    l_idx: Int32,
+    side: Constexpr,
+    num_threads: Constexpr,
+) -> None:
+    """Quantize one BF16 epilogue subtile ``sC_sub`` ``(EPI_M, EPI_N)`` (smem, visible to every
+    epilogue thread) whose element ``(m, n)`` is GEMM output ``(m0 + m, n0 + n, l_idx)``.
+    Chunk ``c`` = 8 consecutive M of one N: ``m8 = c % (EPI_M / 8)``, ``n = c // (EPI_M / 8)``,
+    so lanes ``4j .. 4j + 3`` of a warp hold one 32-column scale block of one row (the
+    ``mxf8_quant_store_x8`` contract; every lane reaches its shuffles)."""
+    EPI_M = cute.size(sC_sub, mode=[0])
+    EPI_N = cute.size(sC_sub, mode=[1])
+    assert EPI_M % 32 == 0, f"MXF8 side output needs EPI_M % 32 == 0, got {EPI_M}"
+    M8 = EPI_M // 8
+    CHUNKS = M8 * EPI_N
+    ITERS = (CHUNKS + num_threads - 1) // num_threads
+    q_base = cute.make_ptr(
+        cutlass.Uint8, side.q_addr, cute.AddressSpace.gmem, assumed_align=16
+    )
+    sf_base = cute.make_ptr(
+        cutlass.Uint8, side.sf_addr, cute.AddressSpace.gmem, assumed_align=16
+    )
+    for it in cutlass.range_constexpr(ITERS):
+        c = epi_tidx + it * num_threads
+        # Chunks past CHUNKS (only when CHUNKS % num_threads != 0) re-read an in-range chunk
+        # so the shuffles stay well-defined -- whole 4-lane groups together, CHUNKS % 4 == 0
+        # -- and store nothing: their row is pushed past rows_max.
+        cc = c % CHUNKS
+        m8 = cc % M8
+        n = cc // M8
+        vals = cute.make_rmem_tensor((8,), cutlass.Float32)
+        for i in cutlass.range_constexpr(8):
+            vals[i] = sC_sub[(m8 * 8 + i, n)].to(cutlass.Float32)
+        row = n0 + n
+        col = l_idx * side.l_cols + m0 + m8 * 8
+        _mxf8.mxf8_quant_store_x8(
+            vals,
+            q_base,
+            cutlass.Int64(row) * side.k_cols + cutlass.Int64(col),
+            sf_base,
+            cutlass.Int64(row),
+            cutlass.Int64(col),
+            cutlass.Int64(side.k_cols // 128),
+            row + (c // CHUNKS) * side.rows_max < side.rows_max,
+        )
+
+
+@cute.jit
+def epilogue_tma_store_mxf8_side(
+    gemm_kernel: Any,
+    epi_tidx: Int32,
+    warp_idx: Int32,
+    tma_atom_c: cute.CopyAtom,
+    tCtAcc_base: cute.Tensor,
+    sC: cute.Tensor,
+    tCgC_base: cute.Tensor,
+    epi_tile: cute.Tile,
+    num_tiles_executed: Int32,
+    epilogue_op: Constexpr,
+    mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
+    acc_consumer_state: pipeline.PipelineState,
+    acc_pipeline: pipeline.PipelineAsync,
+    c_pipeline: pipeline.PipelineTmaStore,
+) -> pipeline.PipelineState:
+    """Library ``epilogue_tma_store`` body (BF16 C, no SFD) plus the MXF8 side output of
+    every subtile (``_mxf8_side_store_subtile``) between its smem store and its TMA store."""
+    side = gemm_kernel.glm_mxf8_side
+    assert not gemm_kernel.use_2cta_instrs, "MXF8 side output: 1-CTA MMA only"
+    assert gemm_kernel.c_dtype is cutlass.BFloat16, "MXF8 side output: BF16 C only"
+    tCgC = sm100_epilogue.transform_partitioned_tensor_layout(tCgC_base)
+    tCtAcc = sm100_epilogue.transform_partitioned_tensor_layout(tCtAcc_base)
+
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
+        sm100_epilogue.epilogue_tmem_copy_and_partition(
+            gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
+        )
+    )
+
+    tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, gemm_kernel.c_dtype)
+    tiled_copy_r2s, tRS_rC, tRS_sC = sm100_epilogue.epilogue_smem_copy_and_partition(
+        gemm_kernel, tiled_copy_t2r, tTR_rC, epi_tidx, sC
+    )
+
+    tCgC_epi = cute.flat_divide(tCgC, epi_tile)
+    bSG_sC, bSG_gC_partitioned = cpasync.tma_partition(
+        tma_atom_c,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sC, 0, 2),
+        cute.group_modes(tCgC_epi, 0, 2),
+    )
+
+    num_epi_threads = WARP_SIZE * len(gemm_kernel.epilogue_warp_id)
+    epilog_sync_barrier = pipeline.NamedBarrier(
+        barrier_id=gemm_kernel.epilog_sync_bar_id,
+        num_threads=num_epi_threads,
+    )
+    # epilogue subtiles along M inside one tile (maps the flat subtile index to (m, n))
+    epi_m_cnt = cute.size(tTR_tAcc_base.shape, mode=[3])
+    epi_tile_m = cute.size(sC, mode=[0])
+    epi_tile_n = cute.size(sC, mode=[1])
+
+    bSG_gC = bSG_gC_partitioned[(None, None, None, *mma_tile_coord_mnl)]
+    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_consumer_state.index)]
+
+    acc_pipeline.consumer_wait(acc_consumer_state)
+
+    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+
+    subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+    epi_n_cnt = subtile_cnt // epi_m_cnt
+    num_prev_subtiles = num_tiles_executed * subtile_cnt
+    for subtile_idx in range(subtile_cnt):
+        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+        # Convert to C type (the library's non-SFD sequence)
+        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+        acc_vec = acc_vec.to(gemm_kernel.c_dtype)
+        acc_vec = epilogue_op(acc_vec)
+        tRS_rC.store(acc_vec)
+
+        c_buffer = (num_prev_subtiles + subtile_idx) % gemm_kernel.num_c_stage
+        cute.copy(tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)])
+        cute.arch.fence_proxy(
+            "async.shared",
+            space="cta",
+        )
+        epilog_sync_barrier.arrive_and_wait()
+
+        # MXF8 side output of this subtile from the BF16 smem copy every thread now sees;
+        # the reads finish before the barrier below, so the buffer is not yet reused.
+        _mxf8_side_store_subtile(
+            sC[(None, None, c_buffer)],
+            epi_tidx,
+            (mma_tile_coord_mnl[0] * epi_m_cnt + subtile_idx % epi_m_cnt) * epi_tile_m,
+            (mma_tile_coord_mnl[1] * epi_n_cnt + subtile_idx // epi_m_cnt) * epi_tile_n,
+            mma_tile_coord_mnl[2],
+            side,
+            num_epi_threads,
+        )
+
+        if warp_idx == gemm_kernel.epilogue_warp_id[0]:
+            cute.copy(
+                tma_atom_c,
+                bSG_sC[(None, c_buffer)],
+                bSG_gC[(None, subtile_idx)],
+            )
+            c_pipeline.producer_commit()
+            c_pipeline.producer_acquire()
+        epilog_sync_barrier.arrive_and_wait()
+
+    epilog_sync_barrier.arrive_and_wait()
+
+    with cute.arch.elect_one():
+        acc_pipeline.consumer_release(acc_consumer_state)
+    acc_consumer_state.advance()
+    return acc_consumer_state
+
+
 class PersistentDenseGemmKernel:
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
@@ -462,6 +687,7 @@ class PersistentDenseGemmKernel:
         wait_for_prior_pdl: bool = False,
         signal_next_pdl: bool = False,
         prewait_tma_operand: Literal["none", "a"] = "none",
+        signal_after_wait_pdl: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -495,6 +721,11 @@ class PersistentDenseGemmKernel:
             TMEM cleanup.
         :param prewait_tma_operand: ``"a"`` loads the first k-block of A before the
             wait (swapped A is the immutable weight); ``"none"`` waits before both.
+        :param signal_after_wait_pdl: Also signal the next grid right after the
+            activation wait (in addition to the end-of-kernel signal), so a dependent
+            that does not read this grid's output can run concurrently with its
+            mainloop (decode: the K-B GEMM -> the RoPE generation kernel with its
+            late wait).
         """
 
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
@@ -505,6 +736,12 @@ class PersistentDenseGemmKernel:
         self.wait_for_prior_pdl = wait_for_prior_pdl
         self.signal_next_pdl = signal_next_pdl
         self.prewait_tma_operand = prewait_tma_operand
+        self.signal_after_wait_pdl = signal_after_wait_pdl
+        if signal_after_wait_pdl and not (wait_for_prior_pdl and signal_next_pdl):
+            raise ValueError("signal_after_wait_pdl needs a wait-and-signal role")
+        # decode act-quant fusion: the epilogue also writes the output as MXF8
+        # (``epilogue_tma_store_mxf8_side``); set by the PDL-chain factory
+        self.glm_mxf8_side = None
         # K dimension is deferred in _setup_attributes
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
@@ -1037,6 +1274,8 @@ class PersistentDenseGemmKernel:
                     ):
                         if handle.count == 0:
                             cute.arch.griddepcontrol_wait()
+                            if cutlass.const_expr(self.signal_after_wait_pdl):
+                                cute.arch.griddepcontrol_launch_dependents()
                     cute.copy(
                         tma_atom_a,
                         tAgA_slice[(None, handle.count)],
@@ -1049,6 +1288,8 @@ class PersistentDenseGemmKernel:
                     ):
                         if handle.count == 0:
                             cute.arch.griddepcontrol_wait()
+                            if cutlass.const_expr(self.signal_after_wait_pdl):
+                                cute.arch.griddepcontrol_launch_dependents()
                     cute.copy(
                         tma_atom_b,
                         tBgB_slice[(None, handle.count)],

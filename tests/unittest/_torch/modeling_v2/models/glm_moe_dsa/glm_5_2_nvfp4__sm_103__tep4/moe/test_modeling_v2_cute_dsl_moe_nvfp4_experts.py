@@ -115,6 +115,7 @@ def _compiled(pair: bool):
                 inter=INTER,
                 experts=EXPERTS,
                 max_rows=MAX_ROWS,
+                dyn_slots=4,
             )
     return _STATE[key]
 
@@ -201,7 +202,7 @@ def test_certified_cells(cell) -> None:
     with validating(op):
         result = op(
             xq, xsf, maps, topk_w, fc1_w, fc1_s, fc2_w, fc2_s,
-            norm_const, alpha1, alpha2, out, c, sfc, join, compiled,
+            norm_const, alpha1, alpha2, out, c, sfc, join, compiled, spec.get("dyn_slot"),
         )  # fmt: skip
     assert result is out, "the op accumulates into `out` and returns it"
     # `reference` reads `out` as the value FC2 accumulates onto: the value before the call.

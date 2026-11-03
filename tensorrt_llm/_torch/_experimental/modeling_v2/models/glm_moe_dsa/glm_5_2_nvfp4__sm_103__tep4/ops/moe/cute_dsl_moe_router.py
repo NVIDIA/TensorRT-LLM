@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
 from ...kernels.moe import moe_frontend_router as _vec2
+from ...kernels.moe import moe_decode_router_partials as _partials
 from ...kernels.moe import moe_frontend_router_tc as _tc
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
 from ...kernels.moe import moe_prefill_router_partials as _prefill
@@ -78,23 +79,15 @@ def _simt_launch(compiled) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor
     return launch
 
 
-def _tc_launch(gemm) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
-    k_split = HIDDEN // SPLIT_K
+#: CTAs per multicast cluster of the decode partials router: 2 instead of the kernel's 8,
+#: so the router finds its SMs beside the shared expert's gate/up behind the pre-MoE
+#: all-reduce (same MMAs in the same order, bitwise partials).
+DECODE_CLUSTER = 2
 
+
+def _partials_launch(fn) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
     def launch(x, weight, out):
-        gemm(
-            int(x.shape[0]),
-            EXPERTS,
-            k_split,
-            SPLIT_K,
-            x.data_ptr(),
-            weight.data_ptr(),
-            out.permute(0, 2, 1),
-            HIDDEN,
-            k_split,
-            HIDDEN,
-            k_split,
-        )
+        fn(x, weight, out, int(x.shape[0]))
 
     return launch
 
@@ -104,7 +97,10 @@ def build(rows: int, device) -> RouterRunner:
     zeros. Call at load.
 
     Rows 1..5 take the SIMT kernel (one expert per CTA), 6..64 the tensor-core split-K
-    kernel; both with PDL as the engine sets it. Costs one CuTe DSL compile per row
+    kernel that loads its weight slice before its PDL wait, multicasts each activation
+    tile over a `DECODE_CLUSTER`-CTA cluster and releases the top-k at entry (router +
+    top-k 7.78 -> 5.95 us per MoE layer at 64 rows on B300, the top-k ending 4.7 us
+    earlier behind the all-reduce in serving); both with PDL as the engine sets it. Costs one CuTe DSL compile per row
     count (cached per process by the kernel modules). Raises if `rows` is outside 1..64.
     """
     rows = int(rows)
@@ -122,7 +118,11 @@ def build(rows: int, device) -> RouterRunner:
             runner = RouterRunner(
                 "tc_partials",
                 rows,
-                _tc_launch(_tc.compile_router_tc_partials(x, w, out, use_pdl=_USE_PDL)),
+                _partials_launch(
+                    _partials.compile_router_partials(
+                        x, w, out, use_pdl=_USE_PDL, cluster=DECODE_CLUSTER
+                    )
+                ),
             )
         runner.launch(x, w, out)
     return runner

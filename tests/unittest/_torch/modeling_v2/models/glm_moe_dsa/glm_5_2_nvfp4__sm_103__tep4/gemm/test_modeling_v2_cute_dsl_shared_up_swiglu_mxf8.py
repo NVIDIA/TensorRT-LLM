@@ -74,9 +74,11 @@ def test_certified_cells(cell, compiled, plain, weights) -> None:
     want = rows_swiglu.swiglu(sw, gu)
     torch.cuda.synchronize()
     assert torch.equal(out, want), f"{int((out != want).sum())} outputs differ from the pair"
-    # The fp64 SwiGLU on the same operands: one bf16 rounding on each side.
+    # The fp64 SwiGLU on the same MXF8 operands. The GEMM's fp32 sums and the reference's
+    # differ in order, so a gate or up value may round to the neighbouring bf16 before the
+    # product: up to 4 ulp on such an element against the row scale, 1 ulp RMS.
     assert_within_ulp(
-        out, op.reference(x, w8_il, out, compiled, pre=pre), element_ulp=2.0, rms_ulp=0.5
+        out, op.reference(x, w8_il, out, compiled, pre=pre), element_ulp=4.0, rms_ulp=1.0
     )
 
 

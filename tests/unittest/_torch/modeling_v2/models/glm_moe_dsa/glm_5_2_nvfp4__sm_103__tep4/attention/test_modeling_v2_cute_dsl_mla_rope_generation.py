@@ -149,6 +149,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert (spec["qk_nope_head_dim"], spec["latent_row_stride"]) == (NOPE, QKVA_WIDTH)
     p, n, layer = spec["predicted_tokens_per_seq"], spec["num_seqs"], spec["layer_idx"]
     cached = spec["cached"]
+    # The K-B GEMM wrote the q-base: the op must leave those bytes (the sentinel) alone.
+    from_kb = bool(spec.get("q_base_from_kb"))
     torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
     dev = torch.cuda.current_device()
 
@@ -186,6 +188,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
             q_pe_token_stride=q_pe.stride(0),
             latent_row_stride=latent.stride(0),
             device_index=dev,
+            q_base_from_kb=from_kb,
         )
         # The target's positional call, argument for argument.
         args = (
@@ -199,9 +202,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         )  # fmt: skip
         before = [env.layer(i).clone() for i in range(env.num_layers)]
 
-        op(*args, compiled=compiled)
+        op(*args, compiled=compiled, q_base_from_kb=from_kb)
         torch.cuda.synchronize()
-        ref = op.reference(*args, compiled=compiled)
+        ref = op.reference(*args, compiled=compiled, q_base_from_kb=from_kb)
 
         # Read-only inputs come back untouched.
         for got, was in zip((q, qkva, fused_q), inputs):

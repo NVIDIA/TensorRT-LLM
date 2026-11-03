@@ -50,8 +50,18 @@ _DENSE_GEMM = _swappeddensegemmpersistent._DENSE_GEMM
 _GlmPersistentDenseGemmKernel = _swappeddensegemmpersistent._GlmPersistentDenseGemmKernel
 
 PersistentPdlRole = _swappeddensegemmpdlchain.PersistentPdlRole
-WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
+WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = (
+    _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
+)
+# decode K-B / RoPE overlap: same role plus a dependent signal right after the activation wait, so a
+# late-waiting the RoPE generation kernel (``emit_q_base=False``) runs concurrently with this GEMM.
+WAIT_EARLY_SIGNAL_PRELOAD_WEIGHT_ROLE = (
+    _swappeddensegemmpdlchain.WAIT_EARLY_SIGNAL_PRELOAD_WEIGHT_ROLE
+)
 make_pdl_chain_kernel = _swappeddensegemmpdlchain.make_pdl_chain_kernel
+Mxf8SideOutput = _swappeddensegemmpdlchain.Mxf8SideOutput
+# Kernel-name fragment of a build with the MXF8 side output (decode act-quant fusion, V-B -> o_proj).
+MXF8_SIDE_KERNEL_SUFFIX = "_x8"
 
 _ALIGNMENT_BYTES = 16
 _BF16_VECTOR_SIZE = _ALIGNMENT_BYTES // 2
@@ -266,6 +276,7 @@ def _compile(
     *,
     emit_fp8_q_base: bool = False,
     m_rows_allowed: tuple[int, ...] = (),
+    mxf8_side: Mxf8SideOutput | None = None,
 ) -> CompiledBatchedGemm:
     if schedule.orientation != "swapped":
         raise ValueError(f"{abi.module_name}: batched MLA adapter requires swapped orientation")
@@ -276,8 +287,21 @@ def _compile(
         emit_fp8_q_base=emit_fp8_q_base,
     )
     if emit_fp8_q_base and pdl_role is None:
-        raise ValueError(f"{abi.module_name}: emit_fp8_q_base requires a PDL-chain role")
-    a, b, c = _make_runtime_arguments(input_tensor, weight, output, fp8_output=emit_fp8_q_base)
+        raise ValueError(
+            f"{abi.module_name}: emit_fp8_q_base requires a PDL-chain role"
+        )
+    if mxf8_side is not None and (
+        pdl_role is None
+        or emit_fp8_q_base
+        or not getattr(schedule, "use_tma_store", True)
+    ):
+        raise ValueError(
+            f"{abi.module_name}: the MXF8 side output needs a PDL-chain role, a BF16 C and "
+            "the TMA-store epilogue"
+        )
+    a, b, c = _make_runtime_arguments(
+        input_tensor, weight, output, fp8_output=emit_fp8_q_base
+    )
     mnkl = (
         abi.output_features,
         abi.active_m,
@@ -298,7 +322,7 @@ def _compile(
             schedule.raster_along,
         )
     else:
-        gemm = make_pdl_chain_kernel(schedule, pdl_role)
+        gemm = make_pdl_chain_kernel(schedule, pdl_role, mxf8_side)
     if not gemm.can_implement(
         mnkl,
         a.element_type,
@@ -312,8 +336,12 @@ def _compile(
     kernel_name_prefix = abi.kernel_name_prefix
     if emit_fp8_q_base:
         kernel_name_prefix = f"{kernel_name_prefix}{FP8_Q_BASE_KERNEL_SUFFIX}"
+    if mxf8_side is not None:
+        kernel_name_prefix = f"{kernel_name_prefix}{MXF8_SIDE_KERNEL_SUFFIX}"
     if pdl_role is not None:
         kernel_name_prefix = f"{kernel_name_prefix}_pdl_chain"
+        if pdl_role.signal_after_wait:
+            kernel_name_prefix = f"{kernel_name_prefix}_es"
     gemm.kernel.set_name_prefix(
         kernel_name_prefix,
         remove_cutlass_symbol=True,
@@ -353,6 +381,7 @@ def make_build(
     pdl_role: PersistentPdlRole | None = None,
     emit_fp8_q_base: bool = False,
     m_rows_allowed: tuple[int, ...] = (),
+    mxf8_side: Mxf8SideOutput | None = None,
 ) -> Callable[[], CompiledBatchedGemm]:
     """Create the no-argument factory consumed by the TRT module registry.
 
@@ -361,6 +390,8 @@ def make_build(
         FP32->BF16->FP8 bytes (see the module docstring). Default off.
     :param m_rows_allowed: row counts one compiled object serves (runtime-M);
         empty = exactly ``abi.active_m``.
+    :param mxf8_side: V-B only (decode act-quant fusion): the epilogue also writes the BF16 output as
+        MXF8 into the fixed buffers it names (``Mxf8SideOutput``). Default off.
     """
     compiled_by_layout: dict[tuple[object, ...], CompiledBatchedGemm] = {}
     rows_allowed = tuple(m_rows_allowed) or (int(abi.active_m),)
@@ -399,6 +430,7 @@ def make_build(
                     schedule,
                     pdl_role,
                     emit_fp8_q_base,
+                    mxf8_side,
                 )
                 compiled = compiled_by_layout.get(key)
                 if compiled is None:
@@ -412,6 +444,7 @@ def make_build(
                         pdl_role,
                         emit_fp8_q_base=emit_fp8_q_base,
                         m_rows_allowed=rows_allowed,
+                        mxf8_side=mxf8_side,
                     )
                     compiled_by_layout[key] = compiled
             return compiled(input_tensor, weight, output)
@@ -485,12 +518,16 @@ def rows_of_group(group: str) -> tuple[int, ...]:
 
 
 @lru_cache(maxsize=None)
-def _build_factory(emit_fp8_q_base: bool, group: str):
+def _build_factory(emit_fp8_q_base: bool, group: str, early_signal: bool = False):
     rows = rows_of_group(group)
     return make_build(
         make_abi(rows[-1]),
         _SCHEDULE_BY_GROUP[group],
-        pdl_role=WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE,
+        pdl_role=(
+            WAIT_EARLY_SIGNAL_PRELOAD_WEIGHT_ROLE
+            if early_signal
+            else WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
+        ),
         emit_fp8_q_base=emit_fp8_q_base,
         m_rows_allowed=rows,
     )
@@ -501,8 +538,14 @@ def build(
     emit_fp8_q_base: bool = False,
     active_m: int = _FORMAL_ACTIVE_M,
     schedule_group: str | None = None,
+    early_signal: bool = False,
 ):
     """Registry factory.
+
+    ``early_signal`` (decode K-B / RoPE overlap, needs ``emit_fp8_q_base``): the dependent grid is
+    signalled right after the activation wait as well, so the RoPE generation kernel compiled with
+    ``late_wait`` (which does not read this GEMM's output) runs concurrently with it;
+    kernel name gains ``_es``. Same GEMM and output bytes.
 
     ``emit_fp8_q_base`` selects the FP8 q-base epilogue; ``active_m`` selects the
     cell (one of :data:`ACTIVE_M_CELLS`) and thereby the schedule group.  The
@@ -515,4 +558,8 @@ def build(
             f"self_attn.k_b_bmm: schedule_group={schedule_group!r} does not serve "
             f"active_m={active_m} (expected {group!r})"
         )
-    return _build_factory(bool(emit_fp8_q_base), group)()
+    if early_signal and not emit_fp8_q_base:
+        raise ValueError(
+            "self_attn.k_b_bmm: early_signal needs emit_fp8_q_base (the RoPE generation kernel then skips the q-base)"
+        )
+    return _build_factory(bool(emit_fp8_q_base), group, bool(early_signal))()

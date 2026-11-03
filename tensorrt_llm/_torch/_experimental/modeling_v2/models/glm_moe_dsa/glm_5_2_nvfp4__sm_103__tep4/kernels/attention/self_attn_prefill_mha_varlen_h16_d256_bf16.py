@@ -64,14 +64,28 @@ per-head factors read from ``head_scales`` [2, 16] FP32 at each tile's start (ro
 so the inner loops are those of the BF16 kernel. The conditional rescale threshold is capped at
 ``FP8_RESCALE_THRESHOLD_MAX`` (P <= 2^(8 + 0.75) ~ 430 < 448, the E4M3 maximum). CLC schedule only
 (the per-head factor is indexed by the CLC tile's head).
-MHA epilogue options options (FP8 launchers; ``build(..., variant=...)``, kernel symbol suffix ``_sol``; same
+MHA epilogue options (FP8 launchers; ``build(..., variant=...)``, kernel symbol suffix ``_sol``; same
 output bytes): ``cvt4`` converts P to E4M3 four values per register (one packed
 ``cvt.rn.satfinite.e4m3x2.f32`` pair, no PRMT re-packing); ``epi_fast`` (MXF8-O launcher) gives the
 correction warps 208 registers, reads a whole 128-column O chunk from TMEM, hands it back to the MMA
 and then scales / BF16-rounds (packed ``cvt.rn.bf16x2.f32`` on the ALU pipe instead of one XU ``F2F``
 per value) / block-scales / stores from registers, the four 32-value sub-chunks interleaved stage by
 stage. The served q8 epilogue was latency-bound on the correction warps (~6k cycles per work tile at
-the 1.03 GHz base clock) and delays the next tile's per-step O handoff (MHA epilogue options study, DLSIM_TRACK).
+the 1.03 GHz base clock) and delays the next tile's per-step O handoff.
+Tail-first Q tiling (``tail_first``, kernel symbol suffix ``_tail``; same output bytes): a request's
+query rows are tiled shifted back by ``s`` rows -- tile pair t covers rows ``[256 t - s, 256 (t + 1) -
+s)`` -- so the partial tile pair is the FIRST one, whose causal kv loop is the shortest, instead of the
+last one, which runs the request's whole kv length; every other pair's kv loop also ends up to ``s``
+rows earlier. ``s`` is the largest shift ``<= pad = 256 n - q_len`` (n tile pairs) that keeps each
+pair's causal diagonal on the 128-row kv-tile grid, ``s = pad - ((pad - c) mod 128)`` for c cached rows
+(0 if negative), so a pair crosses two masked kv steps instead of three; ``tail_align=False`` shifts by
+``pad`` itself (symbol suffix ``_tailraw``). The tile code runs unchanged in a shifted request frame --
+first row ``cu_seqlens[b] - s``, ``q_len + s`` query rows, the same K/V rows -- whose bottom-right
+causal alignment is the original one. The ``s`` leading rows (the previous request's rows, or TMA
+zero-fill below row 0) only feed rows that are not stored: the epilogue predicate keeps rows
+``s <= r < q_len + s``. A stored row sees the same kv tiles with the same masks in the same order as
+without the option (the extra fully masked tiles past its diagonal add exact zeros, and a rescale of a
+row whose max did not move multiplies by exp2(0) = 1), so the output bytes are the same.
 Launch: TVM-FFI (``--enable-tvm-ffi``, environment stream); one compiled function serves every
 T / B / max_seqlen. Kernel symbol prefix ``glm52_self_attn_prefill_mha``.
 """
@@ -126,13 +140,16 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
         fp8: bool = False,
         cvt4: bool = False,
         epi_fast: bool = False,
+        tail_first: bool = False,
+        tail_align: bool = True,
     ) -> None:
         """``sched``: ``clc`` (default; see the module doc) or ``static`` (the base persistent
         round-robin over (m, h, b) tiles). ``clc_budget_div`` sizes the CLC order's (h, b)
         chunk: ``max(4, clc_budget_div // m_cta_tiles)`` groups, about
         ``clc_budget_div * 128 KiB`` of K/V. ``rescale_threshold``: conditional rescale (module
-        doc); 0 restores the base exact-max schedule. ``cvt4`` / ``epi_fast``: the MHA epilogue options
-        options (module doc; same output bytes)."""
+        doc); 0 restores the base exact-max schedule. ``cvt4`` / ``epi_fast``: the MHA epilogue
+        options (module doc; same output bytes). ``tail_first``: tail-first Q tiling, its shift kept
+        on the kv-tile grid unless ``tail_align=False`` (module doc; same output bytes)."""
         super().__init__(
             cutlass.Float32,
             cutlass.Float32,
@@ -148,6 +165,8 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
         self.fp8 = bool(fp8)
         self.cvt4 = bool(cvt4)
         self.epi_fast = bool(epi_fast)
+        self.tail_first = bool(tail_first)
+        self.tail_align = bool(tail_align)
         # epi_fast holds a 128-column FP32 O chunk per thread: softmax 4 x 256 + correction
         # 4 x 208 + mma / load / sched / empty 4 x 32 <= 12 warps x 168 launch registers
         self.num_regs_correction_epi = 208
@@ -870,6 +889,89 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
             o_handle.release()
         return mma_o_consumer, s_corr_consumer
 
+    def _tail_frame(self, cu_b, seqlen_b, seqlen_k):
+        """Tail-first frame of one request (module doc): ``(first row, query rows, s)`` =
+        ``(cu_b - s, seqlen_b + s, s)``; rows ``< s`` of the frame are not stored. ``s = pad`` (``pad =
+        256 n - seqlen_b``) or, with ``tail_align``, the largest ``s <= pad`` with ``s = c (mod 128)``
+        for the ``c = seqlen_k - seqlen_b`` cached rows (0 if none). Traced on the kernel's Int32
+        values, signed arithmetic only, no control flow."""
+        tm = self.qk_mma_tiler[0]
+        tk = self.qk_mma_tiler[1]
+        pad = (seqlen_b + (tm - 1)) // tm * tm - seqlen_b
+        s = pad
+        if cutlass.const_expr(self.tail_align):
+            # (pad - c) mod tk, non-negative for either remainder sign convention
+            r = ((pad - (seqlen_k - seqlen_b)) % tk + tk) % tk
+            s = cutlass.max(pad - r, Int32(0))
+        return cu_b - s, seqlen_b + s, s
+
+    @cute.jit
+    def correction_epilog_tail(
+        self,
+        value_args: Tuple,
+        sum_args: Tuple,
+        o_args: Tuple,
+        epi_tile: cute.Tile,
+    ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
+        """The base ``correction_epilog`` for ``tail_first``: ``value_args`` carries a 4th entry,
+        the frame's first stored row, and the row predicate also rejects the leading rows."""
+        (seqlen_q, scale_output, scale_softmax_log2, row_lo) = value_args
+        (sum_consumer, sSum, sMax) = sum_args
+        (mma_o_consumer, gO_staged, cO_staged, tOtO_staged, gLSE) = o_args
+        tidx, _, _ = cute.arch.thread_idx()
+        thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
+        sum_handle = sum_consumer.wait_and_advance()
+        row_sum = sSum[thread_idx]
+        row_max = Float32(0.0)
+        if cutlass.const_expr(sMax is not None):
+            row_max = sMax[thread_idx]
+        cute.arch.fence_view_async_shared()
+        sum_handle.release()
+        scale = scale_output / row_sum
+        if cutlass.const_expr(gLSE is not None):
+            lse = cute.math.log2(row_sum, fastmath=True) + scale_softmax_log2 * row_max
+            if cutlass.const_expr(self.p_prescale_log2 != 0.0):
+                lse = lse - self.p_prescale_log2
+            if _row_stored(cO_staged[thread_idx, 0, 0][0], seqlen_q, row_lo):
+                gLSE[thread_idx] = lse
+        for iter in cutlass.range(self.iterations_pv):
+            o_handle = mma_o_consumer.wait_and_advance()
+            gO = gO_staged[None, None, iter]
+            cO = cO_staged[None, None, iter]
+            tOtO = tOtO_staged[(None, None), 0, 0, iter]
+            tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
+            cO_epi = cute.zipped_divide(cO, epi_tile)
+            gO_epi = cute.zipped_divide(gO, epi_tile)
+            tidx, _, _ = cute.arch.thread_idx()
+            thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
+            tmem_copy_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.pv_acc_dtype
+            )
+            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
+            thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+            tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
+            tTMEM_LOADgO = thr_tmem_load.partition_D(gO_epi)
+            tTMEM_LOADcO = thr_tmem_load.partition_D(cO_epi)
+            for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
+                tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
+                tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
+                tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
+                tTMrO = cute.make_rmem_tensor(
+                    tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype
+                )
+                cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                for j in cutlass.range(
+                    cute.size(tTMrO), unroll_full=True, vectorize=True
+                ):
+                    tTMrO[j] = tTMrO[j] * scale
+                tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+                o_vec = tTMrO.load()
+                tSMrO.store(o_vec.to(self.o_dtype))
+                if _row_stored(tTMEM_LOADcO_i[0][0], seqlen_q, row_lo):
+                    cute.autovec_copy(tSMrO, tTMEM_LOADgO_i)
+            o_handle.release()
+        return mma_o_consumer, sum_consumer
+
     @cute.jit
     def correction_epilog_q8(
         self,
@@ -887,7 +989,12 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
         BF16 O values just stored, so the bytes are that kernel's for this O.  ``q8_args =
         (gQ8_staged, sf8_base, row_base, head)``: the e4m3 partition of the operand (O's
         layout), the scale bytes, the request's first global row and the tile's head."""
-        (seqlen_q, scale_output, scale_softmax_log2) = value_args
+        seqlen_q = value_args[0]
+        scale_output = value_args[1]
+        scale_softmax_log2 = value_args[2]
+        row_lo = None
+        if cutlass.const_expr(len(value_args) > 3):
+            row_lo = value_args[3]
         (sum_consumer, sSum, sMax) = sum_args
         (mma_o_consumer, gO_staged, cO_staged, tOtO_staged, gLSE) = o_args
         (gQ8_staged, sf8_base, row_base, head) = q8_args
@@ -905,7 +1012,7 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
             lse = cute.math.log2(row_sum, fastmath=True) + scale_softmax_log2 * row_max
             if cutlass.const_expr(self.p_prescale_log2 != 0.0):
                 lse = lse - self.p_prescale_log2
-            if cute.elem_less(cO_staged[thread_idx, 0, 0][0], seqlen_q):
+            if _row_stored(cO_staged[thread_idx, 0, 0][0], seqlen_q, row_lo):
                 gLSE[thread_idx] = lse
         k_tiles = Int64(NUM_HEADS * HEAD_DIM // 128)
         col_base = Int64(head) * HEAD_DIM
@@ -979,7 +1086,7 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                     tQ8r_4 = cute.logical_divide(tQ8r, cute.make_layout(4))
                     for g in cutlass.range_constexpr(8):
                         fmha_utils.cvt_f32x4_to_f8x4(tTMrO_4[None, g], tQ8r_4[None, g])
-                    if cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q):
+                    if _row_stored(tTMEM_LOADcO_i[0][0], seqlen_q, row_lo):
                         if cutlass.const_expr(self.q8_store_o):
                             cute.autovec_copy(tSMrO_all[i], tTMEM_LOADgO_i)
                         cute.autovec_copy(tQ8r, tTMEM_LOADgQ8_i)
@@ -1021,7 +1128,7 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                     code, inv_scale = _mxf8.mxf8_code_and_inv_scale(block_max)
                     tQ8r = cute.make_rmem_tensor(tTMrO.shape, cutlass.Float8E4M3FN)
                     tQ8r.store((tTMrO.load() * inv_scale).to(cutlass.Float8E4M3FN))
-                    if cute.elem_less(tTMEM_LOADcO_i[0][0], seqlen_q):
+                    if _row_stored(tTMEM_LOADcO_i[0][0], seqlen_q, row_lo):
                         if cutlass.const_expr(self.q8_store_o):
                             cute.autovec_copy(tSMrO, tTMEM_LOADgO_i)
                         cute.autovec_copy(tQ8r, tTMEM_LOADgQ8_i)
@@ -1345,9 +1452,12 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                 cu_kb = cu_seqlens_k[batch_coord]
                 seqlen_q = seqlen_b
                 seqlen_k = cu_seqlens_k[batch_coord + 1] - cu_kb
+                row_lo = None
+                if cutlass.const_expr(self.tail_first):
+                    cu_b, seqlen_q, row_lo = self._tail_frame(cu_b, seqlen_b, seqlen_k)
                 # A 2-CTA tile pair is skipped as a unit (both CTAs see the same
                 # mma tile), so every role makes the same decision.
-                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_b
+                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_q
                 if tile_valid:
                     mQ_b = cute.domain_offset((cu_b, 0, ((0, 0), 0)), mQ_qdl)
                     mK_b = cute.domain_offset((cu_kb, 0, ((0, 0), 0)), mK_kdl)
@@ -1465,9 +1575,12 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                 cu_kb = cu_seqlens_k[batch_coord]
                 seqlen_q = seqlen_b
                 seqlen_k = cu_seqlens_k[batch_coord + 1] - cu_kb
+                row_lo = None
+                if cutlass.const_expr(self.tail_first):
+                    cu_b, seqlen_q, row_lo = self._tail_frame(cu_b, seqlen_b, seqlen_k)
                 # A 2-CTA tile pair is skipped as a unit (both CTAs see the same
                 # mma tile), so every role makes the same decision.
-                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_b
+                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_q
                 if tile_valid:
                     seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
                         self.mask_type,
@@ -1592,9 +1705,12 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                 cu_kb = cu_seqlens_k[batch_coord]
                 seqlen_q = seqlen_b
                 seqlen_k = cu_seqlens_k[batch_coord + 1] - cu_kb
+                row_lo = None
+                if cutlass.const_expr(self.tail_first):
+                    cu_b, seqlen_q, row_lo = self._tail_frame(cu_b, seqlen_b, seqlen_k)
                 # A 2-CTA tile pair is skipped as a unit (both CTAs see the same
                 # mma tile), so every role makes the same decision.
-                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_b
+                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_q
                 if tile_valid:
                     seqlen_kv_loop_steps = fmha_utils.FusedMask.get_trip_count(
                         self.mask_type,
@@ -1711,9 +1827,12 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                 cu_kb = cu_seqlens_k[batch_coord]
                 seqlen_q = seqlen_b
                 seqlen_k = cu_seqlens_k[batch_coord + 1] - cu_kb
+                row_lo = None
+                if cutlass.const_expr(self.tail_first):
+                    cu_b, seqlen_q, row_lo = self._tail_frame(cu_b, seqlen_b, seqlen_k)
                 # A 2-CTA tile pair is skipped as a unit (both CTAs see the same
                 # mma tile), so every role makes the same decision.
-                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_b
+                tile_valid = mma_block_coord[0] * self.qk_mma_tiler[0] < seqlen_q
                 if tile_valid:
                     mO_b = cute.domain_offset((cu_b, 0, ((0, 0), 0)), mO_qdl)
                     gO_qdl = cute.flat_divide(
@@ -1770,9 +1889,25 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                         gLSE_staged = gLSE_ql[
                             None, curr_block_coord[0], curr_block_coord[2]
                         ]
-                    if cutlass.const_expr(mQ8_qdl is None):
+                    epi_values = (seqlen_q, out_scale, sm_scale)
+                    if cutlass.const_expr(row_lo is not None):
+                        epi_values = (seqlen_q, out_scale, sm_scale, row_lo)
+                    if cutlass.const_expr(mQ8_qdl is None and row_lo is None):
                         mma_o_consumer, sum_consumer = self.correction_epilog(
-                            (seqlen_q, out_scale, sm_scale),
+                            epi_values,
+                            (sum_consumer, sSum, sMax),
+                            (
+                                mma_o_consumer,
+                                gO_staged,
+                                cO_staged,
+                                tOtO_staged,
+                                gLSE_staged,
+                            ),
+                            epi_tile,
+                        )
+                    elif cutlass.const_expr(mQ8_qdl is None):
+                        mma_o_consumer, sum_consumer = self.correction_epilog_tail(
+                            epi_values,
                             (sum_consumer, sSum, sMax),
                             (
                                 mma_o_consumer,
@@ -1785,7 +1920,7 @@ class GlmPrefillMhaVarlenD256(_d256.FusedMultiHeadAttentionPrefillD256):
                         )
                     else:
                         mma_o_consumer, sum_consumer = self.correction_epilog_q8(
-                            (seqlen_q, out_scale, sm_scale),
+                            epi_values,
                             (sum_consumer, sSum, sMax),
                             (
                                 mma_o_consumer,
@@ -1928,6 +2063,17 @@ class GlmPrefillMhaVarlenD256Fp8Q8(GlmPrefillMhaVarlenD256):
         )
 
 
+def _row_stored(row, seqlen_q, row_lo):
+    """Epilogue row predicate in the request frame: ``row < seqlen_q``, and with ``row_lo`` (the
+    tail-first frame's first stored row) also ``row >= row_lo``, as one SIGNED compare
+    ``min(row - row_lo, seqlen_q - 1 - row) >= 0``. (An ``Uint32(row - row_lo) < Uint32(...)``
+    range trick is lowered as a signed compare here and lets the frame's leading rows through:
+    debug job 5110409 caught their stores below the request start.)"""
+    if row_lo is None:
+        return cute.elem_less(row, seqlen_q)
+    return cutlass.min(row - row_lo, seqlen_q - 1 - row) >= 0
+
+
 @dsl_user_op
 def _cvt_bf16x2_rn(hi: Float32, lo: Float32, *, loc=None, ip=None) -> Int32:
     """Round two FP32 values to BF16 (RN) with one packed ``cvt.rn.bf16x2.f32`` (ALU pipe; the
@@ -2028,7 +2174,9 @@ class PrefillMha:
         **variant,
     ) -> None:
         """``variant``: kernel-class options (``sched``, ``rescale_threshold``, the MHA epilogue options
-        ``cvt4`` / ``epi_fast``); any MHA epilogue options option adds ``_sol`` to the kernel symbol."""
+        ``cvt4`` / ``epi_fast``, ``tail_first`` / ``tail_align``); any MHA epilogue option adds
+        ``_sol`` to the kernel symbol, ``tail_first`` adds ``_tail`` (``_tailraw`` with
+        ``tail_align=False``)."""
         dev = torch.device("cuda", device)
         self.device = dev
         self.fp8 = bool(fp8)
@@ -2051,7 +2199,12 @@ class PrefillMha:
                 if self.fp8
                 else ""
             )
-            + ("_sol" if (variant.get("cvt4") or variant.get("epi_fast")) else ""),
+            + ("_sol" if (variant.get("cvt4") or variant.get("epi_fast")) else "")
+            + (
+                ("_tail" if variant.get("tail_align", True) else "_tailraw")
+                if variant.get("tail_first")
+                else ""
+            ),
             remove_cutlass_symbol=True,
         )
         self.in_dtype = torch.float8_e4m3fn if self.fp8 else torch.bfloat16
@@ -2205,7 +2358,8 @@ def build(
 ) -> PrefillMha:
     """Registry entry: one compiled launcher per device (and per BF16 / FP8 / FP8 + MXF8-O
     variant; ``q8_store_o=False``: MXF8 O only, no BF16 O rows). ``variant``: kernel-class
-    options (e.g. the MHA epilogue options ``{"cvt4": True, "epi_fast": True}``); same output bytes."""
+    options (e.g. the MHA epilogue options ``{"cvt4": True, "epi_fast": True}``, ``tail_first``); same
+    output bytes."""
     d = torch.cuda.current_device() if device is None else int(device)
     v = dict(variant or {})
     key = (d, bool(fp8), bool(q8), bool(q8_store_o) or not q8) + (

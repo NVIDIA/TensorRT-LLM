@@ -55,7 +55,8 @@ def _compiled(spec) -> CompiledTopkRouting:
         if key not in _COMPILED:
             _COMPILED[key] = build_prefill(torch.cuda.current_device())
         return _COMPILED[key]
-    key = (rows, spec["splits"], spec["signal_gg1"], spec.get("fuse_zero", False))
+    hist = spec.get("expert_hist", False)
+    key = (rows, spec["splits"], spec["signal_gg1"], spec.get("fuse_zero", False), hist)
     if key not in _COMPILED:
         _COMPILED[key] = build_decode(
             rows,
@@ -63,6 +64,7 @@ def _compiled(spec) -> CompiledTopkRouting:
             torch.cuda.current_device(),
             signal_gg1=spec["signal_gg1"],
             fuse_zero=spec.get("fuse_zero", False),
+            expert_hist=hist,
         )
     return _COMPILED[key]
 
@@ -117,8 +119,13 @@ def test_certified_cells(cell) -> None:
     if spec.get("fuse_zero"):
         zero = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     compiled = _compiled(spec)
+    hist = None
+    if spec.get("expert_hist"):
+        hist = torch.full((64,), -1, dtype=torch.int32, device="cuda")
     with validating(op):
-        weights, ids, maps = op(logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled)
+        weights, ids, maps = op(
+            logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled, expert_hist=hist
+        )
     ref_w, ref_ids, ref_maps = op.reference(
         logits, bias, offset, ROUTED_SCALE, outputs, zero, compiled
     )
@@ -142,6 +149,11 @@ def test_certified_cells(cell) -> None:
             assert torch.equal(got[k], ref_maps[k]), f"{k} differs from the reference"
     if zero is not None:
         assert bool((zero == 0).all()), "the fused zero plane was not cleared"
+    if hist is not None:
+        # This step's token count per local expert, every expert written (zeros included).
+        local = ids[(ids >= offset) & (ids < offset + 64)].long() - offset
+        want = torch.bincount(local, minlength=64).to(torch.int32)
+        assert torch.equal(hist, want), "expert_hist is not the step's per-expert counts"
 
 
 def _unreachable(*args) -> None:

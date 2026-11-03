@@ -90,6 +90,54 @@ def build(kernel: str, group: str, device_id: int) -> AbsorbedBmmRunner:
     return AbsorbedBmmRunner(kernel, group, rows, launch)
 
 
+def build_decode_fp8_q_base(group: str, device_id: int) -> AbsorbedBmmRunner:
+    """The decode K-B for row-count group `group` with the e4m3 q-base epilogue, releasing
+    its PDL dependent right after its activation wait. Call at load.
+
+    The epilogue rounds each output FP32 -> BF16 -> E4M3 (nearest, saturating) into the
+    uint8 `[16, M, 512]` transpose view of the sparse decode MLA's `[M, 16, 576]` fp8
+    query: the bytes the rope generation kernel would write from the bf16 K-B output. The
+    dependent it releases early is that rope kernel built with `q_base_from_kb`, which
+    does not read this output and waits for it only at its end. Launched once on zeros.
+    Costs one CuTe DSL compile per group."""
+    if group not in GROUPS:
+        raise ValueError(f"k_b: group must be one of {GROUPS}, got {group!r}")
+    rows = tuple(_k_b.rows_of_group(group))
+    m, lay, dev = rows[-1], LAYOUTS["k_b"], torch.device("cuda", device_id)
+    with torch.cuda.device(device_id):
+        launch = _k_b.build(emit_fp8_q_base=True, active_m=m, early_signal=True)
+        a, weight, _ = _views("k_b", m, dev)
+        quant = torch.zeros([m, lay.heads, lay.out_row], dtype=torch.uint8, device=dev)
+        launch(a, weight, quant[..., : lay.n].transpose(0, 1))
+        torch.cuda.synchronize(device_id)
+    return AbsorbedBmmRunner("k_b", f"fp8_{group}", rows, launch)
+
+
+def build_v_b_mxf8_side(
+    group: str, device_id: int, operand: tuple[torch.Tensor, torch.Tensor]
+) -> AbsorbedBmmRunner:
+    """The decode V-B for row-count group `group` whose epilogue also writes its bf16
+    output `[M, 4096]` (token-major) as an MXF8 operand -- the activation quant's bytes --
+    into `operand = (xq [64, 4096] uint8, sfa)`: the decode o_proj launcher's operand
+    (`DecodeMxf8Runner.operand`). Its addresses are baked into the kernel, so the buffers
+    must live as long as the runner and never move. The bf16 output is the plain cell's.
+    Launched once on zeros at load. Costs one CuTe DSL compile per group."""
+    if group not in GROUPS:
+        raise ValueError(f"v_b: group must be one of {GROUPS}, got {group!r}")
+    xq, sfa = operand
+    lay = LAYOUTS["v_b"]
+    width = lay.heads * lay.n
+    if xq.dtype != torch.uint8 or tuple(xq.shape) != (64, width) or not xq.is_contiguous():
+        raise ValueError(f"v_b: the operand must be a contiguous uint8 [64, {width}]")
+    side = _v_b.Mxf8SideOutput(xq.data_ptr(), sfa.data_ptr(), width, lay.n, 64)
+    rows = tuple(_v_b.rows_of_group(group))
+    with torch.cuda.device(device_id):
+        launch = _v_b.build(active_m=rows[-1], mxf8_side=side)
+        launch(*_views("v_b", rows[-1], torch.device("cuda", device_id)))
+        torch.cuda.synchronize(device_id)
+    return AbsorbedBmmRunner("v_b", f"x8_{group}", rows, launch)
+
+
 def build_prefill(kernel: str, device_id: int) -> AbsorbedBmmRunner:
     """The prefill kernel for `kernel` ("k_b" or "v_b") on `device_id`. Call at load.
 
@@ -186,6 +234,34 @@ class CuteDslAbsorbedBmm(OpWrapper):
             spec=dict(kernel="v_b", rows=8192, prefill=True),
         ),
         Cell(
+            why="decode V-B writing o_proj's MXF8 operand at MTP width 2",
+            spec=dict(kernel="v_b", rows=2, x8=True),
+        ),
+        Cell(
+            why="decode V-B writing o_proj's MXF8 operand at 48 rows, a partial tile",
+            spec=dict(kernel="v_b", rows=48, x8=True),
+        ),
+        Cell(
+            why="decode V-B writing o_proj's MXF8 operand at the full decode batch",
+            spec=dict(kernel="v_b", rows=64, x8=True),
+        ),
+        Cell(
+            why="decode fp8 q-base K-B at MTP width 2, releasing its dependent early",
+            spec=dict(kernel="k_b", rows=2, fp8=True, decode=True),
+        ),
+        Cell(
+            why="decode fp8 q-base K-B at the small group's largest",
+            spec=dict(kernel="k_b", rows=8, fp8=True, decode=True),
+        ),
+        Cell(
+            why="decode fp8 q-base K-B at 48 rows, a partial last row tile",
+            spec=dict(kernel="k_b", rows=48, fp8=True, decode=True),
+        ),
+        Cell(
+            why="decode fp8 q-base K-B at the full decode batch",
+            spec=dict(kernel="k_b", rows=64, fp8=True, decode=True),
+        ),
+        Cell(
             why="fp8 q-base K-B at 65 rows, the first context row count past decode",
             spec=dict(kernel="k_b", rows=65, prefill=True, fp8=True),
         ),
@@ -208,8 +284,11 @@ class CuteDslAbsorbedBmm(OpWrapper):
 
     On the context step the target takes the fp8 q-base K-B (`build_prefill_fp8_q_base`)
     instead when the rows go on the context rope/append kernel: K-B then writes the FMHA's
-    e4m3 query bytes itself and the rope kernel skips its q-base groups. Row counts the
-    decode groups serve keep the bf16 kernels and the full rope.
+    e4m3 query bytes itself and the rope kernel skips its q-base groups. On a pure decode
+    step the decode groups' fp8 q-base K-B (`build_decode_fp8_q_base`) runs beside the
+    rope kernel, which then skips the q-base, and the decode V-B built with
+    `build_v_b_mxf8_side` writes o_proj's MXF8 operand; elsewhere the decode groups keep the bf16
+    kernels and the full rope.
 
     Both kernel kinds check every call: row count in the runner's range, and
     every shape and stride of `a` and `out` exactly as compiled. Anything else
@@ -239,7 +318,7 @@ class CuteDslAbsorbedBmm(OpWrapper):
         (nearest, saturating), as uint8 bytes. `out` is not written."""
         with true_fp32_matmul():
             prod = a.float() @ weight.float().transpose(1, 2)
-        if runner.group == "prefill_fp8":
+        if runner.group in ("prefill_fp8", "fp8_m_le_8", "fp8_m_ge_16"):
             bf16 = prod.to(torch.bfloat16).float().clamp(-448.0, 448.0)
             return bf16.to(torch.float8_e4m3fn).view(torch.uint8)
         return prod.to(out.dtype)

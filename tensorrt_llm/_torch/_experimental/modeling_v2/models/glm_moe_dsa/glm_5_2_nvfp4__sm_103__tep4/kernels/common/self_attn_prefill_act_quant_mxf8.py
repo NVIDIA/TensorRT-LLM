@@ -30,9 +30,9 @@ flight before the first conversion; then per pass the block amax, the scale, one
 passes), K / 128)``.  The row count and pitches are runtime values:
 one compiled instance serves every T.  Pointer arguments only: CUDA-graph safe.
 
-:pattern: glm-ctx-proj-act-quant-mxf8
-:device: SM100+ (Blackwell)
-:shape: runtime rows R x K (K % 128 == 0), BF16 in, e4m3 [R, K] + e8m0 blocked SF out
+Pattern: glm-ctx-proj-act-quant-mxf8
+Device: SM100+ (Blackwell)
+Shape: runtime rows R x K (K % 128 == 0), BF16 in, e4m3 [R, K] + e8m0 blocked SF out
 """
 
 from collections.abc import Callable

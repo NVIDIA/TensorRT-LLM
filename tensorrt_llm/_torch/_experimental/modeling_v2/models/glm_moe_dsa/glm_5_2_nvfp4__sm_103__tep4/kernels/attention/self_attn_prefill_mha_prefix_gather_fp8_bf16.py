@@ -30,9 +30,9 @@ column chunk (an 8-byte e4m3 or 16-byte BF16 load, a 16-byte BF16 store), so a
 row is moved with full-width coalesced accesses.  Pointer arguments only: the
 launch is CUDA-graph safe.
 
-:pattern: glm-mha-kv-prefix-gather
-:device: SM100+ (Blackwell)
-:shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
+Pattern: glm-mha-kv-prefix-gather
+Device: SM100+ (Blackwell)
+Shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
 """
 
 from collections.abc import Callable

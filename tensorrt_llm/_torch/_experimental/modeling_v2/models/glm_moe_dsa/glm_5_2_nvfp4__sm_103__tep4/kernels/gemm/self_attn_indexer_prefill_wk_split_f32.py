@@ -22,9 +22,9 @@ access is a coalesced 128-byte (FP32) or 64-byte (BF16) segment.  All three
 operands take a runtime row pitch with a unit inner stride; the output rows
 must not overlap the input.
 
-:pattern: glm-indexer-prefill-wk-split
-:device: SM100+ (Blackwell)
-:shape: runtime rows; 160 = 128 key + 32 weight columns
+Pattern: glm-indexer-prefill-wk-split
+Device: SM100+ (Blackwell)
+Shape: runtime rows; 160 = 128 key + 32 weight columns
 """
 
 from collections.abc import Callable

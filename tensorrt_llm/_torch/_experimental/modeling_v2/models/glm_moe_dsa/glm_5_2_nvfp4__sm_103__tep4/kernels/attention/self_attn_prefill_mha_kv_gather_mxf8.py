@@ -44,9 +44,9 @@ One 288-thread CTA covers four rows; each thread owns one 8-element column chunk
 (4 consecutive threads = one 32-element scale block, reduced with two butterfly
 shuffles).  Pointer arguments only: CUDA-graph safe.
 
-:pattern: glm-mha-kv-gather-mxf8
-:device: SM100+ (Blackwell)
-:shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
+Pattern: glm-mha-kv-gather-mxf8
+Device: SM100+ (Blackwell)
+Shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
 """
 
 from collections.abc import Callable

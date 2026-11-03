@@ -20,6 +20,7 @@ from ...kernels.moe import moe_prefill_frontend_schedule as _sched
 from ...kernels.moe import moe_prefill_topk_routing as _prefill
 from ...kernels.moe import moe_prefill_topk_routing_noraw as _prefill_noraw
 from ...kernels.moe import moe_topk_routing as _decode
+from ...kernels.moe import moe_topk_routing_push as _push
 from .cute_dsl_moe_routing import (
     LOCAL_EXPERTS,
     MAP_KEYS,
@@ -40,6 +41,9 @@ PREFILL_PRODUCER_CTAS = 148
 #: The fused output-zero plane uses 128-bit stores.
 _ZERO_ALIGN = 16
 
+#: Whether a decode handle at `rows` rows runs the push cluster path (9..64 rows): the widths
+#: that can also write the per-expert counts (`build_decode(expert_hist=True)`).
+uses_push_path = _push.uses_push_path
 #: What a decode `outputs` set holds, in the kernel's order (`allocate_decode_outputs`).
 DECODE_OUTPUTS = _decode.OUTPUT_ORDER
 #: What a prefill `outputs` set holds: the top-k pair, the histogram scratch, the maps.
@@ -70,8 +74,9 @@ class CompiledTopkRouting:
     Decode: `rows` is the exact row count, `logit_splits` the K partials it sums (1, or the
     router's 4), and the PDL roles and zero plane are compiled in. Prefill: `rows` None
     (any count in 65..8192), one logit plane, PDL as the engine sets it, no zero plane.
-    `launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output)` is the
-    kernel call.
+    `launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output,
+    expert_hist)` is the kernel call; `expert_hist` is the int32 `[64]` row a handle built
+    with `expert_hist=True` also writes (None otherwise).
     """
 
     kind: str
@@ -80,18 +85,25 @@ class CompiledTopkRouting:
     signal_gg1: bool
     fuse_zero: bool
     launch: Callable[..., None]
+    expert_hist: bool = False
 
 
-def _decode_launch(compiled, fuse_zero: bool) -> Callable[..., None]:
+def _decode_launch(
+    compiled, fuse_zero: bool, push: bool = False, hist: bool = False
+) -> Callable[..., None]:
     as_t = _decode._as_tensor
-    zero_align = _ZERO_ALIGN if fuse_zero else 4
+    # The push kernel loads its logits 128 bits at a time; its zero slot is the logits.
+    zero_align = _ZERO_ALIGN if fuse_zero or push else 4
+    logits_align = 16 if push else 4
 
-    def launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output):
+    def launch(
+        logits, bias, local_expert_offset, routed_scale, outputs, zero_output, expert_hist=None
+    ):
         # Without the zero plane the kernel's ABI still takes a tensor there, unread;
         # the logits stand in, as the kernel's own runner passes them.
         zero_arg = zero_output if fuse_zero else logits
         compiled(
-            as_t(logits.reshape(-1)),
+            as_t(logits.reshape(-1), assumed_align=logits_align),
             as_t(bias),
             as_t(zero_arg.reshape(-1), assumed_align=zero_align),
             *(as_t(outputs[name]) for name in DECODE_OUTPUTS),
@@ -99,13 +111,20 @@ def _decode_launch(compiled, fuse_zero: bool) -> Callable[..., None]:
             cutlass.Int32(local_expert_offset),
             cutlass.Float32(routed_scale),
             cutlass_torch.current_stream(),
+            *((as_t(expert_hist, assumed_align=16),) if hist else ()),
         )
 
     return launch
 
 
 def build_decode(
-    rows: int, logit_splits: int, device, *, signal_gg1: bool, fuse_zero: bool = False
+    rows: int,
+    logit_splits: int,
+    device,
+    *,
+    signal_gg1: bool,
+    fuse_zero: bool = False,
+    expert_hist: bool = False,
 ) -> CompiledTopkRouting:
     """Compile the fused decode top-k for exactly `rows` rows (1..64) reading
     `logit_splits` K partials (1: `[rows, 256]` logits; 4: the tensor-core router's
@@ -115,6 +134,9 @@ def build_decode(
     `signal_gg1` releases the next grouped GEMM early: only where nothing between the
     two reads what this writes (see `note`). `fuse_zero` also clears a bf16 `[rows,
     6144]` output (the MTP layer's, which has no quantize launch to carry the clear).
+    `expert_hist` (the push widths, 9..64 rows): the handle also writes the step's token
+    count per local expert into an int32 `[64]` row the call passes, which the next decode
+    step's L2 prefetch of the same layer ranks experts by (`cute_dsl_moe_l2_prefetch`).
     """
     rows = int(rows)
     shape = (rows, EXPERTS) if logit_splits == 1 else (rows, int(logit_splits), EXPERTS)
@@ -123,8 +145,14 @@ def build_decode(
     zero = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device) if fuse_zero else None
     outputs = allocate_decode_outputs(rows, device)
     signal = bool(_USE_PDL and signal_gg1)
+    # The cluster widths (9..64 rows) hand the histogram off by st.async instead of two
+    # cluster barriers (`moe_topk_routing_push`, same outputs and maps bit for bit).
+    push = _push.uses_push_path(rows, fuse_zero)
+    if expert_hist and not push:
+        raise ValueError(f"expert_hist is written on the push widths only, not at {rows} rows")
+    hist = {"expert_hist": torch.zeros(64, dtype=torch.int32, device=device)} if expert_hist else {}
     with torch.cuda.device(device):
-        compiled = _decode.compile_fused_topk_routing(
+        compiled = (_push if push else _decode).compile_fused_topk_routing(
             logits,
             bias,
             zero,
@@ -132,6 +160,7 @@ def build_decode(
             wait_for_router_pdl=_USE_PDL,
             signal_gg1_pdl=signal,
             fuse_zero=fuse_zero,
+            **hist,
         )
     return CompiledTopkRouting(
         "decode",
@@ -139,12 +168,16 @@ def build_decode(
         int(logit_splits),
         signal,
         bool(fuse_zero),
-        _decode_launch(compiled, fuse_zero),
+        _decode_launch(compiled, fuse_zero, push, bool(expert_hist)),
+        bool(expert_hist),
     )
 
 
 def _prefill_launch(handles: dict[int, Callable[..., None]]) -> Callable[..., None]:
-    def launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output):
+    def launch(
+        logits, bias, local_expert_offset, routed_scale, outputs, zero_output, expert_hist=None
+    ):
+        # The prefill kernels write no per-expert counts (`is_valid` refuses `expert_hist`).
         rows = int(logits.shape[0])
         h = handles[_sched.propose_schedule(rows).histogram_warps]
         n = rows * TOP_K
@@ -288,6 +321,14 @@ class CuteDslMoeTopkRouting(OpWrapper):
             spec=dict(rows=64, splits=4, signal_gg1=True, offset=192),
         ),
         Cell(
+            why="the full decode batch also writing the per-expert counts for the L2 prefetch",
+            spec=dict(rows=64, splits=4, signal_gg1=True, offset=64, expert_hist=True),
+        ),
+        Cell(
+            why="12 rows on the 2-CTA push path writing the per-expert counts",
+            spec=dict(rows=12, splits=4, signal_gg1=False, offset=192, expert_hist=True),
+        ),
+        Cell(
             why="the MTP layer at width 2, clearing its output plane",
             spec=dict(rows=2, splits=1, signal_gg1=True, fuse_zero=True, offset=64),
         ),
@@ -339,8 +380,11 @@ class CuteDslMoeTopkRouting(OpWrapper):
         outputs: dict[str, torch.Tensor],
         zero_output: torch.Tensor | None,
         compiled: CompiledTopkRouting,
+        expert_hist: torch.Tensor | None = None,
     ):
-        compiled.launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output)
+        compiled.launch(
+            logits, bias, local_expert_offset, routed_scale, outputs, zero_output, expert_hist
+        )
         rows = int(logits.shape[0])
         n = rows * TOP_K
         weights = outputs["topk_weights"].reshape(-1)[:n].view(rows, TOP_K)
@@ -356,11 +400,12 @@ class CuteDslMoeTopkRouting(OpWrapper):
         outputs: dict[str, torch.Tensor],
         zero_output: torch.Tensor | None,
         compiled: CompiledTopkRouting,
+        expert_hist: torch.Tensor | None = None,
     ):
         """`noaux_tc_op`'s arithmetic on the summed partials (tanh-form sigmoid, stable
         descending sort, fp64 renormalization), then `reference_maps` of the ids. Fresh
-        tensors; `outputs`, `zero_output` and `compiled` are not read (the zero plane's
-        clear is checked by the test)."""
+        tensors; `outputs`, `zero_output`, `compiled` and `expert_hist` are not read (the
+        zero plane's clear and the counts are checked by the test)."""
         weights, ids, _ = _sigmoid_topk(logits, bias, routed_scale)
         return weights, ids, reference_maps(ids, local_expert_offset)
 
@@ -373,6 +418,7 @@ class CuteDslMoeTopkRouting(OpWrapper):
         outputs: dict[str, torch.Tensor],
         zero_output: torch.Tensor | None,
         compiled: CompiledTopkRouting,
+        expert_hist: torch.Tensor | None = None,
     ) -> None:
         # The compiled handles skip the shape checks the kernel modules' runners repeat
         # per call: a logits tensor with another split count is summed wrongly, and an
@@ -398,6 +444,16 @@ class CuteDslMoeTopkRouting(OpWrapper):
                     f"{name} must be {ref[name].dtype} {tuple(ref[name].shape)} for {rows} rows"
                 )
                 assert t.is_contiguous(), f"{name} must be contiguous"
+            if compiled.expert_hist:
+                assert (
+                    expert_hist is not None
+                    and expert_hist.dtype == torch.int32
+                    and tuple(expert_hist.shape) == (64,)
+                    and expert_hist.is_contiguous()
+                    and expert_hist.data_ptr() % 16 == 0
+                ), "this handle writes expert_hist: a contiguous 16-byte aligned int32 [64]"
+            else:
+                assert expert_hist is None, "this handle writes no expert counts"
             if compiled.fuse_zero:
                 assert zero_output is not None and tuple(zero_output.shape) == (rows, HIDDEN)
                 assert zero_output.dtype == torch.bfloat16 and zero_output.is_contiguous()
@@ -409,6 +465,7 @@ class CuteDslMoeTopkRouting(OpWrapper):
                 f"the prefill top-k serves {PREFILL_MIN_ROWS}..{PREFILL_MAX_ROWS} rows"
             )
             assert zero_output is None, "the prefill top-k has no zero plane"
+            assert expert_hist is None, "the prefill top-k writes no expert counts"
             n = rows * TOP_K
             q = (n + TILE - 1) // TILE + LOCAL_EXPERTS - 1
             need = {

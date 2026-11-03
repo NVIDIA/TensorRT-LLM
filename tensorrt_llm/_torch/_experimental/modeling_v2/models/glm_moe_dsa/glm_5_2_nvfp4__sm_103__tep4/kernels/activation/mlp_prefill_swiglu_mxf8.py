@@ -29,9 +29,9 @@ are in flight before the first exponential.  The grid is ``(padded_rows(R) / (16
 passes), W / 128)``.  Row count and source pitch are runtime values; one compiled instance
 serves every W that is a multiple of 128.  Pointer arguments only: CUDA-graph safe.
 
-:pattern: glm-ctx-swiglu-mxf8
-:device: SM100+ (Blackwell)
-:shape: runtime rows R, runtime W (W % 128 == 0); BF16 [R, 2W] in, e4m3 [R, W] + e8m0 blocked SF out
+Pattern: glm-ctx-swiglu-mxf8
+Device: SM100+ (Blackwell)
+Shape: runtime rows R, runtime W (W % 128 == 0); BF16 [R, 2W] in, e4m3 [R, W] + e8m0 blocked SF out
 """
 
 from collections.abc import Callable
