@@ -84,7 +84,7 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: K extent of one pipeline stage (one 128x128 FP8 weight block).
 CTA_K = 128
@@ -3598,6 +3598,15 @@ def _compiled_prequantized_kernel(n: int, k: int, tactic: PrequantizedLowMTactic
     )
 
 
+def precompile_prequantized(n: int, k: int, max_m: int) -> int:
+    """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
+    an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
+    tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
+    for tactic in tactics:
+        _compiled_prequantized_kernel(n, k, tactic, TRTLLM_ENABLE_PDL)
+    return len(tactics)
+
+
 def run_low_m_gemm_prequantized(
     xq: torch.Tensor,
     xs: torch.Tensor,
@@ -3829,5 +3838,6 @@ __all__ = [
     "quant_bf16x8_to_e4m3",
     "run_low_m_gemm",
     "run_low_m_gemm_prequantized",
+    "precompile_prequantized",
     "ue8m0_of_amax",
 ]

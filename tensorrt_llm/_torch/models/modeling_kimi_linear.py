@@ -100,6 +100,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -576,6 +577,76 @@ def _defers_moe_residual(prefix_sum: torch.Tensor, num_candidates: int) -> bool:
     """Whether a MoE layer leaves its residual update to the next layer's pre-attention mix over
     ``num_candidates``: where the decode kernel serves that mix and folds the update in."""
     return _attn_res_kernel(prefix_sum, num_candidates) is _AttnResKernel.DECODE
+
+
+class _AttnResVariant(NamedTuple):
+    """A compiled variant of the decode attention-residual kernel (``kimi_k3_attn_res``)."""
+
+    num_candidates: int
+    add_mode: int
+    cluster: int
+    mxfp8: bool
+    snapshots_after_wait: bool
+
+
+def _decode_attn_res_variants(
+    layers: Sequence[nn.Module],
+    attn_res_block_size: int,
+    hidden: int,
+    max_tokens: int,
+    device_index: int,
+    helix_a2a_first_layer: int,
+    verify_batches: bool,
+) -> set[_AttnResVariant]:
+    """The decode-kernel variants ``KimiLinearModel.forward`` can launch on mixes of up to
+    ``max_tokens`` rows, from the layers' kinds and the snapshot schedule (``layer_idx``,
+    ``is_kda``, ``is_moe``, ``token_sliced``) and ``_attn_res_kernel``.
+
+    ``verify_batches``: speculative-verify batches run, so a KDA layer's mix that folds in the
+    previous MoE residual may also emit the MXFP8 form of its output (for the row counts its
+    mixer's fused projection takes, ``KimiKDALinearAttention.takes_prequantized_input``). Mixes
+    on captured layers run unfused and are not separated out: this is a superset.
+    """
+    from ..kernels.blackwell import kimi_k3_attn_res as kernel
+
+    token_counts = range(1, min(max_tokens, kernel.MAX_TOKENS) + 1)
+    variants = set()
+
+    def add(num_candidates, add_mode, mxfp8=False, after_wait=False, takes=None):
+        for m in token_counts:
+            if takes is not None and not takes(m):
+                continue
+            if (
+                _select_attn_res_kernel(m, hidden, num_candidates, device_index)
+                is _AttnResKernel.DECODE
+            ):
+                cluster = kernel.cluster_size(m, num_candidates)
+                variants.add(_AttnResVariant(num_candidates, add_mode, cluster, mxfp8, after_wait))
+
+    num_snapshots = 0
+    previous_moe = False
+    for i, layer in enumerate(layers):
+        if num_snapshots > 0:
+            # Pre-attention mix: a MoE predecessor's residual update is folded in where this
+            # kernel runs (``_defers_moe_residual`` asks the same selector), a plain row else.
+            if previous_moe:
+                add(num_snapshots + 1, kernel.ADD_MOE)
+                if verify_batches and layer.is_kda and not layer.token_sliced:
+                    takes = layer.linear_attn.qkvg_takes_prequantized
+                    add(num_snapshots + 1, kernel.ADD_MOE, mxfp8=True, takes=takes)
+            else:
+                add(num_snapshots + 1, kernel.ADD_NONE, after_wait=i == helix_a2a_first_layer)
+        snapshot = layer.layer_idx % attn_res_block_size == 0
+        num_snapshots += snapshot
+        if num_snapshots > 0:
+            # Post-attention mix: the new snapshot is the prefix sum, else the attention output
+            # is added to it.
+            add(num_snapshots + 1, kernel.ADD_NONE if snapshot else kernel.ADD_PREFIX)
+        previous_moe = layer.is_moe
+    if num_snapshots > 0:
+        # Output mix of the model.
+        add(num_snapshots + 1, kernel.ADD_NONE)
+    return variants
 
 
 def _attn_res_decode_kernel(
@@ -2674,6 +2745,72 @@ class KimiLinearModel(DecoderModel):
             f"({KIMI_K3_AUX_ATTN_RES_STREAM_ENV}={int(_AUX_ATTN_RES_STREAM_ENABLED)})",
             key="kimi_k3_aux_capture_mode",
         )
+
+    def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
+        """JIT-compile the decode attention-residual kernel variants (``kimi_k3_attn_res``) and
+        the prequantized FP8 low-M GEMMs that forwards of up to ``max_num_tokens`` tokens reach,
+        so no served step compiles them; returns the number of kernels compiled.
+
+        The decode-kernel prewarm hook ``DecoderWarmup`` calls on every module that defines it.
+        Depends only on the model layout, the device and the attention-residual settings, so
+        every rank compiles the same set. ``verify_batches``: this worker runs speculative verify
+        batches, which hand the KDA projections MXFP8 operands.
+        """
+        device_index = torch.cuda.current_device()
+        if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
+            return 0
+        from ..kernels.blackwell import fp8_block_scale_low_m_gemm, kimi_k3_attn_res
+
+        cfg = self._text_cfg
+        variants = _decode_attn_res_variants(
+            self.layers,
+            cfg.attn_res_block_size,
+            cfg.hidden_size,
+            max_num_tokens,
+            device_index,
+            self.helix_a2a_first_layer,
+            verify_batches,
+        )
+        for variant in sorted(variants):
+            kimi_k3_attn_res.precompile(
+                variant.num_candidates,
+                variant.add_mode,
+                variant.cluster,
+                cfg.hidden_size,
+                variant.mxfp8,
+                variant.snapshots_after_wait,
+            )
+        compiled = len(variants)
+        if not verify_batches:
+            return compiled
+        # Prequantized GEMMs: the KDA q/k/v/g projections fed by the mix's MXFP8 output, and the
+        # o_proj fed by the fused verify epilogue where it takes an MXFP8 operand (SM107).
+        mxfp8_rows = 0
+        if any(v.mxfp8 for v in variants):
+            mxfp8_rows = min(
+                max_num_tokens, kimi_k3_attn_res.MAX_TOKENS, _FUSED_ATTN_RES_MAX_TOKENS
+            )
+        rows_by_shape: dict[tuple[int, int], int] = {}
+
+        def need(linear: nn.Module | None, rows: int) -> None:
+            if isinstance(linear, _Fp8BlockScaleWeightReadLinear):
+                key = (linear.out_features, linear.in_features)
+                rows = min(rows, linear._low_m.kernel_max_m)
+                rows_by_shape[key] = max(rows, rows_by_shape.get(key, 0))
+
+        for layer in self.layers:
+            if not layer.is_kda:
+                continue
+            mixer = layer.linear_attn
+            if not layer.token_sliced and mixer.qkvg_takes_prequantized(1):
+                need(getattr(mixer, "qkvg_proj", None), mxfp8_rows)
+            o_proj = getattr(mixer, "o_proj", None)
+            if getattr(o_proj, "supports_prequantized_input", False):
+                need(o_proj, max_num_tokens)
+        for (n, k), rows in sorted(rows_by_shape.items()):
+            if rows > 0:
+                compiled += fp8_block_scale_low_m_gemm.precompile_prequantized(n, k, rows)
+        return compiled
 
     def forward(
         self,
