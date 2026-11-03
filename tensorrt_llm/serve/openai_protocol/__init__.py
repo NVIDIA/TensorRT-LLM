@@ -215,8 +215,10 @@ _NAME_TO_MODULE = {
     "to_disaggregated_params": "tensorrt_llm.serve.openai_protocol.disagg",
     "to_llm_conversation_params": "tensorrt_llm.serve.openai_protocol.disagg",
     "to_llm_disaggregated_params": "tensorrt_llm.serve.openai_protocol.disagg",
-    # Defined in the VisualGen serving package. Named here only as strings: an import,
-    # even under TYPE_CHECKING, would load that package into every LLM process.
+    # Defined in the VisualGen serving package. Named here only as strings: the static
+    # import-isolation check that lets CI run only the VisualGen tests for VisualGen-only
+    # changes forbids an import edge from this package to the VisualGen package, even under
+    # TYPE_CHECKING, so these names are not in the TYPE_CHECKING block above.
     "ImageEditRequest": "tensorrt_llm.serve.api.visual_gen.protocol",
     "ImageGenerationRequest": "tensorrt_llm.serve.api.visual_gen.protocol",
     "ImageGenerationResponse": "tensorrt_llm.serve.api.visual_gen.protocol",

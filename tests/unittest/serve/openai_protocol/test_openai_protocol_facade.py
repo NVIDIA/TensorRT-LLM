@@ -429,6 +429,7 @@ def test_chat_models_do_not_load_extensions(package_dir):
         }}))
         """
     )
+    culprits: list = []
     if out["extensions"]:
         importers = sorted(
             name
