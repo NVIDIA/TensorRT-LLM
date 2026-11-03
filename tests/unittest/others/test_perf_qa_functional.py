@@ -309,7 +309,8 @@ def test_qa_serve_results_and_cleanup(
     if client_commands:
         assert "--port" in client_commands[0] and "12345" in client_commands[0]
     process.terminate.assert_called()
-    process.wait.assert_called()
+    cleanup_calls = [call[0] for call in process.method_calls]
+    assert "wait" in cleanup_calls[cleanup_calls.index("terminate") + 1 :]
     for args, kwargs in process.wait.call_args_list:
         timeout = kwargs.get("timeout", args[0] if args else None)
         assert timeout is not None and 0 < timeout < float("inf")
