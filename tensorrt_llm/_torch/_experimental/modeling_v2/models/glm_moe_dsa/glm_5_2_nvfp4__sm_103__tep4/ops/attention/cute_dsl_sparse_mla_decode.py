@@ -15,6 +15,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from ...kernels.attention import (
     self_attn_fmha_sparse_mla_h16_qk576_v512_topk2048_fp8_bf16 as _kernel,
 )
+from ...kernels.attention import (
+    self_attn_fmha_sparse_mla_wide_h16_qk576_v512_topk2048_fp8_bf16 as _wide_kernel,
+)
 
 #: `sparse_attn_indices` holds global pool rows, used as they are.
 INDEX_KIND_GLOBAL = _kernel.INDEX_KIND_GLOBAL
@@ -72,7 +75,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     """
     kernels = {}
     for kind in index_kinds:
-        specs = _kernel.precompile_for_serving(
+        specs = _wide_kernel.precompile_for_serving(
             max_batch_size=int(max_batch_size),
             all_sparse_indices_valid=bool(all_sparse_indices_valid),
             max_sq=int(max_sq),
@@ -81,7 +84,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
         )
         for spec in specs:
             # Already built by the walk above; this returns the cached kernel.
-            kernels[spec] = _kernel.compile(
+            kernels[spec] = _wide_kernel.compile(
                 all_sparse_indices_valid=spec.all_sparse_indices_valid,
                 num_heads=spec.num_heads,
                 q_scaling=spec.q_scaling,
@@ -250,6 +253,14 @@ class CuteDslSparseMlaDecode(OpWrapper):
     dependency. Which batches pick the reducer depends on the device's
     cluster occupancy; the `gmem_split` cells find them on the device.
 
+    The handle builds its kernels from the module
+    `self_attn_fmha_sparse_mla_wide_...`: the base kernel with PV reading V
+    from the tile's own K latent slots instead of gathering the latent a second
+    time (H16 only). Same split-K picks, reducers and ABI, bitwise the same
+    outputs (`test_wide_kernel_is_bitwise_the_base_kernel`), about half the
+    gathered bytes: on B300 at 32 sequences x MTP 2, 2048 valid rows per query,
+    28.2 -> 20.7 us per call in CUDA-graph replay.
+
     The kernel reads neither scale array: its softmax scale is compiled in as
     `1/16` and its output scale is 1. `is_valid` holds the arrays to those
     values.
@@ -287,7 +298,7 @@ class CuteDslSparseMlaDecode(OpWrapper):
                 f"no kernel compiled for {batch} sequences, index kind {index_kind!r}, "
                 f"{quant_q_buffer.shape[1]} heads on {quant_q_buffer.device}"
             )
-        runner = _kernel.prepare_runner(
+        runner = _wide_kernel.prepare_runner(
             quant_q_buffer,
             kv_pool_view,
             sparse_attn_indices,

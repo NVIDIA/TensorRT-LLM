@@ -29,7 +29,15 @@ Three relayouts no checkpoint stores:
 * the routed experts in the vendored grouped GEMMs' layout: FC1 rows in 64-row
   blocks alternating up and gate, and the block scales in the 512-byte
   `(32, 4, 4)` atom. This is not the trtllm-gen runner's layout, so the trunk
-  experts have no stock MoE fallback.
+  experts have no stock MoE fallback. With `TRTLLM_GLM52_MOE_FC1_KBLK=1` (the
+  default; the model reads it once at build as `fc1_kblk`) each expert's FC1
+  weight is then stored k-block (`moe_fc1_kblock`): `[N/128][K/256][128 rows][128 B]`,
+  so each FC1 GEMM's 128-row x 128 B TMA box is one contiguous 16 KB read instead of
+  128 B pieces at a 3 KB pitch (decode GG1 -4.0 .. -4.6 %). Same shape, same bytes
+  per expert and per 128-row block, scales unchanged. `TRTLLM_GLM52_MOE_FC2_KBLK=1`
+  (also the default; `fc2_kblk`) does the same to each expert's FC2 weight, whose boxes
+  were 128 B pieces at a 1 KB pitch (prefill-pair GG2 -2.1 .. -2.9 %, decode FC2
+  -1.2 .. -1.5 %).
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ import torch
 import torch.nn as nn
 
 from . import dec_hot_experts as _hot
+from .kernels.moe import moe_fc1_kblock as _fc1_kblock
 from .kernels.moe import mtp_moe_gather_grouped_gemm_act_fusion as _mtp_fc1
 
 # FC1 pairs up and gate in 64-row blocks; the MTP kernel's `epi_subtile_n` is the same 64.
@@ -132,13 +141,24 @@ def _sf_atoms(s: torch.Tensor) -> torch.Tensor:
 
 
 def _fc1_w(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
+    """One expert's `(up, gate)` -> 64-row blocks alternating up, gate; then, when the model
+    was built with `fc1_kblk`, the k-block layout both FC1 GEMMs are compiled for. Per
+    expert, so the replica slots (`dec_hot_experts`) get the same layout as the home ones."""
     w = torch.cat(t, dim=0)
-    return torch.index_select(w, 0, _pair_perm(w.shape[0], w.device)).contiguous()
+    w = torch.index_select(w, 0, _pair_perm(w.shape[0], w.device)).contiguous()
+    return _fc1_kblock.to_kblock(w) if core.fc1_kblk else w
 
 
 def _fc1_s(t: tuple[torch.Tensor, ...], core) -> torch.Tensor:
     s = torch.cat([x.view(torch.uint8) for x in t], dim=0)
     return _sf_atoms(torch.index_select(s, 0, _pair_perm(s.shape[0], s.device)))
+
+
+def _fc2_w(t: torch.Tensor, core) -> torch.Tensor:
+    """One expert's FC2 weight, row-major as stored; when the model was built with
+    `fc2_kblk`, the k-block layout the three FC2 GEMMs are compiled for. Per expert, so the
+    replica slots get the same layout as the home ones."""
+    return _fc1_kblock.to_kblock(t.contiguous()) if core.fc2_kblk else t
 
 
 def _fc2_s(t: torch.Tensor, core) -> torch.Tensor:
@@ -444,6 +464,7 @@ class GlmMoeDsaTep4Weights:
             shape=lambda d: (d.local_experts + d.dec_replicas, d.hidden, d.moe_inter // 2),
             dtype=torch.uint8,
             src=_expert_window("down_proj.weight"),
+            transform=_fc2_w,
             layers=_routed_layers,
         ),
         W(

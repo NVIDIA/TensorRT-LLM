@@ -17,6 +17,8 @@ Layout of one layer's FC1 operands (the target's ``fc1_w`` / ``fc1_s``, the GG1 
   weights  ``[64 experts, 2*I = 4096 rows, H/2 = 3072 B]``: the (expert, N-tile) slice is 256 rows = 786432 B
   scales   ``[64, 2*I/128 = 32, H/64 = 96, 512 B]``: the (expert, N-tile) slice is 2 row blocks = 98304 B
 Expert strides are runtime arguments (bytes), so a stacked or a per-expert-strided store both work.
+The weights' byte order inside a slice does not matter here: in the k-block layout (``moe_fc1_kblock``, the
+target's default) each 128-row block is still one contiguous range, so a 256-row slice is the same 786432 B.
 
 Selection, identical in every CTA (64 counts, one warp): expert ``e`` takes slot ``rank(e)``. Its rank is the
 number of experts with a larger count, or the same count and a smaller index. Experts with a zero count take no

@@ -13,6 +13,15 @@ has no half-byte dtype, and `from_dlpack` cannot describe a `[K, N, L]` element 
 function, so `_fc1` / `_fc2` below build those views from raw pointers next to the kernel
 call that consumes them. `@cute.jit` reads its function's source, so they live in this
 importable module.
+
+Both FC1 kernels are compiled for one FC1 weight layout, `fc1_kblk` (`moe_fc1_kblock`):
+the k-block layout the target loads by default, whose 128-row x 128 B TMA boxes are each
+one contiguous 16 KB read, or the row-major `[E, N, K/2]` one. The torch operand keeps its
+shape either way; the compiled handle records which byte order it reads, and `reference`
+reads the weight back through it. The FC2 kernels (decode dynamic and static FC2, the
+prefill pair's GG2) are likewise compiled for one FC2 weight layout, `fc2_kblk`
+(`moe_fc1_kblock.fc2_enabled`): the same k-block relayout of `[E, hidden, inter/2]`, whose
+boxes were 128 B rows at a 1 KB pitch.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
+from ...kernels.moe import moe_fc1_kblock as _fc1_kblock
 from ...kernels.moe import moe_gather_grouped_gemm_act_fusion as _gg1
 from ...kernels.moe import moe_grouped_gemm_finalize_fusion as _gg2
 from ...kernels.moe import moe_grouped_gemm_finalize_fusion_dyn as _gg2_dyn
@@ -141,6 +151,9 @@ def _fc1(
     mma_tiler_k: cutlass.Constexpr,
     raster_along_m: cutlass.Constexpr,
     num_sms: cutlass.Constexpr,
+    # B's bytes are in the k-block layout (`moe_fc1_kblock`). The view below is the same
+    # either way; only the kernel's B descriptor differs.
+    b_kblock: cutlass.Constexpr,
 ):
     """Gather + grouped GEMM + fused SwiGLU + SFC.
 
@@ -193,6 +206,7 @@ def _fc1(
         raster_along_m,
         num_sms,
         stream,
+        b_kblock,
     )
 
 
@@ -230,6 +244,9 @@ def _fc2(
     epi_subtile_n: cutlass.Constexpr,
     raster_along_m: cutlass.Constexpr,
     num_sms: cutlass.Constexpr,
+    # B's bytes are in the k-block layout (`moe_fc1_kblock`, `fc2_kblk`). The view below is
+    # the same either way; only the kernel's B descriptor differs.
+    b_kblock: cutlass.Constexpr,
 ):
     """Grouped GEMM + fused finalize.
 
@@ -296,6 +313,7 @@ def _fc2(
         raster_along_m,
         num_sms,
         stream,
+        b_kblock,
     )
 
 
@@ -341,6 +359,7 @@ def _fc2_dyn(
     num_sms: cutlass.Constexpr,
     a_rows: cutlass.Constexpr,
     ab_stage_cap: cutlass.Constexpr,
+    b_kblock: cutlass.Constexpr,
 ):
     """`_fc2` on the copy with dynamic tile assignment: after its first tile by CTA index,
     each persistent CTA takes the next tile from the two-word counter at `dyn_ptr` (zero
@@ -404,6 +423,7 @@ def _fc2_dyn(
         a_rows,
         ab_stage_cap,
         stream,
+        b_kblock,
     )
 
 
@@ -419,7 +439,8 @@ class CompiledDecodeExperts:
     """The decode pair, compiled once for a row capacity. `bias` is the zero fp32
     `[experts, 2 * inter]` operand both GEMMs declare and neither reads. `fc2_dyn` is FC2
     with dynamic tile assignment and `dyn_ctr` its per-call-site counters (`dyn_slots`
-    rows of two int32 words), or None."""
+    rows of two int32 words), or None. `fc1_kblk` / `fc2_kblk`: FC1 / both FC2s read their
+    weight in the k-block layout (`moe_fc1_kblock`)."""
 
     fc1: object
     fc2: object
@@ -430,6 +451,8 @@ class CompiledDecodeExperts:
     max_rows: int
     fc2_dyn: object = None
     dyn_ctr: torch.Tensor | None = None
+    fc1_kblk: bool = False
+    fc2_kblk: bool = False
 
 
 @dataclass(frozen=True)
@@ -437,13 +460,16 @@ class CompiledPairExperts:
     """The prefill pair at both MMA N widths, `{128 | 256: (gg1, gg2)}`; the width is
     picked per call (`selected_width`: 128 up to 1536 rows, 256 above). `bias` is the zero
     fp32 `[experts, hidden]` operand in GG2's ABI that it does not read. `experts` is the
-    stacks' depth: 64, or 64 + R with context replica slots (`replicas`)."""
+    stacks' depth: 64, or 64 + R with context replica slots (`replicas`). `fc1_kblk` /
+    `fc2_kblk`: GG1 / GG2 read their weight in the k-block layout (`moe_fc1_kblock`)."""
 
     pair: Mapping[int, tuple[object, object]]
     bias: torch.Tensor
     hidden: int
     inter: int
     experts: int
+    fc1_kblk: bool = False
+    fc2_kblk: bool = False
 
     @property
     def replicas(self) -> int:
@@ -463,6 +489,8 @@ def build_decode(
     inter: int,
     experts: int,
     max_rows: int,
+    fc1_kblk: bool,
+    fc2_kblk: bool,
     dyn_slots: int = 0,
 ) -> CompiledDecodeExperts:
     """Compile FC1 and FC2 once, for up to `max_rows` rows. Call at load; nothing is
@@ -482,7 +510,17 @@ def build_decode(
     `DYN_MAX_ROWS` tokens, with that many call-site counters: each call passes its own
     slot (`dyn_slot`), and two launches on one slot must not overlap. At 40-47 active
     experts on B300: -8.3 .. -10.2 % per FC2.
+
+    `fc1_kblk` is the FC1 weight's layout as loaded (`moe_fc1_kblock`; the target passes
+    the value it read once at build): True compiles FC1 for the k-block layout, False for
+    row-major. Keyword-only with no default: a mismatch would be silently wrong.
+    `fc2_kblk` is the same for the FC2 weight (`moe_fc1_kblock.fc2_enabled`), and compiles
+    both the static and the dynamic FC2 for it.
     """
+    if type(fc1_kblk) is not bool:
+        raise ValueError("fc1_kblk must be bool")
+    if type(fc2_kblk) is not bool:
+        raise ValueError("fc2_kblk must be bool")
     dev = out.device
     n_fc1 = 2 * inter
     cap_m = max_tiles(max_rows) * TILE
@@ -518,6 +556,7 @@ def build_decode(
             MMA_TILER_K,
             True,
             sms,
+            fc1_kblk,
         )
         fc2 = cute.compile(
             _fc2,
@@ -551,6 +590,7 @@ def build_decode(
             0,
             False,
             sms,
+            fc2_kblk,
         )
         fc2_dyn = dyn_ctr = None
         if dyn_slots > 0:
@@ -589,9 +629,20 @@ def build_decode(
                 sms,
                 DYN_A_ROWS,
                 0,
+                fc2_kblk,
             )
     return CompiledDecodeExperts(
-        fc1, fc2, bias, hidden, inter, experts, int(max_rows), fc2_dyn, dyn_ctr
+        fc1,
+        fc2,
+        bias,
+        hidden,
+        inter,
+        experts,
+        int(max_rows),
+        fc2_dyn,
+        dyn_ctr,
+        fc1_kblk,
+        fc2_kblk,
     )
 
 
@@ -732,7 +783,9 @@ def _run_decode(
         compiled.fc2(*fc2_args, stream)
 
 
-def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> CompiledPairExperts:
+def build_prefill_pair(
+    hidden: int, inter: int, experts: int, device, *, fc1_kblk: bool, fc2_kblk: bool
+) -> CompiledPairExperts:
     """Compile the prefill pair at both MMA N widths (128, 256), every SM, PDL as the
     engine sets it, and launch each width once on zero tiles: a compiled handle still
     loads its module on its first launch, which the first context step would otherwise
@@ -742,13 +795,29 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
     The warm launch allocates weight-shaped scratch for the descriptors (nothing is read
     at zero tiles), freed on return. Raises if the device is not sm_103 or a compile
     fails: the target then runs every context step on the decode pair.
+
+    `fc1_kblk`: GG1 reads its weight in the k-block layout (`moe_fc1_kblock`), as in
+    `build_decode`; both widths' B boxes are whole 128-row blocks. `fc2_kblk`: the same for
+    GG2's weight.
     """
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     with torch.cuda.device(device):
         pair = {
             width: (
-                _pair.compile_gg1(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL, experts=experts),
-                _pair.compile_gg2(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL, experts=experts),
+                _pair.compile_gg1(
+                    tile_n=width,
+                    num_sms=num_sms,
+                    use_pdl=_USE_PDL,
+                    experts=experts,
+                    fc1_kblk=fc1_kblk,
+                ),
+                _pair.compile_gg2(
+                    tile_n=width,
+                    num_sms=num_sms,
+                    use_pdl=_USE_PDL,
+                    experts=experts,
+                    fc2_kblk=fc2_kblk,
+                ),
             )
             for width in (128, 256)
         }
@@ -758,6 +827,8 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
             hidden,
             inter,
             experts,
+            fc1_kblk,
+            fc2_kblk,
         )
         u8 = {"dtype": torch.uint8, "device": device}
         e4 = {"dtype": torch.float8_e4m3fn, "device": device}
@@ -877,7 +948,13 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
 
     # Decode: one row, an MTP-sized batch, the 64-row ceiling, and the accumulate form
     # (out holding the shared expert's partial, joined between the GEMMs). Prefill: each
-    # MMA N width at its edges, a count that is not a tile multiple, and the budget.
+    # MMA N width at its edges, a count that is not a tile multiple, and the budget. The
+    # cells without `fc1_kblk` / `fc2_kblk` run that weight row-major
+    # (TRTLLM_GLM52_MOE_FC1_KBLK=0 / TRTLLM_GLM52_MOE_FC2_KBLK=0); seven repeat the decode
+    # forms and each prefill width on the k-block FC1 weight, and the last eight on both
+    # weights k-block (the target's default), covering the static and the dynamic decode
+    # FC2, the prefill GG2 at both widths and the 72-deep replica stack, plus one cell
+    # with only FC2 k-block.
     CELLS: tuple[Cell, ...] = (
         Cell(why="one decode row", spec=dict(pair=False, rows=1, offset=0)),
         Cell(
@@ -916,13 +993,88 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
             why="8192 rows on the 72-deep pair, N256, replica slots, accumulating",
             spec=dict(pair=True, rows=8192, offset=128, replicas=8, accumulate=True),
         ),
+        Cell(
+            why="k-block FC1 weight: one decode row",
+            spec=dict(pair=False, rows=1, offset=0, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 64 decode rows accumulating onto a joined partial",
+            spec=dict(pair=False, rows=64, offset=192, accumulate=True, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 64 decode rows on the dynamic FC2",
+            spec=dict(pair=False, rows=64, offset=64, dyn_slot=1, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 192 rows on the prefill pair, N128 (MTP5 decode)",
+            spec=dict(pair=True, rows=192, offset=0, norm_const=0.5, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 1537 rows, N256, accumulating onto a joined partial",
+            spec=dict(pair=True, rows=1537, offset=128, accumulate=True, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 8192 rows on the prefill pair, N256",
+            spec=dict(pair=True, rows=8192, offset=64, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 weight: 8192 rows on the 72-deep pair, N256, replica slots",
+            spec=dict(pair=True, rows=8192, offset=192, replicas=8, fc1_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: one decode row (static FC2)",
+            spec=dict(pair=False, rows=1, offset=64, fc1_kblk=True, fc2_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 64 decode rows on the static FC2, accumulating",
+            spec=dict(
+                pair=False, rows=64, offset=128, accumulate=True, fc1_kblk=True, fc2_kblk=True
+            ),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 32 decode rows on the dynamic FC2",
+            spec=dict(pair=False, rows=32, offset=0, dyn_slot=2, fc1_kblk=True, fc2_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 64 decode rows on the dynamic FC2, accumulating",
+            spec=dict(
+                pair=False,
+                rows=64,
+                offset=192,
+                accumulate=True,
+                dyn_slot=3,
+                fc1_kblk=True,
+                fc2_kblk=True,
+            ),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 128 rows on the prefill pair, N128 (MTP3 decode)",
+            spec=dict(pair=True, rows=128, offset=64, norm_const=0.5, fc1_kblk=True, fc2_kblk=True),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 1537 rows, N256, accumulating onto a joined partial",
+            spec=dict(
+                pair=True, rows=1537, offset=0, accumulate=True, fc1_kblk=True, fc2_kblk=True
+            ),
+        ),
+        Cell(
+            why="k-block FC1 and FC2 weights: 8192 rows on the 72-deep pair, N256, replica slots",
+            spec=dict(pair=True, rows=8192, offset=128, replicas=8, fc1_kblk=True, fc2_kblk=True),
+        ),
+        Cell(
+            why="k-block FC2 weight alone: 513 rows on the prefill pair, N128",
+            spec=dict(pair=True, rows=513, offset=192, fc2_kblk=True),
+        ),
     )
 
     note = """
     The target builds the decode pair once for 8192 rows (`build_decode`, with one
     dynamic-FC2 slot per trunk layer: a layer's decode FC2 runs at most once per forward)
     and the prefill pair once (`build_prefill_pair`), and with context replicas on a second
-    prefill pair for `64 + R` slots, which runs the replica top-k's maps. Launches of up to
+    prefill pair for `64 + R` slots, which runs the replica top-k's maps. All of them for
+    the one FC1 weight layout the target loaded (`TRTLLM_GLM52_MOE_FC1_KBLK`, k-block by
+    default) and the one FC2 weight layout (`TRTLLM_GLM52_MOE_FC2_KBLK`, likewise); either
+    layout gives bitwise the same FC1 output and the same FC2 products. Launches of up to
     64 tokens pass their layer's `dyn_slot`; the dynamic FC2's atomics add a token's terms in another
     order, as the static kernel's already do run to run. Up to 64 rows take the decode pair; 65..8192
     take the prefill pair when it built, else the decode pair. There is no stock path:
@@ -1008,7 +1160,9 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         requantized through `fp4_quantize.reference` with `norm_const` as its global
         scale and read back as code times e4m3 scale (as FC2 reads it), then the weighted
         sum added onto `out` in fp32 and rounded once to bf16. Fresh tensor; `out` is
-        read, not written. `c`, `sfc`, `join` and `compiled` are not read."""
+        read, not written. `c`, `sfc` and `join` are not read; of `compiled` only
+        `fc1_kblk` / `fc2_kblk`, which say to read a k-block `fc1_w` / `fc2_w` back to
+        row-major."""
         rows = int(xq.shape[0])
         hidden = int(out.shape[1])
         x = dequantize(
@@ -1021,11 +1175,13 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         with true_fp32_matmul():
             for e, expanded in sorted(expert_rows(maps).items()):
                 tokens = expanded // TOP_K
-                w1 = dequantize(fc1_w[e], s1[e])
+                w1e = _fc1_kblock.from_kblock(fc1_w[e]) if compiled.fc1_kblk else fc1_w[e]
+                w1 = dequantize(w1e, s1[e])
                 h = _swiglu_interleaved(x[tokens] @ w1.t(), alpha1[e].float())
                 packed, sf = fp4_quantize.reference(h.contiguous(), gs, SF_VEC, False, False)
                 hq = dequantize(packed, sf.view(torch.float8_e4m3fn).float().view(h.shape[0], -1))
-                y = (hq @ dequantize(fc2_w[e], s2[e]).t()) * alpha2[e].float()
+                w2e = _fc1_kblock.from_kblock(fc2_w[e]) if compiled.fc2_kblk else fc2_w[e]
+                y = (hq @ dequantize(w2e, s2[e]).t()) * alpha2[e].float()
                 acc.index_add_(0, tokens, y * w_flat[expanded].unsqueeze(1))
         return acc.to(out.dtype)
 

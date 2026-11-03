@@ -48,7 +48,12 @@ Shapes and layouts follow the production op:
 
   A    (k, m, 1)               NVFP4, K-major
   SFA  512-byte atoms, (512, scale_k/4, m/128, 1)
-  B    (k, n, l)               NVFP4, K-major
+  B    (k, n, l)               NVFP4, K-major; row-major, or with ``b_kblock`` the k-block
+                               layout ``[l][n/128][k/256][128 rows][128 B]``
+                               (``moe_fc1_kblock``, ``TRTLLM_GLM52_MOE_FC2_KBLK``), whose
+                               128 x 128 B TMA boxes are each one contiguous 16 KB read
+                               instead of 128 B rows at a 1 KB pitch (-1.9 / -2.2 % at
+                               32 / 64 tokens, B300, cold L2); same shared-memory image, bitwise output
   SFB  512-byte atoms, (512, scale_k/4, n/128, l)
   out  (num_tokens, n)         BF16 -- **must be zero-initialised**, the epilogue
                                accumulates into it
@@ -227,6 +232,10 @@ def host_function(
     # The caller passes the real value.
     num_sms: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
+    # FC2 weight (B) in the k-block layout (`moe_fc1_kblock` on W2, `fc2_enabled`,
+    # [expert][N/128][K/256][128 rows][128 B]): each tile_n x 128 B box is tile_n / 128
+    # contiguous 16 KB reads instead of 128 B row pieces at a K/2 = 1 KB pitch.
+    b_kblock: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host-side JIT function for contiguous grouped block-scaled GEMM + finalize fusion.
 
@@ -282,18 +291,38 @@ def host_function(
         tma_format=cuda.TensorMapDataFormat.BYTE,
     )
 
-    tma_b_desc = cuda.create_tensor_map_tiled_from_view(
-        b_tensor,
-        box_dims=(
-            mma_tiler_mnk[2] // fp4_lanes_per_storage,
-            mma_tiler_mnk[1],
-            1,
-        ),  # (Kx2_slice, N_tile, L_tile)
-        stride_order=(0, 1, 2),
-        swizzle=cuda.TensorMapSwizzle.s128b,
-        dtype=fp4x2_dtype,
-        tma_format=cuda.TensorMapDataFormat.BYTE,
-    )
+    if cutlass.const_expr(b_kblock and (mma_tiler_mnk[2] != 256 or mma_tiler_mnk[1] % 128 != 0)):
+        raise ValueError("b_kblock needs mma_tiler_k 256 and mma_tiler_n a multiple of 128")
+    if cutlass.const_expr(b_kblock):
+        # k-block B: a 5-D descriptor over (128 B of K, 128 rows, k-block, row block,
+        # expert); the box takes tile_n / 128 row blocks of one k-block, each one contiguous
+        # 16 KB read. It lands in shared memory as the row-major box does (tile_n rows of
+        # 128 B, 128 B swizzle). Strides are in 16 B units for dims 1..4.
+        kin = mma_tiler_mnk[2] // fp4_lanes_per_storage
+        kk = b_tensor.shape[0]
+        nn = b_tensor.shape[1]
+        tma_b_desc = cuda.create_tensor_map_tiled(
+            b_tensor.iterator.toint(),
+            fp4x2_dtype,
+            global_dims=[kin, 128, kk // kin, nn // 128, b_tensor.shape[2]],
+            global_strides=[kin // 16, kin * 128 // 16, kk * 128 // 16, kk * nn // 16],
+            box_dims=(kin, 128, 1, mma_tiler_mnk[1] // 128, 1),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+            tma_format=cuda.TensorMapDataFormat.BYTE,
+        )
+    else:
+        tma_b_desc = cuda.create_tensor_map_tiled_from_view(
+            b_tensor,
+            box_dims=(
+                mma_tiler_mnk[2] // fp4_lanes_per_storage,
+                mma_tiler_mnk[1],
+                1,
+            ),  # (Kx2_slice, N_tile, L_tile)
+            stride_order=(0, 1, 2),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+            dtype=fp4x2_dtype,
+            tma_format=cuda.TensorMapDataFormat.BYTE,
+        )
 
     # No C TMA descriptor — finalize fusion uses atomic scatter instead of TMA store.
     # Pointers (out_ptr, tile_idx_ptr, etc.) are passed as runtime Int64 arguments
@@ -450,6 +479,7 @@ def host_function(
         acc_stages,
         overlapping_accum,
         sf_tmem_cols,
+        b_kblock,
     ).launch(
         grid=grid,
         block=[threads_per_cta, 1, 1],
@@ -506,6 +536,10 @@ def moe_grouped_gemm_finalize_fusion_kernel(
     acc_stages: cutlass.Constexpr[int],
     overlapping_accum: cutlass.Constexpr[bool],
     sf_tmem_cols: cutlass.Constexpr[int],
+    # FC2 weight (B) in the k-block layout (`moe_fc1_kblock` on W2, `fc2_enabled`,
+    # [expert][N/128][K/256][128 rows][128 B]): each tile_n x 128 B box is tile_n / 128
+    # contiguous 16 KB reads instead of 128 B row pieces at a K/2 = 1 KB pitch.
+    b_kblock: cutlass.Constexpr[bool] = False,
 ) -> None:
     """GPU device kernel for contiguous grouped mixed precision block-scaled GEMM.
 
@@ -863,13 +897,24 @@ def moe_grouped_gemm_finalize_fusion_kernel(
                         (coord_k_packed, coord_m, coord_l_a),
                         ab_full_mbar_ptr.subview(current_ab_stage),
                     )
-                    prims.cp_async_bulk_tensor_shared_cta_global(
-                        sB_staged,
-                        tma_b_desc.get_ptr(),
-                        (coord_k_packed, coord_n, coord_l_b),
-                        ab_full_mbar_ptr.subview(current_ab_stage),
-                        l2_cache_hint=b_policy,
-                    )
+                    if cutlass.const_expr(b_kblock):
+                        # (byte in K, row, k-block, row block, expert); coord_n_sf is the
+                        # tile's first 128-row block.
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sB_staged,
+                            tma_b_desc.get_ptr(),
+                            (0, 0, k_tile, coord_n_sf, coord_l_b),
+                            ab_full_mbar_ptr.subview(current_ab_stage),
+                            l2_cache_hint=b_policy,
+                        )
+                    else:
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sB_staged,
+                            tma_b_desc.get_ptr(),
+                            (coord_k_packed, coord_n, coord_l_b),
+                            ab_full_mbar_ptr.subview(current_ab_stage),
+                            l2_cache_hint=b_policy,
+                        )
                     # TMA load SFA: contiguous (L=1), use coord_l_a=0
                     prims.cp_async_bulk_tensor_shared_cta_global(
                         sSFA_staged,

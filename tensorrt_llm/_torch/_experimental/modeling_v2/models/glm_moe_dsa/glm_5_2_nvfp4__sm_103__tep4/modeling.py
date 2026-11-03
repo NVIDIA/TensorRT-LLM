@@ -57,6 +57,7 @@ from tensorrt_llm.logger import logger
 
 from . import dec_hot_experts as _hot
 from . import weights as _weights
+from .kernels.moe import moe_fc1_kblock as _fc1_kblock
 from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
 from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
@@ -515,6 +516,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 f"({self.dec_replicas}), got {self.ctx_replicas}"
             )
         self.mtp_enabled = getattr(model_config, "spec_config", None) is not None
+        # The routed experts' FC1 weight layout (`TRTLLM_GLM52_MOE_FC1_KBLK`, `moe_fc1_kblock`),
+        # read once here: the loader (`weights._fc1_w`), the MTP layer's quantized experts and
+        # every compiled FC1 kernel follow this one value.
+        self.fc1_kblk = _fc1_kblock.enabled()
+        # The same for FC2 (`TRTLLM_GLM52_MOE_FC2_KBLK`): the loader (`weights._fc2_w`), the
+        # MTP layer's quantized FC2 and every compiled FC2 kernel follow this one value.
+        self.fc2_kblk = _fc1_kblock.fc2_enabled()
 
         self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
 
@@ -1134,7 +1142,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return built
         mw, j = self._mtp, self.num_layers
 
-        def quant(stack: torch.Tensor):
+        def quant(stack: torch.Tensor, kblk: bool = False):
             e, n, k = stack.shape
             dev = stack.device
             qw = torch.empty((e, n, k // 2), dtype=torch.uint8, device=dev)
@@ -1147,13 +1155,16 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             for x in range(e):
                 gs = (448.0 * 6.0 / stack[x].abs().amax().float()).reshape(1)
                 q, sf = fp4_quantize(stack[x].contiguous(), gs, 16, False, False)
-                qw[x] = q.view(n, k // 2)
+                q = q.view(n, k // 2)
+                # In the layout the trunk's FC1 / FC2 kernels are compiled for (`fc1_kblk` /
+                # `fc2_kblk`).
+                qw[x] = _fc1_kblock.to_kblock(q) if kblk else q
                 qs[x] = _weights._sf_atoms(sf.view(torch.uint8).view(n, k // 16))
                 ws2[x] = 1.0 / gs[0]
             return qw, qs.view(torch.float8_e4m3fn), ws2
 
-        q1, s1, a1 = quant(mw["fc1"])
-        q2, s2, a2 = quant(mw["fc2"])
+        q1, s1, a1 = quant(mw["fc1"], self.fc1_kblk)
+        q2, s2, a2 = quant(mw["fc2"], self.fc2_kblk)
         one = torch.ones(1, dtype=torch.float32, device=q1.device)
         for key in (f"l{j}_fc1", f"l{j}_fc2"):
             prm = self.w[key]
@@ -1442,10 +1453,16 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # The decode expert replicas' slots follow this rank's 64 (0 when off).
             experts=experts + self.dec_replicas,
             max_rows=rows,
+            fc1_kblk=self.fc1_kblk,
+            fc2_kblk=self.fc2_kblk,
             # One FC2 tile counter per MoE call site: the trunk layers and the MTP layer.
             dyn_slots=self.num_layers + 1,
         )
-        k.pair = optional(lambda: _moe_experts_op.build_prefill_pair(hidden, inter, experts, dev))
+        k.pair = optional(
+            lambda: _moe_experts_op.build_prefill_pair(
+                hidden, inter, experts, dev, fc1_kblk=self.fc1_kblk, fc2_kblk=self.fc2_kblk
+            )
+        )
         if k.pair is not None:
             for sl in self._moe_slots:
                 sl.pc = _moe_experts_op.allocate_pair_c(rows, inter, dev, self.ctx_replicas)
@@ -1458,7 +1475,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 lambda: (
                     _moe_topk_pre_rep_op.build_prefill(self.ctx_replicas, dev),
                     _moe_experts_op.build_prefill_pair(
-                        hidden, inter, experts + self.ctx_replicas, dev
+                        hidden,
+                        inter,
+                        experts + self.ctx_replicas,
+                        dev,
+                        fc1_kblk=self.fc1_kblk,
+                        fc2_kblk=self.fc2_kblk,
                     ),
                 )
             )

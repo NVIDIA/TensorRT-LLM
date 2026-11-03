@@ -107,27 +107,38 @@ def _require_experts(experts):
         raise ValueError("experts must be an integer in [64, 80]")
 
 
-def compile_gg1(*, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64):
+def compile_gg1(
+    *, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64, fc1_kblk: bool = False
+):
     """Compile gather/GG1/SwiGLU/NVFP4 using the actual unpadded input-scale ABI.
 
     `experts`: the weight / scale / alpha stacks' depth (64 home experts; 64 + R with replica
     slots). Only the operands' L extent changes; the kernel indexes the stacks through the
-    tile maps."""
+    tile maps. `fc1_kblk`: W1 is stored in the k-block layout (`moe_fc1_kblock`); the torch
+    view handed in keeps its shape, only the byte order differs."""
     _require_contract(tile_n, num_sms, use_pdl)
     _require_experts(experts)
+    if type(fc1_kblk) is not bool:
+        raise ValueError("fc1_kblk must be bool")
     module = _load_kernel("moe_prefill_nvfp4_gg1", "evict_last", use_pdl)
-    return _compile_gg1(module, tile_n, num_sms, experts=experts)
+    return _compile_gg1(module, tile_n, num_sms, experts=experts, fc1_kblk=fc1_kblk)
 
 
-def compile_gg2(*, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64):
-    """Compile compact-M128 GG2/weighted BF16 atomic finalize (no bias); `experts` as GG1's."""
+def compile_gg2(
+    *, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64, fc2_kblk: bool = False
+):
+    """Compile compact-M128 GG2/weighted BF16 atomic finalize (no bias); `experts` as GG1's.
+    `fc2_kblk`: W2 is stored in the k-block layout (`moe_fc1_kblock`, `fc2_enabled`), as
+    `fc1_kblk` is for GG1's W1; same view shape, only the byte order differs."""
     _require_contract(tile_n, num_sms, use_pdl)
     _require_experts(experts)
+    if type(fc2_kblk) is not bool:
+        raise ValueError("fc2_kblk must be bool")
     module = _load_kernel("moe_prefill_nvfp4_gg2", "evict_first", use_pdl)
-    return _compile_gg2(module, tile_n, num_sms, experts=experts)
+    return _compile_gg2(module, tile_n, num_sms, experts=experts, fc2_kblk=fc2_kblk)
 
 
-def _compile_gg1(module, tile_n, num_sms, bindings=None, experts=64):
+def _compile_gg1(module, tile_n, num_sms, bindings=None, experts=64, fc1_kblk=False):
     """Build the packed GG1 ABI; inputs and linear scales share unpadded T."""
     if bindings is None:
         cutlass = importlib.import_module("cutlass")
@@ -170,11 +181,12 @@ def _compile_gg1(module, tile_n, num_sms, bindings=None, experts=64):
         False,
         False,
         False,
+        fc1_kblk,
         options="--enable-tvm-ffi --generate-line-info",
     )
 
 
-def _compile_gg2(module, tile_n, num_sms, bindings=None, experts=64):
+def _compile_gg2(module, tile_n, num_sms, bindings=None, experts=64, fc2_kblk=False):
     """Build compact-M128 GG2 ABI with distinct dynamic row/tile/SF extents."""
     if bindings is None:
         cutlass = importlib.import_module("cutlass")
@@ -216,7 +228,11 @@ def _compile_gg2(module, tile_n, num_sms, bindings=None, experts=64):
         False,
         False,
         0,
-        False,
+        # raster_along_m: on the context-step N256 build, M-first tile order keeps one N block's
+        # output window (~3.8 MB) and W2 slice L2-resident across consecutive tiles: DRAM 736 ->
+        # 677 MB per layer and -4.4 % at 7513 rows (1 B300, two real routings). N128 (MTP3/5
+        # decode rows) measured +0.5..+1.8 % with it, so it keeps the N-first order.
+        tile_n == 256,
         num_sms,
         runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         0,
@@ -226,5 +242,6 @@ def _compile_gg2(module, tile_n, num_sms, bindings=None, experts=64):
         True,
         True,
         128,
+        fc2_kblk,
         options="--enable-tvm-ffi --generate-line-info",
     )
