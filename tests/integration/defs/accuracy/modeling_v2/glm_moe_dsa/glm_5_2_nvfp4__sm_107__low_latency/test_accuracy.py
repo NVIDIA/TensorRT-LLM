@@ -40,6 +40,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate import GSM8KInferenceX
+from tensorrt_llm.evaluate.lm_eval import LmEvalWrapper
 from tensorrt_llm.llmapi import (
     CudaGraphConfig,
     DeepSeekSparseAttentionConfig,
@@ -669,7 +670,7 @@ def _high_throughput_engine_kwargs(batch_size: int, draft_len: int) -> dict:
     return kwargs
 
 
-def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) -> int:
+def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) -> list:
     """Exercise every ADP owner after capture, with enough requests to fill its batch."""
     prompts = [
         f"Exercise {index}: explain step by step how to multiply two three-digit numbers."
@@ -700,7 +701,64 @@ def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) ->
             "_glm_rubin_mtp_tail_scatter_kernel",
         ):
             assert any(kernel in name for name in names), f"Rank {rank} did not execute {kernel}"
-    return len(prompts)
+    return outputs
+
+
+def _request_speculation_records(outputs: list) -> list[dict]:
+    """Retain each owner's final counters; ADP iteration speculation fields are broadcast."""
+    records = []
+    for output in outputs:
+        assert output.finished and not getattr(output, "error", None)
+        per_draft = list(output.per_pos_drafted or [0])
+        per_accepted = list(output.per_pos_accepted or [0])
+        assert all(isinstance(value, int) and value >= 0 for value in (*per_draft, *per_accepted))
+        if output.spec_dec_totals is None:
+            assert not any(per_draft) and not any(per_accepted)
+            accepted, drafted = 0, 0
+        else:
+            accepted, drafted = output.spec_dec_totals
+        assert sum(per_draft) == drafted and sum(per_accepted) == accepted
+        assert all(
+            a <= (per_draft[i] if i < len(per_draft) else 0) for i, a in enumerate(per_accepted)
+        )
+        records.append(
+            dict(
+                request_id=output.request_id,
+                accepted_draft_tokens=accepted,
+                drafted_tokens=drafted,
+                per_pos_drafted=per_draft,
+                per_pos_accepted=per_accepted,
+            )
+        )
+    assert len({record["request_id"] for record in records}) == len(records)
+    return records
+
+
+def _request_acceptance_metrics(records: list[dict]) -> dict:
+    accepted = sum(record["accepted_draft_tokens"] for record in records)
+    drafted = sum(record["drafted_tokens"] for record in records)
+    steps = sum(record["per_pos_drafted"][0] for record in records)
+    assert 0 <= accepted <= drafted and steps > 0
+    return dict(
+        acceptance_length=1 + accepted / steps,
+        accepted_draft_tokens=accepted,
+        drafted_tokens=drafted,
+        speculative_request_steps=steps,
+        completed_requests=len(records),
+    )
+
+
+def _drain_adp_stats(llm: LLM) -> list[dict]:
+    # Request futures already completed. Iteration completion counters belong
+    # to rank zero and cannot be used to count the whole ADP corpus.
+    stats = []
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        batch = llm.get_stats(timeout=0.5)
+        if not batch:
+            break
+        stats.extend(batch)
+    return stats
 
 
 class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
@@ -713,14 +771,26 @@ class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
         assert os.environ.get("INTEGRATION_TEST") != "1", "This guard requires all 1319 samples"
         monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", str(_TP_SIZE * batch_size))
         monkeypatch.setenv("TLLM_EVAL_PARTIAL_SCORES_EVERY", "100")
+        monkeypatch.setenv("TLLM_EVAL_SPEC_STATS", "1")
+        request_records = []
+        original_log_spec_stats = LmEvalWrapper._log_spec_stats
+
+        def capture_request_stats(wrapper, outputs):
+            request_records.extend(_request_speculation_records(outputs))
+            original_log_spec_stats(wrapper, outputs)
+
+        monkeypatch.setattr(LmEvalWrapper, "_log_spec_stats", capture_request_stats)
         with (
             scoped_env_overrides(_HIGH_THROUGHPUT_ENV),
             LLM(_MODEL_PATH, **_high_throughput_engine_kwargs(batch_size, draft_len)) as llm,
         ):
-            probe_requests = _assert_high_throughput_paths(
+            probe_outputs = _assert_high_throughput_paths(
                 llm, batch_size, tmp_path / "optimized-path-traces"
             )
-            _request_stats(llm, probe_requests)
+            probe_records = _request_speculation_records(probe_outputs)
+            probe_stats = _drain_adp_stats(llm)
+            (tmp_path / "probe-request-stats.json").write_text(json.dumps(probe_records) + "\n")
+            (tmp_path / "probe-iteration-stats.json").write_text(json.dumps(probe_stats) + "\n")
             evaluator = GSM8KInferenceX(
                 dataset_path=_DATASET_PATH,
                 num_samples=_NUM_SAMPLES,
@@ -742,31 +812,30 @@ class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
                 sampling_override=True,
                 scores_filter="exact_match,strict-match",
             )
-            stats = _request_stats(llm, _NUM_SAMPLES)
+            stats = _drain_adp_stats(llm)
 
+        assert len(request_records) == _NUM_SAMPLES
+        assert len({record["request_id"] for record in request_records}) == _NUM_SAMPLES
         rank_ids = {stat["rank"] for stat in stats}
         assert rank_ids == set(range(_TP_SIZE)), f"Incomplete ADP statistics: {rank_ids}"
-        spec_stats = [
-            stat["specDecodingStats"]
-            for stat in stats
-            if stat.get("specDecodingStats") and stat["specDecodingStats"]["numDraftTokens"] > 0
-        ]
-        assert spec_stats, "Missing real speculative iteration statistics"
-        assert max(stat["numRequestsWithDraftTokens"] for stat in spec_stats) == batch_size
-        acceptance_length = acceptance_length_from_iteration_stats(stats)
+        for rank in range(_TP_SIZE):
+            assert (
+                max(
+                    stat["inflightBatchingStats"]["numGenRequests"]
+                    for stat in probe_stats
+                    if stat["rank"] == rank
+                )
+                == batch_size
+            )
         scores = _full_accuracy_scores(tmp_path / f"samples_{_TASK_NAME}.json")
         metrics = {
             **scores,
             "batch_size": batch_size,
             "draft_len": draft_len,
-            "acceptance_length": acceptance_length,
-            "accepted_draft_tokens": sum(stat["numAcceptedTokens"] for stat in spec_stats),
-            "drafted_tokens": sum(stat["numDraftTokens"] for stat in spec_stats),
-            "speculative_request_steps": sum(
-                stat["numRequestsWithDraftTokens"] for stat in spec_stats
-            ),
-            "completed_requests": sum(stat["numCompletedRequests"] for stat in stats),
+            **_request_acceptance_metrics(request_records),
         }
+        acceptance_length = metrics["acceptance_length"]
+        (tmp_path / "request-speculation-stats.json").write_text(json.dumps(request_records) + "\n")
         (tmp_path / "glm_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         (tmp_path / "iteration_stats.json").write_text(json.dumps(stats) + "\n")
         print(f"[GLM high throughput] {json.dumps(metrics)}")
