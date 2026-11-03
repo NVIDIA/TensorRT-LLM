@@ -3916,25 +3916,34 @@ class KimiLinearModel(DecoderModel):
                 max_num_tokens, kimi_k3_attn_res.MAX_TOKENS, _FUSED_ATTN_RES_MAX_TOKENS
             )
         rows_by_shape: dict[tuple[int, int], int] = {}
+        staged_by_shape: dict[tuple[int, int], Callable[[int], bool]] = {}
 
-        def need(linear: nn.Module | None, rows: int) -> None:
+        def need(
+            linear: nn.Module | None, rows: int, stages: Callable[[int], bool] | None = None
+        ) -> None:
             if isinstance(linear, _Fp8BlockScaleWeightReadLinear):
                 key = (linear.out_features, linear.in_features)
-                rows = min(rows, linear._low_m.kernel_max_m)
+                # The prequantized GEMM takes the whole low-M GEMM range (takes_prequantized_input).
+                rows = min(rows, linear._low_m.max_m)
                 rows_by_shape[key] = max(rows, rows_by_shape.get(key, 0))
+                if stages is not None:
+                    staged_by_shape[key] = stages
 
         for layer in self.layers:
             if not layer.is_kda:
                 continue
             mixer = layer.linear_attn
             if not layer.token_sliced and mixer.qkvg_takes_prequantized(1):
-                need(getattr(mixer, "qkvg_proj", None), mxfp8_rows)
+                # The mix releases a q/k/v/g projection that stages its weights at its entry.
+                need(getattr(mixer, "qkvg_proj", None), mxfp8_rows, mixer.qkvg_stages_weights)
             o_proj = getattr(mixer, "o_proj", None)
             if getattr(o_proj, "supports_prequantized_input", False):
                 need(o_proj, max_num_tokens)
         for (n, k), rows in sorted(rows_by_shape.items()):
             if rows > 0:
-                compiled += fp8_block_scale_low_m_gemm.precompile_prequantized(n, k, rows)
+                compiled += fp8_block_scale_low_m_gemm.precompile_prequantized(
+                    n, k, rows, staged_by_shape.get((n, k))
+                )
         return compiled
 
     def forward(

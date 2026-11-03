@@ -107,7 +107,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -4109,13 +4109,28 @@ def weights_on_chip(m: int, n: int, k: int) -> bool:
     return tactic.a_stages + tactic.tmem_tiles >= kt_max
 
 
-def precompile_prequantized(n: int, k: int, max_m: int) -> int:
+def precompile_prequantized(
+    n: int, k: int, max_m: int, stage_weights: Optional[Callable[[int], bool]] = None
+) -> int:
     """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
-    an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
-    tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
-    for tactic in tactics:
-        _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False, fold_weight_scale=True)
-    return len(tactics)
+    an ``[N, K]`` weight at ``1..max_m`` rows, as :func:`run_low_m_gemm_prequantized` selects
+    them (the low-M range, the mid-M GEMM above it, and where ``stage_weights(M)`` the staged
+    tactic); returns their count."""
+    low_m_max = low_m_max_for(n, k)
+    kernels = set()
+    for m in range(1, max_m + 1):
+        fold = m <= low_m_max
+        tactic = default_prequantized_tactic(m, n, k) if fold else default_mid_tactic(m, n, k)
+        kernels.add((tactic, fold))
+        if stage_weights is not None and stage_weights(m) and weights_on_chip(m, n, k):
+            kernels.add((staged_prequantized_tactic(m, n, k), fold))
+    for tactic, fold in kernels:
+        # The same arguments as the launches, so that they hit these cache entries.
+        if fold:
+            _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False, fold_weight_scale=True)
+        else:
+            _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False)
+    return len(kernels)
 
 
 def run_low_m_gemm_prequantized(
