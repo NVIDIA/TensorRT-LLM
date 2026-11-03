@@ -2510,6 +2510,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
+                // Request one Slurm segment for multi-node disaggregated/aggregated perf-sanity
+                // and SingleNvlinkDomain stages; the cluster defines its topology constraints.
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || aggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"

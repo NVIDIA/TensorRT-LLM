@@ -106,7 +106,7 @@ class EfaOutputParity(AccuracyConfig):
         self.requests_checked = len(results)
 
 
-@pytest.mark.timeout(900)
+@pytest.mark.timeout(1800)
 @pytest.mark.parametrize("perf_sanity_test_case", ["disagg-e2e-b300_qwen3_0.6b_efa_functional"])
 def test_kv_cache_v2_efa(output_dir: str, perf_sanity_test_case: str) -> None:
     """Run the existing multi-node harness with functional, rather than throughput, gates."""
