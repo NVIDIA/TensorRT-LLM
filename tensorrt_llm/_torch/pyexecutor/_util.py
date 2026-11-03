@@ -114,6 +114,38 @@ def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def _cuda_tensor_attributes(obj) -> List[torch.Tensor]:
+    """CUDA tensors stored directly as attributes of ``obj``.
+
+    For an ``nn.Module`` these are the tensors it keeps outside its registered
+    parameters and buffers, e.g. tables derived from its weights.
+    """
+    return [
+        value for value in vars(obj).values()
+        if isinstance(value, torch.Tensor) and value.is_cuda
+    ]
+
+
+def _unique_cuda_storage_bytes(tensors: List[torch.Tensor],
+                               exclude: set[int]) -> int:
+    """Bytes of the distinct CUDA storages behind ``tensors``.
+
+    Views of one storage count once; storages whose data pointer is in
+    ``exclude`` do not count.
+    """
+    seen = set(exclude)
+    total = 0
+    for tensor in tensors:
+        if not tensor.is_cuda:
+            continue
+        storage = tensor.untyped_storage()
+        if storage.data_ptr() in seen:
+            continue
+        seen.add(storage.data_ptr())
+        total += storage.nbytes()
+    return total
+
+
 def _get_initial_lora_data_type(
     configured_lora_data_type: Optional[torch.dtype],
 ) -> Optional[torch.dtype]:
@@ -1414,6 +1446,46 @@ class KvCacheCreator:
                         include_request_cost=include_request_cost))
         return None
 
+    def _get_context_server_spec_reserve(self, fraction: float) -> int:
+        """KV budget that keeps a context-KV-only drafter out of PyTorch's headroom.
+
+        The drafter's weights, derived tables and capture buffers are in the
+        profiled peak, and ``fraction`` of the memory left after the peak goes
+        to the KV cache, so each resident byte costs the KV cache ``fraction``
+        of a byte and the PyTorch headroom the rest. Taking the remainder from
+        the KV budget as well leaves a context server's headroom, which absorbs
+        attention over long reused prefixes, untouched by the drafter.
+
+        Returns:
+            ``(1 - fraction)`` times the bytes of the CUDA tensors held by the
+            draft model (minus storage shared with the target) and the
+            speculative metadata; 0 unless ``speculative_config.context_kv_only``.
+        """
+        if not getattr(self._speculative_config, "context_kv_only", False):
+            return 0
+        model = self._model_engine.model
+        draft_model = getattr(model, "draft_model", None)
+        tensors = []
+        if draft_model is not None:
+            tensors.extend(draft_model.parameters())
+            tensors.extend(draft_model.buffers())
+            for module in draft_model.modules():
+                tensors.extend(_cuda_tensor_attributes(module))
+        spec_metadata = getattr(self._model_engine, "spec_metadata", None)
+        if spec_metadata is not None:
+            tensors.extend(_cuda_tensor_attributes(spec_metadata))
+        shared = {
+            tensor.untyped_storage().data_ptr()
+            for name, tensor in (
+                *model.named_parameters(remove_duplicate=False),
+                *model.named_buffers(remove_duplicate=False),
+            ) if tensor.is_cuda and not name.startswith("draft_model.")
+        }
+        resident = _unique_cuda_storage_bytes(tensors, exclude=shared)
+        logger.info(f"Context-KV-only drafter: {resident / GB:.2f} GiB of "
+                    "resident CUDA tensors.")
+        return int((1.0 - fraction) * resident)
+
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
@@ -2019,6 +2091,15 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+        spec_reserve = self._get_context_server_spec_reserve(fraction)
+        if spec_reserve > 0:
+            budget_before = kv_cache_max_memory
+            kv_cache_max_memory = int(budget_before - spec_reserve)
+            logger.info(
+                f"Reserving {spec_reserve / GB:.2f} GiB of PyTorch headroom for "
+                "the context-KV-only drafter's resident tensors: KV cache budget "
+                f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
+            )
 
         # Estimation uses inferred pool sizing; the final manager uses the
         # user-provided configuration.

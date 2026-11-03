@@ -1916,3 +1916,30 @@ def test_context_kv_only_requires_disaggregated_serving():
         creator._validate_context_kv_only()
     creator._speculative_config = None
     creator._validate_context_kv_only()
+
+
+@needs_cuda
+def test_context_server_takes_the_drafter_out_of_the_kv_budget_not_the_headroom():
+    """The KV budget gives back (1 - fraction) of what the drafter keeps resident,
+    so a context-KV-only drafter does not shrink PyTorch's headroom."""
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+
+    head = torch.nn.Linear(16, 8, bias=False, device="cuda")
+    draft = torch.nn.Module()
+    draft.fc = torch.nn.Linear(32, 16, bias=False, device="cuda")
+    draft.lm_head = head  # shared with the target: not the drafter's
+    draft.table = torch.zeros(100, device="cuda")  # derived, not registered
+    draft.blocks = draft.fc.weight[:, :16]  # a view: counted once
+    model = torch.nn.Module()
+    model.model = torch.nn.Linear(16, 16, bias=False, device="cuda")
+    model.lm_head = head
+    model.draft_model = draft
+    metadata = SimpleNamespace(captures=torch.zeros(8, 16, device="cuda"), host_rows=torch.zeros(8))
+
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=model, spec_metadata=metadata)
+    creator._speculative_config = SimpleNamespace(context_kv_only=True)
+    resident = draft.fc.weight.nbytes + draft.table.nbytes + metadata.captures.nbytes
+    assert creator._get_context_server_spec_reserve(0.7) == int((1.0 - 0.7) * resident)
+    creator._speculative_config.context_kv_only = False
+    assert creator._get_context_server_spec_reserve(0.7) == 0
