@@ -30,6 +30,7 @@ import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
 import tensorrt_llm._torch.speculative.dflash as dflash_module
 from tensorrt_llm._torch.pyexecutor import _util
 from tensorrt_llm._torch.pyexecutor.disagg_gen_prefetch import (
+    DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS,
     DISAGG_GEN_PREFETCH_REQUESTS_ENV,
     PRIORITIZE_FIRST_TOKEN_ENV,
     get_disagg_gen_prefetch_requests,
@@ -68,7 +69,16 @@ def prefetch_env(monkeypatch):
     return _set
 
 
-@pytest.mark.parametrize("raw, expected", [(None, 0), ("", 0), ("0", 0), ("1", 1), (" 3 ", 3)])
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS),
+        ("", DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS),
+        ("0", 0),
+        ("1", 1),
+        (" 3 ", 3),
+    ],
+)
 def test_env_parsing(prefetch_env, raw, expected):
     prefetch_env(raw)
     assert get_disagg_gen_prefetch_requests() == expected
@@ -99,8 +109,10 @@ def test_resolve_ignores_unsupported_executors(prefetch_env, override):
 
 
 def test_resolve_gate(prefetch_env):
-    prefetch_env(None)
+    prefetch_env("0")
     assert resolve_disagg_gen_prefetch_requests(**_ELIGIBLE) == 0
+    prefetch_env(None)
+    assert resolve_disagg_gen_prefetch_requests(**_ELIGIBLE) == DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS
     prefetch_env("2")
     assert resolve_disagg_gen_prefetch_requests(**_ELIGIBLE) == 2
 
@@ -184,12 +196,31 @@ _NIXL = SimpleNamespace(backend="NIXL")
 
 
 @pytest.mark.parametrize("max_batch_size", [1, 2])
-def test_engine_seat_pool_is_unchanged_by_default(monkeypatch, prefetch_env, max_batch_size):
-    prefetch_env(None)
+def test_engine_seat_pool_is_unchanged_when_prefetch_is_off(
+    monkeypatch, prefetch_env, max_batch_size
+):
+    prefetch_env("0")
     for transceiver in (None, _NIXL):
         assert _engine_seat_pool(
             monkeypatch, cache_transceiver_config=transceiver, max_batch_size=max_batch_size
         ) == (max_batch_size, 0)
+
+
+@pytest.mark.parametrize("max_batch_size", [1, 2])
+def test_engine_seat_pool_by_default(monkeypatch, prefetch_env, max_batch_size):
+    prefetch_env(None)
+    assert _engine_seat_pool(
+        monkeypatch, cache_transceiver_config=None, max_batch_size=max_batch_size
+    ) == (
+        max_batch_size,
+        0,
+    )
+    assert _engine_seat_pool(
+        monkeypatch, cache_transceiver_config=_NIXL, max_batch_size=max_batch_size
+    ) == (
+        max_batch_size + DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS,
+        DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS,
+    )
 
 
 @pytest.mark.parametrize("prefetch", [1, 3])
@@ -354,6 +385,9 @@ class _FakeDFlashWorker:
 
     def __init__(self, max_batch_size):
         self._ctx_buf_inited = True
+        # The private context arena (VANILLA): a new request's length starts at zero. Over the target's KV cache
+        # manager (_ctx_unified_cache) it would start at its prompt position instead.
+        self._ctx_unified_cache = False
         self._req_to_slot = {}
         self._req_ctx_pos = {}
         self._free_slots = deque(range(max_batch_size))

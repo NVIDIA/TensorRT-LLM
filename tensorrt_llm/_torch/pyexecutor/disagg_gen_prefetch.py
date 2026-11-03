@@ -16,8 +16,9 @@
 
 A disaggregated generation worker normally admits at most ``max_batch_size``
 requests, so the next request's KV transfer only starts after a running
-request finishes. Setting ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS=N`` lets the
-worker admit up to ``N`` more generation-only requests. They receive their KV
+request finishes. With ``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS=N`` (default
+``DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS``, 1) the worker admits up to ``N`` more
+generation-only requests. They receive their KV
 while the running batch decodes; the forward batch is still capped at
 ``max_batch_size`` by the scheduler budget.
 
@@ -29,7 +30,7 @@ The extra requests need room in three pools, all widened by ``N``:
   ``GENERATION_TO_COMPLETE`` and still owns its slot;
 * the KV-cache index pool (``KVCacheManagerV2.max_admissible_sequences``).
 
-``N = 0`` (the default) leaves every pool and the admission cap unchanged.
+``N = 0`` leaves every pool and the admission cap unchanged.
 
 Prefetch is turned off when ``TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN=1``.
 That scheduler option orders generation-only requests that have not emitted
@@ -43,6 +44,12 @@ import os
 from tensorrt_llm.logger import logger
 
 DISAGG_GEN_PREFETCH_REQUESTS_ENV = "TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS"
+# Prefetch one request's KV by default: a generation worker of one to three requests then has
+# the next request's KV arriving while its batch decodes (pair it with the gen router's
+# max_inflight_per_server at max_batch_size + 1). Where prefetch does not apply (aggregated
+# serving, attention DP, PP, KV cache manager V1, ...) ``resolve_disagg_gen_prefetch_requests``
+# returns 0 without a warning.
+DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS = 1
 # Read with the same rule as ``scheduler_v2`` so both agree on whether it is on.
 PRIORITIZE_FIRST_TOKEN_ENV = "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN"  # nosec B105 - env var name, not a password
 
@@ -51,11 +58,15 @@ def _prioritize_first_token_enabled() -> bool:
     return os.environ.get(PRIORITIZE_FIRST_TOKEN_ENV, "0") == "1"
 
 
+def _explicitly_requested() -> bool:
+    return os.environ.get(DISAGG_GEN_PREFETCH_REQUESTS_ENV, "").strip() != ""
+
+
 def get_disagg_gen_prefetch_requests() -> int:
-    """Return the requested number of prefetch requests (0 when unset)."""
+    """Return the requested number of prefetch requests (the default when unset)."""
     raw = os.environ.get(DISAGG_GEN_PREFETCH_REQUESTS_ENV, "").strip()
     if not raw:
-        return 0
+        return DEFAULT_DISAGG_GEN_PREFETCH_REQUESTS
     try:
         value = int(raw)
     except ValueError as e:
@@ -110,7 +121,7 @@ def resolve_disagg_gen_prefetch_requests(
     if _prioritize_first_token_enabled():
         reasons.append(f"{PRIORITIZE_FIRST_TOKEN_ENV}=1")
     if reasons:
-        if warn:
+        if warn and _explicitly_requested():
             logger.warning_once(
                 f"{DISAGG_GEN_PREFETCH_REQUESTS_ENV}={requested} is ignored "
                 f"({', '.join(reasons)}).",
