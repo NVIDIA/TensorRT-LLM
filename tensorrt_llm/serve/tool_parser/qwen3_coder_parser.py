@@ -566,16 +566,24 @@ class Qwen3CoderToolParser(BaseToolParser):
 
         return calls
 
+    @staticmethod
+    def _strip_partial_suffix(text: str, tag: str) -> str:
+        """Drop a trailing proper prefix of ``tag`` (a tag cut off mid-way)."""
+        for size in range(min(len(tag) - 1, len(text)), 0, -1):
+            if text.endswith(tag[:size]):
+                return text[:-size]
+        return text
+
     def _close_unterminated_call(self, tools: list[Tool]) -> list[ToolCallItem]:
         """Flush and close a call the stream ended inside.
 
-        If the body ends with ``</function>`` (EOS before ``</tool_call>``),
-        the function is complete, so an unclosed last parameter ends at that
+        If the body ends with ``</function>`` (EOS before or partway through
+        ``</tool_call>``), the function is complete, so an unclosed last parameter ends at that
         tag. Otherwise generation was cut off (e.g. ``max_tokens``) and only
         closed parameters are kept, so a truncated value or a partial closing
         tag is never reported as a final value.
         """
-        body = self._buf.rstrip()
+        body = self._strip_partial_suffix(self._buf.rstrip(), "</tool_call>").rstrip()
         function_closed = not self.grammar_constrained and body.endswith("</function>")
         if function_closed:
             body = body[: -len("</function>")]

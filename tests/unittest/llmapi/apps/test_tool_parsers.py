@@ -1848,6 +1848,14 @@ class TestQwen3CoderStreamEnd:
              {
                  "scale": 42
              }),
+            # Cut off partway through </tool_call>, after </function>.
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</function>\n"
+             "</tool", {
+                 "x": "abc"
+             }),
+            ("<tool_call><function=f><parameter=x>abc</function></tool_call", {
+                "x": "abc"
+            }),
             # max_tokens inside a value or a closing tag: only closed
             # parameters are kept.
             ("<tool_call><function=f><parameter=x>abc", {}),
