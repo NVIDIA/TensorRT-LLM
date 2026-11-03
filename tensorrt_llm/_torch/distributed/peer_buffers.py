@@ -16,7 +16,8 @@
 
 ``peer_ptrs[r]`` is rank ``r``'s buffer in this rank's address space, so a low-latency exchange
 written against peer pointers runs the same within a node (CUDA IPC) and across the nodes of one
-NVLink domain (fabric memory, the allocation MNNVL all-reduce uses).
+NVLink domain (unicast fabric memory: these exchanges use only the peer mappings, so they take no
+NVLS multicast object, a rack-wide NVSwitch resource).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
@@ -37,7 +39,10 @@ class PeerTransport(enum.Enum):
 
 
 class PeerBuffers:
-    """``nbytes`` per rank, zero-filled on every rank before :meth:`create` returns on any rank."""
+    """``nbytes`` per rank, zero-filled on every rank before :meth:`create` returns on any rank.
+
+    The ranks agree on setup failures: then :meth:`create` returns None on every rank.
+    """
 
     def __init__(
         self,
@@ -71,7 +76,8 @@ class PeerBuffers:
     def create(
         cls, mapping: Mapping, nbytes: int, transport: Optional[PeerTransport] = None
     ) -> Optional["PeerBuffers"]:
-        """The buffers of ``mapping``'s TP group, or None where the group has no peer transport.
+        """The buffers of ``mapping``'s TP group, or None where the group has no peer transport or
+        their setup failed on any rank.
 
         Collective over the TP group: every rank calls it at the same point. ``transport``
         overrides the group's own (IPC within a node, MNNVL across nodes).
@@ -90,43 +96,41 @@ class PeerBuffers:
 
         from .communicator import Distributed
 
-        ipc = IpcMemory(mapping, nbytes, True)
-        if not ipc.open_ipc:
+        dist = Distributed.get(mapping)
+        ipc = None
+        try:
+            ipc = IpcMemory(mapping, nbytes, True)  # cudaMalloc + memset 0 + handle all-gather
+            ok = ipc.open_ipc
+        except RuntimeError as e:
+            logger.warning(f"IPC peer buffers failed: {e}")
+            ok = False
+        if not all(dist.tp_allgather(ok)):
             return None
-        # IpcMemory zero-fills its allocation; no rank writes before every rank has.
+        # No rank writes before every rank's allocation is zeroed.
         torch.cuda.synchronize()
-        Distributed.get(mapping).tp_barrier()
+        dist.tp_barrier()
         return cls(ipc.local_ptr, ipc.peer_ptrs, nbytes, PeerTransport.IPC, ipc)
 
     @classmethod
-    def _create_mnnvl(cls, mapping: Mapping, nbytes: int) -> "PeerBuffers":
-        from .ops import (
-            _get_mnnvl_workspace_comm,
-            _make_mnnvl_mcast_buffer,
-            _mnnvl_workspace_all_succeeded,
-        )
+    def _create_mnnvl(cls, mapping: Mapping, nbytes: int) -> Optional["PeerBuffers"]:
+        from .mnnvl_memory import TpMnnvlMemory
+        from .ops import _mnnvl_workspace_all_succeeded
 
-        comm = _get_mnnvl_workspace_comm(mapping)
-        handle, views, error = None, None, None
+        comm = TpMnnvlMemory.get_comm(mapping)
         try:
-            handle = _make_mnnvl_mcast_buffer(comm, nbytes, mapping, True)
-            views = [
-                handle.get_uc_buffer(r, (nbytes,), torch.uint8, 0) for r in range(mapping.tp_size)
-            ]
-            views[mapping.tp_rank].zero_()
-            torch.cuda.synchronize()
-        except Exception as e:  # converged below, so no rank waits on a failed peer
-            error = e
-        # Collective: every rank zeroed its buffer before any rank writes into it.
-        if not _mnnvl_workspace_all_succeeded(comm, error is None):
-            raise RuntimeError("MNNVL peer buffers failed on a TP rank") from error
-        return cls(
-            views[mapping.tp_rank].data_ptr(),
-            [view.data_ptr() for view in views],
-            nbytes,
-            PeerTransport.MNNVL,
-            (handle, comm),
-        )
+            mem = TpMnnvlMemory(mapping, nbytes)
+            mem.as_torch_strided_tensor(torch.uint8)[mapping.tp_rank].zero_()
+        except RuntimeError as e:
+            logger.warning(f"MNNVL peer buffers failed: {e}")
+            mem = None
+        # Importing or mapping a peer handle can fail on one rank only: every rank falls back together.
+        if not _mnnvl_workspace_all_succeeded(comm, mem is not None):
+            return None
+        torch.cuda.synchronize()
+        # Every rank zeroed its buffer before any rank writes into it.
+        comm.barrier()
+        peers = [mem.ptr + r * mem.rank_stride for r in range(mapping.tp_size)]
+        return cls(peers[mapping.tp_rank], peers, nbytes, PeerTransport.MNNVL, mem)
 
 
 __all__ = ["PeerBuffers", "PeerTransport"]

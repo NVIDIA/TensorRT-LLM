@@ -3194,7 +3194,7 @@ class TokenCommNonDeterministic(KernelComponent):
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(
-                2,
+                1 if self.tail_parity else 2,
                 self.transfer_thread_count,
                 Int32(self.promised_launchable_sm_count),
                 self._linear_cta_idx,

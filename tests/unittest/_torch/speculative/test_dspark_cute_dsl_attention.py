@@ -325,10 +325,12 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads):
     )
 
 
+# The PyTorch reference serves GPUs and shapes the fused kernel does not cover.
+@pytest.mark.parametrize("fused", (True, False), ids=("cute_dsl", "reference"))
 @pytest.mark.parametrize("persist", (False, True))
 @pytest.mark.parametrize("heads,block,q_b_norm_enabled", ((128, 6, True), (64, 5, False)))
 def test_dspark_attention_forward_batched_matches_scalar_reference(
-    monkeypatch, persist, heads, block, q_b_norm_enabled
+    monkeypatch, fused, persist, heads, block, q_b_norm_enabled
 ):
     import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
 
@@ -412,6 +414,10 @@ def test_dspark_attention_forward_batched_matches_scalar_reference(
             counted_draft_block,
         )
         patch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_rope", counted_rmsnorm_rope)
+        if not fused:
+            patch.setattr(
+                dspark_attention, "is_fused_dsv4_dspark_attention_supported", lambda *args: False
+            )
         actual = dspark_attention.dspark_attention_forward_batched(
             x, main_x, start_pos, op_cache, slots, valid_len, **kwargs
         )
@@ -420,12 +426,15 @@ def test_dspark_attention_forward_batched_matches_scalar_reference(
     # physical preparation; q_a takes the row RMSNorm kernel and only the
     # per-head q with its norm uses the generic op (without it the RoPE tails
     # rotate in place).
-    assert calls == {
-        "fused_attention": 1,
-        "cache_write": 1,
-        "draft_block": 1,
-        "rmsnorm_rope": int(q_b_norm_enabled),
-    }
+    if fused:
+        assert calls == {
+            "fused_attention": 1,
+            "cache_write": 1,
+            "draft_block": 1,
+            "rmsnorm_rope": int(q_b_norm_enabled),
+        }
+    else:
+        assert calls["fused_attention"] == 0
 
     expected = torch.cat(
         [

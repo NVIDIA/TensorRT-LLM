@@ -3143,13 +3143,15 @@ class TestIndexTables(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
-    def test_scratch_blocks_match_the_reference_converter(self):
+    @parameterized.expand([(0,), (32,)])
+    def test_scratch_blocks_match_the_reference_converter(self, reserve: int):
         """The substituting path, against PageIndexConverter given the same scratch range.
 
         A scratch block's slot comes from the spec rather than the page table, and the
         layer's offset wraps inside the shared slot instead of being added to it. Both are
         easy to transcribe wrongly, and neither shows up on a config without scratch, so
-        this drives a real scratch range and defers the arithmetic to the reference.
+        this drives a real scratch range and defers the arithmetic to the reference. A
+        ``reserve`` first gives blocks regular pages that the chunk's scratch range then covers.
         """
         num_layers, window, tpb, prompt_len = 4, 128, 32, 1024
         cfg = KVCacheManagerConfig(
@@ -3167,7 +3169,7 @@ class TestIndexTables(unittest.TestCase):
                 )
                 for i in range(num_layers)
             ],
-            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=0),
+            swa_scratch_reuse=SwaScratchReuseConfig(max_rewind_len=reserve),
         )
         manager = KVCacheManager(cfg)
         cache = None
@@ -3202,12 +3204,23 @@ class TestIndexTables(unittest.TestCase):
                 cache = manager.create_kv_cache(None, [TokenId(i) for i in range(prompt_len)])
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
+                if reserve:
+                    self.assertTrue(cache.resize(reserve))
                 self.assertTrue(cache.resize(prompt_len))
                 self.assertTrue(cache.has_scratch_slots, "config produced no scratch")
 
                 scratch = _scratch_desc(cache, lg)
                 self.assertIsNotNone(scratch)
                 self.assertGreater(scratch.range.end - scratch.range.beg, 0)
+                if reserve:
+                    raw = [int(x) for x in cache.get_base_page_indices(lg)]
+                    self.assertTrue(
+                        any(
+                            raw[block] != BAD_PAGE_INDEX
+                            for block in range(scratch.range.beg, scratch.range.end)
+                        ),
+                        "the reservation left no regular page inside the scratch range",
+                    )
 
                 batch.wait_published()
                 batch.publish()

@@ -871,7 +871,8 @@ def _mxfp8_blocks(values):
     return (values * reciprocal[:, None]).to(tl.float8e4nv), exponent
 
 
-@triton.jit
+# The row counts are runtime values, so every token count runs one compiled kernel.
+@triton.jit(do_not_specialize=["M", "SF_ROWS"])
 def _inverse_rope_mxfp8_kernel(
     X,
     POS,
@@ -879,9 +880,9 @@ def _inverse_rope_mxfp8_kernel(
     Q,
     S,
     M,
+    SF_ROWS,
     stride_xm,
     D: tl.constexpr,
-    SF_ROWS: tl.constexpr,
     HEADS: tl.constexpr,
 ):
     """One token row x HEADS heads of one group -> E4M3 ``[groups, M, D]`` + swizzled UE8M0.
@@ -890,8 +891,9 @@ def _inverse_rope_mxfp8_kernel(
     they load again as pairs, rotate back in FP32 and round to BF16 before their two
     1x32 blocks quantize. Padding rows up to SF_ROWS write zero scales.
     """
-    row = tl.program_id(0)
-    group = tl.program_id(1)
+    # Element offsets reach groups * M * D, which passes int32 for long token batches.
+    row = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1).to(tl.int64)
     part = tl.program_id(2)
     valid = row < M
     heads = part * HEADS + tl.arange(0, HEADS)
@@ -957,9 +959,9 @@ def inverse_rope_mxfp8(
         quantized,
         scales,
         rows,
+        sf_rows,
         output.stride(0),
         depth,
-        sf_rows,
         heads,
         num_warps=2,
     )

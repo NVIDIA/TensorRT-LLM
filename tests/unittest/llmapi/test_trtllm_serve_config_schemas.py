@@ -180,6 +180,51 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
         (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
+        (generator.SERVE_SCHEMA, {"gen_prompt_tail_tokens": 256}, True),
+        (generator.SERVE_SCHEMA, {"gen_prompt_tail_tokens": 255}, False),
+        (generator.DISAGG_SCHEMA, {"generation_servers": {"gen_prompt_tail_tokens": 255}}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"prompt_token_cache_config": {"path": "/dev/shm/ptc", "max_bytes": 1 << 30}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"prompt_token_cache_config": {"path": "/dev/shm/ptc"}}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"prompt_token_cache_config": {"path": "/dev/shm/ptc", "max_bytes": 0}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"attention_dp_config": {"kv_cache_routing_new_conv_placement": "least_prefill"}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"attention_dp_config": {"kv_cache_routing_new_conv_placement": "least_cost"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "sparse_attention_config": {
+                    "algorithm": "csa2",
+                    "use_cute_dsl_paged_mqa_logits": True,
+                }
+            },
+            True,
+        ),
+        # CSA2 takes its indexer geometry from the checkpoint and has no deterministic GVR Top-K.
+        (
+            generator.SERVE_SCHEMA,
+            {"sparse_attention_config": {"algorithm": "csa2", "index_topk": 1024}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"sparse_attention_config": {"algorithm": "csa2", "gvr_deterministic_topk": True}},
+            False,
+        ),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -317,6 +362,9 @@ def test_dspark_device_reranking_field(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+_WARMUP_PLACEMENT = {"start_step": 0, "interval_steps": 4000}
+
+
 @pytest.mark.parametrize(
     ("load_balancer", "valid"),
     [
@@ -334,6 +382,39 @@ def test_dspark_device_reranking_field(
         ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
         ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
         ({"mode": "dynamic", "num_slots": 320}, False),
+        ({"num_slots": 288, "warmup_placement": _WARMUP_PLACEMENT}, True),
+        (
+            {
+                "num_slots": 384,
+                "layer_updates_per_iter": 0,
+                "warmup_placement": {
+                    **_WARMUP_PLACEMENT,
+                    "max_migrations": 100000,
+                    "min_rows": 1 << 20,
+                    "min_pos": 2,
+                    "planner": "cost",
+                    "decay": 0.5,
+                    "min_round_gain": 0.5,
+                    "count_every_steps": 4,
+                },
+            },
+            True,
+        ),
+        ({"num_slots": 288, "warmup_placement": {"interval_steps": 4000}}, False),
+        ({"num_slots": 288, "warmup_placement": {**_WARMUP_PLACEMENT, "interval_steps": 0}}, False),
+        ({"num_slots": 288, "warmup_placement": {**_WARMUP_PLACEMENT, "decay": 0}}, False),
+        (
+            {
+                "num_slots": 288,
+                "warmup_placement": {**_WARMUP_PLACEMENT, "max_moved_fraction": 1.5},
+            },
+            False,
+        ),
+        ({"num_slots": 288, "warmup_placement": {**_WARMUP_PLACEMENT, "planner": "greedy"}}, False),
+        (
+            {"mode": "per_layer_dynamic", "num_slots": 320, "warmup_placement": _WARMUP_PLACEMENT},
+            False,
+        ),
     ],
 )
 def test_load_balancer_schema_matches_runtime(
@@ -455,6 +536,78 @@ def test_dwdp_modes_match_runtime(
         if filename == generator.DISAGG_SCHEMA:
             for section in ("context_servers", "generation_servers"):
                 assert validator.is_valid({section: config}) == (error is None), section
+
+
+_PROMPT_TAIL = {
+    "gen_prompt_tail_tokens": 8192,
+    "kv_cache_config": {"enable_block_reuse": False},
+    "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+}
+_GVR_EMISSION = {
+    "algorithm": "csa2",
+    "enable_heuristic_topk": True,
+    "use_self_sampling_topk": False,
+    "use_gvr_emission": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        (_PROMPT_TAIL, None),
+        # KV cache manager V2 never replays a prefill on a disaggregated server.
+        (
+            {**_PROMPT_TAIL, "scheduler_config": {"capacity_scheduler_policy": "MAX_UTILIZATION"}},
+            None,
+        ),
+        ({**_PROMPT_TAIL, "kv_cache_config": {}}, "KV cache block reuse"),
+        (
+            {
+                **_PROMPT_TAIL,
+                "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "CPP"},
+            },
+            "transceiver runtime other than PYTHON",
+        ),
+        (
+            {
+                **_PROMPT_TAIL,
+                "kv_cache_config": {"enable_block_reuse": False, "use_kv_cache_manager_v2": False},
+                "scheduler_config": {"capacity_scheduler_policy": "MAX_UTILIZATION"},
+            },
+            "KV cache manager V1",
+        ),
+        ({**_PROMPT_TAIL, "speculative_config": {"decoding_type": "AUTO"}}, "AUTO drafters"),
+        (
+            {"sparse_attention_config": {**_GVR_EMISSION, "use_cute_dsl_paged_mqa_logits": True}},
+            None,
+        ),
+        ({"sparse_attention_config": _GVR_EMISSION}, "use_cute_dsl_paged_mqa_logits=True"),
+        (
+            {
+                "moe_config": {
+                    "load_balancer": {
+                        "num_slots": 288,
+                        "layer_updates_per_iter": 1,
+                        "warmup_placement": _WARMUP_PLACEMENT,
+                    }
+                }
+            },
+            "needs layer_updates_per_iter 0",
+        ),
+    ],
+)
+def test_cross_field_rules_reject_at_config_time(
+    schemas: dict[str, dict], tmp_path: Path, config: dict, error: str | None
+) -> None:
+    """The schema checks each field alone; the runtime config also rejects these combinations."""
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    Draft202012Validator(schemas[generator.SERVE_SCHEMA]).validate(config)
+    if error is None:
+        TorchLlmArgs(model=tmp_path, gpus_per_node=1, **config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            TorchLlmArgs(model=tmp_path, gpus_per_node=1, **config)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:

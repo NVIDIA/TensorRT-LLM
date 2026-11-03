@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import CompactTPArgmax
 from tensorrt_llm._torch.models.modeling_speculative import VanillaMarkov, markov_prev_embeddings
 from tensorrt_llm._torch.modules.embedding import LMHead
+from tensorrt_llm._torch.modules.mxfp8_draft_head import quantize_mxfp8_rows
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -34,13 +35,15 @@ def _capture(call):
     return graph, output
 
 
-def test_full_vocab_five_step_chain_and_changed_input_graph(monkeypatch):
+# An FP32 lm_head_output_dtype: the chain proposes from the BF16-rounded logits.
+@pytest.mark.parametrize("output_dtype", (None, torch.float32), ids=("bf16_logits", "fp32_logits"))
+def test_full_vocab_five_step_chain_and_changed_input_graph(monkeypatch, output_dtype):
     # The chain on the BF16 head, without its MXFP8 copy.
     monkeypatch.setattr(CompactTPArgmax, "_fp8_head_logits", lambda *args: None)
     device = torch.device("cuda", torch.cuda.current_device())
     batch, vocab, block, hidden, markov_rank = 32, 129280, 5, 5120, 256
     with torch.inference_mode():
-        head = LMHead(vocab, hidden, dtype=torch.bfloat16).to(device)
+        head = LMHead(vocab, hidden, dtype=torch.bfloat16, output_dtype=output_dtype).to(device)
         markov = VanillaMarkov(vocab_size=vocab, markov_rank=markov_rank).to(device)
         local_generator = torch.Generator(device=device).manual_seed(
             14236 + torch.cuda.current_device()
@@ -80,7 +83,7 @@ def test_full_vocab_five_step_chain_and_changed_input_graph(monkeypatch):
             return result
 
         def full_vocab_bf16_reference():
-            base = head.apply_linear(normalized, head.bias)
+            base = head.apply_linear(normalized, head.bias).to(torch.bfloat16)
             previous, sampled = bonus, []
             for step in range(block):
                 bias = F.linear(markov_prev_embeddings(previous, state._w1), state._w2)
@@ -191,7 +194,7 @@ def test_fp8_head_feeds_the_chain_its_mxfp8_logits():
         _, values, _ = state._head_fp8
         # E4M3 rounding: 2^-4 relative for normal values, half a subnormal step of the block scale.
         for rows in (slice(0, 2048), slice(vocab - 2048, vocab)):
-            _, scales = modeling_dspark._quantize_mxfp8_rows(head.weight[rows])
+            _, scales = quantize_mxfp8_rows(head.weight[rows])
             weight = head.weight[rows].float().view(2048, hidden // 32, 32)
             scale = torch.exp2(scales.float() - 127)[..., None]
             dequantized = values[rows].float().view(2048, hidden // 32, 32) * scale

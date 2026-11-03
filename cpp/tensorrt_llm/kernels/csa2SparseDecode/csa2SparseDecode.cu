@@ -45,6 +45,8 @@
 #include "tensorrt_llm/kernels/csa2SparseDecode/csa2SparseDecodeKernel.cuh"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cuda.h>
 #include <initializer_list>
 
@@ -58,6 +60,7 @@ namespace
 
 constexpr int kBlockKeys = 64;
 constexpr int64_t kMaxTmaRows = int64_t{1} << 31;
+constexpr int kMaxDevices = 64;
 
 int blocksPerToken(int swaTopk, int mainTopk)
 {
@@ -170,6 +173,23 @@ void checkParams(Csa2SparseDecodeParams const& p, Csa2SparseDecodeSchedule const
         "CSA2 sparse decode workspace must be 256-B aligned");
 }
 
+// The kernel needs more than the default 48 KB of dynamic shared memory; the attribute is set once per device.
+void ensureSharedMemoryAttribute()
+{
+    static std::array<std::atomic<bool>, kMaxDevices> configured{};
+    int const device = common::getDevice();
+    if (device < kMaxDevices && configured[device].load(std::memory_order_acquire))
+    {
+        return;
+    }
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+        csa2SparseDecodeKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Csa2Kernel::SMEM_SIZE)));
+    if (device < kMaxDevices)
+    {
+        configured[device].store(true, std::memory_order_release);
+    }
+}
+
 void launchAttention(Csa2SparseDecodeParams const& p, KernelParams const& kp, cudaStream_t stream)
 {
     Csa2Kernel::TmaParams tma{};
@@ -196,8 +216,7 @@ void launchAttention(Csa2SparseDecodeParams const& p, KernelParams const& kp, cu
             CU_TENSOR_MAP_DATA_TYPE_FLOAT32, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE);
 
     auto const kernel = &csa2SparseDecodeKernel;
-    TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Csa2Kernel::SMEM_SIZE)));
+    ensureSharedMemoryAttribute();
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = p.enablePdl ? 1 : 0;
@@ -285,19 +304,33 @@ bool isSupported()
 #if defined(PLACEHOLDER_KERNELS)
     return false;
 #else
-    if (!common::isSM100Family())
+    // Per device: 0 not queried yet, 1 supported, 2 unsupported.
+    static std::array<std::atomic<int>, kMaxDevices> cached{};
+    int const device = common::getDevice();
+    if (device < kMaxDevices)
     {
-        return false;
+        int const known = cached[device].load(std::memory_order_acquire);
+        if (known != 0)
+        {
+            return known == 1;
+        }
     }
-    // The family builds carry no image for some members; ask the runtime for one.
-    cudaFuncAttributes attributes{};
-    cudaError_t const status = cudaFuncGetAttributes(&attributes, csa2SparseDecodeKernel);
-    if (status != cudaSuccess)
+    bool supported = common::isSM100Family();
+    if (supported)
     {
-        static_cast<void>(cudaGetLastError());
-        return false;
+        // The family builds carry no image for some members; ask the runtime for one.
+        cudaFuncAttributes attributes{};
+        if (cudaFuncGetAttributes(&attributes, csa2SparseDecodeKernel) != cudaSuccess)
+        {
+            static_cast<void>(cudaGetLastError());
+            supported = false;
+        }
     }
-    return true;
+    if (device < kMaxDevices)
+    {
+        cached[device].store(supported ? 1 : 2, std::memory_order_release);
+    }
+    return supported;
 #endif
 }
 

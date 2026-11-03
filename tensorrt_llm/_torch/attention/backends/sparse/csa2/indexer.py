@@ -71,6 +71,30 @@ _CANDIDATE_CLUSTER_TOPK_MAX_ROWS = 64
 _DECODE_GVR_SOURCE_MAX_ROWS = 256
 
 
+def _sparse_block(candidate_block_size: int) -> int:
+    """DeepGEMM sparse MQA-logits block (16 or 8 positions) dividing the candidate blocks, or 0."""
+    return next((block for block in (16, 8) if candidate_block_size % block == 0), 0)
+
+
+def candidate_consumer_requirement(
+    heads: int, head_dim: int, candidate_block_size: int
+) -> str | None:
+    """What this GPU, build or index geometry lacks for candidate consumers, or None.
+
+    Candidate consumers score the published candidate blocks only with DeepGEMM's sparse MQA logits.
+    """
+    sm = get_sm_version() if torch.cuda.is_available() else 0
+    if not 100 <= sm < 110:
+        return f"an SM100-family GPU (this is SM{sm})"
+    if not _HAS_SPARSE_MQA_LOGITS:
+        return "a DeepGEMM build with the sparse MQA-logits kernels"
+    if (heads, head_dim) != (32, 128):
+        return f"32 index heads of 128 dims (the checkpoint has {heads} of {head_dim})"
+    if not _sparse_block(candidate_block_size):
+        return f"a candidate_block_size that is a multiple of 8 (the checkpoint has {candidate_block_size})"
+    return None
+
+
 class CSA2Indexer(Indexer):
     """Prepare owner-cache candidates and publish CSA2 logical selections.
 
@@ -147,24 +171,20 @@ class CSA2Indexer(Indexer):
         self.top_k.prefill_implementation = prefill
         self.top_k.decode_implementation = decode
         self.top_k.gvr_self_sampling = self.options.use_self_sampling_topk
+        # CSA2's decode Top-K selectors opt into the CuTe DSL decode kernels' wide-row launches.
+        self.top_k.wide_fp32_rows = True
+        self.top_k.wide_cta_rows = True
+        self.top_k.split_long_rows = True
         self._exact_top_k = exact
         self.narrow_prefill_top_k = (
             TopK(self.index_topk, prefill_implementation=exact) if prefill != exact else None
         )
         self.candidate_top_k: TopK | None = None
         # Candidate consumers score only the published candidate blocks with
-        # DeepGEMM's sparse MQA logits: SM100, 32 heads of 128D MXFP4 rows and
-        # candidate blocks that are multiples of 16 or 8 positions.
-        self.sparse_block = next(
-            (block for block in (16, 8) if layout.candidate_block_size % block == 0), 0
-        )
-        self.use_sparse_candidates = bool(
-            _HAS_SPARSE_MQA_LOGITS
-            and layer.consumes_candidates
-            and 100 <= sm < 110
-            and heads == 32
-            and head_dim == 128
-            and self.sparse_block > 0
+        # DeepGEMM's sparse MQA logits.
+        self.sparse_block = _sparse_block(layout.candidate_block_size)
+        self.use_sparse_candidates = layer.consumes_candidates and (
+            candidate_consumer_requirement(heads, head_dim, layout.candidate_block_size) is None
         )
 
     def _configure_candidate_topk(self, max_positions: int) -> None:
@@ -181,13 +201,11 @@ class CSA2Indexer(Indexer):
                 prefill_implementation=(
                     TopKImplementation.TORCH if torch_reference else TopKImplementation.CUDA_RADIX
                 ),
-                # Up to _CANDIDATE_CLUSTER_TOPK_MAX_ROWS rows select with the multi-CTA
-                # (cluster) radix kernel, which splits each wide row over several CTAs.
-                decode_implementation=(
-                    TopKImplementation.TORCH
-                    if torch_reference
-                    else TopKImplementation.CUTE_DSL_RADIX
-                ),
+                # With the CuTe DSL Top-K, up to _CANDIDATE_CLUSTER_TOPK_MAX_ROWS rows select with
+                # its multi-CTA (cluster) radix kernel, which splits each wide row over several CTAs.
+                decode_implementation=self._exact_top_k,
+                wide_fp32_rows=True,
+                split_long_rows=True,
             )
         elif self.candidate_top_k.top_k != count:
             raise ValueError("CSA2 candidate block budget must remain fixed for an indexer")
@@ -302,6 +320,8 @@ class CSA2Indexer(Indexer):
                 prefill_implementation=self._exact_top_k,
                 decode_implementation=self._exact_top_k,
                 compress_ratio=selector.compress_ratio,
+                wide_fp32_rows=True,
+                split_long_rows=True,
             )
             # A plain attribute: the stand-in holds no state worth registering.
             self.__dict__["_decode_radix_top_k"] = radix
@@ -531,9 +551,11 @@ class CSA2Indexer(Indexer):
             None,
             block_counts,
             candidate=True,
+            # The CUDA radix decode Top-K needs split-work buffers; its prefill form does not.
             is_prefill=(
                 count > _CANDIDATE_CLUSTER_TOPK_MAX_ROWS
                 or blocks.shape[1] <= self.candidate_top_k.top_k
+                or self.candidate_top_k.decode_implementation == TopKImplementation.CUDA_RADIX
             ),
         )
         expand_candidates_(
@@ -627,8 +649,8 @@ class CSA2Indexer(Indexer):
         by one CuTe launch; with ``candidates`` the same launch gathers the
         candidate columns instead. TopK runs over the masked scores, then one
         CuTe launch validates, sorts and pads the selection with ``-1``. Without
-        candidates, ``fused_decode_select_`` does all three in one launch for small
-        decode tiles.
+        candidates and with the CuTe DSL Top-K enabled, ``fused_decode_select_`` does
+        all three in one launch for small decode tiles.
         """
         valid = metadata.csa2_indexer_valid_pages
         visible = metadata.csa2_indexer_visible_lengths
@@ -639,6 +661,7 @@ class CSA2Indexer(Indexer):
             if (
                 gvr_prior_indices is None
                 and not self.top_k._gvr_emission_armed
+                and self._exact_top_k == TopKImplementation.CUTE_DSL_RADIX
                 and fused_decode_select_supported(logits, output_indices.shape[1])
             ):
                 # The candidate publication scores validated, visible columns only, so it reads

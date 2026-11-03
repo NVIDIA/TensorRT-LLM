@@ -263,8 +263,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self._use_beam_search)
-        # Uploads the per-step metadata between decode replays.
-        self._host_uploader = HostUploader()
+        # Uploads the per-step metadata between decode replays (RuntimeHooks.stage_decode_inputs).
+        self._host_uploader = HostUploader() if self.runtime_hooks.stage_decode_inputs else None
         if self._config.is_spec_decode and self.runtime_hooks.spec_step_fold is not None:
             self.runtime_hooks.spec_step_fold.bind_engine_buffers(
                 self._buffers.input_ids_cuda,
@@ -521,6 +521,8 @@ class DecoderRunner(ScheduledModelRunner):
             sparse_attention_config=self._sparse_attention_config,
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
+            prioritize_decode_graphs=self.runtime_hooks.prioritize_decode_graphs,
+            stage_decode_inputs=self.runtime_hooks.stage_decode_inputs,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.

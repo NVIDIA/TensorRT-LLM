@@ -141,10 +141,11 @@ class DisaggTransferCoordinator:
         ] = {}
         # Prepared gen-init requests whose receive waits for start_deferred_gen_receives.
         self._deferred_gen_receives: List[LlmRequest] = []
-        # A rank that polls its generation receives alone (a single rank, or attention DP
-        # with one pipeline stage) may post the ready ones before the others.
+        # Only a rank that polls its generation receives alone (a single rank, or attention DP with
+        # one pipeline stage) may post the ready ones first: helix CP ranks poll in a CP collective.
         self._post_ready_gen_receives_first = is_kv_manager_v2 and (
-            dist.world_size == 1 or (enable_attention_dp and dist.pp_size == 1)
+            dist.world_size == 1
+            or (enable_attention_dp and dist.pp_size == 1 and dist.cp_size == 1)
         )
         # Gen-init requests whose receive was started and not yet finished, by request id.
         self._started_gen_receives: dict[int, LlmRequest] = {}

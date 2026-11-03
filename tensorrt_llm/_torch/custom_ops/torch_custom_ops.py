@@ -2518,21 +2518,24 @@ class FP8BlockScaleGemmRunner(TunableRunner):
 
     def small_m_applies(self, inputs: List[Optional[torch.Tensor]]) -> bool:
         input, weight, _, block_scale = inputs
-        return (input.dtype == torch.bfloat16 and input.is_contiguous()
+        return (self.weight_applies(input.shape[0], weight, block_scale)
+                and input.dtype == torch.bfloat16 and input.is_contiguous()
                 and input.data_ptr() % 16 == 0
-                and input.shape[1] == weight.shape[1]
-                and self.weight_applies(input.shape[0], weight, block_scale))
+                and input.shape[1] == weight.shape[1])
 
     def weight_applies(self, num_tokens: int, weight: torch.Tensor,
                        block_scale: Optional[torch.Tensor]) -> bool:
+        if block_scale is None:
+            return False
         from ..modules.low_m_gemm import lowm_fp8_mma_fits
         n, k = weight.shape
-        return (block_scale is not None and self.output_dtype == torch.bfloat16
+        # Row count first: it rejects every prefill-sized call.
+        return (lowm_fp8_mma_fits(num_tokens, n, k)
+                and self.output_dtype == torch.bfloat16
                 and weight.dtype == torch.float8_e4m3fn
                 and weight.is_contiguous() and n % 128 == 0 and k % 128 == 0
                 and block_scale.shape == (n // 128, k // 128)
-                and block_scale.is_contiguous()
-                and lowm_fp8_mma_fits(num_tokens, n, k))
+                and block_scale.is_contiguous())
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
@@ -2643,10 +2646,10 @@ class FP8BlockScaleSwigluGemmRunner(TunableRunner):
 
     def small_m_applies(self, inputs: List[Optional[torch.Tensor]]) -> bool:
         gate_up, weight, _, block_scale = inputs
-        return (gate_up.dtype == torch.bfloat16
-                and gate_up.shape[1] == 2 * weight.shape[1]
-                and FP8BlockScaleGemmRunner(torch.bfloat16).weight_applies(
-                    gate_up.shape[0], weight, block_scale))
+        return (FP8BlockScaleGemmRunner(torch.bfloat16).weight_applies(
+            gate_up.shape[0], weight, block_scale)
+                and gate_up.dtype == torch.bfloat16
+                and gate_up.shape[1] == 2 * weight.shape[1])
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:

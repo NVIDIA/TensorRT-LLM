@@ -79,8 +79,8 @@ def hold_pass(gathered: Sequence[Sequence[int]], min_backlog: int) -> bool:
 
 class CtxDecoderBatcher:
     """Per-executor state, used on the executor thread around ``schedule_request``. It serves a
-    context server: the first pass in which a rank holds a request that is not context-only retires
-    it on every rank."""
+    context server: the first pass in which a rank holds a request that is not context-only, or
+    cannot hold at all, retires it on every rank."""
 
     def __init__(self, executor, scheduler: "KVCacheV2Scheduler", window: int):
         self.executor = executor
@@ -107,6 +107,14 @@ class CtxDecoderBatcher:
         if not all(int(row[4]) for row in gathered):
             self.retired = True
             logger.info("Context decoder-tail batching off: this server runs generation requests")
+            return
+        if not all(int(row[0]) for row in gathered):
+            # The captured prefill graphs stay until the executor releases its resources.
+            self.retired = True
+            logger.info(
+                "Context decoder-tail batching off: a prefill CUDA graph replays every chunk's "
+                "decoder rows"
+            )
             return
         hold = hold_pass(gathered, self.scheduler.max_num_tokens or 0)
         self.scheduler.set_ctx_decoder_hold(self.window if hold else 0)

@@ -715,6 +715,7 @@ def _cleanup_executor(events, completed: bool):
     executor = PyExecutor.__new__(PyExecutor)
     executor.response_cv = threading.Condition()
     executor.shutdown_event = threading.Event()
+    executor._intake_window = threading.Event()
     executor.num_micro_batches = 0
     executor._event_loop_completed = completed
     if events is not None:

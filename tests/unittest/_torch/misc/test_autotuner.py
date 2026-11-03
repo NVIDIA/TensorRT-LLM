@@ -1202,7 +1202,8 @@ def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
 
 
 def _rank_disagreeing_cache_worker(world_size, strategy, seeded_rank):
-    """Only ``seeded_rank`` starts with the cache entry; tuning must not deadlock."""
+    """Only ``seeded_rank`` starts with the cache entry, and the ranks' token counts build different
+    profile lists, as under attention DP; tuning must not deadlock."""
     rank = tensorrt_llm.mpi_rank()
     mapping = Mapping(world_size=world_size,
                       rank=rank,
@@ -1223,13 +1224,27 @@ def _rank_disagreeing_cache_worker(world_size, strategy, seeded_rank):
         key = tuner.profiling_cache.get_cache_key(custom_op, runner,
                                                   (x.size(), w.size()), config)
         tuner.profiling_cache[key] = (0, 2, 1e-9)
+    bucketed_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_power_of_2_num_tokens_buckets, next_positive_power_of_2), ),
+                                   distributed_tuning_strategy=strategy)
+    bucketed_op = f"{custom_op}_bucketed"
 
     with autotune():
         _, tactic = tuner.choose_one(custom_op=custom_op,
                                      runners=[runner],
                                      tuning_config=config,
                                      inputs=[x, w])
-    tactics = dist.tp_cp_allgather(obj=tactic)
+        tuner.choose_one(
+            custom_op=bucketed_op,
+            runners=[runner],
+            tuning_config=bucketed_config,
+            inputs=[torch.randn(16 + 8 * rank, 32, device='cuda'), w])
+    # The 16-row bucket, which every rank profiled.
+    _, bucketed_tactic = tuner.choose_one(custom_op=bucketed_op,
+                                          runners=[runner],
+                                          tuning_config=bucketed_config,
+                                          inputs=[x, w])
+    tactics = dist.tp_cp_allgather(obj=(tactic, bucketed_tactic))
     dist.barrier()
     return rank, tactics
 

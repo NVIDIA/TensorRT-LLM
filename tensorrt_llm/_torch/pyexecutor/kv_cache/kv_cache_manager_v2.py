@@ -668,18 +668,26 @@ def _host_tier_numa_node(quota: int, mapping: Mapping) -> int:
     attribute = cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID
     result, node = cuda.cuDeviceGetAttribute(attribute, torch.cuda.current_device())
     problem = None
+    available = 0
     if result != cuda.CUresult.CUDA_SUCCESS or node < 0:
         problem = (
             "kv_cache_config.host_cache_bind_to_gpu_numa_node: the GPU reports no host NUMA "
             "node; turn the field off."
         )
+    else:
+        try:
+            available = _numa_node_available_bytes(node)
+        except (OSError, KeyError, ValueError, IndexError) as error:
+            problem = (
+                "kv_cache_config.host_cache_bind_to_gpu_numa_node: cannot read the memory of "
+                f"NUMA node {node}: {error!r}; turn the field off."
+            )
     placement = (socket.gethostname(), int(node) if problem is None else -1)
     placements = (
         Distributed.get(mapping).allgather(placement) if mapping.world_size > 1 else [placement]
     )
     if problem is None:
         ranks_on_node = placements.count(placement)
-        available = _numa_node_available_bytes(node)
         if available < quota * ranks_on_node:
             problem = (
                 f"kv_cache_config.host_cache_bind_to_gpu_numa_node: NUMA node {node} of "
@@ -2590,16 +2598,13 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reduce the rank-local auto quota to the fleet minimum; see
             # _sync_host_tier_quota for why divergence wedges collectives.
             host_quota = _sync_host_tier_quota(host_quota, mapping)
+        host_tier_numa_node = None
         if host_quota > 0:
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
-            host_tier_numa_node = None
             if kv_cache_config.host_cache_bind_to_gpu_numa_node:
                 host_tier_numa_node = _host_tier_numa_node(int(host_quota), mapping)
-                logger.info(
-                    f"KV cache manager v2 host tier bound to NUMA node {host_tier_numa_node}"
-                )
             cache_tiers.append(
                 HostCacheTierConfig(
                     quota=int(host_quota),
@@ -2699,6 +2704,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 raise RuntimeError("KV cache manager initialization failed on another rank")
 
         assert candidate is not None
+        if host_tier_numa_node is not None:
+            logger.info(f"KV cache manager v2 host tier bound to NUMA node {host_tier_numa_node}")
         if self._get_external_cache_bytes(candidate):
             config = replace(
                 config,

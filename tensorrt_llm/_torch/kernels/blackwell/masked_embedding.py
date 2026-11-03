@@ -93,6 +93,9 @@ def supports_masked_embedding(tokens: torch.Tensor, weight: torch.Tensor) -> boo
         and weight.is_contiguous()
         and weight.shape[1] % VEC == 0
         and weight.data_ptr() % 16 == 0
+        # The kernel computes element offsets in 32 bits.
+        and weight.numel() < 2**31
+        and tokens.numel() * weight.shape[1] < 2**31
     )
 
 

@@ -22,7 +22,6 @@ executed-batch and lifecycle transcripts, which do not exist yet.
 import inspect
 import queue
 import threading
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -142,7 +141,6 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.enable_early_first_token_response = False
     executor.drafter = None
     executor.model_engine = None
-    executor._overlap_loop_stream = nullcontext
     executor.previous_batch = None
     executor.active_requests = []
     executor.canceled_req_ids = []

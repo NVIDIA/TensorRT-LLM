@@ -29,14 +29,30 @@ _FLAG_BYTES = 256
 
 
 @triton.jit
-def _handshake_kernel(epoch_ptr, peer_flag_ptr, own_flag_ptr):
-    # Both ranks run the same sequence of handshakes; this rank's count is the epoch. The system
-    # release publishes this rank's earlier work (its FC2 rows) before the flag; the acquire after
-    # the wait orders the following reads of the peer's rows after the peer's FC2.
+def _globaltimer():
+    return tl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=tl.int64, is_pure=False, pack=1
+    )
+
+
+@triton.jit
+def _trap():
+    tl.inline_asm_elementwise("trap;", "=r", [], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _handshake_kernel(epoch_ptr, peer_flag_ptr, own_flag_ptr, timeout_ns):
+    # Both ranks run the same sequence of handshakes; this rank's count is the epoch (64-bit, so it
+    # does not wrap). The system release publishes this rank's earlier work (its FC2 rows) before
+    # the flag; the acquire after the wait orders the following reads of the peer's rows after the
+    # peer's FC2. A peer later than the MoE communication timeout traps, as in the native combine.
     epoch = tl.load(epoch_ptr) + 1
     tl.atomic_xchg(peer_flag_ptr, epoch, sem="release", scope="sys")
+    deadline = _globaltimer() + timeout_ns
     seen = tl.load(own_flag_ptr, volatile=True)
     while seen < epoch:
+        if _globaltimer() > deadline:
+            _trap()
         seen = tl.load(own_flag_ptr, volatile=True)
     tl.atomic_add(own_flag_ptr, 0, sem="acquire", scope="sys")
     tl.store(epoch_ptr, epoch)
@@ -92,19 +108,24 @@ class PullCombineSync:
         self._flags = self._memory.as_torch_strided_tensor(torch.uint8)
         self._ep_rank = ep_rank
         self._flag(ep_rank).zero_()
-        self._epoch = torch.zeros(1, dtype=torch.int32, device=self._flags.device)
+        self._epoch = torch.zeros(1, dtype=torch.int64, device=self._flags.device)
         torch.cuda.synchronize()
         # Both flags are zero before either rank can raise its peer's.
         MnnvlMemory.get_comm(mapping).barrier()
 
     def _flag(self, rank: int) -> torch.Tensor:
-        return self._flags[rank, :4].view(torch.int32)
+        # Each rank's row starts its own allocation-aligned segment, so the 8-byte view is aligned.
+        return self._flags[rank, :8].view(torch.int64)
 
-    def signal_wait(self) -> None:
+    def signal_wait(self, timeout_s: int) -> None:
         """On the current stream: release this rank's earlier work to the peer and wait for the
-        peer's (graph capturable: the epoch lives on the device)."""
+        peer's, trapping after ``timeout_s`` (graph capturable: the epoch lives on the device)."""
         _handshake_kernel[(1,)](
-            self._epoch, self._flag(1 - self._ep_rank), self._flag(self._ep_rank), num_warps=1
+            self._epoch,
+            self._flag(1 - self._ep_rank),
+            self._flag(self._ep_rank),
+            timeout_s * 1_000_000_000,
+            num_warps=1,
         )
 
 

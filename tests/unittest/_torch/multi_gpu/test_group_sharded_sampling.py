@@ -252,8 +252,8 @@ def _run(world: int, group_size: int) -> bool:
 
 def _check_temperature_draws(grouped, head, norm, accept):
     """Temperature-only steps through the model path (eager and graph-replayed, unseeded rows at
-    offsets above 2**62 and a seeded row at 0.7): each row's token is the inverse-CDF draw at its
-    Philox uniform."""
+    temperatures 1.0 and 0.7 and offsets above 2**62): each row's token is the inverse-CDF draw at
+    its Philox uniform."""
     rank = tensorrt_llm.mpi_rank()
 
     def metadata():
@@ -266,7 +266,7 @@ def _check_temperature_draws(grouped, head, norm, accept):
         spec_metadata.runtime_draft_len = DRAFT_LEN
         spec_metadata.samples_from_vocab_shards = True
         spec_metadata.populate_sampling_params_for_one_model(
-            [_request(0, 1.0, None), _request(1, 0.7, 1234)]
+            [_request(0, 1.0, None), _request(1, 0.7, None)]
         )
         assert spec_metadata.is_all_temperature_only
         return spec_metadata

@@ -1048,7 +1048,8 @@ def _compiled_mma(
         c2 = torch.empty((m, n - split_n), dtype=out_dtype, device=dev)
     else:
         c = c2 = torch.empty((m, n), dtype=out_dtype, device=dev)
-    pos, cos_sin = _rope_placeholders(m, rope_positions, dev)
+    pos = torch.empty((m,), dtype=torch.int32, device=dev)
+    cos_sin = torch.empty((max(rope_positions, 1), 2, 32), dtype=torch.float32, device=dev)
     gamma = torch.empty((1, k if a_rms_eps is not None else 8), dtype=torch.bfloat16, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(
@@ -1078,11 +1079,11 @@ def _no_gamma(device) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=None)
-def _rope_placeholders(m: int, positions: int, device):
-    """(positions [m] int32, cos/sin [P, 2, 32] fp32) with the compiled shapes (dummies when unused)."""
+def _rope_placeholders(m: int, device):
+    """The (positions [m] int32, cos/sin [1, 2, 32] fp32) arguments of kernels without RoPE."""
     return (
         torch.zeros((m,), dtype=torch.int32, device=device),
-        torch.zeros((max(positions, 1), 2, 32), dtype=torch.float32, device=device),
+        torch.zeros((1, 2, 32), dtype=torch.float32, device=device),
     )
 
 
@@ -1121,7 +1122,7 @@ def mxfp8_lowm_linear(
     else:
         out = out2 = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if rope is None:
-        positions, cos_sin = _rope_placeholders(m, 0, x.device)
+        positions, cos_sin = _rope_placeholders(m, x.device)
         head_dim = 0
     else:
         positions, cos_sin, head_dim = rope
@@ -1178,7 +1179,7 @@ def bf16_lowm_linear(
         out_dtype=out_dtype,
         k_warps=k_warps if (k // 64) % k_warps == 0 else 0,
     )
-    positions, cos_sin = _rope_placeholders(m, 0, x.device)
+    positions, cos_sin = _rope_placeholders(m, x.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         graph_safe_from_dlpack(x),
@@ -1241,7 +1242,7 @@ def fp8_grouped_lowm(
     block128 = scale.dtype == torch.float32
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     if inverse_rope is None:
-        pos, cos_sin = _rope_placeholders(m, 0, x.device)
+        pos, cos_sin = _rope_placeholders(m, x.device)
         head_dim = 0
     else:
         pos, cos_sin, head_dim = inverse_rope

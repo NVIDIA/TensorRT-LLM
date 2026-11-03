@@ -261,7 +261,7 @@ def _check_temperature_only(mapping, head, norm, processor, worker):
     assert worker.samples_from_vocab_shards
     model = types.SimpleNamespace(logits_processor=processor, lm_head=head, spec_worker=worker)
 
-    def metadata(num_gens):
+    def metadata(num_gens, seed=None):
         spec_metadata = SpecMetadata(
             max_num_requests=2,
             max_draft_len=DRAFT_LEN,
@@ -270,10 +270,10 @@ def _check_temperature_only(mapping, head, norm, processor, worker):
         )
         spec_metadata.runtime_draft_len = DRAFT_LEN
         spec_metadata.samples_from_vocab_shards = True
-        # AgentX requests send no sampling fields (temperature 1); one seeded row at 0.7.
-        requests = [_request(0, 1.0, None), _request(1, 0.7, 1234)][:num_gens]
+        # AgentX requests send no sampling fields (temperature 1); a second row at 0.7.
+        requests = [_request(0, 1.0, None), _request(1, 0.7, seed)][:num_gens]
         spec_metadata.populate_sampling_params_for_one_model(requests)
-        assert spec_metadata.is_all_temperature_only
+        assert spec_metadata.is_all_temperature_only == (seed is None or num_gens == 1)
         return spec_metadata
 
     def accept(spec_metadata, hidden, draft):
@@ -295,6 +295,18 @@ def _check_temperature_only(mapping, head, norm, processor, worker):
             spec_metadata.seeds[:rows].tolist(),
             spec_metadata.offsets[:rows].tolist(),
         )
+
+    # A seeded row keeps its step on the replicated head and the stock sampler, so its tokens do
+    # not depend on the rest of the batch.
+    seeded = metadata(2, seed=1234)
+    seeded.gather_ids = torch.arange(2 * (DRAFT_LEN + 1), device="cuda")
+    _, vocab_sharded = SpecDecOneEngineForCausalLM._verify_logits(
+        model,
+        _hidden(2 * (DRAFT_LEN + 1), 4000),
+        types.SimpleNamespace(num_seqs=2, num_contexts=0),
+        seeded,
+    )
+    assert not vocab_sharded
 
     checked, results, tokens = 0, [], []
 

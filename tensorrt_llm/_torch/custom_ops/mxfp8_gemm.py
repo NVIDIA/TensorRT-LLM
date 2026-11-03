@@ -7,7 +7,6 @@ Every candidate accumulates each output over K in one sequential FP32 pass and r
 tactics return the same bits for the same inputs and an output row never depends on the other rows.
 """
 
-from collections import Counter
 from functools import lru_cache
 from typing import ClassVar
 
@@ -212,30 +211,13 @@ class MXFP8GemmUnifiedRunner(TunableRunner):
         return self.runners[backend](inputs, tactic=sub_tactic)
 
 
-def agree_on_tactics(per_rank: list[dict]) -> dict:
-    """Per cache key, the entry whose tactic most ranks chose (ties: the lowest rank's), from the
-    ranks' cache entries in rank order. Ranks of a data-parallel step wait for the slowest one, so
-    a rank that kept a slower kernel by profiling noise would cost them all."""
-    agreed = {}
-    for key in {key for entries in per_rank for key in entries}:
-        held = [entries[key] for entries in per_rank if key in entries]
-        votes = Counter(repr(value[1]) for value in held)
-        top = max(votes.values())
-        agreed[key] = next(value for value in held if votes[repr(value[1])] == top)
-    return agreed
-
-
 def agree_mxfp8_tactics(custom_op: str) -> None:
-    """Make every rank of the tuner's tensor-parallel group hold the same ``custom_op`` tactics
-    (``agree_on_tactics``). A collective: every rank calls it at the same point of the warmup."""
-    tuner = AutoTuner.get()
-    AutoTuner.L2_FLUSH_BUFFERS.clear()
-    if not tuner._is_distributed():
-        return
-    cache = tuner.profiling_cache
-    mine = cache.get_specific_custom_op(custom_op)
-    agreed = agree_on_tactics(tuner._dist.tp_cp_allgather(obj=mine))
-    changed = sum(1 for key, value in agreed.items() if key not in mine or mine[key][1] != value[1])
-    cache.merge_cache_data(agreed)
+    """Make the tuner's tensor-parallel ranks hold the tactics most of them chose for ``custom_op``
+    and the MXFP8 quantizer tuned with it, since a step waits for its slowest rank. Collective."""
+    from .torch_custom_ops import _MXFP8_QUANTIZE_AUTOTUNED_OP
+
+    changed = AutoTuner.get().post_tune_merge_tactics(
+        {custom_op, _MXFP8_QUANTIZE_AUTOTUNED_OP}, majority=True
+    )
     if changed:
-        logger.info(f"[MXFP8] {changed} of {len(agreed)} GEMM tactics set to the ranks' majority")
+        logger.info(f"[MXFP8] {changed} quantize/GEMM tactics set to the ranks' majority")

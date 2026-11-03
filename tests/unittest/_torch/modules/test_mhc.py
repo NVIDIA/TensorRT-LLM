@@ -1557,16 +1557,18 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
-@pytest.mark.parametrize("num_tokens", [1, 129])
+@pytest.mark.parametrize("num_tokens", [1, 129, 1024])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("fuse_norm", [False, True])
 @pytest.mark.parametrize("lagged", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_mhc_fused_hc_force_deterministic(
     monkeypatch: pytest.MonkeyPatch,
     num_tokens: int,
     hidden_size: int,
     fuse_norm: bool,
     lagged: bool,
+    deterministic: bool,
 ) -> None:
     """Deterministic dispatch must bypass autotuning and remain stable across graph replay."""
     from tensorrt_llm._torch.modules.mhc import mhc_cuda
@@ -1604,6 +1606,7 @@ def test_mhc_fused_hc_force_deterministic(
             norm_weight=norm_weight,
             norm_eps=1e-6,
             pre_mix_ext=external_pre_mix,
+            deterministic=deterministic,
         )
 
     expected = tuple(t.clone() for t in run(inputs, pre_mix_ext))
@@ -2518,6 +2521,30 @@ def test_single_pass_boundary_weight_follows_weight_updates():
     loaded = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=5)
     module.load_state_dict(loaded.state_dict())
     assert_matches(loaded)
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_fused_hc_lagged_force_deterministic_row_independent(monkeypatch: pytest.MonkeyPatch):
+    """Under FORCE_DETERMINISTIC a row's lagged boundary is bitwise the same in a 1024-token batch
+    and alone, whichever boundary kernels the device has."""
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1")
+    hidden = V41_REAL_HIDDEN_SIZE
+    module_prev = _build_mhc(hidden, seed=0)
+    module = _build_mhc(hidden, seed=2, single_pass=True)
+    residual_prev = _residual(1024, hidden, seed=1)
+    x_prev = _residual(1024, hidden, seed=4)[:, 0, :].contiguous()
+    _, post_prev, comb_prev = module_prev.hc_coeffs(residual_prev)
+    pre_ext = module_prev.hc_coeffs(_residual(1024, hidden, seed=3))[0]
+    norm_w = (torch.rand(hidden, device="cuda") + 0.5).bfloat16()
+    args = (x_prev, residual_prev, post_prev, comb_prev, pre_ext)
+    batch = module.fused_hc_lagged(*args, norm_weight=norm_w, norm_eps=1e-6)
+    row = 517
+    alone = module.fused_hc_lagged(
+        *(t[row : row + 1].contiguous() for t in args), norm_weight=norm_w, norm_eps=1e-6
+    )
+    for got, want in zip(alone, batch, strict=True):
+        assert torch.equal(got, want[row : row + 1])
 
 
 @skip_pre_blackwell

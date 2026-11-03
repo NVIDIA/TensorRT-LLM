@@ -60,7 +60,7 @@ _MAX_VOCAB = (1 << 18) - 1
 
 
 @triton.jit
-def _prefer_argmax(a, a_index, b, b_index):
+def prefer_argmax(a, a_index, b, b_index):
     """``torch.argmax`` order: NaN first, then the larger value, ties to the smaller index."""
     a_nan = a != a
     b_nan = b != b
@@ -141,7 +141,7 @@ def _sharded_argmax_kernel(
     best, idx = tl.reduce(
         (tl.where(in_vocab, x, float("-inf")), tl.where(in_vocab, cols + vocab_offset, NO_INDEX)),
         0,
-        _prefer_argmax,
+        prefer_argmax,
     )
     tl.store(part_val_ptr + row * num_chunks + chunk, best)
     tl.store(part_idx_ptr + row * num_chunks + chunk, idx)
@@ -155,7 +155,7 @@ def _sharded_argmax_kernel(
         part_off = r[:, None] * num_chunks + c[None, :]
         pv = tl.load(part_val_ptr + part_off, mask=part_mask, other=float("-inf"), volatile=True)
         pi = tl.load(part_idx_ptr + part_off, mask=part_mask, other=NO_INDEX, volatile=True)
-        cand_val, cand_idx = tl.reduce((pv, pi), 1, _prefer_argmax)
+        cand_val, cand_idx = tl.reduce((pv, pi), 1, prefer_argmax)
         index_field = (
             tl.where(cand_idx == NO_INDEX, _INDEX_MASK, cand_idx).to(tl.uint32).to(tl.uint64)
         )
@@ -198,7 +198,7 @@ def _sharded_argmax_kernel(
         got = tl.load(mine + entry_off, mask=entry_mask, other=0, volatile=True)
         vals = tl.where(entry_mask, got.to(tl.int32).to(tl.float32, bitcast=True), float("-inf"))
         ids = tl.where(entry_mask, ((got >> 32) & _INDEX_MASK).to(tl.int32), _INDEX_MASK)
-        _, token = tl.reduce((vals, ids), 0, _prefer_argmax)
+        _, token = tl.reduce((vals, ids), 0, prefer_argmax)
         tl.store(out_ptr + r, token.to(out_ptr.dtype.element_ty), mask=live)
         tl.store(state_ptr + 1, tag % _TAG_MOD + 1)
         tl.store(state_ptr, 0)
@@ -329,4 +329,4 @@ class VocabShardedSampler:
         return out
 
 
-__all__ = ["VocabShardedSampler"]
+__all__ = ["VocabShardedSampler", "prefer_argmax"]

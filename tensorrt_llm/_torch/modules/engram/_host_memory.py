@@ -21,6 +21,8 @@ from cuda.bindings import driver as cuda
 from tensorrt_llm.logger import logger
 
 _POSIX_FD = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+# "0" turns off page-cache eviction, and the lock around it, for a node that is out of memory.
+_EVICT_ENV = "TRTLLM_ENGRAM_EVICT_PAGE_CACHE"
 # Eviction faults memory in 4 GiB steps until about 16 GiB of clean cache is left on the node.
 _EVICT_CHUNK = 4 << 30  # 4 GiB
 _EVICT_MARGIN = 16 << 30  # 16 GiB
@@ -56,10 +58,12 @@ def host_numa_node(device: int) -> int | None:
     )
     if not supported:
         return None
-    return _check(
+    node = _check(
         cuda.cuDeviceGetAttribute(attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, device),
         "cuDeviceGetAttribute",
     )
+    # -1: the device has no host NUMA affinity.
+    return node if node >= 0 else None
 
 
 def node_gpu_numa_nodes() -> list[int]:
@@ -219,7 +223,10 @@ def _eviction_lock(mode: int):
 
 
 def host_numa_mem(size: int, device: int, numa_node: int, shareable: bool = False) -> HostNumaMem:
-    """``HostNumaMem``, retried after evicting the node's page cache if the node is out of memory."""
+    """``HostNumaMem``, retried after evicting the node's page cache if the node is out of memory,
+    unless ``TRTLLM_ENGRAM_EVICT_PAGE_CACHE=0``."""
+    if os.environ.get(_EVICT_ENV, "1").lower() in ("0", "false"):
+        return HostNumaMem(size, device, numa_node, shareable=shareable)
     try:
         # Shared: wait out an eviction in progress, whose child this allocation could push into the OOM killer.
         with _eviction_lock(fcntl.LOCK_SH):
@@ -234,9 +241,13 @@ def host_numa_mem(size: int, device: int, numa_node: int, shareable: bool = Fals
                 # The process that held the lock may have evicted this node already.
                 with contextlib.suppress(HostNumaOutOfMemoryError):
                     return HostNumaMem(size, device, numa_node, shareable=shareable)
+            logger.warning(
+                f"Engram: {error}; evicting the page cache of NUMA node {numa_node}, which every "
+                f"process on the node loses ({_EVICT_ENV}=0 turns this off)"
+            )
             if not evict_numa_node_page_cache(numa_node, lock_fd):
                 raise
-            logger.info(f"Engram: {error}; evicted page cache on NUMA node {numa_node}, retrying")
+            logger.info(f"Engram: evicted page cache on NUMA node {numa_node}, retrying")
             return HostNumaMem(size, device, numa_node, shareable=shareable)
 
 

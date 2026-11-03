@@ -97,3 +97,27 @@ The splice was also checked against real `gpt2`, Llama-3, and Qwen3
 tokenizers on 300 randomly grown multi-turn prompts each, with deltas
 deliberately starting mid-word: 300/300 identical ids, 280 cache hits, and 0
 re-synchronization fallbacks per tokenizer.
+
+## Node-shared prompt token cache
+
+`prompt_token_cache_config` (prototype) keeps prompt token ids in files that
+every serving frontend of a node shares, so a turn still hits the cache when
+another frontend (`--num_serve_frontends`) served the previous turn. Only the
+DeepSeek-V4.1 input processor (checkpoints with a vision tower) uses it; other
+input processors ignore it with a warning.
+
+```yaml
+prompt_token_cache_config:
+  path: /dev/shm/trtllm-prompt-tokens  # node-local, the same for every frontend
+  max_bytes: 1073741824                # 1 GiB
+```
+
+- `path` is a directory on a node-local file system such as a tmpfs, created if
+  missing. Every frontend of the server must use the same directory, which must
+  be owned by the serving user and not writable by group or others.
+- `max_bytes` caps the space the entries take, each counted in whole file
+  system blocks; the least recently used entries are evicted first.
+- A prompt reuses the ids of its longest cached prefix that ends at an
+  `<｜Assistant｜>` marker and tokenizes only the rest, so the ids equal a full
+  tokenization. Startup fails unless the tokenizer is fast and keeps that marker
+  as one added token that does not strip its neighbours.

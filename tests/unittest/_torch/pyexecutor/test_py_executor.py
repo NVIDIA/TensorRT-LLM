@@ -80,6 +80,7 @@ def _forward_step_executor(
         kv_connector_manager=None,
         resource_manager=object(),
         iter_counter=0,
+        is_warmup=False,
         enable_spec_decode=enable_spec_decode,
         runtime_draft_len=runtime_draft_len,
         sampler=Mock(get_cache_indirection=Mock(return_value=object())),
@@ -4197,7 +4198,6 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor.previous_batch = None
-        executor._overlap_loop_stream = nullcontext
         executor._flush_pending_transfer_responses = Mock()
         return executor
 

@@ -22,6 +22,7 @@
 import itertools
 import json
 import math
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -482,6 +483,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     # The target logits only feed the guided-decoder bitmask, the acceptance helpers
     # and the ``logits`` output; the draft computes its own.
     reads_lm_head_dtype_logits = True
+    # Whether the back-fill projection may fork (set_target_model), and the draft model whose
+    # derived weights cache_derived_state builds (set_draft_model).
+    _forks_backfill = True
+    _draft_model_ref: Optional[weakref.ref] = None
 
     def __init__(
         self,
@@ -625,6 +630,25 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def set_draft_model(self, draft_model) -> None:
+        super().set_draft_model(draft_model)
+        self._draft_model_ref = None if draft_model is None else weakref.ref(draft_model)
+
+    def set_target_model(self, target_model: nn.Module) -> None:
+        # The forked back-fill all-reduce spins until every rank joins it, and a MegaMoE kernel holds
+        # every SM until its peers' kernels run: on one stream each, they could wait on each other.
+        backend = getattr(getattr(target_model, "model_config", None), "moe_backend", None)
+        self._forks_backfill = not str(backend).upper().startswith("MEGAMOE")
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        draft_model = None if self._draft_model_ref is None else self._draft_model_ref()
+        # Reused greedy proposals read a head copy built here, after load, so that KV-cache sizing
+        # accounts for it; rejection sampling never reuses them.
+        prepare = getattr(draft_model, "prepare_greedy_proposals", None)
+        if prepare is not None and not self.spec_config.use_rejection_sampling:
+            prepare()
+
     def prepare_vocab_sharded_sampling(self, lm_head: nn.Module) -> None:
         """Exchange buffers for greedy target sampling from a column-parallel ``lm_head``, or, with
         ``enable_lm_head_tp_in_adp``, from attention DP's replicated BF16 head shared by the
@@ -640,7 +664,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             if mapping.enable_lm_head_tp_in_adp:
                 group_size = min(mapping.gpus_per_node, mapping.tp_size)
                 # Only where target rows are sampled from shards (samples_from_vocab_shards) and every
-                # rank keeps its draft length: the acceptance-rate gate can stop one rank alone.
+                # rank keeps its draft length: the acceptance-rate gate can stop one rank alone. The
+                # group head computes BF16 logits, so a head with another output dtype stays replicated.
                 if not (
                     spec.use_rejection_sampling
                     or spec.enable_penalty
@@ -648,6 +673,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                         spec.acceptance_rate_window_size
                         and spec.acceptance_rate_threshold is not None
                     )
+                    or lm_head.output_dtype not in (None, torch.bfloat16)
                 ):
                     self._vocab_sharded_sampler = GroupShardedVerify.create(
                         mapping, lm_head.weight, group_size, _GROUP_VERIFY_MAX_ROWS
@@ -1239,7 +1265,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         these.
         """
         self._join_prep_fork()
-        if not self._prep_fork_model or not do_multi_stream():
+        if not self._prep_fork_model or not self._forks_backfill or not do_multi_stream():
             return
         draft_model = self._prep_fork_model[0]
         num_gens = spec_metadata.num_generations

@@ -1172,6 +1172,15 @@ def _build_release_model(*, bounded_replay_on_generation=False):
     # Construct on the host: a ``torch.device("cuda")`` default-device context
     # breaks YaRN RoPE table creation, which calls ``.numpy()``.
     torch.cuda.set_device(0)
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+        candidate_consumer_requirement,
+    )
+
+    missing = candidate_consumer_requirement(
+        text.index_n_heads, text.index_head_dim, text.candidate_block_size
+    )
+    if missing is not None:
+        pytest.skip(f"The release checkpoint's candidate-consumer layers need {missing}")
     return v41.DeepseekV41ForCausalLM(model_config)
 
 

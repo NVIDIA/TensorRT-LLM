@@ -225,6 +225,18 @@ class DeepseekV41Attention(nn.Module):
         self.mapping = mapping
         self.num_groups = num_groups
         self.layer = layout.layer(layer_idx)
+        if self.layer.consumes_candidates:
+            from .indexer import candidate_consumer_requirement
+
+            missing = candidate_consumer_requirement(
+                index_heads, index_head_dim, layout.candidate_block_size
+            )
+            if missing is not None:
+                raise ValueError(
+                    f"CSA2 layer {layer_idx} reindexes the candidates of layer "
+                    f"{self.layer.candidate_source} (candidate_source_layer_id) with DeepGEMM "
+                    f"sparse MQA logits, which need {missing}"
+                )
         self.num_heads_tp = num_heads // mapping.tp_size
         self.qk_head_dim = self.v_head_dim = head_dim
         self.qk_rope_head_dim = rope_head_dim
@@ -445,9 +457,15 @@ class DeepseekV41Attention(nn.Module):
             and self.wq_a.weight.shape[0] % 128 == 0
             and self.wkv.weight.shape[0] % 128 == 0
         ):
-            # Each projection ends at a complete 128-row scale tile.
-            self._fused_qkv_weight = torch.cat((self.wq_a.weight, self.wkv.weight))
-            self._fused_qkv_scale = torch.cat((self.wq_a.weight_scale, self.wkv.weight_scale))
+            # Each projection ends at a complete 128-row scale tile, so both become views of the
+            # fused copy instead of keeping their own storage.
+            weight = torch.cat((self.wq_a.weight, self.wkv.weight))
+            scale = torch.cat((self.wq_a.weight_scale, self.wkv.weight_scale))
+            rows, scale_rows = self.wq_a.weight.shape[0], self.wq_a.weight_scale.shape[0]
+            self.wq_a.weight.data, self.wkv.weight.data = weight[:rows], weight[rows:]
+            self.wq_a.weight_scale.data = scale[:scale_rows]
+            self.wkv.weight_scale.data = scale[scale_rows:]
+            self._fused_qkv_weight, self._fused_qkv_scale = weight, scale
         self._o_a_mxfp8_scale = None
         if self._o_a_fp8_block128 and is_sm_100f():
             from .projection import mxfp8_weight_scale

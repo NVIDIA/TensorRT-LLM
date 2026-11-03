@@ -177,7 +177,6 @@ l0_b200:
   - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
   - unittest/_torch/modules/test_embedding_vocab_slice.py
   - unittest/_torch/distributed/test_ll_allgather.py
-  - unittest/_torch/kernels/test_deep_gemm_jit_cache.py
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_deferred_gen_receive
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)

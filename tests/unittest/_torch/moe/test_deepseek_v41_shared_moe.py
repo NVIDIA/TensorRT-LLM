@@ -103,6 +103,8 @@ def _load_shared_weights(mlp: GatedMLP, weights: dict[str, torch.Tensor]) -> Non
     mlp.down_proj.load_weights(
         [{key: weights[f"0.w2.{key}"] for key in ("weight", "weight_scale")}]
     )
+    # As DeepseekV4ForCausalLM sets it: the full-TP shared-expert piece needs the small-M scales.
+    mlp.gate_up_proj.use_fp8_small_m_gemm = mlp.down_proj.use_fp8_small_m_gemm = True
     mlp.gate_up_proj.post_load_weights()
     mlp.down_proj.post_load_weights()
 

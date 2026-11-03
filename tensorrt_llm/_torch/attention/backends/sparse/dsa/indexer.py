@@ -77,18 +77,15 @@ _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
     os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 28)
 )
-# Per-device allocator pool of the eager MQA logits; see _mqa_logits_pool.
+# Per-device allocator pool of the eager compressed MQA logits; see _mqa_logits_pool.
 _MQA_LOGITS_POOLS: dict[int, torch.cuda.MemPool] = {}
 
 
-def _mqa_logits_pool(device: torch.device):
-    """Allocator context of the eager prefill MQA logits: a pool of their own.
-
-    Each call allocates up to the logits budget (4 GiB in FP32 at 1G elements) at a new size.
-    From the shared pool that keeps mapping fresh multi-GiB ranges until the device is full and
-    every further growth flushes the whole cache; in a pool of their own, one range is reused.
-    """
-    if torch.cuda.is_current_stream_capturing():
+def _mqa_logits_pool(device: torch.device, max_seqlen_k: int):
+    """Allocator context of eager prefill MQA logits. Compressed logits (``max_seqlen_k > 0``, CSA2's
+    packed groups) change width with every group, so their own pool reuses one range where the
+    shared pool would map fresh multi-GiB ranges until a growth flushes the whole cache."""
+    if max_seqlen_k <= 0 or torch.cuda.is_current_stream_capturing():
         return nullcontext()
     pool = _MQA_LOGITS_POOLS.get(device.index)
     if pool is None:
@@ -1765,7 +1762,7 @@ class Indexer(nn.Module):
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
                 q_scale_2d = F.pad(q_scale_2d, (0, padded_heads - heads))
                 weights = F.pad(weights, (0, padded_heads - heads))
-            with _mqa_logits_pool(q_fp8.device):
+            with _mqa_logits_pool(q_fp8.device, max_seqlen_k):
                 return fp8_fp4_mqa_logits(
                     (q_fp8, q_scale_2d),
                     (k_fp4_bytes, k_scale_int32),
@@ -1776,7 +1773,7 @@ class Indexer(nn.Module):
                     max_seqlen_k=max_seqlen_k,
                     schedule_meta=schedule_meta if padded_heads == heads else None,
                 )
-        with _mqa_logits_pool(q_fp8.device):
+        with _mqa_logits_pool(q_fp8.device, max_seqlen_k):
             return fp8_mqa_logits(
                 q_fp8,
                 (k_fp8, k_scale.reshape(-1)),
