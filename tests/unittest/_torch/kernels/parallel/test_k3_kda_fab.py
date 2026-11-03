@@ -193,3 +193,20 @@ def test_rejects_unsupported_inputs():
     assert not mod.can_use_k3_kda_fab(x, w_bfa, w_fb, 9)
     assert not mod.can_use_k3_kda_fab(x[:, :7000], w_bfa, w_fb, HEADS)
     assert mod.can_use_k3_kda_fab(x, w_bfa, w_fb, HEADS)
+
+
+@pytest.mark.parametrize("m", [129, 132, 138, 144, 168, 192])
+def test_helix8_shape_above_128_rows(m):
+    """helix8 KDA (12 heads, N2 = 1536) above 128 rows: the default tiling gives each tail worker two
+    token tiles (one does not fit), so the kernel runs instead of the unfused fallback."""
+    mod = _module()
+    heads, n1, n2 = 12, 144, 12 * 128
+    w_bfa, w_fb = _weights(seed=5, n1=n1, heads=heads, n2=n2)
+    x = _input(m, seed=m)
+    assert mod.can_use_k3_kda_fab(x, w_bfa, w_fb, heads)
+    n_tiles = (m + 7) // 8
+    assert mod.default_config(n_tiles, n2, HIDDEN).ntb >= 2
+    beta, fg = torch.ops.trtllm.k3_kda_fab_proj(x, w_bfa, w_fb, heads)
+    _check(beta, fg, x, w_bfa, w_fb, heads)
+    beta2, fg2 = torch.ops.trtllm.k3_kda_fab_proj(x, w_bfa, w_fb, heads)
+    assert torch.equal(beta, beta2) and torch.equal(fg, fg2)

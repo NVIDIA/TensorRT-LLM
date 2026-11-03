@@ -1768,16 +1768,34 @@ def default_config(n_tiles: int, n2: int = 768, k: int = 7168) -> FabConfig:
     the 152 SMs; more than ~28 CTAs here break its single-wave cluster placement. So the grid is
     27 CTAs (``mma.sync``, M <= 64) or 28 CTAs (UMMA, larger M), with at most one tail item each.
     Other shapes keep the tiling with at most ``k / 64`` K splits and enough ``W_fb`` rows per
-    tail item to cover ``n2`` with the CTAs available.
+    tail item to cover ``n2`` with the CTAs available. When those tail items do not fit the grid
+    or their ``W_fb`` block does not fit shared memory (helix8's N2 = 1536 above 128 rows), each
+    tail worker takes 2, 4, ... token tiles instead of one (fewer, smaller items); a tiling that
+    fits keeps ``ntb`` as above.
     """
-    cfg = _base_config(n_tiles)
-    cfg = dataclasses.replace(cfg, s=min(cfg.s, k // _K_CHUNK))
-    geo = _geometry(cfg, n_tiles, n2, k)
-    row_blocks = max(1, geo["num_ctas"] // geo["token_blocks"])
-    mtb = max(cfg.mtb, _ceil_div(n2 // _M_TILE, row_blocks))
-    if mtb > 128 // _M_TILE:
-        mtb = _ceil_div(mtb, 128 // _M_TILE) * (128 // _M_TILE)
-    return dataclasses.replace(cfg, mtb=mtb)
+    base = _base_config(n_tiles)
+    base = dataclasses.replace(base, s=min(base.s, k // _K_CHUNK))
+
+    def with_tail(cfg: FabConfig) -> FabConfig:
+        geo = _geometry(cfg, n_tiles, n2, k)
+        row_blocks = max(1, geo["num_ctas"] // geo["token_blocks"])
+        mtb = max(cfg.mtb, _ceil_div(n2 // _M_TILE, row_blocks))
+        if mtb > 128 // _M_TILE:
+            mtb = _ceil_div(mtb, 128 // _M_TILE) * (128 // _M_TILE)
+        return dataclasses.replace(cfg, mtb=mtb)
+
+    def fits(cfg: FabConfig) -> bool:
+        geo = _geometry(cfg, n_tiles, n2, k)
+        return geo["items"] <= geo["num_ctas"] and geo["smem_bytes"] <= _SMEM_CAPACITY
+
+    cfg = with_tail(base)
+    ntb = base.ntb * 2
+    while base.umma and not fits(cfg) and ntb <= base.ntg and base.ntg % ntb == 0:
+        cand = with_tail(dataclasses.replace(base, ntb=ntb))
+        if fits(cand):
+            return cand
+        ntb *= 2
+    return cfg
 
 
 @functools.cache
