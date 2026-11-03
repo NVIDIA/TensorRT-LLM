@@ -1868,7 +1868,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                             m_global = m_base_tile + m_local_start
                             n_global = n_base_subtile + n_local
-                            if m_global + 7 < m_total:
+                            # Bound by C itself: with swap_ab, M is the hidden size and N the tokens.
+                            if m_global + 7 < mC_raw.shape[0] and n_global < mC_raw.shape[1]:
                                 rVec = cute.make_rmem_tensor(
                                     cute.make_layout((4, 2), stride=(2, 1)),
                                     self.c_dtype,
