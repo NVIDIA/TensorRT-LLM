@@ -94,7 +94,7 @@ class PythonRequestInputs:
 class ExecutorRequest:
     """Serialize a bound request and its Python inputs as one internal envelope.
 
-    Native reads delegate to the bound request. The four compatibility views
+    Native reads delegate to the bound request. The compatibility views
     below serve admission and routing consumers that also accept LlmRequest.
     """
 
@@ -119,6 +119,10 @@ class ExecutorRequest:
     @property
     def py_scheduling_params(self) -> SchedulingParams | None:
         return self.inputs.scheduling_params
+
+    @property
+    def py_conversation_params(self) -> ConversationParams | None:
+        return self.inputs.conversation_params
 
     @property
     def py_disaggregated_params(self) -> DisaggregatedParams | None:

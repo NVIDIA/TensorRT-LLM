@@ -1788,6 +1788,7 @@ def test_typed_request_inputs_transport_and_child_policy(route: str) -> None:
             uncached_prefill_tokens=2,
         ),
     )
+    envelope.request.py_conversation_params = ConversationParams(conversation_id="stale")
     if route == "pickle":
         envelope = pickle.loads(pickle.dumps(envelope))
     elif route == "rpc":
@@ -1805,6 +1806,8 @@ def test_typed_request_inputs_transport_and_child_policy(route: str) -> None:
         finally:
             sender.close()
             receiver.close()
+    assert envelope.py_conversation_params is envelope.inputs.conversation_params
+    assert envelope.py_conversation_params.conversation_id == "conv"
     parent = executor_request_to_llm_request(42, envelope, [43, 44], False)
     for request in (parent, *parent.child_requests):
         assert request.py_logprobs_mode == LogprobMode.PROCESSED
