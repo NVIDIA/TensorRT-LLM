@@ -1121,15 +1121,24 @@ def test_class_docstring_and_code_changes_preserve_coverage_decision(
         assert "class/signature import change" in note
 
 
-def test_selector_keeps_cbts_binding_consumer_without_touch_rows(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("path", "module"),
+    [
+        ("jenkins/scripts/cbts/cbts/owner.py", "cbts.owner"),
+        ("tests/unittest/utils/owner.py", "utils.owner"),
+        ("tests/unittest/_torch/owner.py", "_torch.owner"),
+    ],
+)
+def test_selector_keeps_binding_consumer_without_touch_rows(
+    tmp_path: Path, path: str, module: str
+) -> None:
     """A constant imported by a test affects that test without executing owner frames."""
-    path = "jenkins/scripts/cbts/cbts/owner.py"
     owner = tmp_path / path
     owner.parent.mkdir(parents=True)
     owner.write_text("VALUE = 2\n")
     consumer = tmp_path / "tests/unittest/pkg/test_consumer.py"
     consumer.parent.mkdir(parents=True)
-    consumer.write_text("from cbts.owner import VALUE\n")
+    consumer.write_text(f"from {module} import VALUE\n")
     selector = CoverageSelector(_ExternalTestReferenceDB(), tmp_path)
 
     result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"})

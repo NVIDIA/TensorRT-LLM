@@ -303,6 +303,7 @@ class RepositoryReferenceIndex:
                 for root in (
                     "jenkins/scripts/cbts/",
                     "tests/",
+                    "tests/unittest/",
                     "tests/integration/",
                     "tests/integration/defs/",
                 ):

@@ -255,26 +255,32 @@ def test_repository_reference_index_marks_dynamic_importers_incomplete(tmp_path:
 
 
 @pytest.mark.parametrize(
-    "consumer",
+    ("defining", "module"),
     [
-        "from cbts.owner import VALUE\n",
-        "import cbts.owner as owner\nprint(owner.VALUE)\n",
-        "from cbts import owner\nprint(owner.VALUE)\n",
-        'from importlib import import_module\nowner = import_module("cbts.owner")\n',
-        "from jenkins.scripts.cbts.cbts.owner import VALUE\n",
+        ("jenkins/scripts/cbts/cbts/owner.py", "cbts.owner"),
+        ("tests/unittest/utils/owner.py", "utils.owner"),
+        ("tests/unittest/_torch/owner.py", "_torch.owner"),
     ],
 )
-def test_repository_reference_index_matches_cbts_import_root(
-    reference_root: Path, consumer: str
+@pytest.mark.parametrize("form", ["binding", "module", "parent", "dynamic", "qualified"])
+def test_repository_reference_index_matches_harness_import_roots(
+    reference_root: Path, defining: str, module: str, form: str
 ) -> None:
-    """Both supported CBTS spellings retain references to changed bindings."""
-    defining = "jenkins/scripts/cbts/cbts/owner.py"
+    """Harness-relative and repository-qualified imports retain changed bindings."""
+    parent, _, leaf = module.rpartition(".")
+    consumers = {
+        "binding": f"from {module} import VALUE\n",
+        "module": f"import {module} as owner\nprint(owner.VALUE)\n",
+        "parent": f"from {parent} import {leaf}\nprint({leaf}.VALUE)\n",
+        "dynamic": f'from importlib import import_module\nowner = import_module("{module}")\n',
+        "qualified": f"from {defining[:-3].replace('/', '.')} import VALUE\n",
+    }
     owner = reference_root / defining
     owner.parent.mkdir(parents=True)
     owner.write_text("VALUE = 2\n")
     test = reference_root / "tests/unittest/scripts/cbts/test_consumer.py"
-    test.parent.mkdir(parents=True)
-    test.write_text(consumer)
+    test.parent.mkdir(parents=True, exist_ok=True)
+    test.write_text(consumers[form])
     _stage_reference_files(reference_root)
 
     references = RepositoryReferenceIndex(reference_root).external_reference_paths(
