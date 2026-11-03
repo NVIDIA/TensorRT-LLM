@@ -127,6 +127,14 @@ class ConcreteToolParser(BaseToolParser):
             trigger="[TOOL_CALLS]")
 
 
+def _decoded_arguments(parameters):
+    """Decode streamed arguments; text that is not JSON stays visible as such."""
+    try:
+        return json.loads(parameters)
+    except json.JSONDecodeError:
+        return f"<not JSON: {parameters!r}>"
+
+
 # ============================================================================
 # BaseToolParser Tests
 # ============================================================================
@@ -332,6 +340,33 @@ class TestBaseToolParser:
         # Should have sent tool name (first call)
         assert len(result.calls) == 1
         assert result.calls[0].name == "get_weather"
+
+    def test_parse_streaming_increment_releases_every_complete_call(
+            self, sample_tools):
+        """An increment holding whole calls releases them all, with arguments.
+
+        Nothing may be left for a later increment: this one can be the last
+        of the stream, and finish() adds nothing for this parser.
+        """
+        parser = ConcreteToolParser()
+
+        result = parser.parse_streaming_increment(
+            '[TOOL_CALLS] {"name":"get_weather","arguments":{"location":"Boston"}}'
+            ', {"name":"search_web","arguments":{"query":"AI"}}[/TOOL_CALLS] Done.',
+            sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 _decoded_arguments(call.parameters))
+                for call in result.calls] == [
+                    (0, "get_weather", {
+                        "location": "Boston"
+                    }),
+                    (1, "search_web", {
+                        "query": "AI"
+                    }),
+                ]
+        assert result.normal_text == " Done."
+        assert parser.finish(sample_tools).calls == []
 
     def test_parse_streaming_increment_invalid_tool_name(self, sample_tools):
         """Test streaming parser handles invalid tool name."""
@@ -1140,6 +1175,183 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         # The completed call must also be consumed from the buffer, otherwise the
         # parser stays in the tool-call branch and swallows the rest of the output.
         assert "<tool_call>" not in parser._buffer
+
+
+_QWEN3_WEATHER_CALL = (
+    '<tool_call>\n{"name": "get_weather", "arguments": '
+    '{"location": "San Francisco, CA", "unit": "celsius"}}\n</tool_call>')
+_QWEN3_SEARCH_CALL = ('<tool_call>\n{"name": "search_web", "arguments": '
+                      '{"query": "SF \\"weather\\" {today}"}}\n</tool_call>')
+_QWEN3_JSON_OUTPUTS = {
+    "one_call":
+    _QWEN3_WEATHER_CALL,
+    "two_calls":
+    _QWEN3_WEATHER_CALL + "\n" + _QWEN3_SEARCH_CALL,
+    "text_around_calls": ("Let me check both.\n" + _QWEN3_WEATHER_CALL +
+                          "\nAnd a search:\n" + _QWEN3_SEARCH_CALL + "\nDone."),
+}
+
+
+class TestQwen3StreamingMatchesWholeTextParse:
+    """Streamed ``<tool_call>`` JSON calls end equal to the whole-text parse.
+
+    Qwen3ToolParser streams these calls through
+    ``BaseToolParser.parse_streaming_increment``. Whatever the increments, a
+    client assembling the streamed calls by index must end with the calls
+    ``detect_and_parse`` finds in the whole text, including when a call
+    arrives in the last increment, after which nothing can release it.
+    """
+
+    @staticmethod
+    def _chunkings(text):
+        yield "whole", [text]
+        yield "per_char", list(text)
+        for size in (2, 3, 5, 8, 13):
+            yield f"size_{size}", [
+                text[i:i + size] for i in range(0, len(text), size)
+            ]
+        for cut in range(1, len(text)):
+            yield f"split_{cut}", [text[:cut], text[cut:]]
+
+    @staticmethod
+    def _whole_text_calls(text, tools):
+        result = Qwen3ToolParser().detect_and_parse(text, tools)
+        return [(index, call.name, _decoded_arguments(call.parameters))
+                for index, call in enumerate(result.calls)]
+
+    @staticmethod
+    def _streamed_calls(chunks, tools):
+        """Assemble the calls by tool index, as a streaming client does."""
+        parser = Qwen3ToolParser()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        calls = {}
+        for result in results:
+            indices = [call.tool_index for call in result.calls]
+            assert len(indices) == len(set(indices)), (
+                f"one increment repeats a tool index: {indices}")
+            for call in result.calls:
+                name, arguments = calls.get(call.tool_index, (None, ""))
+                calls[call.tool_index] = (name or call.name,
+                                          arguments + call.parameters)
+        return [(index, name, _decoded_arguments(arguments))
+                for index, (name, arguments) in sorted(calls.items())]
+
+    @pytest.mark.parametrize("output", sorted(_QWEN3_JSON_OUTPUTS))
+    def test_streamed_calls_match_whole_text_parse(self, sample_tools, output):
+        """Whole output, one character, fixed sizes, every two-way split."""
+        text = _QWEN3_JSON_OUTPUTS[output]
+        expected = self._whole_text_calls(text, sample_tools)
+        assert expected and all(
+            isinstance(arguments, dict) for _, _, arguments in expected)
+
+        chunkings = list(self._chunkings(text))
+        differing = [
+            label for label, chunks in chunkings
+            if self._streamed_calls(chunks, sample_tools) != expected
+        ]
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings end with other "
+            f"calls than the whole-text parse, e.g. {differing[:8]}")
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            ["Let me check.\n", _QWEN3_WEATHER_CALL],
+            [
+                _QWEN3_WEATHER_CALL[:len('<tool_call>\n{"name": "get_wea')],
+                _QWEN3_WEATHER_CALL[len('<tool_call>\n{"name": "get_wea'):],
+            ],
+        ],
+        ids=["whole_call_in_last_increment", "last_increment_has_the_rest"],
+    )
+    def test_last_increment_sends_the_arguments_with_the_name(
+            self, sample_tools, chunks):
+        """A call first named by the last increment comes with its arguments."""
+        parser = Qwen3ToolParser()
+        for chunk in chunks[:-1]:
+            assert parser.parse_streaming_increment(chunk,
+                                                    sample_tools).calls == []
+
+        last = parser.parse_streaming_increment(chunks[-1], sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 _decoded_arguments(call.parameters))
+                for call in last.calls] == [(0, "get_weather", {
+                    "location": "San Francisco, CA",
+                    "unit": "celsius"
+                })]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_two_calls_in_last_increment_are_both_sent(self, sample_tools):
+        """Both whole calls of one increment are released, one item each."""
+        parser = Qwen3ToolParser()
+
+        last = parser.parse_streaming_increment(
+            _QWEN3_JSON_OUTPUTS["two_calls"], sample_tools)
+
+        assert [(call.tool_index, call.name,
+                 _decoded_arguments(call.parameters))
+                for call in last.calls] == [
+                    (0, "get_weather", {
+                        "location": "San Francisco, CA",
+                        "unit": "celsius"
+                    }),
+                    (1, "search_web", {
+                        "query": 'SF "weather" {today}'
+                    }),
+                ]
+        assert parser.finish(sample_tools).calls == []
+
+    @pytest.mark.parametrize(
+        "chunks",
+        [
+            [_QWEN3_JSON_OUTPUTS["text_around_calls"]],
+            [
+                "Let me check both.\n",
+                _QWEN3_WEATHER_CALL + "\n" + _QWEN3_SEARCH_CALL,
+            ],
+            [
+                _QWEN3_WEATHER_CALL + "\n" +
+                _QWEN3_SEARCH_CALL[:len('<tool_call>\n{"name": "sea')],
+                _QWEN3_SEARCH_CALL[len('<tool_call>\n{"name": "sea'):],
+            ],
+        ],
+        ids=[
+            "whole_output_in_one_step", "calls_in_last_step",
+            "last_step_has_the_rest"
+        ],
+    )
+    def test_chat_stream_carries_the_arguments_to_the_end(
+            self, sample_tools, chunks):
+        """The chat stream assembles to the whole-text calls in each case."""
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser="qwen3", stream=True)
+
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, chunks)
+
+        calls = {}
+        for payload in payloads:
+            for choice in payload["choices"]:
+                tool_calls = choice["delta"].get("tool_calls") or []
+                indices = [tool_call["index"] for tool_call in tool_calls]
+                assert len(indices) == len(set(indices)), (
+                    f"one chunk repeats a tool index: {indices}")
+                for tool_call in tool_calls:
+                    function = tool_call["function"]
+                    name, arguments = calls.get(tool_call["index"], (None, ""))
+                    calls[tool_call["index"]] = (
+                        name or function.get("name"),
+                        arguments + (function.get("arguments") or ""))
+        streamed = [(index, name, _decoded_arguments(arguments))
+                    for index, (name, arguments) in sorted(calls.items())]
+
+        assert streamed == self._whole_text_calls("".join(chunks), sample_tools)
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
 class TestQwen3CoderRequiredTools:
