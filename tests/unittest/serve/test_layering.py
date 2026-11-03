@@ -117,6 +117,25 @@ CONTRACTS = (
             "what they need. Move the shared helper to serve/_base/ instead."
         ),
     ),
+    Contract(
+        name="serve/exception_handling/ imports no server, VisualGen or Responses module",
+        importers=("tensorrt_llm.serve.exception_handling",),
+        forbidden=(
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.app",
+            "tensorrt_llm.serve.api.visual_gen",
+            "tensorrt_llm.serve._visual_gen_errors",
+            "tensorrt_llm.serve.openai_video_routes",
+            "tensorrt_llm.serve.responses_utils",
+        ),
+        fix=(
+            "The error registry is shared by both apps and every role: the composition root "
+            "injects what it needs, and VisualGen code registers the VisualGen renderer on "
+            "app.state.error_renderers from its own route registration, which only the "
+            "VisualGen role runs."
+        ),
+    ),
 )
 
 
