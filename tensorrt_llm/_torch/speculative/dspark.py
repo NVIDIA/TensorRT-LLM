@@ -1293,9 +1293,10 @@ class DSparkWorker(DFlashWorker):
         """Draw sampled drafts ancestrally through the Markov head; argmax drafts keep the chain.
 
         Position k is drawn by the seeded draft sampler from
-        ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{k-1}`` being the token
-        drawn before it (the anchor for k = 0), and that distribution is stored
-        as the position's proposal in ``draft_probs``. ``gen_logits`` are the
+        ``base_k + bias(d_{k-1})`` under the request's draft sampling
+        parameters (:meth:`_draft_sampling_params`), ``d_{k-1}`` being the
+        token drawn before it (the anchor for k = 0), and that distribution is
+        stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
         raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
         int32 draft tokens and the stored vocab width. Without a Markov head, or
         for argmax drafts, the DFlash path (greedy-chained

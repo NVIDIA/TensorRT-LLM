@@ -3778,10 +3778,10 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
         Must run once ``speculative_model`` names a local directory:
         ``target_layer_ids`` has no usable default, and without it no target
-        hidden states are captured. Reads the JSON directly, so
-        ``trust_remote_code`` (the shared loader signature) is unused here.
-        Called from validation for a local path,
+        hidden states are captured. Called from validation for a local path,
         and again from model loading once a HF repo id has been downloaded.
+        Reads the JSON directly, so ``trust_remote_code`` (the shared loader
+        signature) is unused here.
         """
         if self.speculative_model is None:
             return
