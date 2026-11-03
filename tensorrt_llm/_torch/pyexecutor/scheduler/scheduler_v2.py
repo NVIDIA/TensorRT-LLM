@@ -921,8 +921,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             # A non-ADP replay that cannot acquire KV must let decode release
             # pages. Retry admission without replay; keep its forward isolated.
+            # Pass every active request so the retry keeps the PEFT claims of
+            # paused decodes, which requests_list has already dropped.
             return self._schedule_loop(
-                requests_list,
+                active_requests,
                 inflight_request_ids,
                 defer_remote_tail_context=True,
                 prefix_waits=prefix_waits,

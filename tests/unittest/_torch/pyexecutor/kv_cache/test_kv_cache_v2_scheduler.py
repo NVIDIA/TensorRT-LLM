@@ -1923,6 +1923,23 @@ class TestGenSlotPreemption:
         resumed = sched.schedule_request([resident], set())
         assert ids(resumed.generation_requests) == ([] if paused_ids else [0])
 
+    def test_paused_peft_claim_survives_remote_tail_retry(self):
+        peft = make_peft_cache_manager(max_device_pages=1)
+        mgr = make_kv_cache_manager(
+            prepare_context_fn=lambda req, reuse_limit=None: req.py_request_id != 1
+        )
+        sched = make_scheduler(mgr, peft_cache_manager=peft)
+        sched.set_gen_paused_ids(frozenset({0}))
+        paused = make_gen_request(0, lora_task_id=10)
+        replay = make_ctx_request(1, context_remaining_length=64)
+        replay.py_csa2_remote_tail_mode = "destination"
+        other = make_ctx_request(2, context_remaining_length=64, lora_task_id=20)
+        # The replay cannot allocate KV, so admission retries without it. The
+        # retry must still count the paused decode's resident adapter.
+        out = sched.schedule_request([paused, replay, other], set())
+        assert out.context_requests == []
+        assert out.generation_requests == []
+
     def test_forced_resume_displaces_a_live_request_within_batch_limit(self):
         sched = make_scheduler(make_kv_cache_manager(), max_batch_size=1)
         # A forced resume removes the old request from the policy's paused set.
