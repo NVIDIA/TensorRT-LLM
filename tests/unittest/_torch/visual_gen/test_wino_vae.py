@@ -331,3 +331,23 @@ def test_forward_registers_no_parameters() -> None:
     with torch.inference_mode():
         model.encode(pixels, return_dict=False)
     assert {name: set(m._parameters) for name, m in model.named_modules()} == slots
+
+
+@pytest.mark.parametrize("frontend", [True, False])
+def test_conv_beyond_max_in_frames(monkeypatch: pytest.MonkeyPatch, frontend: bool) -> None:
+    """A call longer than max_in_frames goes through the cuDNN graph API in one call, or in
+    max_in_frames pieces without the frontend; both match the plain conv."""
+    if not frontend:
+        monkeypatch.setattr(wino_vae_module, "cudnn_frontend_available", lambda: False)
+    torch.manual_seed(0)
+    conv = WinoVaeCausalConv3d(64, 12, 3, padding=1).to(device=DEVICE, dtype=DTYPE)
+    conv.max_in_frames = 3
+    x = torch.randn(1, 64, 6, 16, 24, device=DEVICE).to(DTYPE)
+    x = x.contiguous(memory_format=torch.channels_last_3d)
+    with torch.inference_mode():
+        got = conv._conv3d(x, conv.bias, (0, 1, 1))
+        ref = torch.nn.functional.conv3d(
+            x.float(), conv.weight.float(), conv.bias.float(), padding=(0, 1, 1)
+        )
+    assert got.shape == ref.shape
+    assert _rel_l2(got, ref) < 1e-2

@@ -142,9 +142,10 @@ class WinoVaeOptions:
         return cls(**values)
 
 
-# The decoder's narrow conv_out (256 -> 12 channels) runs on at most this many input frames
-# per cuDNN call (the outputs are concatenated): beyond three frames cuDNN picks a much
-# slower kernel for that shape.
+# The decoder's narrow conv_out (256 -> 12 channels): beyond this many input frames torch's
+# cuDNN path picks a much slower kernel for that shape, so longer calls go through the cuDNN
+# graph API (its fastest plan for the shape, the bias inside), or in pieces of at most this
+# many input frames without the frontend.
 _CONV_OUT_MAX_IN_FRAMES = 3
 # Storage type of the temporal Winograd inputs and conv products between the norm kernels:
 # three more mantissa bits than bf16 for the transformed values (required by F(4,3)).
@@ -666,8 +667,8 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         )
         # When set, forward() leaves the bias out; the caller hands it to the consumer kernel.
         self.defer_bias = False
-        # When set, a stride-1 temporal conv runs on at most this many input frames per
-        # cuDNN call and concatenates the output frames.
+        # When set, a stride-1 temporal conv call of more input frames than this does not go
+        # through torch's cuDNN path in one piece (see _conv3d).
         self.max_in_frames: int | None = None
         # Tensors derived from the weight (transformed filters, the current-frame slice).
         self._derived: dict[tuple, tuple[tuple, Any]] = {}  # key -> (_stamp of the weight, value)
@@ -739,16 +740,21 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
     def _conv3d(
         self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
     ) -> torch.Tensor:
-        """The 3D conv of an already causally padded ``x``: in calls of at most
-        ``max_in_frames`` input frames when set (concatenated), else through the cuDNN graph
-        API with the plan selected for this shape when ``cudnn_frontend`` is set (and the
-        frontend is installed, the call unbatched), else torch's cuDNN path."""
+        """The 3D conv of an already causally padded ``x``. A call of more than
+        ``max_in_frames`` input frames (when set) goes through the cuDNN graph API in one call
+        when the frontend is installed and the call is unbatched, else in calls of at most
+        ``max_in_frames`` input frames (concatenated). Otherwise: the cuDNN graph API with the
+        plan selected for this shape when ``cudnn_frontend`` is set (frontend installed, call
+        unbatched), else torch's cuDNN path."""
         kt = self.kernel_size[0]
+        frontend_ok = self.groups == 1 and x.shape[0] == 1 and cudnn_frontend_available()
         if (
             self.max_in_frames is not None
             and self.stride[0] == 1
             and x.shape[2] > self.max_in_frames >= kt
         ):
+            if frontend_ok:
+                return self._conv_frontend(x, bias, padding)
             per_call = self.max_in_frames - kt + 1
             parts = [
                 F.conv3d(
@@ -763,24 +769,25 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
                 for t in range(0, x.shape[2] - kt + 1, per_call)
             ]
             return _channels_last_3d_if_needed(torch.cat(parts, dim=2))
-        if (
-            self.cudnn_frontend
-            and self.groups == 1
-            and x.shape[0] == 1
-            and cudnn_frontend_available()
-        ):
-            w = self.weight.detach()
-            if not w.is_contiguous(memory_format=torch.channels_last_3d):
-                w = w.contiguous(memory_format=torch.channels_last_3d)
-            return conv_frontend(
-                x.contiguous(memory_format=torch.channels_last_3d),
-                w,
-                bias,
-                tuple(self.stride),
-                tuple(padding),
-                tuple(self.dilation),
-            )
+        if self.cudnn_frontend and frontend_ok:
+            return self._conv_frontend(x, bias, padding)
         return F.conv3d(x, self.weight, bias, self.stride, padding, self.dilation, self.groups)
+
+    def _conv_frontend(
+        self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """The conv through the cuDNN graph API, the bias inside the graph."""
+        w = self.weight.detach()
+        if not w.is_contiguous(memory_format=torch.channels_last_3d):
+            w = w.contiguous(memory_format=torch.channels_last_3d)
+        return conv_frontend(
+            x.contiguous(memory_format=torch.channels_last_3d),
+            w,
+            bias,
+            tuple(self.stride),
+            tuple(padding),
+            tuple(self.dilation),
+        )
 
     def buffer_eligible(self, x: "torch.Tensor | DeferredSum") -> bool:
         return x.shape[0] == 1 and self.kernel_size[0] == 3 and self._unit_stride
