@@ -19,7 +19,8 @@ variables read at call time:
 ``TRTLLM_FP4_MLA_TWOSTREAM``          1 (default): automatic; 0: never split the call.
 ``TRTLLM_FP4_MLA_TWOSTREAM_R2``       force the number of 2x requests (0 = force the plain 4x path).
 ``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` minimum modelled gain over the plain 4x path (default 0.08 = 8 %).
-``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``   cap on r2 (default 36 = the largest share that still leaves the 4x arm the longer one at q4).
+``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``   cap on r2 (default 36 = the largest share that still leaves the 4x arm
+                                      the longer one at q4).
 ``TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE`` relative cost of this tree's 2x packed kernel (see ``DEFAULT_T2_SCALE``).
 """
 
@@ -134,7 +135,9 @@ def item_costs_us(kv_tiles: int) -> tuple[float, float]:
     return T4_FIXED_US + T4_TILE_US * tiles, (T2_FIXED_US + T2_TILE_US * tiles) * t2_scale()
 
 
-def plain_4x_us(num_requests: int, rows_per_request: int, kv_tiles: int, *, lanes_4x: int = LANES_4X) -> tuple[float, int]:
+def plain_4x_us(
+    num_requests: int, rows_per_request: int, kv_tiles: int, *, lanes_4x: int = LANES_4X
+) -> tuple[float, int]:
     """Modelled duration of the plain 4x path: one FULL wave, or the device split plan spreading the fractional wave
     over the leftover slots (fractional waves x item + split overhead).  Returns (us, whole waves)."""
     t4, _ = item_costs_us(kv_tiles)
@@ -165,7 +168,11 @@ def makespan_us(
     n4 = (num_requests - r2) * items_per_request_4x
     n2 = r2 * items_per_request_2x
     waves_4x = math.ceil(n4 / lanes_4x) if n4 > 0 else 0
-    rounds_2x = math.ceil(n2 / lanes_2x_pairs) if (n2 > 0 and lanes_2x_pairs > 0) else (0 if n2 == 0 else 1 << 30)
+    rounds_2x = (
+        math.ceil(n2 / lanes_2x_pairs)
+        if (n2 > 0 and lanes_2x_pairs > 0)
+        else (0 if n2 == 0 else 1 << 30)
+    )
     arm_4x = waves_4x * t4
     arm_2x = rounds_2x * t2 * CONTENTION_2X
     overlap = min(1.0, arm_2x / arm_4x) if arm_4x > 0 else 0.0
@@ -185,14 +192,32 @@ def plan_two_stream(
     decode step calls this once per layer).  See :func:`_plan_two_stream`."""
     knobs = tuple(
         os.getenv(name)
-        for name in (TWOSTREAM_ENV, TWOSTREAM_R2_ENV, TWOSTREAM_MIN_GAIN_ENV, TWOSTREAM_MAX_R2_ENV, TWOSTREAM_T2_SCALE_ENV)
+        for name in (
+            TWOSTREAM_ENV,
+            TWOSTREAM_R2_ENV,
+            TWOSTREAM_MIN_GAIN_ENV,
+            TWOSTREAM_MAX_R2_ENV,
+            TWOSTREAM_T2_SCALE_ENV,
+        )
     )
-    return _plan_two_stream_cached(int(num_requests), int(rows_per_request), int(max_kv_len), int(sm_count), int(lanes_4x), knobs)
+    return _plan_two_stream_cached(
+        int(num_requests),
+        int(rows_per_request),
+        int(max_kv_len),
+        int(sm_count),
+        int(lanes_4x),
+        knobs,
+    )
 
 
 @functools.lru_cache(maxsize=256)
 def _plan_two_stream_cached(
-    num_requests: int, rows_per_request: int, max_kv_len: int, sm_count: int, lanes_4x: int, knobs: tuple
+    num_requests: int,
+    rows_per_request: int,
+    max_kv_len: int,
+    sm_count: int,
+    lanes_4x: int,
+    knobs: tuple,
 ) -> TwoStreamPlan:
     return _plan_two_stream(
         num_requests=num_requests,
@@ -230,12 +255,22 @@ def _plan_two_stream(
     kv_tiles = max(1, math.ceil(max(1, int(max_kv_len)) / KV_TILE))
     pairs_2x = lanes_2x(sm_count, lanes_4x)
     plain_us, plain_waves, _ = makespan_us(
-        num_requests, 0, rows_per_request, kv_tiles, lanes_4x=lanes_4x, lanes_2x_pairs=max(1, pairs_2x)
+        num_requests,
+        0,
+        rows_per_request,
+        kv_tiles,
+        lanes_4x=lanes_4x,
+        lanes_2x_pairs=max(1, pairs_2x),
     )
 
     def result(r2: int, reason: str) -> TwoStreamPlan:
         us, w4, w2 = makespan_us(
-            num_requests, r2, rows_per_request, kv_tiles, lanes_4x=lanes_4x, lanes_2x_pairs=max(1, pairs_2x)
+            num_requests,
+            r2,
+            rows_per_request,
+            kv_tiles,
+            lanes_4x=lanes_4x,
+            lanes_2x_pairs=max(1, pairs_2x),
         )
         return TwoStreamPlan(r2, num_requests, plain_waves, w4, w2, plain_us, us, reason)
 
@@ -265,4 +300,7 @@ def _plan_two_stream(
     gain = 1.0 - best[0] / plain_us if plain_us > 0 else 0.0
     if gain < min_gain:
         return result(0, f"modelled gain {gain:.1%} below {min_gain:.0%}")
-    return result(best[1], f"modelled gain {gain:.1%} ({plain_waves} -> {result(best[1], '').waves_4x} 4x waves)")
+    return result(
+        best[1],
+        f"modelled gain {gain:.1%} ({plain_waves} -> {result(best[1], '').waves_4x} 4x waves)",
+    )

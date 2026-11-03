@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Two-stream FP4 MLA decode: the 4x kernel on the first requests and the 2x packed kernel on the last ones, concurrently.
+"""Two-stream FP4 MLA decode: the 4x kernel on the first requests, the 2x packed kernel on the last ones, concurrently.
 
 The four-CTA-cluster kernel can only occupy the 92 TPC pairs that host 4-CTA clusters (184 of the 212 SMs); the
 28 SMs on the unpaired TPCs idle for its whole duration.  ``fp4_mla_twostream.plan_two_stream`` moves exactly as
@@ -33,11 +33,13 @@ import torch
 
 from .config import FP4_MLA_Q_LOGICAL_DIM, FP4_MLA_SCALE_ROW_GROUP, _ceil_div
 from .layout import _get_fp4_mla_swizzled_scale_size
-from .packed_plan import _PackedPlanGeometry, _packed_wave_tasks
+from .packed_plan import _packed_wave_tasks, _PackedPlanGeometry
 
 # (high-priority stream for the 4x arm, low-priority stream for the 2x arm, (fork, join_high, join_low) events) per
 # device.  The events are re-recorded every call (one host thread issues the op), like multi_stream_utils does.
-_twostream_state: dict[int, tuple[torch.cuda.Stream, torch.cuda.Stream, tuple[torch.cuda.Event, ...]]] = {}
+_twostream_state: dict[
+    int, tuple[torch.cuda.Stream, torch.cuda.Stream, tuple[torch.cuda.Event, ...]]
+] = {}
 
 
 def _get_twostream_state(
@@ -97,13 +99,21 @@ def run_cutedsl_twostream_decode(
     r2 = int(num_requests_2x)
     r4 = int(num_requests) - r2
     if not 0 < r2 < num_requests:
-        raise RuntimeError(f"FP4 MLA two-stream decode needs 0 < 2x requests {r2} < {num_requests}.")
+        raise RuntimeError(
+            f"FP4 MLA two-stream decode needs 0 < 2x requests {r2} < {num_requests}."
+        )
     if rows_per_seq % FP4_MLA_SCALE_ROW_GROUP != 0:
-        raise RuntimeError("FP4 MLA two-stream decode needs whole 128-row scale groups per request.")
+        raise RuntimeError(
+            "FP4 MLA two-stream decode needs whole 128-row scale groups per request."
+        )
     if page_indptr.numel() != num_requests + 1 or kv_lens.numel() < num_requests:
-        raise RuntimeError("FP4 MLA two-stream decode: page table / KV length views do not cover the batch.")
+        raise RuntimeError(
+            "FP4 MLA two-stream decode: page table / KV length views do not cover the batch."
+        )
     if src_page_ids.numel() % num_requests != 0:
-        raise RuntimeError("FP4 MLA two-stream decode needs the fixed-stride generation page table.")
+        raise RuntimeError(
+            "FP4 MLA two-stream decode needs the fixed-stride generation page table."
+        )
     page_stride = src_page_ids.numel() // num_requests
     rows4 = r4 * rows_per_seq
     sf_bytes4 = _get_fp4_mla_swizzled_scale_size(rows4, FP4_MLA_Q_LOGICAL_DIM)
@@ -133,7 +143,9 @@ def run_cutedsl_twostream_decode(
     high, low, (fork, join_high, join_low) = _get_twostream_state(output.device)
     current = torch.cuda.current_stream(output.device)
     if current == high or current == low:
-        raise RuntimeError("FP4 MLA two-stream decode: the caller's stream must not be one of the arm streams.")
+        raise RuntimeError(
+            "FP4 MLA two-stream decode: the caller's stream must not be one of the arm streams."
+        )
     fork.record(current)
     high.wait_event(fork)
     low.wait_event(fork)

@@ -353,8 +353,8 @@ SMEM_P4_RUNTIME_SCALE_PAIR_BYTES = SMEM_P4_RUNTIME_SCALE_PAIR_FLOATS * ctm.Float
 # the whole 4-CTA cluster in the 4x kernel). Measured 2026-11-01 (hecate0340, DS-R1 shapes, logits scaled x1..x32): with
 # the default 1.0 realistic logits (x4) cost the 4x kernel 18-19 % and the 2x kernel 2-6 %; 4.0 removes the stalls up to
 # x8 logits and 6.0 up to ~x16 with FP32 cosine unchanged (the P scale saturates only above ~6.5 log2 at kv_gs 89.6; 8.0
-# breaks accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it, the --lazy-anchor-threshold-log2 argv flag
-# of the bench tools overrides both.
+# breaks accuracy). Default 4.0; TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2 overrides it and the --lazy-anchor-threshold-log2
+# argv flag of the bench tools overrides both.
 SMEM_P4_LAZY_ANCHOR_REBASE_LOG2 = _initial_float_from_argv(
     "--lazy-anchor-threshold-log2", float(os.environ.get("TRTLLM_FP4_MLA_LAZY_ANCHOR_LOG2", "4.0"))
 )
