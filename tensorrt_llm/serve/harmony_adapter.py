@@ -551,7 +551,8 @@ class HarmonyAdapter:
             for tool in tools:
                 func_def = tool.get("function", {})
                 func_name = func_def.get("name", "")
-                func_description = func_def.get("description", "")
+                # A request tool dumps an unset description as None.
+                func_description = func_def.get("description") or ""
                 func_parameters = func_def.get("parameters", {})
 
                 if func_name:

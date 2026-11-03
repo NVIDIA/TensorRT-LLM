@@ -28,9 +28,12 @@ from tensorrt_llm.inputs.utils import MultimodalDataTracker
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
+    _construct_harmony_messages,
     _create_input_messages,
     _get_chat_completion_function_tools,
+    _get_encoding,
     _render_developer_as_system,
+    _render_for_completion,
     _response_output_item_to_chat_completion_message,
     _tool_resolution,
 )
@@ -611,6 +614,28 @@ def test_developer_renders_as_system_only_where_the_template_lacks_it(tokenizer,
     messages = _render_developer_as_system(_DEVELOPER_TURN, tokenizer, None, None)
     assert [m["role"] for m in messages] == [role, "user"]
     assert _DEVELOPER_TURN[0]["role"] == "developer"
+
+
+# ---------------------------------------------------------------------------
+# Function tools in the Harmony developer message
+# ---------------------------------------------------------------------------
+
+
+def _harmony_prompt(**function):
+    tool = {"type": "function", "name": "get_weather", **function}
+    request = ResponsesRequest(model="m", input="q", tools=[tool])
+    return _render_for_completion(_construct_harmony_messages(request, None))
+
+
+def test_harmony_renders_a_tool_without_a_description_like_an_empty_one(harmony_vocab):
+    parameters = {"type": "object", "properties": {"city": {"type": "string"}}}
+    assert _harmony_prompt(parameters=parameters) == _harmony_prompt(
+        description="", parameters=parameters
+    )
+
+
+def test_harmony_renders_a_tool_declared_by_name_alone_as_taking_no_arguments(harmony_vocab):
+    assert "type get_weather = () => any;" in _get_encoding().decode(_harmony_prompt())
 
 
 # ---------------------------------------------------------------------------

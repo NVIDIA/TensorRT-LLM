@@ -559,6 +559,26 @@ class TestExtensions:
 
         assert low.token_ids != high.token_ids
 
+    def test_harmony_renders_a_tool_without_a_description_like_an_empty_one(
+        self, harmony_vocab
+    ) -> None:
+        def ids(**function):
+            tool = {"type": "function", "function": {"name": "get_weather", **function}}
+            return render_chat(chat_request(tools=[tool]), harmony_resources()).token_ids
+
+        parameters = WEATHER_TOOL["function"]["parameters"]
+        assert ids(parameters=parameters) == ids(description="", parameters=parameters)
+
+    def test_harmony_renders_a_tool_declared_by_name_alone_as_taking_no_arguments(
+        self, harmony_vocab
+    ) -> None:
+        from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+        tool = {"type": "function", "function": {"name": "get_time"}}
+        ids = render_chat(chat_request(tools=[tool]), harmony_resources()).token_ids
+
+        assert "type get_time = () => any;" in get_harmony_adapter().encoding.decode(ids)
+
     def test_a_gpt_oss_model_without_the_harmony_switch_uses_the_template(
         self, harmony_vocab, tokenizer
     ) -> None:
