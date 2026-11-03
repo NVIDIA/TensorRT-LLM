@@ -339,6 +339,10 @@
 /tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/kernels/serial/test_sparse_kv_cache_compact.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+# The fused QK-norm, RoPE and gate kernel and its test are co-owned by the
+# kernels and Attention teams.
+/tensorrt_llm/_torch/attention/kernels/fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/attention/kernels/test_fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
