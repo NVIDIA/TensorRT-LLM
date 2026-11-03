@@ -357,20 +357,29 @@ _AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 """Set to ``0`` to run every attention-residual mix as the PyTorch reference.
 Default: the fused kernels (``trtllm::attn_res_fwd``, ``_attn_res_kernel``)
-where they serve the shape."""
+where they serve the shape. ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` bounds the
+per-token fused mixes (decode) without touching ``trtllm::attn_res_fwd``."""
 
 _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
 
-KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
-"""``1`` (or its alias ``split``) runs the attention-residual mixes (+ RMSNorm) above the decode
-kernel's token range on the persistent kernel (one CTA per SM looping over tokens; H == 7168 and
-2 <= N <= 9). The default, ``per_token``, leaves them unfused. See ``_attn_res_kernel``.
+KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
+"""Largest token count of an attention-residual mix (+ RMSNorm) that runs on a per-token fused
+kernel: the CuTe DSL decode kernel where it serves the shape (``kimi_k3_attn_res``: up to 64
+tokens; SM100, SM103, and SM107 with a Rubin-capable CuTe DSL), else the C++ per-token ops
+(``trtllm::attn_res_rmsnorm_fwd`` / ``attn_res_add_rmsnorm_fwd``: H == 7168, N <= 12). A positive
+integer, default 64. ``1`` keeps the per-token kernels to single-token decode. Larger mixes take
+the persistent kernel with ``KIMI_K3_ATTN_RES_TOPOLOGY=1``, else run unfused. See
+``_attn_res_kernel``.
 
-The decode kernel serves every shape up to its token limit, so ``split`` is the only topology:
-``persistent`` (formerly the persistent kernel at every shape) is accepted as another alias of
-``1`` with a warning, and the per-token ceiling is the decode kernel's limit
-(``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` is not read).
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
+"""``per_token`` (default): attention-residual mixes (+ RMSNorm) that no per-token kernel takes
+(above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens, or a shape those kernels do not serve) run
+unfused. ``1`` (alias ``split``): they run on the persistent kernel (one CTA per SM looping over
+tokens) when H == 7168 and 2 <= N <= 9. See ``_attn_res_kernel``.
 
 Off by default because the persistent kernel measures as no-regression on
 NVFP4 but as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, through a
@@ -379,15 +388,14 @@ downstream interaction with the TRTLLM-gen MoE rather than through this kernel.
 Read at import, so CUDA-graph capture and replay cannot disagree about it.
 """
 
-_UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
-
 
 def _read_persistent_attn_res() -> bool:
     raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
     if raw == "persistent":
         logger.warning(
-            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=persistent is treated as '1': the decode kernel serves "
-            "the shapes up to its token limit and the persistent kernel the larger ones"
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=persistent is treated as '1': the per-token kernels "
+            f"serve the mixes up to {KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} tokens and the "
+            "persistent kernel the larger ones"
         )
     if raw not in ("per_token", "1", "split", "persistent"):
         # Loudly: a mistyped A/B arm that silently fell back to the default would
@@ -396,15 +404,25 @@ def _read_persistent_attn_res() -> bool:
             f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be 'per_token', '1', 'split' or 'persistent', "
             f"got {raw!r}"
         )
-    if _UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV in os.environ:
-        logger.warning(
-            f"{_UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV} is ignored: the per-token attention-residual "
-            "kernel serves the shapes up to its own token limit"
-        )
     return raw != "per_token"
 
 
+def _read_fused_attn_res_max_tokens() -> int:
+    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "64")
+    try:
+        value = int(raw)
+    except ValueError:
+        # Loudly, for the same reason as the topology above.
+        raise ValueError(
+            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be a positive integer, got {raw!r}"
+        ) from None
+    if value < 1:
+        raise ValueError(f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}")
+    return value
+
+
 _PERSISTENT_ATTN_RES_ENABLED = _read_persistent_attn_res()
+_FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
 
 
 class _AttnResKernel(enum.Enum):
@@ -412,6 +430,8 @@ class _AttnResKernel(enum.Enum):
 
     #: ``kimi_k3_attn_res`` (CuTe DSL, PDL prologue, a CTA cluster per token).
     DECODE = enum.auto()
+    #: ``trtllm::attn_res_rmsnorm_fwd`` / ``attn_res_add_rmsnorm_fwd`` (C++, per token).
+    PER_TOKEN = enum.auto()
     #: ``trtllm::attn_res_add_rmsnorm_persistent_fwd`` (one CTA per SM looping over tokens).
     PERSISTENT = enum.auto()
     #: ``_apply_attn_res`` and the module RMSNorm.
@@ -429,31 +449,56 @@ def _decode_attn_res_on_device(device_index: int) -> bool:
     return kimi_k3_attn_res.is_supported_device(device_index)
 
 
+@functools.cache
+def _per_token_attn_res_on_device(device_index: int) -> bool:
+    """Whether the C++ per-token attention-residual ops run here (built, SM10x)."""
+    try:
+        torch.ops.trtllm.attn_res_rmsnorm_fwd
+        torch.ops.trtllm.attn_res_add_rmsnorm_fwd
+    except (AttributeError, RuntimeError):
+        return False
+    return torch.cuda.get_device_capability(device_index)[0] == 10
+
+
+def _select_attn_res_kernel(
+    num_tokens: int, hidden: int, num_candidates: int, device_index: int
+) -> _AttnResKernel:
+    """``_attn_res_kernel`` for a BF16 CUDA mix of ``num_tokens`` rows of ``hidden``."""
+    if not _FUSED_ATTN_RES_ENABLED:
+        return _AttnResKernel.UNFUSED
+    if num_tokens <= _FUSED_ATTN_RES_MAX_TOKENS:
+        if _decode_attn_res_on_device(device_index):
+            from ..kernels.blackwell import kimi_k3_attn_res
+
+            if kimi_k3_attn_res.supports(num_tokens, hidden, num_candidates):
+                return _AttnResKernel.DECODE
+        if hidden == 7168 and num_candidates <= 12 and _per_token_attn_res_on_device(device_index):
+            return _AttnResKernel.PER_TOKEN
+    if _PERSISTENT_ATTN_RES_ENABLED and hidden == 7168 and 2 <= num_candidates <= 9:
+        return _AttnResKernel.PERSISTENT
+    return _AttnResKernel.UNFUSED
+
+
 def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResKernel:
     """The kernel of the attention-residual mix + RMSNorm of ``prefix_sum [M, H]`` over
     ``num_candidates`` (the snapshots and the prefix sum).
 
-    The decode kernel where it serves the shape (``kimi_k3_attn_res.supports``: up to 64
-    tokens), else the persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1`` and it serves the
-    shape, else unfused. This is the only place that decides it: the fused mixes and the MoE
-    layers' residual deferral (``_defers_moe_residual``) both ask here.
+    Up to ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` tokens (default 64) a per-token kernel: the CuTe
+    DSL decode kernel where it serves the shape (``kimi_k3_attn_res.supports``: up to 64 tokens,
+    on a device ``kimi_k3_attn_res.is_supported_device`` accepts), else the C++ per-token ops
+    (H == 7168, N <= 12). Otherwise the persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1``
+    and it serves the shape, else unfused. This is the only place that decides it: the fused
+    mixes and the MoE layers' residual deferral (``_defers_moe_residual``) both ask here.
     """
-    if (
-        not _FUSED_ATTN_RES_ENABLED
-        or prefix_sum.dtype is not torch.bfloat16
-        or not prefix_sum.is_cuda
-    ):
+    if prefix_sum.dtype is not torch.bfloat16 or not prefix_sum.is_cuda:
         return _AttnResKernel.UNFUSED
     num_tokens, hidden = prefix_sum.shape
-    if _decode_attn_res_on_device(prefix_sum.device.index):
-        from ..kernels.blackwell import kimi_k3_attn_res
-
-        if kimi_k3_attn_res.supports(num_tokens, hidden, num_candidates):
-            return _AttnResKernel.DECODE
-    if _PERSISTENT_ATTN_RES_ENABLED and hidden == 7168 and 2 <= num_candidates <= 9:
-        return _AttnResKernel.PERSISTENT
-    _note_attn_res_fusion("attn_res+norm/select", False, num_tokens, hidden, num_candidates)
-    return _AttnResKernel.UNFUSED
+    kernel = _select_attn_res_kernel(
+        num_tokens, hidden, num_candidates, prefix_sum.device.index or 0
+    )
+    if kernel is _AttnResKernel.UNFUSED and _FUSED_ATTN_RES_ENABLED:
+        _note_attn_res_fusion("attn_res+norm/select", False, num_tokens, hidden, num_candidates)
+    return kernel
 
 
 # Largest token count per trtllm::attn_res_fwd call (cpp/tensorrt_llm/thop/attnResOp.cpp).
@@ -490,14 +535,14 @@ def _apply_attn_res_fused(
 
     def run(prefix: torch.Tensor, block: torch.Tensor) -> torch.Tensor:
         T = prefix.shape[0]
-        output, _rsigma, _probs, _logits = attn_res_op(
+        mixed, _rsigma, _probs, _logits = attn_res_op(
             prefix.reshape(T, 1, H).contiguous(),
             block.reshape(K, T, 1, H).contiguous(),
             proj_weight,
             norm_weight,
             float(norm.eps),
         )
-        return output.reshape(T, H)
+        return mixed.reshape(T, H)
 
     if M <= _ATTN_RES_OP_MAX_TOKENS:
         return run(prefix_sum, block_residual)
@@ -535,14 +580,14 @@ def _defers_moe_residual(prefix_sum: torch.Tensor, num_candidates: int) -> bool:
 
 def _attn_res_decode_kernel(
     layer: torch.Tensor,
-    addends: Tuple[torch.Tensor, ...],
+    addends: tuple[torch.Tensor, ...],
     block_residual: torch.Tensor,
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
     mxfp8: bool = False,
     snapshots_after_wait: bool = False,
-) -> Optional[Tuple[Optional[torch.Tensor], ...]]:
+) -> tuple[torch.Tensor | None, ...] | None:
     """``(updated prefix sum or None, normed mix)`` from the decode attention-residual kernel
     (``kimi_k3_attn_res``: PDL prologue, cluster per token) where ``_attn_res_kernel`` picks it,
     else None.
@@ -557,8 +602,11 @@ def _attn_res_decode_kernel(
     if _attn_res_kernel(layer, num_candidates) is not _AttnResKernel.DECODE:
         return None
     M, H = layer.shape
-    # The kernel reads dense rows; these are no-ops for the decoder's tensors.
-    layer, block_residual = layer.contiguous(), block_residual.contiguous()
+    # The kernel reads dense rows. ``layer`` and the addends are read after its PDL wait, so a copy
+    # here is safe (and a no-op for the decoder's tensors). The weights and the snapshot bank are
+    # read before the wait, so they are passed as they are: a conversion copy would be the grid
+    # the kernel reads ahead of. The ops reject operands that are not contiguous BF16.
+    layer = layer.contiguous()
     addends = tuple(addend.contiguous() for addend in addends)
     weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
     _note_attn_res_fusion(f"attn_res+norm/decode/add{len(addends)}", True, M, H, num_candidates)
@@ -611,6 +659,37 @@ def _attn_res_persistent_kernel(
     return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
 
+def _attn_res_per_token_kernel(
+    prefix_sum: torch.Tensor,
+    addend: torch.Tensor | None,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """``(updated prefix sum or None, normed mix)`` from the C++ per-token attention-residual ops
+    (``trtllm::attn_res_rmsnorm_fwd``, with an ``addend`` ``attn_res_add_rmsnorm_fwd``)."""
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[0])
+    args = (
+        block_residual.reshape(K, M, 1, H).contiguous(),
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        output_norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
+    )
+    layer = prefix_sum.reshape(M, 1, H).contiguous()
+    if addend is None:
+        _note_attn_res_fusion("attn_res+norm/per_token", True, M, H, K + 1)
+        return None, torch.ops.trtllm.attn_res_rmsnorm_fwd(layer, *args).reshape(M, H)
+    updated_prefix_sum, normed = torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        layer, addend.reshape(M, 1, H).contiguous(), *args
+    )
+    _note_attn_res_fusion("add+attn_res+norm/per_token", True, M, H, K + 1)
+    return updated_prefix_sum.reshape(M, H), normed.reshape(M, H)
+
+
 def _note_attn_res_fusion(site: str, fused: bool, M: int, H: int, N: int) -> None:
     """Report whether the fused path was actually reached, once per shape.
 
@@ -648,6 +727,10 @@ def _apply_attn_res_rmsnorm_fused(
             output_norm,
             snapshots_after_wait=snapshots_after_wait,
         )[1]
+    if kernel is _AttnResKernel.PER_TOKEN:
+        return _attn_res_per_token_kernel(
+            prefix_sum, None, block_residual, proj, norm, output_norm
+        )[1]
     if kernel is _AttnResKernel.PERSISTENT:
         return _attn_res_persistent_kernel(
             prefix_sum, None, block_residual, proj, norm, output_norm
@@ -677,6 +760,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     if kernel is _AttnResKernel.DECODE:
         return _attn_res_decode_kernel(
             prefix_sum, (addend,), block_residual, proj, norm, output_norm
+        )
+    if kernel is _AttnResKernel.PER_TOKEN:
+        return _attn_res_per_token_kernel(
+            prefix_sum, addend, block_residual, proj, norm, output_norm
         )
     if kernel is _AttnResKernel.PERSISTENT:
         return _attn_res_persistent_kernel(
