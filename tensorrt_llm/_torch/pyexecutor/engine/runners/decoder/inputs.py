@@ -2930,16 +2930,14 @@ class DecoderInputPreparer:
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
             return inputs
-        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step. With
-        # RuntimeHooks.kv_lens_update_once, a step that corrects the KV lengths below (and then calls it again) calls
-        # it only there: the second call rewrites everything the first one writes, and nothing reads the metadata
-        # in between.
-        if attn_meta is not None:
-            if not (
-                self.runtime_hooks.kv_lens_update_once
-                and self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
-            ):
-                attn_meta.on_update_kv_lens()
+        # Overlap scheduling corrects kv_lens_cuda below from the runtime
+        # accepted-token counts and calls on_update_kv_lens() again after it.
+        has_kv_lens_correction = self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
+        # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
+        # With a correction, the call after it does this: every on_update_kv_lens rebuilds
+        # from the current lengths and nothing reads its outputs in between.
+        if attn_meta is not None and not has_kv_lens_correction:
+            attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -2982,7 +2980,7 @@ class DecoderInputPreparer:
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
 
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
+                if has_kv_lens_correction:
                     if fused_offsets:
                         pass
                     elif (

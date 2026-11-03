@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""RuntimeHooks.kv_lens_update_once: DecoderInputPreparer.preprocess_inputs re-derives the KV-length metadata once,
+"""DecoderInputPreparer.preprocess_inputs re-derives the KV-length metadata once,
 after the overlap scheduler's KV-length correction, on exactly the steps that correct it, and leaves the inputs as
 before."""
 
@@ -63,9 +63,8 @@ def test_corrected_step_updates_once_with_the_same_inputs(gen) -> None:
         )
         outs[once] = (md.seen, inputs["position_ids"].tolist(), md.kv_lens_cuda.tolist())
     corrected = [100 + i - 3 for i in range(gen)]
-    # Without the hook: once before the correction, once after it.
-    assert outs[False][0] == [[100 + i for i in range(gen)], corrected]
-    # With it: only the call after the correction, which sees the same lengths.
+    # The upstream path updates after correction for both legacy hook values.
+    assert outs[False][0] == [corrected]
     assert outs[True][0] == [corrected]
     assert outs[True][1:] == outs[False][1:]
 

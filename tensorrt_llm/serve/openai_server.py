@@ -31,7 +31,6 @@ from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
-from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -48,7 +47,8 @@ from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
-from tensorrt_llm.inputs.media_io import BaseMediaIO
+from tensorrt_llm.inputs.media_io import (BaseMediaIO,
+                                          log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -157,6 +157,7 @@ from .._utils import (AdjustedSteadyClock,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
+from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
@@ -181,7 +182,7 @@ def _is_visual_gen_instance(obj) -> bool:
 _msgpack_decoder = msgspec.msgpack.Decoder()
 
 
-class _MsgspecRequest(Request):
+class _MsgspecRequest(KvHintsRequest):
     """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
 
     async def json(self):
@@ -196,20 +197,13 @@ class _MsgspecRequest(Request):
                     raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
             else:
                 self._json_body = json.loads(body)
-        return self._json_body
+        return self.filter_kv_hints(self._json_body)
 
 
-class _MsgspecRoute(APIRoute):
-    """APIRoute that parses request bodies via :class:`_MsgspecRequest`."""
+class _MsgspecRoute(KvHintsRoute):
+    """Parse msgpack/JSON and apply hint trust policy before model validation."""
 
-    def get_route_handler(self):
-        original_route_handler = super().get_route_handler()
-
-        async def route_handler(request: Request):
-            return await original_route_handler(
-                _MsgspecRequest(request.scope, request.receive))
-
-        return route_handler
+    request_type = _MsgspecRequest
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -698,6 +692,7 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_media_load",
         )
         BaseMediaIO.set_executor(self._media_load_executor)
+        log_allowed_local_media_path()
         # /metrics reads iteration stats with a blocking call that waits up to
         # 2 s. A dedicated thread keeps those waits off the default executor,
         # which request handling also uses; get_iteration_stats runs at most
@@ -883,6 +878,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                                   cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
+                                                  "0") == "1"
         self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
@@ -1145,12 +1142,6 @@ class OpenAIServer(_VideoRoutesMixin):
             return False
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
-
-    @property
-    def _vocab_size(self) -> Optional[int]:
-        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
-            return self.tokenizer.tokenizer.vocab_size
-        return None
 
     @staticmethod
     def create_error_response(
@@ -2494,6 +2485,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
                 cache_salt=request.cache_salt,
+                kv_hints=request.kv_hints,
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
                 priority=request.priority
@@ -3133,6 +3125,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
                     trace_headers=trace_headers,
+                    kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
                     else DEFAULT_REQUEST_PRIORITY)
                 asyncio.create_task(
@@ -3303,6 +3296,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
                 trace_headers=trace_headers,
+                kv_hints=request.kv_hints,
                 priority=request.priority
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
@@ -3406,10 +3400,11 @@ class OpenAIServer(_VideoRoutesMixin):
                              "storage, which is disabled on this server."),
                 )
 
-            # Same reasoning for the web_search server tool. Dropping it lets
-            # the model answer from memory while the client believes a live
-            # search was folded in - a wrong answer it cannot detect. A 400
-            # is recoverable: drop the tool and retry.
+            # A web_search server tool this server cannot honour gets a 400
+            # only under TRTLLM_WEB_SEARCH_UNAVAILABLE=reject, for clients that
+            # drop the tool and retry rather than take an answer that may look
+            # searched. By default the request is served without the tool (see
+            # web_search_rejection_reason).
             web_search_error = web_search_rejection_reason(request.tools)
             if web_search_error is not None:
                 return self.create_error_response(
@@ -3523,6 +3518,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 streaming=request.stream,
                 disaggregated_params=disaggregated_params,
                 conversation_params=conversation_params,
+                kv_hints=request.kv_hints,
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
