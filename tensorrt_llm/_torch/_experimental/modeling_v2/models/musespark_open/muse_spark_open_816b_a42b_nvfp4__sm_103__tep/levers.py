@@ -398,7 +398,8 @@ def _hot_replicas(requires_decode: bool) -> RuleFn:
 LL_MAX_BATCH = 8
 
 
-#: The TP4 paths: on wherever served under ``auto``.
+#: The TP4 paths, some of which TEP8 serves too (``modeling._SM103_TEP8_MULTI_REQUEST_PATHS``):
+#: on wherever served under ``auto``.
 TEP4_PATHS = (
     "multi_request_prep_append",
     "multi_request_split_kv",
