@@ -216,7 +216,8 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     auto const privateLc = lifeCycle(1, "replay");
     auto const optional = lifeCycle(1, "draft");
 
-    // Lifecycles are registered in buffer order, after the attention layer's.
+    // The layer lifecycles first (attention, the REQUIRED SSM state, layer 3's layer-level PRIVATE),
+    // then the OPTIONAL one only an override creates; the PRIVATE overrides join layer 3's lifecycle.
     EXPECT_EQ(registry.size(), LifeCycleId{4});
     EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{4});
     EXPECT_EQ(required, LifeCycleId{1});
@@ -242,6 +243,83 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     EXPECT_NE(grouping[required], grouping[privateLc]);
     EXPECT_NE(grouping[required], grouping[optional]);
     EXPECT_NE(grouping[privateLc], grouping[optional]);
+}
+
+TEST(KvCacheManagerV2ConfigTest, BufferOverridesNumberTheirLifecyclesAfterLayerLifecycles)
+{
+    // Full attention, two SSM layers, windowed attention and a layer-level PRIVATE SSM layer, with no
+    // buffer overrides; then the same config with PRIVATE replay buffers on the first two SSM layers
+    // (a group no layer has on its own) and OPTIONAL ones on the second (a new group too), placed
+    // before the later layers' buffers.
+    auto const makeLayers = [](bool overrides)
+    {
+        auto config = makeTieredConfig();
+        config.commitMinSnapshot = true;
+        for (LayerId layerId = 1; layerId <= 2; ++layerId)
+        {
+            SsmLayerConfig ssm{.layerId = layerId, .buffers = {BufferConfig{.role = "state", .size = 4096}}};
+            if (overrides)
+            {
+                ssm.buffers.push_back(BufferConfig{.role = "old_x", .size = 2048, .reusePolicy = ReusePolicy::PRIVATE});
+                if (layerId == 2)
+                {
+                    ssm.buffers.push_back(
+                        BufferConfig{.role = "draft", .size = 2048, .reusePolicy = ReusePolicy::OPTIONAL});
+                }
+            }
+            // An override equal to the layer's policy is no override.
+            ssm.buffers.push_back(BufferConfig{.role = "conv", .size = 1024, .reusePolicy = ReusePolicy::REQUIRED});
+            config.layers.emplace_back(std::move(ssm));
+        }
+        config.layers.emplace_back(AttentionLayerConfig{.layerId = 3,
+            .buffers = {BufferConfig{.role = "key", .size = 4096}},
+            .slidingWindowSize = 8,
+            .reusePolicy = ReusePolicy::PRIVATE});
+        config.layers.emplace_back(SsmLayerConfig{.layerId = 4,
+            .buffers = {BufferConfig{.role = "state", .size = 4096}},
+            .reusePolicy = ReusePolicy::OPTIONAL});
+        return config;
+    };
+    auto const plain = makeLayers(false);
+    auto const split = makeLayers(true);
+    ASSERT_NO_THROW(plain.validate());
+    ASSERT_NO_THROW(split.validate());
+    LifeCycleRegistry const plainRegistry(plain);
+    LifeCycleRegistry const splitRegistry(split);
+
+    // Every lifecycle of the plain config keeps its id, and the override-only ones follow in buffer order.
+    std::vector<LifeCycle> const expected{AttnLifeCycle{}, SsmLifeCycle{ReusePolicy::REQUIRED},
+        AttnLifeCycle::make(8, std::nullopt, split.tokensPerBlock, ReusePolicy::PRIVATE),
+        SsmLifeCycle{ReusePolicy::OPTIONAL}, SsmLifeCycle{ReusePolicy::PRIVATE}};
+    ASSERT_EQ(plainRegistry.size(), LifeCycleId{4});
+    ASSERT_EQ(splitRegistry.size(), LifeCycleId{5});
+    for (LifeCycleId id{0}; id < splitRegistry.size(); ++id)
+    {
+        SCOPED_TRACE(id.value());
+        EXPECT_EQ(splitRegistry[id], expected.at(id.value()));
+        if (id < plainRegistry.size())
+        {
+            EXPECT_EQ(plainRegistry[id], splitRegistry[id]);
+        }
+    }
+    EXPECT_EQ(
+        splitRegistry.ssmLifeCycleIds(), (std::vector<LifeCycleId>{LifeCycleId{1}, LifeCycleId{3}, LifeCycleId{4}}));
+
+    // The storage config assigns the buffers the same ids, and the OPTIONAL draft buffer joins layer 4's group.
+    auto const plainStorage = createStorageConfig(plain);
+    auto const splitStorage = createStorageConfig(split);
+    for (auto const& [buffer, attr] : plainStorage.bufferAttributes())
+    {
+        SCOPED_TRACE(std::to_string(buffer.layerId) + "/" + buffer.role);
+        EXPECT_EQ(splitStorage.bufferAttributes().at(buffer).lifeCycleId, attr.lifeCycleId);
+    }
+    auto const lifeCycle = [&](LayerId layerId, DataRole const& role) {
+        return splitStorage.bufferAttributes().at(BufferId{layerId, role}).lifeCycleId;
+    };
+    EXPECT_EQ(lifeCycle(1, "old_x"), LifeCycleId{4});
+    EXPECT_EQ(lifeCycle(2, "old_x"), LifeCycleId{4});
+    EXPECT_EQ(lifeCycle(2, "draft"), LifeCycleId{3});
+    EXPECT_EQ(lifeCycle(1, "conv"), LifeCycleId{1});
 }
 
 TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesMustBePositive)
@@ -275,8 +353,8 @@ TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesGivesPrivateSsmLifecycleAFixedPo
     using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReservedSsmConfig;
     LifeCycleId const attention{0};
     LifeCycleId const requiredSsm{1};
-    LifeCycleId const privateSsm{2};
-    LifeCycleId const privateAttention{3};
+    LifeCycleId const privateAttention{2};
+    LifeCycleId const privateSsm{3};
 
     // Without the bound the PRIVATE SSM and PRIVATE attention lifecycles share a pool group of equal slots.
     auto const elastic = createStorageConfig(makeReservedSsmConfig(32 << 20, std::nullopt));

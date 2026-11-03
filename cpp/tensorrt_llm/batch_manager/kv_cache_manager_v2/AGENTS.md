@@ -104,6 +104,12 @@ lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
 (`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
 These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
 `LayerGroupId` remains a lifecycle alias for legacy APIs.
+Lifecycle ids follow registration order in two passes over layers and their
+buffers: first buffers on their layer's policy (no override, or an override
+equal to it), then buffers whose override differs. A lifecycle that only a
+buffer override creates (for example a PRIVATE replay group of REQUIRED SSM
+layers) is numbered after every layer lifecycle, so adding it never renumbers
+the existing groups.
 The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
 documentation only: uniform layers retain their results, while a split layer
 fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,

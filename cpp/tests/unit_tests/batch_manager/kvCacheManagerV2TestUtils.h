@@ -85,10 +85,10 @@ inline KVCacheManagerConfig makeHybridTieredConfig()
 //! REQUIRED full attention (layer 0), two SSM layers whose 2 KiB old_x replay buffers are PRIVATE
 //! (layers 1-2), and PRIVATE windowed attention (layer 3) on a GPU tier of `gpuQuota` bytes.
 //!
-//! Layer groups are registered in buffer order: 0 is the attention layer, 1 the REQUIRED SSM state, 2
-//! the PRIVATE SSM replay buffers and 3 the PRIVATE attention layer. The PRIVATE SSM slot (two 2 KiB
-//! buffers) is as large as the PRIVATE attention slot, so both share one pool group unless
-//! maxLiveKvCaches gives the PRIVATE SSM group a fixed capacity.
+//! Layer lifecycles are numbered before the ones only buffer overrides create: 0 is the attention
+//! layer, 1 the REQUIRED SSM state, 2 the PRIVATE attention layer and 3 the PRIVATE SSM replay buffers.
+//! The PRIVATE SSM slot (two 2 KiB buffers) is as large as the PRIVATE attention slot, so both share one
+//! pool group unless maxLiveKvCaches gives the PRIVATE SSM group a fixed capacity.
 inline KVCacheManagerConfig makeReservedSsmConfig(size_t gpuQuota, std::optional<int> maxLiveKvCaches)
 {
     KVCacheManagerConfig config;

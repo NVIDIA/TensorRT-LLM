@@ -8738,6 +8738,37 @@ def test_v2_gdn_replay_history_uses_private_kvcm_buffers(manager_cls):
         mgr.shutdown()
 
 
+@skip_no_cuda
+@_GDN_MANAGERS
+def test_v2_gdn_private_replay_group_follows_the_layer_groups(manager_cls):
+    """The PRIVATE replay buffers override their REQUIRED GDN layers' policy, and the group only they create is
+    numbered after the layers' own groups, although the GDN layers come before the attention layer. The recurrent and
+    attention groups keep the ids they have without replay, so the pool ids of the layers' KV addressing
+    (``kv_cache_pool_mapping``, the attention metadata's ``host_kv_cache_pool_mapping``) stay {0, 1}: the Qwen4Exp
+    target certifies thop_attention over those two pools only."""
+    plain = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2, conv_state_layout="q_k_v", model_manager_cls=manager_cls
+    )
+    try:
+        assert plain.replay_layer_group_id is None
+        plain_groups = (
+            int(plain.impl.get_buffer_group_id(LayerId(0), MambaRole.SSM_STATE)),
+            int(plain.impl.get_layer_group_id(LayerId(2))),
+        )
+        plain_pools = plain.kv_cache_pool_mapping[:, 0].tolist()
+    finally:
+        plain.shutdown()
+    mgr = _build_v2_gdn_replay_manager(manager_cls)
+    try:
+        assert mgr.replay_layer_group_id is not None
+        groups = (mgr.ssm_layer_group_id, int(mgr.impl.get_layer_group_id(LayerId(2))))
+        assert groups == plain_groups == (0, 1)
+        assert mgr.replay_layer_group_id == 2
+        assert mgr.kv_cache_pool_mapping[:, 0].tolist() == plain_pools == [0, 0, 1]
+    finally:
+        mgr.shutdown()
+
+
 @_GDN_MANAGERS
 @pytest.mark.parametrize("flashinfer_ring", [False, True], ids=["triton", "ring"])
 def test_gdn_replay_cache_estimate_matches_declared_buffers(

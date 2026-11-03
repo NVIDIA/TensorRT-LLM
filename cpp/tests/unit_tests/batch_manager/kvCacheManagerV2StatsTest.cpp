@@ -786,8 +786,8 @@ TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityTakesItsSlotsBeforeRatioSizing)
         elastic->shutdown();
 
         auto manager = std::make_shared<KvCacheManager>(makeReservedSsmConfig(quota, 8));
-        EXPECT_EQ(manager->getBufferGroupId(1, "old_x"), LifeCycleId{2});
-        EXPECT_EQ(hotPoolGroups(*manager), (std::vector<int>{0, 1, 3, 2}));
+        EXPECT_EQ(manager->getBufferGroupId(1, "old_x"), LifeCycleId{3});
+        EXPECT_EQ(hotPoolGroups(*manager), (std::vector<int>{0, 1, 2, 3}));
         auto const slots = hotSlotCounts(*manager);
         ASSERT_EQ(slots.size(), 4U);
         // ceil(8 / 0.97) slots at every quota; the other groups split the rest of it.
@@ -812,7 +812,7 @@ TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityTakesItsSlotsBeforeRatioSizing)
         SCOPED_TRACE(privateSsmWeight);
         auto config = makeReservedSsmConfig(32 << 20, 8);
         float const otherWeight = (1.0F - privateSsmWeight) / 3.0F;
-        config.initialPoolRatio = std::vector<float>{otherWeight, otherWeight, privateSsmWeight, otherWeight};
+        config.initialPoolRatio = std::vector<float>{otherWeight, otherWeight, otherWeight, privateSsmWeight};
         auto manager = std::make_shared<KvCacheManager>(config);
         auto const slots = hotSlotCounts(*manager);
         EXPECT_EQ(slots.at(3), 9);
@@ -832,7 +832,7 @@ TEST_F(ReplayCacheTest, TunerLeavesFixedPrivateSsmCapacityAlone)
     config.poolRebalance.cooldownSecs = 0.0;
     config.poolRebalance.targetRatioUpdateInterval = 1;
     auto manager = std::make_shared<KvCacheManager>(config);
-    EXPECT_EQ(manager->storage().getPoolGroupIndex(kHotLevel, LifeCycleId{2}), PoolGroupIndex{3});
+    EXPECT_EQ(manager->storage().getPoolGroupIndex(kHotLevel, LifeCycleId{3}), PoolGroupIndex{3});
     auto const before = hotSlotCounts(*manager);
     auto sampleCaches = [&](int count)
     {

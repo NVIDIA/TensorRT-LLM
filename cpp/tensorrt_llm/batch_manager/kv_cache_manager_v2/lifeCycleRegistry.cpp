@@ -67,9 +67,22 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
     for (auto const& layer : config.layers)
     {
         std::visit([](auto const& cfg) { cfg.validate(); }, layer);
-        for (auto const& buffer : layerBuffers(layer))
+    }
+    // Buffers on their layer's policy first, then buffers whose override differs from it, each pass
+    // in layer and buffer order: a lifecycle only an override creates is numbered after every layer
+    // lifecycle, so adding one never renumbers the groups the config has without it.
+    for (bool const overridden : {false, true})
+    {
+        for (auto const& layer : config.layers)
         {
-            registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
+            auto const layerPolicy = std::visit([](auto const& cfg) { return cfg.reusePolicy; }, layer);
+            for (auto const& buffer : layerBuffers(layer))
+            {
+                if ((buffer.effectiveReusePolicy(layerPolicy) != layerPolicy) == overridden)
+                {
+                    registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
+                }
+            }
         }
     }
     check();
