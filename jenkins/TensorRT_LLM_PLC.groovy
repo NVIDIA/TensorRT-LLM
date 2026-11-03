@@ -736,6 +736,7 @@ pipeline {
         booleanParam(name: 'runContainerOssScanning', defaultValue: true, description: 'Run Container OSS Scanning (Pulse container scan)')
         booleanParam(name: 'runContainerMalwareScanning', defaultValue: false, description: 'Run Container Malware Scanning (Pulse container scan)')
         booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
+        string(name: 'slack_thread_id', defaultValue: '', description: 'Optional: Slack thread to reply in via the Cora bot; when empty the message goes to the swdl-trtllm-plc channel')
     }
     options {
         skipDefaultCheckout()
@@ -830,11 +831,13 @@ pipeline {
                         echo detectedLicensesTable
                     }
                     currentBuild.description = "⚠️ Manual approval required — click 'Console Output' to review licenses, then approve or abort"
-                    withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-                        def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
-                        writeJSON file: '/tmp/slack_payload.json', json: [report: slackReport, dashboardUrl: manualReviewUrl]
-                        sh "curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/slack_payload.json \$PLC_SLACK_WEBHOOK"
-                    }
+                    def slackReport = "New licenses detected in release mode (${params.ref} branch). Manual approval required before release."
+                    slackSend(
+                        channel: params.slack_thread_id?.trim() ?: 'swdl-trtllm-plc',
+                        tokenCredentialId: 'CORA_SLACK_BOT_TOKEN',
+                        botUser: true,
+                        message: "${slackReport}\n<${manualReviewUrl}|Review licenses>",
+                    )
                     timeout(time: 96, unit: 'HOURS') {
                         input(
                             message: "New licenses detected in release mode. Please review the licenses listed above and confirm they are all approved for release.",
