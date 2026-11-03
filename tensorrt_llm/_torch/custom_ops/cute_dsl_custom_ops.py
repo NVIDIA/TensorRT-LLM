@@ -5677,6 +5677,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # addends are BF16 ``[M, H]``, ``block`` BF16 ``[N - 1, M, H]``, the
     # weights BF16 ``[H]``; inputs as ``kimi_k3_attn_res.can_run`` accepts.
 
+    def _check_kimi_k3_attn_res_inputs(layer: torch.Tensor,
+                                       addends: Tuple[torch.Tensor,
+                                                      ...], block: torch.Tensor,
+                                       *weights: torch.Tensor) -> None:
+        # Host-side checks only: the kernel does not validate its operands.
+        if not kimi_k3_attn_res.can_run(layer, addends, block, *weights):
+            raise ValueError("kimi_k3_attn_res: unsupported inputs (layer "
+                             f"{tuple(layer.shape)} {layer.dtype}, block "
+                             f"{tuple(block.shape)}, addends "
+                             f"{[tuple(a.shape) for a in addends]}); see "
+                             "kimi_k3_attn_res.can_run")
+
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_rmsnorm",
                              mutates_args=(),
                              device_types="cuda")
@@ -5686,6 +5698,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  out_weight: torch.Tensor, rms_eps: float,
                                  out_eps: float) -> torch.Tensor:
         """Attention-residual mix of ``block`` and ``layer``, then RMSNorm."""
+        _check_kimi_k3_attn_res_inputs(layer, (), block, res_weight, rms_weight,
+                                       out_weight)
         output = torch.empty_like(layer)
         kimi_k3_attn_res.run_attn_res(layer, (), block, res_weight, rms_weight,
                                       out_weight, rms_eps, out_eps, output,
@@ -5706,6 +5720,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(bf16(prefix + addend), output)``: the residual add, then the mix
         and RMSNorm on the updated prefix sum."""
+        _check_kimi_k3_attn_res_inputs(prefix, (addend, ), block, res_weight,
+                                       rms_weight, out_weight)
         output = torch.empty_like(prefix)
         updated = torch.empty_like(prefix)
         kimi_k3_attn_res.run_attn_res(prefix, (addend, ), block, res_weight,
@@ -5729,6 +5745,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """``(prefix, output)`` with ``prefix = bf16(residual + bf16(routed +
         shared))``, a MoE layer's residual update, then the mix and RMSNorm on
         ``prefix``."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
         output = torch.empty_like(residual)
         prefix = torch.empty_like(residual)
         kimi_k3_attn_res.run_attn_res(residual, (routed, shared), block,
@@ -5761,6 +5779,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         xs)`` of its output: E4M3 ``[M, H]`` and UE8M0 1x32 scales in the
         R128c4 layout, the bits the FP8 low-M GEMM's in-kernel quantization
         makes of the output."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
         output = torch.empty_like(residual)
         prefix = torch.empty_like(residual)
         xq, xs = _kimi_k3_attn_res_mxfp8_outputs(residual)
