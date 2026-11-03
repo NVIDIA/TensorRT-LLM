@@ -995,13 +995,14 @@ class TestFingerprint:
         assert not fingerprints_match(incomplete, incomplete)
 
     def test_an_extension_revision_changes_the_digest(self, tokenizer) -> None:
-        class NewRevision(SimpleExtension):
-            render_version = 2
+        # One extension class at two revisions, so that only render_version differs.
+        def fingerprint(render_version):
+            extension = SimpleExtension()
+            extension.render_version = render_version
+            return compute_fingerprint(resources(tokenizer, extension=extension))
 
-        old = compute_fingerprint(resources(tokenizer, extension=SimpleExtension()))
-        new = compute_fingerprint(resources(tokenizer, extension=NewRevision()))
-
-        assert not fingerprints_match(old, new)
+        assert fingerprints_match(fingerprint(1), fingerprint(1))
+        assert not fingerprints_match(fingerprint(1), fingerprint(2))
 
     def test_the_same_checkpoint_at_two_locations_has_one_fingerprint(self, tmp_path) -> None:
         # The standalone renderer and the worker typically see the same files at different
