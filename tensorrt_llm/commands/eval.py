@@ -25,8 +25,7 @@ from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
                         GPQAExtended, GPQAMain, GPQANemoSkills, GSM8KInferenceX,
                         IFBench, ImageGenerationEval, JsonModeEval, LongBenchV1,
-                        LongBenchV2, MMMUPro, SciCode)
-from ..evaluate.visual_gen.video_generation_eval import VideoGenerationEval
+                        LongBenchV2, MMMUPro, SciCode, VideoGenerationEval)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_dict
