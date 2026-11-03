@@ -358,10 +358,11 @@ def test_dspark_native_verify_acceptance_and_rollover(heads: int, tokens: int) -
     # The next round must ignore the rejected suffix and start from the
     # accepted Conv window/history, including the freshly repacked row.
     scalar_pool, scalar_conv = pool.clone(), fused["conv_state"].clone()
+    # The ordinary one-token kernel consumes fixed-capacity, 16-row histories.
     scalar_history = ops.ReplayHistory(
-        history.k.clone(),
-        history.u.clone(),
-        history.g.clone(),
+        history.k[:, :, : ops.HISTORY_SIZE].contiguous(),
+        history.u[:, :, : ops.HISTORY_SIZE].contiguous(),
+        history.g[:, :, : ops.HISTORY_SIZE].contiguous(),
         history.length.clone(),
         history.slot_map,
     )

@@ -369,7 +369,7 @@ def verify(
     and the dummy mask have B entries. Only the sampler's accepted prefix
     may subsequently advance Conv, history lengths, or the packed state.
     """
-    from ...custom_ops.cute_dsl_kda_2fp4_replay import fused_replay
+    from ...custom_ops.cute_dsl_kda_2fp4_mtp_replay import fused_replay
 
     _validate_checkpoint(pool)
     batch, heads = slots.numel(), pool.shape[1]
