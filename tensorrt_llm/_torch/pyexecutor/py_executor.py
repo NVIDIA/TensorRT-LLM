@@ -8591,6 +8591,16 @@ class PyExecutor:
                 ctx_draft_tokens = [0
                                     ] * self.model_engine.max_total_draft_tokens
             req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+            if req.py_draft_tokens and not any(req.py_draft_tokens):
+                # Placeholder drafts (zeros: the context server sent none, or
+                # its drafter returned zeros for the context step) have no
+                # draft-probability row on this side. With rejection sampling,
+                # the first verify step would read an unwritten row and could
+                # accept token 0, so use the one-hot row, as for a generation
+                # request that enters without drafts.
+                req.py_needs_onehot_draft_probs |= getattr(
+                    self.model_engine.spec_config, "use_rejection_sampling",
+                    False)
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
                     req, beam_width, first_gen_tokens):
