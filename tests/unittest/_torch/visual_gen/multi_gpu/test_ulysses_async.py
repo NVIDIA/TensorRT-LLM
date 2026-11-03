@@ -22,6 +22,7 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -219,6 +220,98 @@ def _run(world_size: int, test_fn: Callable):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
     run_distributed(world_size, test_fn, preload=("tensorrt_llm",))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "batch_size,layout_name,expect_fused_copy",
+    [(1, "NHD", False), (2, "NHD", True), (1, "HND", True)],
+)
+def test_async_post_unscatter_avoids_redundant_copy(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    layout_name: str,
+    expect_fused_copy: bool,
+) -> None:
+    from tensorrt_llm._torch.visual_gen.attention.backends import parallel
+
+    world_size = 2
+    local_sequence_length = 3
+    local_heads = 2
+    head_dim = 8
+    receive_shape = (world_size, batch_size, local_sequence_length, local_heads, head_dim)
+    element_count = world_size * batch_size * local_sequence_length * local_heads * head_dim
+    base = torch.arange(element_count, dtype=torch.float32).reshape(receive_shape)
+    receive_buffers = tuple((base + offset).to(torch.bfloat16) for offset in (0, 1, 2))
+    local_inputs = tuple(torch.empty(0) for _ in range(3))
+    receive_by_input = {
+        id(local_input): receive_buffer
+        for local_input, receive_buffer in zip(local_inputs, receive_buffers)
+    }
+    layout = (
+        parallel.AttentionTensorLayout.NHD
+        if layout_name == "NHD"
+        else parallel.AttentionTensorLayout.HND
+    )
+    fused_calls = []
+    recorded = {}
+
+    def reference_layout(receive_buffer: torch.Tensor, is_hnd: bool) -> torch.Tensor:
+        output = receive_buffer.permute(1, 0, 2, 3, 4).reshape(
+            batch_size, world_size * local_sequence_length, local_heads, head_dim
+        )
+        return output.transpose(1, 2).contiguous() if is_hnd else output
+
+    def fused_post_unscatter(
+        query_receive: torch.Tensor,
+        key_receive: torch.Tensor,
+        value_receive: torch.Tensor,
+        *,
+        is_hnd: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused_calls.append(True)
+        return (
+            reference_layout(query_receive, is_hnd),
+            reference_layout(key_receive, is_hnd),
+            reference_layout(value_receive, is_hnd),
+        )
+
+    def record_backend(**forward_kwargs: object) -> torch.Tensor:
+        recorded.update(forward_kwargs)
+        query = forward_kwargs["q"]
+        key = forward_kwargs["k"]
+        value = forward_kwargs["v"]
+        assert isinstance(query, torch.Tensor)
+        assert isinstance(key, torch.Tensor)
+        assert isinstance(value, torch.Tensor)
+        return query + key + value
+
+    monkeypatch.setattr(parallel, "_ulysses_post_unscatter", fused_post_unscatter)
+    attention = SimpleNamespace(
+        world_size=world_size,
+        inner_backend=SimpleNamespace(preferred_layout=layout, forward=record_backend),
+        _issue_async=lambda local_input: receive_by_input[id(local_input)],
+        _join_async=lambda: None,
+        _output_a2a=lambda output, batch_argument, sequence_argument: output,
+    )
+    output = parallel.UlyssesAttention.forward_async(
+        attention,
+        lambda: local_inputs[0],
+        lambda: local_inputs[1],
+        lambda: local_inputs[2],
+    )
+    is_hnd = layout == parallel.AttentionTensorLayout.HND
+    expected = tuple(reference_layout(receive_buffer, is_hnd) for receive_buffer in receive_buffers)
+    assert torch.equal(output, expected[0] + expected[1] + expected[2])
+    assert bool(fused_calls) == expect_fused_copy
+    assert recorded["batch_size"] == batch_size
+    assert recorded["seq_len"] == world_size * local_sequence_length
+    assert recorded["seq_len_kv"] == world_size * local_sequence_length
+    if not expect_fused_copy:
+        for argument_name, receive_buffer in zip(("q", "k", "v"), receive_buffers):
+            tensor = recorded[argument_name]
+            assert isinstance(tensor, torch.Tensor)
+            assert tensor.data_ptr() == receive_buffer.data_ptr()
 
 
 def test_slot_ring_wraparound():

@@ -825,7 +825,14 @@ class UlyssesAttention(AttentionBackend):
         # only instantiated for __nv_bfloat16.
         _, B_q, Sp_q, HpP_q, D_q = q_5d.shape
         is_hnd = self.inner_backend.preferred_layout == AttentionTensorLayout.HND
-        use_fused_post_unscatter = self.world_size > 1 and q_5d.dtype == torch.bfloat16
+        post_unscatter_is_view = (
+            not is_hnd
+            and B_q == 1
+            and all(receive_buffer.is_contiguous() for receive_buffer in (q_5d, k_5d, v_5d))
+        )
+        use_fused_post_unscatter = (
+            self.world_size > 1 and q_5d.dtype == torch.bfloat16 and not post_unscatter_is_view
+        )
         if use_fused_post_unscatter:
             q_out, k_out, v_out = _ulysses_post_unscatter(q_5d, k_5d, v_5d, is_hnd=is_hnd)
             B = B_q
