@@ -47,7 +47,12 @@ from tensorrt_llm._torch.utils import (
     relu2,
 )
 
-from ..activation import DEFAULT_MOE_ACTIVATION, MoEActivation, MoEActivationSupport
+from ..activation import (
+    DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
+    MoEActivation,
+    MoEActivationSupport,
+)
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import MoERunContext, identity_quant_of
 from ..quantization import MoEWeightLoadingMode, NVFP4MarlinFusedMoEMethod
@@ -129,11 +134,20 @@ class MarlinFusedMoEBase(MoEImplBase):
     capabilities = MARLIN_CAPABILITIES
     input_requirement = MARLIN_INPUT_REQUIREMENT
 
-    # The Marlin epilogue takes no activation constants, and
-    # ``_apply_activation`` only distinguishes these three -- any other gated
-    # kind would silently run SiLU, any other non-gated kind ReLU.
+    # The Marlin epilogue is ``_apply_activation``. It only distinguishes these
+    # four -- any other gated kind would silently run SiLU, any other non-gated
+    # kind ReLU -- and only SwigluBias reads the constants (see eligibility.py).
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Relu2})
+        kinds=frozenset(
+            {
+                ActivationType.Swiglu,
+                ActivationType.SwigluBias,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+            }
+        ),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
     )
 
     def __init__(
@@ -236,6 +250,14 @@ class MarlinFusedMoEBase(MoEImplBase):
         [tokens, intermediate_size] otherwise.
         """
         inter_size = self.intermediate_size_per_partition
+        if self.activation_type == ActivationType.SwigluBias:
+            # The CUTLASS loader packs FC1 as [w3; w1]: up first, gate second.
+            up = gemm1_out[:, :inter_size]
+            gate = gemm1_out[:, inter_size : 2 * inter_size]
+            if self.act_clamp is not None:
+                gate = gate.clamp(max=self.act_clamp)
+                up = up.clamp(min=-self.act_clamp, max=self.act_clamp)
+            return gate * torch.sigmoid(gate * self.act_alpha) * (up + self.act_beta)
         if is_gated_activation(self.activation_type):
             gate = gemm1_out[:, :inter_size]
             up = gemm1_out[:, inter_size : 2 * inter_size]
