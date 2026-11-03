@@ -568,7 +568,7 @@ def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
     )
 
     with with_multi_stream(True):
-        runtime.forward_parts(torch.ones(num_tokens, 4))
+        runtime(torch.ones(num_tokens, 4), return_parts=True)
     join = calls.index(("shared_done_wait", "main"))
     assert calls.index(("shared", "aux")) < calls.index(("shared_done_record", "aux"))
     if num_tokens == 2:
