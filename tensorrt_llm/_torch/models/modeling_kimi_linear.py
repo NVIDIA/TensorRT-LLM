@@ -1244,6 +1244,12 @@ def _low_m_gemm_push_applies(num_rows: int, out_features: int, in_features: int)
     return fp8_block_scale_low_m_gemm.all_reduce_push_applies(num_rows, out_features, in_features)
 
 
+def _low_m_gemm_push_max_m(out_features: int, in_features: int) -> int:
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+    return fp8_block_scale_low_m_gemm.all_reduce_push_max_m_for(out_features, in_features)
+
+
 def _low_m_gemm_scale_from_mxfp8(weight_scale: torch.Tensor, n: int, k: int) -> torch.Tensor:
     """The DeepGEMM-packed scale the low-M GEMM reads, from the SM107 CuTe MXFP8 scale."""
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
@@ -1282,6 +1288,9 @@ class _Fp8BlockScaleWeightReadLinear(
     # See ``set_output_rows`` (stand-ins built without ``__init__`` have none).
     _output_rows: Optional[Tuple[int, int]] = None
     _output_rows_operands: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    # Largest row count :meth:`forward` pushes into ``output_all_reduce`` from the low-M GEMM
+    # (``all_reduce_push_max_m_for``, at least the GEMM's range; 0: never); set at post-load.
+    _push_max_m: int = 0
 
     def __init__(
         self,
@@ -1307,6 +1316,7 @@ class _Fp8BlockScaleWeightReadLinear(
         self._low_m_weight_scale: Optional[torch.Tensor] = None
         # Largest row count :meth:`forward_nvfp4` serves (0: never); set at post-load.
         self._nvfp4_out_max_m = 0
+        self._push_max_m = 0
         self._output_all_reduce = output_all_reduce
         self._in_place_max_rows = in_place_max_rows
         # ``(first row, rows)`` of the weight :meth:`forward_rows_prequantized` projects onto, and
@@ -1456,6 +1466,11 @@ class _Fp8BlockScaleWeightReadLinear(
         else:
             self._low_m, self._low_m_weight_scale = Fp8BlockScaleLowMGemmRange(), None
         self._nvfp4_out_max_m = _low_m_gemm_nvfp4_max_m(n, k) if self._low_m.max_m else 0
+        self._push_max_m = (
+            _low_m_gemm_push_max_m(n, k)
+            if self._low_m.max_m and self._output_all_reduce is not None
+            else 0
+        )
         self._output_rows_operands = None
         if self._output_rows is not None and self._low_m.max_m:
             c0, rows = self._output_rows
@@ -1529,7 +1544,13 @@ class _Fp8BlockScaleWeightReadLinear(
         if self._output_all_reduce is None:
             return None
         num_rows = x_flat.shape[0]
-        if not self._low_m.serves(x_flat) or not _low_m_gemm_push_applies(
+        # Above the GEMM's range where its push beats the default GEMM + all-reduce.
+        serves = self._low_m.serves(x_flat) or (
+            1 <= num_rows <= self._push_max_m
+            and x_flat.dtype == torch.bfloat16
+            and x_flat.is_contiguous()
+        )
+        if not serves or not _low_m_gemm_push_applies(
             num_rows, self.out_features, self.in_features
         ):
             return None

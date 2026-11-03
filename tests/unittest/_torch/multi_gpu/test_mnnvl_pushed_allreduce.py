@@ -108,8 +108,21 @@ def _left_pending(m, h, k, world, in_place_max_rows):
     attention: where its GEMM pushes, up to ``in_place_max_rows`` rows (either transport)."""
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
-    pushes = m <= low_m.max_m_for(h, k) and low_m.all_reduce_push_applies(m, h, k)
-    return pushes and m <= in_place_max_rows
+    return low_m.all_reduce_push_applies(m, h, k) and m <= in_place_max_rows
+
+
+def _projection(plain, x, gate=None):
+    """``plain`` (no all-reduce) on ``x`` (``* gate``) as the pushing o_proj computes it: above
+    the GEMM's range where its push is selected (``all_reduce_push_max_m_for``), the mid-M GEMM
+    instead of the default GEMM."""
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
+
+    m, (n, k) = x.shape[0], plain.weight.shape
+    if low_m.max_m_for(n, k) < m and low_m.all_reduce_push_applies(m, n, k):
+        y = torch.empty(m, n, device=x.device, dtype=torch.bfloat16)
+        rows = x if gate is None else x * gate
+        return low_m.run_low_m_gemm(rows, plain.weight, plain._low_m_weight_scale, y)
+    return plain(x) if gate is None else plain.forward_gated(x, gate)
 
 
 def _scale_rows(xs, m, h):
@@ -225,7 +238,7 @@ def _run_rank(world_size):
         # all-reduce.
         for n, k in ((7168, 768), (7168, 1536)):
             w, w_scale = _gemm_weight(n, k, 11 + rank)
-            for m in (1, 7, 14, 32, 64, 65, 96, 128, 200):
+            for m in (1, 7, 14, 32, 64, 65, 96, 120, 128, 144, 192, 200):
                 if not low_m.all_reduce_push_applies(m, n, k):
                     continue
                 x = _input(m, k, 5 * m, rank)
@@ -338,7 +351,7 @@ def _run_rank_o_proj(world_size):
                     w, w_scale, hidden, allreduce, in_place_max_rows
                 )
                 o_proj.post_load_weights()
-                for m in (1, 8, 14, 32, 64, 65, 96, 128, 200):
+                for m in (1, 8, 14, 32, 64, 65, 96, 120, 128, 192, 200):
                     x = _input(m, k, 9 * m, rank)
                     gate = _input(m, k, 13 * m, rank)
                     prefix = torch.randn(m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
@@ -346,7 +359,7 @@ def _run_rank_o_proj(world_size):
                         torch.bfloat16
                     )
                     for g in (None, gate):
-                        ref_out = allreduce(plain(x) if g is None else plain.forward_gated(x, g))
+                        ref_out = allreduce(_projection(plain, x, g))
                         ref = kimi._apply_attn_res_add_and_rmsnorm(
                             prefix, ref_out, block, proj, norm, out_norm
                         )

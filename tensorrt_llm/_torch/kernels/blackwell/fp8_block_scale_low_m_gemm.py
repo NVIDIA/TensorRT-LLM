@@ -89,7 +89,8 @@ activation ring) and pushed in 16-byte vectors. The push variant releases its de
 finish kernel, which reads the workspace's rotation state as soon as it is resident) from the
 activation producer right after its ``griddepcontrol.wait`` instead of from the weight producer
 at kernel start, so every earlier grid, the previous all-reduce on the workspace included, has
-completed by then.
+completed by then. Callers that all-reduce the output select the push up to
+:func:`all_reduce_push_max_m_for`, which a measured shape may raise above :func:`max_m_for`.
 
 Both kernels launch one non-persistent grid (``N/128`` weight tiles x ``split_k`` cluster
 ranks). Selection is deterministic, so every variant runs the plain GEMM's tactic: tactics
@@ -3339,6 +3340,10 @@ class _ShapeTables:
     #: (``None``: that kernel's default tactic; see :func:`nvfp4_out_tactic`). None for other
     #: shapes. Independent of ``max_m``, which limits the BF16 GEMM.
     nvfp4_out_route: dict = dataclasses.field(default_factory=dict)
+    #: (N, K) -> largest M for which a caller that all-reduces the output selects this GEMM with
+    #: its all-reduce push epilogue (:func:`all_reduce_push_max_m_for`), where that pair beats the
+    #: default GEMM followed by the all-reduce above ``max_m``; ``max_m`` for other shapes.
+    push_max_m: dict = dataclasses.field(default_factory=dict)
 
 
 # SM100 / SM103, tuned on GB300 for the Kimi-K3 decode projections (CUDA graph, weights not
@@ -3618,6 +3623,11 @@ _SM107_TABLES = _ShapeTables(
     nvfp4_out_route={
         (3584, 7168): ((1, 16, "low", 3), (17, 96, "mid", 4), (97, 256, "mid", None)),
     },
+    # o_proj + MNNVL all-reduce on 4 Rubin ranks, default GEMM + copy push + finish against the
+    # mid-M push + finish: 15.97 / 13.06 us at 120 rows, 16.49 / 14.74 at 144, 18.24 / 17.77 at 192.
+    push_max_m={
+        (7168, 1536): 192,
+    },
 )
 
 #: Minimum weight-ring depth the rule keeps when growing the activation ring.
@@ -3689,6 +3699,16 @@ def low_m_max_for(n: int, k: int) -> int:
         return cutover
     k_tiles = _ceil_div(k // CTA_K, _rule_split(n, k, mid=False))
     return LOW_M_MAX if k_tiles <= _LOW_M_FULL_RANGE_K_TILES else 32
+
+
+def all_reduce_push_max_m_for(n: int, k: int) -> int:
+    """Largest M for which a caller whose output goes into an MNNVL all-reduce selects
+    :func:`run_low_m_gemm_all_reduce_push` for an ``[N, K]`` weight on the current device: at
+    least :func:`max_m_for` (0 where that is 0)."""
+    max_m = max_m_for(n, k)
+    if not max_m:
+        return 0
+    return min(MAX_M, max(max_m, _tables().push_max_m.get((_tile_n(n), k), 0)))
 
 
 def kernel_max_m_for(n: int, k: int) -> int:
@@ -4406,13 +4426,13 @@ def _compiled_mid_push_kernel(
 
 def all_reduce_push_applies(m: int, n: int, k: int, gated: bool = False) -> bool:
     """Whether :func:`run_low_m_gemm_all_reduce_push` serves ``M`` rows of an ``[N, K]`` weight:
-    where :func:`run_low_m_gemm` is selected for the weight. In the low-M kernel's range with
-    its default tactic (split-K owners stage their rows in the quantized activation ring, see
-    :func:`push_stages_fit`); above it (not ``gated``) the mid-M kernel, which stages its rows
-    in its activation ring."""
+    where it is selected for the weight (:func:`all_reduce_push_max_m_for`). In the low-M
+    kernel's range with its default tactic (split-K owners stage their rows in the quantized
+    activation ring, see :func:`push_stages_fit`); above it (not ``gated``) the mid-M kernel,
+    which stages its rows in its activation ring."""
     if 1 <= m <= kernel_max_m_for(n, k):
         return push_stages_fit(n, k, default_tactic(m, n, k))
-    return not gated and low_m_max_for(n, k) < m <= max_m_for(n, k)
+    return not gated and low_m_max_for(n, k) < m <= all_reduce_push_max_m_for(n, k)
 
 
 def run_low_m_gemm_all_reduce_push(

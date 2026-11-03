@@ -435,6 +435,22 @@ def test_selection_rule():
         mod.validate_mid_tactic(n, k, mod.default_mid_tactic(128, n, k))
 
 
+def test_all_reduce_push_selection():
+    """The all-reduce push is selected over the GEMM's range and, for a measured shape, above
+    it (the mid-M push; never gated there); 0 where the GEMM is never selected."""
+    mod = _kernel_module()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert mod.all_reduce_push_max_m_for((sms + 1) * 128, 1280) == 0
+    for n, k in [(7168, 768), (7168, 1536), (3072, 7168)]:
+        assert mod.all_reduce_push_max_m_for(n, k) >= mod.max_m_for(n, k)
+    max_m, push_max = mod.max_m_for(7168, 1536), mod.all_reduce_push_max_m_for(7168, 1536)
+    assert push_max == (192 if _is_sm107() and max_m else max_m)
+    for m in range(max_m + 1, push_max + 1):
+        assert mod.all_reduce_push_applies(m, 7168, 1536)
+        assert not mod.all_reduce_push_applies(m, 7168, 1536, gated=True)
+    assert not mod.all_reduce_push_applies(push_max + 1, 7168, 1536)
+
+
 @sm100_only
 @pytest.mark.parametrize("m", [1, 32, 64, 128, 129, 256])
 def test_fp8_block_scales_linear_selects_low_m_gemm(m):
