@@ -1608,7 +1608,7 @@ repos:
           ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Record advisory Pyrefly type-check report
-        entry: scripts/run_pyrefly.sh --rebase-upstream
+        entry: scripts/run_pyrefly.sh
         language: script
         verbose: true
         require_serial: true
