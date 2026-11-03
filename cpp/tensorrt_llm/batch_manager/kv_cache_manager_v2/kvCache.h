@@ -368,7 +368,9 @@ public:
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
     // tree instead of copied (SSM state and the last partial block).
-    void commit(TokenSpan tokens, bool isEnd = false);
+    //! snapshotGroups selects shareable fixed groups at this endpoint; unset selects all, empty selects none.
+    void commit(
+        TokenSpan tokens, bool isEnd = false, std::optional<std::vector<LifeCycleId>> snapshotGroups = std::nullopt);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();
@@ -696,9 +698,8 @@ private:
     void _snapshotSsmToTreeBlock(
         SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move = false);
 
-    // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,
-    // copying partial attention pages and optionally the SSM snapshot.
-    void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm);
+    // Snapshot a partial final block, copying its prefix pages and the selected fixed groups.
+    void _snapshotPartialBlockToTree(BlockOrdinal ordinal, Span<LifeCycleId const> snapshotGroups);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
@@ -755,14 +756,9 @@ private:
     // Mirrors Python's _on_stop_committing().
     void _onStopCommitting();
 
-    // Commit a single block at ordinal `ord`.
-    // `isLast` mirrors Python's is_last parameter: when True (or on VIRTUAL_STOP),
-    // transitions to USER_STOP and calls _onStopCommitting() internally.
-    // Caller must have recordEventScope() open so finishEvent() works.
-    // `commitSsm` snapshots the current SSM state for this block; `moveSsm`
-    // moves (vs copies) the live SSM page into the tree (caller must guarantee
-    // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
-    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
+    // Publish one block and the selected fixed groups. The caller must have recordEventScope() open.
+    // `isLast` stops later publication; `moveSsm` requires that the live memory will receive no later writes.
+    void _commitBlock(int ord, bool isLast, Span<LifeCycleId const> snapshotGroups = {}, bool moveSsm = false);
 
     // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
     // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the

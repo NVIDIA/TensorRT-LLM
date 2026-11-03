@@ -138,9 +138,15 @@ KVCM supports independent policies for callers that provide those indices.
 The sparse fetch path configured by `sparseCache` still uses one group per layer;
 its setup uses the checked layer lookup and rejects split layers.
 
-Implicit SSM lifecycles are deduplicated by policy; explicit fixed groups retain
-independent identities. Iterate `ssmLifeCycleIds()` for working state and use
-`requiredSsmLifeCycleId()` only for prefix pruning.
+Implicit SSM lifecycles are deduplicated by policy. Explicit allocation groups
+retain their identities even when their policies match. Iterate
+`ssmLifeCycleIds()` for working state; the singular `requiredSsmLifeCycleId()`
+rejects configurations containing multiple REQUIRED fixed groups.
+Prefix matching checks every REQUIRED fixed group's actual checkpoint and every
+REQUIRED group's declared `reuseAlignment`. It returns the latest endpoint they
+can all serve. Rounding a checkpoint to a position without a recorded state is
+invalid. PRIVATE groups impose no shared-prefix constraint; OPTIONAL groups
+report availability only at the chosen endpoint and their own alignment.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is
@@ -209,6 +215,12 @@ types/config/exceptions
 `commit()` finalizes full blocks. Its `isEnd=true` form is a terminal-memory
 contract: later writes to the request's KV memory are invalid, because final
 live pages may be moved into the radix tree rather than copied.
+
+The optional `snapshotGroups` argument selects active, shareable fixed groups to
+snapshot at this call's final endpoint. Unset preserves the default of selecting
+all such groups; an empty list publishes no fixed snapshots. Selection is
+validated before progress changes. Previously published snapshots of unselected
+groups stay available. Empty-token calls preserve their stop-only behavior.
 
 `stopCommitting()` is a distinct transition and must not call `commit()`:
 doing so would append the same tokens twice. It also releases stale held SWA

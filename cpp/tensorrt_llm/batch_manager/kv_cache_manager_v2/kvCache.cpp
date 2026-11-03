@@ -239,6 +239,11 @@ void KvCache::_collectReuseCandidates()
         auto const* attention = std::get_if<AttnLifeCycle>(&lifeCycles[lc]);
         auto const policy = reusePolicy(lifeCycles[lc]);
         ReuseGroupStatus status{lc, policy, end, end > 0 && policy == ReusePolicy::REQUIRED, {}};
+        if (policy == ReusePolicy::OPTIONAL && end % lifeCycles.reuseAlignment(lc) != 0)
+        {
+            mReuseStatus.push_back(std::move(status));
+            continue;
+        }
         if (status.complete)
         {
             if (!attention)
@@ -1611,7 +1616,7 @@ void KvCache::_reattachOrphanTreeBlocks(BlockOrdinal lastOrdinal, RootBlock& roo
 // tree. Mirrors Python's _snapshot_partial_block_to_tree.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
+void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, Span<LifeCycleId const> snapshotGroups)
 {
     int const start = ordinal.value() * mTokensPerBlock;
     int const end = std::min(start + mTokensPerBlock, static_cast<int>(mCommittedTokens.size()));
@@ -1662,10 +1667,9 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
             attachedLcs.push_back(lcIdx);
         }
     }
-    if (commitSsm)
+    for (auto lcId : snapshotGroups)
     {
-        for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
-            _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens);
+        _snapshotSsmToTreeBlock(treeBlock, lcId, start + numTokens);
     }
     if (treeBlock->eventSink)
     {
@@ -2391,7 +2395,7 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(SeqBlock
 // calls _onStopCommitting() — callers do not need post-call cleanup.
 // ---------------------------------------------------------------------------
 
-void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
+void KvCache::_commitBlock(int ord, bool isLast, Span<LifeCycleId const> snapshotGroups, bool moveSsm)
 {
     TLLM_CHECK_DEBUG(mCommitState == CommitState::ALLOWED);
     TLLM_CHECK_DEBUG(ord == mNumCommittedBlocks);
@@ -2563,9 +2567,9 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
     }
     TLLM_CHECK_DEBUG(!didCommit || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
 
-    if (didCommit && commitSsm)
+    if (didCommit)
     {
-        for (auto lcId : mManager->lifeCycles().ssmLifeCycleIds())
+        for (auto lcId : snapshotGroups)
             _snapshotSsmToTreeBlock(newBlock, lcId, start + static_cast<int>(tokenBlock.size()), moveSsm);
     }
 
@@ -2609,20 +2613,50 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(TokenSpan tokens, bool isEnd)
+void KvCache::commit(TokenSpan tokens, bool isEnd, std::optional<std::vector<LifeCycleId>> snapshotGroups)
 {
     KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
+    if (tokens.size() != 0 && mCommitState == CommitState::USER_STOP)
+    {
+        throw LogicError("Cannot commit tokens after stop_committing()");
+    }
+    std::vector<LifeCycleId> selectedSnapshots;
+    if (snapshotGroups.has_value() || tokens.size() != 0)
+    {
+        auto const& lifeCycles = mManager->lifeCycles();
+        if (snapshotGroups.has_value())
+        {
+            selectedSnapshots = std::move(*snapshotGroups);
+        }
+        else
+        {
+            for (auto group : lifeCycles.ssmLifeCycleIds())
+            {
+                if (!isPrivateLifeCycle(lifeCycles[group]))
+                {
+                    selectedSnapshots.push_back(group);
+                }
+            }
+        }
+        std::set<LifeCycleId> unique;
+        for (auto group : selectedSnapshots)
+        {
+            TLLM_CHECK_WITH_INFO(group >= 0 && group < lifeCycles.size(), "snapshot_groups contains an unknown group");
+            TLLM_CHECK_WITH_INFO(lifeCycles.isSsm(group) && !isPrivateLifeCycle(lifeCycles[group]),
+                "snapshot_groups must contain only shareable fixed allocation groups");
+            TLLM_CHECK_WITH_INFO(unique.insert(group).second, "snapshot_groups contains a duplicate group");
+            auto const* state = std::get_if<SharedPageLock>(&mSsmBlocks[kDefaultBeamIndex][group]);
+            TLLM_CHECK_WITH_INFO(state && state->isValid(), "snapshot_groups contains an inactive fixed group");
+        }
+    }
     if (tokens.size() == 0)
     {
         if (isEnd)
             stopCommitting();
         return;
     }
-    if (mCommitState == CommitState::USER_STOP)
-        throw LogicError("Cannot commit tokens after stop_committing()");
-
     TLLM_CHECK_DEBUG_WITH_INFO(
         !mTextOnly || std::none_of(tokens.begin(), tokens.end(), [](TokenIdExt const& t) { return t.isDigest(); }),
         "Cannot commit digest tokens to a text-only KV cache");
@@ -2663,9 +2697,9 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
         auto scope = recordEventScope();
         for (int ordinal = numCommittedBlocksBefore; ordinal < newNumFullBlocks; ++ordinal)
         {
-            bool const commitSsm
-                = commitMinSnapshot && mManager->lifeCycles().hasSSM() && ordinal == ssmSnapshotOrdinal;
-            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd);
+            auto const groups = commitMinSnapshot && ordinal == ssmSnapshotOrdinal ? toSpan(selectedSnapshots)
+                                                                                   : Span<LifeCycleId const>{};
+            _commitBlock(ordinal, /*isLast=*/false, groups, /*moveSsm=*/isEnd);
             // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
             if (mCommitState != CommitState::ALLOWED)
                 break;
@@ -2675,12 +2709,11 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
             BlockOrdinal const partialOrdinal{newNumFullBlocks};
             if (isEnd && mManager->enablePartialCommit())
             {
-                _commitBlock(newNumFullBlocks, /*isLast=*/true, /*commitSsm=*/mManager->lifeCycles().hasSSM(),
-                    /*moveSsm=*/mManager->lifeCycles().hasSSM());
+                _commitBlock(newNumFullBlocks, /*isLast=*/true, toSpan(selectedSnapshots), /*moveSsm=*/true);
             }
             else if (!isEnd)
             {
-                _snapshotPartialBlockToTree(partialOrdinal, /*commitSsm=*/mManager->lifeCycles().hasSSM());
+                _snapshotPartialBlockToTree(partialOrdinal, toSpan(selectedSnapshots));
             }
         }
     }
@@ -3135,7 +3168,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
         auto& snapshotBlock = *matched.back();
         auto* snapshotPage = snapshotBlock.storage[lcId];
         TLLM_CHECK_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
-        ssmLevel = snapshotPage->cacheLevel;
+        ssmLevel = std::max(ssmLevel.value_or(kHotLevel), snapshotPage->cacheLevel);
         mSsmBlocks[kDefaultBeamIndex][lcId] = snapshotPage->hold();
         if (claimRetention)
         {

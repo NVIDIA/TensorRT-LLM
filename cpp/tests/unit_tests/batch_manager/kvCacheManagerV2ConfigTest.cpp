@@ -411,7 +411,7 @@ TEST(KvCacheManagerV2ConfigTest, ExplicitGroupReferencesAndPoliciesAreValidated)
     reject(config);
 }
 
-TEST(KvCacheManagerV2ConfigTest, MultipleRequiredFixedGroupsAreRejectedBeforeMatching)
+TEST(KvCacheManagerV2ConfigTest, MultipleRequiredFixedGroupsRetainTheirIdentities)
 {
     auto config = makeConfig();
     config.commitMinSnapshot = true;
@@ -419,14 +419,35 @@ TEST(KvCacheManagerV2ConfigTest, MultipleRequiredFixedGroupsAreRejectedBeforeMat
         = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1}, .allocationUnit = AllocationUnit::kFixed}};
     std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].allocationGroupId = AllocationGroupId{1};
     config.layers.emplace_back(SsmLayerConfig{1, {BufferConfig{"state", 4096}}});
-    EXPECT_THROW(config.validate(), std::runtime_error);
-    EXPECT_THROW(createStorageConfig(config), std::runtime_error);
+    EXPECT_NO_THROW(config.validate());
+    EXPECT_NO_THROW(createStorageConfig(config));
 
     config.allocationGroups.push_back(
         AllocationGroupConfig{.allocationGroupId = AllocationGroupId{2}, .allocationUnit = AllocationUnit::kFixed});
     std::get<SsmLayerConfig>(config.layers[1]).buffers[0].allocationGroupId = AllocationGroupId{2};
-    EXPECT_THROW(config.validate(), std::runtime_error);
-    EXPECT_THROW(createStorageConfig(config), std::runtime_error);
+    EXPECT_NO_THROW(config.validate());
+    EXPECT_NO_THROW(createStorageConfig(config));
+    LifeCycleRegistry const registry(config);
+    EXPECT_EQ(registry.ssmLifeCycleIds().size(), 2U);
+    EXPECT_THROW(registry.requiredSsmLifeCycleId(), std::runtime_error);
+}
+
+TEST(KvCacheManagerV2ConfigTest, ReuseAlignmentIsPerExplicitGroupAndMustBePositive)
+{
+    auto config = makeConfig();
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{8}, .reuseAlignment = 7}};
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 1,
+        .buffers = {BufferConfig{.role = "state", .size = 4096, .allocationGroupId = AllocationGroupId{8}}}});
+    ASSERT_NO_THROW(config.validate());
+    LifeCycleRegistry const registry(config);
+    EXPECT_EQ(registry.reuseAlignment(LifeCycleId{0}), 1);
+    EXPECT_EQ(registry.reuseAlignment(registry.getId(AllocationGroupId{8})), 7);
+    for (int alignment : {0, -1})
+    {
+        config.allocationGroups[0].reuseAlignment = alignment;
+        EXPECT_THROW(config.validate(), std::runtime_error);
+        EXPECT_THROW(createStorageConfig(config), std::runtime_error);
+    }
 }
 
 TEST(KvCacheManagerV2ConfigTest, DeferredAllocationAndSuspendPoliciesAreExplicit)

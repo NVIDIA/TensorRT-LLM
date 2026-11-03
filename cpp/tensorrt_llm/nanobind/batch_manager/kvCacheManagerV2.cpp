@@ -1814,14 +1814,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::AllocationGroupConfig* group, int allocationGroupId, kv::AllocationUnit allocationUnit,
                 std::optional<int> slidingWindowSize, std::optional<int> numSinkTokens, kv::ReusePolicy reusePolicy,
-                bool initiallyActive, kv::SuspendPolicy suspendPolicy)
+                bool initiallyActive, kv::SuspendPolicy suspendPolicy, int reuseAlignment)
             {
                 new (group) kv::AllocationGroupConfig{kv::AllocationGroupId{allocationGroupId}, allocationUnit,
-                    slidingWindowSize, numSinkTokens, reusePolicy, initiallyActive, suspendPolicy};
+                    slidingWindowSize, numSinkTokens, reusePolicy, initiallyActive, suspendPolicy, reuseAlignment};
             },
             nb::arg("allocation_group_id"), nb::arg("allocation_unit"), nb::arg("sliding_window_size") = std::nullopt,
             nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED,
-            nb::arg("initially_active") = true, nb::arg("suspend_policy") = kv::SuspendPolicy::kHold)
+            nb::arg("initially_active") = true, nb::arg("suspend_policy") = kv::SuspendPolicy::kHold,
+            nb::arg("reuse_alignment") = 1)
         .def_prop_rw(
             "allocation_group_id",
             [](kv::AllocationGroupConfig const& group) { return group.allocationGroupId.value(); },
@@ -1831,7 +1832,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("num_sink_tokens", &kv::AllocationGroupConfig::numSinkTokens)
         .def_rw("reuse_policy", &kv::AllocationGroupConfig::reusePolicy)
         .def_rw("initially_active", &kv::AllocationGroupConfig::initiallyActive)
-        .def_rw("suspend_policy", &kv::AllocationGroupConfig::suspendPolicy) DEF_COPY(kv::AllocationGroupConfig);
+        .def_rw("suspend_policy", &kv::AllocationGroupConfig::suspendPolicy)
+        .def_rw("reuse_alignment", &kv::AllocationGroupConfig::reuseAlignment) DEF_COPY(kv::AllocationGroupConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(
@@ -2186,8 +2188,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "decoding give a request several and are out of scope; this is the guard.")
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
+                std::optional<std::vector<int>> snapshotGroups)
             {
+                std::optional<std::vector<kv::LifeCycleId>> selected;
+                if (snapshotGroups.has_value())
+                {
+                    selected.emplace();
+                    for (int group : *snapshotGroups)
+                    {
+                        selected->push_back(kv::LifeCycleId{group});
+                    }
+                }
                 // An empty token list with is_end=True must still stop committing, so we do not
                 // early-return on empty; commit() handles it. beam_search_indices is only
                 // rejected when there are tokens, matching the reference ordering.
@@ -2205,11 +2217,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         TLLM_CHECK_WITH_INFO(!(self.textOnly() && !knownNoDigest),
                             "commit() received a digest token on a text_only sequence — hashing would be corrupted");
                         nb::gil_scoped_release release;
-                        self.commit(view, isEnd);
+                        self.commit(view, isEnd, std::move(selected));
                     });
             },
             nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
-            nb::arg("is_end") = false)
+            nb::arg("is_end") = false, nb::arg("snapshot_groups") = std::nullopt)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",

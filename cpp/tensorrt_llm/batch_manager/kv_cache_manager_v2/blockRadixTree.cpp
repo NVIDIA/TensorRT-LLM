@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -850,7 +851,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
 }
 
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
-    std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const
+    std::vector<MatchResult> matched, bool includeFixedState) const
 {
     // All blocks except the last must be fully matched (mirrors Python: matched[:-1]).
     TLLM_CHECK_DEBUG(matched.size() <= 1
@@ -859,15 +860,43 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
 
     auto attnLcs = mLifeCycles.attentionLifeCycles();
 
-    // Fixed-point loop: SSM may select an earlier exact snapshot, while attention may
-    // shorten the match to the coverage of a required page. Every retry strictly
-    // shortens the match, so the loop terminates.
+    int const initialLength = numMatchedTokens(matched, mTokensPerBlock);
+    int64_t alignment = 1;
+    for (auto const& [lcId, lifeCycle] : mLifeCycles)
+    {
+        if (!requiresPrefixCoverage(lifeCycle) || (!includeFixedState && mLifeCycles.isSsm(lcId)))
+        {
+            continue;
+        }
+        int64_t const groupAlignment = mLifeCycles.reuseAlignment(lcId);
+        int64_t const factor = groupAlignment / std::gcd(alignment, groupAlignment);
+        // An alignment larger than the matched prefix has no nonzero endpoint; cap before multiplying.
+        if (alignment > initialLength / factor)
+        {
+            return {};
+        }
+        alignment *= factor;
+    }
+    auto truncate = [&](int length)
+    {
+        matched.resize(static_cast<size_t>(divUp(length, mTokensPerBlock)));
+        if (!matched.empty())
+        {
+            matched.back().numMatchedTokens = length - (static_cast<int>(matched.size()) - 1) * mTokensPerBlock;
+        }
+    };
+
+    // Each shortening changes the endpoint every other group must serve. Retry until all agree.
     while (!matched.empty())
     {
-        // Check SSM snapshot availability first: truncating to the last reusable SSM
-        // snapshot changes the matched length that all the attention checks use.
-        if (ssmLcId.has_value())
+        int const previousLength = numMatchedTokens(matched, mTokensPerBlock);
+        truncate(previousLength - static_cast<int>(previousLength % alignment));
+        for (auto lcId : mLifeCycles.ssmLifeCycleIds())
         {
+            if (!includeFixedState || !requiresPrefixCoverage(mLifeCycles[lcId]))
+            {
+                continue;
+            }
             int ssmTrunc = 0;
             int ssmMatchLen = 0;
             for (int i = static_cast<int>(matched.size()) - 1; i >= 0; --i)
@@ -875,8 +904,9 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 auto const& entry = matched[static_cast<size_t>(i)];
                 // An SSM page holds the recurrent state after exactly this many tokens,
                 // so reuse must stop there instead of anywhere inside the block.
-                int const snapshotLen = entry.block->pageCoverage(*ssmLcId);
-                if (snapshotLen > 0 && entry.numMatchedTokens >= snapshotLen)
+                int const snapshotLen = entry.block->pageCoverage(lcId);
+                int64_t const endpoint = static_cast<int64_t>(i) * mTokensPerBlock + snapshotLen;
+                if (snapshotLen > 0 && entry.numMatchedTokens >= snapshotLen && endpoint % alignment == 0)
                 {
                     ssmTrunc = i + 1;
                     ssmMatchLen = snapshotLen;
@@ -889,6 +919,10 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 break;
             }
             matched.back().numMatchedTokens = ssmMatchLen;
+        }
+        if (matched.empty())
+        {
+            break;
         }
 
         // Only pages that are active at this candidate endpoint constrain attention
@@ -937,7 +971,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
                 break;
             }
         }
-        if (!shortened)
+        if (!shortened && numMatchedTokens(matched, mTokensPerBlock) == previousLength)
         {
             break;
         }
@@ -973,7 +1007,9 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     auto rawMatched = matchTokenPath(reuseScope, tokens, knownNoDigest, enablePartialMatch);
     // Content-divergence depth is measured before page or recurrent-snapshot pruning.
     int const numReusableTokensBeforePruning = numMatchedTokens(rawMatched, mTokensPerBlock);
-    auto const ssmLcId = mLifeCycles.requiredSsmLifeCycleId();
+    auto const& fixedGroups = mLifeCycles.ssmLifeCycleIds();
+    bool const hasRequiredFixed = std::any_of(fixedGroups.begin(), fixedGroups.end(),
+        [this](LifeCycleId id) { return requiresPrefixCoverage(mLifeCycles[id]); });
     // Page requirements depend on the final endpoint. Back off before pruning
     // so SWA coverage and recurrent snapshots are validated at that endpoint.
     if (backoff > 0)
@@ -984,11 +1020,11 @@ BlockRadixTree::ReuseMatch BlockRadixTree::match(
     // the prefix the attention pages alone support. Only hybrid models pay for
     // the second pass; without an SSM life cycle the two results are identical.
     std::optional<int> numReusableTokensBeforeHybridPruning;
-    if (ssmLcId.has_value())
+    if (hasRequiredFixed)
     {
-        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, std::nullopt), mTokensPerBlock);
+        numReusableTokensBeforeHybridPruning = numMatchedTokens(pruneMatch(rawMatched, false), mTokensPerBlock);
     }
-    auto matched = pruneMatch(std::move(rawMatched), ssmLcId);
+    auto matched = pruneMatch(std::move(rawMatched), true);
     ReuseMatch result{};
     result.numTokens = numMatchedTokens(matched, mTokensPerBlock);
     result.numLookupTokens = static_cast<int>(tokens.size());

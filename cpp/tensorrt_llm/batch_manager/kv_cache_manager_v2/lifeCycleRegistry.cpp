@@ -70,13 +70,14 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
     {
         explicitGroups.emplace(group.allocationGroupId, &group);
     }
-    auto const appendLifeCycle
-        = [this](LifeCycle const& lc, bool initiallyActive = true, SuspendPolicy suspendPolicy = SuspendPolicy::kHold)
+    auto const appendLifeCycle = [this](LifeCycle const& lc, bool initiallyActive = true,
+                                     SuspendPolicy suspendPolicy = SuspendPolicy::kHold, int alignment = 1)
     {
         LifeCycleId const id = mLifeCycleList.size();
         mLifeCycleList.push_back(lc);
         mInitiallyActive.push_back(initiallyActive);
         mSuspendPolicies.push_back(suspendPolicy);
+        mReuseAlignments.push_back(alignment);
         if (std::holds_alternative<SsmLifeCycle>(lc))
         {
             mSsmLifeCycleIds.push_back(id);
@@ -102,8 +103,8 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
                 if (mAllocationGroupIdMap.find(id) == mAllocationGroupIdMap.end())
                 {
                     auto const& group = *explicitGroups.at(id);
-                    mAllocationGroupIdMap[id] = appendLifeCycle(
-                        makeLifeCycle(group, config.tokensPerBlock), group.initiallyActive, group.suspendPolicy);
+                    mAllocationGroupIdMap[id] = appendLifeCycle(makeLifeCycle(group, config.tokensPerBlock),
+                        group.initiallyActive, group.suspendPolicy, group.reuseAlignment);
                 }
             }
             else

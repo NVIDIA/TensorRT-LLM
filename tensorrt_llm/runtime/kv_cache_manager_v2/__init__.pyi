@@ -290,7 +290,7 @@ class SuspendPolicy(enum.Enum):
 
 @dataclass(slots=True)
 class AllocationGroupConfig:
-    """One independently owned allocation group with an explicit lifecycle."""
+    """An independent allocation group; reusable endpoints must satisfy reuse_alignment."""
 
     allocation_group_id: AllocationGroupId
     allocation_unit: AllocationUnit
@@ -299,6 +299,7 @@ class AllocationGroupConfig:
     reuse_policy: ReusePolicy = ...
     initially_active: bool = True
     suspend_policy: SuspendPolicy = ...
+    reuse_alignment: int = 1
 
 @dataclass(slots=True, frozen=True)
 class BufferConfig:
@@ -831,6 +832,7 @@ class _KVCache:
         accepted_input_tokens: Sequence[TokenIdExt],
         beam_search_indices: Sequence[int] | None = None,
         is_end: bool = False,
+        snapshot_groups: Sequence[CacheGroupId] | None = None,
     ) -> None: ...
     @property
     def num_committed_tokens(self) -> int: ...

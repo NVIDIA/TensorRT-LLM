@@ -205,6 +205,12 @@ public:
         return mSuspendPolicies.at(id);
     }
 
+    //! Endpoint alignment belongs to the declared group, independently of physical pooling.
+    int reuseAlignment(LifeCycleId id) const
+    {
+        return mReuseAlignments.at(id);
+    }
+
     // Number of unique life cycles.
     [[nodiscard]] LifeCycleId size() const noexcept
     {
@@ -236,14 +242,17 @@ public:
 
     std::optional<LifeCycleId> requiredSsmLifeCycleId() const
     {
+        std::optional<LifeCycleId> result;
         for (auto id : mSsmLifeCycleIds)
         {
             if (requiresPrefixCoverage((*this)[id]))
             {
-                return id;
+                TLLM_CHECK_WITH_INFO(!result.has_value(),
+                    "Multiple REQUIRED fixed groups must be inspected individually through ssmLifeCycleIds()");
+                result = id;
             }
         }
-        return std::nullopt;
+        return result;
     }
 
     bool hasSSM() const noexcept
@@ -323,6 +332,7 @@ private:
             TLLM_CHECK_WITH_INFO(
                 mInitiallyActive.size() == mLifeCycleList.size() && mSuspendPolicies.size() == mLifeCycleList.size(),
                 "corrupted allocation group policy registry");
+            TLLM_CHECK_WITH_INFO(mLifeCycleList.size() == mReuseAlignments.size(), "corrupted group alignments");
         }
     }
 
@@ -331,6 +341,7 @@ private:
     std::map<AllocationGroupId, LifeCycleId> mAllocationGroupIdMap;
     ActiveGroups mInitiallyActive;
     TypedVec<LifeCycleId, SuspendPolicy> mSuspendPolicies;
+    TypedVec<LifeCycleId, int> mReuseAlignments;
     std::vector<LifeCycleId> mSsmLifeCycleIds;
 };
 

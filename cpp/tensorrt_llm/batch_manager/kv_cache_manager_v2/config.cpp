@@ -42,6 +42,7 @@ void AllocationGroupConfig::validate() const
     TLLM_CHECK_WITH_INFO((initiallyActive && suspendPolicy == SuspendPolicy::kHold)
             || (allocationUnit == AllocationUnit::kFixed && reusePolicy == ReusePolicy::PRIVATE),
         "AllocationGroupConfig: deferred activation and RELEASE suspension require a PRIVATE FIXED group");
+    TLLM_CHECK_WITH_INFO(reuseAlignment > 0, "AllocationGroupConfig: reuse_alignment must be positive");
     if (allocationUnit == AllocationUnit::kFixed)
     {
         TLLM_CHECK_WITH_INFO(!slidingWindowSize.has_value() && !numSinkTokens.has_value(),
@@ -207,18 +208,12 @@ void KVCacheManagerConfig::validateAllocationGroups() const
     }
 
     std::set<AllocationGroupId> referenced;
-    bool hasImplicitRequiredFixed = false;
     for (auto const& layer : layers)
     {
         for (auto const& buffer : layerBuffers(layer))
         {
             if (!buffer.allocationGroupId.has_value())
             {
-                if (auto const* fixed = std::get_if<SsmLayerConfig>(&layer))
-                {
-                    hasImplicitRequiredFixed
-                        |= buffer.effectiveReusePolicy(fixed->reusePolicy) == ReusePolicy::REQUIRED;
-                }
                 continue;
             }
             AllocationGroupId const id = *buffer.allocationGroupId;
@@ -242,7 +237,6 @@ void KVCacheManagerConfig::validateAllocationGroups() const
         }
     }
 
-    int requiredFixedGroups = hasImplicitRequiredFixed ? 1 : 0;
     for (auto const& [id, group] : groups)
     {
         TLLM_CHECK_WITH_INFO(
@@ -251,12 +245,8 @@ void KVCacheManagerConfig::validateAllocationGroups() const
         {
             TLLM_CHECK_WITH_INFO(commitMinSnapshot,
                 "KVCacheManagerConfig: FIXED allocation group %d requires commit_min_snapshot=True", id.value());
-            requiredFixedGroups += group->reusePolicy == ReusePolicy::REQUIRED ? 1 : 0;
         }
     }
-    TLLM_CHECK_WITH_INFO(requiredFixedGroups <= 1,
-        "KVCacheManagerConfig: multiple REQUIRED fixed allocation groups are not supported by prefix matching");
-
     auto validateBatch = [&](BatchDesc const& batch)
     {
         for (auto const& request : batch.kvCaches)

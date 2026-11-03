@@ -843,6 +843,255 @@ TEST_F(ReplayCacheTest, ExplicitFixedGroupSnapshotsWithoutSsmLayer)
     manager->shutdown();
 }
 
+KVCacheManagerConfig makeDeclaredReuseConfig(int alignment = 1, ReusePolicy secondPolicy = ReusePolicy::REQUIRED)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups
+        = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{10}, .reuseAlignment = alignment},
+            AllocationGroupConfig{.allocationGroupId = AllocationGroupId{20}, .allocationUnit = AllocationUnit::kFixed},
+            AllocationGroupConfig{.allocationGroupId = AllocationGroupId{30},
+                .allocationUnit = AllocationUnit::kFixed,
+                .reusePolicy = secondPolicy},
+            AllocationGroupConfig{.allocationGroupId = AllocationGroupId{40},
+                .allocationUnit = AllocationUnit::kFixed,
+                .reusePolicy = ReusePolicy::PRIVATE,
+                .reuseAlignment = 101}};
+    config.layers
+        = { AttentionLayerConfig{.layerId = 0,
+            .buffers = {BufferConfig{.role = "key", .size = 4096, .allocationGroupId = AllocationGroupId{10}},
+                BufferConfig{.role = "first", .size = 8192, .allocationGroupId = AllocationGroupId{20}},
+                BufferConfig{.role = "second", .size = 16384, .allocationGroupId = AllocationGroupId{30}},
+                BufferConfig{.role = "private", .size = 2048, .allocationGroupId = AllocationGroupId{40}}}};
+    return config;
+}
+
+TEST_F(ReplayCacheTest, RequiredFixedGroupsReuseOnlyACommonPublishedSnapshot)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeDeclaredReuseConfig());
+    auto const first = manager->getBufferGroupId(0, "first");
+    auto const second = manager->getBufferGroupId(0, "second");
+    auto const privateGroup = manager->getBufferGroupId(0, "private");
+    auto const tokens = makeTokens(16);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(16));
+    std::array<SplitSsmBuffer, 2> const buffers{{{0, "first", 8192, false, 0x31}, {0, "second", 16384, false, 0x52}}};
+    for (auto const& buffer : buffers)
+    {
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, *source, buffer, 0)),
+                      buffer.pattern, buffer.size, mStream),
+            cudaSuccess);
+    }
+    source->commit(TokenSpan{tokens.data(), 4});
+    for (auto const& buffer : buffers)
+    {
+        ASSERT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, *source, buffer, 0)), 0xEE,
+                      buffer.size, mStream),
+            cudaSuccess);
+    }
+    source->commit(TokenSpan{tokens.data() + 4, 4}, false, std::vector<LifeCycleId>{first});
+    source->commit(TokenSpan{tokens.data() + 8, 4}, false, std::vector<LifeCycleId>{second});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 12}), 4);
+    auto reader = manager->createKvCache({}, TokenSpan{tokens.data(), 12}, 2);
+    ASSERT_EQ(reader->numCommittedTokens(), 4);
+    ASSERT_TRUE(reader->resume(mStream));
+    ASSERT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    for (auto const& buffer : buffers)
+    {
+        EXPECT_NE(ssmBufferAddress(*manager, *reader, buffer, 0), ssmBufferAddress(*manager, *source, buffer, 0));
+        std::vector<uint8_t> data(buffer.size);
+        ASSERT_EQ(cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, *reader, buffer, 0)),
+                      data.size(), cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(data.begin(), data.end(), [&](uint8_t value) { return value == buffer.pattern; }));
+    }
+    reader->close();
+    source->commit(TokenSpan{tokens.data() + 12, 4});
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 16);
+    auto const match = manager->radixTree().match({}, toSpan(tokens), false, true);
+    for (auto const* block : match.blocks)
+    {
+        EXPECT_EQ(block->getPage(privateGroup), nullptr);
+    }
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, ReuseAlignmentNeverInventsAnExactSnapshot)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeDeclaredReuseConfig(4));
+    auto const tokens = makeTokens(11);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(11));
+    source->commit(TokenSpan{tokens.data(), 6});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 6}), 0);
+    source->commit(TokenSpan{tokens.data() + 6, 2});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 8}), 8);
+    source->commit(TokenSpan{tokens.data() + 8, 3});
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 8);
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, DifferentPartialSnapshotsRequireAnEarlierCommonEndpoint)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeDeclaredReuseConfig());
+    auto const first = manager->getBufferGroupId(0, "first");
+    auto const second = manager->getBufferGroupId(0, "second");
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(TokenSpan{tokens.data(), 4});
+    source->commit(TokenSpan{tokens.data() + 4, 2}, false, std::vector<LifeCycleId>{first});
+    source->commit(TokenSpan{tokens.data() + 6, 1}, false, std::vector<LifeCycleId>{second});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 7}), 4);
+    source->commit(TokenSpan{tokens.data() + 7, 1});
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 8);
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, RequiredAlignmentsIntersectAndPrivateAlignmentIsIgnored)
+{
+    auto config = makeDeclaredReuseConfig(4);
+    config.allocationGroups[1].reuseAlignment = 6;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const tokens = makeTokens(24);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(24));
+    source->commit(TokenSpan{tokens.data(), 12});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 12}), 12);
+    source->commit(TokenSpan{tokens.data() + 12, 6});
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 18}), 12);
+    source->commit(TokenSpan{tokens.data() + 18, 6});
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 24);
+    source->close();
+    manager->shutdown();
+
+    config.allocationGroups[0].reuseAlignment = std::numeric_limits<int>::max();
+    config.allocationGroups[1].reuseAlignment = std::numeric_limits<int>::max() - 2;
+    manager = std::make_shared<KvCacheManager>(config);
+    source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(24));
+    source->commit(toSpan(tokens));
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 0);
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, OptionalSnapshotAlignmentDoesNotShortenRequiredReuse)
+{
+    auto config = makeDeclaredReuseConfig(1, ReusePolicy::OPTIONAL);
+    config.allocationGroups[2].reuseAlignment = 8;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const optional = manager->getBufferGroupId(0, "second");
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(TokenSpan{tokens.data(), 6});
+    auto reader = manager->createKvCache({}, TokenSpan{tokens.data(), 6}, 2);
+    EXPECT_EQ(reader->numCommittedTokens(), 6);
+    EXPECT_FALSE(reader->reuseStatus()[optional.value()].complete);
+    EXPECT_THROW(reader->resume(mStream, std::vector<LifeCycleId>{optional}), std::invalid_argument);
+    reader->close();
+    source->commit(TokenSpan{tokens.data() + 6, 2});
+    reader = manager->createKvCache({}, toSpan(tokens), 3);
+    EXPECT_EQ(reader->numCommittedTokens(), 8);
+    EXPECT_TRUE(reader->reuseStatus()[optional.value()].complete);
+    ASSERT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{optional}));
+    reader->close();
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, InvalidSnapshotSelectionLeavesCommitRetryable)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeDeclaredReuseConfig());
+    auto const first = manager->getBufferGroupId(0, "first");
+    auto const blockGroup = manager->getBufferGroupId(0, "key");
+    auto const privateGroup = manager->getBufferGroupId(0, "private");
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    std::vector<std::vector<LifeCycleId>> const invalid{
+        {LifeCycleId{-1}}, {LifeCycleId{1000}}, {blockGroup}, {privateGroup}, {first, first}};
+    for (auto const& selection : invalid)
+    {
+        EXPECT_THROW(source->commit(TokenSpan{tokens.data(), 4}, false, selection), std::runtime_error);
+        EXPECT_EQ(source->numCommittedTokens(), 0);
+        EXPECT_EQ(source->historyLength(), 0);
+    }
+    source->commit(TokenSpan{tokens.data(), 4}, false, std::vector<LifeCycleId>{});
+    EXPECT_EQ(source->numCommittedTokens(), 4);
+    EXPECT_EQ(manager->probeReuse({}, TokenSpan{tokens.data(), 4}), 0);
+    source->commit(TokenSpan{tokens.data() + 4, 4});
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 8);
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, EvictingOneRequiredSnapshotGroupInvalidatesTheCommonEndpoint)
+{
+    auto manager = std::make_shared<KvCacheManager>(makeDeclaredReuseConfig());
+    auto const second = manager->getBufferGroupId(0, "second");
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(TokenSpan{tokens.data(), 4});
+    source->commit(TokenSpan{tokens.data() + 4, 4});
+    ASSERT_EQ(manager->probeReuse({}, toSpan(tokens)), 8);
+    auto& storage = manager->storage();
+    auto const pool = storage.getPoolGroupIndex(kHotLevel, second);
+    auto const stats = storage.getStatistics(kHotLevel, pool);
+    auto reservations = storage.newSlotsForPoolGroup(kHotLevel, pool, stats.free + stats.evictable);
+    EXPECT_EQ(manager->probeReuse({}, toSpan(tokens)), 0);
+    for (auto& slot : reservations)
+    {
+        storage.releaseSlot(second, kHotLevel, std::move(slot));
+    }
+    source->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, ReuseSourceTierIncludesEveryRequiredFixedGroup)
+{
+    auto config = makeDeclaredReuseConfig();
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const first = manager->getBufferGroupId(0, "first");
+    auto const second = manager->getBufferGroupId(0, "second");
+    auto const tokens = makeTokens(8);
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    source->commit(toSpan(tokens));
+    source->close();
+    auto const match = manager->radixTree().match({}, toSpan(tokens), false, true);
+    ASSERT_EQ(match.numTokens, 8);
+    auto page = match.blocks.back()->getPage(first)->sharedFromThis();
+    auto& storage = manager->storage();
+    storage.excludeFromEviction(*page);
+    storage.batchedMigrate(CacheLevel{1}, {page}, {});
+    storage.scheduleForEviction(*page);
+    ASSERT_EQ(page->cacheLevel, CacheLevel{1});
+    ASSERT_EQ(match.blocks.back()->getPage(second)->cacheLevel, kHotLevel);
+    auto reader = manager->createKvCache({}, toSpan(tokens), 2);
+    EXPECT_EQ(reader->numCommittedTokens(), 8);
+    EXPECT_EQ(reader->cachedTokensByLevel().at(kHotLevel), 0);
+    EXPECT_EQ(reader->cachedTokensByLevel().at(CacheLevel{1}), 8);
+    reader->close();
+    page.reset();
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
 {
     auto config = makeConfig();

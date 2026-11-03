@@ -170,6 +170,9 @@ struct AllocationGroupConfig
     //! RELEASE discards a PRIVATE FIXED group's contents after its cache-stream work finishes.
     SuspendPolicy suspendPolicy = SuspendPolicy::kHold;
 
+    //! Reusable endpoints must be multiples of this token count.
+    int reuseAlignment = 1;
+
     void validate() const;
 };
 

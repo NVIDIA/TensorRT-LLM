@@ -436,10 +436,8 @@ private:
     // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
     std::vector<MatchResult> matchTokenPath(
         ReuseScope const& reuseScope, TokenSpan tokens, bool knownNoDigest, bool enablePartialMatch) const;
-    // Shorten `matched` to the prefix that is actually reusable. Passing
-    // std::nullopt for `ssmLcId` skips the recurrent-snapshot constraint and
-    // yields the attention-only prefix (used for numReusableTokensBeforeHybridPruning).
-    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, std::optional<LifeCycleId> ssmLcId) const;
+    //! Find the latest endpoint every required group can serve. The diagnostic pass excludes fixed state.
+    std::vector<MatchResult> pruneMatch(std::vector<MatchResult> matched, bool includeFixedState) const;
 
     // Erase any pending empty root blocks from mRoots.
     // Const-qualified: deferred cleanup is not a logical mutation.
