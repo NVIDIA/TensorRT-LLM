@@ -3338,12 +3338,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.use_harmony:
             return 0
         # A generation-only handoff runs the prompt the context worker relayed
-        # instead of rendering one.
-        params = request.disaggregated_params
-        relayed = (params is not None
-                   and params.request_type == "generation_only"
-                   and (request.prompt_token_ids is not None
-                        or request.prompt_token_ids_b64 is not None))
+        # instead of rendering one; asked as the render path asks it.
+        relayed = request.relayed_prompt_token_ids() is not None
         render_resources = RenderResources.from_server(self)
         return render_resources.prompt_tokens_excluded_from_usage(
             add_generation_prompt=True,

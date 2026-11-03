@@ -531,6 +531,24 @@ def test_a_relayed_prompt_without_context_usage_is_counted_as_chat_counts_it(ser
     assert responses[0] == chat[0] == 5
 
 
+def test_an_empty_relayed_prompt_is_rendered_and_leaves_out_the_opener(serve):
+    """An empty ``prompt_token_ids_b64`` relays no prompt, so the input is rendered as usual."""
+    client, prompts = serve("kimi_k3")
+
+    plain = _responses_usage(client, False, store=False)
+    empty_relay = _responses_usage(
+        client,
+        False,
+        store=False,
+        prompt_token_ids_b64="",
+        disaggregated_params={"request_type": "generation_only"},
+    )
+
+    rendered, also_rendered = prompts
+    assert also_rendered == rendered
+    assert empty_relay[0] == plain[0] == len(rendered) - 3
+
+
 _RECORDING = "usage-facts-model"
 
 
