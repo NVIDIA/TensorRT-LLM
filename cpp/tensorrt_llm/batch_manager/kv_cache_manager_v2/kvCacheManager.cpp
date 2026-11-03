@@ -73,7 +73,7 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratchRange.contains(ordinal))
+        if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value() && scratchRange.contains(ordinal))
         {
             // Scratch block: its slot comes from the request's own scratch slots, not from
             // base_indices.

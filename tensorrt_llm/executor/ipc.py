@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 from queue import Queue
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -89,6 +89,8 @@ class ZeroMqQueue:
 
         self.hmac_key = address[1] if address is not None else None
         self.use_hmac_encryption = use_hmac_encryption
+        # Run on the receiving thread between receiving a message and parsing it.
+        self.parse_gate: Optional[Callable[[], None]] = None
 
         self._setup_lock = threading.Lock()
 
@@ -483,6 +485,7 @@ class ZeroMqQueue:
         if self.socket_type == zmq.ROUTER:
             identity, data = self.socket.recv_multipart()
             self._last_identity = identity  # Store for replies
+            self._wait_for_parse_gate()
             obj = self._parse_data(data)
             if return_identity:
                 return obj, identity
@@ -490,6 +493,7 @@ class ZeroMqQueue:
         else:
             if self.use_hmac_encryption:
                 data = self.socket.recv()
+                self._wait_for_parse_gate()
                 obj = self._parse_data(data)
             else:
                 obj = self.socket.recv_pyobj()
@@ -497,6 +501,10 @@ class ZeroMqQueue:
             if return_identity:
                 return obj, None
             return obj
+
+    def _wait_for_parse_gate(self):
+        if self.parse_gate is not None:
+            self.parse_gate()
 
     async def _recv_data_async(self, return_identity: bool = False) -> Any:
         """Async version of _recv_data."""

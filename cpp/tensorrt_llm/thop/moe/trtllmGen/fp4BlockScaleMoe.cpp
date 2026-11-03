@@ -22,6 +22,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/cuda/EmptyTensor.h>
 #include <ATen/ops/index_select.h>
+#include <algorithm>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -33,8 +34,8 @@ using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Run
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
 // Routing results the caller computed for one tile size, in the layout the routing kernel writes (all int32):
-// per-expert token blocks padded to the tile, CTAs in expert order, experts numbered from 0 over the experts the
-// problem is run with. When supplied, the routing kernel is not launched.
+// per-expert token blocks padded to the tile (an expert's rows in any order), CTAs in expert order, experts numbered
+// from 0 over the experts the problem is run with. When supplied, the routing kernel is not launched.
 struct PreRoutedBuffers
 {
     torch::Tensor expanded_idx_to_permuted_idx; // >= num_tokens * top_k (-1 = routed to another rank)
@@ -548,9 +549,14 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::optional<torch:
 
     if (!do_finalize)
     {
-        // Pre-routed: the routing kernel that fills expert_weights did not run; the weights are topk_weights.
-        return {
-            gemm2_output, prerouted != nullptr ? topk_weights.value() : expert_weights, expanded_idx_to_permuted_idx};
+        // No output may alias an input: pre-routed, the permutation is the caller's table, which an empty
+        // [0, tile] placeholder names, and expert_weights is left unwritten (the weights are topk_weights).
+        if (prerouted != nullptr)
+        {
+            return {
+                gemm2_output, expert_weights, at::empty({0, tile_tokens_dim}, expanded_idx_to_permuted_idx.options())};
+        }
+        return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
     }
 
     return {output};
@@ -639,14 +645,15 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
-        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output = torch::nullopt)
+        torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output,
+        torch::optional<torch::Tensor> const& routing_tables, std::vector<int64_t> const& routing_table_tiles)
     {
         return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
             gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, routing_method_type, do_finalize, moeConfigIndex, topk_weights, topk_ids, output,
-            nullptr, -1);
+            nullptr, -1, routing_tables, routing_table_tiles);
     }
 
     // run() with caller-computed routing tables for tile routing_tile_n (see PreRoutedBuffers), used in place of the
@@ -678,7 +685,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, local_expert_offset, local_num_experts,
             routed_scaling_factor, routing_method_type, do_finalize, moeConfigIndex, topk_weights, topk_ids, output,
-            &prerouted, routing_tile_n);
+            &prerouted, routing_tile_n, torch::nullopt, {});
     }
 
 private:
@@ -696,7 +703,8 @@ private:
         std::optional<double> const routed_scaling_factor, int64_t const routing_method_type, bool const do_finalize,
         std::vector<int64_t> moeConfigIndex, torch::optional<torch::Tensor> const& topk_weights,
         torch::optional<torch::Tensor> const& topk_ids, torch::optional<torch::Tensor> const& output,
-        PreRoutedBuffers const* prerouted, int64_t const routing_tile_n)
+        PreRoutedBuffers const* prerouted, int64_t const routing_tile_n,
+        torch::optional<torch::Tensor> const& routing_tables, std::vector<int64_t> const& routing_table_tiles)
     {
         int64_t tileN = moeConfigIndex[0];
         int64_t config = moeConfigIndex[1];
@@ -744,6 +752,23 @@ private:
         {
             runner = &getRunner(tileN, /* useFineGrained */ false);
             configToRun = config;
+        }
+        // routing_tables [tiles, 5, width]: per tile the PreRoutedBuffers rows, the last holding (num_non_exiting_ctas,
+        // total_num_padded_tokens). Only this tactic's tile is used; other tiles route as usual.
+        std::optional<PreRoutedBuffers> tables;
+        if (routing_tables.has_value())
+        {
+            auto const& all = routing_tables.value();
+            TORCH_CHECK(
+                all.dim() == 3 && all.size(0) == static_cast<int64_t>(routing_table_tiles.size()) && all.size(1) == 5,
+                "routing_tables must be [len(routing_table_tiles), 5, width].");
+            auto const it = std::find(routing_table_tiles.begin(), routing_table_tiles.end(), tileN);
+            if (it != routing_table_tiles.end())
+            {
+                auto const t = all.select(0, std::distance(routing_table_tiles.begin(), it));
+                tables = PreRoutedBuffers{t[0], t[1], t[2], t[3], t[4].narrow(0, 0, 1), t[4].narrow(0, 1, 1)};
+                prerouted = &tables.value();
+            }
         }
         return run_fp4_block_scale_moe_runner(routing_logits, routing_bias, hidden_states, hidden_states_scale,
             gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,

@@ -14,8 +14,10 @@
 # limitations under the License.
 """Native preprocessing for DeepSeek-V4.1 formatted text and image prompts."""
 
+import hashlib
+import json
 import math
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -29,13 +31,98 @@ from tensorrt_llm.inputs import (
     ExtraProcessedInputs,
     TextPrompt,
 )
+from tensorrt_llm.inputs.shared_prompt_store import SharedPromptStore
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.tokenizer import TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v41.tokenizer import ASSISTANT_TOKEN
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import PromptTokenCacheConfig
 
 __all__ = ["DeepseekV41InputProcessor", "IMAGE_PLACEHOLDER"]
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 _IMAGE_START, _IMAGE, _IMAGE_NEW_LINE, _IMAGE_END = range(4)
+
+
+class _TurnPrefixTokenCache:
+    """Token ids of rendered prompts up to their last generation marker, in a node-shared store.
+
+    Every turn's prompt ends with ``<｜Assistant｜>`` plus the generation prefix, and a
+    conversation's next prompt starts with the previous one up to that marker. The
+    marker is an added token that keeps its neighbours, which the tokenizer splits out
+    before pre-tokenization, so ``encode(text[:end]) + encode(text[end:])`` equals
+    ``encode(text)`` whenever ``end`` follows a marker. A prompt reuses the ids of its
+    longest stored prefix ending at a marker and encodes only the rest.
+    """
+
+    def __init__(self, store: SharedPromptStore, tokenizer: PreTrainedTokenizerBase) -> None:
+        self._store = store
+        self._tokenizer = tokenizer
+        # Keys cover the tokenizer, so entries written for another tokenizer never match.
+        self._namespace = hashlib.blake2b(
+            tokenizer.backend_tokenizer.to_str().encode(), digest_size=16
+        ).digest()
+
+    @staticmethod
+    def supports(tokenizer: PreTrainedTokenizerBase) -> bool:
+        """Whether every encoding equals the joined encodings of its parts split after a marker.
+
+        True when the tokenizer is fast, does not normalize, and extracts the marker as one
+        added token before pre-tokenization: it strips no neighbour, and no other added
+        token contains it or overlaps it.
+        """
+        if not getattr(tokenizer, "is_fast", False):
+            return False
+        normalizer = json.loads(tokenizer.backend_tokenizer.to_str()).get("normalizer")
+        if normalizer is not None and normalizer != {"type": "Sequence", "normalizers": []}:
+            return False
+        marker_ids = tokenizer.encode(ASSISTANT_TOKEN, add_special_tokens=False)
+        added = tokenizer.added_tokens_decoder
+        marker = added.get(marker_ids[0]) if len(marker_ids) == 1 else None
+        if marker is None or marker.lstrip or marker.rstrip or marker.single_word:
+            return False
+        for token in added.values():
+            content = token.content
+            if content == ASSISTANT_TOKEN:
+                continue
+            if ASSISTANT_TOKEN in content or any(
+                content.endswith(ASSISTANT_TOKEN[:i]) or content.startswith(ASSISTANT_TOKEN[-i:])
+                for i in range(1, len(ASSISTANT_TOKEN))
+            ):
+                return False
+        return True
+
+    def encode(self, text: str) -> list[int]:
+        ends = []
+        start = text.find(ASSISTANT_TOKEN)
+        while start >= 0:
+            ends.append(start + len(ASSISTANT_TOKEN))
+            start = text.find(ASSISTANT_TOKEN, ends[-1])
+        if not ends:
+            return self._encode(text)
+        # Keys chain the text up to each marker, so a key names that whole prefix.
+        keys, digest, pos = [], hashlib.blake2b(self._namespace, digest_size=16), 0
+        for end in ends:
+            digest.update(text[pos:end].encode("utf-8", "surrogatepass"))
+            pos = end
+            keys.append(digest.digest())
+        cut, head, hit = 0, [], None
+        for end, key in zip(reversed(ends), reversed(keys)):
+            value = self._store.get(key)
+            if value is not None:
+                cut, head, hit = end, np.frombuffer(value, dtype=np.int32).tolist(), key
+                break
+        if cut < ends[-1]:
+            head = head + self._encode(text[cut : ends[-1]])
+            self._store.put(keys[-1], np.asarray(head, dtype=np.int32).tobytes())
+            if hit is not None:
+                # The longer entry serves the conversation's next turn.
+                self._store.demote(hit)
+        return head + self._encode(text[ends[-1] :])
+
+    def _encode(self, text: str) -> list[int]:
+        return self._tokenizer.encode(text, add_special_tokens=False)
 
 
 def _num_image_tokens(height: int, width: int) -> int:
@@ -103,9 +190,11 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         config: Checkpoint configuration with nested text and vision configs.
         tokenizer: Tokenizer to use, or None to load it from the checkpoint.
         trust_remote_code: Whether tokenizer loading may execute checkpoint code.
+        prompt_token_cache_config: Node-shared token ids of earlier turns' prompts.
     """
 
     supports_token_id_mm_expansion = True
+    supports_prompt_token_cache = True
 
     def __init__(
         self,
@@ -113,12 +202,31 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         config: PretrainedConfig,
         tokenizer: PreTrainedTokenizerBase | None,
         trust_remote_code: bool = True,
+        prompt_token_cache_config: Optional["PromptTokenCacheConfig"] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(model_path, config, tokenizer, trust_remote_code, **kwargs)
         if tokenizer is None:
             self._tokenizer = AutoTokenizer.from_pretrained(
                 model_path, trust_remote_code=trust_remote_code, use_fast=self.use_fast
+            )
+        self._turn_prefix_cache = None
+        if prompt_token_cache_config is not None:
+            hf_tokenizer = (
+                self._tokenizer.tokenizer
+                if isinstance(self._tokenizer, TransformersTokenizer)
+                else self._tokenizer
+            )
+            if not _TurnPrefixTokenCache.supports(hf_tokenizer):
+                raise ValueError(
+                    "prompt_token_cache_config needs a fast tokenizer in which "
+                    f"{ASSISTANT_TOKEN} is a single added token that keeps its neighbours"
+                )
+            self._turn_prefix_cache = _TurnPrefixTokenCache(
+                SharedPromptStore(
+                    prompt_token_cache_config.path, prompt_token_cache_config.max_bytes
+                ),
+                hf_tokenizer,
             )
         self._image_token_id = getattr(config, "image_token_id", 129264)
         vision_config = getattr(config, "vision_config", None)
@@ -341,7 +449,16 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
         if inputs.get("prompt") is None:
             return self.call_with_token_ids(inputs, sampling_params)
         add_special_tokens = sampling_params.add_special_tokens if sampling_params else True
-        token_ids = self.tokenizer.encode(inputs["prompt"], add_special_tokens=add_special_tokens)
+        if (
+            self._turn_prefix_cache is not None
+            and not add_special_tokens
+            and sampling_params.truncate_prompt_tokens is None
+        ):
+            token_ids = self._turn_prefix_cache.encode(inputs["prompt"])
+        else:
+            token_ids = self.tokenizer.encode(
+                inputs["prompt"], add_special_tokens=add_special_tokens
+            )
         return self._process_prompt(token_ids, inputs)
 
     def _process_prompt(

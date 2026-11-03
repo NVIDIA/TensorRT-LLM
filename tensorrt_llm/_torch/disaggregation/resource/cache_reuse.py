@@ -155,15 +155,29 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         # valid_only=False yields one entry per block ordinal, with -1
         # (BAD_PAGE_INDEX) for out-of-window (SWA-evicted) and unbound blocks.
         # Position is the index; no length arithmetic needed.
+        kv_cache = self._mgr.kv_cache_map[req.py_request_id]
+        ordinals = block_ordinals_from_base_indices(kv_cache, group_idx)
+        if ordinals is not None:
+            return ordinals
         return np.fromiter(
-            self._mgr.kv_cache_map[req.py_request_id].get_aggregated_page_indices(
-                group_idx, valid_only=False
-            ),
+            kv_cache.get_aggregated_page_indices(group_idx, valid_only=False),
             dtype=np.int64,
         )
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         self._mgr.try_commit_blocks(req)
+
+
+def block_ordinals_from_base_indices(kv_cache, group_idx: int):
+    """``get_aggregated_page_indices(group_idx, valid_only=False)`` read zero-copy from an active
+    cache's base page indices, which equal it over ``num_blocks`` entries; None otherwise."""
+    if not kv_cache.is_active:
+        return None
+    num_blocks = kv_cache.num_blocks
+    base = kv_cache.get_base_page_indices(group_idx)
+    if len(base) < num_blocks:
+        return None
+    return np.array(base[:num_blocks], dtype=np.int64)
 
 
 def create_cache_reuse_adapter(

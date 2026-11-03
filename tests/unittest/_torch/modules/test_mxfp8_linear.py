@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,18 +22,23 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops as flashinfer_ops_module
+import tensorrt_llm._torch.custom_ops.mxfp8_gemm as mxfp8_gemm_module
 import tensorrt_llm._torch.custom_ops.torch_custom_ops as custom_ops_module
 import tensorrt_llm._torch.modules.linear as linear_module
-from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import (
+    FlashInferMXFP8GemmRunner,
+    MXFP8GemmUnifiedRunner,
+)
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
-    FlashInferMXFP8GemmRunner,
     MXFP8GemmRunner,
     MXFP8QuantizeRunner,
     _get_mxfp8_large_m_tuning_buckets,
     _map_to_mxfp8_large_m_bucket,
 )
 from tensorrt_llm._torch.modules.linear import (
+    _CUTE_DSL_MXFP8_QUANTIZE_MIN_ROWS,
     Linear,
     MXFP8LinearMethod,
     TensorParallelMode,
@@ -42,6 +48,7 @@ from tensorrt_llm._torch.modules.linear import (
     flashinfer_mxfp8_autotune,
     flashinfer_mxfp8_decode_graph_capture,
     get_quant_method,
+    mxfp8_quantize_activation,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
 from tensorrt_llm.mapping import Mapping
@@ -263,6 +270,7 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
 
     method = MXFP8LinearMethod()
+    method.tune_mxfp8_backends = True
     output = method.apply(module, activation, bias=None)
 
     assert output is expected
@@ -279,6 +287,8 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
 
 def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     """Keep native eager GEMM while routing captured work to the opaque wrapper."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
 
@@ -287,7 +297,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "flashinfer",
-        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=Mock()),
+        SimpleNamespace(mm_mxfp8=mm_mxfp8, autotune=nullcontext),
     )
     _, _, _, native_gemm, native_output, autotuned_gemm, autotuned_output = _mock_mxfp8_ops(
         monkeypatch, mm_mxfp8
@@ -322,6 +332,27 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     assert method.apply(module, activation, bias=None) is native_output
     assert native_gemm.call_count == 2
 
+    method.tune_mxfp8_backends = True
+    module.quant_method = method
+    module.mxfp8_allowed_backends = ("cutedsl_swap_ab",)
+    quantize_gemm = Mock(return_value=autotuned_output)
+    prequantized_gemm = Mock(return_value=autotuned_output)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_gemm_autotuned", quantize_gemm)
+    monkeypatch.setattr(projection, "mxfp8_query_gemm", prequantized_gemm)
+    monkeypatch.setattr(projection, "native_mxfp8_gemm", Mock(return_value=native_output))
+    act, scales = torch.empty((2, 4)), torch.empty(512, dtype=torch.uint8)
+    for context in (flashinfer_mxfp8_autotune, flashinfer_mxfp8_decode_graph_capture):
+        with context():
+            assert method.apply(module, activation, bias=None) is autotuned_output
+            assert projection.mxfp8_linear_quantized(module, act, scales) is autotuned_output
+            assert quantize_gemm.call_args.args[-1] == module.mxfp8_allowed_backends
+            assert (
+                prequantized_gemm.call_args.kwargs["allowed_backends"]
+                == module.mxfp8_allowed_backends
+            )
+        assert method.apply(module, activation, bias=None) is native_output
+        assert projection.mxfp8_linear_quantized(module, act, scales) is native_output
+
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["auto", "flashinfer"])
@@ -344,7 +375,7 @@ def test_mxfp8_compile_skips_context_dispatch(
             linear_module, name, SimpleNamespace(get=Mock(side_effect=AssertionError))
         )
     method = MXFP8LinearMethod()
-    method.tune_decode_graph_backends = True
+    method.tune_mxfp8_backends = True
     method.mark_flashinfer_autotuned()
     module = SimpleNamespace(
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
@@ -734,14 +765,13 @@ def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
     not _mxfp8_cutlass_op_available(),
     reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
 )
-@pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
+@pytest.mark.parametrize("batch_size", (1, 192, 257))
 def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_size):
-    """Per-bucket tuned decode graphs must match the native op.
+    """Profile exact shapes through Linear, then reuse the winner during graph replay."""
+    from flashinfer.autotuner import AutoTuner as FlashInferAutoTuner
 
-    Profile the quantizer and GEMM backends for a decode bucket during the
-    warmup-only pass, then capture the same shape and replay it. This covers
-    the CuTeDSL scale layouts and the in-process winner cache used by capture.
-    """
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
     if not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
         pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
 
@@ -775,35 +805,43 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     method = tuned.quant_method
     assert isinstance(method, MXFP8LinearMethod)
     assert method.enable_flashinfer_auto()
-    method.tune_decode_graph_backends = True
+    method.tune_mxfp8_backends = True
 
-    # Record the (quantize, GEMM) tactics each pass selects.
-    chosen_tactics = []
-    choose_tactic = custom_ops_module._choose_mxfp8_tactic
+    profiled = []
+    profile = tuner._profile_single_kernel
 
-    def record_tactic(*args, **kwargs):
-        tactic = choose_tactic(*args, **kwargs)
-        chosen_tactics.append(tactic)
-        return tactic
+    def record_profile(*, runner, inputs, tactic, **kwargs):
+        elapsed = profile(runner=runner, inputs=inputs, tactic=tactic, **kwargs)
+        if isinstance(runner, MXFP8GemmUnifiedRunner):
+            profiled.append((inputs[0].shape[0], tactic))
+        return elapsed
 
-    monkeypatch.setattr(custom_ops_module, "_choose_mxfp8_tactic", record_tactic)
+    monkeypatch.setattr(tuner, "_profile_single_kernel", record_profile)
+    monkeypatch.setattr(
+        FlashInferAutoTuner.get(), "choose_one", Mock(side_effect=AssertionError("Nested tuning"))
+    )
 
     # Both CuTeDSL candidates must run and match, independent of which
     # backend wins the profiling below.
     act, act_scale = MXFP8QuantizeRunner(x.dtype)([x], tactic=MXFP8QuantizeRunner.CUTE_DSL)
-    cute_dsl_output = FlashInferMXFP8GemmRunner(tuned.dtype)(
+    cute_dsl_output = FlashInferMXFP8GemmRunner(tuned.dtype, "flashinfer_cute_dsl")(
         [act, act_scale, tuned.weight, tuned.weight_scale],
-        tactic=FlashInferMXFP8GemmRunner.CUTE_DSL,
     )
     torch.testing.assert_close(cute_dsl_output, native_output, rtol=2e-2, atol=2e-2)
 
-    # Warmup-only pass: profile both backends of each stage for this bucket.
-    with flashinfer_mxfp8_autotune(), flashinfer_mxfp8_decode_graph_capture():
+    # Warmup profiles concrete candidates at this exact row count.
+    with flashinfer_mxfp8_autotune():
         warmup_output = tuned(x)
     torch.testing.assert_close(warmup_output, native_output, rtol=2e-2, atol=2e-2)
-    assert len(chosen_tactics) == 2
-    warmup_tactics = tuple(chosen_tactics)
-    chosen_tactics.clear()
+    assert {rows for rows, _ in profiled} == {batch_size}
+    assert any(tactic[0].startswith("flashinfer_") for _, tactic in profiled)
+    assert any(tactic[0] == "trtllm_cutlass" for _, tactic in profiled)
+    assert {tactic[1] for _, tactic in profiled if tactic[0] == "cutedsl_swap_ab"} == set(range(6))
+    monkeypatch.setattr(
+        tuner, "_profile_single_kernel", Mock(side_effect=AssertionError("Unexpected retuning"))
+    )
+    with flashinfer_mxfp8_autotune():
+        torch.testing.assert_close(tuned(x), warmup_output, rtol=0, atol=0)
 
     # Capture pass: the in-process winners are reused without profiling.
     static_x = x.clone()
@@ -812,13 +850,14 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     with torch.cuda.graph(graph):
         with flashinfer_mxfp8_decode_graph_capture():
             graph_output = tuned(static_x)
-    assert tuple(chosen_tactics) == warmup_tactics
 
     # Replay on a fresh input so the check cannot pass on the captured result.
     replay_x = torch.randn_like(x)
     static_x.copy_(replay_x)
     graph.replay()
     torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
+
+    tuner._profile_single_kernel.assert_not_called()
 
 
 def _even_rows(rows: int, rank: int, tp_size: int) -> tuple[int, int]:
@@ -922,3 +961,327 @@ def test_mxfp8_fused_scales_follow_weight_rows_per_tp_rank(weight_mode, shard_ro
         # Dynamic MXFP8 activations cost about 1% relative error; a scale row
         # on the wrong weight row is off by at least a factor of two.
         assert rel < 0.05, (rank, float(rel))
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available() or not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    reason="Needs the native MXFP8 quantizer and FlashInfer's CuTeDSL one",
+)
+def test_mxfp8_quantize_activation_matches_native():
+    x = torch.randn(_CUTE_DSL_MXFP8_QUANTIZE_MIN_ROWS, 1280, dtype=torch.bfloat16, device="cuda")
+    act, act_scale = mxfp8_quantize_activation(x)
+    native_act, native_scale = torch.ops.trtllm.mxfp8_quantize(x, True)
+    assert torch.equal(act.view(torch.uint8), native_act.view(torch.uint8))
+    assert torch.equal(act_scale.view(torch.uint8), native_scale.view(torch.uint8))
+
+
+def _meta_mxfp8_inputs():
+    return [
+        torch.empty((3, 32), dtype=torch.float8_e4m3fn, device="meta"),
+        torch.empty(512, dtype=torch.uint8, device="meta"),
+        torch.empty((16, 32), dtype=torch.float8_e4m3fn, device="meta"),
+        torch.empty(512, dtype=torch.uint8, device="meta"),
+    ]
+
+
+def _mxfp8_swapab_inputs(rows, n, k):
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+    activation = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+    weight_fp8, weight_scale = torch.ops.trtllm.mxfp8_quantize(weight, True)
+    activation_fp8, activation_scale = torch.ops.trtllm.mxfp8_quantize(activation, True)
+    return [
+        activation_fp8,
+        activation_scale.view(torch.uint8),
+        weight_fp8,
+        weight_scale.view(torch.uint8),
+    ]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="Needs SM100, SM103 or SM107",
+)
+@pytest.mark.parametrize("tactic", range(6))
+@pytest.mark.parametrize("rows,n,k", [(192, 1792, 5120), (1, 8, 32), (257, 136, 96)])
+@torch.inference_mode()
+def test_mxfp8_swapab_matches_reference(rows, n, k, tactic):
+    """Both tiles handle projection sizes and M/N/K tails against an independent reference."""
+    from tensorrt_llm._torch.modules.mxfp8_swapab import MXFP8SwapABGemmRunner
+    from tensorrt_llm._torch.utils import unswizzle_sf
+
+    def dequantize(values, scales):
+        m, k = values.shape
+        linear_scales = unswizzle_sf(
+            scales, ((m + 127) // 128) * 128, ((k + 127) // 128) * 128, 32
+        )[:m, : k // 32]
+        return dequant_mxfp8_weight(values, linear_scales).double()
+
+    inputs = _mxfp8_swapab_inputs(rows, n, k)
+    act, act_scale, weight, weight_scale = inputs
+    expected = (dequantize(act, act_scale) @ dequantize(weight, weight_scale).t()).bfloat16()
+    runner = MXFP8SwapABGemmRunner(torch.bfloat16)
+    actual = runner(inputs, tactic=tactic)
+    assert actual.shape == (rows, n) and actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available()
+    or not IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Needs SM100/SM103, the native MXFP8 GEMM and FlashInfer's CuTeDSL MXFP8 kernels",
+)
+@torch.inference_mode()
+def test_mxfp8_projection_gemms_keep_the_native_bits(monkeypatch):
+    """At the DeepSeek-V4.1 projection shapes, every tactic of the decode-step tuner (ll, mid and
+    hi rows) and the decoder pass's dense CuTe DSL GEMM, eager and captured, give the native GEMM's
+    bits; the small-M kernel gives the same bits with two tiles per CTA as with one."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import dense_mxfp8_gemm
+    from tensorrt_llm._torch.modules.low_m_gemm import mxfp8_lowm_linear
+
+    native = MXFP8GemmRunner(torch.bfloat16).mxfp8_gemm_runner
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16)
+    alpha = torch.ones(1, dtype=torch.float32, device="cuda")
+    torch.manual_seed(0)
+
+    def quantize(rows, columns, scale=1.0):
+        return torch.ops.trtllm.mxfp8_quantize(
+            torch.randn(rows, columns, device="cuda", dtype=torch.bfloat16) * scale, True
+        )
+
+    def unified_inputs(x, weight, weight_scale):
+        act, act_scale = torch.ops.trtllm.mxfp8_quantize(x, True)
+        return [act, act_scale.view(torch.uint8), weight, weight_scale.view(torch.uint8)]
+
+    # Decode steps: the fused Q-A + KV and the O-B projection.
+    for n, k in ((1792, 5120), (5120, 8192)):
+        weight, weight_scale = quantize(n, k, 0.02)
+        for rows in (6, 150, 1280):
+            x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+            inputs = unified_inputs(x, weight, weight_scale)
+            expected = native.run_gemm(*inputs[:2], weight, weight_scale, alpha, -1)
+            tactics = runner.get_valid_tactics(inputs, None)
+            assert {backend for backend, _ in tactics} == set(
+                mxfp8_gemm_module.MXFP8_DEFAULT_BACKENDS
+            )
+            for tactic in tactics:
+                assert torch.equal(runner(inputs, tactic=tactic), expected), (rows, tactic)
+            # A row's output does not depend on the other rows.
+            one = runner(unified_inputs(x[:1], weight, weight_scale), tactic=tactics[0])
+            assert torch.equal(one, expected[:1]), rows
+
+    # The decode-step tuner profiles every tactic with a cold L2; the ranks then agree.
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    cold = []
+    profile = tuner._profile_cold_l2
+
+    def record(*args, **kwargs):
+        cold.append(1)
+        return profile(*args, **kwargs)
+
+    monkeypatch.setattr(tuner, "_profile_cold_l2", record)
+    inputs = unified_inputs(
+        torch.randn(150, k, device="cuda", dtype=torch.bfloat16), weight, weight_scale
+    )
+    with autotune(skip_dynamic_tuning_buckets=True):
+        _, tactic = tuner.choose_one("test::mxfp8_unified", [runner], runner.tuning_config, inputs)
+    assert cold and tactic in runner.get_valid_tactics(inputs, None)
+    mxfp8_gemm_module.agree_mxfp8_tactics("test::mxfp8_unified")
+    assert not AutoTuner.L2_FLUSH_BUFFERS
+
+    # An attention-DP context's decoder pass: Q-B and O-B, captured once an eager call compiled it.
+    for n, k in ((32768, 1280), (5120, 8192)):
+        weight, weight_scale = quantize(n, k, 0.02)
+        for rows in (384, 1152):
+            act, act_scale = quantize(rows, k)
+            expected = native.run_gemm(act, act_scale, weight, weight_scale, alpha, -1)
+            operands = (act, act_scale.view(-1), weight, weight_scale.view(-1), alpha)
+            eager = dense_mxfp8_gemm(*operands)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = dense_mxfp8_gemm(*operands)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(eager, expected) and torch.equal(captured, expected), (n, rows)
+
+    # Small-M decode steps: fused Q-A + KV, and Q-B with and without the folded q_norm.
+    norm = (torch.rand(1280, device="cuda") + 0.5).bfloat16(), 1e-6
+    for n, k, kwargs in (
+        (1792, 5120, {"split_n": 1280}),
+        (4096, 1280, {}),
+        (4096, 1280, {"rms_norm": norm}),
+    ):
+        weight, weight_scale = quantize(n, k, 0.02)
+        for rows in (6, 16):
+            x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+            one, two = (
+                mxfp8_lowm_linear(
+                    x, weight, weight_scale.view(-1), scale_swizzled=True, n_tiles=tiles, **kwargs
+                )
+                for tiles in (1, 2)
+            )
+            for got, want in zip(*((y,) if torch.is_tensor(y) else y for y in (two, one))):
+                assert torch.equal(got, want), (n, rows, kwargs.keys())
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "flashinfer_warmup,outer_tuning,outer_skip_buckets",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_mxfp8_tuning_scope_preserves_other_ops(
+    monkeypatch, flashinfer_warmup, outer_tuning, outer_skip_buckets
+):
+    """Only the FlashInfer context enables profiling; local bucket policy never leaks."""
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=nullcontext))
+    inputs = _meta_mxfp8_inputs()
+    monkeypatch.setattr(MXFP8GemmUnifiedRunner, "forward", lambda *a, **k: inputs[0])
+    monkeypatch.setattr(MXFP8QuantizeRunner, "forward", lambda *a, **k: tuple(inputs[:2]))
+
+    def choose_one(custom_op, runners, tuning_config, selected_inputs):
+        assert tuner.is_tuning_mode == flashinfer_warmup
+        assert tuner.skip_dynamic_tuning_buckets
+        return runners[0], -1
+
+    monkeypatch.setattr(tuner, "choose_one", choose_one)
+    with (
+        autotune(tune_mode=outer_tuning, skip_dynamic_tuning_buckets=outer_skip_buckets),
+        flashinfer_mxfp8_autotune() if flashinfer_warmup else nullcontext(),
+    ):
+        custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16)
+        assert (tuner.is_tuning_mode, tuner.skip_dynamic_tuning_buckets) == (
+            outer_tuning,
+            outer_skip_buckets,
+        )
+        custom_ops_module.mxfp8_quantize_gemm_autotuned(inputs[0], *inputs[2:], torch.bfloat16)
+        assert (tuner.is_tuning_mode, tuner.skip_dynamic_tuning_buckets) == (
+            outer_tuning,
+            outer_skip_buckets,
+        )
+    assert not tuner.is_tuning_mode and not tuner.skip_dynamic_tuning_buckets
+    assert not linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "phase,enable_autotuner",
+    [("warmup", True), ("warmup", False), ("capture", True), ("context", True)],
+)
+def test_mxfp8_decode_graph_warmup_autotunes_automatically(monkeypatch, phase, enable_autotuner):
+    """Engine FlashInfer warmup leaves other operators' tuning and bucket modes intact."""
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=nullcontext))
+    method = Mock(spec=MXFP8LinearMethod)
+    method.needs_flashinfer_autotune = enable_autotuner
+    method.tune_mxfp8_backends = enable_autotuner
+    runner = object.__new__(DecoderCudaGraphs)
+    runner.model = SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)])
+    runner._config = SimpleNamespace(
+        enable_autotuner=enable_autotuner,
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
+    )
+    runner.cuda_graph_runner = SimpleNamespace(enabled=True, is_warmup_only=phase != "capture")
+    runner._metrics = {}
+    runner.maybe_autotune_lora = nullcontext
+    manager = SimpleNamespace(context_swa_layer_limit=1) if phase == "context" else None
+    resources = SimpleNamespace(get_resource_manager=lambda key: manager)
+    observed = []
+
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+
+    def generation_warmup(resource_manager):
+        observed.append(
+            (
+                tuner.is_tuning_mode,
+                tuner.skip_dynamic_tuning_buckets,
+                linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get(),
+            )
+        )
+
+    runner._capture_generation_cuda_graphs = generation_warmup
+    runner._capture_additional_cuda_graphs = Mock()
+    runner._capture_prefill_cuda_graphs = Mock()
+    runner.run_cuda_graph_warmup(resources)
+    tune = phase == "warmup" and enable_autotuner
+    assert observed == ([] if phase == "context" else [(False, False, tune, True)])
+    assert not tuner.is_tuning_mode and not tuner.skip_dynamic_tuning_buckets
+    assert not linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+    assert not linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="Needs SM100, SM103 or SM107",
+)
+@pytest.mark.parametrize(
+    "backend,swapab_tile",
+    [
+        ("flashinfer_cutlass", None),
+        ("flashinfer_cute_dsl", None),
+        ("cutedsl_swap_ab", 0),
+        ("cutedsl_swap_ab", 1),
+    ],
+)
+@torch.inference_mode()
+def test_mxfp8_loaded_tactic_primes_before_graph_capture(
+    monkeypatch, tmp_path, backend, swapab_tile
+):
+    """Loaded winners compile before capture and replay without either tuner profiling."""
+    from flashinfer.autotuner import AutoTuner as FlashInferAutoTuner
+    from flashinfer.gemm import gemm_base
+
+    from tensorrt_llm._torch.modules import mxfp8_swapab
+
+    inputs = _mxfp8_swapab_inputs(32, 256, 512)
+    runner = MXFP8GemmUnifiedRunner(torch.bfloat16, (backend,))
+    tactic = (
+        (backend, swapab_tile)
+        if swapab_tile is not None
+        else runner.get_valid_tactics(inputs, None)[0]
+    )
+    reference = runner(inputs, tactic=tactic)
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    key = tuner.profiling_cache.get_cache_key(
+        custom_ops_module._MXFP8_GEMM_AUTOTUNED_OP,
+        runner,
+        tuple(x.shape for x in inputs),
+        runner.tuning_config,
+    )
+    tuner.profiling_cache[key] = (0, tactic, 0.1)
+    path = tmp_path / "mxfp8-tactics.json"
+    tuner.profiling_cache.save_cache(path, rank=0)
+    reloaded = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", reloaded)
+    reloaded.profiling_cache.load_cache(path, rank=0)
+    monkeypatch.setattr(
+        reloaded, "_profile_single_kernel", Mock(side_effect=AssertionError("Retuning"))
+    )
+    monkeypatch.setattr(
+        FlashInferAutoTuner.get(), "choose_one", Mock(side_effect=AssertionError("Nested tuning"))
+    )
+    monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
+    monkeypatch.setattr(mxfp8_swapab, "_COMPILED", {})
+    mxfp8_gemm_module._flashinfer_runner.cache_clear()
+    with flashinfer_mxfp8_autotune():
+        actual = custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, (backend,))
+    torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16, (backend,))
+    new_inputs = _mxfp8_swapab_inputs(32, 256, 512)
+    for destination, source in zip(inputs, new_inputs):
+        destination.copy_(source)
+    graph.replay()
+    torch.testing.assert_close(captured, runner(inputs, tactic=tactic), atol=0, rtol=0)
+    reloaded._profile_single_kernel.assert_not_called()

@@ -33,7 +33,7 @@ from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
-from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
@@ -660,6 +660,10 @@ def worker_main(
                     # ranks.
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
+                if (isinstance(llm_args, TorchLlmArgs)
+                        and llm_args.enable_client_io_during_gpu_wait):
+                    # Parse each received request while the executor waits on the GPU.
+                    request_queue.parse_gate = worker.engine.wait_for_intake_window
 
                 for req in _incoming_requests(request_queue):
                     if isinstance(req, CancellingRequest):

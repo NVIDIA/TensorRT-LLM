@@ -141,7 +141,8 @@ def _reference(
     ("invalid_case", "reason"),
     [
         ("q_dtype", "q dtype must be BF16"),
-        ("block_size", "draft block size must be 5 or 6"),
+        ("head_count", "q must have 8, 16, 32, 64 or 128 heads"),
+        ("block_size", "draft block size must be 1 to 8"),
         ("valid_len_dtype", "valid_len must use INT64"),
         ("freqs_shape", "inverse_rope_freqs shape must be"),
     ],
@@ -158,9 +159,11 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     inputs = [q, kv_cache, _legacy_valid_len(start_pos), sink, freqs]
     if invalid_case == "q_dtype":
         inputs[0] = q.float()
+    elif invalid_case == "head_count":
+        inputs[0] = q[:, :, :96].contiguous()
+        inputs[3] = sink[:96].contiguous()
     elif invalid_case == "block_size":
-        inputs[0] = q[:, :4].contiguous()
-        inputs[4] = freqs[:, :4].contiguous()
+        inputs[0] = q.repeat(1, 2, 1, 1)[:, :9].contiguous()
     elif invalid_case == "valid_len_dtype":
         inputs[2] = inputs[2].to(torch.int32)
     else:
@@ -183,7 +186,7 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     "invalid_case,reason",
     [
         ("q_dtype", "must use BF16"),
-        ("block_size", "requires block 5/6"),
+        ("block_size", "requires a 1-8 token block"),
         ("heads", "64/128 heads"),
         ("page_size", "16/32/64/128/256-token pages"),
         ("draft_shape", "draft KV must have shape"),
@@ -204,7 +207,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
     if invalid_case == "q_dtype":
         inputs["q"] = inputs["q"].float()
     elif invalid_case == "block_size":
-        inputs["q"] = inputs["q"][:, :4].contiguous()
+        inputs["q"] = inputs["q"].repeat(1, 2, 1, 1)[:, :9].contiguous()
     elif invalid_case == "heads":
         inputs["q"] = inputs["q"][:, :, :24].contiguous()
     elif invalid_case == "page_size":
@@ -235,9 +238,11 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         attention_op.fused_dsv4_dspark_attention(**inputs)
 
 
-@pytest.mark.parametrize("heads", (64, 128))
-@pytest.mark.parametrize("block", (5, 6))
-@pytest.mark.parametrize("page_size", (16, 32, 64, 128, 256))
+@pytest.mark.parametrize(
+    "heads,block,page_size",
+    [(h, b, p) for h in (64, 128) for b in (5, 6) for p in (16, 32, 64, 128, 256)]
+    + [(h, b, 128) for h in (64, 128) for b in (1, 3, 8)],
+)
 def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
     inputs = _make_inputs(
         29,
@@ -927,3 +932,279 @@ def test_production_ring_fused_qkv_layout_numbers_and_graph(monkeypatch, batch, 
         torch.testing.assert_close(captured, expected, rtol=8e-2, atol=1e-2)
         torch.testing.assert_close(cache, expected_cache, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(cache[1], initial[1], rtol=0, atol=0)
+
+
+# The PyTorch reference serves GPUs and shapes the fused kernel does not cover.
+@pytest.mark.parametrize("fused", (True, False), ids=("cute_dsl", "reference"))
+@pytest.mark.parametrize("persist", (False, True))
+@pytest.mark.parametrize("heads,block,q_b_norm_enabled", ((128, 6, True), (64, 5, False)))
+def test_dspark_attention_forward_batched_matches_scalar_reference(
+    monkeypatch, fused, persist, heads, block, q_b_norm_enabled
+):
+    import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
+
+    torch.manual_seed(17)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch, hidden = 2, 64
+    head_dim, rope_dim = 512, 64
+    q_rank, groups, o_rank, window = 1024, 8, 32, 128
+
+    def scaled_randn(*shape):
+        return torch.randn(*shape, device=device, dtype=dtype) * 0.02
+
+    x = torch.randn(batch, block, hidden, device=device, dtype=dtype) * 0.1
+    main_x = torch.randn(batch, 1, hidden, device=device, dtype=dtype) * 0.1
+    start_pos = torch.tensor([5, 390], device=device, dtype=torch.long)
+    slots = torch.tensor([1, 0], device=device, dtype=torch.long)
+    # The scalar reference attends every written window row.
+    valid_len = torch.tensor([6, 128], device=device, dtype=torch.long)
+    kwargs = {
+        "wq_a": scaled_randn(q_rank, hidden),
+        "q_norm_w": torch.ones(q_rank, device=device, dtype=dtype),
+        "wq_b": scaled_randn(heads * head_dim, q_rank),
+        "wkv": scaled_randn(head_dim, hidden),
+        "kv_norm_w": torch.ones(head_dim, device=device, dtype=dtype),
+        "wo_a": scaled_randn(groups * o_rank, heads * head_dim // groups),
+        "wo_b": scaled_randn(hidden, groups * o_rank),
+        "attn_sink": torch.randn(heads, device=device, dtype=torch.float32) * 0.1,
+        "n_heads": heads,
+        "head_dim": head_dim,
+        "rope_head_dim": rope_dim,
+        "n_groups": groups,
+        "o_lora_rank": o_rank,
+        "window_size": window,
+        "eps": 1e-6,
+        "softmax_scale": head_dim**-0.5,
+        "freqs_cis": dspark_attention.precompute_dspark_freqs_cis(rope_dim, 512, device=device),
+        "persist": persist,
+        "q_b_norm_enabled": q_b_norm_enabled,
+    }
+    cache_storage = torch.randn(3, 3, window, head_dim, device=device, dtype=dtype) * 0.1
+    op_cache = cache_storage[:, 1]
+    reference_cache = op_cache.clone()
+    calls = {
+        "fused_attention": 0,
+        "cache_write": 0,
+        "draft_block": 0,
+        "rmsnorm_rope": 0,
+    }
+    op_attention = dspark_attention.fused_dsv4_dspark_attention
+    op_cache_write = dspark_attention.cute_dsl_dspark_rmsnorm_rope_cache_write
+    op_draft_block = dspark_attention.cute_dsl_dspark_rmsnorm_rope_draft_block
+    op_rmsnorm_rope = dspark_attention.cute_dsl_dspark_rmsnorm_rope
+
+    def counted_attention(*args):
+        calls["fused_attention"] += 1
+        return op_attention(*args)
+
+    def counted_cache_write(*args):
+        calls["cache_write"] += 1
+        return op_cache_write(*args)
+
+    def counted_draft_block(*args):
+        calls["draft_block"] += 1
+        return op_draft_block(*args)
+
+    def counted_rmsnorm_rope(*args):
+        calls["rmsnorm_rope"] += 1
+        return op_rmsnorm_rope(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dspark_attention, "fused_dsv4_dspark_attention", counted_attention)
+        patch.setattr(
+            dspark_attention,
+            "cute_dsl_dspark_rmsnorm_rope_cache_write",
+            counted_cache_write,
+        )
+        patch.setattr(
+            dspark_attention,
+            "cute_dsl_dspark_rmsnorm_rope_draft_block",
+            counted_draft_block,
+        )
+        patch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_rope", counted_rmsnorm_rope)
+        if not fused:
+            patch.setattr(
+                dspark_attention, "is_fused_dsv4_dspark_attention_supported", lambda *args: False
+            )
+        actual = dspark_attention.dspark_attention_forward_batched(
+            x, main_x, start_pos, op_cache, slots, valid_len, **kwargs
+        )
+
+    # Main K/V and block K/V reuse their existing RMSNorm/RoPE launches for
+    # physical preparation; q_a takes the row RMSNorm kernel and only the
+    # per-head q with its norm uses the generic op (without it the RoPE tails
+    # rotate in place).
+    if fused:
+        assert calls == {
+            "fused_attention": 1,
+            "cache_write": 1,
+            "draft_block": 1,
+            "rmsnorm_rope": int(q_b_norm_enabled),
+        }
+    else:
+        assert calls["fused_attention"] == 0
+
+    expected = torch.cat(
+        [
+            dspark_attention._dspark_attention_forward_legacy(
+                x[i : i + 1],
+                main_x[i : i + 1],
+                int(start_pos[i]),
+                reference_cache[int(slots[i]) : int(slots[i]) + 1],
+                **kwargs,
+            )
+            for i in range(batch)
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
+    torch.testing.assert_close(op_cache, reference_cache, rtol=2e-2, atol=2e-2)
+
+
+_TP_HIDDEN, _TP_Q_RANK, _TP_HEADS, _TP_HEAD_DIM = 5120, 1280, 64, 512
+_TP_GROUPS, _TP_O_RANK, _TP_WINDOW, _TP_EPS = 8, 1024, 128, 1e-20
+
+
+def _fp8_rows(n, k, std, gen):
+    """E4M3 weight with UE8M0 32x32 block scales: (e4m3, linear [n, k/32] UE8M0, exact BF16)."""
+    w = torch.randn(n, k, generator=gen, device="cuda") * std
+    blocks = w.view(n // 32, 32, k // 32, 32).abs().amax(dim=(1, 3))
+    exp = torch.ceil(torch.log2(blocks / 448.0)).clamp(-127, 127)
+    scale = torch.exp2(exp).repeat_interleave(32, 0).repeat_interleave(32, 1)
+    q = (w / scale).to(torch.float8_e4m3fn)
+    rows = (exp + 127).to(torch.uint8).repeat_interleave(32, 0).contiguous()
+    return q, rows, (q.float() * scale).to(torch.bfloat16)
+
+
+def _tp_weights(tp):
+    import types
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    wq_a = _fp8_rows(_TP_Q_RANK, _TP_HIDDEN, 0.02, gen)
+    wkv = _fp8_rows(_TP_HEAD_DIM, _TP_HIDDEN, 0.02, gen)
+    wq_b = _fp8_rows(_TP_HEADS * _TP_HEAD_DIM, _TP_Q_RANK, 0.03, gen)
+    wo_a = _fp8_rows(_TP_GROUPS * _TP_O_RANK, _TP_HEADS * _TP_HEAD_DIM // _TP_GROUPS, 0.02, gen)
+    wo_b = _fp8_rows(_TP_HIDDEN, _TP_GROUPS * _TP_O_RANK, 0.02, gen)
+    full = dict(
+        wq_a=wq_a[2],
+        wq_b=wq_b[2],
+        wkv=wkv[2],
+        wo_a=wo_a[2],
+        wo_b=wo_b[2],
+        q_norm_w=(1 + 0.1 * torch.randn(_TP_Q_RANK, generator=gen, device="cuda")).bfloat16(),
+        kv_norm_w=(1 + 0.1 * torch.randn(_TP_HEAD_DIM, generator=gen, device="cuda")).bfloat16(),
+        attn_sink=torch.randn(_TP_HEADS, generator=gen, device="cuda"),
+    )
+    qkv = (
+        torch.cat([wq_a[0], wkv[0]]).contiguous(),
+        torch.cat([wq_a[1], wkv[1]]).contiguous(),
+        _TP_Q_RANK,
+    )
+    heads, groups = _TP_HEADS // tp, _TP_GROUPS // tp
+    shards = []
+    for r in range(tp):
+        q_rows = slice(r * heads * _TP_HEAD_DIM, (r + 1) * heads * _TP_HEAD_DIM)
+        g_rows = slice(r * groups * _TP_O_RANK, (r + 1) * groups * _TP_O_RANK)
+        attn = types.SimpleNamespace(
+            qk_head_dim=_TP_HEAD_DIM,
+            num_heads_tp=heads,
+            wq_b=types.SimpleNamespace(
+                weight=wq_b[0][q_rows].contiguous(), _lowm_scale_lin=wq_b[1][q_rows].contiguous()
+            ),
+            o_a_proj=wo_a[0][g_rows].contiguous().view(groups, _TP_O_RANK, -1),
+            o_b_proj=types.SimpleNamespace(
+                weight=wo_b[0][:, g_rows].contiguous(),
+                _lowm_scale_lin=wo_b[1][:, g_rows.start // 32 : g_rows.stop // 32].contiguous(),
+            ),
+            attn_sink=full["attn_sink"][r * heads : (r + 1) * heads].contiguous(),
+        )
+        shards.append((attn, wo_a[1][g_rows].contiguous()))
+    return full, qkv, shards
+
+
+def test_tp_attention_shards_sum_to_replicated():
+    """The TP head shards of ``dspark_attention_forward_tp`` sum to the replicated BF16 path on
+    the exact dequantization of the same FP8 weights, up to BF16 rounding, and every shard
+    writes the replicated path's main-KV frame."""
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        DSparkTPAttentionStep,
+        _prepare_dspark_attention_rope,
+        dspark_attention_forward_batched,
+        dspark_attention_forward_tp,
+    )
+
+    block, batch = 5, 3
+    full, qkv, shards = _tp_weights(8)
+    gen = torch.Generator(device="cuda").manual_seed(batch)
+    x = torch.randn(batch, block, _TP_HIDDEN, generator=gen, device="cuda").bfloat16()
+    main_x = torch.randn(batch, 1, _TP_HIDDEN, generator=gen, device="cuda").bfloat16()
+    window = (
+        torch.randn(batch + 1, _TP_WINDOW, _TP_HEAD_DIM, generator=gen, device="cuda") / 2
+    ).bfloat16()
+    slots = torch.arange(batch, device="cuda")
+    start_pos = 3000 + 7 * torch.arange(batch, device="cuda")
+    valid_len = torch.tensor([100, 128, 3][:batch], device="cuda")
+    freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 4000, device="cuda")
+    rope = _prepare_dspark_attention_rope(start_pos, block, freqs)
+    softmax_scale = _TP_HEAD_DIM**-0.5
+
+    reference_window = window.clone()
+    expected = dspark_attention_forward_batched(
+        x,
+        main_x,
+        start_pos,
+        reference_window,
+        slots,
+        valid_len,
+        persist=True,
+        rope_metadata=rope,
+        freqs_cis=freqs,
+        q_b_norm_enabled=False,
+        n_heads=_TP_HEADS,
+        head_dim=_TP_HEAD_DIM,
+        rope_head_dim=_ROPE_DIM,
+        n_groups=_TP_GROUPS,
+        o_lora_rank=_TP_O_RANK,
+        window_size=_TP_WINDOW,
+        eps=_TP_EPS,
+        softmax_scale=softmax_scale,
+        **full,
+    )
+
+    rows = batch * block
+    inverse = torch.view_as_real(rope[1])
+    step = DSparkTPAttentionStep(
+        main_rope_freqs=torch.view_as_real(rope[0]).reshape(-1, _ROPE_DIM // 2, 2),
+        block_freqs=rope[1],
+        positions=torch.arange(rows, device="cuda", dtype=torch.int32),
+        rope_table=inverse.view(rows, _ROPE_DIM // 2, 2).transpose(1, 2).contiguous(),
+        inverse_rope_freqs=inverse,
+        block_rope_freqs=inverse.view(rows, _ROPE_DIM // 2, 2),
+    )
+    tp_window = window.clone()
+    partials = [
+        dspark_attention_forward_tp(
+            x,
+            main_x,
+            start_pos,
+            tp_window,
+            slots,
+            valid_len,
+            step,
+            attn=attn,
+            qkv=qkv,
+            wo_a_scale=wo_a_scale,
+            wkv=full["wkv"],
+            q_norm_w=full["q_norm_w"],
+            kv_norm_w=full["kv_norm_w"],
+            eps=_TP_EPS,
+            softmax_scale=softmax_scale,
+        )
+        for attn, wo_a_scale in shards
+    ]
+    torch.testing.assert_close(tp_window, reference_window, rtol=0, atol=0)
+    # The all-reduce: FP32 sum in rank order, one BF16 rounding.
+    actual = torch.stack([p.float() for p in partials]).sum(0).bfloat16()
+    diff = actual.float() - expected.float()
+    assert diff.norm() / expected.float().norm() < 1e-2

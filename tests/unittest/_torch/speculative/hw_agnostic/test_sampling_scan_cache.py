@@ -18,6 +18,7 @@ class _Req:
         self.py_request_id, self.py_seq_slot, self.temperature = rid, slot, temperature
         self.params = dict(top_k=20, top_p=0.9, min_p=None, seed=None) | params
         self.state = LlmRequestState.GENERATION_IN_PROGRESS
+        self.py_spec_sampling_params = None
         self.reads = 0
 
     @property
@@ -31,6 +32,8 @@ def _metadata(**overrides):
         runtime_draft_len=6,
         is_ragged_verify=False,
         group_all_greedy_sample=None,
+        group_all_temperature_only=None,
+        samples_from_vocab_shards=False,
         dummy_slot_row=8,
         _sampling_scan_cache=None,
         temperature_only_graphs=False,
@@ -47,15 +50,18 @@ def _scan(metadata, requests):
 
 
 def _rescanned(metadata, requests):
+    # The scan caches normalized params on the request; clear them so a rescan reads the config again.
+    requests[0].py_spec_sampling_params = None
     before = requests[0].reads
     result = _scan(metadata, requests)
+    rescanned = requests[0].reads > before
     fresh = _metadata(
         runtime_draft_len=metadata.runtime_draft_len,
         is_ragged_verify=metadata.is_ragged_verify,
         group_all_greedy_sample=metadata.group_all_greedy_sample,
     )
     assert result == _scan(fresh, requests)
-    return requests[0].reads > before + 1
+    return rescanned
 
 
 def test_scan_cache_reuses_and_rescans_on_changes():

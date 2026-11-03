@@ -51,11 +51,11 @@ def _gen_dspark_context_wkv_m_profiles(max_m: int) -> Tuple[int, ...]:
     return tuple(buckets)
 
 
-_DSV4_DSPARK_NUM_HEADS = (64, 128)
+_DSV4_DSPARK_NUM_HEADS = (8, 16, 32, 64, 128)
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_WINDOW_SIZE = 128
 _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE = 8
-_DSV4_DSPARK_BLOCK_SIZES = (5, 6)
+_DSV4_DSPARK_BLOCK_SIZES = tuple(range(1, _DSV4_DSPARK_DRAFT_BLOCK_STORAGE_SIZE + 1))
 _DSV4_DSPARK_ROPE_DIM = 64
 
 
@@ -190,7 +190,8 @@ def _run_paged_dspark_attention(
         or page_size not in (16, 32, 64, 128, 256)
     ):
         raise ValueError(
-            "DSpark requires block 5/6, 64/128 heads, head_dim 512 and 16/32/64/128/256-token pages"
+            "DSpark requires a 1-8 token block, 8/16/32/64/128 heads, head_dim 512 and "
+            "16/32/64/128/256-token pages"
         )
     if q.dtype != torch.bfloat16 or draft_block.dtype != q.dtype or kv_pages.dtype != q.dtype:
         raise ValueError("DSpark Q, draft KV and pages must use BF16")
@@ -499,11 +500,13 @@ def is_fused_dsv4_dspark_attention_supported(
         return _log_unsupported(
             f"expected q/kv_cache ranks 4/3, got {q.ndim}/{kv_cache.ndim}", "tensor_ranks"
         )
+    if q.shape[0] == 0:
+        return _log_unsupported("batch must be nonempty", "batch_size")
     if q.shape[1] not in _DSV4_DSPARK_BLOCK_SIZES:
-        return _log_unsupported(f"draft block size must be 5 or 6, got {q.shape[1]}", "block_size")
+        return _log_unsupported(f"draft block size must be 1 to 8, got {q.shape[1]}", "block_size")
     if q.shape[2] not in _DSV4_DSPARK_NUM_HEADS or q.shape[3] != _DSV4_DSPARK_HEAD_DIM:
         return _log_unsupported(
-            "q must have 128 heads and head_dim 512; "
+            "q must have 8, 16, 32, 64 or 128 heads and head_dim 512; "
             f"got {q.shape[2]} heads and head_dim {q.shape[3]}",
             "q_shape",
         )
@@ -553,7 +556,11 @@ def is_fused_dsv4_dspark_attention_supported(
 
 def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: int) -> None:
     """Best-effort prewarm of the production DSV4 DSpark fused-op path."""
-    if _get_dspark_arch_str() is None or block_size not in _DSV4_DSPARK_BLOCK_SIZES:
+    if (
+        _get_dspark_arch_str() is None
+        or block_size not in _DSV4_DSPARK_BLOCK_SIZES
+        or num_heads not in _DSV4_DSPARK_NUM_HEADS
+    ):
         return
 
     batch = 1

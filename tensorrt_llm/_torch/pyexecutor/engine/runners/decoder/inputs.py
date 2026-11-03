@@ -2,22 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decoder input preparation state."""
 
+import contextlib
+import itertools
 import math
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
+import numpy as np
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor import step_inputs
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
@@ -51,7 +56,11 @@ from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_T
 from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
-from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    helix_local_len,
+    set_per_request_prefill_cuda_graph_flag,
+)
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
@@ -70,6 +79,7 @@ from ..common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_position_id_offset,
+    get_top_level_model,
     pad_input_tokens,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
@@ -79,6 +89,7 @@ from ..common import (
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
 from .metadata import set_spec_metadata_all_rank_num_tokens
+from .spec_overlap_inputs import stage_spec_overlap_inputs
 
 
 def resolve_runtime_draft_len(
@@ -263,7 +274,6 @@ class HostLists:
     mrope_delta_read_seq_slots: list[int] = field(default_factory=list)
     # will contain previous batch indices of generation requests
     previous_batch_indices: list[int] = field(default_factory=list)
-    previous_pos_indices: list[int] = field(default_factory=list)
     # Half-open token-row spans of padding requests (CUDA-graph and
     # attention-DP dummies) whose input ids are not appended to the host
     # ``input_ids`` list; zero-filled after the input-id copies.
@@ -340,6 +350,7 @@ class DecoderInputPreparer:
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
     # The model's decode prologue (RuntimeHooks.decode_prologue), set by the runner.
     decode_prologue: DecodePrologue | None = None
+    _spec_overlap_staging = False
 
     def __init__(
         self,
@@ -355,6 +366,7 @@ class DecoderInputPreparer:
         use_beam_search: bool,
         steady_gen_cache_supported: bool,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
+        host_uploader: HostUploader | None = None,
     ) -> None:
         self._buffers = buffers
         self._pinned_host_cache = {}
@@ -446,6 +458,19 @@ class DecoderInputPreparer:
         self.previous_request_ids = []
         self.previous_verify_lens = [] if self._dspark_trims_submitted_tokens else None
         self.has_previous_device_draft = False
+        self._host_uploader = host_uploader
+        # Overlap-scheduled speculative steps stage their inputs in one launch;
+        # MRoPE, helix, ragged verification and a model's own step fold keep the
+        # per-buffer copies.
+        self._spec_overlap_staging = (
+            host_uploader is not None
+            and config.is_spec_decode
+            and not config.disable_overlap_scheduler
+            and not config.use_mrope
+            and not self._dspark_trims_submitted_tokens
+            and not mapping.has_cp_helix()
+            and self.runtime_hooks.spec_step_fold is None
+        )
 
     def _new_extra_inputs(self) -> ExtraInputsCollector:
         """Return the collector of this pass's model inputs beyond the decoder's own."""
@@ -523,6 +548,18 @@ class DecoderInputPreparer:
         """Return whether overlap decode needs every reserved generation page."""
         return uses_full_generation_page_table(
             self._config.disable_overlap_scheduler, spec_config, attn_metadata
+        )
+
+    def replays_final_windows_only(self) -> bool:
+        """Whether bounded decoder replay may keep only each prompt's final window: no prefill
+        graph that expects every chunk's decoder history can run a context chunk. Breakable
+        prefill graphs are captured only for forwards without a replay plan."""
+        backend = self._config.prefill_cuda_graph_backend
+        if backend == PrefillCudaGraphBackend.DISABLED:
+            return True
+        runner = self.breakable_cuda_graph_runner
+        return backend == PrefillCudaGraphBackend.BREAKABLE and (
+            runner is None or not runner.captured_num_tokens
         )
 
     def _get_all_rank_num_tokens_and_spec_counts(
@@ -1149,8 +1186,8 @@ class DecoderInputPreparer:
             scheduled_requests,
             attn_metadata,
             spec_metadata,
-            maybe_graph,
             gather_context_logits,
+            is_dummy=is_dummy,
         )
         inputs = self._build_inputs(
             host,
@@ -1579,7 +1616,6 @@ class DecoderInputPreparer:
         position_ids = host.lists.position_ids
         num_cached_tokens_per_seq = host.lists.num_cached_tokens_per_seq
         previous_batch_indices = host.lists.previous_batch_indices
-        previous_pos_indices = host.lists.previous_pos_indices
         unwritten_input_id_rows = host.lists.unwritten_input_id_rows
         helix_owned_new_tokens = host.lists.helix_owned_new_tokens
         extra_inputs = host.extra_inputs
@@ -1724,7 +1760,6 @@ class DecoderInputPreparer:
                 )
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
-                previous_pos_indices.extend([previous_batch_idx] * request_tokens_per_step)
 
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num + request_tokens_per_step - request.py_num_compressed_tokens
@@ -2078,6 +2113,71 @@ class DecoderInputPreparer:
         if _n_gen > 0:
             host.beam_width = beam_width
 
+    def _stage_spec_overlap_inputs(
+        self,
+        host: HostInputs,
+        input_ids: list[int],
+        new_tokens: torch.Tensor,
+        new_tokens_lens: torch.Tensor,
+        next_draft_tokens: torch.Tensor,
+        tokens_per_step: int,
+        first_previous_request: int,
+    ) -> bool:
+        """Write an overlap-scheduled speculative step's inputs with one upload and one launch.
+
+        Sets ``host.host_position_ids``; returns False, having written nothing, when the
+        previous step's outputs are not int32 or narrower than this step, or when the rows
+        before the in-flight requests do not take ``tokens_per_step`` tokens each.
+        """
+        if (
+            host.previous_batch_token_start != first_previous_request * tokens_per_step
+            or new_tokens.dim() != 3
+            or new_tokens.shape[0] < tokens_per_step
+            or new_tokens.shape[2] != 1
+            or next_draft_tokens.dim() != 2
+            or next_draft_tokens.shape[1] < tokens_per_step - 1
+            or any(
+                tensor.dtype != torch.int32
+                for tensor in (new_tokens, new_tokens_lens, next_draft_tokens)
+            )
+        ):
+            return False
+        position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
+        # The acceptance-count and gather-id segments stay empty: the step has no acceptance
+        # counts to stage, and the gather ids keep their cached upload (_gather_ids_buffer).
+        segments = (
+            input_ids,
+            host.lists.draft_tokens,
+            (),
+            host.lists.previous_batch_indices,
+            position_ids,
+            (),
+        )
+        segment_ends = list(itertools.accumulate(len(segment) for segment in segments))
+        host_values = np.fromiter(
+            itertools.chain.from_iterable(segments), dtype=np.int32, count=segment_ends[-1]
+        )
+        stage_spec_overlap_inputs(
+            self._host_uploader.upload("spec_overlap_inputs", torch.from_numpy(host_values)),
+            segment_ends,
+            self._buffers.input_ids_cuda,
+            self._buffers.draft_tokens_cuda,
+            self._buffers.draft_tokens_cuda,
+            self._buffers.previous_batch_indices_cuda,
+            self._buffers.position_ids_cuda,
+            self._buffers.gather_ids_cuda,
+            self._buffers.previous_pos_id_offsets_cuda,
+            self._buffers.previous_kv_lens_offsets_cuda,
+            new_tokens,
+            next_draft_tokens,
+            new_tokens_lens,
+            first_previous_request,
+            tokens_per_step,
+        )
+        self._staged_previous_batch_indices = list(host.lists.previous_batch_indices)
+        host.host_position_ids = torch.from_numpy(host_values[segment_ends[3] : segment_ends[4]])
+        return True
+
     def _copy_token_ids_to_device(
         self,
         host: HostInputs,
@@ -2095,7 +2195,6 @@ class DecoderInputPreparer:
         position_ids = host.lists.position_ids
         draft_lens = host.lists.draft_lens
         previous_batch_indices = host.lists.previous_batch_indices
-        previous_pos_indices = host.lists.previous_pos_indices
         extend_requests = host.lists.extend_requests
         extend_dummy_requests = host.lists.extend_dummy_requests
 
@@ -2114,7 +2213,14 @@ class DecoderInputPreparer:
                 self._staged_previous_batch_indices = list(previous_batch_indices)
             return previous_slots
 
-        def previous_pos_indices_device(previous_batch_tokens: int) -> None:
+        def previous_pos_indices_device(tokens_per_request: Sequence[int]) -> int:
+            """Upload each previous-batch token's slot; returns the number of tokens."""
+            previous_pos_indices = [
+                slot
+                for slot, tokens in zip(previous_batch_indices, tokens_per_request)
+                for _ in range(tokens)
+            ]
+            previous_batch_tokens = len(previous_pos_indices)
             if previous_pos_indices != self._staged_previous_pos_indices:
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
@@ -2122,7 +2228,8 @@ class DecoderInputPreparer:
                 self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True
                 )
-                self._staged_previous_pos_indices = list(previous_pos_indices)
+                self._staged_previous_pos_indices = previous_pos_indices
+            return previous_batch_tokens
 
         if scheduled_requests.is_attention_dp_phase_idle:
             # Graph padding normally reuses an existing input buffer. An idle
@@ -2135,12 +2242,27 @@ class DecoderInputPreparer:
         assert total_num_tokens <= self._config.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self._config.max_num_tokens})"  # noqa: E501
         )
+        staged = (
+            self._spec_overlap_staging
+            and enable_spec_decode
+            and next_draft_tokens_device is not None
+            and previous_batch_len > 0
+            and self._stage_spec_overlap_inputs(
+                host,
+                input_ids,
+                new_tokens_device,
+                new_tokens_lens_device,
+                next_draft_tokens_device,
+                self.get_runtime_tokens_per_gen_step(runtime_draft_len),
+                len(extend_requests) - len(extend_dummy_requests) - previous_batch_len,
+            )
+        )
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
-        if num_tokens > 0:
+        if num_tokens > 0 and not staged:
             input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
             self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
-        if num_draft_tokens > 0:
+        if num_draft_tokens > 0 and not staged:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
             self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
                 draft_tokens, non_blocking=True
@@ -2163,7 +2285,7 @@ class DecoderInputPreparer:
             if fold_rows is not None and any(slot is None for slot in fold_rows):
                 fold_rows = None
             fold_staged = step_fold.begin_step(fold_rows, len(extend_requests))
-        if next_draft_tokens_device is not None:
+        if next_draft_tokens_device is not None and not staged:
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
             num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
@@ -2179,7 +2301,7 @@ class DecoderInputPreparer:
             )
             if not inputs_staged and step_fold is not None and previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
-                previous_pos_indices_device(previous_batch_len * runtime_tokens_per_gen_step)
+                previous_pos_indices_device([runtime_tokens_per_gen_step] * previous_batch_len)
                 inputs_staged = step_fold.gather(
                     new_tokens_device,
                     next_draft_tokens_device,
@@ -2215,8 +2337,10 @@ class DecoderInputPreparer:
                     tokens != runtime_tokens_per_gen_step
                     for tokens in host.previous_batch_tokens_per_request
                 )
-                previous_batch_tokens = len(previous_pos_indices)
-                previous_pos_indices_device(previous_batch_tokens)
+                tokens_per_request = host.previous_batch_tokens_per_request
+                if tokens_per_request is None:
+                    tokens_per_request = [runtime_tokens_per_gen_step] * previous_batch_len
+                previous_batch_tokens = previous_pos_indices_device(tokens_per_request)
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that
@@ -2332,7 +2456,7 @@ class DecoderInputPreparer:
                         previous_begin:num_extend_reqeust_wo_dummy
                     ].copy_(previous_kv_len_offsets, non_blocking=True)
 
-        elif new_tokens_device is not None:
+        elif next_draft_tokens_device is None and new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
             max_draft_len = max(draft_lens)
             new_tokens = new_tokens_device[
@@ -2370,6 +2494,9 @@ class DecoderInputPreparer:
         *,
         batched_mrope_generation_updates: Sequence[tuple[int, int, torch.Tensor]] | None = None,
     ) -> None:
+        if host.host_position_ids is not None:
+            # The speculative overlap staging wrote the positions with the token ids.
+            return
         total_num_tokens = host.total_num_tokens
         position_ids = apply_position_id_offset(host.lists.position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
@@ -2515,15 +2642,32 @@ class DecoderInputPreparer:
         }
         remote_tail_modes.discard(None)
         if remote_tail_modes:
-            if len(remote_tail_modes) != 1 or any(
-                getattr(request, "py_csa2_remote_tail_mode", None) is None
-                for request in scheduled_requests.context_requests
+            from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderCheckpoint, EncoderReplay
+
+            remote_tail_mode = next(iter(remote_tail_modes))
+            if len(remote_tail_modes) != 1 or (
+                remote_tail_mode == "source"
+                and any(
+                    getattr(request, "py_csa2_remote_tail_mode", None) is None
+                    for request in scheduled_requests.context_requests
+                )
             ):
-                raise ValueError("CSA2 remote-tail context batches must be homogeneous")
-            attn_metadata.csa2_remote_tail_mode = next(iter(remote_tail_modes))
-            attn_metadata.csa2_remote_tail_starts = [
-                request.py_csa2_remote_tail_start for request in scheduled_requests.context_requests
-            ]
+                raise ValueError("CSA2 remote-tail source context batches must be homogeneous")
+            attn_metadata.csa2_remote_tail_mode = remote_tail_mode
+            context_starts = []
+            for request in scheduled_requests.context_requests:
+                mode = getattr(request, "py_csa2_remote_tail_mode", None)
+                if mode is not None:
+                    context_starts.append(request.py_csa2_remote_tail_start)
+                else:
+                    recovery = getattr(request, "py_ced_replay", None)
+                    if isinstance(recovery, EncoderReplay):
+                        context_starts.append(recovery.start)
+                    elif isinstance(recovery, EncoderCheckpoint):
+                        context_starts.append(recovery.global_end)
+                    else:
+                        context_starts.append(0)
+            attn_metadata.csa2_remote_tail_starts = context_starts
         else:
             attn_metadata.csa2_remote_tail_mode = None
             attn_metadata.csa2_remote_tail_starts = []
@@ -2562,9 +2706,7 @@ class DecoderInputPreparer:
         if prepare_context_replay is not None:
             prepare_context_replay(
                 scheduled_requests.context_requests,
-                allow_final_window=(
-                    self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
-                ),
+                allow_final_window=self.replays_final_windows_only(),
             )
         attn_metadata.prepare()
         host.num_cached_tokens_snapshot = num_cached_tokens_snapshot
@@ -2576,8 +2718,9 @@ class DecoderInputPreparer:
         scheduled_requests: ScheduledRequests,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata | None,
-        maybe_graph: bool,
         gather_context_logits: bool,
+        *,
+        is_dummy: bool,
     ) -> None:
         total_num_tokens = host.total_num_tokens
 
@@ -2597,39 +2740,108 @@ class DecoderInputPreparer:
         # keeps the complete input shape on every rank.
         attn_metadata.padded_num_tokens = None
         prepare_adp_inputs = getattr(self.model, "prepare_adp_inputs", None)
-        if self._config.enable_attention_dp and prepare_adp_inputs is not None:
-            prepare_adp_inputs(
-                attn_metadata,
-                all_token_states_required=(
-                    gather_context_logits
-                    or (
-                        spec_metadata is not None
-                        and not isinstance(spec_metadata, DSparkSpecMetadata)
-                    )
-                ),
-                requests=scheduled_requests.context_requests,
+        breakable_runner = self.breakable_cuda_graph_runner
+        breakable_prefill = (
+            self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+            and breakable_runner is not None
+        )
+        if (
+            self._config.enable_attention_dp or breakable_prefill
+        ) and prepare_adp_inputs is not None:
+            capture_context = (
+                enable_breakable_cuda_graph()
+                if breakable_prefill and breakable_runner.is_capturing
+                else contextlib.nullcontext()
             )
+            with capture_context:
+                prepare_adp_inputs(
+                    attn_metadata,
+                    all_token_states_required=(
+                        gather_context_logits
+                        or (
+                            spec_metadata is not None
+                            and not isinstance(spec_metadata, DSparkSpecMetadata)
+                        )
+                    ),
+                    requests=scheduled_requests.context_requests,
+                )
 
         spec_all_rank_counts = None
         attn_all_rank_num_tokens = None
-        if scheduled_requests.attention_dp_phase is RemoteTailPhase.DECODE:
-            attn_all_rank_num_tokens = self._get_remote_tail_decode_rank_tokens(
-                attn_metadata, maybe_graph
-            )
-        elif spec_metadata is not None and self._config.enable_attention_dp:
+        if spec_metadata is not None and self._config.enable_attention_dp:
             (attn_all_rank_num_tokens, spec_all_rank_counts) = (
                 self._get_all_rank_num_tokens_and_spec_counts(attn_metadata, spec_metadata)
             )
+        breakable_eligible = True
+        if breakable_prefill:
+            if attn_all_rank_num_tokens is None:
+                attn_all_rank_num_tokens = get_all_rank_num_tokens(
+                    attn_metadata,
+                    enable_attention_dp=self._config.enable_attention_dp,
+                    mapping=self.mapping,
+                    dist=self.dist,
+                )
+            replay_plan = getattr(attn_metadata, "decoder_replay_plan", None)
+            layer_model = get_top_level_model(self.model)
+            supports_mixed_breakable = getattr(
+                layer_model, "disagg_remote_tail_replay", False
+            ) and not getattr(layer_model, "disagg_context_only", False)
+            breakable_eligible = (
+                replay_plan is None
+                and not host.lists.multimodal_params_list
+                and (
+                    not host.remote_tail_modes
+                    or (supports_mixed_breakable and host.remote_tail_modes == {"destination"})
+                )
+                and (
+                    scheduled_requests.attention_dp_phase
+                    not in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
+                    or supports_mixed_breakable
+                )
+            )
+            if replay_plan is not None and replay_plan.replays_local_tokens and not is_dummy:
+                logger.debug(
+                    "Breakable prefill CUDA graph is unavailable for batches that "
+                    "compact decoder replay rows; using eager forward."
+                )
+        unpadded_all_rank_num_tokens = attn_all_rank_num_tokens
         virtual_num_tokens = self.pad_tokens(
             attn_metadata,
             total_num_tokens,
             host.num_ctx_requests,
             attn_all_rank_num_tokens,
             allow_prefill_cuda_graph=(
-                not host.remote_tail_modes
-                and scheduled_requests.attention_dp_phase is not RemoteTailPhase.CONTEXT
+                breakable_prefill
+                or (
+                    not host.remote_tail_modes
+                    and scheduled_requests.attention_dp_phase
+                    not in (RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED)
+                )
             ),
         )
+        if breakable_prefill and get_per_request_prefill_cuda_graph_flag():
+            graph_available = breakable_eligible
+            if not (breakable_runner.is_capturing or breakable_runner.is_warming_up):
+                # An eager forward must receive the original token count. Warmup forwards run
+                # eagerly, except those that capture the bucket graph's break graphs.
+                graph_available = (
+                    graph_available
+                    and (not is_dummy or breakable_runner.is_capturing_break_graphs)
+                    and not gather_context_logits
+                    and breakable_runner.has_graph(virtual_num_tokens)
+                )
+            # Bucket selection is collective; combine eligibility and capture
+            # availability in one vote before keeping any padding.
+            if self._config.enable_attention_dp:
+                graph_available = bool(
+                    self.dist.tp_allgather_int64([int(graph_available)])[:, 0].all()
+                )
+            if not graph_available:
+                set_per_request_prefill_cuda_graph_flag(False)
+                attn_metadata.padded_num_tokens = None
+                if self._config.enable_attention_dp:
+                    attn_metadata.all_rank_num_tokens = unpadded_all_rank_num_tokens
+                virtual_num_tokens = total_num_tokens
 
         host.spec_all_rank_counts = spec_all_rank_counts
         host.virtual_num_tokens = virtual_num_tokens
@@ -2900,18 +3112,6 @@ class DecoderInputPreparer:
                 else None
             ),
         )
-
-    def _get_remote_tail_decode_rank_tokens(
-        self, attn_metadata: AttentionMetadata, can_run_graph: bool
-    ) -> list[int]:
-        """Require captured decode on every rank in the normal token-count vote."""
-        gathered = self.dist.tp_allgather_int64([attn_metadata.num_tokens, int(can_run_graph)])
-        if not gathered[:, 1].all():
-            raise RuntimeError(
-                "Conditional attention-DP decode requires a captured CUDA "
-                "graph on every rank; at least one rank missed its graph"
-            )
-        return gathered[:, 0].tolist()
 
     def _kv_lens_corrected_in_preprocess(
         self, inputs: dict[str, Any], enable_spec_decode: bool

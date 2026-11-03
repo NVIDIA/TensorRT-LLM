@@ -47,7 +47,9 @@ def model_kwargs(tp_size: int = 4, *, attention_dp: bool = False) -> dict[str, o
         "moe_expert_parallel_size": tp_size,
         "enable_attention_dp": attention_dp,
         "attn_backend": "TRTLLM",
-        "moe_config": {"backend": "CUTLASS"},
+        # The fused FC2 finalize sums the top-k experts in a nondeterministic order, which
+        # moves the greedy smoke completions from request to request.
+        "moe_config": {"backend": "CUTLASS", "disable_finalize_fusion": True},
         "allreduce_strategy": "NCCL",
         "max_batch_size": MAX_BATCH_SIZE,
         "max_num_tokens": MAX_NUM_TOKENS,

@@ -1,0 +1,324 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+diff --git a/third-party/cutlass/include/cutlass/arch/config.h b/third-party/cutlass/include/cutlass/arch/config.h
+index 995d82ee..b87abd14 100644
+--- a/third-party/cutlass/include/cutlass/arch/config.h
++++ b/third-party/cutlass/include/cutlass/arch/config.h
+@@ -85,7 +85,10 @@
+ // SM100, SM100a
+ #if !CUTLASS_CLANG_CUDA && (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
+   #define CUTLASS_ARCH_MMA_SM100_SUPPORTED 1
+-  #if (!defined(CUTLASS_ARCH_MMA_SM100_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000)
++  // SM107 (Rubin) reuses the SM100 (Blackwell) kernel family. Treat __CUDA_ARCH__ 1070
++  // like 1000 so the sm_107f cubin enables SM100 MMA/TMA/tcgen05 instead of the disabled
++  // PTX stubs (which crash with cudaErrorLaunchFailure).
++  #if (!defined(CUTLASS_ARCH_MMA_SM100_ENABLED) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1070))
+     #define CUTLASS_ARCH_MMA_SM100_ENABLED 1
+
+     #if (!defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && defined(__CUDA_ARCH_FEAT_SM100_ALL))
+@@ -97,7 +100,7 @@
+     #define CUTLASS_ARCH_MMA_SM100F_SUPPORTED 1
+     #endif
+
+-    #if (!defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && CUDA_ARCH_FAMILY(1000))
++    #if (!defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && (CUDA_ARCH_FAMILY(1000) || CUDA_ARCH_FAMILY(1070)))
+       #define CUTLASS_ARCH_MMA_SM100F_ENABLED CUTLASS_ARCH_MMA_SM100F_SUPPORTED
+     #endif
+   #endif
+diff --git a/csrc/runtime/jit.hpp b/csrc/runtime/jit.hpp
+--- a/csrc/runtime/jit.hpp
++++ b/csrc/runtime/jit.hpp
+@@ -7,2 +7,4 @@
+ #include <cutlass/version.h>
++#include <deep_jit/utils/filesystem.hpp>
++#include <deep_jit/utils/hash.hpp>
+ #include <deep_jit/backend/cuda/backend.hpp>
+@@ -17,7 +19,8 @@
+     const auto config = deep_jit::Config(
+         library_root,
+         "DG",
+-        "cutlass-" + std::to_string(CUTLASS_VERSION),
++        "cutlass-" + std::to_string(CUTLASS_VERSION) + "-" +
++            deep_jit::hash::get_hex_digest(deep_jit::read(include_dir / "cutlass/arch/config.h")),
+         {include_dir},
+         {"deep_gemm/"});
+ 
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+index fdef46d..0bcde60 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_mqa_logits.cuh
+@@ -489,11 +489,11 @@
+                         } else {
+                             auto sum_0 = make_float2(0, 0);
+                             auto sum_1 = make_float2(0, 0);
++                            // ReLU with `fmaxf` runs on the ALU pipe; the weighted sum saturates the FMA pipe.
+                             const auto transform = [&](const uint32_t& j, const float2& sum) {
+-                                auto a_0 = make_float2(accum[j], accum[j + 1]);
+-                                auto a_1 = make_float2(fabsf(accum[j]), fabsf(accum[j + 1]));
++                                auto a = make_float2(fmaxf(accum[j], 0.0f), fmaxf(accum[j + 1], 0.0f));
+                                 auto b = make_float2(weights[i][j], weights[i][j + 1]);
+-                                return __ffma2_rn(__fadd2_rn(a_0, a_1), b, sum);
++                                return __ffma2_rn(a, b, sum);
+                             };
+ 
+                             #pragma unroll
+@@ -503,7 +503,7 @@
+                             }
+ 
+                             auto sum = __fadd2_rn(sum_0, sum_1);
+-                            reduced = (sum.x + sum.y) / 2;
++                            reduced = sum.x + sum.y;
+                         }
+                         auto result = static_cast<logits_dtype_t>(kIsMXSF ? reduced : reduced * scale_kv);
+                         const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
+diff --git a/csrc/apis/mega_mhc.hpp b/csrc/apis/mega_mhc.hpp
+index 1cbc0c8..2cb19e0 100644
+--- a/csrc/apis/mega_mhc.hpp
++++ b/csrc/apis/mega_mhc.hpp
+@@ -20,7 +20,16 @@
+     const uint32_t num_k_blocks = hidden / mhc_layout::BLOCK_K;
+     const uint32_t max_num_splits = cute::min(
+         mhc_layout::kNumMaxSplits, cute::max(mhc_layout::kDefaultNumSplits, num_sms / num_m_blocks));
+-    return math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
++    const uint32_t num_splits = math::ceil_div(num_k_blocks, math::ceil_div(num_k_blocks, max_num_splits));
++
++    // A partly filled last wave of tasks runs slowly: take the most splits whose tasks fit one wave fewer when
++    // that still leaves each SM fewer K blocks
++    const uint32_t num_waves = math::ceil_div(num_m_blocks * num_splits, num_sms);
++    const uint32_t num_fewer_splits = (num_waves - 1) * num_sms / num_m_blocks;
++    if (num_fewer_splits > 0 and (num_waves - 1) * math::ceil_div(num_k_blocks, num_fewer_splits) <
++            num_waves * math::ceil_div(num_k_blocks, num_splits))
++        return num_fewer_splits;
++    return num_splits;
+ }
+ 
+ static const torch::Tensor& get_split_barriers(const torch::TensorOptions& options) {
+@@ -70,6 +79,7 @@
+  *     y_routed_sf                    [T,H/128] int32 | None
+  *     y_shared_sf                    [T,H/128] int32 | None
+  *     shared_sf_block_m              int
++ *     y_tiled_sf                     [align(T,128)*H/32] UInt8 | None
+  *
+  * Returns:
+  *     None
+@@ -84,7 +94,10 @@
+  *     With y_fp8, supply exactly either y_gemm_sf alone, or y_routed_sf and
+  *     y_shared_sf together. y_gemm_sf is TMA-aligned column-major,
+  *     y_routed_sf is contiguous row-major, and y_shared_sf is the Mega MoE
+- *     shared-expert layout and requires shared_sf_block_m > 0.
++ *     shared-expert layout and requires shared_sf_block_m > 0. y_tiled_sf, instead of all of
++ *     them, receives the SF bytes in CUTLASS's block-scaled 128x4 layout (the swizzled MXFP8 SF
++ *     that TensorRT-LLM's GEMMs read) with TensorRT-LLM's scale rule (no 2^-22 floor); its
++ *     padding rows are left untouched.
+  */
+ static void mega_mhc(const torch::Tensor& x,
+                      const torch::Tensor& residual,
+@@ -112,14 +125,16 @@
+                      const std::optional<torch::Tensor>& y_gemm_sf,
+                      const std::optional<torch::Tensor>& y_routed_sf,
+                      const std::optional<torch::Tensor>& y_shared_sf,
+-                     const int& shared_sf_block_m) {
+-    // Shifted state is all-or-nothing; FP8 uses either GEMM SF or routed and shared SF together
++                     const int& shared_sf_block_m,
++                     const std::optional<torch::Tensor>& y_tiled_sf) {
++    // Shifted state is all-or-nothing; FP8 uses either GEMM SF, routed and shared SF together, or tiled SF
+     const bool is_shifted = shifted_prev_mix.has_value();
+     DG_HOST_ASSERT(is_shifted == new_prev_mix.has_value());
+     DG_HOST_ASSERT(y_routed_sf.has_value() == y_shared_sf.has_value());
+     DG_HOST_ASSERT(not (y_gemm_sf.has_value() and y_routed_sf.has_value()));
++    DG_HOST_ASSERT(not (y_tiled_sf.has_value() and (y_gemm_sf.has_value() or y_routed_sf.has_value())));
+     DG_HOST_ASSERT(y_bf16.has_value() or y_fp8.has_value());
+-    DG_HOST_ASSERT(y_fp8.has_value() == (y_gemm_sf.has_value() or y_routed_sf.has_value()));
++    DG_HOST_ASSERT(y_fp8.has_value() == (y_gemm_sf.has_value() or y_routed_sf.has_value() or y_tiled_sf.has_value()));
+     DG_HOST_ASSERT(y_shared_sf.has_value() ? shared_sf_block_m > 0 : shared_sf_block_m == 0);
+ 
+     const auto [num_tokens, hidden] = get_shape<2>(x);
+@@ -240,6 +255,17 @@
+     // GEMM and routed SF differ only in strides and share one primary writer.
+     const auto& y_primary_sf = y_routed_sf.has_value() ? y_routed_sf : y_gemm_sf;
+ 
++    // Tiled SF words take the shared writer: word w of a token sits 128 words after word w - 1.
++    std::optional<torch::Tensor> y_tiled_sf_words;
++    if (y_tiled_sf.has_value()) {
++        const auto num_sf_words = hidden / static_cast<int>(mhc_layout::kHiddenPerSFWord);
++        DG_HOST_ASSERT(y_tiled_sf->scalar_type() == torch::kByte and y_tiled_sf->is_contiguous());
++        DG_HOST_ASSERT(y_tiled_sf->device() == device);
++        DG_HOST_ASSERT(reinterpret_cast<uintptr_t>(y_tiled_sf->data_ptr()) % sizeof(uint32_t) == 0);
++        DG_HOST_ASSERT(y_tiled_sf->numel() >= align<int64_t>(num_tokens, 128) * num_sf_words * 4);
++        y_tiled_sf_words = y_tiled_sf->view({-1}).view(torch::kInt).as_strided({num_tokens, num_sf_words}, {1, 128});
++    }
++
+     sm100_mega_mhc(
+         x, residual, post_mix, comb_res_mix, shifted_prev_mix,
+         fn, mix_scales, mix_bases,
+@@ -247,8 +273,9 @@
+         rmsnorm_weight, rmsnorm_eps,
+         new_residual, new_prev_mix, new_post_mix, new_comb_res_mix,
+         y_bf16_storage, y_bf16.has_value(), scratch, split_barriers,
+-        y_fp8, y_primary_sf, y_shared_sf,
+-        shared_sf_block_m, rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
++        y_fp8, y_primary_sf, y_tiled_sf.has_value() ? y_tiled_sf_words : y_shared_sf,
++        y_tiled_sf.has_value() ? static_cast<int>(mhc_layout::kTiledSFBlockM) : shared_sf_block_m,
++        rmsnorm_scale, num_tokens, hidden, num_splits, num_sms);
+ }
+ 
+ static void register_apis(pybind11::module_& m) {
+@@ -281,7 +308,8 @@
+         py::arg("y_gemm_sf") = std::nullopt,
+         py::arg("y_routed_sf") = std::nullopt,
+         py::arg("y_shared_sf") = std::nullopt,
+-        py::arg("shared_sf_block_m") = 0);
++        py::arg("shared_sf_block_m") = 0,
++        py::arg("y_tiled_sf") = std::nullopt);
+ }
+ 
+ } // namespace deep_gemm::mega_mhc
+diff --git a/csrc/jit_kernels/impls/sm100_mega_mhc.hpp b/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
+index 3be09f3..037f18b 100644
+--- a/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
++++ b/csrc/jit_kernels/impls/sm100_mega_mhc.hpp
+@@ -115,7 +115,7 @@
+ static void __instantiate_kernel() {{
+     auto ptr = reinterpret_cast<void*>(&sm100_mega_mhc_impl<
+         {}, {}, {},
+-        {}, {}, {}, {}
++        {}, {}, {}, {}u
+     >);
+ }};
+ )",
+@@ -123,7 +123,7 @@
+         mix_args.new_prev_mix != nullptr,
+         store_bf16,
+         norm_args.y_fp8 != nullptr,
+-        shared_sf_block_m));
++        static_cast<uint32_t>(shared_sf_block_m)));
+ 
+     // Launch
+     jit->launch(
+diff --git a/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh b/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
+index 24960b7..76f0da3 100644
+--- a/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/epilogue/sm100_mega_mhc.cuh
+@@ -113,12 +113,31 @@
+     return __float22bfloat162_rn(__fmul2_rn(__fmul2_rn(__bfloat1622float2(input), {scale, scale}), __bfloat1622float2(weight)));
+ }
+ 
++// The tiled SF output follows TensorRT-LLM's MXFP8 rule: the exact UE8M0 ceiling of amax / 448 without
++// the 2 ^ -22 floor, so all-zero blocks get 0.
+ template <uint32_t SF_BLOCK_M>
++CUTLASS_DEVICE uint32_t get_sf_exp(const nv_bfloat16& amax) {
++    if constexpr (SF_BLOCK_M == kTiledSFBlockM) {
++        const uint32_t rounded_exp = (static_cast<uint32_t>(__bfloat16_as_ushort(amax)) + 0x1fu) >> 7;
++        return rounded_exp > 8u ? rounded_exp - 8u : 0u;
++    } else {
++        return math::get_ue8m0_sf_exp(amax);
++    }
++}
++
++template <uint32_t kHidden, uint32_t SF_BLOCK_M>
+ CUTLASS_DEVICE uint32_t get_shared_sf_row_idx(const uint32_t& token_idx) {
+-    // Mega MoE SF pages interleave four 32-row groups within each 128-row page.
+-    const uint32_t idx = token_idx % SF_BLOCK_M;
+-    return token_idx / SF_BLOCK_M * ((SF_BLOCK_M + 127u) & ~127u) +
+-           (idx & ~127u) + (idx & 31u) * 4 + ((idx >> 5) & 3u);
++    if constexpr (SF_BLOCK_M == kTiledSFBlockM) {
++        // 128-row tiles of 128 words per SF word column (word stride 128), each interleaving
++        // four 32-row groups.
++        return token_idx / 128u * (kHidden / kHiddenPerSFWord * 128u) +
++               (token_idx & 31u) * 4 + ((token_idx >> 5) & 3u);
++    } else {
++        // Mega MoE SF pages interleave four 32-row groups within each 128-row page.
++        const uint32_t idx = token_idx % SF_BLOCK_M;
++        return token_idx / SF_BLOCK_M * ((SF_BLOCK_M + 127u) & ~127u) +
++               (idx & ~127u) + (idx & 31u) * 4 + ((idx >> 5) & 3u);
++    }
+ }
+ 
+ CUTLASS_DEVICE uint32_t store_fp8_and_pack_sf(const NormArgs& norm_args, const uint64_t& output_offset,
+@@ -221,7 +240,7 @@
+         const uint64_t output_offset = static_cast<uint64_t>(token_idx) * kHidden;
+         uint32_t shared_sf_row_idx = 0;
+         if constexpr (SF_BLOCK_M > 0)
+-            shared_sf_row_idx = get_shared_sf_row_idx<SF_BLOCK_M>(token_idx);
++            shared_sf_row_idx = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(token_idx);
+ 
+         const auto weight_packs = reinterpret_cast<const uint4*>(
+             norm_args.weight + hidden_pack_begin * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane);
+@@ -248,10 +267,11 @@
+                 const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
+                 const uint32_t packed_sf = store_fp8_and_pack_sf(
+                     norm_args, output_offset + hidden_idx, retained[hidden_pack_offset],
+-                    math::get_ue8m0_sf_exp(amax));
++                    get_sf_exp<SF_BLOCK_M>(amax));
+                 if constexpr (SF_BLOCK_M > 0) {
+                     if (lane_idx % kNumLanesPerSFWord == 0) {
+-                        norm_args.y_primary_sf[token_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = packed_sf;
++                        if constexpr (SF_BLOCK_M != kTiledSFBlockM)
++                            norm_args.y_primary_sf[token_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = packed_sf;
+                         norm_args.y_shared_sf[shared_sf_row_idx + sf_word_idx * norm_args.y_shared_sf_stride_word] = packed_sf;
+                     }
+                 } else {
+@@ -332,8 +352,8 @@
+     const float rms_scale = rsqrtf(x1_sqr_sum * kInvHidden + norm_args.eps) * norm_args.scale;
+     const float2 rms_scales = {ptx::exchange(rms_scale, 0), ptx::exchange(rms_scale, 1)};
+     if constexpr (SF_BLOCK_M > 0) {
+-        shared_sf_row_indices.x = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx);
+-        shared_sf_row_indices.y = get_shared_sf_row_idx<SF_BLOCK_M>(m_idx + 1);
++        shared_sf_row_indices.x = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(m_idx);
++        shared_sf_row_indices.y = get_shared_sf_row_idx<kHidden, SF_BLOCK_M>(m_idx + 1);
+     }
+     for (uint32_t hidden_pack_idx = hidden_pack_begin; hidden_pack_idx < hidden_pack_end; ++ hidden_pack_idx) {
+         const uint32_t hidden_idx = hidden_pack_idx * kHiddenPerNormPack + lane_idx * kHiddenPerNormLane;
+@@ -363,12 +383,13 @@
+             const auto packed_amax = math::warp_reduce_max<kNumLanesPerSF>(nv_bfloat162(
+                 math::get_packed_bf16_amax(values_pairs[0]),
+                 has_second_token ? math::get_packed_bf16_amax(values_pairs[1]) : __ushort_as_bfloat16(0)));
+-            const uint2 sf_exponents = {math::get_ue8m0_sf_exp(packed_amax.x),
+-                                        math::get_ue8m0_sf_exp(packed_amax.y)};
++            const uint2 sf_exponents = {get_sf_exp<SF_BLOCK_M>(packed_amax.x),
++                                        get_sf_exp<SF_BLOCK_M>(packed_amax.y)};
+             const uint32_t sf_word_idx = hidden_pack_idx * kNumSFWordsPerNormPack + lane_idx / kNumLanesPerSFWord;
+             const uint32_t first_packed_sf = store_fp8_and_pack_sf(norm_args, output_offset, values[0], sf_exponents.x);
+             if (lane_idx % kNumLanesPerSFWord == 0) {
+-                norm_args.y_primary_sf[m_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
++                if constexpr (SF_BLOCK_M != kTiledSFBlockM)
++                    norm_args.y_primary_sf[m_idx * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = first_packed_sf;
+                 if constexpr (SF_BLOCK_M > 0)
+                     norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.x] = first_packed_sf;
+             }
+@@ -376,7 +397,8 @@
+                 const uint32_t second_packed_sf = store_fp8_and_pack_sf(
+                     norm_args, output_offset + kHidden, values[1], sf_exponents.y);
+                 if (lane_idx % kNumLanesPerSFWord == 0) {
+-                    norm_args.y_primary_sf[(m_idx + 1) * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
++                    if constexpr (SF_BLOCK_M != kTiledSFBlockM)
++                        norm_args.y_primary_sf[(m_idx + 1) * norm_args.y_primary_sf_stride_token + sf_word_idx * norm_args.y_primary_sf_stride_word] = second_packed_sf;
+                     if constexpr (SF_BLOCK_M > 0)
+                         norm_args.y_shared_sf[static_cast<int64_t>(sf_word_idx) * norm_args.y_shared_sf_stride_word + shared_sf_row_indices.y] = second_packed_sf;
+                 }
+diff --git a/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh b/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
+index de59a59..a88c4bb 100644
+--- a/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
++++ b/deep_gemm/include/deep_gemm/layout/mega_mhc.cuh
+@@ -13,6 +13,9 @@
+ // FP8 scale-factor layout
+ static constexpr uint32_t kHiddenPerSF = 32;
+ static constexpr uint32_t kHiddenPerSFWord = 128;
++// The shared SF block size that selects the tiled SF output: CUTLASS's block-scaled 128x4 layout (the
++// swizzled MXFP8 SF of TensorRT-LLM's GEMMs) instead of a Mega MoE page layout.
++static constexpr uint32_t kTiledSFBlockM = 0xffffffffu;
+ 
+ // Kernel tile and pipeline geometry
+ static constexpr uint32_t BLOCK_M = 64;

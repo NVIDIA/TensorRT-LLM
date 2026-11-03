@@ -299,6 +299,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
     embed_tokens: Embedding
     layers: nn.ModuleList
     norm: RMSNorm
+    # Whether a prefill forward can replay one captured graph of the whole body.
+    supports_prefill_cuda_graph: bool = True
 
     def __init__(self, model_config: ModelConfig):
         super().__init__()
@@ -872,6 +874,12 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Whether the speculative worker samples greedy and temperature-only target rows from
+        vocabulary shards; known after weight loading."""
+        return False
 
     def setup_aliases(self) -> None:
         """Wire structural Python references between modules.

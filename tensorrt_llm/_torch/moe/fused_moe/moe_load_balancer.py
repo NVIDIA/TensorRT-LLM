@@ -885,7 +885,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
                  ep_rank: int,
                  ep_size: int,
                  layer_updates_per_iter: int,
-                 shared_memory_base_name: Optional[str] = None):
+                 shared_memory_base_name: Optional[str] = None,
+                 warmup_placement=None):
         """
         Initialize a MoeLoadBalancer instance.
 
@@ -894,7 +895,14 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
             ep_size: The total number of processes in expert parallelism
             layer_updates_per_iter: The number of layers to update per iteration
             shared_memory_base_name: Shared memory base name, will use 'moe_shared' if None
+            warmup_placement: Optional ``WarmupPlacementController`` that re-places the experts
+                of the static layers during warmup, then freezes (needs static routing).
         """
+        if warmup_placement is not None and layer_updates_per_iter > 0:
+            raise ValueError(
+                "warmup placement keeps the layers static; it needs layer_updates_per_iter == 0"
+            )
+        self.warmup_placement = warmup_placement
         self.is_shutdown = True
         self.ep_rank = ep_rank
         self.ep_size = ep_size
@@ -1008,6 +1016,8 @@ class MoeLoadBalancer(BaseMoeLoadBalancer):
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_finalize_model()
         self.load_balancer_impl.finalize_model()
+        if self.warmup_placement is not None:
+            self.warmup_placement.finalize()
         torch.cuda.empty_cache()
 
     def set_warm_up_iter_count(self, iter_count: int):
@@ -1085,6 +1095,8 @@ moe_model_arch_list = [
     'DeepseekV3ForCausalLM',
     'DeepseekV32ForCausalLM',
     'DeepseekV4ForCausalLM',
+    'DeepseekV41ForCausalLM',
+    'DeepseekV41ForConditionalGeneration',
     'GlmMoeDsaForCausalLM',
     'GptOssForCausalLM',
     'KimiK25ForConditionalGeneration',
@@ -1159,17 +1171,38 @@ def maybe_create_moe_load_balancer(
                 # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
                 pass
 
+            warmup_placement = _create_warmup_placement(model_config, ep_rank,
+                                                        ep_size)
             moe_load_balancer = MoeLoadBalancer(
                 ep_rank=ep_rank,
                 ep_size=ep_size,
-                layer_updates_per_iter=config.layer_updates_per_iter)
+                layer_updates_per_iter=config.layer_updates_per_iter,
+                warmup_placement=warmup_placement)
             logger.info(
-                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s...",
+                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s, "
+                "warmup placement %s...",
                 config.layer_updates_per_iter,
+                "on" if warmup_placement is not None else "off",
             )
         else:
             raise ValueError(f"Unknown MoE load-balancer mode: {mode!r}")
     return moe_load_balancer
+
+
+def _create_warmup_placement(model_config, ep_rank: int, ep_size: int):
+    """The controller of ``moe_load_balancer.warmup_placement``, or None when unset."""
+    from .moe_warmup_placement import (WarmupPlacementController,
+                                       WarmupPlacementSettings,
+                                       register_controller)
+    settings = WarmupPlacementSettings.from_config(
+        model_config.moe_load_balancer.warmup_placement)
+    if settings is None:
+        return None
+    controller = WarmupPlacementController(settings,
+                                           ep_rank=ep_rank,
+                                           ep_size=ep_size)
+    register_controller(controller)
+    return controller
 
 
 class MoeLoadBalancerIterContext:

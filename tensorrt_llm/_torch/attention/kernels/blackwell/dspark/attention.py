@@ -20,6 +20,7 @@ class DSparkPersistentTileSchedulerParams:
         problem_shape_b: cute.Int32,
         problem_shape_s: cute.Int32,
         cluster_shape_mnk: cute.Shape,
+        last_q_pair: int | None = None,
         *,
         problem_shape_b_fdd: cute.FastDivmodDivisor = None,
         problem_shape_s_fdd: cute.FastDivmodDivisor = None,
@@ -31,6 +32,7 @@ class DSparkPersistentTileSchedulerParams:
         self.problem_shape_b_fdd = problem_shape_b_fdd
         self.problem_shape_s_fdd = problem_shape_s_fdd
         self.cluster_shape_mnk = cluster_shape_mnk
+        self.last_q_pair = last_q_pair
         if cutlass.const_expr(problem_shape_b_fdd is None):
             self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
                 problem_shape_b, loc=loc, ip=ip
@@ -70,6 +72,7 @@ class DSparkPersistentTileSchedulerParams:
             problem_shape_b,
             problem_shape_s,
             self.cluster_shape_mnk,
+            self.last_q_pair,
             problem_shape_b_fdd=b_fdd,
             problem_shape_s_fdd=s_fdd,
             loc=self.loc,
@@ -161,6 +164,10 @@ class DSparkPersistentTileScheduler:
             current_work_cluster_batch, self.params.problem_shape_s_fdd
         )
         _, b_idx = divmod(current_work_s_batch, self.params.problem_shape_b_fdd)
+        if cutlass.const_expr(self.params.last_q_pair is not None):
+            # Paired tiles start at even tokens; an odd block's last tile ends at
+            # its final token, so it overlaps the previous tile by one token.
+            s_idx = cutlass.min(s_idx * 2, self.params.last_q_pair)
 
         # Keep a zero split coordinate for the kernel's existing tensor slicing.
         return WorkTileInfo((cluster_idx, s_idx, b_idx, 0), is_valid)
@@ -195,7 +202,7 @@ class DSparkPersistentTileScheduler:
 
 
 class DSparkAttention(DSparkAttentionKernel):
-    """Attention over a 128-token paged context window and one 5/6-token draft block."""
+    """Attention over a 128-token paged context window and one draft block of up to 8 tokens."""
 
     window_size = 128
     block_size = 6
@@ -207,8 +214,8 @@ class DSparkAttention(DSparkAttentionKernel):
     page_size_draft = 8
     page_size_win = 128
 
-    @staticmethod
     def _compute_grid(
+        self,
         o: cute.Tensor,
         cluster_shape_mnk: cute.Shape,
         max_active_clusters: int,
@@ -216,8 +223,9 @@ class DSparkAttention(DSparkAttentionKernel):
         """Build scheduler parameters and cap the persistent DSpark grid."""
         tile_sched_params = DSparkPersistentTileSchedulerParams(
             cute.size(o.shape[3]),
-            cute.size(o.shape[2]),
+            -(-self.seq_len_q // self.q_tokens_per_tile),
             cluster_shape_mnk,
+            self.seq_len_q - 2 if self.q_tokens_per_tile == 2 else None,
         )
         grid = DSparkPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
         return tile_sched_params, grid
@@ -248,8 +256,8 @@ class DSparkAttention(DSparkAttentionKernel):
         history_page_size: int = 32,
         num_heads: int = num_heads,
     ):
-        if num_heads not in (64, 128):
-            raise ValueError(f"DSpark attention must have 64 or 128 heads, got {num_heads}")
+        if num_heads not in (8, 16, 32, 64, 128):
+            raise ValueError(f"DSpark num_heads must be 8, 16, 32, 64 or 128, got {num_heads}")
         self.num_heads = num_heads
         expected_config = {
             "acc_dtype": (acc_dtype, cutlass.Float32),
@@ -266,8 +274,8 @@ class DSparkAttention(DSparkAttentionKernel):
         ]
         if mismatches:
             raise ValueError("Unsupported DSpark kernel configuration: " + ", ".join(mismatches))
-        if seq_len_q not in (5, 6):
-            raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
+        if not 1 <= seq_len_q <= page_size_draft:
+            raise ValueError(f"DSpark block size must be 1 to {page_size_draft}, got {seq_len_q}")
         if history_page_size not in (16, 32, 64, 128, 256):
             raise ValueError("DSpark history page size must be 16, 32, 64, 128, or 256")
         if inverse_rope_dim not in (0, 64):
@@ -301,6 +309,11 @@ class DSparkAttention(DSparkAttentionKernel):
         self.history_page_size = history_page_size
         # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
         self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
+        # 64 heads fill only half of the M128 tile, so two consecutive draft
+        # tokens share one tile and its K/V loads, one token per CTA. The FP8
+        # output epilogue stores one token per tile.
+        if num_heads == 64 and seq_len_q > 1 and output_groups is None:
+            self.q_tokens_per_tile = 2
 
     @cute.jit
     def wrapper(
@@ -330,8 +343,16 @@ class DSparkAttention(DSparkAttentionKernel):
         conversion. ``o_tensor`` remains a tensor so TVM-FFI can select the
         calling PyTorch stream, matching the CuTe DSL host-wrapper convention.
         """
+        # Rows are the heads of q_tokens_per_tile consecutive tokens, indexed by
+        # the first token. A single 64-head token keeps heads separate so TMA
+        # zero-fills the unused half of the M128 tile.
         q_layout = cute.make_layout(
-            (self.num_heads, self.head_dim, self.seq_len_q, batch_size),
+            (
+                self.num_heads * self.q_tokens_per_tile,
+                self.head_dim,
+                self.seq_len_q - self.q_tokens_per_tile + 1,
+                batch_size,
+            ),
             stride=(
                 self.head_dim,
                 1,

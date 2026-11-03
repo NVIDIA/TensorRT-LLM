@@ -1,0 +1,91 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# TRTLLMINF-435 TEMPORARY: Remove this feature-branch-only list before main/release merge.
+
+version: 0.0.1
+l0_gb300_ds_v4_1:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*gb300*'
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # Native staging allocations retain Blackwell's required 128 KiB TMA backing.
+  - unittest/_torch/attention/sparse/csa2/test_backend.py::test_staging_keeps_minimum_tma_backing
+  # Context boundary collapse reuse and SWA address construction.
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_swa_refresh_preserves_per_layer_page_domains
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_shared_context_domains_follow_owner_source_batch_and_replay
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_context_uploads_refresh_changing_geometry
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_shared_context_uploads_preserve_owners_and_live_positions
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs
+  - unittest/_torch/attention/sparse/csa2/test_metadata.py::test_decode_graph_deferral_keeps_unsupported_prepare_paths_complete
+  # Batched candidate prefill scores like one sequence per request.
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_batched_candidate_prefill_matches_per_request
+  - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_candidate_shared_prefill_exact_and_mixed
+  - unittest/_torch/kernels/serial/test_csa2_sparse_context.py
+  - unittest/_torch/attention/sparse/csa2/test_backend.py::test_fused_context_matches_trtllm_gen
+  - unittest/_torch/attention/sparse/csa2/test_module.py::test_context_prefill_runs_fused_kernel
+  - unittest/_torch/attention/sparse/csa2/test_fused_decode.py
+  - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py::DecoderInputPreparerTestCase::test_breakable_mixed_eligibility_preserves_compaction_fallback
+  - unittest/_torch/misc/test_host_staging.py
+  - unittest/_torch/modules/test_engram_history_uploads.py
+  - unittest/_torch/modules/test_engram_decode_hash.py
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py::test_remote_tail_source_reuses_boundary_collapse
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py::test_remote_tail_destination_keeps_decoder_state
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py -k "model_defaults or final_window or empty_decoder"
+  - unittest/_torch/attention/sparse/csa2/test_cache_manager.py::test_decoder_replay_selects_cache_lifecycles -k scratch
+  - unittest/_torch/pyexecutor/kv_cache/test_kvcm2_integration.py::test_swa_scratch_budget_separates_reuse_policies
+  - unittest/_torch/modeling/test_deepseek_v41_ced.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_worker.py -k "seed_context"
+  # DSpark draft: compact TP argmax.
+  - unittest/_torch/speculative/test_dspark_compact_argmax.py
+  - unittest/_torch/speculative/test_dspark_tp1_argmax.py
+  - unittest/_torch/speculative/test_dspark_fused_accept.py
+  # DSpark draft: fused batched attention and CuTe back-fill.
+  - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py::test_dspark_attention_forward_batched_matches_scalar_reference
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py::test_packed_backfill_matches_separate_projection_and_preserves_masked_slots
+  - unittest/_torch/speculative/test_dspark_draft_step.py
+  # DSpark fused Markov chain: IPC and fabric-memory (MNNVL) exchange workspaces.
+  - unittest/_torch/speculative/test_dspark_markov_chain.py
+  - unittest/disaggregated/test_context_only_cache_transfer.py
+  - unittest/disaggregated/test_csa2_kv_transfer.py
+  - unittest/_torch/modules/test_engram.py::test_v41_engram_gate_parity
+  - unittest/_torch/modules/test_engram.py::test_sharded_fp8_lookup_host_tables
+  - unittest/_torch/modules/test_engram.py::test_sharded_fp8_lookup_after_host_numa_oom
+  - unittest/_torch/modules/test_engram.py::test_sharded_fp8_tables_node_shared
+  - unittest/_torch/modules/test_engram.py::test_sharded_fp8_tables_node_shared_numa_placement
+  - unittest/_torch/modules/test_engram.py::test_v41_wkv_shards_match_replicated_columns
+  - unittest/_torch/distributed/test_ll_allgather.py
+  - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip[world:4-heads:24]
+  - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip[world:4-heads:18]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2] TIMEOUT (30)
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-head-sharded]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-sharded]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world4-head-groups]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2] TIMEOUT (30)
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_encoder_pass_graph[world2] TIMEOUT (30)
+  # Shared-expert down projection: the served SwiGLU + FP8 and BF16 paths, raced.
+  - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
+  # Vocabulary-sharded T=1 sampling, which the greedy GSM8K gates do not reach.
+  - unittest/_torch/multi_gpu/test_sharded_sampling.py
+  # MegaMoE on a 4-GPU DEP layer against the reference, and the quantized-combine tactics.
+  - unittest/_torch/moe/test_megamoe_e2e.py
+  - unittest/_torch/moe/test_megamoe_default_tactics.py
+  # Attention-DP verify rows from a node-local group's shards of the LM head (enable_lm_head_tp_in_adp).
+  - unittest/_torch/multi_gpu/test_group_sharded_sampling.py
+  # DSpark GSM8K accuracy and acceptance length: TP4/EP4 and DP4/EP4.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[mxfp4-tp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
+  # Breakable prefill graphs (whole prefill and decoder pass) vs eager prefill on DEP4.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_breakable_prefill_cuda_graph TIMEOUT (60)

@@ -17,6 +17,7 @@
 import pickle
 import sys
 from itertools import repeat
+from typing import NamedTuple
 
 import cloudpickle
 import pytest
@@ -24,23 +25,70 @@ import torch
 import torch.nn.functional as F
 from _torch.helpers import per_token_cast_to_fp8_e8m0
 from _torch.moe import test_deepseek_v41_parallel_moe as parallel_moe
-from _torch.moe.quantize_utils import FP8BlockScalesQuantizeUtil, MXFP4MXFP8QuantizeUtil
+from _torch.moe.quantize_utils import (
+    BaseQuantizeUtil,
+    FP8BlockScalesQuantizeUtil,
+    MXFP4MXFP8QuantizeUtil,
+    NVFP4QuantizeUtil,
+)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
+from tensorrt_llm._torch.models import modeling_deepseekv4
+from tensorrt_llm._torch.models.modeling_deepseekv4 import (
+    _EAGER_SHARED_EXPERT_OVERLAP_MIN_TOKENS,
+    DeepseekV4MoE,
+    full_tp_shared_expert_forward,
+)
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import TrtllmGenFusedMoEBase
 from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
-from tensorrt_llm._torch.utils import AuxStreamType
+from tensorrt_llm._torch.utils import AuxStreamType, Fp4QuantizedTensor
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 parallel_moe_executor = parallel_moe.parallel_moe_executor
+
+
+class _RoutedExperts(NamedTuple):
+    """The routed experts of one MoE backend."""
+
+    quant_algo: QuantAlgo
+    quantizer_cls: type[BaseQuantizeUtil]
+    weight_kwargs: dict[str, int | torch.Tensor]
+    backend_cls: type[MoEImplBase]
+
+
+# CUTEDSL and TRTLLM run the NVFP4 checkpoint's routed experts, CUTLASS the MXFP4 ones of DeepSeek-V4.1-Flash.
+_ROUTED_EXPERTS = {
+    "CUTLASS": _RoutedExperts(
+        quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
+        quantizer_cls=MXFP4MXFP8QuantizeUtil,
+        weight_kwargs={"input_hidden_alignment": 128},
+        backend_cls=CutlassFusedMoE,
+    ),
+    "CUTEDSL": _RoutedExperts(
+        quant_algo=QuantAlgo.NVFP4,
+        quantizer_cls=NVFP4QuantizeUtil,
+        # Maps the binary inputs' maximum, 1, to FP4's range.
+        weight_kwargs={"x_sf_global": torch.tensor(448.0 * 6.0)},
+        backend_cls=CuteDslFusedMoE,
+    ),
+    "TRTLLM": _RoutedExperts(
+        quant_algo=QuantAlgo.NVFP4,
+        quantizer_cls=NVFP4QuantizeUtil,
+        weight_kwargs={"x_sf_global": torch.tensor(448.0 * 6.0)},
+        backend_cls=TrtllmGenFusedMoEBase,
+    ),
+}
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCOL)
 
@@ -97,13 +145,31 @@ def _shared_fp8_reference(
     return output, torch.cat((gate, up), dim=-1)
 
 
-def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
+def _nvfp4_input(x: torch.Tensor, scale: torch.Tensor) -> Fp4QuantizedTensor:
+    """The rows as the FFN boundary's NVFP4 pass hands them to the routed experts."""
+    from tensorrt_llm._torch.kernels.blackwell.mhc import mhc_boundary
+
+    return Fp4QuantizedTensor(*mhc_boundary.nvfp4_quantize(x, scale.view(1)), is_sf_swizzled=False)
+
+
+def _run_shared_moe(
+    ep_size: int,
+    attention_dp: bool,
+    moe_backend: str,
+    comm_method: str,
+    num_tokens: int = 1,
+    nvfp4_input: bool = False,
+) -> None:
     from _torch.moe import test_deepseek_v41_parallel_moe as parallel_moe
 
     rank = mpi_rank()
     world_size = mpi_world_size()
     local_rank, local_size = parallel_moe._local_mpi_topology()
     torch.cuda.set_device(local_rank)
+    if comm_method == "NVLINK_ONE_SIDED":
+        supported = mpi_comm().allgather(NVLinkOneSided.is_platform_supported())
+        if not all(supported):
+            pytest.skip(f"Requires NVLink/MNNVL support on every EP rank: {supported}")
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -113,7 +179,8 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
         moe_tp_size=world_size // ep_size,
         enable_attention_dp=attention_dp,
     )
-    routed_quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8)
+    routed_experts = _ROUTED_EXPERTS[moe_backend]
+    routed_quant_config = QuantConfig(quant_algo=routed_experts.quant_algo)
     shared_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
     model_config = ModelConfig(
         pretrained_config=PretrainedConfig(
@@ -130,11 +197,16 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
         ),
         mapping=mapping,
         quant_config=shared_quant_config,
-        moe_backend="CUTLASS",
-        max_num_tokens=256,
+        moe_backend=moe_backend,
+        max_num_tokens=max(256, num_tokens + world_size),
     )
 
-    with torch.device(f"cuda:{local_rank}"), torch.inference_mode():
+    with (
+        torch.device(f"cuda:{local_rank}"),
+        torch.inference_mode(),
+        pytest.MonkeyPatch.context() as env,
+    ):
+        env.setenv("TRTLLM_FORCE_COMM_METHOD", comm_method)
         torch.manual_seed(1701)
         moe = DeepseekV4MoE(
             num_experts=parallel_moe._NUM_EXPERTS,
@@ -149,7 +221,10 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
             layer_idx=0,
         )
         with moe.experts:
-            assert isinstance(moe.experts.backend, CutlassFusedMoE)
+            assert isinstance(moe.experts.backend, routed_experts.backend_cls)
+            assert moe.eager_overlap_min_tokens == (
+                _EAGER_SHARED_EXPERT_OVERLAP_MIN_TOKENS if attention_dp else None
+            )
             assert not moe.experts.reduce_results
             expected_shared_tp = 1 if attention_dp else 2
             expected_shared_rank = rank % expected_shared_tp
@@ -166,7 +241,7 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
             moe.gate.e_score_correction_bias.copy_(
                 torch.randn(parallel_moe._NUM_EXPERTS, dtype=torch.float32) * 0.05
             )
-            routed_quantizer = MXFP4MXFP8QuantizeUtil(
+            routed_quantizer = routed_experts.quantizer_cls(
                 num_experts=parallel_moe._NUM_EXPERTS,
                 dtype=torch.bfloat16,
                 intermediate_size=parallel_moe._INTERMEDIATE_SIZE,
@@ -176,7 +251,7 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
                 swiglu_beta=0.0,
                 swiglu_limit=parallel_moe._CLAMP,
             )
-            routed_weights = routed_quantizer.create_weights(input_hidden_alignment=128)
+            routed_weights = routed_quantizer.create_weights(**routed_experts.weight_kwargs)
             reference_routed = routed_quantizer.create_ref_module(
                 parallel_moe._ReferenceRouting(moe.gate.e_score_correction_bias)
             )
@@ -184,7 +259,11 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
             moe.experts.load_weights([routed_weights])
             moe.experts.post_load_weights()
             del routed_weights
-            if not attention_dp:
+            if moe_backend == "TRTLLM":
+                # TRTLLM-Gen keeps a 64-row-aligned shard (576 rows at MoE TP4) unpadded.
+                shard = parallel_moe._INTERMEDIATE_SIZE // mapping.moe_tp_size
+                assert moe.experts.backend.w3_w1_weight.shape[-2] == 2 * shard
+            elif not attention_dp:
                 # TP4's 576-wide routed shards need 128-element alignment.
                 assert parallel_moe._INTERMEDIATE_SIZE // mapping.moe_tp_size == 576
                 weight_elements = torch.iinfo(moe.experts.backend.w2_weight.dtype).bits // 4
@@ -219,7 +298,7 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
                     scales.mul_(2)
             _load_shared_weights(moe.shared_experts, shared_weights)
 
-            counts = list(range(1, world_size + 1))
+            counts = list(range(num_tokens, num_tokens + world_size))
             # Binary rows stay exact under FP8 quantization and distinguish DP slices.
             # Nonnegative inputs keep the shared expert out of the zero SiLU tail.
             torch.manual_seed(1702)
@@ -229,6 +308,11 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
             start = sum(counts[:rank])
             x = global_x[start : start + counts[rank]] if attention_dp else global_x
             all_rank_num_tokens = counts if attention_dp else None
+            routed_input = {}
+            if nvfp4_input:
+                routed_input["hidden_states_fp4"] = _nvfp4_input(
+                    x, moe.experts.backend.fc31_input_scale
+                )
             reference_logits = F.linear(x.float(), moe.gate.weight.float())
             expected_routed = reference_routed(x, reference_logits)
             expected_shared, expected_gate_up = _shared_fp8_reference(x, shared_weights)
@@ -261,46 +345,149 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
                 torch.testing.assert_close(actual_shared, expected_shared, rtol=1e-2, atol=0.1)
 
                 actual_routed = moe.compute_routed_output(
-                    x, None, None, all_rank_num_tokens, do_finalize=True
+                    x,
+                    routed_input.get("hidden_states_fp4"),
+                    None,
+                    all_rank_num_tokens,
+                    do_finalize=True,
                 )
                 if moe.allreduce is not None:
                     actual_routed = moe.allreduce(actual_routed)
                 reference_routed.check_accuracy(actual_routed, expected_routed)
 
-                actual = moe(x, all_rank_num_tokens=all_rank_num_tokens)
+                comm = moe.experts.comm
+                if isinstance(comm, NVLinkOneSided):
+                    # The FC2 output (the combine payload) must not depend on what its buffer held.
+                    torch.cuda.synchronize()
+                    mpi_comm().Barrier()
+                    offset = int(comm.moe_a2a_metainfo[comm.COMBINE_INPUT_OFFSET_INDEX])
+                    size = int(comm.moe_a2a_metainfo[comm.COMBINE_INPUT_SIZE_INDEX])
+                    comm.workspace[comm.ep_rank, offset : offset + size].fill_(0xFF)
+                    torch.cuda.synchronize()
+                    mpi_comm().Barrier()
+                    # Two ranks above the pull threshold: the combine pulls and adds the shared output.
+                    assert comm.pull_combine_applies(max(counts)) == (
+                        ep_size == 2 and moe_backend == "CUTEDSL" and num_tokens >= 4096
+                    )
+
+                # Records the stream that runs the shared expert (or this rank's 1/tp piece of it).
+                shared_expert_streams = []
+                moe.shared_experts.register_forward_pre_hook(
+                    lambda *_: shared_expert_streams.append(torch.cuda.current_stream())
+                )
+
+                def run_piece(*args):
+                    shared_expert_streams.append(torch.cuda.current_stream())
+                    return full_tp_shared_expert_forward(*args)
+
+                env.setattr(modeling_deepseekv4, "full_tp_shared_expert_forward", run_piece)
+                if attention_dp:
+                    # A floor above this rank's rows keeps the first forward serial.
+                    moe.eager_overlap_min_tokens = counts[rank] + 1
+                actual = moe(x, all_rank_num_tokens=all_rank_num_tokens, **routed_input)
                 torch.cuda.synchronize()
+                assert shared_expert_streams == [torch.cuda.current_stream()], (
+                    "the serial forward forked"
+                )
                 assert actual.shape == x.shape
                 assert torch.isfinite(actual).all()
                 expected = expected_routed + expected_shared
                 reference_routed.check_accuracy(actual, expected)
                 if attention_dp:
-                    # Send rank 0's prefix to the last rank to check row-order sensitivity.
-                    misordered = torch.cat(mpi_comm().allgather(actual.cpu())).roll(
-                        sum(counts[:-1]), dims=0
+                    if moe_backend == "CUTLASS":
+                        # Send rank 0's prefix to the last rank to check row-order sensitivity
+                        # (MXFP4's tolerance tells the rows apart; NVFP4's does not).
+                        misordered = torch.cat(mpi_comm().allgather(actual.cpu())).roll(
+                            sum(counts[:-1]), dims=0
+                        )
+                        misordered = misordered[start : start + counts[rank]].to(actual.device)
+                        with pytest.raises(Exception, match="Mismatch percentage"):
+                            reference_routed.check_accuracy(misordered, expected)
+                    # With the floor at one token the layer forks; the output must not change.
+                    moe.eager_overlap_min_tokens = 1
+                    forked = moe(x, all_rank_num_tokens=all_rank_num_tokens, **routed_input)
+                    assert shared_expert_streams[1:] == [moe.aux_stream], (
+                        "the forward with the floor at one token did not fork"
                     )
-                    misordered = misordered[start : start + counts[rank]].to(actual.device)
-                    with pytest.raises(Exception, match="Mismatch percentage"):
-                        reference_routed.check_accuracy(misordered, expected)
+                    if comm_method == "NVLINK_ONE_SIDED":
+                        assert isinstance(moe.experts.comm, NVLinkOneSided)
+                    if moe_backend == "CUTLASS":
+                        assert torch.equal(forked, actual), (
+                            "the shared-expert fork changed the output"
+                        )
+                    else:
+                        # CUTEDSL varies by a bf16 rounding step run to run, also in per-rank partials.
+                        scale = actual.abs().max().item()
+                        torch.testing.assert_close(forked, actual, rtol=0, atol=2**-5 * scale)
+                if moe_backend == "TRTLLM":
+                    # The one-launch route (with the runner's routing tables) gives the separate launches' bits.
+                    backend = moe.experts.backend
+                    assert backend._fuses_route
+                    backend._fuses_route = False
+                    try:
+                        separate = moe(x, all_rank_num_tokens=all_rank_num_tokens, **routed_input)
+                    finally:
+                        backend._fuses_route = True
+                    assert torch.equal(separate, actual), "the one-launch route changed the output"
 
 
 @skip_pre_blackwell
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
-    "parallel_moe_executor,ep_size,attention_dp",
+    "parallel_moe_executor,ep_size,attention_dp,moe_backend,comm_method,num_tokens,nvfp4_input",
     [
-        pytest.param(4, 1, False, id="tp4-ep1-sharedtp2"),
-        pytest.param(4, 4, True, id="tp4-ep4-dp-sharedtp1"),
+        pytest.param(4, 1, False, "CUTLASS", "ALLGATHER", 1, False, id="tp4-ep1-sharedtp2"),
+        pytest.param(4, 4, True, "CUTLASS", "ALLGATHER", 1, False, id="tp4-ep4-dp-sharedtp1"),
+        # The GB300 ctx_only target's MoE kernels and dispatch/combine.
+        pytest.param(
+            4,
+            4,
+            True,
+            "CUTEDSL",
+            "NVLINK_ONE_SIDED",
+            1,
+            False,
+            id="tp4-ep4-dp-sharedtp1-cutedsl-nvfp4",
+        ),
+        # The ctx DEP2 target at 32K tokens per rank on the FFN boundary's NVFP4 rows: one-launch routing,
+        # pull combine with the shared output added, FC1 zeroing the payload.
+        pytest.param(
+            2,
+            2,
+            True,
+            "CUTEDSL",
+            "NVLINK_ONE_SIDED",
+            32768,
+            True,
+            id="tp2-ep2-dp-sharedtp1-cutedsl-nvfp4-pull",
+        ),
+        # The ll TP8 decode step (6 rows) on TRTLLM-Gen from the boundary's NVFP4 rows: MoE TP4 (unpadded
+        # 576-row shards, the shared expert's 1/tp pieces) and MoE TP2 x EP2 (expert-parallel routing tables).
+        pytest.param(4, 1, False, "TRTLLM", "ALLGATHER", 0, True, id="tp4-ep1-trtllm-nvfp4"),
+        pytest.param(4, 2, False, "TRTLLM", "ALLGATHER", 0, True, id="tp4-ep2-trtllm-nvfp4"),
     ],
     indirect=["parallel_moe_executor"],
 )
 def test_deepseek_v41_shared_moe(
-    parallel_moe_executor: MPIPoolExecutor | None, ep_size: int, attention_dp: bool
+    parallel_moe_executor: MPIPoolExecutor | None,
+    ep_size: int,
+    attention_dp: bool,
+    moe_backend: str,
+    comm_method: str,
+    num_tokens: int,
+    nvfp4_input: bool,
 ) -> None:
     if parallel_moe_executor is None:
-        _run_shared_moe(ep_size, attention_dp)
+        _run_shared_moe(ep_size, attention_dp, moe_backend, comm_method, num_tokens, nvfp4_input)
         return
     world_size = parallel_moe_executor.num_workers
     results = parallel_moe_executor.map(
-        _run_shared_moe, repeat(ep_size, world_size), repeat(attention_dp, world_size)
+        _run_shared_moe,
+        repeat(ep_size, world_size),
+        repeat(attention_dp, world_size),
+        repeat(moe_backend, world_size),
+        repeat(comm_method, world_size),
+        repeat(num_tokens, world_size),
+        repeat(nvfp4_input, world_size),
     )
     assert all(result is None for result in results)

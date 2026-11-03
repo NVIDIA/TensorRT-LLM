@@ -33,6 +33,7 @@ touching the MoE backend.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import math
@@ -500,6 +501,159 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 }
 
 
+# Static defaults for the SM107 DeepSeek-V4.1-Flash DEP4/8/16 shapes.
+# Full runner keys keep selection rank-identical and limit it to the listed
+# launch capacities and activation modes, independently of routing or live rows.
+# A None phase hint selects the minimum safe FC1 prologue.
+_SM107_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    (
+        107,
+        world_size,
+        6,
+        384 // world_size,
+        5120,
+        2304,
+        4608,
+        max_tokens_per_rank,
+        str(torch.bfloat16),
+        True,
+        gate_up_clamp,
+        None,
+        None,
+        False,
+        "bf16",
+        swiglu_alpha,
+        swiglu_beta,
+        0,
+    ): (
+        list(mma_tiler),
+        [cluster_m, 1, 1],
+        [fallback_cluster_m, 1, 1] if fallback_cluster_m is not None else None,
+        schedule_policy,
+        "atomic_counter" if schedule_policy[0] == "phase_interleave" else "grid_stride",
+        "epi_warps",
+        True,
+        1,
+        flag_batch,
+        epi_flag_batch,
+    )
+    for world_size, bucket_tactics in {
+        4: {
+            2048: ((256, 256, 256), 4, None, ("phase_interleave", None), 1, (1, 4)),
+            4096: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
+            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 4)),
+            16384: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 1)),
+            32768: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 1)),
+        },
+        8: {
+            2048: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
+            4096: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 2)),
+            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 4)),
+            16384: ((256, 256, 256), 4, None, ("phase_interleave", 3), 1, (1, 4)),
+            32768: ((256, 128, 512), 4, None, ("phase_interleave", None), 4, (1, 4)),
+        },
+        16: {
+            2048: ((256, 128, 512), 4, None, ("phase_interleave", 3), 1, (1, 1)),
+            4096: ((256, 128, 512), 4, None, ("phase_interleave", 4), 1, (1, 4)),
+            8192: ((256, 256, 256), 4, 2, ("phase_interleave", 3), 1, (1, 2)),
+            16384: ((256, 128, 512), 4, None, ("phase_interleave", 3), 4, (1, 1)),
+            32768: ((256, 256, 256), 2, None, ("grouped", 512), 1, (1, 1)),
+        },
+    }.items()
+    for max_tokens_per_rank, (
+        mma_tiler,
+        cluster_m,
+        fallback_cluster_m,
+        schedule_policy,
+        flag_batch,
+        epi_flag_batch,
+    ) in bucket_tactics.items()
+    for gate_up_clamp, swiglu_alpha, swiglu_beta in (
+        (None, None, None),
+        (10.0, None, None),
+        (10.0, 1.0, 0.0),
+    )
+}
+
+
+# Static defaults for the SM103 DeepSeek-V4.1-Flash shapes at DEP2/4/8/16, also with one extra slot
+# per rank (warmup placement with hot-expert copies): above
+# _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT, the phase-interleaved cluster-4 schedule with one FC2
+# TMA stage; the key omits max_tokens_per_rank (index 7 of the runner key) and covers every bucket.
+_SM103_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    (
+        103,
+        world_size,
+        6,
+        384 // world_size + extra_slots,
+        5120,
+        2304,
+        4608,
+        str(torch.bfloat16),
+        True,
+        10.0,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    ): (
+        [256, 128, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("phase_interleave", 3),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 4),
+    )
+    for world_size in (2, 4, 8, 16)
+    for extra_slots in (0, 1)
+}
+# Mean routed rows per local expert at the rung (max_tokens_per_rank x top-k / experts per rank) up to
+# which the grouped schedule of _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS beats phase interleave.
+_SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT = 32
+
+_SM103_DSV41_FLASH_SMALL_RUNG_TACTICS: dict[Tuple, Tuple] = {
+    key: (
+        [256, 128, 256],
+        [4, 1, 1],
+        [2, 1, 1],
+        ("grouped", 512),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        2,
+        1,
+        (1, 4),
+    )
+    for key in _SM103_DSV41_FLASH_DEFAULT_TACTICS
+}
+
+# The evict-first L2 hint on the expert-weight TMA loads pays while each weight tile is streamed
+# about once: through a mean of 96 received rows per expert (DEP32 at 192 tokens per rank), within
+# one 128-row token tile; with more rows, hot experts re-read their weights across token tiles.
+_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_EXPERT = 96
+# With skewed routing, hot experts span several token tiles before the per-expert mean reaches it.
+_WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK = 3072  # 3K received rows
+
+
+def _megamoe_weight_evict_first(
+    sm_version: int, max_tokens_per_rank: int, num_topk: int, num_experts_per_rank: int
+) -> bool:
+    """Whether the expert-weight TMA loads of this rung take the evict-first L2 hint."""
+    received_rows = max_tokens_per_rank * num_topk
+    return (
+        sm_version == 103
+        and received_rows <= _WEIGHT_EVICT_FIRST_MAX_ROWS_PER_EXPERT * num_experts_per_rank
+        and received_rows <= _WEIGHT_EVICT_FIRST_MAX_ROWS_PER_RANK
+    )
+
+
 # ---------------------------------------------------------------------------
 # Curated tuning space with staged-store and mixed-CGA candidates, filtered through
 # ``validate_megamoe_tactic``. MUST be identical on every EP rank: the MERGE
@@ -547,6 +701,38 @@ _MEGAMOE_NONBULK_STANDALONE_TACTIC: Tuple = (
     None,
     1,
     (2, 4),
+)
+
+# Quantized combine (NVFP4 / MXFP8 token-back): the non-bulk standalone tactic with every FC2 tile
+# publishing its completion at once. The token-back warps push an expert's rows only once its FC2
+# done counter is complete, so publishing in batches of 4 tiles per CTA held each push back.
+_MEGAMOE_QUANTIZED_COMBINE_TACTIC: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "grid_stride",
+    "standalone_warps",
+    False,
+    None,
+    1,
+    (2, 1),
+)
+
+# NVFP4-combine calls of at least this many tokens per rank, whose FC2 epilogue paces the FC2 tiles,
+# store the FC2 output in bulk through two staging buffers (2048: smaller calls gain nothing).
+_MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS = 2048
+_MEGAMOE_NVFP4_COMBINE_BULK_TACTIC: Tuple = (
+    [256, 256, 256],
+    [2, 1, 1],
+    None,
+    ("grouped", 512),
+    "grid_stride",
+    "standalone_warps",
+    True,
+    2,
+    1,
+    (2, 1),
 )
 
 _SM107_GENPHASE_TACTICS: dict[int, Tuple] = {
@@ -716,6 +902,22 @@ def _megamoe_problem_key(
     )
 
 
+def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
+    """Static default tactic of a measured runner key, or None."""
+    tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key)
+    if tactic is None:
+        tactic = _SM107_DSV41_FLASH_DEFAULT_TACTICS.get(problem_key)
+    if tactic is None:
+        rows_per_expert = problem_key[7] * problem_key[2] / problem_key[3]
+        table = (
+            _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS
+            if rows_per_expert <= _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT
+            else _SM103_DSV41_FLASH_DEFAULT_TACTICS
+        )
+        tactic = table.get(problem_key[:7] + problem_key[8:])
+    return tactic
+
+
 def _default_megamoe_tactic_for_problem(
     *,
     sm_version: int,
@@ -727,7 +929,14 @@ def _default_megamoe_tactic_for_problem(
     shape_tuned_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
-        return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        if sm_version == 107:
+            return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        if (
+            combine_format.startswith("16e2m1")
+            and num_tokens >= _MEGAMOE_NVFP4_COMBINE_BULK_MIN_TOKENS
+        ):
+            return _unpack_tactic(_MEGAMOE_NVFP4_COMBINE_BULK_TACTIC)
+        return _unpack_tactic(_MEGAMOE_QUANTIZED_COMBINE_TACTIC)
     bucket = _sm107_tactic_bucket(max_tokens_per_rank) if sm_version == 107 else None
     if bucket is not None:
         expected_in_kernel_fc2_reduce = _sm107_use_in_kernel_fc2_reduce(
@@ -751,7 +960,7 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         apply_topk_in_fc1=problem_key[9],
         in_kernel_fc2_reduce=problem_key[13],
         combine_format=problem_key[14],
-        shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
+        shape_tuned_tactic=_shape_tuned_megamoe_tactic(problem_key),
     )
 
 
@@ -913,6 +1122,14 @@ def _construct_megamoe_kernel(
             "topk_index_dtype": cutlass.Int32 if sm_version == 107 else cutlass.Int64,
             "max_tokens_per_rank": int(common["max_tokens_per_rank"]),
             "apply_topk_at_fc1": bool(common["apply_topk_in_fc1"]),
+            **(
+                {
+                    "shared_intermediate_size": int(common["shared_intermediate_size"]),
+                    "shared_gate_up_clamp": common["shared_gate_up_clamp"],
+                }
+                if common.get("shared_intermediate_size") is not None
+                else {}
+            ),
         }
     )
     mma_tiler = tuple(common["mma_tiler_mnk"])
@@ -948,6 +1165,8 @@ def _construct_megamoe_kernel(
         )
     if common["fc2_tma_stages"] is not None:
         impl_values["fc2_tma_stages"] = int(common["fc2_tma_stages"])
+    if sm_version != 107:
+        impl_values["weight_evict_first"] = bool(common["weight_evict_first"])
     impl_desc = ImplDesc(impl_values)
 
     def construct(kernel_cls):
@@ -2185,6 +2404,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=(None if gate_up_clamp is None else float(gate_up_clamp)),
                 situ_beta=(None if situ_beta is None else float(situ_beta)),
                 situ_linear_beta=(None if situ_linear_beta is None else float(situ_linear_beta)),
+                weight_evict_first=_megamoe_weight_evict_first(
+                    sm_version, max_tokens_per_rank, num_topk, num_experts_per_rank
+                ),
                 **_LOCKED_KERNEL_KWARGS,
             )
             probe, _ = _construct_megamoe_kernel(
@@ -2257,6 +2479,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             in_kernel_fc2_reduce: bool = False,
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
+            shared_intermediate_size: Optional[int] = None,
+            shared_gate_up_clamp: Optional[float] = None,
             helper_expert_count: int = 0,
         ) -> None:
             super().__init__()
@@ -2310,6 +2534,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # generated kernel, so deliberately EXCLUDED from unique_id /
             # _tactic_cache_key: opted-in and opted-out runs share caches.
             self.tactic_autotune = bool(tactic_autotune)
+            self.weight_evict_first = _megamoe_weight_evict_first(
+                self.sm_version, self.max_tokens_per_rank, self.num_topk, self.num_experts_per_rank
+            )
+            # The fused FP8 shared expert changes the generated kernel and its local workspace.
+            if shared_intermediate_size is not None and self.sm_version not in (100, 103):
+                raise ValueError("The fused shared expert requires SM100 or SM103.")
+            self.shared_intermediate_size = (
+                None if shared_intermediate_size is None else int(shared_intermediate_size)
+            )
+            self.shared_gate_up_clamp = (
+                None if shared_gate_up_clamp is None else float(shared_gate_up_clamp)
+            )
             # ``S``. CODEGEN-CHANGING: a helper-bearing build carries the READY
             # gate and a static ``H`` boundary in the sched warp, so it MUST NOT
             # share a compile-cache entry with the ungated baseline.  Hence it
@@ -2332,6 +2568,22 @@ if IS_MEGAMOE_OP_AVAILABLE:
             return key
 
         def _build_unique_id(self):
+            key = self._tactic_lookup_key()
+            if self.shared_intermediate_size is not None:
+                key = (
+                    *key,
+                    ("shared_fp8", self.shared_intermediate_size, self.shared_gate_up_clamp),
+                )
+            return key
+
+        def _tactic_lookup_key(self):
+            """The problem key of the default tactic tables, which the fused shared expert shares."""
+            key = self.__dict__.get("_tactic_key")
+            if key is None:
+                key = self._tactic_key = self._build_tactic_key()
+            return key
+
+        def _build_tactic_key(self):
             return _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
@@ -2389,7 +2641,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
-            default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
+            default_tactic = _shape_tuned_megamoe_tactic(self._tactic_lookup_key())
             if default_tactic is not None:
                 default_tactic = _unpack_tactic(default_tactic)
                 if default_tactic not in candidates:
@@ -2610,6 +2862,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 gate_up_clamp=self.gate_up_clamp,
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
+                weight_evict_first=self.weight_evict_first,
+                shared_intermediate_size=self.shared_intermediate_size,
+                shared_gate_up_clamp=self.shared_gate_up_clamp,
                 helper_expert_count=self.helper_expert_count,
                 **_LOCKED_KERNEL_KWARGS,
             )
@@ -2665,6 +2920,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tuple(epi_flag_batch),
                 str(token_back_ready_granularity),
                 launch_config,
+                self.weight_evict_first,
             )
 
         def _resolve_kernel_descriptor(
@@ -2690,6 +2946,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             tactic: Any = -1,
             peer_offsets: Optional[List[int]] = None,
             shared_workspace: Optional[torch.Tensor] = None,
+            shared_num_tokens: int = 0,
             **kwargs,
         ) -> None:
             del kwargs
@@ -2697,7 +2954,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if use_default_tactic:
                 num_tokens = int(inputs[0].shape[0])
                 tactic_t = _default_megamoe_tactic_for_key(
-                    self.unique_id(),
+                    self._tactic_lookup_key(),
                     num_tokens=num_tokens,
                 )
             elif isinstance(tactic, list):
@@ -2930,6 +3187,25 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 shared_workspace=_to_cute_ptr_cached(shared_workspace),
                 stream=_current_cu_stream(),
             )
+            if self.shared_intermediate_size is not None:
+                (
+                    shared_fc1_weight,
+                    shared_fc1_weight_sf,
+                    shared_fc2_weight,
+                    shared_fc2_weight_sf,
+                    shared_activation,
+                    shared_activation_sf,
+                ) = inputs[12:18]
+                runtime_kwargs.update(
+                    shared_fc1_weight=_to_cute_w(shared_fc1_weight),
+                    shared_fc1_weight_sf=_to_cute_w(shared_fc1_weight_sf),
+                    shared_fc2_weight=_to_cute_w(shared_fc2_weight),
+                    shared_fc2_weight_sf=_to_cute_w(shared_fc2_weight_sf),
+                    shared_activation=_to_cute_w(shared_activation),
+                    shared_activation_sf=_to_cute_w(shared_activation_sf),
+                    # A runtime scalar, never a compile-time constant.
+                    shared_num_tokens=cutlass.Int32(int(shared_num_tokens)),
+                )
             runtime_kwargs.update(
                 topk_indices=cute_topk_idx,
                 topk_scores=cute_topk_weights,
@@ -2975,8 +3251,29 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 self.__class__.kernel_cache[cache_key] = (compiled, kernel)
             else:
                 compiled = cached[0]
+            # Eager launches must not overlap the dispatch router: in eager warmup that
+            # overlap can trap the persistent kernel's 2-CTA TMEM teardown. Graphs and
+            # per-layer dynamic EPLB (helper experts) keep PDL.
+            if (
+                not _capturing
+                and self.helper_expert_count == 0
+                and getattr(kernel, "use_pdl", False)
+            ):
+                compiled = self._eager_compiled(cache_key, kernel, runtime_kwargs)
             compiled(**runtime_kwargs)
             return combine_output
+
+        def _eager_compiled(self, cache_key: Tuple, kernel: Any, runtime_kwargs: dict) -> Any:
+            """The kernel compiled without PDL, for launches outside graph capture."""
+            eager_key = (cache_key, "eager")
+            cached = self.__class__.kernel_cache.get(eager_key)
+            if cached is None:
+                cute = _cute_launch_helpers()[3]
+                eager_kernel = copy.copy(kernel)
+                eager_kernel.use_pdl = False
+                cached = (cute.compile(eager_kernel, **runtime_kwargs), eager_kernel)
+                self.__class__.kernel_cache[eager_key] = cached
+            return cached[0]
 
     def _megamoe_get_runner(
         world_size,
@@ -2998,6 +3295,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format,
         tactic_autotune,
         helper_expert_count,
+        shared_intermediate_size=None,
+        shared_gate_up_clamp=None,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3023,6 +3322,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            shared_intermediate_size,
+            shared_gate_up_clamp,
         )
 
         def _make():
@@ -3046,6 +3347,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 combine_format=combine_format,
                 tactic_autotune=tactic_autotune,
                 helper_expert_count=helper_expert_count,
+                shared_intermediate_size=shared_intermediate_size,
+                shared_gate_up_clamp=shared_gate_up_clamp,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3098,6 +3401,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        shared_fc1_weight: Optional[torch.Tensor] = None,
+        shared_fc1_weight_sf: Optional[torch.Tensor] = None,
+        shared_fc2_weight: Optional[torch.Tensor] = None,
+        shared_fc2_weight_sf: Optional[torch.Tensor] = None,
+        shared_activation: Optional[torch.Tensor] = None,
+        shared_activation_sf: Optional[torch.Tensor] = None,
+        shared_num_tokens: int = 0,
+        shared_intermediate_size: Optional[int] = None,
+        shared_gate_up_clamp: Optional[float] = None,
         # READY ABI tail. ``helper_expert_count`` (S) is codegen-time;
         # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
         # view published by the weight transport, ``..._generation`` the
@@ -3132,6 +3444,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ``act_alpha`` / ``act_beta`` select the activation: both None
         runs SwiGLU, both set runs SiTU with the gate-side and linear-side
         soft-caps, respectively. They are codegen-time constants.
+
+        ``shared_intermediate_size`` fuses an FP8 shared expert: MXFP8 weights and the MXFP8
+        activation (``shared_num_tokens`` live rows) run as extra tiles, and its output joins the
+        top-k reduction into ``combine_output``.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103, 107):
@@ -3167,6 +3483,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            shared_intermediate_size=shared_intermediate_size,
+            shared_gate_up_clamp=shared_gate_up_clamp,
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3186,6 +3504,18 @@ if IS_MEGAMOE_OP_AVAILABLE:
             fc1_norm_const,
             combine_output,
         ]
+        if shared_intermediate_size is not None:
+            shared_inputs = (
+                shared_fc1_weight,
+                shared_fc1_weight_sf,
+                shared_fc2_weight,
+                shared_fc2_weight_sf,
+                shared_activation,
+                shared_activation_sf,
+            )
+            if any(tensor is None for tensor in shared_inputs):
+                raise ValueError("The fused shared expert needs all six shared tensors.")
+            inputs.extend(shared_inputs)
         if not tactic_autotune:
             # Opt-OUT (default; serving never opts in): skip the AutoTuner.
             # ``choose_one`` is NOT a safe no-op -- in tuning mode a cache miss
@@ -3198,6 +3528,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     tactic=-1,
                     peer_offsets=peer_offsets,
                     shared_workspace=shared_workspace,
+                    shared_num_tokens=shared_num_tokens,
                 )
             finally:
                 # Release the cached runner reference to this generation's terminal tensor.
@@ -3247,6 +3578,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 inputs,
                 peer_offsets=prof_peer_offsets,
                 shared_workspace=prof_shared_workspace,
+                shared_num_tokens=shared_num_tokens,
             )
         finally:
             runner._profiling_scratch = None
@@ -3258,6 +3590,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 tactic=best_tactic,
                 peer_offsets=peer_offsets,
                 shared_workspace=shared_workspace,
+                shared_num_tokens=shared_num_tokens,
             )
         finally:
             runner._helper_ready_flags = None
@@ -3304,6 +3637,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format: str = "bf16",
         tactic_autotune: bool = False,
         num_tokens: int = -1,
+        shared_fc1_weight: Optional[torch.Tensor] = None,
+        shared_fc1_weight_sf: Optional[torch.Tensor] = None,
+        shared_fc2_weight: Optional[torch.Tensor] = None,
+        shared_fc2_weight_sf: Optional[torch.Tensor] = None,
+        shared_activation: Optional[torch.Tensor] = None,
+        shared_activation_sf: Optional[torch.Tensor] = None,
+        shared_num_tokens: int = 0,
+        shared_intermediate_size: Optional[int] = None,
+        shared_gate_up_clamp: Optional[float] = None,
         # READY ABI tail. ``helper_expert_count`` (S) is codegen-time;
         # ``hot_expert_weight_ready_flags`` is the local uint64[EP] terminal
         # view published by the weight transport, ``..._generation`` the

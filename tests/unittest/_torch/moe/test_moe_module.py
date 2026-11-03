@@ -75,6 +75,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
     DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
@@ -1736,6 +1737,160 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
         dtype_routing_logits=dtype_routing_logits,
         bias_dtype=torch.float32,
     )
+
+
+@pytest.mark.parametrize("moe_backend", [MoeBackendType.TRTLLM, MoeBackendType.MEGAMOE_CUTEDSL])
+@pytest.mark.parametrize("seq_len", [6, 12, 192])
+def test_dsv4_fused_route_quant_matches_separate_launches(moe_backend, seq_len):
+    """The one-launch DeepSeek-V4 routing + NVFP4 quantization leaves the MoE output bitwise."""
+    model = MoeModelConfig(num_experts=256, top_k=6, hidden_size=2048, intermediate_size=512)
+    dtype = torch.bfloat16
+    skip_reason = (
+        should_skip_trtllm(moe_backend, QuantAlgo.NVFP4, model)
+        if moe_backend == MoeBackendType.TRTLLM
+        else should_skip_megamoe_cutedsl(moe_backend, QuantAlgo.NVFP4, dtype, model)
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+    torch.manual_seed(0)
+    bias = torch.randn(model.num_experts, dtype=torch.float32, device="cuda") * 0.1
+    routing_method = DeepSeekV4MoeRoutingMethod(
+        top_k=model.top_k,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+        callable_e_score_correction_bias=lambda: bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+    )
+    x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.NVFP4, x, moe_backend
+    )
+    quant_kwargs.pop("ref_cls", None)
+    quantize_util = quantize_util_cls(
+        num_experts=model.num_experts,
+        dtype=dtype,
+        intermediate_size=model.intermediate_size,
+        hidden_size=model.hidden_size,
+        quant_config=quant_config,
+    )
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1)
+    model_cfg = _create_model_config(
+        num_experts=model.num_experts,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        dtype=dtype,
+        mapping=mapping,
+        quant_config=quant_config,
+        moe_backend=moe_backend.value,
+        max_num_tokens=256,
+    )
+    # Unfinalized (per-expert rows, weights, permutation), as the model's fused all-reduce takes it.
+    unfinalized = moe_backend == MoeBackendType.TRTLLM
+    with create_moe(
+        routing_method=routing_method, reduce_results=not unfinalized, model_config=model_cfg
+    ) as fused_moe:
+        fused_moe.create_weights()
+        fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        fused_moe.post_load_weights()
+        fused_moe.cuda()
+        assert fused_moe.backend._fuses_route_quant
+
+        def forward(do_finalize):
+            return fused_moe.forward(
+                x, router_logits, all_rank_num_tokens=[seq_len], do_finalize=do_finalize
+            )
+
+        with torch.inference_mode():
+            fused = forward(True)
+            fused_rows = forward(False) if unfinalized else None
+            fused_moe.backend._fuses_route_quant = False
+            separate = forward(True)
+            separate_rows = forward(False) if unfinalized else None
+    # Bitwise, also where the TRTLLM leaf hands the runner its routing tables (6 tokens, not 12).
+    torch.testing.assert_close(fused, separate, atol=0, rtol=0)
+    if unfinalized:
+        # An expert's rows may sit elsewhere in its block: compare them by expanded index.
+        rows = [out[0][out[2].flatten().long()] for out in (fused_rows, separate_rows)]
+        torch.testing.assert_close(rows[0], rows[1], atol=0, rtol=0)
+        torch.testing.assert_close(fused_rows[1], separate_rows[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("seq_len", [5, 64])
+def test_dspark_draft_fused_route_quant_matches_separate_launches(seq_len, monkeypatch):
+    """The DSpark draft bank (top-3 of 128, bias-selected) on TRTLLM-Gen MXFP4 x MXFP8 routes and
+    quantizes its input in one launch, and the MoE output is bitwise that of the separate
+    routing, scale cast and quantization launches."""
+    moe_backend = MoeBackendType.TRTLLM
+    model = MoeModelConfig(num_experts=128, top_k=3, hidden_size=2048, intermediate_size=512)
+    dtype = torch.bfloat16
+    skip_reason = should_skip_trtllm(moe_backend, QuantAlgo.W4A8_MXFP4_MXFP8, model)
+    if skip_reason:
+        pytest.skip(skip_reason)
+    torch.manual_seed(3)
+    bias = torch.randn(model.num_experts, dtype=torch.float32, device="cuda") * 0.1
+    routing_method = DeepSeekV4MoeRoutingMethod(
+        top_k=model.top_k,
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.5,
+        callable_e_score_correction_bias=lambda: bias,
+        callable_tid2eid=lambda: None,
+        is_hashed=False,
+    )
+    x = torch.randn((seq_len, model.hidden_size), dtype=dtype, device="cuda")
+    router_logits = torch.randn((seq_len, model.num_experts), dtype=torch.float32, device="cuda")
+    quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+        QuantAlgo.W4A8_MXFP4_MXFP8, x, moe_backend
+    )
+    quant_kwargs.pop("ref_cls", None)
+    quantize_util = quantize_util_cls(
+        num_experts=model.num_experts,
+        dtype=dtype,
+        intermediate_size=model.intermediate_size,
+        hidden_size=model.hidden_size,
+        quant_config=quant_config,
+    )
+    model_cfg = _create_model_config(
+        num_experts=model.num_experts,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        dtype=dtype,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        quant_config=quant_config,
+        moe_backend=moe_backend.value,
+        max_num_tokens=256,
+    )
+    with create_moe(
+        routing_method=routing_method, reduce_results=False, model_config=model_cfg
+    ) as fused_moe:
+        fused_moe.create_weights()
+        fused_moe.load_weights([quantize_util.create_weights(**quant_kwargs)])
+        fused_moe.post_load_weights()
+        fused_moe.cuda()
+        backend = fused_moe.backend
+        fused_launch = backend._try_dsv4_draft_route_quant
+        taken = []
+
+        def spy(*args):
+            result = fused_launch(*args)
+            taken.append(result is not None)
+            return result
+
+        def forward():
+            return fused_moe.forward(
+                x, router_logits, all_rank_num_tokens=[seq_len], output_dtype=dtype
+            )
+
+        with torch.inference_mode():
+            monkeypatch.setattr(backend, "_try_dsv4_draft_route_quant", spy)
+            fused = forward()
+            monkeypatch.setattr(backend, "_try_dsv4_draft_route_quant", lambda *_: None)
+            separate = forward()
+    assert taken == [True]
+    torch.testing.assert_close(fused, separate, atol=0, rtol=0)
 
 
 # ============================================================================

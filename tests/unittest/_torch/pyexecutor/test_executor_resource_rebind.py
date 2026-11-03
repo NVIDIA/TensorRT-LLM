@@ -303,6 +303,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         batch_wait_timeout_ms=0,
         batch_wait_timeout_iters=0,
         batch_wait_max_tokens_ratio=0,
+        enable_client_io_during_gpu_wait=False,
     )
     cache = Mock(
         event_buffer_max_size=0,

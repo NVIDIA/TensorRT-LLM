@@ -192,6 +192,7 @@ class TopkReduce:
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
+        extra_term: Optional[cute.Tensor] = None,  # (>= token, hidden) bf16
     ):
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
@@ -212,7 +213,13 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(grid=grid, block=block, stream=stream)
+            if cutlass.const_expr(extra_term is not None):
+                extra_term = cute.make_tensor(
+                    extra_term.iterator, cute.make_layout((extra_term.shape[0], self.hidden), stride=extra_term.stride)
+                )
+            self._reduce_bf16(combine_quant, topk_score, reduced_output, extra_term).launch(
+                grid=grid, block=block, stream=stream
+            )
             return
 
         # The mega kernel hands sf in already as the depth-2 broadcast layout; a
@@ -247,7 +254,13 @@ class TopkReduce:
     # -- kernels --------------------------------------------------------------
 
     @cute.kernel
-    def _reduce_bf16(self, combine_output: cute.Tensor, topk_score: Optional[cute.Tensor], reduced_output: cute.Tensor):
+    def _reduce_bf16(
+        self,
+        combine_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        extra_term: Optional[cute.Tensor],
+    ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
@@ -299,6 +312,21 @@ class TopkReduce:
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
                             value_pair, score_pair, (Float32(0.0), Float32(0.0))
                         )
+
+            if cutlass.const_expr(extra_term is not None):
+                extra = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                extra_src = cute.zipped_divide(extra_term[token_idx, None], (hidden_per_thread,))[
+                    (None,), (hidden_tile_idx,)
+                ]
+                cute.copy(
+                    load_atom,
+                    mark_alignment(extra_src, hidden_per_thread * cutlass.BFloat16.width // 8),
+                    extra,
+                )
+                for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                    acc[i], acc[i + 1] = cute.arch.add_packed_f32x2(
+                        (acc[i], acc[i + 1]), (Float32(extra[i]), Float32(extra[i + 1]))
+                    )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

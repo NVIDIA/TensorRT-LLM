@@ -137,6 +137,7 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine._pending_transfer_responses = []
     engine._pending_response_terminations = []
     engine.is_shutdown = False
+    engine.previous_batch = None
     engine.enable_attention_dp = False
     engine.gather_all_responses = False
     engine.kv_connector_manager = None

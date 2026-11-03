@@ -21,7 +21,7 @@ import torch
 from tensorrt_llm._utils import get_sm_version
 
 from .....autotuner import AutoTuner
-from .....cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from .....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from .....locality_domain_utils import _copy_to_new_cuda_allocation
 from .....utils import ActivationType, AuxStreamType, EventType, Fp4QuantizedTensor
 from ...activation import ActivationParamShape, MoEActivationSupport
@@ -29,6 +29,7 @@ from ...cutlass.eligibility import SmSupport
 from ...impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEFusedRouteQuant,
     MoEInputRequirement,
     MoEProblem,
     MoERunContext,
@@ -53,6 +54,8 @@ from .eligibility import check_grouped_gemm_leaf
 
 # Import-time opt-in for the grouped-GEMM leaf's tiled BF16 input quantizer.
 TRITON_INPUT_QUANT = os.environ.get("TRTLLM_MOE_TRITON_FP4_QUANT", "0") == "1"
+if IS_CUTLASS_DSL_AVAILABLE:
+    from .....moe.kernels.blackwell.dsv4_route_quant import dsv4_route
 
 # Kill switch for TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async.
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
@@ -164,6 +167,23 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             post_quant_comm,
             enable_triton=enable_triton,
         )
+
+    def try_fused_route(
+        self, x: Fp4QuantizedTensor, router_logits: torch.Tensor
+    ) -> MoEFusedRouteQuant | None:
+        """Sqrt-softplus routing in one CuTe DSL launch, bitwise ``routing_method.apply``, for an
+        input its producer already quantized to NVFP4."""
+        if not getattr(self, "_fuses_route", False) or x.is_sf_swizzled:
+            return None
+        ids, weights, _ = dsv4_route(
+            router_logits.to(torch.float32).contiguous(),
+            self.routing_method.e_score_correction_bias.to(torch.float32).contiguous(),
+            self.routing_method.top_k,
+            self.routing_method.routed_scaling_factor,
+            torch.float32,
+            self.hidden_size,
+        )
+        return MoEFusedRouteQuant(ids, weights, x.fp4_tensor, x.scaling_factor.view(x.shape[0], -1))
 
     def quantize_input_async(
         self,
@@ -464,8 +484,18 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 num_non_exiting_tiles,
             ) = sort_outputs
 
+        # With the expert all-to-all, FC1's scheduler warp zeroes the FC2 finalize output while FC1
+        # runs instead of a memset, which could only start once FC1's persistent CTAs drain.
+        fc1_zero = (
+            self.use_fused_finalize
+            and enable_alltoall
+            and not use_rubin
+            and not use_count_native_expert_metadata
+            and self.activation_type == ActivationType.Swiglu
+            and moe_output.is_contiguous()
+        )
         has_aux_streams = self._has_moe_output_memset_aux_stream()
-        if self.use_fused_finalize and has_aux_streams:
+        if self.use_fused_finalize and has_aux_streams and not fc1_zero:
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
             moe_output.record_stream(memset_stream)
@@ -545,10 +575,39 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # produced on the aux stream and are first read here, after moe_sort
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
-        x, x_sf = gather_act_op(**gather_act_kwargs)
+        if fc1_zero:
+            x, x_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_zero_blackwell(
+                **{
+                    name: gather_act_kwargs[name]
+                    for name in (
+                        "input",
+                        "weight",
+                        "input_scale",
+                        "weight_scale",
+                        "alpha",
+                        "tile_idx_to_group_idx",
+                        "tile_idx_to_mn_limit",
+                        "permuted_idx_to_expanded_idx",
+                        "num_non_exiting_tiles",
+                        "global_sf",
+                        "num_experts",
+                        "top_k",
+                        "num_local_experts",
+                        "local_expert_offset",
+                        "tile_size",
+                        "swiglu_limit_scalar",
+                    )
+                },
+                zero_out=moe_output,
+                activation_type=int(self.activation_type),
+            )
+        else:
+            x, x_sf = gather_act_op(**gather_act_kwargs)
 
         if self.use_fused_finalize:
-            if has_aux_streams:
+            if fc1_zero:
+                pass  # FC2 follows FC1, which zeroed moe_output, on this stream.
+            elif has_aux_streams:
                 self.event_dict[EventType.MoeOutputMemset].wait()
             elif use_count_native_expert_metadata:
                 torch.ops.trtllm.moe_output_memset_from_expert_counts_inplace(
@@ -811,6 +870,18 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         )
 
         return moe_output
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        # The geometries where ``routing_method.apply`` runs gate_forward, which dsv4_route matches.
+        self._fuses_route = (
+            IS_CUTLASS_DSL_AVAILABLE
+            and self.has_nvfp4
+            and get_sm_version() in (100, 103)
+            and self.routing_method.sqrt_softplus_bias_selection
+            and self.routing_method.top_k == 6
+            and self.num_experts in (256, 384)
+        )
 
     def _locality_domain_scale_shard(
         self, partition_id: int, half_n1: int, half_n2: int

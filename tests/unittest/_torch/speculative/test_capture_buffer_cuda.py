@@ -91,6 +91,59 @@ def test_shared_buffer_capture_replay(metadata) -> None:
         torch.testing.assert_close(actual[:, 64:], torch.full_like(actual[:, 64:], 2 * value))
 
 
+@pytest.mark.parametrize("replay_rows", [False, True])
+def test_side_stream_capture_matches_capture(replay_rows: bool) -> None:
+    """DSpark captures on its side stream equal the plain capture, eager and in graph replays."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    def make():
+        return DSparkSpecMetadata(
+            max_num_requests=8,
+            max_draft_len=5,
+            max_total_draft_tokens=5,
+            spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+            layers_to_capture=[37, 38, 39],
+            hidden_size=256,
+            max_num_tokens=64,
+            dtype=torch.bfloat16,
+        )
+
+    plain, side = make(), make()
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    residuals = [torch.empty(12, 4 * 256, dtype=torch.bfloat16, device="cuda") for _ in range(3)]
+    rows = torch.randperm(12, generator=gen, device="cuda")[:12] if replay_rows else None
+    sink = torch.zeros(4096, 4096, device="cuda")
+
+    def forward(metadata, on_side):
+        for layer, residual in zip((37, 38, 39), residuals):
+            if on_side:
+                done = metadata.capture_on_side_stream(layer, residual, rows)
+                assert done is not None
+                # Work on the main stream while the capture runs beside it.
+                sink.mul_(0.5)
+                torch.cuda.current_stream().wait_event(done)
+            else:
+                metadata.maybe_capture_hidden_states(layer, residual, row_indices=rows)
+        return metadata.get_hidden_states(12).clone()
+
+    with torch.inference_mode(), with_multi_stream(True):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for residual in residuals:
+                residual.copy_(torch.randn(residual.shape, generator=gen, device="cuda"))
+            assert torch.equal(forward(side, True), forward(plain, False))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = forward(side, True)
+            for _ in range(3):
+                for residual in residuals:
+                    residual.copy_(torch.randn(residual.shape, generator=gen, device="cuda"))
+                graph.replay()
+                assert torch.equal(captured, forward(plain, False))
+        stream.synchronize()
+
+
 def test_graph_metadata_follows_current_device(metadata) -> None:
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")

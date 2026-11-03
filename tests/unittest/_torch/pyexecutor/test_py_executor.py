@@ -261,6 +261,7 @@ def test_validate_token_id_range_accepts_end_id(end_id) -> None:
     request = types.SimpleNamespace(
         py_end_id=end_id,
         py_multimodal_data=None,
+        py_prompt_token_bound=None,
         check_token_id_range=lambda _vocab_size: True,
     )
 
@@ -610,17 +611,6 @@ def test_remote_tail_short_prompt_rejects_unsupported_requests(
     setattr(request, field, value)
 
     with pytest.raises(ValueError, match=message):
-        PyExecutor._configure_csa2_remote_tail(executor, request)
-
-
-@pytest.mark.parametrize("context_only", [False, True])
-def test_remote_tail_short_prompt_rejects_block_reuse(context_only: bool) -> None:
-    executor, request = _make_remote_tail_executor_and_request(64, context_only)
-    executor.resource_manager.resource_managers[
-        ResourceManagerType.KV_CACHE_MANAGER
-    ].enable_block_reuse = True
-
-    with pytest.raises(ValueError, match="requires block reuse to be disabled"):
         PyExecutor._configure_csa2_remote_tail(executor, request)
 
 
@@ -2658,6 +2648,8 @@ class _CleanupStub:
         self.send_expected_batch_num_handles = {}
         self._pp_handles_raise = pp_handles_raise
         self._events: list = []
+        self._staged_responses = []
+        self._intake_window = threading.Event()
 
         original_notify = self.response_cv.notify_all
 
@@ -2673,6 +2665,7 @@ class _CleanupStub:
             raise RuntimeError("PP send handle in bad state")
 
     _executor_loop_cleanup = PyExecutor._executor_loop_cleanup
+    _flush_staged_responses = PyExecutor._flush_staged_responses
 
 
 class TestExecutorLoopCleanup:
@@ -2839,6 +2832,8 @@ class _StubADPExecutor:
                 request_id=kwargs["request_ids"][0],
                 is_dummy_request=True,
             )
+            if not kwargs["is_gen"]:
+                req.context_remaining_length = kwargs["token_nums"][0]
             return [req]
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
@@ -3189,6 +3184,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        track_unique_tokens=False,
     )
     seen = {}
     stub._cancel_queued_context_requests = types.MethodType(
@@ -3279,6 +3275,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
         _should_exclude_last_generation_logits=lambda: False,
         _kv_load_tracker=KvLoadTracker(None, rank=0, enabled=False),
         _kv_cache_capacity={},
+        track_unique_tokens=False,
     )
     for name in (
         "_get_request_admission_capacity",
@@ -3879,6 +3876,23 @@ def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     assert len(scheduled_batch.context_requests) == 1
 
 
+def test_pad_empty_batch_preserves_context_dummy_role():
+    stub, scheduled_batch = _unfittable_rank()
+    stub._adp_dummy_is_gen = False
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert scheduled_batch.batch_size == 1
+    assert scheduled_batch.generation_requests == []
+    dummy = scheduled_batch.context_requests_last_chunk[0]
+    assert dummy.context_chunk_size == 1
+    assert dummy.is_attention_dp_dummy is True
+    assert dummy in stub.active_requests
+    assert stub._pending_adp_dummy_request is dummy
+    assert stub.add_dummy_calls[0]["is_gen"] is False
+    assert stub.add_dummy_calls[0]["token_nums"] == [1]
+
+
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     stub, scheduled_batch = _unfittable_rank()
     scheduled_batch.context_requests_chunking = [
@@ -4035,7 +4049,7 @@ def test_pad_empty_batch_dummy_is_excluded_from_gen_alloc_revert():
 
     stub._is_kv_manager_v2 = True
     stub.enable_joint_kv_cache_reuse = False
-    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
     reverted = [c.args[0] for c in stub.kv_cache_manager.revert_allocate_generation.call_args_list]
     assert reverted == [real_gen_request]
@@ -4053,7 +4067,7 @@ def test_revert_gen_alloc_gives_back_both_pools_under_joint_reuse():
     scheduled_batch = ScheduledRequests()
     scheduled_batch.generation_requests.append(gen_request)
 
-    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+    PyExecutor._revert_unexecuted_alloc(stub, scheduled_batch)
 
     stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
     stub.draft_kv_cache_manager.revert_allocate_generation.assert_called_once_with(gen_request)
@@ -4199,6 +4213,8 @@ class TestPendingTransferResponseFlush:
         executor._is_kv_manager_v2 = False
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
+        executor.previous_batch = None
+        executor._overlap_loop_stream = nullcontext
         executor._flush_pending_transfer_responses = Mock()
         return executor
 
@@ -4257,7 +4273,7 @@ class TestPendingTransferResponseFlush:
         executor._pause_requests = Mock()
         executor._can_queue = Mock(return_value=(False, None))
         executor.kv_connector_manager = None
-        executor._revert_gen_alloc = Mock()
+        executor._revert_unexecuted_alloc = Mock()
         executor._finalize_adp_dummy_allocation = Mock()
         executor.kv_cache_transceiver = None
         executor._kv_connector_terminate_requests = Mock()
