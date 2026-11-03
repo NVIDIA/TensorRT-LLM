@@ -25,6 +25,9 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
+  # Lamport all-reduces of mixed dtypes and odd sizes sharing one workspace.
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_allreduce_lamport_mixed_dtype
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_minimax_allreduce_rms_odd_tokens
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
@@ -75,7 +78,8 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[4-3-VANILLA] TIMEOUT (30)
   # Synthetic weights cover Engram head/row shards and TP/EP shared-expert collectives.
   - unittest/_torch/multi_gpu/test_engram_sharding.py::test_engram_shard_roundtrip -k "world:4"
-  # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce).
+  # Vocab-parallel token selection over TP2/TP4 vocab shards (default all-reduce),
+  # and the pair exchange next to large bf16 one-shot all-reduces.
   - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
   - unittest/_torch/moe/test_deepseek_v41_shared_moe.py
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
