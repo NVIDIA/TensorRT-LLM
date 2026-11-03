@@ -60,7 +60,9 @@ def _model_config(*, kv_heads, head_dim, kv_quant_algo=None):
 def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
     creator = object.__new__(KvCacheCreator)
     creator._speculative_config = SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True, is_external_drafter=lambda: True),
+        spec_dec_mode=SimpleNamespace(
+            is_dflash=lambda: True, is_dspark=lambda: False, is_external_drafter=lambda: True
+        ),
         attention_backend="TRTLLM",
         _allow_separate_draft_kv_cache=True,
         draft_len_schedule=None,
