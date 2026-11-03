@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+import functools
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -5775,15 +5776,26 @@ class TestFirstChunkBudgetBeforeClaim:
 
 class TestInforwardMambaSnapshot:
     """A forced chunk ending at the last snapshot point P runs through the prompt end
-    instead when the Mamba manager takes the snapshot inside the forward."""
+    instead when the Mamba manager takes the snapshot inside the forward; with
+    ``inforward_snapshot_any_point`` it also passes an earlier point P (at a multiple of
+    ``inforward_snapshot_alignment`` from the chunk start) and ends at the following one."""
 
     PROMPT = 4000
 
-    def _sched(self, rows=2, max_num_tokens=8192):
+    def _sched(self, rows=2, max_num_tokens=8192, any_point=False, alignment=1, max_tail=16):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            MambaHybridCacheManagerV2,
+        )
+
         mgr = make_kv_cache_manager(tokens_per_block=32)
         mgr.inforward_snapshot_rows = rows
-        mgr.inforward_snapshot_max_tail = 16
+        mgr.inforward_snapshot_max_tail = max_tail
         mgr.inforward_snapshot_min_main = 3
+        mgr.inforward_snapshot_any_point = any_point
+        mgr.inforward_snapshot_alignment = alignment
+        mgr.inforward_snapshot_end = functools.partial(
+            MambaHybridCacheManagerV2.inforward_snapshot_end, mgr
+        )
         return make_scheduler(
             mgr,
             max_num_tokens=max_num_tokens,
@@ -5827,6 +5839,22 @@ class TestInforwardMambaSnapshot:
         self._sched(rows=1, max_num_tokens=3 * self.PROMPT).schedule_request(reqs, set())
         assert [r.context_chunk_size for r in reqs] == [self.PROMPT, self.PROMPT - 2]
         assert [r.py_mamba_inforward_snapshot_point for r in reqs] == [self.PROMPT - 2, None]
+
+    @pytest.mark.parametrize(
+        "points, chunk, mark",
+        [
+            ([2944, PROMPT - 2], PROMPT - 2, 2944),  # interior point: the step ends at the next
+            ([2944, 3520], 3520, 2944),
+            ([3968], PROMPT, 3968),  # last point: a sub-block tail runs to the prompt end
+            ([2900, PROMPT - 2], 2900, None),  # P not 64 tokens aligned from the chunk start
+        ],
+        ids=["interior_to_last", "interior_to_interior", "last", "unaligned"],
+    )
+    def test_any_point_passes_the_next_point(self, points, chunk, mark):
+        req = self._req(0, points=points)
+        self._sched(any_point=True, alignment=64, max_tail=8192).schedule_request([req], set())
+        assert req.context_chunk_size == chunk
+        assert req.py_mamba_inforward_snapshot_point == mark
 
 
 # ===========================================================================

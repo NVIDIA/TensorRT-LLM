@@ -189,6 +189,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # must lie inside the chunk). See _setup_inforward_snapshot.
     inforward_snapshot_max_tail = 0
     inforward_snapshot_min_main = 0
+    # Whether the recurrent layers record the state at P in the same pass over
+    # the chunk (no tail recompute), so a chunk may also pass a snapshot point
+    # that is not the last one and end at the following one; and the multiple
+    # of tokens P must lie at from the chunk start.
+    inforward_snapshot_any_point = False
+    inforward_snapshot_alignment = 1
     # This step's plan {request id: entry}; replaced, never mutated in place.
     inforward_snapshot_plan: Dict[int, InforwardSnapshotEntry] = {}
     _inforward_stage_ssm: Optional[torch.Tensor] = None
@@ -1233,6 +1239,30 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """The live state slot of a request scheduled in this step."""
         return self._request_id_to_state_index[request_id]
 
+    def inforward_snapshot_end(self, req: LlmRequest, pos: int, point: int) -> Optional[int]:
+        """The end of a context chunk from ``pos`` whose forward can record the
+        snapshot at ``point`` (one of the request's snapshot points), or None.
+
+        The chunk runs to the prompt end when ``point`` is the last snapshot
+        point; with ``inforward_snapshot_any_point`` it may also pass an earlier
+        one and end at the following point.
+        """
+        points = req.expect_snapshot_points
+        if (
+            not points
+            or point not in points
+            or not pos + self.inforward_snapshot_min_main <= point < req.prompt_len
+            or (point - pos) % self.inforward_snapshot_alignment
+        ):
+            return None
+        following = next((p for p in points if p > point), None)
+        if following is not None and not self.inforward_snapshot_any_point:
+            return None
+        end = req.prompt_len if following is None else min(following, req.prompt_len)
+        if end - point > self.inforward_snapshot_max_tail:
+            return None
+        return end
+
     def _plan_inforward_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
         """Turn the scheduler's in-forward snapshot marks into this step's plan."""
         plan: Dict[int, InforwardSnapshotEntry] = {}
@@ -1248,19 +1278,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 context_only
                 and self.inforward_snapshot_rows > len(plan)
                 and not req.is_dummy_request
-                and pos + self.inforward_snapshot_min_main <= point < end
-                and end == req.prompt_len
-                and end - point <= self.inforward_snapshot_max_tail
-                and req.expect_snapshot_points
-                and point == req.expect_snapshot_points[-1]
+                and self.inforward_snapshot_end(req, pos, point) == end
             ):
                 plan[req.py_request_id] = InforwardSnapshotEntry(
                     len(plan), point, point - pos, end - point
                 )
             else:
                 # The scheduler checks the same conditions, so this is not
-                # expected. The chunk still runs through the prompt end, so no
-                # snapshot at P is recorded for this request.
+                # expected. The chunk still runs past P, so no snapshot at P is
+                # recorded for this request.
                 logger.warning(
                     f"Request {req.py_request_id} "
                     f"dropped from the in-forward snapshot plan (P={point}, "
@@ -1270,7 +1296,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.inforward_snapshot_plan = plan
 
     def finish_inforward_snapshots(self, scheduled_batch: ScheduledRequests) -> None:
-        """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
+        """Commit each planned request up to P from its live state, then copy its staged chunk-end state back.
 
         Called on the execution stream right after the forward, so the copies precede the batch's sampler event.
         """

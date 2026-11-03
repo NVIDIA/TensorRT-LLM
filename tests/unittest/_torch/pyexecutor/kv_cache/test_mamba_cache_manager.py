@@ -4056,6 +4056,30 @@ def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
         mgr.shutdown()
 
 
+@pytest.mark.parametrize(
+    "any_point, alignment, pos, point, expected",
+    [
+        (False, 1, 0, 3968, 4000),  # the last point: the chunk runs to the prompt end
+        (False, 1, 0, 2944, None),  # an earlier point ends the chunk
+        (True, 64, 0, 2944, 3968),  # ... unless the layers take any point: end at the next one
+        (True, 64, 64, 2900, None),  # P not a multiple of the alignment from the chunk start
+        (True, 64, 2942, 2944, None),  # fewer chunk tokens before P than the conv window
+        (True, 64, 0, 3000, None),  # not a snapshot point
+    ],
+)
+def test_v2_inforward_snapshot_end(any_point, alignment, pos, point, expected):
+    manager = SimpleNamespace(
+        inforward_snapshot_any_point=any_point,
+        inforward_snapshot_alignment=alignment,
+        inforward_snapshot_min_main=3,
+        inforward_snapshot_max_tail=4096,
+    )
+    request = SimpleNamespace(prompt_len=4000, expect_snapshot_points=[2900, 2944, 3968])
+    assert MambaHybridCacheManagerV2.inforward_snapshot_end(manager, request, pos, point) == (
+        expected
+    )
+
+
 @skip_no_cuda
 def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
     mgr = _build_v2_inforward_snapshot_manager()

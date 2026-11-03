@@ -1469,7 +1469,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
-        inforward_point = None
+        inforward_point = inforward_end = None
         if self._inforward_snapshot_rows:
             # A mark from an earlier pass whose batch did not run this request
             # must not outlive that pass.
@@ -1529,9 +1529,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
             if self._inforward_snapshot_rows_left > 0 and not has_recovery:
-                inforward_point = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
-                if inforward_point is not None:
-                    chunk_size = context_remaining
+                inforward = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
+                if inforward is not None:
+                    inforward_point, inforward_end = inforward
+                    chunk_size = inforward_end - req.context_current_position
         else:
             budget_context_remaining = (
                 context_remaining
@@ -1613,7 +1614,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
-        if inforward_point is not None and req.context_chunk_size == context_remaining:
+        if (
+            inforward_point is not None
+            and req.context_current_position + req.context_chunk_size == inforward_end
+        ):
             req.py_mamba_inforward_snapshot_point = inforward_point
             self._inforward_snapshot_rows_left -= 1
 
@@ -1621,26 +1625,21 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _inforward_snapshot_point(
         self, req: LlmRequest, chunk_size: int, remaining_budget: Optional[int]
-    ) -> Optional[int]:
-        """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
+    ) -> Optional[tuple[int, int]]:
+        """``(P, end)``: the snapshot point P a forced chunk ends at, and the end
+        the chunk can run to instead (``inforward_snapshot_end``: the prompt end,
+        or the following snapshot point).
 
-        The GDN layers then record the state at P inside the forward
+        The recurrent layers then record the state at P inside the forward
         (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
-        context iteration of the short tail [P, prompt end).
+        context iteration of the stretch [P, end).
         """
-        manager = self.kv_cache_manager
         pos = req.context_current_position
         point = pos + chunk_size
-        end = req.prompt_len
-        points = req.expect_snapshot_points
-        if not points or point != points[-1] or not point < end:
+        if pos + req.context_remaining_length != req.prompt_len:
             return None
-        if pos + req.context_remaining_length != end:
-            return None
-        if (
-            end - point > manager.inforward_snapshot_max_tail
-            or point - pos < manager.inforward_snapshot_min_main
-        ):
+        end = self.kv_cache_manager.inforward_snapshot_end(req, pos, point)
+        if end is None:
             return None
         if remaining_budget is not None and end - pos > remaining_budget:
             return None
@@ -1649,7 +1648,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         mm_data = getattr(req, "py_multimodal_data", None)
         if isinstance(mm_data, dict) and mm_data.get("mm_bidirectional_blocks", False):
             return None
-        return point
+        return point, end
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.
