@@ -138,6 +138,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from .regions import RegionLayout, RegionProvider, lay_out_regions
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1864,6 +1865,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
+    # Ownership of region storage, set while the cache config is built; see region_layout.
+    _region_layout: Optional[RegionLayout] = None
 
     def __init__(
         self,
@@ -2452,6 +2455,7 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens_per_block=tokens_per_block,
             cache_tiers=cache_tiers,
         )
+        config = self._lay_out_regions(config)
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
         config = self._add_mixed_precision_layers(config)
@@ -4021,8 +4025,44 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Customize the general cache config for a specialized cache manager."""
+        """Customize the general cache config for a specialized cache manager.
+
+        Runs after the regions are laid out; a layer that ``region_layout``
+        assigns to a region is the region's and must be left as declared.
+        """
         return config
+
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        """Return the providers whose regions this manager stores.
+
+        Called once while the cache config is built, after the per-layer views
+        (``pp_layers``, ``num_local_layers``) are known.
+        """
+        return ()
+
+    def _lay_out_regions(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Replace the base layer configs with the declared regions' storage."""
+        regions = [
+            region for provider in self._region_providers() for region in provider.declare_regions()
+        ]
+        layers, self._region_layout = lay_out_regions(regions, config.layers)
+        if not regions:
+            return config
+        # Per-request storage is snapshotted only at commit endpoints, which the
+        # runtime enforces through minimum-snapshot commits.
+        has_slot_storage = any(isinstance(layer, SsmLayerConfig) for layer in layers)
+        return replace(
+            config,
+            layers=list(layers),
+            commit_min_snapshot=config.commit_min_snapshot or has_slot_storage,
+        )
+
+    @property
+    def region_layout(self) -> RegionLayout:
+        """Which region owns each storage layer; empty when no region is declared."""
+        if self._region_layout is None:
+            return RegionLayout(num_model_layers=self.num_local_layers)
+        return self._region_layout
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -4061,6 +4101,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
 
+        layout = self._region_layout
+        if layout is not None and layout.owners:
+            # Region storage appended after the model layers has no entry in
+            # the per-model-layer views below.
+            self._region_layout = layout.renumbered(retained_layer_ids)
+            retained_layer_ids = [i for i in retained_layer_ids if layout.is_model_layer(i)]
         # Runtime layer IDs are local offsets. Compact every per-layer view
         # together while preserving the model's global layer IDs and count.
         self.pp_layers = [self.pp_layers[i] for i in retained_layer_ids]
