@@ -2713,10 +2713,15 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         return ("the same attention tensor parallelism (tensor_parallel_size, "
                 "or 1 with enable_attention_dp) in context_servers and "
                 "generation_servers")
+    # Only the CUTEDSL MLA DSpark drafter reads a helix-sharded context.
     if any(
             cfg.other_args.get("context_parallel_size", 1) != 1
-            for cfg in server_configs):
-        return "context_parallel_size 1 in both sections"
+            for cfg in server_configs) and any(
+                cfg.other_args["speculative_config"].get(
+                    "attention_backend") != "CUTEDSL"
+                for cfg in server_configs):
+        return ("context_parallel_size 1, or DSpark with attention_backend "
+                "CUTEDSL, in both sections")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")

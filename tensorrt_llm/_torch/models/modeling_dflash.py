@@ -522,6 +522,15 @@ class DFlashForCausalLM(nn.Module):
         """
         return self.dflash_attention_backend == "TRTLLM"
 
+    # The helix shard of the context the worker bound (DFlashWorker), or None.
+    ctx_helix_shard = None
+
+    @property
+    def reads_helix_sharded_ctx_pages(self) -> bool:
+        """Whether the block decode reads a context whose pages are sharded over
+        helix CP, merging the ranks' partial attention."""
+        return False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""

@@ -203,3 +203,38 @@ DRAFT_FP8_KV_SCALE = 1.0
 def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:
     """``x`` as saturated FP8 E4M3 at the drafter's unit per-tensor scale."""
     return x.clamp(-DRAFT_FP8_MAX, DRAFT_FP8_MAX).to(torch.float8_e4m3fn)
+
+
+@dataclass(frozen=True)
+class HelixDraftShard:
+    """The pages of a drafter's context this helix CP rank holds.
+
+    Global page ``g`` (positions ``[g * page_size, (g + 1) * page_size)``) lives
+    on rank ``g % cp_size`` as its local page ``g // cp_size``, like the target's
+    helix pages, so the drafter's pages ride the target's ledger and transfer.
+    """
+
+    cp_size: int
+    cp_rank: int
+    page_size: int
+
+    def local_slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rank-local token slots of global ``positions`` and whether this rank owns them.
+
+        A position on another rank maps to the local slot with the same offset in
+        the same ledger block, which belongs to the same request.
+        """
+        page = positions // self.page_size
+        local = (page // self.cp_size) * self.page_size + positions % self.page_size
+        return local, page % self.cp_size == self.cp_rank
+
+    def local_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        """How many of the first ``lengths`` global positions this rank holds."""
+        span = self.page_size * self.cp_size
+        tail = (lengths % span - self.cp_rank * self.page_size).clamp(min=0, max=self.page_size)
+        return (lengths // span) * self.page_size + tail
+
+    @property
+    def positions_per_page(self) -> int:
+        """Global positions one local page stands for (one per ledger block)."""
+        return self.page_size * self.cp_size

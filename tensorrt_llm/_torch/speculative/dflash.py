@@ -38,6 +38,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
     DFLASH_CONTEXT_LOWERING,
+    HelixDraftShard,
     get_dflash_paged_append,
     to_draft_fp8,
     validate_dflash_fa4_runtime,
@@ -755,6 +756,10 @@ class DFlashWorker(SpecWorkerBase):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
+    # Pages of the drafter's context this helix CP rank holds when a helix
+    # target manager hosts them; None when every rank holds the whole context.
+    _ctx_helix: Optional[HelixDraftShard] = None
+
     def __init__(
         self,
         spec_config: "DFlashDecodingConfig",
@@ -1351,6 +1356,8 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
         self._ctx_block_counts = None
+        self._ctx_helix = None
+        draft_model.ctx_helix_shard = None
         self._paged_latent_prepare = False
         max_batch = spec_metadata.max_num_requests
 
@@ -1519,6 +1526,9 @@ class DFlashWorker(SpecWorkerBase):
                 # Nothing reserved: pages come from the manager's per-request
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len.
+                self._ctx_helix = self._bind_ctx_helix_shard(
+                    draft_model, draft_kv_cache_manager, page_size
+                )
                 self._ctx_kv_buf = pool
                 self._ctx_kv_ptrs = torch.tensor(
                     [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
@@ -1568,6 +1578,33 @@ class DFlashWorker(SpecWorkerBase):
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
+
+    def _bind_ctx_helix_shard(
+        self, draft_model, draft_kv_cache_manager, page_size: int
+    ) -> Optional[HelixDraftShard]:
+        """The helix shard of a context held in a helix target manager's pages.
+
+        Those pages follow the target's helix ledger, so the drafter reads and
+        writes only the rank's own pages and merges partial attention.
+        """
+        mapping = draft_kv_cache_manager.mapping
+        shard = None
+        if self._ctx_unified_cache and mapping.has_cp_helix():
+            if not draft_model.reads_helix_sharded_ctx_pages:
+                raise ValueError(
+                    "The drafter cannot read a context sharded over helix CP; "
+                    "it needs a separate draft KV cache."
+                )
+            shard = HelixDraftShard(mapping.cp_size, mapping.cp_rank, page_size)
+        draft_model.ctx_helix_shard = shard
+        return shard
+
+    @property
+    def _ctx_positions_per_page(self) -> int:
+        """Global positions one row of the block table stands for."""
+        if self._ctx_helix is not None:
+            return self._ctx_helix.positions_per_page
+        return self._ctx_page_size
 
     def _ctx_paged_index_args(self):
         """(kv_indices, kv_indptr) for the append op, and what ``rows`` means.
@@ -1636,14 +1673,23 @@ class DFlashWorker(SpecWorkerBase):
                 else self._ctx_page_table
             )
             page_size = self._ctx_page_size
-            pages = table[rows.long(), positions.long() // page_size].long()
-            offsets = positions.long() % page_size
+            positions = positions.long()
+            owned = None
+            if self._ctx_helix is not None:
+                # Positions on other ranks rewrite their local slot unchanged; a
+                # row's positions within one page apart never share a slot.
+                positions, owned = self._ctx_helix.local_slots(positions)
+                owned = owned.view(-1, 1)
+            pages = table[rows.long(), positions // page_size].long()
+            offsets = positions % page_size
             for layer_idx in range(k.size(1)):
                 pool, new = self._ctx_kv_buf[layer_idx], k[:, layer_idx, 0]
                 if pool.dtype == torch.float8_e4m3fn:
                     # Saturated FP8, as the block decode quantizes its query;
                     # byte views because index_put support for FP8 varies.
                     pool, new = pool.view(torch.uint8), to_draft_fp8(new).view(torch.uint8)
+                if owned is not None:
+                    new = torch.where(owned, new, pool[pages, 0, 0, offsets])
                 pool[pages, 0, 0, offsets] = new
             return
         append_paged_kv_cache = self._get_ctx_paged_append()
@@ -1797,7 +1843,7 @@ class DFlashWorker(SpecWorkerBase):
         # One tolist() for the whole loop: the lengths themselves come from
         # _ctx_len_host, so the loop body below stays sync-free.
         ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+            (self._ctx_block_counts[:num_contexts] * self._ctx_positions_per_page).tolist()
             if self._ctx_block_tables is not None
             else None
         )
@@ -1876,10 +1922,17 @@ class DFlashWorker(SpecWorkerBase):
                     # Manager block tables are keyed by batch position, the
                     # private arena's by slot. See _ctx_paged_index_args.
                     row = i if self._ctx_block_tables is not None else slot
+                    if self._ctx_helix is not None:
+                        # A chunk spans pages of every rank; keep this rank's
+                        # positions (chosen on the host) so no two share a slot.
+                        _, owned = self._ctx_helix.local_slots(torch.arange(cur, end))
+                        keep = owned.nonzero().squeeze(1).to("cuda", non_blocking=True)
+                        chunk_k, local_pos = chunk_k[keep], local_pos[keep]
+                        chunk_v = None if chunk_v is None else chunk_v[keep]
                     self._store_context_kv_paged(
                         chunk_k,
                         chunk_v,
-                        torch.full((actual,), row, dtype=torch.long, device="cuda"),
+                        torch.full((local_pos.numel(),), row, dtype=torch.long, device="cuda"),
                         local_pos,
                     )
                 else:  # VANILLA DFlash backend (FlashAttention)
@@ -2504,7 +2557,9 @@ class DFlashWorker(SpecWorkerBase):
                     # Bound by what the manager handed THIS request: the masked
                     # entries below are still written (fixed-size, for graph
                     # safety) and a placeholder page resolves to another's.
-                    gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
+                    gen_capacity = (
+                        self._ctx_block_counts[gen_rows_out] * self._ctx_positions_per_page
+                    )
                     col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
                 else:
                     col_idx = col_idx.clamp(max=self._max_ctx - 1)
@@ -2552,7 +2607,7 @@ class DFlashWorker(SpecWorkerBase):
                 # valid slot. Truncate what is advertised to match, or the read
                 # attends that clobbered value -- or another request's page.
                 allocated = dflash_allocated_ctx_limit(
-                    self._ctx_block_counts, self._ctx_page_size, block_size
+                    self._ctx_block_counts, self._ctx_positions_per_page, block_size
                 )
                 if self._ctx_unified_cache:
                     self._check_block_within_allocation(

@@ -2112,6 +2112,114 @@ def test_fp8_block_decode_follows_bf16_at_k3_shapes(block_size):
 
 
 # ---------------------------------------------------------------------------
+# Drafter context KV sharded over helix CP.
+# ---------------------------------------------------------------------------
+
+
+def _helix_rank_pool(values, seq, shard, page):
+    """Rank ``shard.cp_rank``'s local pages of every request's global latents."""
+    latent_dim = values.shape[-1]
+    span = page * shard.cp_size
+    local_pages = [(int(n) + span - 1) // span for n in seq.tolist()]
+    table = torch.zeros(len(local_pages), max(local_pages), dtype=torch.long, device="cuda")
+    pool = torch.zeros(sum(local_pages), 1, 1, page, latent_dim, device="cuda")
+    start = 0
+    for b, n in enumerate(local_pages):
+        table[b, :n] = torch.arange(start, start + n, device="cuda")
+        for k in range(n):
+            first = (k * shard.cp_size + shard.cp_rank) * page
+            rows = values[b, first : min(first + page, int(seq[b]))]
+            pool[start + k, 0, 0, : rows.shape[0]] = rows
+        start += n
+    return pool, table
+
+
+@needs_absorbed_mla
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_helix_sharded_block_decode_matches_the_full_context(cp_size, fp8):
+    """Each helix rank attends with every head over its own pages (rank-local
+    page table, lengths and kv_bounds, softmax stats out); merging the ranks'
+    partials as _helix_post_process does equals the decode over the whole
+    context. Ranks that hold none of a short request's pages contribute nothing."""
+    from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard, to_draft_fp8
+
+    heads, page, kv_lora, latent_dim, block_size = 64, 64, 512, 576, 7
+    stub = _k3_block_decoder()
+    gen = torch.Generator(device="cuda").manual_seed(cp_size)
+    ctx = torch.tensor([40, 300, 1700, 6400], device="cuda")
+    seq = ctx + block_size
+    values = torch.randn(len(ctx), int(seq.max()), latent_dim, device="cuda", generator=gen)
+    values[..., :kv_lora] *= 0.5
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+
+    def to_pool(pool):
+        return to_draft_fp8(pool) if fp8 else pool.bfloat16()
+
+    full_pool, full_table = _helix_rank_pool(values, seq, HelixDraftShard(1, 0, page), page)
+    full_fixup = _build_mla_block_fixup(ctx, full_table, block_size, page)
+    expected = stub._cute_dsl_block_decode(query, to_pool(full_pool), full_fixup, block_size)
+
+    tokens = len(ctx) * block_size
+    partials, stats = [], []
+    for cp_rank in range(cp_size):
+        shard = HelixDraftShard(cp_size, cp_rank, page)
+        pool, table = _helix_rank_pool(values, seq, shard, page)
+        fixup = _build_mla_block_fixup(ctx, table, block_size, page, shard)
+        assert torch.equal(fixup.seq_lens_i32.long(), shard.local_lengths(seq))
+        out, stat = stub._cute_dsl_block_decode(query, to_pool(pool), fixup, block_size)
+        out, stat = _helix_sanitize_empty_kv(
+            out.view(tokens, heads, kv_lora), stat, fixup.kv_bounds_i32 == 0
+        )
+        partials.append(out)
+        stats.append(stat)
+    merged = torch.ops.trtllm.helix_post_process(
+        torch.stack(partials).contiguous(), torch.stack(stats).contiguous(), 1.0
+    ).view(tokens, heads, kv_lora)
+
+    expected = expected.view(tokens, heads, kv_lora).float()
+    rel_l2 = ((merged.float() - expected).norm() / expected.norm()).item()
+    # Another KV split changes only the reduction order and rounding.
+    assert rel_l2 < (0.02 if fp8 else 0.01)
+
+
+@needs_cuda
+def test_helix_context_store_writes_only_owned_positions():
+    """A helix rank stores the positions of its own pages at their local slots;
+    another rank's position rewrites the slot it maps to unchanged. A step's
+    window (at most one page) never maps two positions to one slot."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page, layers = 4, 2
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_page_size = page
+    # Rank 1 of 2 owns global pages 1, 3, ... as its local pages 0, 1, ...
+    worker._ctx_helix = HelixDraftShard(2, 1, page)
+    worker._ctx_block_tables = torch.tensor([[3, 0, 2]], device="cuda")
+    sentinel = -7.0
+    worker._ctx_kv_buf = [
+        torch.full((4, 1, 1, page, MLA_LATENT), sentinel, device="cuda").bfloat16()
+        for _ in range(layers)
+    ]
+    positions = torch.tensor([6, 7, 8, 9], device="cuda")
+    k = positions.view(-1, 1, 1, 1).expand(-1, layers, 1, MLA_LATENT).bfloat16()
+    worker._store_context_kv_paged(k, None, torch.zeros_like(positions), positions)
+
+    for layer in range(layers):
+        pool = worker._ctx_kv_buf[layer][:, 0, 0, :, 0]
+        # Positions 6, 7 (global page 1) land in local page 0 = physical page 3.
+        assert pool[3].tolist() == [sentinel, sentinel, 6.0, 7.0]
+        # Positions 8, 9 (global page 2, rank 0's) map to local page 1 =
+        # physical page 0 and leave it unchanged.
+        assert pool[0].tolist() == [sentinel] * page
+
+
+# ---------------------------------------------------------------------------
 # Low-M BF16 GEMM race of the MLA drafter's projections.
 # ---------------------------------------------------------------------------
 

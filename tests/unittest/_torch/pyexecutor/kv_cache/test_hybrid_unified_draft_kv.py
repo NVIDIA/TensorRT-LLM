@@ -307,3 +307,58 @@ def test_mla_dspark_drafter_reads_manager_pages(backend, tokens_per_block, reads
     drafter.dflash_attention_backend = backend
 
     assert drafter.reads_managed_ctx_pages(tokens_per_block) is reads
+
+
+@pytest.mark.parametrize("reads_helix_pages", [True, False])
+def test_helix_target_shares_only_with_a_helix_sharding_drafter(reads_helix_pages):
+    # Kimi K3 helix8 generation: TP1 x CP8, no attention DP.
+    creator = _creator(tp_size=1, is_disagg=True)
+    creator._mapping.cp_size = 8
+    creator._mapping.enable_attention_dp = False
+    creator._mapping.has_cp_helix = lambda: True
+    creator._model_engine.model.draft_model.reads_helix_sharded_ctx_pages = reads_helix_pages
+
+    blocker = creator._dflash_unify_blocker()
+
+    if reads_helix_pages:
+        assert blocker is None
+    else:
+        assert "does not read a helix-sharded context" in blocker
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_helix_shard_partitions_positions_by_page(cp_size):
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page = 4
+    positions = torch.arange(3 * page * cp_size + 3)
+    for cp_rank in range(cp_size):
+        shard = HelixDraftShard(cp_size, cp_rank, page)
+        local, owned = shard.local_slots(positions)
+        mine = positions[(positions // page) % cp_size == cp_rank]
+        assert torch.equal(positions[owned], mine)
+        # A rank's positions fill its local slots in order, without gaps.
+        assert torch.equal(local[owned], torch.arange(len(mine)))
+        for length in range(len(positions) + 1):
+            expected = int((mine < length).sum())
+            assert int(shard.local_lengths(torch.tensor(length))) == expected
+
+
+def test_helix_block_fixup_is_rank_local():
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page, block_size = 4, 3
+    shard = HelixDraftShard(2, 1, page)
+    ctx_len = torch.tensor([6, 1])
+    table = torch.tensor([[7, 8, 9], [4, 5, 6]])
+
+    fixup = _build_mla_block_fixup(ctx_len, table, block_size, page, shard)
+
+    # Request 0: positions 6, 7 (global page 1, rank 1's local page 0) and 8
+    # (rank 0's); request 1: positions 1-3, all on rank 0's page 0.
+    assert fixup.owned.view(2, block_size).tolist() == [[True, True, False], [False] * 3]
+    assert fixup.pages[0, :2].tolist() == [7, 7]
+    assert fixup.offsets[0, :2].tolist() == [2, 3]
+    assert fixup.seq_lens_i32.tolist() == [4, 0]
+    assert fixup.kv_bounds_i32.tolist() == [4] * block_size + [0] * block_size

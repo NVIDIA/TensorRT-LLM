@@ -2067,12 +2067,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     "all CP ranks, so publishing it requires a group-wide "
                     "protocol. Set kv_cache_config.enable_block_reuse=False."
                 )
+            # K-only draft latents shard by page over CP like the target's.
             if is_draft or any(
-                layer.owner is KVCacheLayerOwner.DRAFT for layer in draft_layer_specs or ()
+                layer.owner is KVCacheLayerOwner.DRAFT and layer.kv_factor != 1
+                for layer in draft_layer_specs or ()
             ):
                 raise ValueError(
-                    "KVCacheManagerV2 does not support a draft cache "
-                    "manager or draft-owned layers with helix context parallelism."
+                    "KVCacheManagerV2 does not support a draft cache manager or "
+                    "draft-owned K/V layers with helix context parallelism."
                 )
             if mapping.enable_attention_dp and mapping.pp_size > 1:
                 # Only the pp=1 executor loops call

@@ -392,6 +392,22 @@ def test_launcher_shares_attention_dp_mla_drafter_across_tp(monkeypatch, tmp_pat
     assert os.environ[_SHARED_DRAFT_KV_ENV] == "auto"
 
 
+def test_launcher_shares_the_cutedsl_drafter_with_helix_generation(monkeypatch, tmp_path):
+    # Kimi K3 helix8: one-GPU context workers, TP1 x CP8 generation.
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "enable_attention_dp": True},
+            {"speculative_config": spec, "context_parallel_size": 8},
+        )
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "auto"
+
+
 @pytest.mark.parametrize(
     "request_mode,draft_heads,expected_mode",
     [("0", 8, "0"), (None, 4, "auto")],

@@ -2387,6 +2387,11 @@ class KvCacheCreator:
             return backend == "TRTLLM"
         return draft_model.reads_managed_ctx_pages(self._tokens_per_block)
 
+    def _unified_drafter_reads_helix_pages(self) -> bool:
+        """Whether the loaded drafter reads a context sharded over helix CP."""
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        return draft_model is not None and draft_model.reads_helix_sharded_ctx_pages
+
     def _unified_target_manager_cls_supported(self) -> bool:
         """Whether the target's manager class can hold the drafter's layers.
 
@@ -2453,8 +2458,11 @@ class KvCacheCreator:
             return "there is no draft model config"
         if self._mapping.pp_size != 1:
             return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
-        if self._mapping.cp_size != 1:
-            return f"context_parallel_size is {self._mapping.cp_size}, not 1"
+        if self._mapping.cp_size != 1 and not (
+                self._mapping.has_cp_helix()
+                and self._unified_drafter_reads_helix_pages()):
+            return (f"context_parallel_size is {self._mapping.cp_size} and the "
+                    "drafter does not read a helix-sharded context")
         if self._llm_args.attn_backend != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
