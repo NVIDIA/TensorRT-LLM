@@ -69,19 +69,17 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
-from tensorrt_llm.serve.anthropic_adapter import (
+from tensorrt_llm.serve.api.anthropic.adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
     convert_chat_response, reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
-                                                  BatchStoreFullError,
-                                                  results_to_jsonl)
-from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
-                                                   AnthropicBatchList,
-                                                   AnthropicCountTokensRequest,
-                                                   AnthropicCountTokensResponse,
-                                                   AnthropicCreateBatchRequest,
-                                                   AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.anthropic.batches import (AnthropicBatchStore,
+                                                      BatchStoreFullError,
+                                                      results_to_jsonl)
+from tensorrt_llm.serve.api.anthropic.protocol import (
+    AnthropicBatchDeleteResponse, AnthropicBatchList,
+    AnthropicCountTokensRequest, AnthropicCountTokensResponse,
+    AnthropicCreateBatchRequest, AnthropicMessagesRequest)
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,

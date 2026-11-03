@@ -41,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.anthropic_protocol import (
+from tensorrt_llm.serve.api.anthropic.protocol import (
     AnthropicBatchRequestCounts,
     AnthropicBatchRequestItem,
     AnthropicMessageBatch,

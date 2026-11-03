@@ -27,7 +27,7 @@ import pytest
 from pydantic import ValidationError
 
 import tensorrt_llm.serve.anthropic_adapter as adapter
-from tensorrt_llm.serve.anthropic_adapter import (
+from tensorrt_llm.serve.api.anthropic.adapter import (
     AnthropicRequestError,
     AnthropicResponseError,
     AnthropicStreamReframer,
@@ -37,7 +37,7 @@ from tensorrt_llm.serve.anthropic_adapter import (
     map_stop_reason,
     reframe_openai_stream,
 )
-from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.api.anthropic.protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -1758,7 +1758,7 @@ def test_every_known_block_type_selects_its_own_model():
     catch-all -- where it would be reported as unsupported even though the
     server models it. Nothing else would notice.
     """
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         _CONTENT_BLOCK_MODELS,
         AnthropicMessage,
         AnthropicUnknownBlock,
