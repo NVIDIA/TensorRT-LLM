@@ -773,9 +773,8 @@ class QSASparseHooks(AttentionSparseHooks):
         )
         chunk_size = _query_chunk_size(num_tokens, score_columns)
         if use_prims_ts:
-            from .prims_ts_core import align_prefill_chunk, slice_request_boundaries
+            from .prims_ts_core import slice_request_boundaries
 
-            chunk_size = align_prefill_chunk(chunk_size)
             cu_seq_lens = list(
                 itertools.accumulate(attn_metadata.seq_lens[: attn_metadata.num_seqs].tolist())
             )

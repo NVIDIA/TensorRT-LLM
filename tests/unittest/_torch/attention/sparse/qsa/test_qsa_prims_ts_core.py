@@ -10,8 +10,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.qsa.module import qsa_sparse_gqa_reference
 from tensorrt_llm._torch.attention.backends.sparse.qsa.params import QSASparseParams
 from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import (
-    align_prefill_chunk,
-    prims_ts_available,
+        prims_ts_available,
     prims_ts_sparse_gqa,
     slice_request_boundaries,
 )
@@ -206,20 +205,20 @@ def test_prefill_rows_share_plans_within_bucket() -> None:
         page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
     )
     q, k_cache, v_cache, block_table, block_ids, request_indices, positions, _, _ = _make_case(
-        [37, 91], seed=5
+        [300, 200], seed=5
     )
     prims_ts_sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
     plans = len(_CORE._plans)
     q2, _, _, block_table2, block_ids2, request_indices2, positions2, selected2, metadata = (
-        _make_case([100, 30], seed=6)
+        _make_case([350, 210], seed=6)
     )
     out = prims_ts_sparse_gqa(
         q2, k_cache, v_cache, block_table2, block_ids2, request_indices2, positions2, **kwargs
     )
     assert len(_CORE._plans) == plans
-    assert out.shape[0] == 130
+    assert out.shape[0] == 560
     expected = qsa_sparse_gqa_reference(
         q=q2,
         k_cache=k_cache,
@@ -235,7 +234,7 @@ def test_prefill_rows_share_plans_within_bucket() -> None:
 
 def test_route_offsets_follow_layout_changes_without_replanning() -> None:
     _requires_prims_ts()
-    import flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
 
     kwargs = dict(
         page_size=PAGE_SIZE, max_seq_len_kv=CONTEXT, softmax_scale=HEAD_DIM**-0.5, is_decode=False
@@ -277,10 +276,14 @@ def test_route_offsets_follow_layout_changes_without_replanning() -> None:
     fi_metadata._prepare_q_token_kv_block_sparse_attention = counted
     try:
         outputs = [run(case, lens).clone() for case, lens in zip(cases, layouts)]
+        # Negative control: a different route count is a new plan and must
+        # re-prepare, which shows the counter is live.
+        control = _make_case([38, 92], seed=50)
+        run(control, [38, 92])
     finally:
         fi_metadata._prepare_q_token_kv_block_sparse_attention = original
     torch.cuda.synchronize()
-    assert prepares == 0
+    assert prepares == 1
     for out, ref in zip(outputs, expected):
         assert torch.equal(out, ref)
 
@@ -332,14 +335,6 @@ def test_auto_gates_small_decode_batches() -> None:
     )
     assert not use_prims_ts_indexer(_params(), q64, tokens_per_block=48)
     assert use_prims_ts_indexer(_params(), q64, tokens_per_block=64)
-
-
-def test_align_prefill_chunk() -> None:
-    assert align_prefill_chunk(4048) == 3840
-    assert align_prefill_chunk(8192) == 8192
-    assert align_prefill_chunk(256) == 256
-    assert align_prefill_chunk(255) == 255
-    assert align_prefill_chunk(96) == 96
 
 
 def test_prefill_writes_into_caller_output() -> None:
@@ -445,7 +440,7 @@ def test_decode_graph_capture_replay(kv_dtype) -> None:
     assert torch.equal(out, eager)
 
 
-def test_decode_rows_share_plans_within_bucket() -> None:
+def test_decode_rows_get_exact_plans() -> None:
     _requires_prims_ts()
     from tensorrt_llm._torch.attention.backends.sparse.qsa.prims_ts_core import _CORE
 
@@ -469,7 +464,7 @@ def test_decode_rows_share_plans_within_bucket() -> None:
     out = prims_ts_sparse_gqa(
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
-    assert len(_CORE._plans) == plans
+    assert len(_CORE._plans) == plans + 1
     assert out.shape[0] == 5
     expected = qsa_sparse_gqa_reference(
         q=q,

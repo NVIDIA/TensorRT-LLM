@@ -51,7 +51,9 @@ def _requires_prims_ts():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("PrimTS QSA scorer requires SM100/SM103/SM107")
-    pytest.importorskip("cutlass.experimental.task_scheduling")
+    # The vendored PrimTS kernels need this DSL in the CI image, so a missing
+    # module on a supported GPU is a failure, not a skip.
+    import cutlass.experimental.task_scheduling  # noqa: F401
 
 
 def _scorer():

@@ -13,11 +13,12 @@ from tensorrt_llm.logger import logger
 from .params import QSASparseParams
 
 _PREFILL_GROUP_SIZE = 4
-# A plan miss costs ~40 ms per layer; padding prefill rows to a bucket bounds
-# the plan keys to max_num_tokens / bucket per layer.
-_PREFILL_ROW_BUCKET = 256
-# Decode plans are keyed on the row count too; eager decode batches vary.
-_DECODE_ROW_BUCKET = 8
+# Prefill plans are capacity plans over a route count: the route offsets are
+# padded with trailing empty routes to a multiple of this, so a chunk's row
+# count does not create a plan (the wrapper requires routes <= rows, so
+# chunks shorter than the bucket plan per row count). Decode plans are per
+# row count.
+_PREFILL_ROUTE_BUCKET = 256
 # Query rows (requests x query tokens per request, so MTP counts draft tokens)
 # below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
 # context, TP2): the core ties at one row, the indexer until ~32 rows.
@@ -163,17 +164,6 @@ def _request_boundaries(request_indices: torch.Tensor) -> tuple[int, ...]:
     return (0, *change.tolist(), req.numel())
 
 
-def _pad_rows(t: torch.Tensor, rows: int, fill: float) -> torch.Tensor:
-    padded = t.new_full((rows, *t.shape[1:]), fill)
-    padded[: t.shape[0]] = t
-    return padded
-
-
-def align_prefill_chunk(rows: int) -> int:
-    """Largest bucket multiple not above ``rows``, so full chunks need no padding."""
-    return max(rows // _PREFILL_ROW_BUCKET * _PREFILL_ROW_BUCKET, min(rows, _PREFILL_ROW_BUCKET))
-
-
 def slice_request_boundaries(cu_seq_lens: list[int], start: int, end: int) -> tuple[int, ...]:
     """Request boundaries of packed rows ``[start, end)`` from host cumulative lengths."""
     inner = cu_seq_lens[
@@ -225,6 +215,8 @@ class _PrimsTSSparseCore:
             group_size=_PREFILL_GROUP_SIZE,
             device="cpu",
         )
+        routes = min(rows, -(-(host.numel() - 1) // _PREFILL_ROUTE_BUCKET) * _PREFILL_ROUTE_BUCKET)
+        host = torch.cat([host, host[-1:].expand(routes + 1 - host.numel())])
         buffer_key = (device.index, host.numel())
         buffer = self._qo_indptr.get(buffer_key)
         if buffer is None:
@@ -270,20 +262,11 @@ class _PrimsTSSparseCore:
 
         request_indices = request_indices.to(torch.int32).contiguous()
         q = q.contiguous()
-        bucket = _DECODE_ROW_BUCKET if is_decode else _PREFILL_ROW_BUCKET
-        padded_rows = -(-rows // bucket) * bucket
-        if padded_rows != rows:
-            # Padding rows attend to nothing but token 0 of request 0 and are
-            # sliced off the output; in packed prefill they form inert routes.
-            q = _pad_rows(q, padded_rows, 0)
-            block_ids = _pad_rows(block_ids, padded_rows, -1)
-            request_indices = _pad_rows(request_indices, padded_rows, 0)
-            query_positions = _pad_rows(query_positions, padded_rows, 0)
         if is_decode:
-            route_q = q.view(padded_rows, 1, 1, num_qo_heads, head_dim)
+            route_q = q.view(rows, 1, 1, num_qo_heads, head_dim)
             qo_indptr = None
             group_size = 1
-            num_routes = padded_rows
+            num_routes = rows
             split_kv = True
         else:
             route_q = q
@@ -293,7 +276,7 @@ class _PrimsTSSparseCore:
                 request_boundaries = _request_boundaries(request_indices)
             with self._lock:
                 qo_indptr = self._route_offsets(
-                    make_qo_indptr, request_boundaries, padded_rows, q.device
+                    make_qo_indptr, request_boundaries, rows, q.device
                 )
             group_size = _PREFILL_GROUP_SIZE
             num_routes = qo_indptr.numel() - 1
@@ -305,7 +288,6 @@ class _PrimsTSSparseCore:
             q.device.index,
             k_cache.data_ptr(),
             v_cache.data_ptr(),
-            padded_rows,
             num_routes,
             group_size,
             is_decode,
@@ -320,11 +302,8 @@ class _PrimsTSSparseCore:
             page_size,
             block_topk,
         )
-        result = out
-        if out is None or padded_rows != rows:
-            out = torch.empty(
-                (padded_rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device
-            )
+        if out is None:
+            out = torch.empty((rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device)
         with self._lock:
             wrapper = self._plans.get(key)
             if wrapper is None:
@@ -394,11 +373,7 @@ class _PrimsTSSparseCore:
                 raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
             if key not in self._last_abi:
                 self._last_abi[key] = _run_abi(run_args)
-        if result is None:
-            return out[:rows]
-        if result is not out:
-            result.copy_(out[:rows])
-        return result
+        return out
 
 
 _CORE = _PrimsTSSparseCore()
@@ -448,7 +423,6 @@ def prims_ts_sparse_gqa(
 __all__ = [
     "prims_ts_available",
     "prims_ts_sparse_gqa",
-    "align_prefill_chunk",
     "resolve_sparse_core_backend",
     "slice_request_boundaries",
 ]
