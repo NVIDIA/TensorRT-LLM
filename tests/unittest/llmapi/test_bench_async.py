@@ -15,6 +15,7 @@
 
 import asyncio
 import itertools
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,9 +23,72 @@ import pytest
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.bench.benchmark.utils.asynchronous import LlmManager
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
+from tensorrt_llm.bench.dataclasses.reporting import StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_results,max_draft_tokens",
+    [
+        ([(4, 1), (6, 2)], 2),
+        ([(1, 0), (1, 0)], 0),
+        ([(3, 0), (5, 1), (7, 2)], 2),
+        ([(4, 1)], 2),
+    ],
+)
+async def test_llm_manager_counts_decoding_iterations_across_turns(
+    turn_results: list[tuple[int, int]], max_draft_tokens: int
+) -> None:
+    responses = []
+    for request_id, (num_tokens, decoding_iter) in enumerate(turn_results):
+        response = SimpleNamespace(
+            id=request_id,
+            prompt_token_ids=[1, 2, 3],
+            outputs=[SimpleNamespace(token_ids=list(range(num_tokens)))],
+            finished=True,
+            decoding_iter=decoding_iter,
+        )
+
+        async def aresult(result=response):
+            return result
+
+        response.aresult = aresult
+        responses.append(response)
+
+    llm = MagicMock(spec=LLM)
+    llm.generate_async.side_effect = responses
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [1, 2, 3]
+    tokenizer.decode.return_value = "answer"
+    outbox = asyncio.Queue()
+    manager = LlmManager(llm, outbox, streaming=False, tokenizer=tokenizer)
+    request = InferenceRequest(
+        task_id=0,
+        input_ids=[1, 2, 3],
+        output_tokens=16,
+        turns=[f"question {i}" for i in range(len(turn_results))],
+    )
+    await manager.process_request(request, SamplingParams(), PostprocParams())
+
+    item = outbox.get_nowait()
+    total_tokens = sum(num_tokens for num_tokens, _ in turn_results)
+    total_iterations = sum(decoding_iter + 1 for _, decoding_iter in turn_results)
+    assert len(item.tokens) == total_tokens
+    assert item.decoding_iteration + 1 == total_iterations
+    assert item.response_is_final
+    assert outbox.empty()
+    assert llm.generate_async.call_count == len(turn_results)
+
+    keeper = StatsKeeper()
+    keeper.register_request_perf_item(item)
+    stats = keeper.generate_statistics_summary(max_draft_tokens, batch_size=1)
+    assert stats.acceptance_length == pytest.approx(total_tokens / total_iterations)
+    if max_draft_tokens:
+        expected_rate = (total_tokens - total_iterations) / (max_draft_tokens * total_iterations)
+        assert stats.draft_acceptance_rate_percentiles.average == pytest.approx(expected_rate)
 
 
 @pytest.mark.asyncio
