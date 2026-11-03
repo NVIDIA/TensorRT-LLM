@@ -60,6 +60,14 @@ its dependent grid right after its own ``griddepcontrol.wait``, so the next kern
 projection GEMM or the router) can become resident and stream its weights while this one
 finishes; that is safe for every dependent that, as PDL requires, writes
 no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
+
+``entry_trigger`` releases the dependent at kernel entry instead and prefers the largest
+shared-memory carve-out, so that a projection which holds its whole weight slice on chip before
+its wait (``fp8_block_scale_low_m_gemm.weights_on_chip``) becomes resident and streams its weights
+while this kernel and the grid before it still run, also on the SMs of this kernel's CTAs. The
+dependent, and the grids it releases before its own wait, must then read before their wait only
+memory no grid still running writes (weights, and for the KDA verify kernel the state, conv
+windows and replay rows of the previous step).
 """
 
 from __future__ import annotations
@@ -574,6 +582,7 @@ class KimiK3AttnResKernel:
         finish_chunk: int = 0,
         finish_sanitize: bool = False,
         finish_all_gather: bool = False,
+        entry_trigger: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -601,6 +610,7 @@ class KimiK3AttnResKernel:
         )
         self.finish_sanitize = finish_sanitize
         self.finish_all_gather = finish_all_gather
+        self.entry_trigger = entry_trigger
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -672,6 +682,7 @@ class KimiK3AttnResKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             use_pdl=True,
+            preferred_smem_carveout=100 if self.entry_trigger else None,
         )
 
     @cute.kernel
@@ -706,6 +717,8 @@ class KimiK3AttnResKernel:
         outsq_smem = storage.outsq.data_ptr().toint()
         mbar_smem = storage.mbar.data_ptr().toint()
 
+        if cutlass.const_expr(self.entry_trigger):
+            _griddepcontrol_launch_dependents()
         token = bidx // c
         rank = bidx - token * c
         if cutlass.const_expr(self.finish_two_shot):
@@ -791,10 +804,11 @@ class KimiK3AttnResKernel:
                 premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
         # ---- wait for the previous grid, then release the dependent grid (early_poll: after
-        # the mix, before the first store) ----
+        # the mix, before the first store; entry_trigger: released at kernel entry) ----
         if cutlass.const_expr(not self.early_poll):
             _griddepcontrol_wait()
-            _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.entry_trigger):
+                _griddepcontrol_launch_dependents()
 
         state = None
         finished = []
@@ -920,7 +934,8 @@ class KimiK3AttnResKernel:
         if cutlass.const_expr(self.early_poll):
             # The output buffers may reuse memory the producer, or a grid before it, still reads.
             _griddepcontrol_wait()
-            _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.entry_trigger):
+                _griddepcontrol_launch_dependents()
             _stg_v4_if(valid, upd_addr + row + col, upd_words)
         _stg_v4_if(valid, out_addr + row + col, words)
         if cutlass.const_expr(self.mxfp8):
@@ -999,6 +1014,7 @@ def _compiled(
     finish_chunk: int = 0,
     finish_sanitize: bool = False,
     finish_all_gather: bool = False,
+    entry_trigger: bool = False,
 ):
     kernel = KimiK3AttnResKernel(
         num_candidates,
@@ -1013,6 +1029,7 @@ def _compiled(
         finish_chunk,
         finish_sanitize,
         finish_all_gather,
+        entry_trigger,
     )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1092,6 +1109,7 @@ def run_attn_res(
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     in_place_addend: tuple[int, int] | None = None,
     finish: AllReduceFinish | None = None,
+    entry_trigger: bool = False,
 ) -> None:
     """Launch on the current stream with PDL (inputs are not re-validated; see :func:`can_run`).
 
@@ -1118,6 +1136,7 @@ def run_attn_res(
             on every rank before the next all-reduce on the workspace. For an ``all_gather``
             call the mix is the MoE residual update ``bf16(layer + bf16(routed + shared))``
             with the call's all-gather rows as ``routed`` and its slot sum as ``shared``.
+        entry_trigger: release the dependent at kernel entry (see the module docstring).
     """
     if in_place_addend is not None and addends:
         raise ValueError("pass either addends or in_place_addend")
@@ -1148,6 +1167,7 @@ def run_attn_res(
             if finish is not None
             else ()
         ),
+        entry_trigger=entry_trigger,
     )
     if in_place_addend is not None:
         add_addr, add2_addr = in_place_addend

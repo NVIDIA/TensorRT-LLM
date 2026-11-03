@@ -942,6 +942,85 @@ def test_prequantized_cuda_graph(m):
     assert torch.equal(out, eager)
 
 
+#: KDA fused q/k/v/g of the helix8 (6144 rows) and helix16 (3072) shards, MLA q_a | kv_a (2112).
+STAGED_SHAPES = [(6144, 7168), (3072, 7168), (2112, 7168)]
+
+
+@pytest.mark.parametrize("n, k", STAGED_SHAPES)
+@pytest.mark.parametrize("m", [1, 8, 13, 16, 28, 32, 48, 64])
+def test_prequantized_staged_weights_are_bitwise(m, n, k):
+    """Weights held in tensor memory change where the MMAs read A from, not the MMAs or their
+    order: ``stage_weights`` gives the unstaged kernel's bits in both prequantized ranges."""
+    mod = _kernel_module()
+    w_pad, scale = _make_weight(n, k, seed=n + k)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    xq, xs = _mxfp8_operand(_make_activation(m, k, seed=m))
+    if mod.weights_on_chip(m, n, k):
+        staged = mod.staged_prequantized_tactic(m, n, k)
+        base = (
+            mod.default_mid_tactic(m, n, k)
+            if m > mod.low_m_max_for(n, k)
+            else mod.default_prequantized_tactic(m, n, k)
+        )
+        assert (staged.mma_n, staged.split_k, staged.b_stages) == (
+            base.mma_n,
+            base.split_k,
+            base.b_stages,
+        )
+    ref = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
+    out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed, True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("m", [8, 16, 32])
+def test_staged_tactic_keeps_the_slice_on_chip(m):
+    """KDA q/k/v/g (helix8): the ring plus the staged tiles hold every K tile of a CTA within the
+    shared-memory budget that lets a CTA land beside an attn_res CTA."""
+    mod = _kernel_module()
+    n, k = 6144, 7168
+    t = mod.staged_prequantized_tactic(m, n, k)
+    kt_max = -(-(k // 128) // t.split_k)
+    assert t.tmem_tiles > 0 and t.a_stages + t.tmem_tiles >= kt_max
+    assert mod.mid_smem_bytes(n, k, t, fold_weight_scale=True) <= mod.STAGED_SMEM_BYTES
+    assert mod.weights_on_chip(m, n, k)
+
+
+@pytest.mark.parametrize("a_stages, tmem_tiles", [(12, 1), (12, 4), (2, 12), (1, 5)])
+def test_prequantized_explicit_staging_is_bitwise(a_stages, tmem_tiles):
+    """A 256-column allocation (up to 4 tiles), staged tiles that pass through a ring that wraps
+    before the wait (more staged tiles than ring stages), and a slice that still streams tiles
+    after the staged ones."""
+    mod = _kernel_module()
+    m, n, k = 8, 6144, 7168
+    w_pad, scale = _make_weight(n, k, seed=5)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    xq, xs = _mxfp8_operand(_make_activation(m, k, seed=9))
+    base = mod.default_prequantized_tactic(m, n, k)
+    a_stages = min(a_stages, mod.max_mid_a_stages(n, k, base, fold_weight_scale=True))
+    tactic = dataclasses.replace(base, a_stages=a_stages, tmem_tiles=tmem_tiles)
+    mod.validate_mid_tactic(n, k, tactic, fold_weight_scale=True)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(ref)
+    mod.run_low_m_gemm_prequantized(xq, xs, w, packed, ref, tactic=base)
+    mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out, tactic=tactic)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+def test_validate_rejects_too_many_staged_tiles():
+    mod = _kernel_module()
+    base = mod.MidMTactic(mma_n=8, split_k=3, a_stages=4, b_stages=19)
+    with pytest.raises(ValueError):
+        # 64 accumulator / scale columns + 15 tiles x 32 columns > 512
+        mod.validate_mid_tactic(6144, 7168, dataclasses.replace(base, tmem_tiles=15), True)
+    with pytest.raises(ValueError):
+        # 56 K tiles over 8 ranks: every rank owns 7
+        mod.validate_mid_tactic(
+            6144, 7168, dataclasses.replace(base, split_k=8, b_stages=7, tmem_tiles=8), True
+        )
+
+
 @pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168)])
 @pytest.mark.parametrize("m", [1, 7, 32, 64, 65, 96, 128, 129, 192])
 def test_weight_read_linear_forward_prequantized(m, n, k):

@@ -52,6 +52,14 @@ folds the weight block scale into the activation scales and keeps the low-M kern
 split-K and reduction order; above it, it is the mid-M GEMM without its quantization kernel.
 Either way the output is bitwise :func:`run_low_m_gemm` on the BF16 activation.
 
+Weight staging (``MidMTactic.tmem_tiles`` = ``t > 0``, :func:`staged_prequantized_tactic`): the
+MMA warp copies the first ``t`` weight K tiles of its slice from the ring into tensor memory
+(``tcgen05.cp`` 128x256b, four per tile) as they land and releases their ring stages at once, so
+the weight producer refills them before ``griddepcontrol.wait``; the MMAs of those tiles read A
+from tensor memory, in the same K-tile order, so the output is the unstaged kernel's bits. With
+the ring cut to :data:`STAGED_SMEM_BYTES`, a CTA can hold its whole weight slice on chip before
+the wait (:func:`weights_on_chip`) and still land beside a CTA of the producer in front of it.
+
 Low-M kernel variants for output-gated and gate projections, bitwise equal to the separate
 PyTorch ops followed / preceded by the plain kernel at the same tactic:
 
@@ -1873,12 +1881,38 @@ _MID_SMEM_CAPACITY = _SMEM_CAPACITY - 2048
 @dataclasses.dataclass(frozen=True)
 class MidMTactic:
     """One specialization of :class:`Fp8BlockScaleMidMGemmKernel`: ``mma_n`` padded tokens,
-    cluster ``split_k``, weight ring ``a_stages`` and activation ring ``b_stages``."""
+    cluster ``split_k``, weight ring ``a_stages``, activation ring ``b_stages`` and
+    ``tmem_tiles`` weight K tiles staged in tensor memory (0: none)."""
 
     mma_n: int
     split_k: int
     a_stages: int
     b_stages: int = 3
+    tmem_tiles: int = 0
+
+
+#: Tensor-memory columns of one staged 128 x 128 E4M3 weight tile (four codes per column).
+_A_TMEM_TILE_COLS = CTA_K // 4
+#: Largest tensor-memory allocation of one CTA.
+_TMEM_MAX_COLS = 512
+#: Upper 32 bits of the shared-memory descriptor of a 128B-swizzled K-major weight stage (8-row
+#: group stride 1024 B, descriptor version 1, 128-byte swizzle), the source of ``tcgen05.cp``;
+#: the lower word is the 16-byte start address with a leading offset of one.
+_A_DESC_HI = 0x40004040
+_A_DESC_LO_LBO = 0x10000
+
+
+def _mid_tmem_base_cols(mma_n: int) -> int:
+    """Accumulator plus SFA / SFB columns of the mid-M kernel, rounded to a power of two: the
+    first column of the staged weight tiles."""
+    cols = mma_n + 2 * _SF_TMEM_COLS
+    return 1 << (cols - 1).bit_length()
+
+
+def _mid_tmem_cols(tactic: MidMTactic) -> int:
+    """Tensor-memory columns a CTA of ``tactic`` allocates (a power of two)."""
+    need = _mid_tmem_base_cols(tactic.mma_n) + tactic.tmem_tiles * _A_TMEM_TILE_COLS
+    return 1 << (need - 1).bit_length()
 
 
 def _sf_blocks(mma_n: int) -> int:
@@ -1924,6 +1958,11 @@ def validate_mid_tactic(
         raise ValueError(f"split_k={tactic.split_k} invalid for K={k}")
     if tactic.a_stages < 1 or tactic.b_stages < 1:
         raise ValueError("a_stages and b_stages must be >= 1")
+    # The staged tiles must be K tiles of every cluster rank.
+    if not 0 <= tactic.tmem_tiles <= (k // CTA_K) // tactic.split_k or (
+        _mid_tmem_cols(tactic) > _TMEM_MAX_COLS
+    ):
+        raise ValueError(f"tmem_tiles={tactic.tmem_tiles} invalid for K={k}, {tactic}")
     need = mid_smem_bytes(n, k, tactic, fold_weight_scale)
     capacity = _mid_smem_capacity(fold_weight_scale)
     if need > capacity:
@@ -2116,6 +2155,30 @@ def _sts_b32(addr, v, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _tmem_cp_128x256b(taddr, smem_addr, *, loc=None, ip=None):
+    """``tcgen05.cp`` of 128 rows x 32 bytes (one K block of E4M3 codes) of the 128B-swizzled
+    K-major tile at shared address ``smem_addr`` into eight tensor-memory columns at ``taddr``
+    (row r -> lane r)."""
+    _asm(
+        None,
+        [_iv(taddr, loc=loc, ip=ip), _iv(smem_addr, loc=loc, ip=ip)],
+        "{\n"
+        ".reg .b32 lo, hi;\n"
+        ".reg .b64 desc;\n"
+        "shr.u32 lo, $1, 4;\n"
+        "and.b32 lo, lo, 0x3FFF;\n"
+        f"or.b32 lo, lo, {_A_DESC_LO_LBO};\n"
+        f"mov.b32 hi, {_A_DESC_HI};\n"
+        "mov.b64 desc, {lo, hi};\n"
+        "tcgen05.cp.cta_group::1.128x256b [$0], desc;\n"
+        "}",
+        "r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
 class MxFp8QuantKernel:
     """``x`` BF16 ``[M, K]`` -> E4M3 ``[M, K]`` + UE8M0 1x32 scales for the mid-M GEMM.
 
@@ -2281,9 +2344,10 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         self.chunks_cap = _ceil_div(self.chunks, self.split_k)
         self.a_region_bytes = max(self.a_stages * self.a_stage_bytes, _mid_mailbox_bytes(tactic))
         self.out_stage_bytes = self.mma_n * MMA_M * 2
-        # Accumulator columns plus SFA / SFB columns, rounded to a power of two.
-        cols = self.mma_n + 2 * _SF_TMEM_COLS
-        self.tmem_cols = 1 << (cols - 1).bit_length()
+        # Accumulator plus SFA / SFB columns, then the staged weight tiles.
+        self.tmem_tiles = tactic.tmem_tiles
+        self.a_tmem_col0 = _mid_tmem_base_cols(self.mma_n)
+        self.tmem_cols = _mid_tmem_cols(tactic)
         self.blk = min(32, self.mma_n)
         # SFA stages: one per K tile, or the constant 1.0 when the weight scale is folded.
         self.sfa_stages = 1 if fold_weight_scale else self.kt_max
@@ -2394,6 +2458,24 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         a_layout = sm100_utils.make_smem_layout_a(
             tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, self.a_stages
         )
+        # The same MMA with A in tensor memory for the staged weight tiles (unused without them).
+        tiled_mma_ts = tiled_mma
+        a_tmem_layout = a_layout
+        if cutlass.const_expr(self.tmem_tiles > 0):
+            tiled_mma_ts = sm100_utils.make_blockscaled_trivial_tiled_mma(
+                cutlass.Float8E4M3FN,
+                cutlass.Float8E4M3FN,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                cutlass.Float8E8M0FNU,
+                SF_VEC,
+                tcgen05.CtaGroup.ONE,
+                (MMA_M, self.mma_n),
+                tcgen05.OperandSource.TMEM,
+            )
+            a_tmem_layout = sm100_utils.make_smem_layout_a(
+                tiled_mma_ts, self.mma_tiler, cutlass.Float8E4M3FN, 1
+            )
         b_layout = sm100_utils.make_smem_layout_b(
             tiled_mma, self.mma_tiler, cutlass.Float8E4M3FN, self.b_stages
         )
@@ -2457,6 +2539,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
 
         self.kernel(
             tiled_mma,
+            tiled_mma_ts,
             tma_atom_a,
             tma_tensor_a,
             tma_atom_b,
@@ -2466,6 +2549,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
             mOut,
             m,
             a_layout,
+            a_tmem_layout,
             b_layout,
             sfa_layout,
             sfb_layout,
@@ -2487,6 +2571,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
+        tiled_mma_ts: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
@@ -2496,6 +2581,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         mOut: cute.Tensor,
         m: Int32,
         a_layout: cute.ComposedLayout,
+        a_tmem_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
         sfb_layout: cute.Layout,
@@ -2632,12 +2718,14 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         elif warp_idx == _MMA_WARP:
             self.mma_warp(
                 tiled_mma,
+                tiled_mma_ts,
                 storage,
                 mWS,
                 n_tile,
                 kt_start,
                 kt_count,
                 a_layout,
+                a_tmem_layout,
                 b_layout,
                 sfa_layout,
                 sfb_layout,
@@ -2739,12 +2827,14 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
     def mma_warp(
         self,
         tiled_mma: cute.TiledMma,
+        tiled_mma_ts: cute.TiledMma,
         storage,
         mWS: cute.Tensor,
         n_tile: Int32,
         kt_start: Int32,
         kt_count: Int32,
         a_layout: cute.ComposedLayout,
+        a_tmem_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
         sfb_layout: cute.Layout,
@@ -2787,6 +2877,26 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         acc_tmem_ptr = cute.arch.retrieve_tmem_ptr(
             cutlass.Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
         )
+        staged = self.tmem_tiles
+        if cutlass.const_expr(staged > 0):
+            # Weight K tiles 0 .. staged - 1 into tensor memory as they land (tile j at column
+            # a_tmem_col0 + 32 j, one tcgen05.cp per 32-byte K block); their ring stages are
+            # released at once, so the weight producer refills them before griddepcontrol.wait.
+            # tcgen05.commit tracks the copies like MMAs, and the MMAs that read the tiles are
+            # issued after them by the same thread.
+            tmem_base = storage.tmem_holding_buf.load()
+            sa_base = storage.sA.data_ptr().toint()
+            for j in cutlass.range_constexpr(staged):
+                stage = j % self.a_stages
+                cute.arch.mbarrier_wait(a_full + stage, (j // self.a_stages) & 1)
+                with cute.arch.elect_one():
+                    for kb in cutlass.range_constexpr(CTA_K // SF_VEC):
+                        _tmem_cp_128x256b(
+                            tmem_base + self.a_tmem_col0 + j * _A_TMEM_TILE_COLS + kb * 8,
+                            sa_base + stage * self.a_stage_bytes + kb * SF_VEC,
+                        )
+                    if cutlass.const_expr(j + self.a_stages < self.kt_max):
+                        tcgen05.commit(a_empty + stage)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc = cute.make_tensor(acc_tmem_ptr, tiled_mma.make_fragment_C(acc_shape).layout)
         tCtSFA = cute.make_tensor(
@@ -2812,38 +2922,70 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         tCrA = tiled_mma.make_fragment_A(sA)
         tCrB = tiled_mma.make_fragment_B(sB)
         num_kphases = cute.size(tCrA, mode=[2])
+        # A operands of the staged tiles: tile j's fragment at its tensor-memory columns.
+        tCtA_tiles = []
+        if cutlass.const_expr(staged > 0):
+            tCtA_frag = tiled_mma_ts.make_fragment_A(
+                cute.make_tensor(acc_tmem_ptr, a_tmem_layout.outer)
+            )[None, None, None, 0]
+            for j in cutlass.range_constexpr(staged):
+                tCtA_tiles.append(
+                    cute.make_tensor(
+                        cute.recast_ptr(
+                            acc_tmem_ptr + self.a_tmem_col0 + j * _A_TMEM_TILE_COLS,
+                            dtype=tCtA_frag.element_type,
+                        ),
+                        tCtA_frag.layout,
+                    )
+                )
 
         if cutlass.const_expr(self.fold_weight_scale):
             cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, 0)], tCtSFA_s2t)
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        # The staged tiles' MMAs come first and the first of them starts the accumulator.
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, staged > 0)
+        tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, False)
         # Fully unrolled over the largest K-tile count; the MMA descriptor fields are set outside
         # the per-tile predicate (a rank with one K tile fewer skips the last tile's work), and
-        # only stages that are refilled are released.
+        # only stages that are refilled are released. The staged tiles are K tiles of every rank.
         for kt in cutlass.range_constexpr(self.kt_max):
             a_stage = kt % self.a_stages
             b_stage = kt % self.b_stages
             live = kt < kt_count
             if live:
-                cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                if cutlass.const_expr(kt >= staged):
+                    cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
                 cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
                 if cutlass.const_expr(not self.fold_weight_scale):
                     cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
                 cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
             for kp in cutlass.range_constexpr(num_kphases):
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                if live:
-                    cute.gemm(
-                        tiled_mma,
-                        tCtAcc,
-                        tCrA[(None, None, kp, a_stage)],
-                        tCrB[(None, None, kp, b_stage)],
-                        tCtAcc,
-                    )
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if cutlass.const_expr(kt < staged):
+                    tiled_mma_ts.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                    tiled_mma_ts.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                    if live:
+                        cute.gemm(
+                            tiled_mma_ts,
+                            tCtAcc,
+                            tCtA_tiles[kt][(None, None, kp)],
+                            tCrB[(None, None, kp, b_stage)],
+                            tCtAcc,
+                        )
+                    tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, True)
+                else:
+                    tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                    tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                    if live:
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[(None, None, kp, a_stage)],
+                            tCrB[(None, None, kp, b_stage)],
+                            tCtAcc,
+                        )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             if live:
                 with cute.arch.elect_one():
-                    if cutlass.const_expr(kt + self.a_stages < self.kt_max):
+                    if cutlass.const_expr(kt >= staged and kt + self.a_stages < self.kt_max):
                         tcgen05.commit(a_empty + a_stage)
                     if cutlass.const_expr(kt + self.b_stages < self.kt_max):
                         tcgen05.commit(b_empty + b_stage)
@@ -3739,6 +3881,54 @@ def default_prequantized_tactic(m: int, n: int, k: int) -> MidMTactic:
     return best
 
 
+#: Shared memory of a staged CTA (:func:`staged_prequantized_tactic`): with the producer's CTAs
+#: at the largest carve-out (``kimi_k3_attn_res`` ``entry_trigger``), a CTA of up to 225 KB lands
+#: on an SM that runs a 1 KB CTA (measured on Rubin); 220 KB leaves room for a few KB more.
+STAGED_SMEM_BYTES = 220 * 1024
+
+
+def _prequantized_tactic(m: int, n: int, k: int) -> tuple[MidMTactic, bool]:
+    """The tactic :func:`run_low_m_gemm_prequantized` runs ``M`` rows with by default, and
+    whether it folds the weight scale (the low-M range)."""
+    if m > low_m_max_for(n, k):
+        return default_mid_tactic(m, n, k), False
+    return default_prequantized_tactic(m, n, k), True
+
+
+@functools.cache
+def staged_prequantized_tactic(m: int, n: int, k: int) -> MidMTactic:
+    """The default prequantized tactic's ``mma_n``, split-K and activation ring (so the same
+    bits) with the weight ring cut to :data:`STAGED_SMEM_BYTES` and as many weight K tiles staged
+    in tensor memory as the ring cannot hold (where tensor memory allows)."""
+    base, fold = _prequantized_tactic(m, n, k)
+    kt_total = k // CTA_K
+    kt_max = _ceil_div(kt_total, base.split_k)
+    budget = min(STAGED_SMEM_BYTES, _mid_smem_capacity(fold))
+    a_stages = min(base.a_stages, kt_max)
+    while a_stages > 1 and (
+        mid_smem_bytes(n, k, dataclasses.replace(base, a_stages=a_stages), fold) > budget
+    ):
+        a_stages -= 1
+    tmem_room = (_TMEM_MAX_COLS - _mid_tmem_base_cols(base.mma_n)) // _A_TMEM_TILE_COLS
+    tiles = min(max(kt_max - a_stages, 0), tmem_room, kt_total // base.split_k)
+    tactic = dataclasses.replace(base, a_stages=a_stages, tmem_tiles=tiles)
+    validate_mid_tactic(n, k, tactic, fold)
+    return tactic
+
+
+@functools.cache
+def weights_on_chip(m: int, n: int, k: int) -> bool:
+    """Whether :func:`staged_prequantized_tactic` holds a CTA's whole weight slice on chip
+    (shared-memory ring plus tensor memory) before ``griddepcontrol.wait``, so that the GEMM may
+    be released by its producer at that producer's entry."""
+    try:
+        tactic = staged_prequantized_tactic(m, n, k)
+    except ValueError:
+        return False
+    kt_max = _ceil_div(k // CTA_K, tactic.split_k)
+    return tactic.a_stages + tactic.tmem_tiles >= kt_max
+
+
 def run_low_m_gemm_prequantized(
     xq: torch.Tensor,
     xs: torch.Tensor,
@@ -3748,6 +3938,7 @@ def run_low_m_gemm_prequantized(
     *,
     tactic: MidMTactic | None = None,
     use_pdl: bool = True,
+    stage_weights: bool = False,
 ) -> torch.Tensor:
     """Launch ``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` on the current stream: bitwise
     :func:`run_low_m_gemm` on the BF16 activation that ``(xq, xs)`` quantizes. In the low-M
@@ -3762,15 +3953,21 @@ def run_low_m_gemm_prequantized(
         tactic: kernel specialization (low-M range: ``mma_n`` in :data:`SUPPORTED_MMA_N`);
             :func:`default_prequantized_tactic` if None.
         use_pdl: launch with programmatic dependent launch.
+        stage_weights: (no ``tactic``) :func:`staged_prequantized_tactic` where
+            :func:`weights_on_chip`, the same bits.
     """
     m, k = xq.shape
     n = w.shape[0]
     if not 1 <= m <= MAX_M:
         raise ValueError(f"M={m} must be in [1, {MAX_M}]")
+    staged = tactic is None and stage_weights and weights_on_chip(m, n, k)
     if m > low_m_max_for(n, k):
-        _run_mid_quantized(xq, xs, w, w_scale, out, default_mid_tactic(m, n, k), use_pdl)
+        mid = staged_prequantized_tactic(m, n, k) if staged else default_mid_tactic(m, n, k)
+        _run_mid_quantized(xq, xs, w, w_scale, out, mid, use_pdl)
         return out
-    if tactic is None:
+    if staged:
+        tactic = staged_prequantized_tactic(m, n, k)
+    elif tactic is None:
         tactic = default_prequantized_tactic(m, n, k)
     if m > tactic.mma_n:
         raise ValueError(f"M={m} exceeds tactic.mma_n={tactic.mma_n}")
@@ -4193,6 +4390,8 @@ __all__ = [
     "run_low_m_gemm_all_reduce_push",
     "run_low_m_gemm_prequantized",
     "split_tactic",
+    "staged_prequantized_tactic",
     "ue8m0_of_amax",
     "validate_nvfp4_out_tactic",
+    "weights_on_chip",
 ]

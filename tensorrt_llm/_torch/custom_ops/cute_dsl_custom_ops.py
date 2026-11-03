@@ -5687,25 +5687,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              mutates_args=(),
                              device_types="cuda")
     def fp8_block_scale_low_m_gemm_prequantized(
-            input: torch.Tensor, input_scale: torch.Tensor,
-            weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+            input: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            stage_weights: bool = False) -> torch.Tensor:
         """``fp8_block_scale_low_m_gemm`` on an MXFP8 activation quantized
         upstream: E4M3 ``input [M, K]`` and its UE8M0 1x32 ``input_scale`` in
         the 128-row atom layout of the GEMM's quantization kernel (R128c4 up
         to 128 rows). Bitwise the GEMM of the BF16 activation the operand
-        quantizes."""
+        quantizes. ``stage_weights``: hold the weight slice on chip before
+        the PDL wait where ``fp8_low_m.weights_on_chip`` (same bits)."""
         fp8_low_m.check_prequantized_inputs(input, input_scale, weight,
                                             weight_scale)
         output = torch.empty((input.shape[0], weight.shape[0]),
                              dtype=torch.bfloat16,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm_prequantized(input, input_scale, weight,
-                                                     weight_scale, output)
+        return fp8_low_m.run_low_m_gemm_prequantized(
+            input,
+            input_scale,
+            weight,
+            weight_scale,
+            output,
+            stage_weights=stage_weights)
 
     @torch.library.register_fake(
         "trtllm::fp8_block_scale_low_m_gemm_prequantized")
-    def _(input: torch.Tensor, input_scale: torch.Tensor, weight: torch.Tensor,
-          weight_scale: torch.Tensor) -> torch.Tensor:
+    def _(input: torch.Tensor,
+          input_scale: torch.Tensor,
+          weight: torch.Tensor,
+          weight_scale: torch.Tensor,
+          stage_weights: bool = False) -> torch.Tensor:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
 
@@ -5897,14 +5909,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              mutates_args=(),
                              device_types="cuda")
     def kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
-        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
-        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
-        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+        residual: torch.Tensor,
+        routed: torch.Tensor,
+        shared: torch.Tensor,
+        block: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        out_weight: torch.Tensor,
+        rms_eps: float,
+        out_eps: float,
+        entry_trigger: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_moe_add_rmsnorm`` plus the MXFP8 form ``(xq,
         xs)`` of its output: E4M3 ``[M, H]`` and UE8M0 1x32 scales in the
         R128c4 layout, the bits the FP8 low-M GEMM's in-kernel quantization
-        makes of the output."""
+        makes of the output. ``entry_trigger``: see
+        ``kimi_k3_attn_res.run_attn_res``."""
         output = torch.empty_like(residual)
         prefix = torch.empty_like(residual)
         xq, xs = _kimi_k3_attn_res_mxfp8_outputs(residual)
@@ -5917,19 +5937,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       out_eps,
                                       output,
                                       prefix,
-                                      mxfp8_out=(xq, xs))
+                                      mxfp8_out=(xq, xs),
+                                      entry_trigger=entry_trigger)
         return prefix, output, xq, xs
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8")
-    def _(residual, routed, shared, block, res_weight, rms_weight, out_weight,
-          rms_eps, out_eps):
+    def _(residual,
+          routed,
+          shared,
+          block,
+          res_weight,
+          rms_weight,
+          out_weight,
+          rms_eps,
+          out_eps,
+          entry_trigger=False):
         return (torch.empty_like(residual), torch.empty_like(residual),
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
-    def _kimi_k3_attn_res_moe_finish(residual, uc_local, mc_base, flags, world,
-                                     rank, chunk, sanitize, block, weights,
-                                     rms_eps, out_eps, mxfp8):
+    def _kimi_k3_attn_res_moe_finish(residual,
+                                     uc_local,
+                                     mc_base,
+                                     flags,
+                                     world,
+                                     rank,
+                                     chunk,
+                                     sanitize,
+                                     block,
+                                     weights,
+                                     rms_eps,
+                                     out_eps,
+                                     mxfp8,
+                                     entry_trigger=False):
         output = torch.empty_like(residual)
         prefix = torch.empty_like(residual)
         mxfp8_out = _kimi_k3_attn_res_mxfp8_outputs(residual) if mxfp8 else None
@@ -5950,7 +5990,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                     True,
                                                     chunk=chunk,
                                                     sanitize=sanitize,
-                                                    all_gather=True))
+                                                    all_gather=True),
+            entry_trigger=entry_trigger)
         return (prefix, output) + (tuple(mxfp8_out) if mxfp8 else ())
 
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_finish_rmsnorm",
@@ -5983,21 +6024,47 @@ if IS_CUTLASS_DSL_AVAILABLE:
         mutates_args=(),
         device_types="cuda")
     def kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8(
-        residual: torch.Tensor, uc_local: int, mc_base: int,
-        flags: torch.Tensor, world: int, rank: int, chunk: int, sanitize: bool,
-        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
-        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+        residual: torch.Tensor,
+        uc_local: int,
+        mc_base: int,
+        flags: torch.Tensor,
+        world: int,
+        rank: int,
+        chunk: int,
+        sanitize: bool,
+        block: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        out_weight: torch.Tensor,
+        rms_eps: float,
+        out_eps: float,
+        entry_trigger: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``kimi_k3_attn_res_moe_finish_rmsnorm`` plus the MXFP8 form ``(xq,
-        xs)`` of its output (as ``kimi_k3_attn_res_moe_add_rmsnorm_mxfp8``)."""
+        xs)`` of its output (as ``kimi_k3_attn_res_moe_add_rmsnorm_mxfp8``,
+        also its ``entry_trigger``)."""
         return _kimi_k3_attn_res_moe_finish(
             residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
-            block, (res_weight, rms_weight, out_weight), rms_eps, out_eps, True)
+            block, (res_weight, rms_weight, out_weight), rms_eps, out_eps, True,
+            entry_trigger)
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8")
-    def _(residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
-          block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    def _(residual,
+          uc_local,
+          mc_base,
+          flags,
+          world,
+          rank,
+          chunk,
+          sanitize,
+          block,
+          res_weight,
+          rms_weight,
+          out_weight,
+          rms_eps,
+          out_eps,
+          entry_trigger=False):
         return (torch.empty_like(residual), torch.empty_like(residual),
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 

@@ -266,6 +266,10 @@ maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
 
+    # Row counts for which ``qkvg_proj`` holds its weights on chip before its PDL wait on a
+    # prequantized input; set by ``accept_prequantized_qkvg_input``.
+    _qkvg_stages_weights: Optional[Callable[[int], bool]] = None
+
     def __init__(
         self,
         cfg,
@@ -567,10 +571,22 @@ class KimiKDALinearAttention(nn.Module):
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
 
-    def accept_prequantized_qkvg_input(self, takes_prequantized: Callable[[int], bool]) -> None:
+    def accept_prequantized_qkvg_input(
+        self,
+        takes_prequantized: Callable[[int], bool],
+        stages_weights: Optional[Callable[[int], bool]] = None,
+    ) -> None:
         """Declare that the fused q/k/v/g projection consumes the MXFP8 form of its input
-        (``forward_prequantized``) for the row counts where ``takes_prequantized(num_rows)``."""
+        (``forward_prequantized``) for the row counts where ``takes_prequantized(num_rows)``, and
+        holds its weights on chip before its PDL wait where ``stages_weights(num_rows)``."""
         self._qkvg_takes_prequantized = takes_prequantized
+        self._qkvg_stages_weights = stages_weights
+
+    def qkvg_stages_weights(self, num_rows: int) -> bool:
+        """Whether the fused q/k/v/g projection of ``num_rows`` prequantized rows holds its
+        weights on chip before its PDL wait: then the producer of its input may release it at
+        that producer's entry (``kimi_k3_attn_res`` ``entry_trigger``)."""
+        return self._qkvg_stages_weights is not None and self._qkvg_stages_weights(num_rows)
 
     @staticmethod
     def _is_verify_only_batch(attn_metadata: AttentionMetadata) -> bool:
@@ -1507,7 +1523,10 @@ class KimiKDALinearAttention(nn.Module):
             if qkvg_weight is not None:
                 return torch.nn.functional.linear(x, qkvg_weight)
             if prequantized_input is not None:
-                return fused_qkvg.forward_prequantized(*prequantized_input).view(*x.shape[:-1], -1)
+                stage = self.qkvg_stages_weights(num_rows)
+                return fused_qkvg.forward_prequantized(
+                    *prequantized_input, stage_weights=stage
+                ).view(*x.shape[:-1], -1)
             return fused_qkvg(x)
 
         onorm_lowrank = None

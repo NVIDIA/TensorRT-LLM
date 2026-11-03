@@ -415,6 +415,7 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
     assert attention._bfa_proj_weight.dtype == torch.bfloat16
     # The loader tells the mixer for which row counts the fused projection takes an MXFP8 input.
     assert attention._qkvg_takes_prequantized == attention.qkvg_proj.takes_prequantized_input
+    assert attention._qkvg_stages_weights == attention.qkvg_proj.stages_weights
     for name in _KDA_PROJECTIONS[:4]:
         assert (
             getattr(attention, name).weight.untyped_storage().data_ptr()

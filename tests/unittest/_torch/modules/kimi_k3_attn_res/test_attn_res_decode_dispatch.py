@@ -180,24 +180,29 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
 class _FakeKdaMixer:
     """Stands in for the KDA mixer: records the MXFP8 hand-off it is given for each call."""
 
-    def __init__(self):
+    def __init__(self, stages_weights: bool = False):
         self.seen = []
+        self.stages_weights = stages_weights
 
     def takes_prequantized_input(self, num_rows, attn_metadata):
         return attn_metadata.num_contexts == 0
+
+    def qkvg_stages_weights(self, num_rows):
+        return self.stages_weights
 
     def __call__(self, h, attn_metadata, prequantized_input=None):
         self.seen.append((h, prequantized_input))
         return (h.float() * 0.75).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("attention", ["kda", "mla"])
+@pytest.mark.parametrize("attention", ["kda", "kda_staged", "mla"])
 @pytest.mark.parametrize("m", [7, 32])
 @torch.no_grad()
 def test_decoder_layers_mxfp8_handoff(m: int, attention: str):
     """A KDA or MLA layer whose pre-attention mix folds in the previous MoE residual hands the
     attention the MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the
-    BF16 rows; the layer outputs do not change, and context batches get no hand-off."""
+    BF16 rows; the layer outputs do not change, and context batches get no hand-off. A KDA
+    projection that stages its weights gets the mix released at kernel entry: the same bits."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
@@ -205,8 +210,8 @@ def test_decoder_layers_mxfp8_handoff(m: int, attention: str):
     layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
     mixers = []
     for layer in layers:
-        mixers.append(_FakeKdaMixer())
-        layer.is_kda = attention == "kda"
+        mixers.append(_FakeKdaMixer(stages_weights=attention == "kda_staged"))
+        layer.is_kda = attention != "mla"
         if layer.is_kda:
             layer.linear_attn = mixers[-1]
         else:
@@ -268,3 +273,15 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
     assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
     assert not mixer.takes_prequantized_input(16, metadata(1, 16, 4))
+
+
+def test_kda_mixer_qkvg_stages_weights_only_where_declared():
+    """A mixer stages its q/k/v/g weights (and lets the mix release the projection at entry) only
+    for the row counts its fused projection declared."""
+    mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
+    assert not mixer.qkvg_stages_weights(16)
+    mixer.accept_prequantized_qkvg_input(takes)
+    assert not mixer.qkvg_stages_weights(16)
+    mixer.accept_prequantized_qkvg_input(takes, lambda num_rows: num_rows <= 16)
+    assert mixer.qkvg_stages_weights(16)
+    assert not mixer.qkvg_stages_weights(32)

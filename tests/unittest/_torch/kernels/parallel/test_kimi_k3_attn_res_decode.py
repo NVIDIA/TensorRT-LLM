@@ -201,11 +201,13 @@ def r128c4_offsets(m: int, k: int) -> torch.Tensor:
     return ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
 
 
+@pytest.mark.parametrize("entry_trigger", [False, True])
 @pytest.mark.parametrize("n", [2, 6, 12])
 @pytest.mark.parametrize("m", [1, 7, 14, 32, 64, 128, 144, 192])
-def test_mxfp8_side_output(m: int, n: int):
+def test_mxfp8_side_output(m: int, n: int, entry_trigger: bool):
     """The MXFP8 op returns the plain op's BF16 results and the MXFP8 form of the normalized
-    output that the FP8 low-M GEMM's in-kernel quantization makes of it."""
+    output that the FP8 low-M GEMM's in-kernel quantization makes of it; releasing the dependent
+    at kernel entry changes no bit."""
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
     t = _inputs(m, n, 1.0, seed=m + n)
@@ -213,7 +215,7 @@ def test_mxfp8_side_output(m: int, n: int):
     ops = torch.ops.trtllm
     ref = ops.kimi_k3_attn_res_moe_add_rmsnorm(t["layer"], t["addend"], t["shared"], t["block"], *w)
     prefix, out, xq, xs = ops.kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
-        t["layer"], t["addend"], t["shared"], t["block"], *w
+        t["layer"], t["addend"], t["shared"], t["block"], *w, entry_trigger
     )
     assert _mismatches(prefix, ref[0]) == 0 and _mismatches(out, ref[1]) == 0
     ref_q, ref_s = low_m.mxfp8_quantize_reference(ref[1])
