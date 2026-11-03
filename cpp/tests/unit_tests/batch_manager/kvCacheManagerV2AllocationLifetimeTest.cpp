@@ -278,7 +278,9 @@ TEST_F(AllocationLifetimeTest, HeldDeferredGroupsCannotBeDeselected)
 
 TEST_F(AllocationLifetimeTest, EveryBeamReallocatesReleasedFixedState)
 {
-    auto manager = std::make_shared<KvCacheManager>(makeLifetimeConfig());
+    auto config = makeLifetimeConfig();
+    config.enablePartialCommit = false;
+    auto manager = std::make_shared<KvCacheManager>(config);
     auto cache = manager->createKvCache();
     ASSERT_TRUE(cache->resume(mStream));
     cache->setBeamWidth(BeamIndex{3});
