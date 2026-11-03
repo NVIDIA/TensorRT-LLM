@@ -19210,7 +19210,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              and is_locality_domain_enabled())
                 sm_domain_words = ()
                 if die_claim:
-                    from ...locality_domain.placement import sm_locality_domains
+                    from ..locality_domain.placement import sm_locality_domains
                     from ..moe.kernels.rubin.rubin_small_batch_fused_moe import \
                         pack_sm_domain_words
                     sm_domain_words = pack_sm_domain_words(
