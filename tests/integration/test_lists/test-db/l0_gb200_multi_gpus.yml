@@ -143,3 +143,5 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   # ---- moved to post-merge (MoE CI optimization) ----
   - unittest/_torch/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary
+  # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM).
+  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
