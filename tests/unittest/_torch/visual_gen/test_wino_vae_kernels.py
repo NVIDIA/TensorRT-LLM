@@ -683,6 +683,11 @@ def test_add_bias_and_residual_is_bitwise(C: int, source: str, extras: str) -> N
         ref = ref + residual
     got = add_bias_and_residual(x, m, bias, residual, T, 7, 11)
     assert torch.equal(got, ref)
+    # Into a given destination: a window of a larger buffer.
+    buf = torch.full((T + 3, P, C), 7.0, dtype=bf, device="cuda")
+    into = add_bias_and_residual(x, m, bias, residual, T, 7, 11, out=buf[2 : 2 + T])
+    assert into.data_ptr() == buf[2].data_ptr() and torch.equal(into, ref)
+    assert torch.all(buf[:2] == 7.0) and torch.all(buf[2 + T :] == 7.0)
     # zero-padded output (the downsampler's ZeroPad2d((0, 1, 0, 1))) in the same pass
     padded = add_bias_and_residual(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
     ref_img = F.pad(ref.view(T, 7, 11, C).permute(0, 3, 1, 2), (0, 1, 0, 1)).permute(0, 2, 3, 1)

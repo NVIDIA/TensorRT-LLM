@@ -211,6 +211,12 @@ class _Conv:
 _convs: dict[tuple, _Conv] = {}
 
 
+def _layout_strides(t: torch.Tensor) -> tuple[int, ...]:
+    """``t``'s strides with those of size-1 dimensions zeroed: they never enter an address,
+    so a window of a deeper buffer (same layout, a larger batch stride) shares the plan."""
+    return tuple(0 if size == 1 else stride for size, stride in zip(t.shape, t.stride()))
+
+
 def conv_frontend(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -239,10 +245,10 @@ def conv_frontend(
     key_t = (
         device,
         tuple(x.shape),
-        tuple(x.stride()),
+        _layout_strides(x),
         tuple(w.shape),
-        tuple(w.stride()),
-        tuple(y.stride()),
+        _layout_strides(w),
+        _layout_strides(y),
         x.dtype,
         bias is not None,
         stride,

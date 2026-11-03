@@ -246,9 +246,11 @@ def _can_fuse(s: DeferredSum) -> bool:
     )
 
 
-def _add_bias_and_residual(s: DeferredSum, pad_h: int, pad_w: int) -> torch.Tensor:
+def _add_bias_and_residual(
+    s: DeferredSum, pad_h: int, pad_w: int, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """``s`` added up by the add_bias_and_residual kernel, ``[T, (H+pad_h)*(W+pad_w), C]``,
-    the padding rows and columns zero."""
+    the padding rows and columns zero; into ``out`` when given."""
     src = s.source
     h, w = s.shape[-2:]
     if isinstance(src, torch.Tensor):
@@ -268,6 +270,7 @@ def _add_bias_and_residual(s: DeferredSum, pad_h: int, pad_w: int) -> torch.Tens
         pad_h=pad_h,
         pad_w=pad_w,
         products_geometry=geometry,
+        out=out,
     )
 
 
@@ -1075,6 +1078,10 @@ class WinoVaeResample(WanResample):
         self.pending_bias: torch.Tensor | None = None
         self._time_bias: tuple[tuple, torch.Tensor] | None = None
         self.shard: Shard | None = None
+        if mode == "upsample3d":
+            # The cuDNN graph API's plan beats torch's cuDNN path on the 3x1x1 time conv,
+            # most of all on a frame-buffer window (torch picks a slower kernel there).
+            self.time_conv.cudnn_frontend = True
 
     def _packed_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         conv = self.resample[1]
@@ -1085,16 +1092,16 @@ class WinoVaeResample(WanResample):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: "torch.Tensor | DeferredSum",
         feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
         *,
         prepadded: bool = False,
     ) -> torch.Tensor:
-        """Resample ``x`` ``[B, C, T, H, W]``: upsampling runs the time step, then the space
-        step; downsampling runs the space step, then the time step. The time steps run only in
-        the 3d modes under a causal cache.
+        """Resample ``x`` ``[B, C, T, H, W]`` (a tensor, or a :class:`DeferredSum` added up here):
+        upsampling runs the time step, then the space step; downsampling runs the space step,
+        then the time step. The time steps run only in the 3d modes under a causal cache.
 
         ``shortcut`` = (residual, DupUp3D module, first_chunk), upsample modes only: the space
         step adds the expanded shortcut while writing and the caller skips its add.
@@ -1110,6 +1117,7 @@ class WinoVaeResample(WanResample):
 
         if upsample:
             return self._upsample_space(self._upsample_time(x, feat_cache, feat_idx), shortcut)
+        x = materialize(x)
         if prepadded:
             batch_size, frames = 1, x.shape[0]
             y = self._downsample_space(x, batch_size, prepadded=True)
@@ -1171,46 +1179,32 @@ class WinoVaeResample(WanResample):
 
     def _upsample_time(
         self,
-        x: torch.Tensor,
+        x: "torch.Tensor | DeferredSum",
         feat_cache: list[CacheEntry] | None,
         feat_idx: list[int] | None,
     ) -> torch.Tensor:
         """The upsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one);
-        ``x`` unchanged in upsample2d or without a cache. First chunk: records the ``"Rep"``
-        sentinel and returns ``x`` unchanged (its frames are repeated by the caller's layout).
-        Later chunks: the time conv runs against the cached frame (zero history right after the
-        sentinel), the chunk's last frames become the next cache entry, and the two channel
-        halves are interleaved along time with the conv bias:
-        ``[B, C, T, H, W] -> [B, C, 2T, H, W]``."""
+        ``x`` unchanged (added up) in upsample2d or without a cache. First chunk: records the
+        ``"Rep"`` sentinel and returns ``x`` (its frames are repeated by the caller's layout).
+        Later chunks: the time conv runs against the history (zero right after the sentinel),
+        and the two channel halves are interleaved along time with the conv bias:
+        ``[B, C, T, H, W] -> [B, C, 2T, H, W]``. Unsharded batch-1 chunks run the time conv on
+        its frame buffer, ``x`` added up straight into the buffer window; otherwise the history
+        is prepended by copy."""
         if self.mode != "upsample3d" or feat_cache is None:
-            return x
-        batch_size, channels, frames, height, width = x.size()
+            return materialize(x)
+        batch_size, channels, frames, height, width = x.shape
         idx = feat_idx[0]
         if feat_cache[idx] is None:
             feat_cache[idx] = "Rep"
             feat_idx[0] += 1
-            return x
-
-        cache_x = x[:, :, -CACHE_T:, :, :]
-        if cache_x.shape[2] < 2 and feat_cache[idx] != "Rep":
-            cache_x = torch.cat(
-                [
-                    _to_device_if_needed(
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2), cache_x.device
-                    ),
-                    cache_x,
-                ],
-                dim=2,
-            )
-        if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
-            cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
+            return materialize(x)
         fuse_interleave = kernels_available() and batch_size == 1
         self.time_conv.defer_bias = fuse_interleave
-        if feat_cache[idx] == "Rep":
-            x = self.time_conv(x)
+        if fuse_interleave and self.shard is None:
+            x = self._time_conv_buffered(x, feat_cache, idx, (height, width))
         else:
-            x = self.time_conv(x, feat_cache[idx])
-        feat_cache[idx] = cache_x
+            x = self._time_conv_eager(materialize(x), feat_cache, idx)
         feat_idx[0] += 1
 
         if fuse_interleave:
@@ -1222,6 +1216,44 @@ class WinoVaeResample(WanResample):
         x = x.reshape(batch_size, 2, channels, frames, height, width)
         x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
         return x.reshape(batch_size, channels, frames * 2, height, width)
+
+    def _time_conv_buffered(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry],
+        idx: int,
+        spatial: tuple[int, int],
+    ) -> torch.Tensor:
+        """The time conv of a chunk on its frame buffer: ``x`` is added up (or copied) into the
+        buffer window, the conv reads the history in place, and the cache entry becomes the
+        conv. After the ``"Rep"`` sentinel the buffer starts a clip (zero history)."""
+        tc = self.time_conv
+        entry = feat_cache[idx]
+        window = tc.buffer_begin(None if isinstance(entry, str) else entry, x.shape[2], x, spatial)
+        if isinstance(x, DeferredSum) and _can_fuse(x):
+            _add_bias_and_residual(x, 0, 0, out=frames_view(window))
+        else:
+            window.copy_(materialize(x))
+        feat_cache[idx] = tc
+        return tc.buffer_conv(x.shape[2])
+
+    def _time_conv_eager(
+        self, x: torch.Tensor, feat_cache: list[CacheEntry], idx: int
+    ) -> torch.Tensor:
+        """The time conv of a chunk with its history prepended by copy; the chunk's last frames
+        become the cache entry."""
+        entry = _history_frames(feat_cache[idx])
+        cache_x = x[:, :, -CACHE_T:, :, :]
+        if cache_x.shape[2] < 2 and entry != "Rep":
+            cache_x = torch.cat(
+                [_to_device_if_needed(entry[:, :, -1, :, :].unsqueeze(2), cache_x.device), cache_x],
+                dim=2,
+            )
+        if cache_x.shape[2] < 2 and entry == "Rep":
+            cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
+        y = self.time_conv(x) if entry == "Rep" else self.time_conv(x, entry)
+        feat_cache[idx] = cache_x
+        return y
 
     def _downsample_space(
         self, x_4d: torch.Tensor, batch_size: int, *, prepadded: bool = False
@@ -1819,8 +1851,9 @@ class WinoVaeResidualUpBlock(WanResidualUpBlock):
         )
         if self.upsampler is not None:
             fuse_shortcut = self.avg_shortcut is not None
+            # The upsampler adds x up itself (into its time conv's frame buffer where it can).
             x = self.upsampler(
-                materialize(x),
+                x,
                 feat_cache=feat_cache,
                 feat_idx=feat_idx,
                 shortcut=(residual, self.avg_shortcut, first_chunk) if fuse_shortcut else None,
@@ -1848,7 +1881,7 @@ class WinoVaeUpBlock(WanUpBlock):
             self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsamplers is None
         )
         if self.upsamplers is not None:
-            x = self.upsamplers[0](materialize(x), feat_cache=feat_cache, feat_idx=feat_idx)
+            x = self.upsamplers[0](x, feat_cache=feat_cache, feat_idx=feat_idx)
         return x if isinstance(x, DeferredSum) else _channels_last_3d_if_needed(x)
 
 

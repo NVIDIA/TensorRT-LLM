@@ -600,12 +600,14 @@ def add_bias_and_residual(
     pad_h: int = 0,
     pad_w: int = 0,
     products_geometry: FrameGeometry | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``frames + bias + residual`` as bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero
     rows/columns appended, every add rounded like the eager chain. The frames are ``x``, or the
     temporal Winograd products ``m`` turned into frames first (the output transform A^T along
     time: frame ``g*order + j`` is ``sum_k AT[j][k] m_k[g]``). ``products_geometry``: the
-    products carry halo rows / columns around their ``height`` x ``width`` logical positions."""
+    products carry halo rows / columns around their ``height`` x ``width`` logical positions.
+    ``out``: a contiguous bf16 destination of the result's shape, written and returned."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     if products_geometry is not None and products_geometry.identity:
@@ -633,11 +635,13 @@ def add_bias_and_residual(
         fp16_winograd = m[0].dtype == torch.float16
         m_ptr, stride = _stacked_products(m, m[0].dtype)
     padded = pad_h > 0 or pad_w > 0
-    y = torch.empty(
-        (frames, (height + pad_h) * (width + pad_w), channels),
-        device=src.device,
-        dtype=torch.bfloat16,
-    )
+    shape = (frames, (height + pad_h) * (width + pad_w), channels)
+    if out is None:
+        y = torch.empty(shape, device=src.device, dtype=torch.bfloat16)
+    elif tuple(out.shape) != shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        raise ValueError(f"out must be a contiguous bf16 {list(shape)} tensor")
+    else:
+        y = out
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         fp16_winograd=fp16_winograd,

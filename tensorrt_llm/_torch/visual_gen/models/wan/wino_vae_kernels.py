@@ -353,6 +353,7 @@ def add_bias_and_residual(
     pad_h: int = 0,
     pad_w: int = 0,
     products_geometry: FrameGeometry | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``frames + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order; the
     frames are ``x``, or the temporal Winograd products ``m`` after their output transform
@@ -360,7 +361,9 @@ def add_bias_and_residual(
 
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
     appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``products_geometry``: the
-    products carry halo rows / columns (spatially sharded decode)."""
+    products carry halo rows / columns (spatially sharded decode). ``out``: a contiguous
+    destination of the result's shape (e.g. a conv's frame-buffer window), written and
+    returned."""
     return jit_norm.add_bias_and_residual(
         x=x,
         m=m,
@@ -372,6 +375,7 @@ def add_bias_and_residual(
         pad_h=pad_h,
         pad_w=pad_w,
         products_geometry=products_geometry,
+        out=out,
     )
 
 
