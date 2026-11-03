@@ -28,6 +28,7 @@ context rows, the context attention reads the causal window through the block ta
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from types import SimpleNamespace
@@ -49,7 +50,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
     fp4_quantize,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
+from tensorrt_llm._torch.attention.backends.sparse.params import (
+    MTPIndexShareMetadata,
+    use_self_sampling_gvr,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
@@ -61,6 +65,7 @@ from tensorrt_llm._torch.speculative import (
     get_spec_worker,
     should_use_separate_draft_kv_cache,
 )
+from tensorrt_llm._torch.speculative.eagle3 import _reset_mtp_index_share
 from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 
@@ -200,6 +205,7 @@ from .ops.quantization.cute_dsl_act_quant_mxf8_rows import cute_dsl_act_quant_mx
 from .ops.quantization.cute_dsl_moe_quantize_nvfp4 import cute_dsl_moe_quantize_nvfp4
 from .ops.sampling import cute_dsl_argmax as _argmax_op
 from .ops.sampling.cute_dsl_argmax import cute_dsl_argmax
+from .ops.spec import draft_loop as _draft_loop_op
 
 
 def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
@@ -5597,9 +5603,18 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
 
     Logits the kernel does not take keep the built-in code, counted as misses. Until the
     core's argmax launcher is built (`post_load_weights`), or if it failed to build, both
-    methods are the built-in ones and nothing is counted. Everything else is the built-in
-    worker's.
+    methods are the built-in ones and nothing is counted.
+
+    On a pure decode step it also runs the draft loop's bookkeeping on one launch per group
+    (`ops/spec/draft_loop.py`, ported from Xiao's glm_moe_dsa draft loop): the acceptance and
+    draft-0 inputs, the metadata refresh before draft step 0 and the update after each draft
+    step, and the final draft-token stack with `next_new_tokens`. Routes `draft_accept`,
+    `draft_step`, `draft_finalize`; `TRTLLM_GLM52_DRAFT_LOOP=0` keeps the built-in code. Every
+    other step, and everything else, is the built-in worker's.
     """
+
+    # The draft loop's fused bookkeeping of the running forward (`_forward_impl`), else None.
+    _glm_draft_loop: _draft_loop_op.DraftLoop | None = None
 
     def __init__(
         self,
@@ -5645,6 +5660,140 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
             if tokens is not None:
                 return tokens
         return super()._sample_tokens_for_batch(logits, spec_metadata, num_contexts, batch_size)
+
+    # ---- the draft loop's fused bookkeeping ----
+
+    def _forward_impl(self, *args, **kwargs):
+        """The built-in forward. `sample_and_accept_draft_tokens` decides the fused
+        bookkeeping, the later overrides read it, and it never outlives the forward."""
+        self._glm_draft_loop = None
+        try:
+            return super()._forward_impl(*args, **kwargs)
+        finally:
+            self._glm_draft_loop = None
+
+    def sample_and_accept_draft_tokens(self, input_ids, logits, attn_metadata, spec_metadata):
+        if _draft_loop_op.verify_enabled():
+            # The oracle's counters, at every eager forward (context steps included).
+            _draft_loop_op.VERIFY.report()
+        if _draft_loop_op.enabled():
+            reason = _draft_loop_op.ineligibility(self, attn_metadata, spec_metadata)
+            self._glm_count("draft_accept", reason is None)
+            if reason is not None and attn_metadata.num_contexts == 0:
+                _draft_loop_op.log_decline("the acceptance", reason)
+            if reason is None:
+                self._glm_draft_loop = _draft_loop_op.DraftLoop(self, attn_metadata, spec_metadata)
+                return self._glm_draft_loop.accept(logits)
+        return super().sample_and_accept_draft_tokens(
+            input_ids, logits, attn_metadata, spec_metadata
+        )
+
+    def prepare_1st_drafter_inputs(
+        self, input_ids, position_ids, hidden_states, accepted_tokens, attn_metadata,
+        spec_metadata, draft_model,
+    ):  # fmt: skip
+        loop = self._glm_draft_loop
+        if loop is None:
+            return super().prepare_1st_drafter_inputs(
+                input_ids, position_ids, hidden_states, accepted_tokens, attn_metadata,
+                spec_metadata, draft_model,
+            )  # fmt: skip
+        # No context rows: the draft-0 input ids are the accepted tokens, flattened.
+        return {
+            "input_ids": loop.input_ids,
+            "position_ids": position_ids,
+            "hidden_states": hidden_states,
+            "attn_metadata": attn_metadata,
+            "spec_metadata": spec_metadata,
+        }
+
+    def _forward_linear_draft_loop(
+        self, inputs, attn_metadata, spec_metadata, draft_model, draft_kv_cache_manager,
+        num_contexts, batch_size, num_accepted_tokens, original_all_rank_num_tokens,
+    ):  # fmt: skip
+        """The built-in MTP-Eagle draft loop restricted to the fused domain (no context rows,
+        no guided decoding, SA enhancer or LM-head TP: `draft_loop.ineligibility`), with the
+        metadata updates on `DraftLoop.step` and the stack on `DraftLoop.finalize`."""
+        from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
+        from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+            DSAtrtllmAttentionMetadata,
+        )
+
+        loop = self._glm_draft_loop
+        if loop is None or not isinstance(attn_metadata, DSAtrtllmAttentionMetadata):
+            return super()._forward_linear_draft_loop(
+                inputs, attn_metadata, spec_metadata, draft_model, draft_kv_cache_manager,
+                num_contexts, batch_size, num_accepted_tokens, original_all_rank_num_tokens,
+            )  # fmt: skip
+        draft_len = spec_metadata.runtime_draft_len
+        uses_index_share = isinstance(attn_metadata, MTPIndexShareMetadata)
+        tokens = []
+        with contextlib.ExitStack() as scope:
+            if uses_index_share:
+                attn_metadata.set_in_mtp_draft_loop(True)
+                attn_metadata.set_mtp_num_accepted(num_accepted_tokens)
+                scope.callback(_reset_mtp_index_share, attn_metadata)
+            md = scope.enter_context(
+                self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager)
+            )
+            inputs["attn_metadata"] = md
+            if is_dsa_cache_manager(draft_kv_cache_manager):
+                # The refresh after the draft-cache swap (the built-in loop's comment).
+                self._glm_draft_step(
+                    loop, md, _draft_loop_op.MODE_REFRESH, None, num_accepted_tokens
+                )
+            for i in range(draft_len):
+                if uses_index_share:
+                    md.set_skip_topk(i > 0)
+                hidden, _ = self._run_draft_forward(draft_model, inputs, spec_metadata, i)
+                # One row per request: step 0's last accepted rows, then every row.
+                rows = hidden[loop.gather_ids] if i == 0 else hidden[:batch_size]
+                logits = draft_model.mtp_layers[0].shared_head(rows, draft_model.lm_head, md, True)
+                token = self.sample_draft_tokens(logits, spec_metadata, batch_size, draft_step=i)
+                tokens.append(token)
+                last = i + 1 == draft_len
+                position_ids = self._glm_draft_step(
+                    loop, md,
+                    _draft_loop_op.MODE_STEP0 if i == 0 else _draft_loop_op.MODE_ADVANCE,
+                    None if last else inputs["position_ids"], num_accepted_tokens,
+                )  # fmt: skip
+                if not last:
+                    inputs = {
+                        "input_ids": token,
+                        "position_ids": position_ids,
+                        "hidden_states": rows,
+                        "attn_metadata": md,
+                        "spec_metadata": spec_metadata,
+                    }
+        stacked = loop.finalize(tokens)
+        return stacked if stacked is not None else torch.stack(tokens, dim=1)
+
+    def _glm_draft_step(self, loop, md, mode, position_ids, num_accepted_tokens):
+        """One metadata update of the draft loop, fused or built-in; the next positions."""
+        gather_ids = loop.gather_ids if mode == _draft_loop_op.MODE_STEP0 else None
+        fused, next_positions = loop.step(md, mode, position_ids, gather_ids)
+        if fused:
+            return next_positions
+        return _draft_loop_op.native_step(
+            md, mode, loop.batch_size, loop.draft_len, num_accepted_tokens, position_ids,
+            gather_ids,
+        )  # fmt: skip
+
+    def _prepare_next_new_tokens(
+        self, accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size,
+        num_accepted_tokens,
+    ):  # fmt: skip
+        loop = self._glm_draft_loop
+        if loop is not None and loop.next_new_tokens is not None:
+            return loop.next_new_tokens
+        return super()._prepare_next_new_tokens(
+            accepted_tokens, next_draft_tokens, batch_indices_cuda, batch_size,
+            num_accepted_tokens,
+        )  # fmt: skip
+
+    def _prepare_next_new_tokens_builtin(self, *args):
+        """The built-in `_prepare_next_new_tokens` (the draft-loop oracle's reference)."""
+        return super()._prepare_next_new_tokens(*args)
 
 
 class MTPLayer:
