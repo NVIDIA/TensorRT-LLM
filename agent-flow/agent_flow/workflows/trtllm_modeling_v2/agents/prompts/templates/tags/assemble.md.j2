@@ -1,0 +1,51 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `assemble` — the target
+
+Read an existing target and its weight loader end to end before writing.
+Derive the implementation from `vocabulary.yaml` (the steps), the checkpoint
+as data, the HF reference for the math, and the entries' contracts. Re-derive
+an axis on which this checkpoint differs from the exemplar, and route on it
+when it changes which implementation supports the deployment.
+
+Follow the developer README's model lifecycle: the constructor, `load_weights`,
+`post_load_weights` and `forward` may be inherited, overridden or delegated.
+Keep weight mapping, transformation and sharding in the weight-loading code.
+A `WEIGHTS` table is a scaffold convention, not a required loader interface.
+Account for every model parameter and checkpoint key, including deliberately
+unused tensors and why they are unused. Use the current checkout's tests to
+verify loading.
+
+Keep the sequence of operator calls in `forward` readable and every argument
+explicit. Wrap kernels in thin, stateless `OpWrapper`s with `reference`,
+`is_valid`, `CELLS` and `ARCHS`; weights, configuration and persistent state
+are arguments, with state owned by the target. Reuse operations from the
+catalog or the family and put new code at the narrowest scope that uses it.
+A target must not import from a sibling target; family sharing is allowed.
+Helpers and modules are allowed. Separate `PrefillTarget` and `DecodeTarget`
+classes are optional, and need not duplicate common code. `step_args` is an
+optional metadata-validation helper, not a required forward interface;
+`TRTLLM_MODELING_V2_VALIDATE=1` checks metadata on targets that support it.
+
+Routing selects a supported target once at model load and explains unsupported
+configurations with `NoTarget`. Per-step differences stay inside the target.
+Preserve CUDA-graph safety: avoid host synchronization and data-dependent host
+branches in captured paths. Derive bounds on rows, tokens, batches and slots
+from engine arguments, and check them against `runtime_facts.yaml` rather
+than the workloads the gates happened to serve.
+
+Validate and benchmark the target with `modeling_v2="require"`, so a fallback
+cannot masquerade as target evidence. Run the applicable current-checkout
+unit and whole-model tests; naming conventions and scaffold helpers alone
+are not proof of correctness. A failing checkout check remains a failure to
+report or fix within scope, even when a guide describes a newer convention.
+
+Run a gate yourself to debug, with the command your dispatch names. **A
+shortfall is a debug signal, not a verdict**: back every re-gate with one
+explicit causal hypothesis, and after three hypothesis-backed fixes without
+improvement, stop and block with `accuracy_shortfall` and the trail. Turning
+a runtime switch off (block reuse, say) to get a green gate hides a defect,
+unless `task.yaml`'s runtime block turns it off. The anchor is read-only. A
+call no entry covers is a `vocabulary_gap`: block as soon as you know, naming
+it. Formatting is not your job: the operator lints the branch once, before it
+becomes a PR.
