@@ -2575,7 +2575,7 @@ class KvCacheCreator:
 
     def _joint_reuse_supported(self) -> bool:
         """Span half of the pairing decision; ``build_managers`` ANDs it with
-        ``has_separate_one_model_draft``. ``False`` = leave the run unpaired.
+        ``has_separate_draft_kv_cache``. ``False`` = leave the run unpaired.
         """
         if not self._is_kv_cache_manager_v2:
             return False
@@ -2841,6 +2841,8 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            has_separate_draft_kv_cache=self.
+            _should_create_separate_draft_kv_cache(),
         )
 
     def _get_target_and_draft_cache_costs(
@@ -3522,11 +3524,11 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        has_separate_one_model_draft = self._should_create_separate_draft_kv_cache(
+        has_separate_draft_kv_cache = self._should_create_separate_draft_kv_cache(
         )
         # One term per axis: a draft pool exists to pair with, block reuse is on,
         # and the span is known. Anything outside keeps its unpaired path.
-        self._joint_kv_cache_reuse = (has_separate_one_model_draft and
+        self._joint_kv_cache_reuse = (has_separate_draft_kv_cache and
                                       self_kv_cache_config.enable_block_reuse
                                       and self._joint_reuse_supported())
 
@@ -3542,7 +3544,7 @@ class KvCacheCreator:
 
         # Split combined KV cache budgets before creating managers.
         draft_kv_cache_config = None
-        if has_separate_one_model_draft:
+        if has_separate_draft_kv_cache:
             # The GPU split applies when each manager sizes its pools from
             # max_gpu_total_bytes (V2 and V1 VSWA). V1 non-VSWA and estimation
             # size GPU pools from a shared max_tokens instead.
@@ -3596,7 +3598,7 @@ class KvCacheCreator:
                                        self_kv_cache_config)
 
         # One-model speculative decoding with different KV layouts
-        if has_separate_one_model_draft:
+        if has_separate_draft_kv_cache:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,
@@ -3744,6 +3746,7 @@ def _create_kv_cache_manager(
         cold_page_codec_provider: Optional[object] = None,
         kv_events_config: Optional[KVEventsConfig] = None,
         joint_kv_cache_reuse: bool = False,
+        has_separate_draft_kv_cache: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None) -> KVCacheManager:
@@ -3900,6 +3903,8 @@ def _create_kv_cache_manager(
                 _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
+        manager_extra_kwargs[
+            "has_separate_draft_kv_cache"] = has_separate_draft_kv_cache
         manager_extra_kwargs[
             "disable_overlap_scheduler"] = disable_overlap_scheduler
         manager_extra_kwargs["layer_specs"] = layer_specs
