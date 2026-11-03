@@ -2220,6 +2220,13 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     assert params.multimodal_data["image"]["vision_normalization"] is spec
 
 
+class _RecordingVisionEncoder(torch.nn.Module):
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("decoder_backend", "override"),
@@ -2229,13 +2236,6 @@ def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: 
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase
-    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
-
-    class RecordingVisionEncoder(torch.nn.Module):
-        def __init__(self, model_config: ModelConfig) -> None:
-            super().__init__()
-            self.model_config = model_config
-            self.weight = torch.nn.Parameter(torch.ones(1))
 
     config = ModelConfig(
         pretrained_config=PretrainedConfig(
@@ -2248,13 +2248,41 @@ def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: 
         ),
     )
     config._frozen = True
-    encoder = Qwen3VisionModelBase(config, RecordingVisionEncoder)
+    encoder = Qwen3VisionModelBase(config, _RecordingVisionEncoder)
     assert encoder.visual.model_config.attn_backend == (override or decoder_backend)
     assert encoder.model_config.extra_attrs is config.extra_attrs
     assert encoder.model_config._frozen
     if override is None:
         assert encoder.model_config is config
     assert config.attn_backend == decoder_backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, "VANILLA", "FLASHINFER"])
+def test_qwen2_5_vl_encoder_override_drops_decoder_kv_cache_quant(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from transformers import PretrainedConfig
+
+    monkeypatch.setattr(modeling_qwen2vl, "Qwen2_5_VisionModel", _RecordingVisionEncoder)
+    pretrained_config = PretrainedConfig(vision_config=PretrainedConfig(num_heads=1))
+    pretrained_config.torch_dtype = torch.float32
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+
+    encoder = modeling_qwen2vl.Qwen2VisionModelBase(config, _RecordingVisionEncoder)
+
+    vision = encoder.visual.model_config
+    assert vision.attn_backend == (override or "TRTLLM")
+    # The default keeps today's config. An override drops the decoder's FP8
+    # KV-cache setting, which FlashInfer rejects without a KV cache.
+    assert vision.quant_config.kv_cache_quant_algo == (None if override else QuantAlgo.FP8)
+    assert config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 @pytest.mark.cpu_only

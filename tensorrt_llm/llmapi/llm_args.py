@@ -931,6 +931,22 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        # VANILLA derives segment boundaries on the host, so graph replay
+        # would reuse the captured ones. Image and video share `vision`.
+        graph_encoders = {
+            "vision" if name in ("image", "video") else name
+            for name in self.encoder_cuda_graph or ()
+        }
+        vanilla_graph_encoders = sorted(
+            encoder for encoder, backend in (
+                self.encoder_attention_backend or {}).items()
+            if backend == "VANILLA" and encoder in graph_encoders)
+        if vanilla_graph_encoders:
+            raise ValueError(
+                "multimodal_config.encoder_attention_backend selects VANILLA "
+                f"for {vanilla_graph_encoders}, which does not support "
+                "multimodal_config.encoder_cuda_graph. Select TRTLLM or "
+                "FLASHINFER, or disable CUDA graphs for that encoder.")
         return self
 
 

@@ -205,11 +205,7 @@ _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
 
 
 def _validate_encoder_attention_backend_support(
-        model_cls: type | None,
-        mm_config: MultimodalConfig | None,
-        *,
-        pretrained_config: object | None = None,
-        disable_mm_encoder: bool = False) -> None:
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
     """Reject unsupported encoder selections before allocating model weights."""
     if mm_config is None or not mm_config.encoder_attention_backend:
         return
@@ -227,10 +223,6 @@ def _validate_encoder_attention_backend_support(
             raise ValueError(
                 f"The {encoder} encoder does not support attention backend {backend!r}; "
                 f"supported backends: {sorted(supported[encoder])}")
-        if disable_mm_encoder or (pretrained_config is not None and getattr(
-                pretrained_config, f"{encoder}_config", None) is None):
-            raise ValueError(
-                f"The {encoder} encoder is not enabled for {model_name}")
         if backend == "FLASHINFER":
             from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 
@@ -238,6 +230,21 @@ def _validate_encoder_attention_backend_support(
                 raise ValueError(
                     f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
                 )
+
+
+def _validate_encoder_attention_backend_enabled(
+        mm_config: MultimodalConfig | None,
+        pretrained_config: object,
+        *,
+        disable_mm_encoder: bool = False) -> None:
+    """Reject selections for encoders that the effective model config omits."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    for encoder in mm_config.encoder_attention_backend:
+        if disable_mm_encoder or getattr(pretrained_config, f"{encoder}_config",
+                                         None) is None:
+            raise ValueError(
+                f"The {encoder} encoder is not enabled in the model config")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -1212,11 +1219,8 @@ class ModelLoader:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
 
-        _validate_encoder_attention_backend_support(
-            preference_cls,
-            llm_args.multimodal_config,
-            pretrained_config=config.pretrained_config,
-            disable_mm_encoder=llm_args.disable_mm_encoder)
+        _validate_encoder_attention_backend_support(preference_cls,
+                                                    llm_args.multimodal_config)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -2427,6 +2431,11 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Check after model_kwargs, which can remove an encoder.
+        _validate_encoder_attention_backend_enabled(
+            self.llm_args.multimodal_config,
+            config.pretrained_config,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder)
 
         # Decided here, after `load_config_and_apply_defaults` resolved the
         # built-in class and applied its model defaults to `llm_args`: a
