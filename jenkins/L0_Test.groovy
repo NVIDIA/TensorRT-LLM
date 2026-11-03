@@ -167,8 +167,6 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
 KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
 KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
-RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
-RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim() : ""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -1178,7 +1176,7 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1732,7 +1730,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1781,13 +1779,13 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
         cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -2143,7 +2141,7 @@ def boltedTarArtifactPath(pipeline, String config, String tarName)
     return "${ARTIFACT_PATH}/bolted-${tarName}"
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -3445,7 +3443,7 @@ boolean isDispatcherPodFailure(Throwable e) {
     return ContextDeath.isContextDeath(e)
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
@@ -3503,9 +3501,9 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
@@ -3775,6 +3773,8 @@ def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 // BOLT_CONSUME_ENABLED the same way.
 BOLT_PINNED_REF = ""
 BOLT_TEST_BOLTED_TARBALL = false
+// Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+TRTLLM_RELEASE_REPO = null
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3795,6 +3795,7 @@ def globalVars = [
     // Pre-declared so updateMapWithJson() populates it from the parent (see
     // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
     (LLM_ARTIFACTS_PRIMARY_KEY): "",
+    "TRTLLM_RELEASE_REPO": null,
 ]
 
 class GlobalState {
@@ -4685,9 +4686,6 @@ def runLLMDocBuild(pipeline, config)
     fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/${tarName}", "${llmPath}/${tarName}")
     sh "cd ${llmPath} && tar -zxf ${tarName}"
     // install python package
-    if (env.alternativeTRT) {
-        sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
@@ -5683,7 +5681,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map retryContext=null)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -5699,12 +5697,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
     echoNodeAndGpuInfo(pipeline, stageName)
-
-    if (env.alternativeTRT && cpver) {
-        stage("Replace TensorRT") {
-            trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        }
-    }
 
     // Step 2: run tests
     stage ("Setup Environment")
@@ -5758,11 +5750,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // isFatSqsh: deps and wheel are pre-baked in the fat sqsh — skip all installs.
         // skipInstallWheel: wheel already installed externally (e.g. K8s sanity check
         //   pre-installs a platform-specific wheel) — install deps but skip the wheel.
-        timeout(time: 45, unit: 'MINUTES') {
+        timeout(time: 60, unit: 'MINUTES') {
             if (!isFatSqsh) {
-                if (env.alternativeTRT) {
-                    sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-                }
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
                 // SMG's generated package remains an opt-in dependency. OpenEngine's
                 // private bindings and grpcio dependency are part of the base package.
@@ -6210,7 +6199,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
     cacheErrorAndUploadResult(pipeline, stageName, {
         // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
@@ -6225,7 +6214,7 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
             "PMIX_HOSTNAME=mpi-node0",
         ]
         withEnv(testEnv) {
-            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations, retryContext)
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
         }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
@@ -6298,8 +6287,11 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
     def kitmakerDryRunMetadata = null
     stage("Kitmaker Publish Dry Run") {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            if (!TRTLLM_RELEASE_REPO?.url || !TRTLLM_RELEASE_REPO?.commit) {
+                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
+            }
             sh "rm -rf ${releaseScriptsDir}"
-            trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_COMMIT, releaseScriptsDir, false, true)
+            trtllm_utils.checkoutSource(TRTLLM_RELEASE_REPO.url, TRTLLM_RELEASE_REPO.commit, releaseScriptsDir, false, true)
             trtllm_utils.llmExecStepWithRetry(
                 pipeline,
                 script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
@@ -6325,12 +6317,6 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
         }
     }
     return kitmakerDryRunMetadata
-}
-
-
-def isKitmakerWheelDryRunEnabled()
-{
-    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_COMMIT
 }
 
 
@@ -6457,16 +6443,14 @@ def runLLMBuild(
     is_dlfw=false,
     boltConsume=false,
     boltProfileRef="",
-    boltProfileBranch="")
+    boltProfileBranch="",
+    kitmakerDryRun=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
     sh "ccache -sv"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
-    if (env.alternativeTRT) {
-        sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
@@ -6480,9 +6464,6 @@ def runLLMBuild(
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-grpc-smg.txt")
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-    }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90;100;103;107;120;121'"
@@ -6496,9 +6477,6 @@ def runLLMBuild(
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
-    }
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
@@ -6567,8 +6545,8 @@ def runLLMBuild(
     def kitmakerDryRunMetadata = null
     if (version_override?.contains("+")) {
         echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
-    } else if (!isKitmakerWheelDryRunEnabled()) {
-        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
+    } else if (!kitmakerDryRun) {
+        echo "Skipping Kitmaker wheel dry run outside post-merge"
     } else {
         def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
         kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
@@ -6578,20 +6556,12 @@ def runLLMBuild(
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     // Upload attribution files when they exist
     def attrDir = "tensorrt_llm/cpp/build/attribution"
@@ -6607,7 +6577,7 @@ def runLLMBuild(
 }
 
 
-def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cpver="cp312")
+def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
 {
     def whlUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
 
@@ -6622,31 +6592,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     sh "pwd && ls -alh"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
 
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
-
     if (reinstall_dependencies) {
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
     //WAR: remove python3-pygments first since it is installed in NGC PyTorch image
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
@@ -7019,6 +6976,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
     BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
     BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
+    TRTLLM_RELEASE_REPO = globalVars["TRTLLM_RELEASE_REPO"]
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -7104,7 +7062,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -7186,7 +7144,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true, slurmDispatcher: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
@@ -7399,7 +7357,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -7418,7 +7376,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -7432,7 +7390,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -7591,10 +7549,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             def isDlfw = values[4]
             def wheelPath = ""
             def cpver = "cp312"
-            def pyver = "3.12"
             if (key.contains("PY310")) {
                 cpver = "cp310"
-                pyver = "3.10"
             }
 
             // Same switch the build helpers use for the tarball, so the released
@@ -7606,16 +7562,18 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // behaviour.
             def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
             def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            def kitmakerDryRun = testFilter[(IS_POST_MERGE)] ?: false
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch,
+                    kitmakerDryRun)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
             // sanityRunner("Sanity check") {
-            //     runPackageSanityCheck(pipeline, wheelPath, values[3], cpver)
+            //     runPackageSanityCheck(pipeline, wheelPath, values[3])
             // }
 
             def checkPipStage = false
@@ -7682,13 +7640,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
                             "PMIX_HOSTNAME=mpi-node0",
                         ]
-                        if (env.alternativeTRT) {
-                            stage("Replace TensorRT") {
-                                trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-                            }
-                            libEnv += ["LD_LIBRARY_PATH+tensorrt=/usr/local/tensorrt/lib"]
-                            libEnv += ["LD_LIBRARY_PATH+nvrtc=/usr/local/lib/python${pyver}/dist-packages/nvidia/cuda_nvrtc/lib"]
-                        }
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             // Retry 2 times if timeout occurs.
@@ -7721,7 +7672,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -7762,9 +7713,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --post-merge, post-merge or TRT dependency testing pipelines.
+    // Check --post-merge or post-merge pipelines.
     // If true, add post-merge only test stages and multi-GPU test stages.
-    if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+    if (testFilter[(IS_POST_MERGE)]) {
         parallelJobsFiltered += multiGpuJobs
         parallelJobsFiltered += postMergeJobs
     }
@@ -8007,7 +7958,7 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {
