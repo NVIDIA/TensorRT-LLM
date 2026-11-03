@@ -2220,8 +2220,9 @@ def test_helix_sharded_block_decode_matches_the_full_context(cp_size, fp8):
         fixup = _build_mla_block_fixup(ctx, table, block_size, page, shard)
         assert torch.equal(fixup.seq_lens_i32.long(), shard.local_lengths(seq))
         out, stat = stub._cute_dsl_block_decode(query, to_pool(pool), fixup, block_size)
+        # [tokens, heads * kv_lora]: the layout _helix_post_process takes.
         out, stat = _helix_sanitize_empty_kv(
-            out.view(tokens, heads, kv_lora), stat, fixup.kv_bounds_i32 == 0
+            out.view(tokens, heads * kv_lora), stat, fixup.kv_bounds_i32 == 0
         )
         partials.append(out)
         stats.append(stat)

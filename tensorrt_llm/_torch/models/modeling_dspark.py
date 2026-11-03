@@ -4473,7 +4473,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     capacity,
                 )
                 ctx_out = _helix_post_process(
-                    ctx_out.view(batch * block_size, attn_heads, latent_dim),
+                    # [tokens, heads * latent], the layout the target's MLA hands over.
+                    ctx_out.view(batch * block_size, attn_heads * latent_dim),
                     stats,
                     self._helix_mapping,
                     num_heads,
