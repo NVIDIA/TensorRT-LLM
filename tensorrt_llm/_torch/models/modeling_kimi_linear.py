@@ -1852,6 +1852,23 @@ class KimiK3MoERuntime(nn.Module):
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
 
+    def _latent_up_takes_mxfp8(self, routed_latent: torch.Tensor) -> bool:
+        """Whether the routed latent all-reduce hands latent_up the MXFP8 form of the normalized
+        latent: where latent_up's FP8 low-M GEMM serves the rows and the MNNVL kernels run the
+        all-reduce (``RMS_NORM_QUANT_MXFP8``, the GEMM's own quantization: the same bits)."""
+        up = self.routed_expert_up_proj
+        return (
+            isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            and routed_latent.dim() == 2
+            and routed_latent.dtype == torch.bfloat16
+            and routed_latent.shape[-1] % 256 == 0
+            and self.routed_expert_norm.weight.dtype == torch.bfloat16
+            and up.takes_prequantized_input(routed_latent.shape[0])
+            and self.routed_experts.all_reduce.mnnvl_runs_fusion(
+                AllReduceFusionOp.RMS_NORM_QUANT_MXFP8
+            )
+        )
+
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
         if _K3_DISABLE_MIN_LATENCY_LATENT_PROJ or not isinstance(projection, nn.Linear):
@@ -2333,7 +2350,19 @@ class KimiK3MoERuntime(nn.Module):
             )
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
-        if self._reduce_routed_output:
+        if self._reduce_routed_output and self._latent_up_takes_mxfp8(routed_out):
+            # The MNNVL all-reduce also quantizes the normalized latent the way latent_up's
+            # low-M GEMM would (RMS_NORM_QUANT_MXFP8), which then skips its quantization.
+            latent, latent_scale = moe_all_reduce(
+                routed_out,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
+                    norm_weight=self.routed_expert_norm.weight,
+                    eps=float(self.routed_expert_norm.variance_epsilon),
+                ),
+            )
+            routed_out = self.routed_expert_up_proj.forward_prequantized(latent, latent_scale)
+        elif self._reduce_routed_output:
             # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
             # MNNVL kernel normalizes straight out of the lamport buffer, so
             # the reduced row never round-trips through HBM for a norm kernel.

@@ -71,6 +71,9 @@ enum class AllReduceFusionPattern : int
     // AllReduce + RMSNorm + FP8 1x128 block-scale quant (UE8M0, deep_gemm's
     // packed MN-major layout). No residual, no bf16 norm output.
     kARRMSNormFP8BlockScale = 7,
+    // AllReduce + RMSNorm + MXFP8 quant (E4M3 and one UE8M0 per 1x32 group, R128c4 scale layout).
+    // No residual, no bf16 norm output.
+    kARRMSNormMXFP8 = 8,
 };
 
 enum class QuantType : int
@@ -79,6 +82,7 @@ enum class QuantType : int
     kFP8 = 1,
     kFP4 = 2,
     kFP8BlockScale = 3,
+    kMXFP8 = 4,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -111,6 +115,8 @@ DEFINE_FUSION_PATTERN_TRAITS(
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARRMSNorm, false, false, false, true, true, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARRMSNormFP8BlockScale, false, false, false, true, false, QuantType::kFP8BlockScale);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARRMSNormMXFP8, false, false, false, true, false, QuantType::kMXFP8);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>

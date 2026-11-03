@@ -220,6 +220,13 @@ def _register_fake():
             quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
             scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
             return [norm_out, quant_fp4, scale_fp4, torch.empty_like(residual)]
+        if op == AllReduceFusionOp.RMS_NORM_QUANT_MXFP8:
+            m, hidden = input.numel() // input.shape[-1], input.shape[-1]
+            return [
+                input.new_empty((m, hidden), dtype=torch.float8_e4m3fn),
+                input.new_empty(((m + 127) // 128 * 128 * (hidden // 32), ),
+                                dtype=torch.uint8)
+            ]
         return [torch.empty_like(input)]
 
     @torch.library.register_fake("trtllm::moe_allreduce")

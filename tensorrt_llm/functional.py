@@ -130,6 +130,7 @@ class AllReduceFusionOp(IntEnum):
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
     RMS_NORM_QUANT_FP8_BLOCKSCALE = 10
+    RMS_NORM_QUANT_MXFP8 = 11
 
 
 class AllReduceParams:
@@ -164,8 +165,9 @@ class AllReduceParams:
         self.fp8_payload = fp8_payload
         assert fusion_op in (
             AllReduceFusionOp.NONE.value, AllReduceFusionOp.RMS_NORM.value,
-            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value) or (
-                residual is not None)
+            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value,
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8.value) or (residual
+                                                              is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0

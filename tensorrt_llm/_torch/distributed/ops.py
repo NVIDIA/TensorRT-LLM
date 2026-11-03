@@ -1051,6 +1051,7 @@ class MNNVLAllReduce(nn.Module):
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RMS_NORM,
         AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE,
+        AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -1696,6 +1697,16 @@ class AllReduce(nn.Module):
         return self.mnnvl_allreduce.push_target(num_tokens, hidden_dim,
                                                 in_place, consumer_finishes)
 
+    def mnnvl_runs_fusion(self, fusion_op: AllReduceFusionOp) -> bool:
+        """Whether ``forward`` runs ``fusion_op`` on the MNNVL kernels, the only strategy that
+        offers the fusions without a residual (``RMS_NORM_QUANT_*``)."""
+        torch_distributed = self._disable_mpi and (
+            getattr(self.mapping, "_use_torch_distributed_allreduce", False)
+            or getattr(self.mapping, "_tp_group_pg", None) is not None)
+        return (self.mapping.tp_size > 1 and self.mnnvl_allreduce is not None
+                and not torch_distributed
+                and fusion_op in MNNVLAllReduce.SUPPORTED_FUSION_OPS)
+
     @staticmethod
     def push_input(target: MnnvlPushTarget, input: torch.Tensor) -> None:
         """Push the contiguous BF16 ``input`` into ``target`` with a copy kernel, for a producer
@@ -1763,6 +1774,7 @@ class AllReduce(nn.Module):
             A tensor lists with different tensor outptus according to the fusion_op.
             NONE: [hidden_states]
             RMS_NORM: [hidden_states]
+            RMS_NORM_QUANT_MXFP8 (MNNVL): [norm_e4m3, scale_ue8m0_r128c4]
             RESIDUAL_RMS_NORM: [hidden_states, residual]
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]

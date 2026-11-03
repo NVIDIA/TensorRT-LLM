@@ -2189,6 +2189,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
     case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
     case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE: return MnnvlFusionPattern::kARRMSNormFP8BlockScale;
+    case AllReduceFusionOp::RMS_NORM_QUANT_MXFP8: return MnnvlFusionPattern::kARRMSNormMXFP8;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2264,8 +2265,9 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         // kARRMSNorm has no residual operand (kHasResidual/kHasResidualOut
         // are both false), so residual_in is optional for it alone.
-        bool const needsResidual
-            = fusionOp != AllReduceFusionOp::RMS_NORM && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE;
+        bool const needsResidual = fusionOp != AllReduceFusionOp::RMS_NORM
+            && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE
+            && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_MXFP8;
         TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
             "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
         TORCH_CHECK(!needsResidual || residual_in.has_value(),
@@ -2342,6 +2344,18 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         sfBuf = at::detail::empty_cuda({numPackedSfK, scaleLeadingDim}, torch::kInt32, input.device(), std::nullopt);
     }
 
+    // MXFP8 quant: E4M3 [T, H] and one UE8M0 per 1x32 group in the R128c4 layout (128-row blocks of
+    // [H / 128] 512-byte atoms), the operand layout of the FP8 block-scale low-M GEMM's prequantized input.
+    if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_MXFP8)
+    {
+        TORCH_CHECK(input.scalar_type() == torch::kBFloat16, "[mnnvlFusionAllReduce] MXFP8 quant needs BF16 input");
+        TORCH_CHECK(
+            hiddenDim % 256 == 0, "[mnnvlFusionAllReduce] MXFP8 quant needs hidden % 256 == 0, got ", hiddenDim);
+        quantOut = at::detail::empty_cuda({numTokens, hiddenDim}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        scaleOut = at::detail::empty_cuda(
+            {(numTokens + 127) / 128 * 128 * (hiddenDim / 32)}, torch::kUInt8, input.device(), std::nullopt);
+    }
+
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
     allreduce_params.nRanks = mcast_mem->getWorldSize();
     allreduce_params.rank = mcast_mem->getRank();
@@ -2384,6 +2398,11 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         allreduce_params.quantOut = quantOut.mutable_data_ptr();
         allreduce_params.scaleOut = sfBuf.mutable_data_ptr();
         allreduce_params.sfLeadingDim = static_cast<int>(scaleLeadingDim);
+    }
+    else if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_MXFP8)
+    {
+        allreduce_params.quantOut = quantOut.mutable_data_ptr();
+        allreduce_params.scaleOut = scaleOut.mutable_data_ptr();
     }
 
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
@@ -2431,6 +2450,7 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
             at::from_blob(
                 sfBuf.mutable_data_ptr(), {numTokens, numPackedSfK}, {1, scaleLeadingDim},
                 [keep = sfBuf](void*) mutable {}, sfBuf.options())};
+    case AllReduceFusionOp::RMS_NORM_QUANT_MXFP8: return {quantOut, scaleOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};

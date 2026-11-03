@@ -979,6 +979,84 @@ def test_mnnvl_rms_norm_fusion_without_residual(seq_len, hidden_size,
         assert r is True
 
 
+def run_rms_norm_mxfp8_single_rank(tensor_parallel_size, seq_len, hidden_size):
+    """RMS_NORM_QUANT_MXFP8 against the low-M GEMM's quantization of the RMS_NORM output of the
+    same call, and Kimi K3's latent_up on that operand against latent_up on the BF16 rows."""
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        from tensorrt_llm._torch.kernels.blackwell import \
+            fp8_block_scale_low_m_gemm as low_m
+        from tensorrt_llm._torch.models.modeling_kimi_linear import \
+            _Fp8BlockScaleWeightReadLinear
+
+        os.environ["TLLM_TEST_MNNVL"] = "1"
+        allreduce = AllReduce(mapping=Mapping(world_size=tensor_parallel_size,
+                                              tp_size=tensor_parallel_size,
+                                              rank=rank),
+                              strategy=AllReduceStrategy.MNNVL,
+                              dtype=torch.bfloat16)
+        assert allreduce.mnnvl_runs_fusion(
+            AllReduceFusionOp.RMS_NORM_QUANT_MXFP8)
+        gen = torch.Generator(device="cuda").manual_seed(rank + 3)
+        x = (torch.randn(seq_len, hidden_size, device="cuda", generator=gen) *
+             0.5).to(torch.bfloat16)
+        x[0, :32] = 0  # an all-zero group takes the amax floor
+        norm_weight = (1 + 0.1 * torch.randn(
+            hidden_size,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(0))).to(
+                torch.bfloat16)
+        eps = 1e-6
+        norm = allreduce(x,
+                         all_reduce_params=AllReduceParams(
+                             fusion_op=AllReduceFusionOp.RMS_NORM,
+                             norm_weight=norm_weight,
+                             eps=eps))
+        xq, xs = allreduce(x,
+                           all_reduce_params=AllReduceParams(
+                               fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
+                               norm_weight=norm_weight,
+                               eps=eps))
+        ref_q, ref_s = low_m.mxfp8_quantize_reference(norm)
+        assert xq.dtype == torch.float8_e4m3fn and xs.dtype == torch.uint8
+        assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+        r = torch.arange(seq_len, device="cuda").unsqueeze(1)
+        c = torch.arange(hidden_size // 32, device="cuda").unsqueeze(0)
+        offsets = ((r // 128) * (hidden_size // 128) +
+                   c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+        assert torch.equal(xs[offsets], ref_s)
+
+        weight = (torch.randn(7168, hidden_size, device="cuda", generator=gen) *
+                  0.02).to(torch.bfloat16)
+        up = _Fp8BlockScaleWeightReadLinear(
+            *_Fp8BlockScaleWeightReadLinear.quantize_weight(weight), 7168)
+        up.post_load_weights()
+        if up.takes_prequantized_input(seq_len):
+            assert torch.equal(up.forward_prequantized(xq, xs), up(norm))
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len", [1, 16, 96, 300], ids=lambda m: f"m{m}")
+@pytest.mark.parametrize("hidden_size", [3072, 7168], ids=lambda h: f"n{h}")
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_mnnvl_rms_norm_mxfp8_fusion(seq_len, hidden_size, mpi_pool_executor):
+    """AllReduce + RMSNorm + MXFP8 (Kimi K3 routed latent for latent_up), one-shot and
+    two-shot."""
+    world = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    results = mpi_pool_executor.map(
+        run_rms_norm_mxfp8_single_rank,
+        *zip(*[(world, seq_len, hidden_size)] * world))
+    for r in results:
+        assert r is True
+
+
 @torch.inference_mode()
 def run_fp8_payload_single_rank(tensor_parallel_size, input, residual,
                                 norm_weight, eps, reference_residual):
