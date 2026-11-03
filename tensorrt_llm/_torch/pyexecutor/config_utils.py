@@ -403,11 +403,14 @@ def is_mla(config):
 
 
 def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
-    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path.
+
+    Hybrid linear-attention models (Kimi K3) compose the FP4 MLA cache layout
+    with their recurrent-state lifecycle in ``MambaHybridCacheManagerV2``.
+    """
     return (is_mla(model_config.pretrained_config)
             and model_config.attn_backend == "TRTLLM"
-            and model_config.sparse_attention_config is None
-            and not is_hybrid_linear(model_config.pretrained_config))
+            and model_config.sparse_attention_config is None)
 
 
 def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
@@ -510,16 +513,20 @@ def get_qwen3_hybrid_num_attention_layers(config):
 def mamba_effective_tp_size(mapping) -> int:
     """TP degree for sizing per-rank mamba/KDA state (budgeting AND allocation).
 
-    Attention-DP replicates the state and takes precedence; helix repurposes
-    CP ranks as plain TP for recurrent-state layers. Must match the runtime
-    pool construction (mamba_cache_manager) or the budget split withholds
-    unsharded-state bytes the allocator never uses (observed: 27.2 GiB/rank
-    mis-withheld on a helix16 gen worker whose real pool is 1/16-sharded).
+    Attention-DP replicates the state; helix repurposes CP ranks as plain TP
+    for recurrent-state layers, and under helix + attention-DP at tp_size 1
+    (Kimi K3 helix_a2a) the CP group still shares every request, so the state
+    stays head-sharded across it. Must match the runtime pool construction
+    (mamba_cache_manager) or the budget split withholds unsharded-state bytes
+    the allocator never uses (observed: 27.2 GiB/rank mis-withheld on a
+    helix16 gen worker whose real pool is 1/16-sharded).
     """
+    if mapping.has_cp_helix():
+        if mapping.enable_attention_dp:
+            return mapping.cp_size if mapping.tp_size == 1 else 1
+        return mapping.tp_size * mapping.cp_size
     if mapping.enable_attention_dp:
         return 1
-    if mapping.has_cp_helix():
-        return mapping.tp_size * mapping.cp_size
     return mapping.tp_size
 
 
@@ -849,6 +856,182 @@ def match_nemotron_h_layer_types(model_config, layer_types):
     return [_NEMOTRON_H_LEGACY_LAYER_TYPES.get(t, t) for t in layer_types]
 
 
+MINIMAX_DSPARK_DRAFT_ARCH = "DSparkMiniMaxDraftModel"
+
+# Keys of the standalone MiniMax DSpark drafter config.json that describe the
+# target checkpoint it was exported next to, not the drafter itself. The
+# drafter's MXFP8 linears are dequantized to the compute dtype at load, so the
+# quantization block is dropped and the backbone is built unquantized.
+_MINIMAX_DSPARK_DROPPED_KEYS = frozenset({
+    "text_config",
+    "vision_config",
+    "quantization_config",
+    "architectures",
+    "model_type",
+    "_name_or_path",
+})
+
+
+def build_minimax_dspark_draft_config(
+        config_dict: dict) -> transformers.PretrainedConfig:
+    """Flat drafter config for a standalone MiniMax-M3 DSpark checkpoint.
+
+    The drafter ships a MiniMax VL-shaped config.json: ``model_type``
+    ``minimax_m3_vl`` with the backbone geometry nested under ``text_config``,
+    no ``auto_map`` and no modeling code, so ``AutoConfig.from_pretrained``
+    cannot resolve it. The drafter's own fields (``dspark_*``,
+    ``dflash_config``, ``hidden_size``, ``vocab_size``, ...) are duplicated
+    at the top level and inside ``text_config``. The text side wins for other
+    fields; window declarations must agree, and null window fields are unset.
+    The result is a plain ``PretrainedConfig`` with every field as
+    an attribute, which is what ``DFlashForCausalLM`` and the registered
+    ``DSparkMiniMaxDraftModel`` backbone read.
+
+    ``dflash_config`` gets ``use_swa`` / ``swa_window_size`` when the drafter
+    declares ``sliding_attention`` layers with a ``sliding_window`` but not the
+    DFlash spelling: the block decode keys its per-layer window on the former,
+    and the HF reference these drafters are distilled with applies the window
+    on exactly those layers. An explicit ``use_sliding_window: false`` (the
+    DFlash operator switch read by ``get_layer_attention_window``) forces
+    ``use_swa`` off, whether it would come from that translation or from the
+    checkpoint's own ``dflash_config``, and an explicit ``use_swa: false`` in
+    ``dflash_config`` turns ``use_sliding_window`` off when that key is not set
+    explicitly, so the context window and the block windows are disabled
+    together rather than one at a time.
+    """
+    flat = {
+        k: v
+        for k, v in config_dict.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+    }
+    text = config_dict.get("text_config") or {}
+    # Window declarations may be repeated at the top level, under text_config
+    # and inside either dflash_config copy (HF or DFlash spelling). Every
+    # non-null copy must agree: the context path and the block decode read
+    # them from different places, so conflicting declarations are rejected
+    # before merging, where precedence would otherwise hide them silently.
+    # The error names both sources.
+    window_keys = ("layer_types", "sliding_window", "use_sliding_window")
+    sources = (
+        ("config", config_dict),
+        ("text_config", text),
+        ("dflash_config", config_dict.get("dflash_config") or {}),
+        ("text_config.dflash_config", text.get("dflash_config") or {}),
+    )
+    declared = {}
+    for source_name, source in sources:
+        # use_swa / swa_window_size are DFlash keys: only the dflash_config
+        # copies declare them, nothing reads them at the outer levels.
+        keys = window_keys if source_name in ("config", "text_config") else (
+            *window_keys, "use_swa", "swa_window_size")
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            name = f"{source_name}.{key}"
+            canonical = "sliding_window" if key == "swa_window_size" else key
+            if canonical in declared:
+                other_name, other_value = declared[canonical]
+                if value != other_value:
+                    raise ValueError(
+                        f"Conflicting MiniMax DSpark {canonical}: "
+                        f"{other_name}={other_value!r} vs {name}={value!r}.")
+            else:
+                declared[canonical] = (name, value)
+
+    if "use_swa" in declared and "use_sliding_window" in declared:
+        swa_name, use_swa = declared["use_swa"]
+        sliding_name, use_sliding_window = declared["use_sliding_window"]
+        if use_swa is False and use_sliding_window is True:
+            raise ValueError(f"Conflicting MiniMax DSpark switches: "
+                             f"{swa_name}={use_swa!r} vs "
+                             f"{sliding_name}={use_sliding_window!r}.")
+
+    # A null window field under text_config counts as unset and must not
+    # shadow a value given at the top level.
+    flat.update({
+        k: v
+        for k, v in text.items() if k not in _MINIMAX_DSPARK_DROPPED_KEYS
+        and not (k in window_keys and v is None)
+    })
+    if "layer_types" in declared and flat.get("num_hidden_layers") is not None:
+        name, types = declared["layer_types"]
+        if len(types) != flat["num_hidden_layers"]:
+            raise ValueError(
+                f"Conflicting MiniMax DSpark layer_types: "
+                f"{name} length={len(types)} vs "
+                f"num_hidden_layers={flat['num_hidden_layers']!r}.")
+
+    dflash = dict(flat.get("dflash_config") or {})
+    # text_config replaces the outer dflash_config as a whole; a window field
+    # declared only in the outer copy must survive that replacement (the scan
+    # above already made sure the two copies agree wherever both speak).
+    outer_dflash = config_dict.get("dflash_config") or {}
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if outer_dflash.get(key) is not None and dflash.get(key) is None:
+            dflash[key] = outer_dflash[key]
+    # The operator switch may also be written inside dflash_config; it is read
+    # from the top level, so a nested declaration is surfaced there.
+    if "use_sliding_window" in declared and flat.get(
+            "use_sliding_window") is None:
+        flat["use_sliding_window"] = declared["use_sliding_window"][1]
+    # A null window field in config.json counts as unset, which is how DFlash
+    # and get_layer_attention_window read it; dropping the key here lets the
+    # lifts and switches below treat null and missing alike.
+    for key in ("layer_types", "sliding_window", "use_sliding_window"):
+        if key in flat and flat[key] is None:
+            del flat[key]
+    for key in ("layer_types", "sliding_window", "use_swa", "swa_window_size"):
+        if key in dflash and dflash[key] is None:
+            del dflash[key]
+    layer_types = dflash.get("layer_types") or flat.get("layer_types") or []
+    sliding_window = dflash.get("sliding_window") or flat.get("sliding_window")
+    # DFlash and get_layer_attention_window read the per-layer types and the
+    # window size from the top level; values the checkpoint keeps only in
+    # dflash_config would otherwise window every draft layer, or window the
+    # block decode and not the context.
+    if layer_types:
+        flat.setdefault("layer_types", list(layer_types))
+    if sliding_window:
+        flat.setdefault("sliding_window", int(sliding_window))
+    # Two switches gate the windows: the top-level use_sliding_window (context
+    # window) and the DFlash use_swa (block windows). A checkpoint use_swa:
+    # false also turns the context window off unless use_sliding_window is set
+    # explicitly, and use_sliding_window: false always turns use_swa off, so
+    # neither path stays windowed on its own by accident.
+    if dflash.get("use_swa") is False:
+        flat.setdefault("use_sliding_window", False)
+    if flat.get("use_sliding_window") is False:
+        dflash["use_swa"] = False
+        dflash.pop("swa_window_size", None)
+    elif ("use_swa" not in dflash and sliding_window
+          and "sliding_attention" in layer_types):
+        dflash["use_swa"] = True
+        dflash["swa_window_size"] = int(sliding_window)
+        dflash.setdefault("layer_types", list(layer_types))
+    elif (dflash.get("use_swa") is True and sliding_window
+          and dflash.get("swa_window_size") is None):
+        # An explicit use_swa without the DFlash window size takes the HF one;
+        # DFlash rejects use_swa with no size.
+        dflash["swa_window_size"] = int(sliding_window)
+    flat["dflash_config"] = dflash
+    flat["architectures"] = [MINIMAX_DSPARK_DRAFT_ARCH]
+    # Not ``minimax_m3_vl``: that model_type selects the VL target's
+    # text_config unwrapping and input-processor registration, neither of
+    # which applies to the flattened drafter.
+    flat["model_type"] = "minimax_dspark_draft"
+    dtype = flat.pop("dtype", None) or flat.pop("torch_dtype",
+                                                None) or "bfloat16"
+    flat.pop("torch_dtype", None)
+    if isinstance(dtype, str):
+        dtype = str_dtype_to_torch(dtype)
+    config = transformers.PretrainedConfig()
+    for key, value in flat.items():
+        setattr(config, key, value)
+    config.dtype = dtype
+    config.torch_dtype = dtype
+    return config
+
+
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
                            checkpoint_format: Optional[str] = None,
@@ -990,6 +1173,10 @@ def load_pretrained_config(model_name_or_path: str,
         vision_config = getattr(model_config, "vision_config", None)
         if getattr(vision_config, "num_hidden_layers", 0) > 0:
             model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
+    elif architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        # Standalone MiniMax-M3 DSpark drafter: VL-shaped config.json with
+        # no auto_map, flattened here (see build_minimax_dspark_draft_config).
+        model_config = build_minimax_dspark_draft_config(config_dict)
     elif model_type == "muse_spark":
         # The runtime reads a flat config; the translation from the composite
         # one rejects any value the runtime does not implement.

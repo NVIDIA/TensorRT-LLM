@@ -126,7 +126,9 @@ def test_shared_arbitration_retains_opaque_claims_until_each_settles() -> None:
     watchdog.stop()
 
 
-def test_multi_owner_exposure_waits_for_local_completion(binding: _NativeBinding) -> None:
+def test_multi_owner_exposure_survives_partial_and_duplicate_evidence(
+    binding: _NativeBinding,
+) -> None:
     """KV, AUX, and manager holds survive partial and duplicate remote evidence."""
     binding.retirement.close()
     retirement = binding.watchdog.create_owner(5, "receive", 5.0)
@@ -136,17 +138,16 @@ def test_multi_owner_exposure_waits_for_local_completion(binding: _NativeBinding
         owner.begin_publication()
         owner.seal_writer_cohort(len(cohort), cohort)
         owner.finish_publication()
-    assert kv.record_writer_result(7, True, wait_for_local_completion=True) == (True, False)
-    assert kv.record_writer_result(7, True, wait_for_local_completion=True) == (False, False)
-    assert kv.record_writer_result(8, True, wait_for_local_completion=True) == (True, True)
+    assert kv.record_writer_result(7, True) == (True, False)
+    assert kv.record_writer_result(7, True) == (False, False)
     assert not kv.resources_drained
+    assert id(kv) in retirement._claims
+    assert kv.record_writer_result(8, True) == (True, True)
+    assert id(kv) not in retirement._claims
     assert not retirement.can_retire()
-    assert aux.record_writer_result(7, True, wait_for_local_completion=False) == (True, True)
+    assert aux.record_writer_result(7, True) == (True, True)
     retirement.complete_pieces()
     assert not retirement.is_complete
-    assert id(kv) in retirement._claims
-    kv.finish_local_completion()
-    kv.finish_local_completion()
     assert set(retirement._claims) == {id(binding.manager_hold)}
     # The caller releases its allocation hold only after both accessors ended.
     assert retirement.settle(binding.manager_hold)
@@ -273,7 +274,7 @@ def test_receive_ambiguity_requires_explicit_settlement(binding: _NativeBinding)
     owner.finish_publication()
     assert owner.record_writer_in_doubt(7)
     assert not owner.record_writer_in_doubt(7)
-    assert owner.record_writer_result(7, False, wait_for_local_completion=False) == (False, False)
+    assert owner.record_writer_result(7, False) == (False, False)
     assert not owner.resources_drained
     assert owner.record_writer_settlement(7)
     assert not owner.record_writer_settlement(7)

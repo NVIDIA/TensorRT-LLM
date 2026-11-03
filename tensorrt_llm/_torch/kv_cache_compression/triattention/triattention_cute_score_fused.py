@@ -16,7 +16,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 
@@ -79,6 +79,7 @@ class _TriAttentionScoreKernel:
         pool_strides: tuple[int, int, int, int, int],
         page_shards: int,
         write_partial_stats: bool = False,
+        compact_scores: bool = False,
     ) -> None:
         """Build the single validated production specialization."""
         self.num_physical_pages, _, num_kv_heads, tokens_per_block, pool_dim = pool_shape
@@ -97,6 +98,7 @@ class _TriAttentionScoreKernel:
             raise ValueError("TriAttention CuTe score has unsupported page shards")
 
         self.score_token_capacity = score_token_capacity
+        self.compact_scores = compact_scores
         self.num_layers = num_layers
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -180,13 +182,15 @@ class _TriAttentionScoreKernel:
         mean_cos: cute.Tensor,
         mean_sin: cute.Tensor,
         freq_scale_sq: cute.Tensor,
-        output: cute.Tensor,
+        output,
         partial_stats: cute.Tensor,
         anchor_pool: cute.Tensor,
         raw_tma_descriptors: cute.Tensor,
         request_count: cutlass.Int32,
         stream: cuda.CUstream,
     ):
+        if cutlass.const_expr(self.compact_scores):
+            output = cute.make_tensor(output, cute.make_layout((1,)))
         self.c_dtype = output.element_type
         self.c_layout = utils.LayoutEnum.COL_MAJOR
         self.mma_tiler = (CTA_M, PADDED_HEAD_COLUMNS, self.k_coeff)
@@ -409,8 +413,11 @@ class _TriAttentionScoreKernel:
         source_length = source_lengths[req_id]
         page_off = seg_page_off[segment]
         out_base = seg_out_offset[segment]
-        # Per-request score window start; scratch writes stay absolute.
+        # The compact layout retains only the first tile's alignment prefix.
         score_start = cutlass.Int32(prompt_lengths[req_id])
+        output_origin = cutlass.Int32(0)
+        if cutlass.const_expr(self.compact_scores):
+            output_origin = score_start // CTA_M * CTA_M
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -1057,6 +1064,7 @@ class _TriAttentionScoreKernel:
                 cutlass.Int64(kv_head * PADDED_HEAD_COLUMNS) * segment_tokens
                 + out_base
                 + tile_start_token
+                - output_origin
             )
             page_output = cute.make_tensor(
                 output.iterator + output_offset,
@@ -1113,7 +1121,7 @@ class _TriAttentionScoreKernel:
                     # Only the straddling first tile takes the per-token branch.
                     if cutlass.dynamic_expr(
                         tile_start_token >= score_start
-                        and tile_start_token + CTA_M <= self.score_token_capacity
+                        and tile_start_token + CTA_M - output_origin <= self.score_token_capacity
                     ):
                         cute.copy(
                             simt_atom,
@@ -1123,7 +1131,8 @@ class _TriAttentionScoreKernel:
                     else:
                         output_token = tile_start_token + epilogue_tidx
                         if cutlass.dynamic_expr(
-                            output_token >= score_start and output_token < self.score_token_capacity
+                            output_token >= score_start
+                            and output_token - output_origin < self.score_token_capacity
                         ):
                             cute.copy(
                                 simt_atom,
@@ -1355,7 +1364,9 @@ def build_score_pipeline(
     freq_scale_sq: torch.Tensor,
     score_token_capacity: int,
     union_scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Callable[[int], None]]:
+    compact_scores: bool = False,
+    resident_requests: Optional[int] = None,
+) -> Tuple[torch.Tensor, Callable[[int, Optional[torch.Tensor]], None]]:
     """Compile a capacity-specific score pipeline and return its scratch and launcher."""
     layer_pools = tuple(layout["layer_pools"])
     scored_layers = tuple(int(layer) for layer in layout["dense_layers"])
@@ -1394,8 +1405,12 @@ def build_score_pipeline(
         torch.arange(max_segments, dtype=torch.int64, device=device) * score_token_capacity
     ).to(torch.int32)
 
+    resident_requests = request_capacity if resident_requests is None else resident_requests
+    if not 1 <= resident_requests <= request_capacity:
+        raise ValueError("resident request count must fit the compiled request capacity")
+    scratch_per_request = num_kv_heads * PADDED_HEAD_COLUMNS * num_layers * score_token_capacity
     score_scratch = torch.empty(
-        num_kv_heads * PADDED_HEAD_COLUMNS * max_segments * score_token_capacity,
+        scratch_per_request * resident_requests,
         dtype=torch.float32,
         device=device,
     )
@@ -1415,6 +1430,8 @@ def build_score_pipeline(
         tokens_per_block,
     )
 
+    scratch_operand_index = 13
+    normalize_scratch_operand_index = 1
     score_operands = (
         (block_offsets.view(-1), 16),
         (segment_page_offsets, 16),
@@ -1434,11 +1451,21 @@ def build_score_pipeline(
         (anchor_pool, 16),
         (tma_descriptors, 128),
     )
+    assert score_operands[scratch_operand_index][0] is score_scratch
     score_args = tuple(
         _to_cute(tensor, assumed_align=alignment) for tensor, alignment in score_operands
     )
+    if compact_scores:
+        score_args = (
+            *score_args[:scratch_operand_index],
+            make_ptr(
+                cutlass.Float32, score_scratch.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+            ),
+            *score_args[scratch_operand_index + 1 :],
+        )
     tensor_specs = tuple(_tensor_spec(tensor) for tensor, _ in score_operands)
     static_geometry = (
+        compact_scores,
         request_capacity,
         num_layers,
         score_token_capacity,
@@ -1480,6 +1507,7 @@ def build_score_pipeline(
                     pool_strides=tuple(int(value) for value in anchor_pool.stride()),
                     page_shards=page_shards,
                     write_partial_stats=union_scores is not None,
+                    compact_scores=compact_scores,
                 ),
                 *score_args,
                 cutlass.Int32(1),
@@ -1516,9 +1544,16 @@ def build_score_pipeline(
             (prompt_lengths, 4),
             (union_scores, 16),
         )
+        assert normalize_operands[normalize_scratch_operand_index][0] is score_scratch
         normalize_args = tuple(
             _to_cute(tensor, assumed_align=alignment) for tensor, alignment in normalize_operands
         )
+        if compact_scores:
+            normalize_args = (
+                *normalize_args[:normalize_scratch_operand_index],
+                score_args[scratch_operand_index],
+                *normalize_args[normalize_scratch_operand_index + 1 :],
+            )
         for request_count in range(1, request_capacity + 1):
             page_shards = page_shards_by_request_count[request_count]
             config = _select_normalize_union_config(request_count, score_token_capacity, sm_count)
@@ -1549,6 +1584,7 @@ def build_score_pipeline(
                         token_subtiles=token_subtiles,
                         row_cluster_ctas=row_cluster_ctas,
                         output_row_stride=int(union_scores.stride(0)),
+                        compact_scores=compact_scores,
                     ),
                     *normalize_args,
                     cutlass.Int32(1),
@@ -1557,12 +1593,47 @@ def build_score_pipeline(
 
             compiled_normalizers[request_count] = _get_or_compile(cache_key, build_normalizer)
 
-    def launch_score(request_count: int) -> None:
+    def launch_score(request_count: int, workspace: Optional[torch.Tensor] = None) -> None:
+        """Validate scratch storage and enqueue scoring on the current CUDA stream."""
+        if not 1 <= request_count <= request_capacity:
+            raise ValueError("request count exceeds compiled score capacity")
+        scratch = score_scratch if workspace is None else workspace
+        if (
+            scratch.numel() < scratch_per_request * request_count
+            or scratch.dtype != score_scratch.dtype
+            or scratch.device != device
+            or not scratch.is_contiguous()
+        ):
+            raise ValueError("score workspace does not cover this request cohort")
         current_stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-        compiled_scores[request_count](*score_args, request_count, current_stream)
+        launch_args = score_args
+        union_args = normalize_args
+        if workspace is not None:
+            # The kernels address scratch by pointer and runtime request count.
+            # Match the compiled argument's shape; the backing allocation still
+            # covers the complete cohort, checked above.
+            scratch_arg = (
+                make_ptr(
+                    cutlass.Float32, workspace.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+                )
+                if compact_scores
+                else _to_cute(workspace[: score_scratch.numel()], assumed_align=16)
+            )
+            launch_args = (
+                *score_args[:scratch_operand_index],
+                scratch_arg,
+                *score_args[scratch_operand_index + 1 :],
+            )
+            if normalize_args:
+                union_args = (
+                    *normalize_args[:normalize_scratch_operand_index],
+                    scratch_arg,
+                    *normalize_args[normalize_scratch_operand_index + 1 :],
+                )
+        compiled_scores[request_count](*launch_args, request_count, current_stream)
         if compiled_normalizers:
             compiled_normalizers[request_count](
-                *normalize_args,
+                *union_args,
                 request_count,
                 current_stream,
             )

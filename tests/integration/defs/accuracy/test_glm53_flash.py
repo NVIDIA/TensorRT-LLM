@@ -186,6 +186,7 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
     def test_video_url(self, tmp_path):
         """Exercise GLM video ingestion through the OpenAI serving endpoint."""
         import json
+        import os
         import sys
         from pathlib import Path
 
@@ -241,7 +242,9 @@ class TestGLM53FlashFP8(LlmapiAccuracyTestHarness):
             "--media_io_kwargs",
             json.dumps({"video": {"num_frames": 4, "fps": 2}}),
         ]
-        with popen(command) as process:
+        # The request sends the video as a local path.
+        env = dict(os.environ, TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=str(video.parent))
+        with popen(command, env=env) as process:
             _wait_for_server_ready(process, http_port=port, timeout=1200)
             with OpenAI(base_url=f"http://127.0.0.1:{port}/v1", api_key="tensorrt_llm") as client:
                 response = client.chat.completions.create(

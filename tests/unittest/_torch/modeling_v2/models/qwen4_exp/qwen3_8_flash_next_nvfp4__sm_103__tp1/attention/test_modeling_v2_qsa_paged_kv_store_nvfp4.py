@@ -18,7 +18,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_kv_store_nvfp4 import (  # noqa: E501
     qsa_paged_kv_store_nvfp4 as op,
 )
-from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401
@@ -242,10 +242,10 @@ def _thop_append(qkv, pool, table, requests, new, cached, num_contexts, p, scale
     ctx = [n if i < num_contexts else kv[i] for i, n in enumerate(new)]
     scale_quant_orig = scale_orig_quant.reciprocal()
     rows = qkv.reshape(qkv.shape[0], -1)
-    thop.attention(
+    FallbackFmha.attention(
         q=rows, k=None, v=None,
         output=torch.empty(rows.shape[0], hq * d, dtype=torch.float8_e4m3fn, device=DEV),
-        output_sf=None, workspace_=torch.empty(0, dtype=torch.int8, device=DEV),
+        output_sf=None, workspace=torch.empty(0, dtype=torch.int8, device=DEV),
         sequence_length=torch.tensor(kv, dtype=torch.int32, device=DEV),
         host_past_key_value_lengths=torch.tensor(kv, dtype=torch.int32),
         host_total_kv_lens=torch.tensor(
@@ -276,7 +276,7 @@ def _thop_append(qkv, pool, table, requests, new, cached, num_contexts, p, scale
         mrope_rotary_cos_sin=None, mrope_position_deltas=None, helix_position_offsets=None,
         helix_is_inactive_rank=None, attention_chunk_size=None, softmax_stats_tensor=None,
         is_spec_decoding_enabled=False, use_spec_decoding=False, is_spec_dec_tree=False,
-        spec_decoding_generation_lengths=None, spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_generation_lengths=None, spec_decoding_position_offsets=None,
         spec_decoding_packed_mask=None, spec_decoding_bl_tree_mask_offset=None,
         spec_decoding_bl_tree_mask=None, spec_bl_tree_first_sparse_mask_offset_kv=None,
         sparse_kv_indices=None, sparse_kv_offsets=None, sparse_attn_indices=None,

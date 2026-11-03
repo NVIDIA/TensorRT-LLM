@@ -26,18 +26,32 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
+    DSparkCUDAGraphRunner,
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import PendingBeamHistories
+from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
+    GREEDY_HIDDEN_STATES_KEY,
+    GREEDY_TOKENS_KEY,
+    greedy_tokens_usable,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -47,7 +61,13 @@ from tensorrt_llm._torch.utils import (
     with_model_extra_attrs,
 )
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
+    MiniMaxM3SparseAttentionConfig,
+    PrefillCudaGraphBackend,
+    SeqLenAwareSparseAttentionConfig,
+)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -126,6 +146,15 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+    # This engine's skip cache and step-input pack (None: the hook is off), active only during its own forward.
+    _h2d_cache: H2DSkipCache | None = None
+    _step_pack: StepInputPack | None = None
+    # Whether a batch may keep the greedy tokens a forward sampled in place of the logits. False when the executor
+    # runs a guided decoder, which reads the logits of every batch.
+    keep_greedy_only_outputs = True
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -171,6 +200,13 @@ class DecoderRunner(ScheduledModelRunner):
         self._metrics = metrics
 
         self._config = config
+        self.runtime_hooks = runtime_hooks_of(model)
+        self._h2d_cache = H2DSkipCache() if self.runtime_hooks.skip_unchanged_h2d else None
+        self._step_pack = (
+            StepInputPack(torch.device("cuda", torch.cuda.current_device()))
+            if self.runtime_hooks.pack_step_inputs
+            else None
+        )
 
         self.forward_pass_callable = None
         # Optional in-graph sampling hook, registered by PyExecutor. Called at
@@ -193,6 +229,14 @@ class DecoderRunner(ScheduledModelRunner):
         self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self._use_beam_search)
+        if self._config.is_spec_decode and self.runtime_hooks.spec_step_fold is not None:
+            self.runtime_hooks.spec_step_fold.bind_engine_buffers(
+                self._buffers.input_ids_cuda,
+                self._buffers.draft_tokens_cuda,
+                self._buffers.previous_pos_id_offsets_cuda,
+                self._buffers.previous_kv_lens_offsets_cuda,
+                self._config.max_batch_size,
+            )
         self._metadata = DecoderMetadata(
             config=self._config,
             mapping=mapping,
@@ -203,7 +247,11 @@ class DecoderRunner(ScheduledModelRunner):
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
+        self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
+        self._inputs.attach_cuda_graph_runners(
+            self._graphs.cuda_graph_runner, self._graphs.breakable_cuda_graph_runner
+        )
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -237,7 +285,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _make_cuda_graphs(self) -> DecoderCudaGraphs:
         """Build the CUDA graph component; call after the input preparer."""
-        return DecoderCudaGraphs(**self._cuda_graphs_kwargs())
+        return DecoderCudaGraphs(**self._cuda_graphs_kwargs(), inputs=self._inputs)
 
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         return dict(
@@ -268,9 +316,7 @@ class DecoderRunner(ScheduledModelRunner):
         cuda_graph_runner = self._initialize_cuda_graph_runner()
         return dict(
             cuda_graph_runner=cuda_graph_runner,
-            breakable_cuda_graph_runner=self._initialize_breakable_cuda_graph_runner(
-                cuda_graph_runner
-            ),
+            breakable_cuda_graph_runner=self._initialize_breakable_cuda_graph_runner(),
             config=self._config,
             mapping=self._mapping,
             model=self._model,
@@ -313,7 +359,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._inputs.guided_decoder = value
 
     @property
-    def cuda_graph_runner(self) -> CUDAGraphRunner | None:
+    def cuda_graph_runner(self) -> CUDAGraphRunner:
         return self._graphs.cuda_graph_runner
 
     @torch.inference_mode()
@@ -325,7 +371,15 @@ class DecoderRunner(ScheduledModelRunner):
         resource_manager: ResourceManager,
         is_dummy: bool = False,
     ) -> Any:
-        return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
+        with h2d_cache.active(self._h2d_cache), step_inputs.active(self._step_pack):
+            try:
+                return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
+            except BaseException:
+                # A failed step issues none of its packed copies, so forget the shadows recorded for them too.
+                step_inputs.discard()
+                if self._h2d_cache is not None:
+                    self._h2d_cache.clear()
+                raise
 
     def _initialize_moe_workspace_reclaimer(self) -> None:
         """Create the native workspace owner for this runner's lifetime."""
@@ -395,14 +449,11 @@ class DecoderRunner(ScheduledModelRunner):
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=None,
         )
-        # Let the first CUDA graph capture create its private pool. Piecewise
-        # CUDA graphs use a separate pool owned by their runners, so sharing a
-        # pre-created pool handle with the outer graph runner is unnecessary.
-        self._cuda_graph_mem_pool = None
         self._dynamic_draft_len_mapping = compute_dynamic_draft_len_mapping(self._config)
 
-    def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner | None:
-        cuda_graph_runner = CUDAGraphRunner(self._cuda_graph_runner_config())
+    def _initialize_cuda_graph_runner(self) -> CUDAGraphRunner:
+        runner_type = DSparkCUDAGraphRunner if self._dspark_confidence_enabled else CUDAGraphRunner
+        cuda_graph_runner = runner_type(self._cuda_graph_runner_config())
         register_hooks = getattr(self._model, "register_cuda_graph_pre_replay_hooks", None)
         if register_hooks is not None:
             register_hooks(cuda_graph_runner)
@@ -410,15 +461,12 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
         return CUDAGraphRunnerConfig(
-            use_cuda_graph=(
-                not self._config.is_encode_only and self._config.cuda_graph_config is not None
-            ),
+            use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
             cuda_graph_batch_sizes=self._config.cuda_graph_batch_sizes,
             max_cuda_graph_batch_size=self._config.max_cuda_graph_batch_size,
             max_beam_width=self._config.max_beam_width,
             spec_config=self._config.spec_config,
-            cuda_graph_mem_pool=self._cuda_graph_mem_pool,
             dynamic_draft_len_mapping=self._dynamic_draft_len_mapping,
             max_num_tokens=self._config.max_num_tokens,
             use_mrope=self._config.use_mrope,
@@ -428,8 +476,9 @@ class DecoderRunner(ScheduledModelRunner):
             batch_size=self._config.max_batch_size,
             mapping=self._mapping,
             dist=self._dist,
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             sparse_attention_config=self._sparse_attention_config,
+            short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
+            private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
@@ -445,13 +494,30 @@ class DecoderRunner(ScheduledModelRunner):
             ),
         )
 
-    def _initialize_breakable_cuda_graph_runner(
-        self, cuda_graph_runner: CUDAGraphRunner | None
-    ) -> BreakableCUDAGraphRunner | None:
+    def _short_long_seq_len_threshold(self) -> int | None:
+        """The total sequence length that splits the short and long decode graph families, or None for one family.
+
+        Set by a sparse attention config that asks for the split, or by a model whose MSA
+        policy stages identity selections for short sequences: a sequence within the
+        top-k blocks attends every valid block.
+        """
+        sparse_config = self._sparse_attention_config
         if (
-            cuda_graph_runner is None
-            or self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE
+            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
+            and sparse_config.needs_separate_short_long_cuda_graphs()
         ):
+            return sparse_config.seq_len_threshold
+        if self.runtime_hooks.msa.short_sequence_identity:
+            if not isinstance(sparse_config, MiniMaxM3SparseAttentionConfig):
+                raise ValueError(
+                    "MsaRuntimePolicy.short_sequence_identity requires a MiniMax-M3 sparse "
+                    f"attention config, got {type(sparse_config).__name__}"
+                )
+            return sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
+        return None
+
+    def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
+        if self._config.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:
             return None
 
         decoder_model = (
@@ -461,6 +527,10 @@ class DecoderRunner(ScheduledModelRunner):
         )
         if not isinstance(decoder_model, DecoderModelForCausalLM):
             raise ValueError("breakable prefill CUDA graph requires a decoder model body")
+        logger.info(
+            f"Breakable prefill CUDA graphs on {type(decoder_model.model).__name__} "
+            f"for num_tokens={self._config.prefill_cuda_graph_num_tokens}"
+        )
         return BreakableCUDAGraphRunner(decoder_model.model)
 
     @property
@@ -626,6 +696,16 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
+            # Pack the step's small input copies into one upload and one scatter at the
+            # graph replay. Only a replay of an already captured graph, which always
+            # reaches the flush, may open a pack.
+            if (
+                self.runtime_hooks.pack_step_inputs
+                and can_run_graph
+                and not self.cuda_graph_runner.is_warmup_only
+                and not self.cuda_graph_runner.needs_capture(key)
+            ):
+                step_inputs.begin()
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -655,6 +735,13 @@ class DecoderRunner(ScheduledModelRunner):
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
 
+            if (
+                can_run_graph
+                and not is_dummy
+                and getattr(self._inputs, "_dspark_device_budget", None) is not None
+            ):
+                self._inputs._apply_device_window_prologue(inputs, new_tensors_device)
+
             def run_model(model_inputs: dict[str, Any]) -> Any:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     return self._forward_step(
@@ -662,7 +749,6 @@ class DecoderRunner(ScheduledModelRunner):
                         enable_spec_decode=enable_spec_decode,
                         runtime_draft_len=runtime_draft_len,
                         is_dummy=is_dummy,
-                        gather_ids=prepared.gather_ids,
                         gather_context_logits=gather_context_logits,
                     )
 
@@ -687,6 +773,7 @@ class DecoderRunner(ScheduledModelRunner):
                 moe_load_balancer=moe_load_balancer,
                 enable_spec_decode=enable_spec_decode,
                 gather_context_logits=gather_context_logits,
+                static_inputs_staged=prepared.static_inputs_staged,
                 position_id_offsets=(
                     self._buffers.previous_pos_id_offsets_cuda
                     if enable_spec_decode
@@ -695,12 +782,16 @@ class DecoderRunner(ScheduledModelRunner):
                     else None
                 ),
             )
+            # No-op unless a pack was opened above and the replay did not issue it.
+            step_inputs.flush()
             if captures_model_body:
                 return outputs
 
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
+                outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
             self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
 
             if not isinstance(outputs, dict):
@@ -747,14 +838,13 @@ class DecoderRunner(ScheduledModelRunner):
         enable_spec_decode: bool,
         runtime_draft_len: int,
         is_dummy: bool,
-        gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
         inputs = self._inputs.preprocess_inputs(
             inputs, enable_spec_decode=enable_spec_decode, runtime_draft_len=runtime_draft_len
         )
-        if inputs.get("spec_metadata", None):
-            gather_ids = inputs["spec_metadata"].gather_ids
+        spec_metadata = inputs.get("spec_metadata")
+        gather_ids = spec_metadata.gather_ids if spec_metadata is not None else None
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
@@ -829,6 +919,39 @@ class DecoderRunner(ScheduledModelRunner):
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
 
+    def _logits_for_greedy_tokens(
+        self, scheduled_requests: ScheduledRequests, outputs: dict
+    ) -> dict:
+        """Replace greedy tokens sampled by the forward with logits when a request needs logits.
+
+        A forward that samples greedily in place of the LM head returns the head's input
+        alongside the tokens. When any generation request needs more than its greedy token,
+        the logits come from that input eagerly, followed by the in-graph sampling and the
+        logits post-processing the forward skipped. Returns the outputs to use: ``outputs``
+        itself, or a new dict (a replayed graph's outputs dict is reused by later replays).
+        """
+        if (
+            self.keep_greedy_only_outputs
+            and self._config.max_beam_width == 1
+            and scheduled_requests.num_context_requests == 0
+            # An idle attention-DP rank runs a dummy row for an empty batch, whose outputs are restored from logits.
+            and len(scheduled_requests.generation_requests) > 0
+            and all(
+                greedy_tokens_usable(request) for request in scheduled_requests.generation_requests
+            )
+        ):
+            return outputs
+        outputs = dict(outputs)
+        outputs.pop(GREEDY_TOKENS_KEY)
+        hidden_states = outputs.pop(GREEDY_HIDDEN_STATES_KEY)
+        # One row per generation request: every row is a last token.
+        outputs["logits"] = self._model.logits_processor.forward(
+            hidden_states, self._model.lm_head, None, True
+        )
+        if self.sample_in_graph_callable is not None and self._mapping.is_last_pp_rank():
+            self.sample_in_graph_callable(outputs)
+        return outputs
+
     def _start_beam_histories(
         self, scheduled_requests: ScheduledRequests
     ) -> tuple[list[LlmRequest], PendingBeamHistories] | None:
@@ -874,6 +997,11 @@ class DecoderRunner(ScheduledModelRunner):
             return
 
         logits_tensor = outputs["logits"]
+        if logits_tensor is None:
+            # Greedy tokens sampled by the forward; _logits_for_greedy_tokens supplied
+            # logits instead whenever a request needed them.
+            return
+
         if outputs.get("logits_vocab_shard", False):
             # The spec worker kept the logits vocabulary-sharded (this TP
             # rank's columns). A post-processor sees the whole vocabulary, so
@@ -930,6 +1058,16 @@ class DecoderRunner(ScheduledModelRunner):
 
                 logits_processors = getattr(request, "py_logits_post_processors", None)
                 if logits_processors:
+                    if (
+                        not is_context_request
+                        and getattr(request, "py_verify_len", None) is not None
+                    ):
+                        raise RuntimeError(
+                            "per-request logits post-processors are not supported with DSpark "
+                            "ragged verification: the processor interface assumes one uniform "
+                            "row stride and would modify another request's packed logits after "
+                            "a short verify window"
+                        )
                     if is_context_request:
                         token_ids = [request.get_tokens(0)]
                     elif (histories := beam_histories.get(id(request))) is not None:
@@ -994,3 +1132,55 @@ class DecoderRunner(ScheduledModelRunner):
         # The sampler sees the original empty batch, never the execution row.
         # Copy the map because CUDA graph outputs are retained across replays.
         return {**outputs, "logits": outputs["logits"][:0]}
+
+    # Scheduler-facing state stays on the input owner that stages each layout.
+
+    @property
+    def _dspark_confidence_enabled(self):
+        return self._inputs._dspark_confidence_enabled
+
+    @property
+    def _dspark_trims_submitted_tokens(self):
+        return self._inputs._dspark_trims_submitted_tokens
+
+    @property
+    def _dspark_sps_cost_table(self):
+        return self._inputs._dspark_sps_cost_table
+
+    @property
+    def _dspark_exact_candidate_cells(self):
+        return self._inputs._dspark_exact_candidate_cells
+
+    @property
+    def _dspark_exact_identity_words(self):
+        return self._inputs._dspark_exact_identity_words
+
+    @property
+    def _dspark_device_budget(self):
+        return getattr(self._inputs, "_dspark_device_budget", None)
+
+    @_dspark_device_budget.setter
+    def _dspark_device_budget(self, value) -> None:
+        self._inputs._dspark_device_budget = value
+
+    @property
+    def previous_request_ids(self):
+        return self._inputs.previous_request_ids
+
+    @property
+    def previous_verify_lens(self):
+        return self._inputs.previous_verify_lens
+
+    @property
+    def has_previous_device_draft(self):
+        return self._inputs.has_previous_device_draft
+
+    def ragged_verify_token_buckets(self, padded_bs: int):
+        return self._inputs.ragged_verify_token_buckets(padded_bs)
+
+    def fit_ragged_verify_lens(self, *args, **kwargs):
+        return self._inputs.fit_ragged_verify_lens(*args, **kwargs)
+
+    def _get_spec_worker(self):
+        """Return the one-model speculative worker when it is initialized."""
+        return getattr(self._model, "spec_worker", None)

@@ -1195,7 +1195,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     ep_size: int,
     tile_size: int,
     activation_type: ActivationType,
-):
+) -> None:
     """Test gather-based grouped GEMM with fused activation.
 
     This test validates the gather kernel which:
@@ -1205,6 +1205,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
        non-gated)
     4. Quantizes output to FP4 with scale factor generation
     """
+    torch.manual_seed(143)
     is_gated = is_gated_activation(activation_type)
     is_situ = activation_type == ActivationType.SiTu
     # SiTU rejects the SwiGLU clamp (matching MegaMoE and DeepGEMM).

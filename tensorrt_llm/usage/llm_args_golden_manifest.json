@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {
@@ -309,6 +314,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
     },
     {
       "capture_policy": "bool",
@@ -879,6 +889,11 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.control_grace_sec"
+    },
+    {
       "allowed_values": [
         "both",
         "producer",
@@ -893,6 +908,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_connector_config.mooncake_store.segment_size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.transfer_timeout_sec"
     },
     {
       "capture_policy": "list[int]|none",
@@ -1013,6 +1033,11 @@
       "path": "mm_encoder_only"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "mnnvl_allreduce_fp8_payload"
+    },
+    {
       "allowed_values": [
         "off",
         "auto",
@@ -1050,6 +1075,39 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "moe_config.disable_finalize_fusion"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.auxiliary_sms"
+    },
+    {
+      "allowed_values": [
+        "per_layer_resident",
+        "shared_banks"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.helper_slot_mode"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "moe_config.load_balancer.layer_updates_per_iter"
+    },
+    {
+      "allowed_values": [
+        "standard",
+        "per_layer_dynamic"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.mode"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.load_balancer.num_slots"
     },
     {
       "capture_policy": "int|none",
@@ -1324,6 +1382,11 @@
       "path": "reorder_policy_config.policy_name"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "replicate_embedding"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "request_stats_max_iterations"
@@ -1359,6 +1422,20 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "allowed_values": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "capture_policy": "enum[ContextSchedulingPolicy]",
+      "kind": "categorical",
+      "path": "scheduler_config.context_scheduling_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_starvation_iterations"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
@@ -1391,6 +1468,11 @@
       "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",
       "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_frontend_affinity_port_stride"
     },
     {
       "capture_policy": "bool",
@@ -1713,6 +1795,24 @@
       "path": "speculative_config.decoding_type"
     },
     {
+      "allowed_values": [
+        "auto",
+        "mxfp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_lm_head_dtype"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "nvfp4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_moe_dtype"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.dynamic_tree_max_topK"
@@ -1829,11 +1929,6 @@
       "capture_policy": "literal|none",
       "kind": "categorical",
       "path": "speculative_config.moe_backend"
-    },
-    {
-      "capture_policy": "int|none",
-      "kind": "value",
-      "path": "speculative_config.num_eagle_layers"
     },
     {
       "capture_policy": "int|none",

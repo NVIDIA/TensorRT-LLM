@@ -646,12 +646,17 @@ def run_client_tests(example_dir,
         for output_file in output_files:
             with open(output_path(output_file), 'r') as f:
                 content = f.read()
-                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                if ("deepseek_v3_lite" in test_desc
+                        or "qwen3_32b_fp8" in test_desc
+                        or output_file == "output_chat.json"):
                     # Different models (and endpoints) phrase the continuation
                     # of the raw asyncio prompt differently, and repeated
                     # attempts to pin down the exact wording have proven
-                    # fragile across CI runs. Match case-insensitively on the
-                    # prompt's own keywords instead of an exact phrase.
+                    # fragile across CI runs: e.g. qwen3_32b_fp8's near-tied
+                    # greedy tokens flip with the GPU type and with the ctx/gen
+                    # TP sizes (https://nvbugs/6770977). Match
+                    # case-insensitively on the prompt's own keywords instead
+                    # of an exact phrase.
                     lowered_content = content.lower()
                     assert "berlin" in lowered_content, (
                         f"Expected 'Berlin' not found in {output_file}")
@@ -666,17 +671,6 @@ def run_client_tests(example_dir,
                     expected_strings = [
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
-                    ]
-                elif "qwen3_32b_fp8" in test_desc:
-                    # https://nvbugs/6566734: the greedy completion of the raw
-                    # asyncio prompt is near-tied between answering the question
-                    # and continuing it; both are valid non-garbage outputs.
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        [
-                            "Asyncio in Python is a library",
-                            "I have read that it is used for asynchronous programming"
-                        ]
                     ]
                 else:
                     # Qwen3-0.6B (migrated from TinyLlama onto this default
@@ -1563,6 +1557,67 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            env=env,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+def test_disaggregated_context_first_bf16_ownership(
+        disaggregated_test_root: str, llm_venv: Any,
+        disaggregated_example_root: str) -> None:
+    """Exercise serving activation and output through two real TP2 executors.
+
+    Args:
+        disaggregated_test_root: Fixture preparing the integration test assets.
+        llm_venv: Runtime environment with the tested TRT-LLM installation.
+        disaggregated_example_root: Existing disaggregated serving/client harness.
+
+    This verifies activation and successful serving, not outstanding-DMA fencing
+    or replacement after a fatal transfer. Native module tests cover retirement.
+    """
+    model_root = resolve_llm_model_path("Qwen3/Qwen3-0.6B")
+    setup_model_symlink(llm_venv, model_root, "Qwen3/Qwen3-0.6B")
+    env = llm_venv._new_env.copy()
+    env.update({
+        "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT": "1",
+        "TRTLLM_DISAGG_NO_RETRY": "1",
+        "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "0",
+        "TRTLLM_DISAGG_LAYERWISE": "0",
+        "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE": "0",
+    })
+    worker_config = {
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "enable_attention_dp": False,
+        "kv_cache_config": {
+            "use_kv_cache_manager_v2": True,
+            "free_gpu_memory_fraction": 0.2,
+            "enable_partial_reuse": False,
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 60000,
+            "kv_cache_bounce_size_mb": 0,
+            "agent_bounce_buffer_enable": False,
+            "enable_pipelined_transfer": False,
+        },
+    }
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python",
+        env=env,
+        model_path=model_root,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="context_first",
+        config_overrides={
+            "context_servers": worker_config,
+            "generation_servers": worker_config,
+        },
+        assert_ctx_log_contains="Context-first BF16 KV ownership ENABLED",
+        assert_gen_log_contains="Context-first BF16 KV ownership ENABLED")
 
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
@@ -3061,11 +3116,14 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
+    # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 def _deepseek_v41_completion(server_url: str, model: str, prompt: str,

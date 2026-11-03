@@ -43,11 +43,25 @@ from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
+from tensorrt_llm._torch.kimi_k3_cache_policy import (
+    KIMI_K3_FP8_KV_LAYERS_ENV,
+    get_kimi_k3_fp8_kv_layer_ids,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    DFlashDecodingConfig,
+    DSparkDecodingConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -133,6 +147,40 @@ def test_fp4_mla_request_validation_still_requires_nvfp4_kv() -> None:
             metadata,
             forward_args,
         )
+
+
+@pytest.mark.parametrize(
+    "attention_input_type, context_only_cache, supported",
+    [
+        (AttentionInputType.context_only, True, True),
+        (AttentionInputType.generation_only, True, False),
+        (AttentionInputType.context_only, False, False),
+    ],
+    ids=["context_only_cache", "generation", "context_with_full_cache"],
+)
+def test_fp4_mla_missing_v_scale_pool_only_for_context_only_cache(
+    attention_input_type: AttentionInputType, context_only_cache: bool, supported: bool
+) -> None:
+    # Only a disaggregated context worker omits the V-scale pool.
+    metadata = _fp4_mla_validation_metadata(
+        kv_cache_manager=SimpleNamespace(
+            dtype=_DataType.NVFP4,
+            kv_factor=1,
+            fp4_mla_context_only_cache=context_only_cache,
+        ),
+        fp4_mla_state=Fp4MlaState(hp_pool=object(), v_scale_pool=None),
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=attention_input_type)
+    fmha = SimpleNamespace(attn=SimpleNamespace(sparse_params=None))
+    is_context = attention_input_type == AttentionInputType.context_only
+    k = torch.empty(1, 4) if is_context else None
+    v = torch.empty(1, 4) if is_context else None
+
+    if supported:
+        assert Fp4MlaFmha._is_supported(fmha, torch.empty(1, 4), k, v, metadata, forward_args)
+    else:
+        with pytest.raises(RuntimeError, match="requires the V-scale pool"):
+            Fp4MlaFmha._is_supported(fmha, torch.empty(1, 4), k, v, metadata, forward_args)
 
 
 @pytest.mark.parametrize(
@@ -365,6 +413,70 @@ def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
     assert spec_helix_kwargs["helix_position_offsets"] is helix_position_offsets
     assert spec_helix_kwargs["helix_is_inactive_rank"] is metadata.helix_is_inactive_rank
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    ("cp_size", "helix", "accepted"),
+    [(1, False, True), (8, True, True), (8, False, False)],
+    ids=["no_cp", "helix", "non_helix_cp"],
+)
+def test_validate_fp4_mla_config_accepts_only_helix_context_parallelism(
+    monkeypatch: pytest.MonkeyPatch, cp_size: int, helix: bool, accepted: bool
+) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    model_config = SimpleNamespace(
+        sparse_attention_config=None,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+        mapping=SimpleNamespace(cp_size=cp_size, has_cp_helix=lambda: helix),
+        spec_config=None,
+    )
+    llm_args = SimpleNamespace(kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True))
+    if accepted:
+        model_loader.validate_fp4_mla_config(model_config, llm_args)
+    else:
+        with pytest.raises(ValueError, match="only through Helix"):
+            model_loader.validate_fp4_mla_config(model_config, llm_args)
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "keeps_separate_draft_kv_cache"),
+    [
+        (DSparkDecodingConfig(max_draft_len=5), True),
+        (DFlashDecodingConfig(max_draft_len=7), True),
+        (MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=3), False),
+    ],
+    ids=["dspark", "dflash", "mtp"],
+)
+def test_validate_fp4_mla_config_keeps_standalone_drafter_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_config: DecodingBaseConfig,
+    keeps_separate_draft_kv_cache: bool,
+) -> None:
+    """A standalone drafter keeps its own draft KV pool under FP4 MLA.
+
+    Without it the drafter falls back to a context arena that is dense in
+    max_seq_len. Drafters whose layers share the target's FP4 MLA cache
+    (one-model MTP) keep using it.
+    """
+    from tensorrt_llm._torch.pyexecutor import model_loader
+
+    monkeypatch.setattr(model_loader, "supports_fp4_mla_attention", lambda config: True)
+    assert spec_config.spec_dec_mode.use_one_engine()
+    model_config = SimpleNamespace(
+        sparse_attention_config=None,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+        mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
+        spec_config=spec_config,
+    )
+    llm_args = SimpleNamespace(kv_cache_config=SimpleNamespace(use_kv_cache_manager_v2=True))
+
+    model_loader.validate_fp4_mla_config(model_config, llm_args)
+
+    assert spec_config._allow_separate_draft_kv_cache is keeps_separate_draft_kv_cache
 
 
 def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
@@ -644,11 +756,11 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
+def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             model_type="kimi_linear",
@@ -669,8 +781,417 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
     )
 
     fp4_bytes_per_token = 320 + 40 + 32
-    assert slope == fp4_bytes_per_token + 576 * torch.bfloat16.itemsize
+    assert slope == fp4_bytes_per_token + 576 * torch.float8_e4m3fn.itemsize
     assert intercept == 3 * (HP_BLOCK_SIZE + 3) * 576 * 2
+
+
+@pytest.mark.parametrize("rank, num_fp8_layers", [(0, 0), (1, 2)])
+def test_fp4_mla_v2_default_fp8_tail_sizing_uses_global_layers(
+    monkeypatch: pytest.MonkeyPatch, rank: int, num_fp8_layers: int
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_k3",
+            num_hidden_layers=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": list(range(2, 17, 2))},
+        )
+    )
+    slope, intercept = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        Mapping(world_size=2, tp_size=1, pp_size=2, rank=rank),
+        num_layers=4,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_batch_size=3,
+        spec_config=SimpleNamespace(tokens_per_gen_step=4),
+    )
+
+    # The last two MLA layers of the global schedule (13 and 15) live on the
+    # second pipeline stage.
+    num_fp4_layers = 4 - num_fp8_layers
+    assert slope == num_fp4_layers * (320 + 40 + 32) + num_fp8_layers * 576
+    assert intercept == 3 * 2 * num_fp4_layers * (HP_BLOCK_SIZE + 3) * 576 * 2
+
+
+def test_kimi_k3_fp8_kv_layer_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    # NVFP4 defaults to the last two MLA layers; other dtypes keep none.
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset({5, 7})
+    assert get_kimi_k3_fp8_kv_layer_ids(config) == frozenset()
+    # Other model families never take the Kimi K3 default.
+    assert (
+        get_kimi_k3_fp8_kv_layer_ids(SimpleNamespace(model_type="deepseek_v3"), nvfp4_enabled=True)
+        == frozenset()
+    )
+
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "1")
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset({1})
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "")
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True) == frozenset()
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "2")
+    with pytest.raises(ValueError, match="only MLA layers"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "9")
+    with pytest.raises(ValueError, match="outside"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True)
+
+
+@pytest.mark.parametrize("fp8_env", [None, "", "7"], ids=["unset", "empty", "explicit"])
+def test_kimi_k3_deprecated_bf16_kv_layers_env(monkeypatch: pytest.MonkeyPatch, fp8_env) -> None:
+    config = SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+    if fp8_env is None:
+        monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_env)
+    monkeypatch.setenv("TLLM_KIMI_K3_BF16_KV_LAYERS", "5")
+    # The deprecated variable selects the FP8 layers only when the new one is unset.
+    expected = {None: frozenset({5}), "": frozenset(), "7": frozenset({7})}[fp8_env]
+    for nvfp4_enabled in (True, False):
+        assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=nvfp4_enabled) == expected
+    # Other model families ignore the variable.
+    assert (
+        get_kimi_k3_fp8_kv_layer_ids(SimpleNamespace(model_type="deepseek_v3"), nvfp4_enabled=True)
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize(
+    "fp4_kv, sparse_config, expected_fp8_context",
+    [
+        (True, None, True),
+        (True, SimpleNamespace(algorithm="skip_softmax"), False),
+        (False, None, False),
+    ],
+    ids=["dense_nvfp4", "sparse_nvfp4", "bf16"],
+)
+def test_dense_fp4_mla_declares_fp8_context_workspace(
+    monkeypatch: pytest.MonkeyPatch, fp4_kv: bool, sparse_config, expected_fp8_context: bool
+) -> None:
+    # An all-NVFP4 model still attends cached-prefix chunks through the FP8
+    # context kernel, so it must declare that kernel's workspace.
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "")
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    requested = {}
+
+    def workspace_bytes_per_token(**kwargs):
+        requested.update(kwargs)
+        return 7 if kwargs["fp8_context_mla"] else 0
+
+    monkeypatch.setattr(
+        trtllm_backend,
+        "thop",
+        SimpleNamespace(get_context_mla_workspace_bytes_per_token=workspace_bytes_per_token),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=8,
+            linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            num_attention_heads=16,
+        ),
+        quant_config=SimpleNamespace(
+            quant_mode=SimpleNamespace(
+                has_fp4_kv_cache=lambda: fp4_kv, has_fp8_kv_cache=lambda: False
+            )
+        ),
+        sparse_attention_config=sparse_config,
+    )
+
+    rate = trtllm_backend.TrtllmAttention.runtime_workspace_bytes_per_token(
+        model_config, Mapping(world_size=1, tp_size=1, pp_size=1)
+    )
+
+    assert rate == (7 if expected_fp8_context else 0)
+    assert requested.get("fp8_context_mla", False) is expected_fp8_context
+
+
+@pytest.mark.parametrize(
+    "model_type, fp8_env, pp_rank, expected_fp8_context",
+    [
+        # The default keeps global MLA layer 7 in FP8, on the second stage.
+        ("kimi_linear", None, 1, True),
+        ("kimi_linear", None, 0, False),
+        # An empty list keeps every MLA layer in NVFP4.
+        ("kimi_linear", "", 1, False),
+        # Other model families have no FP8 fallback layers.
+        ("deepseek_v3", None, 1, False),
+    ],
+    ids=["k3_local_fallback", "k3_remote_fallback", "k3_no_fallback", "non_k3"],
+)
+def test_kimi_k3_fp8_fallback_declares_fp8_context_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    fp8_env,
+    pp_rank: int,
+    expected_fp8_context: bool,
+) -> None:
+    # A sparse config keeps the dense FP4 MLA reservation out, so only the
+    # Kimi K3 FP8 fallback layers can request the FP8 context workspace.
+    if fp8_env is None:
+        monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_env)
+    monkeypatch.delenv("TLLM_KIMI_K3_BF16_KV_LAYERS", raising=False)
+    monkeypatch.setattr(trtllm_backend, "get_sm_version", lambda: 100)
+    requested = {}
+
+    def workspace_bytes_per_token(**kwargs):
+        requested.update(kwargs)
+        return 7 if kwargs["fp8_context_mla"] else 0
+
+    monkeypatch.setattr(
+        trtllm_backend,
+        "thop",
+        SimpleNamespace(get_context_mla_workspace_bytes_per_token=workspace_bytes_per_token),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type=model_type,
+            num_hidden_layers=8,
+            linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            qk_nope_head_dim=128,
+            v_head_dim=128,
+            num_attention_heads=16,
+        ),
+        quant_config=SimpleNamespace(
+            quant_mode=SimpleNamespace(
+                has_fp4_kv_cache=lambda: True, has_fp8_kv_cache=lambda: False
+            )
+        ),
+        sparse_attention_config=SimpleNamespace(algorithm="skip_softmax"),
+    )
+
+    rate = trtllm_backend.TrtllmAttention.runtime_workspace_bytes_per_token(
+        model_config, _pp_mapping(2, pp_rank)
+    )
+
+    assert rate == (7 if expected_fp8_context else 0)
+    assert requested.get("fp8_context_mla", False) is expected_fp8_context
+
+
+def _pp_mapping(pp_size: int, rank: int = 0, pp_partition=None) -> Mapping:
+    return Mapping(
+        world_size=pp_size, tp_size=1, pp_size=pp_size, rank=rank, pp_partition=pp_partition
+    )
+
+
+@pytest.mark.parametrize(
+    "num_hidden_layers, full_attn_layers, mapping, expected",
+    [
+        # One stage keeps the global tail.
+        (8, [2, 4, 6, 8], None, {5, 7}),
+        # A stage whose MLA layers are exactly the tail keeps its earlier one in NVFP4.
+        (8, [2, 4, 6, 8], _pp_mapping(2), {7}),
+        # A one-MLA-layer stage keeps it in NVFP4.
+        (8, [2, 4, 6, 8], _pp_mapping(2, pp_partition=[6, 2]), {5}),
+        (8, [2, 4, 6, 8], _pp_mapping(4), set()),
+        # Stages with more MLA layers keep the full default.
+        (16, list(range(2, 17, 2)), _pp_mapping(2), {13, 15}),
+        # Too few MLA layers for the default tail.
+        (4, [2, 4], None, {3}),
+        (4, [4], None, set()),
+        # A truncated config ignores full_attn_layers past its last layer.
+        (4, [2, 4, 6, 8], None, {3}),
+    ],
+)
+def test_kimi_k3_default_fp8_kv_layers_keep_an_nvfp4_mla_layer_per_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    num_hidden_layers: int,
+    full_attn_layers: list[int],
+    mapping,
+    expected: set[int],
+) -> None:
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=num_hidden_layers,
+        linear_attn_config={"full_attn_layers": full_attn_layers},
+    )
+
+    assert get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping) == frozenset(
+        expected
+    )
+
+
+def test_kimi_k3_default_fp8_kv_layers_agree_across_pp_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+
+    selections = {
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=_pp_mapping(2, rank))
+        for rank in range(2)
+    }
+
+    assert selections == {frozenset({7})}
+
+
+@pytest.mark.parametrize(
+    "layer_ids, mapping, stage",
+    [
+        ("5,7", _pp_mapping(2), 1),
+        ("7", _pp_mapping(2, pp_partition=[6, 2]), 1),
+        ("1,3,5,7", None, 0),
+    ],
+)
+def test_kimi_k3_explicit_fp8_kv_layers_reject_an_all_fp8_stage(
+    monkeypatch: pytest.MonkeyPatch, layer_ids: str, mapping, stage: int
+) -> None:
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, layer_ids)
+    config = SimpleNamespace(
+        model_type="kimi_k3",
+        num_hidden_layers=8,
+        linear_attn_config={"full_attn_layers": [2, 4, 6, 8]},
+    )
+
+    with pytest.raises(ValueError, match=f"pipeline stage {stage}"):
+        get_kimi_k3_fp8_kv_layer_ids(config, nvfp4_enabled=True, mapping=mapping)
+    # Without NVFP4 the model-wide check reports the dtype mismatch instead.
+    assert get_kimi_k3_fp8_kv_layer_ids(config, mapping=mapping) == frozenset(
+        int(layer_id) for layer_id in layer_ids.split(",")
+    )
+
+
+def test_fp4_mla_v2_cache_size_keeps_an_nvfp4_layer_on_a_tail_only_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_k3",
+            num_hidden_layers=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": list(range(2, 17, 2))},
+        )
+    )
+
+    # The second stage owns layers 12-15, whose MLA layers 13 and 15 are the
+    # global default tail; layer 13 stays NVFP4.
+    slope, _ = Fp4MlaKVCacheManagerV2.get_cache_size_per_token(
+        model_config,
+        _pp_mapping(2, rank=1, pp_partition=[12, 4]),
+        num_layers=2,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_batch_size=3,
+        spec_config=SimpleNamespace(tokens_per_gen_step=4),
+    )
+
+    assert slope == (320 + 40 + 32) + 576
+
+
+@pytest.mark.parametrize("chunked_loop_num", [0, 2])
+def test_fp4_mla_chunked_prefill_attends_cached_partitions_then_current_chunk(
+    monkeypatch: pytest.MonkeyPatch, chunked_loop_num: int
+) -> None:
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    tokens, cached, heads, nope, rope, rank, v_dim = 4, 6, 2, 8, 4, 16, 8
+    calls = []
+
+    def load_chunked_kv_cache_for_mla(**kwargs):
+        calls.append(("load", kwargs["num_ctx_cached_tokens"]))
+        num = kwargs["num_ctx_cached_tokens"]
+        return torch.zeros(num, rank), torch.zeros(num, rope)
+
+    def forward_partition(q, k, v, metadata, forward_args, *, kv_lens_cuda, kv_lens_cpu):
+        calls.append(("partition", forward_args.attention_mask, k.shape[0], int(kv_lens_cpu[0])))
+        assert forward_args.attention_input_type == AttentionInputType.context_only
+        assert forward_args.latent_cache is None
+        assert k.shape == (k.shape[0], heads * (nope + rope))
+        assert v.shape == (k.shape[0], heads * v_dim)
+        partition_keys.append(k)
+        return forward_args.output
+
+    def merge(merged, temp, stats, temp_stats, merge_op, metadata):
+        calls.append(("merge", merge_op))
+
+    partition_keys = []
+    mha = SimpleNamespace(
+        append_fp4_mla_context_cache=lambda q, latent, metadata: calls.append(("append",)),
+        load_chunked_kv_cache_for_mla=load_chunked_kv_cache_for_mla,
+        forward_fp4_mla_context_partition=forward_partition,
+        merge_attention_for_mla=merge,
+    )
+    module = SimpleNamespace(
+        mha=mha,
+        out_scale=None,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        qk_nope_head_dim=nope,
+        qk_head_dim=nope + rope,
+        num_heads_tp=heads,
+        num_context_heads=heads,
+        v_head_dim=v_dim,
+        _project_context_kv=lambda x: torch.zeros(x.shape[0], heads * (nope + v_dim)),
+    )
+    metadata = SimpleNamespace(
+        num_ctx_tokens=tokens,
+        num_contexts=1,
+        chunked_loop_num=chunked_loop_num,
+        cu_chunked_seq_len=[torch.tensor([0, cached])] * chunked_loop_num,
+        host_cu_chunked_seq_len=torch.tensor([[0, cached]] * max(chunked_loop_num, 1)),
+        chunked_global_offset=[torch.zeros(1)] * chunked_loop_num,
+        max_chunk_len_per_loop=[cached] * chunked_loop_num,
+        chunked_seq_len=[torch.tensor([cached])] * chunked_loop_num,
+        host_chunked_seq_len=[torch.tensor([cached])] * chunked_loop_num,
+        prompt_lens_cuda_runtime=torch.tensor([tokens]),
+        prompt_lens_cpu_runtime=torch.tensor([tokens]),
+        merge_op_tensor=[f"op{i}" for i in range(chunked_loop_num + 1)],
+        runtime_features=SimpleNamespace(chunked_prefill_buffer_batch_size=1),
+    )
+    q = torch.zeros(tokens, heads * (nope + rope))
+    latent = torch.randn(tokens, 1, rank + rope)
+    output = torch.empty(tokens, heads * v_dim)
+
+    result = MLA.forward_context_with_chunked_prefill_fp4(
+        module, q, torch.zeros(tokens, rank), latent, metadata, output
+    )
+
+    assert result is output
+    # The chunk is appended to the FP4 cache once, before any partition.
+    assert calls[0] == ("append",)
+    expected = []
+    for loop_idx in range(chunked_loop_num):
+        expected += [
+            ("load", cached),
+            ("partition", PredefinedAttentionMask.FULL, cached, cached),
+            ("merge", f"op{loop_idx}"),
+        ]
+    expected += [
+        ("partition", PredefinedAttentionMask.CAUSAL, tokens, tokens),
+        ("merge", f"op{chunked_loop_num}"),
+    ]
+    assert calls[1:] == expected
+    # The current chunk attends with the RoPE part of its own latent cache.
+    current_k = partition_keys[-1].view(tokens, heads, nope + rope)
+    for head in range(heads):
+        torch.testing.assert_close(current_k[:, head, nope:], latent[:, 0, rank:])
 
 
 def test_fp4_mla_v2_runtime_sizing_accounts_for_pipeline_slots() -> None:
@@ -1012,6 +1533,82 @@ def test_fp4_mla_disagg_import_rebuild_matches_context_cache_update(
         manager.shutdown()
 
 
+def test_fp4_mla_hp_ring_content_depends_only_on_position(monkeypatch) -> None:
+    """A context prefill leaves the same BF16 tail in rings of different sizes.
+
+    A context worker without speculative decoding keeps a 16-slot HP ring and a
+    generation worker with five draft tokens keeps 21 slots. The disaggregated
+    transfer moves each retained position from slot ``p % 16`` to slot
+    ``p % 21``; that reproduces the generation worker's own prefill only if the
+    ring holds the same values at those slots, which this checks against a
+    generation-shaped manager prefilling the same latents.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FP4 MLA (NVFP4 KV cache) requires Blackwell or newer")
+    _reset_triton_allocator()
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    torch.manual_seed(0)
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    # Partial tiles of 1 and 15 tokens, one ending in a later page, and an
+    # exact tile multiple that leaves no tail.
+    seq_lens = [page_size + 1, 2 * page_size - 1, 37, 48]
+    num_pages = sum((seq_len + page_size - 1) // page_size for seq_len in seq_lens)
+    managers = []
+    try:
+        for spec_config in (None, MTPDecodingConfig(max_draft_len=5)):
+            manager = _create_fp4_mla_v2_manager(
+                max_tokens=num_pages * page_size,
+                max_seq_len=2 * page_size,
+                max_batch_size=len(seq_lens),
+                spec_config=spec_config,
+            )
+            managers.append(manager)
+            manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
+            for pool in manager._iter_fp4_mla_physical_pool_views():
+                pool.view(torch.uint8).zero_()
+        ctx, gen = managers
+        assert ctx.fp4_mla_hp_pool_size == HP_BLOCK_SIZE
+        assert gen.fp4_mla_hp_pool_size == HP_BLOCK_SIZE + 5
+
+        latent = (
+            torch.randn(sum(seq_lens), 576, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        for manager in managers:
+            scatter_fp4_mla_kv_cache(
+                _build_multi_seq_metadata(manager, seq_lens=seq_lens, page_size=page_size),
+                latent,
+                layer_idx=0,
+                token_offset=0,
+                phase="context",
+                local_layer=0,
+                v_head_dim=512,
+            )
+        torch.cuda.synchronize()
+
+        def ring_tokens(manager, request_id, seq_len):
+            page = manager._get_batch_cache_indices_by_pool_id(
+                [request_id],
+                pool_id=manager.get_fp4_mla_page_table_spec(0).hp_pool_id,
+                is_kv_aggregate=False,
+            )[0][(seq_len - 1) // page_size]
+            ring = manager.get_fp4_mla_hp_pool()[page, 0, 0].view(-1, 576)
+            tail = range(seq_len - seq_len % HP_BLOCK_SIZE, seq_len)
+            return ring[[p % manager.fp4_mla_hp_pool_size for p in tail]], tail
+
+        for request_id, seq_len in enumerate(seq_lens):
+            ctx_tail, tail = ring_tokens(ctx, request_id, seq_len)
+            gen_tail, _ = ring_tokens(gen, request_id, seq_len)
+            assert len(tail) == seq_len % HP_BLOCK_SIZE
+            # Every tail token was written, so the comparison is not vacuous.
+            assert gen_tail.ne(0).any(dim=1).all()
+            assert torch.equal(ctx_tail, gen_tail)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        for manager in managers:
+            manager.shutdown()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
@@ -1067,13 +1664,28 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
 )
-def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
+@pytest.mark.parametrize("device_page_table", ["0", "1"])
+def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch, device_page_table) -> None:
+    if device_page_table == "0" and not prefer_pinned():
+        pytest.skip("Native page-table expansion requires GPU-addressable host memory")
+    monkeypatch.setenv("TLLM_KVCM_V2_DEVICE_PAGE_TABLE", device_page_table)
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     seq_lens = [FP4_MLA_TOKENS_PER_BLOCK + 1, 3]
     manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
     try:
         manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
         assert manager._use_per_layer_page_tables is False
+        assert manager.uses_device_page_table is (device_page_table == "1")
+        if device_page_table == "0":
+            assert all(
+                tensor.is_pinned()
+                for tensor in (
+                    manager.host_kv_cache_block_offsets,
+                    manager.index_scales,
+                    manager.kv_offset,
+                    manager.index_mapper.get_copy_index([0, 1], 0, 1),
+                )
+            )
         page_spec = manager.get_fp4_mla_page_table_spec(0)
         assert page_spec.cache_page_index_scale == 1
         dst = torch.full(
@@ -1093,6 +1705,28 @@ def test_fp4_mla_manager_v2_copies_per_pool_block_offsets(monkeypatch) -> None:
                 dst[page_spec.cache_pool_id, seq_idx, 0, :num_blocks].tolist()
                 == block_ids[seq_idx][:num_blocks]
             )
+
+        # Check every lifecycle pool and both planes, including padding, after
+        # reordering and shrinking the batch. Reuse a capacity-sized output so
+        # that rows beyond the active batch must remain untouched.
+        for request_ids in ([1, 0], [1]):
+            dst.fill_(-1)
+            copy_idx = manager.index_mapper.get_copy_index(request_ids, 0, 1).long()
+            base = manager.host_kv_cache_block_offsets[:, copy_idx, 0, :]
+            scaled = base * manager.index_scales[:, None, None]
+            expected = torch.stack(
+                (
+                    torch.where(base == BAD_PAGE_INDEX, 0, scaled),
+                    torch.where(
+                        base == BAD_PAGE_INDEX, 0, scaled + manager.kv_offset[:, None, None]
+                    ),
+                ),
+                dim=2,
+            )
+            manager.copy_batch_block_offsets(dst, request_ids, 1, 0, len(request_ids))
+            torch.cuda.synchronize()
+            torch.testing.assert_close(dst[:, : len(request_ids)].cpu(), expected)
+            assert torch.all(dst[:, len(request_ids) :] == -1)
     finally:
         manager.shutdown()
 
@@ -1154,6 +1788,39 @@ def _expand_qk_residual_terms(
         torch.cat((q[..., :prefix_dim], q_main, q_residual, q_main), dim=-1),
         torch.cat((k[..., :prefix_dim], k_main, k_main, k_residual), dim=-1),
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+def test_fp4_mla_pool_views_built_in_inference_mode_can_be_scrubbed(monkeypatch) -> None:
+    """Cached FP4 MLA pool views stay writable outside inference mode.
+
+    Warmup forwards run under ``torch.inference_mode`` and are the first to
+    build and cache these views; the post-warmup KV-cache scrub then zeroes
+    every physical pool outside it.
+    """
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    manager = _create_fp4_mla_v2_manager(max_tokens=1024, max_seq_len=512, max_batch_size=2)
+    try:
+        with torch.inference_mode():
+            manager.get_fp4_mla_cache_buffers(0)
+            manager.get_fp4_mla_cache_pool_bases()
+            for _ in manager._iter_fp4_mla_physical_pool_views():
+                pass
+        cached = [
+            tensor
+            for value in manager._fp4_mla_view_cache.values()
+            for tensor in (value if isinstance(value, tuple) else (value,))
+        ]
+        assert cached
+        assert not any(tensor.is_inference() for tensor in cached)
+        for view in manager._iter_fp4_mla_physical_pool_views():
+            view.zero_()
+        assert not manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+    finally:
+        manager.shutdown()
 
 
 def _create_fp4_mla_v2_manager(
@@ -1527,6 +2194,113 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             head_dim=head_dim,
         )
         assert not torch.count_nonzero(global_slot)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+def test_fp4_mla_helix_generation_writes_hp_ring_at_global_position(monkeypatch) -> None:
+    """Helix generation stores the BF16 tail at the token's global ring slot.
+
+    The context writer and the disaggregated ring transfer address the HP
+    ring by global position, while a Helix rank's cache position is
+    rank-local. The generation update must use the global position.
+    """
+    _reset_triton_allocator()
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    local_kv_len = 6
+    local_cache_position = local_kv_len - 1
+    global_position = 70
+    num_heads = 4
+    (
+        kv_cache_manager,
+        metadata,
+        _,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=[local_kv_len],
+        num_heads=num_heads,
+        seed=37,
+    )
+    try:
+        state = metadata.fp4_mla_state
+        head_dim = kv_lora_rank + qk_rope_head_dim
+        ring_size = kv_cache_manager.fp4_mla_hp_pool_size
+        assert global_position % ring_size != local_cache_position % ring_size
+        state.positions = torch.tensor([global_position], dtype=torch.int32, device="cuda")
+        metadata._helix_spec_tokens_valid = False
+        metadata.helix_position_offsets = state.positions
+        metadata.helix_is_inactive_rank = torch.tensor([False], dtype=torch.bool, device="cuda")
+
+        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+        kv_cache.zero_()
+        sf_cache.zero_()
+        state.hp_pool.zero_()
+        state.v_scale_pool.zero_()
+        v_packed_pool = kv_cache_manager.get_mla_v_packed_pool_base()
+        if v_packed_pool is not None:
+            v_packed_pool.zero_()
+
+        generation_latent = (
+            torch.randn(1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        generation_latent[:, :kv_lora_rank] += 0.5
+        q_pe = (
+            torch.randn(1, num_heads, qk_rope_head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        q_quant_input = torch.zeros(1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        q_rope_out = q_quant_input[..., kv_lora_rank:]
+        rotary_cos_sin = torch.zeros(
+            (FP4_MLA_TOKENS_PER_BLOCK, qk_rope_head_dim, 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        rotary_cos_sin[..., 0] = 1.0
+
+        assert scatter_fp4_mla_kv_cache(
+            metadata,
+            generation_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+            rotary_cos_sin=rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_rope_out,
+            q_quant_input=q_quant_input,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+        )
+        torch.cuda.synchronize()
+
+        hp_pool = state.hp_pool
+        pool_head_dim = hp_pool.shape[-1] // ring_size
+        ring = hp_pool.view(*hp_pool.shape[:-1], ring_size, pool_head_dim)
+        written_slots = sorted(
+            {
+                int(slot)
+                for slot in torch.nonzero(ring[..., :kv_lora_rank].abs().amax(dim=-1))[
+                    :, -1
+                ].tolist()
+            }
+        )
+        assert written_slots == [global_position % ring_size]
+        slot_rows = ring[..., global_position % ring_size, :kv_lora_rank].reshape(-1, kv_lora_rank)
+        written = slot_rows[slot_rows.abs().amax(dim=-1) > 0]
+        assert written.shape[0] >= 1
+        torch.testing.assert_close(
+            written[0].float(), generation_latent[0, :kv_lora_rank].float(), rtol=0, atol=0
+        )
     finally:
         torch.cuda.synchronize()
         _reset_triton_allocator()
