@@ -973,17 +973,21 @@ def test_prequantized_staged_weights_are_bitwise(m, n, k):
     assert torch.equal(out, ref)
 
 
+@pytest.mark.parametrize("n, k", STAGED_SHAPES)
 @pytest.mark.parametrize("m", [8, 16, 32])
-def test_staged_tactic_keeps_the_slice_on_chip(m):
-    """KDA q/k/v/g (helix8): the ring plus the staged tiles hold every K tile of a CTA within the
-    shared-memory budget that lets a CTA land beside an attn_res CTA."""
+def test_staged_tactic_keeps_the_slice_on_chip(m, n, k):
+    """The staged tactic stays within the shared-memory budget that lets a CTA land beside an
+    attn_res CTA, and ``weights_on_chip`` holds exactly where its ring plus tensor-memory tiles
+    cover every K tile of a CTA (the split-K of the architecture's tables decides that: GB300
+    runs the helix8 q/k/v/g at split-K 2, 28 K tiles a CTA, more than fit on chip)."""
     mod = _kernel_module()
-    n, k = 6144, 7168
     t = mod.staged_prequantized_tactic(m, n, k)
+    fold = m <= mod.low_m_max_for(n, k)
     kt_max = -(-(k // 128) // t.split_k)
-    assert t.tmem_tiles > 0 and t.a_stages + t.tmem_tiles >= kt_max
-    assert mod.mid_smem_bytes(n, k, t, fold_weight_scale=True) <= mod.STAGED_SMEM_BYTES
-    assert mod.weights_on_chip(m, n, k)
+    assert mod.mid_smem_bytes(n, k, t, fold_weight_scale=fold) <= mod.STAGED_SMEM_BYTES
+    assert mod.weights_on_chip(m, n, k) == (t.a_stages + t.tmem_tiles >= kt_max)
+    if t.a_stages < kt_max:
+        assert t.tmem_tiles > 0
 
 
 @pytest.mark.parametrize("a_stages, tmem_tiles", [(12, 1), (12, 4), (2, 12), (1, 5)])
