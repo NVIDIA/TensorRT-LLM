@@ -1189,6 +1189,11 @@ _QWEN3_JSON_OUTPUTS = {
     _QWEN3_WEATHER_CALL + "\n" + _QWEN3_SEARCH_CALL,
     "text_around_calls": ("Let me check both.\n" + _QWEN3_WEATHER_CALL +
                           "\nAnd a search:\n" + _QWEN3_SEARCH_CALL + "\nDone."),
+    # Falsy arguments, which the whole-text parse turns into {}.
+    "empty_list_arguments":
+    '<tool_call>\n{"name": "get_weather", "arguments": []}\n</tool_call>',
+    "empty_string_arguments":
+    '<tool_call>\n{"name": "get_weather", "arguments": ""}\n</tool_call>',
 }
 
 

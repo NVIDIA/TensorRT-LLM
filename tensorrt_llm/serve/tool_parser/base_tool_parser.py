@@ -350,10 +350,11 @@ class BaseToolParser(ABC):
                     # A call that is already complete sends its arguments in
                     # the same item: left to a later increment, they would be
                     # lost when this increment is the last of the stream.
+                    # Missing or falsy arguments become {}, as in
+                    # parse_base_json.
                     if is_current_complete:
-                        arguments = current_tool_call.get("arguments")
                         res.calls[0].parameters = json.dumps(
-                            {} if arguments is None else arguments)
+                            current_tool_call.get("arguments") or {})
                         self._complete_current_tool(start_idx + end_idx)
                 else:
                     res = StreamingParseResult()
@@ -364,13 +365,14 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                # A finished call may carry no "arguments" key at all, or an
-                # explicit null. Both mean "no arguments" and are normalized to
-                # {} so the call still completes, matching what parse_base_json
-                # returns on the non-streaming path. While the JSON is still
-                # partial a missing key only means "not streamed yet", so it is
-                # left alone and the elif prev_arguments branch keeps handling it.
-                if is_current_complete and cur_arguments is None:
+                # A finished call may carry no "arguments" key at all, or a
+                # falsy value such as null, [] or "". All of them mean "no
+                # arguments" and are normalized to {} so the call still
+                # completes, matching what parse_base_json returns on the
+                # non-streaming path. While the JSON is still partial a missing
+                # key only means "not streamed yet" and a falsy value may still
+                # grow, so neither is normalized before the call is complete.
+                if is_current_complete and not cur_arguments:
                     cur_arguments = {}
 
                 # An empty argument object is falsy but still has to be streamed and
