@@ -197,6 +197,28 @@ def _writeback_state_rows(
     ssm_pool.index_copy_(0, slot_indices.long(), rows.to(ssm_pool.dtype))
 
 
+def _swap_inforward_snapshot(
+    conv_pool: torch.Tensor,
+    ssm_pool: torch.Tensor,
+    snapshot,
+    stage: Tuple[torch.Tensor, torch.Tensor],
+    window: torch.Tensor,
+) -> None:
+    """Leave the state at P in the live slots and the chunk-end state in the staging rows, as
+    ``MambaHybridCacheManagerV2.finish_inforward_snapshots`` expects: the prefill stored the
+    recurrent state at P into the staging rows and the chunk-end conv window and state into the
+    live slots. ``window``: the ``[k * (W - 1), C]`` pre-convolution rows that end at P."""
+    stage_ssm, stage_conv = stage
+    live, rows = snapshot.live, snapshot.stage_rows
+    chunk_end_state = ssm_pool.index_select(0, live)
+    ssm_pool.index_copy_(0, live, stage_ssm.index_select(0, rows))
+    stage_ssm.index_copy_(0, rows, chunk_end_state)
+    stage_conv.index_copy_(0, rows, conv_pool.index_select(0, live))
+    conv_pool.index_copy_(
+        0, live, window.view(live.shape[0], -1, conv_pool.shape[1]).transpose(1, 2)
+    )
+
+
 def _kda_split_conv_sections(
     conv_state: torch.Tensor, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -629,6 +651,13 @@ class KimiKDALinearAttention(nn.Module):
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
+            snapshot = getattr(mamba_metadata, "kda_inforward_snapshot", None)
+            inforward = None
+            if snapshot is not None:
+                stage = attn_metadata.kv_cache_manager.inforward_snapshot_stage_views(
+                    self.layer_idx
+                )
+                inforward = (snapshot, stage)
             prefill_core = self.forward_prefill(
                 hidden_states[:num_ctx_tokens],
                 cu_seqlens,
@@ -639,6 +668,7 @@ class KimiKDALinearAttention(nn.Module):
                 state_indices[:num_prefills],
                 layer_cache,
                 output=output[:num_ctx_tokens] if output is not None else None,
+                inforward=inforward,
             )
             if output is None:
                 cores.append(prefill_core)
@@ -847,7 +877,14 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         layer_cache=None,
         output: Optional[torch.Tensor] = None,
+        inforward: Optional[tuple] = None,
     ) -> torch.Tensor:
+        """Prefill the context chunks of this step.
+
+        ``inforward = (KdaInforwardSnapshot, (stage_ssm, stage_conv))``: the in-forward
+        snapshots of MambaHybridCacheManagerV2. Each planned request leaves its state at the
+        snapshot point P in its live slot and its chunk-end state in its staging row.
+        """
         from einops import rearrange
 
         if x2d.shape[0] == 0:
@@ -862,6 +899,13 @@ class KimiKDALinearAttention(nn.Module):
             slot_indices = mamba_metadata.state_indices[:num_prefills]
 
         packed_conv, onorm_g = self._project_packed_conv_input(x, x2d)
+        snapshot = window = None
+        if inforward is not None:
+            if not (self._dispatch.prefill_kernel_path == "optimized" and self._fuse_prefill_conv):
+                raise RuntimeError("In-forward KDA snapshots need the optimized KDA prefill")
+            snapshot = inforward[0]
+            # The pre-convolution rows of the window that ends at P (token-major [T, >= 3D]).
+            window = packed_conv[snapshot.conv_win, : conv_pool.shape[1]]
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -899,11 +943,16 @@ class KimiKDALinearAttention(nn.Module):
             ssm_pool,
             slot_indices,
             _prepared_state=prepared_state,
+            snapshot=(
+                None if snapshot is None else (inforward[1][0], snapshot.rows, snapshot.chunks)
+            ),
         )
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+        if snapshot is not None:
+            _swap_inforward_snapshot(conv_pool, ssm_pool, snapshot, inforward[1], window)
 
         core = self._output_gate(x, o, onorm_g)
         return self._store_core(core, output)
@@ -992,12 +1041,15 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices: torch.Tensor,
         *,
         _prepared_state: _KDAPrefillState | None = None,
+        snapshot: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Run post-convolution KDA and update the selected recurrent-state rows.
 
         ``packed_conv`` is BF16 ``[3 * H * D, tokens]``; ``g`` and ``beta``
         are raw logits with shapes ``[1, tokens, H, D]`` and ``[1, tokens, H]``.
         The state pool uses value-first ``[slots, H, D, D]`` storage.
+        ``snapshot = (pool, rows, chunks)``: mid-sequence state snapshots of the
+        optimized indexed kernel (``KDAKernelDispatch.prefill_chunk_kda``).
         """
         state = _prepared_state
         if state is None:
@@ -1045,6 +1097,7 @@ class KimiKDALinearAttention(nn.Module):
             seq_order=getattr(mamba_metadata, "kda_seq_order", None),
             cu_chunks=getattr(mamba_metadata, "kda_cu_chunks", None),
             sm_reserve=self._prefill_sm_reserve,
+            snapshot=snapshot,
         )
 
         # The packed convolution persisted the live convolution pool in place.
