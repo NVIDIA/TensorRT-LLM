@@ -92,13 +92,15 @@ def _store_global_b64(gmem_ptr, value_lo: Int32, value_hi: Int32, *, loc=None, i
 @dsl_user_op
 def _load_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
     smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    # The FP8 epilogue reuses this scratch space for each output column tile.
+    # Keep each read ordered with its stores and prevent reuse across tiles.
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [smem_addr.ir_value(loc=loc, ip=ip)],
             "ld.shared.b32 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
+            "=r,r,~{memory}",
+            has_side_effects=True,
             loc=loc,
             ip=ip,
         )
