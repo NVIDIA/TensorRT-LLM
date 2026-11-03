@@ -1243,6 +1243,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_routed_experts=self.py_return_routed_experts,
             original_end_id=self.py_original_end_id,
             conversation_params=self.py_conversation_params,
+            kv_hints=self.py_kv_hints,
             uncached_prefill_tokens=self.py_uncached_prefill_tokens,
         ).copy_for_child()
         child = LlmRequest(

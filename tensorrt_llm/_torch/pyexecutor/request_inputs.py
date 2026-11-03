@@ -125,6 +125,10 @@ class ExecutorRequest:
         return self.inputs.conversation_params
 
     @property
+    def py_kv_hints(self) -> KvHintsSnapshot | None:
+        return self.inputs.kv_hints
+
+    @property
     def py_disaggregated_params(self) -> DisaggregatedParams | None:
         return self.inputs.disaggregated_params
 
