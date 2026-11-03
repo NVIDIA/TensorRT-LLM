@@ -405,14 +405,15 @@ class TestInputReferenceResolution:
         # … and the payload read fails before any file is written, so nothing leaks.
         assert list(tmp_path.iterdir()) == []  # nothing is ever written to disk
 
-    def test_missing_file_uri_is_client_error(self, tmp_path):
+    def test_missing_file_uri_is_client_error(self, tmp_path, monkeypatch):
         # A file:// path that does not exist is a client 400, not a server 500.
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_LOCAL_PATH", str(tmp_path))
         generator = _StubVisualGen()
         missing = (tmp_path / "does_not_exist.png").as_uri()
         request = VideoGenerationRequest(
             prompt="x", image_reference={"content": missing, "format": "path"}
         )
-        with pytest.raises(ValueError, match="file could not be read"):
+        with pytest.raises(ValueError, match="could not be read"):
             _parse_and_prepare(request, generator)
 
 
@@ -967,40 +968,74 @@ class TestSafeLocalFileRead:
             _safe_read_local_file(str(link))
 
 
-class TestLocalMediaPathCanBeDisallowed:
-    """``format='path'`` reads server-side files, so a deployment can refuse it.
+class TestPathReferencePolicy:
+    """A ``format='path'`` reference follows the request local media policy.
 
-    Allowed by default: a co-located client naming a shared path is a real
-    setup, and the code cannot tell that deployment from an untrusted one.
+    The boundary reads the file itself, under the same variable as a chat media
+    part naming a local file: refused unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH``
+    names a directory that holds it. ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` only
+    governs ``response_format='path'``.
     """
 
+    _ALLOWED_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+    _DISALLOW_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
+
+    @pytest.fixture(autouse=True)
+    def _policy_unset(self, monkeypatch):
+        monkeypatch.delenv(self._ALLOWED_ENV, raising=False)
+        monkeypatch.delenv(self._DISALLOW_ENV, raising=False)
+
     @staticmethod
-    def _request(fmt="path", content="/tmp/ref.png"):
+    def _png(directory: Path) -> Path:
+        buffer = BytesIO()
+        Image.new("RGB", (8, 8), (9, 8, 7)).save(buffer, format="PNG")
+        target = directory / "ref.png"
+        target.write_bytes(buffer.getvalue())
+        return target
+
+    @staticmethod
+    def _request(content: str):
         return VideoGenerationRequest(
-            prompt="x", image_reference={"content": content, "format": fmt}
+            prompt="x", image_reference={"content": content, "format": "path"}
         )
 
-    def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", raising=False)
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
+    def test_refused_without_an_allowed_directory(self, tmp_path):
+        target = self._png(tmp_path)
 
-        assert params.image_reference[0].format == "path"
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            parse_visual_gen_params(self._request(str(target)), _StubVisualGen())
 
-    def test_path_is_refused_when_disallowed(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    def test_read_to_bytes_inside_the_allowed_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        target = self._png(tmp_path)
 
-        with pytest.raises(ValueError, match="is disallowed on this server"):
-            parse_visual_gen_params(self._request(), _StubVisualGen())
+        for content in (str(target), target.as_uri()):
+            params = parse_visual_gen_params(self._request(content), _StubVisualGen())
+            assert params.image_reference[0].format == "bytes"
+            assert params.image_reference[0].content == target.read_bytes()
+
+    def test_the_path_response_switch_does_not_affect_references(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        monkeypatch.setenv(self._DISALLOW_ENV, "1")
+        target = self._png(tmp_path)
+
+        params = parse_visual_gen_params(self._request(str(target)), _StubVisualGen())
+
+        assert params.image_reference[0].format == "bytes"
+
+
+class TestPathResponseSwitch:
+    """``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` turns ``response_format='path'`` off."""
+
+    _ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
 
     def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
         """Silently reading a typo as "1" would break working deployments, and
         silently reading it as "0" would leave one that believes it is locked
         down wide open. Neither is safe to do quietly."""
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "true")
+        monkeypatch.setenv(self._ENV, "true")
         warnings: list[str] = []
         monkeypatch.setattr(visual_gen_utils.logger, "warning", warnings.append)
 
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
-
-        assert params.image_reference[0].format == "path"
-        assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)
+        assert visual_gen_utils.local_media_path_is_disallowed() is False
+        assert any(self._ENV in w for w in warnings)

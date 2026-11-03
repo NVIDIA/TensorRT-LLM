@@ -1076,11 +1076,12 @@ def _normalize_file_uri(uri: str) -> str:
 
 
 # Directory from which request-supplied local media paths may be read.
-# Media parts of a server request may name a `file://` URI or a bare path; such
-# a reference is read from the server's own filesystem, so it is accepted only
-# when TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path
-# lies inside it. Unset (the default) refuses every local reference. The
-# offline Python API does not go through this check.
+# A server request may name a `file://` URI or a bare path (a chat media part,
+# or a VisualGen reference with format='path'); such a reference is read from
+# the server's own filesystem, so it is accepted only when
+# TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path lies
+# inside it. Unset (the default) refuses every local reference. The offline
+# Python API does not go through this check.
 _ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
 
 # Flags for the single open of a request-supplied local file. Each is left
@@ -1186,6 +1187,20 @@ def _read_open_media(fd: int, url: str) -> bytes:
     data = b"".join(chunks)
     _check_media_size(len(data), _MAX_RESPONSE_BYTES)
     return data
+
+
+def read_allowed_local_media(url: str) -> bytes:
+    """Read a request-supplied local media file under the allowed-directory policy.
+
+    `open_allowed_local_media` followed by a bounded read of the open file, for
+    a caller that wants the bytes rather than a decoded object. Blocking; call
+    it on an executor.
+    """
+    fd = open_allowed_local_media(url)
+    try:
+        return _read_open_media(fd, url)
+    finally:
+        os.close(fd)
 
 
 def log_allowed_local_media_path() -> None:

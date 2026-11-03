@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from PIL import Image, UnidentifiedImageError
 
-from tensorrt_llm.inputs.media_io import sniff_media_kind
+from tensorrt_llm.inputs.media_io import read_allowed_local_media, sniff_media_kind
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (
     ImageEditRequest,
@@ -110,22 +110,21 @@ def _merge_extra_params(
 
 
 def local_media_path_is_disallowed() -> bool:
-    """Whether server-side filesystem paths are refused at the HTTP boundary.
+    """Whether ``response_format='path'`` is refused at the HTTP boundary.
 
-    One switch for both directions, because both are the same trust question:
-    a ``path`` reference has the server read its own disk, and
-    ``response_format='path'`` has it disclose where it wrote. Either is what a
-    co-located client wants and what a remote one has no business doing, and
-    the code cannot tell the two deployments apart, so both are allowed by
-    default and turned off together with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``.
-    The local Python API is unaffected: this gate is the HTTP boundary's.
+    A ``path`` response discloses where the server wrote a file: what a
+    co-located client wants and what a remote one has no business seeing. The
+    code cannot tell the two deployments apart, so it is allowed by default
+    and turned off with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``. A ``path``
+    *reference*, which has the server read a file, follows
+    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` instead (`_reference_transport`).
     """
     raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
     if raw not in ("0", "1"):
         logger.warning(
             "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
             f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-            "(server-side paths allowed)."
+            "(path responses allowed)."
         )
     return raw == "1"
 
@@ -135,22 +134,24 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
 
     ``ref`` is a multipart ``UploadFile`` (has ``.file``) or a
     ``MediaReferenceItem`` exposing ``content`` / ``format`` / ``role``. An
-    upload is read to ``bytes`` here — the only decode the boundary owns — and
-    its format is implied by the transport rather than declared by the client;
-    everything else passes through for the engine to resolve.
+    upload is read to ``bytes`` here, its format implied by the transport
+    rather than declared by the client. A ``path`` reference names a file on
+    the server, so it is read to ``bytes`` here as well, under the request
+    local media policy (`read_allowed_local_media`): only a regular file inside
+    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is read. ``url`` and ``base64`` pass
+    through for the engine to resolve.
     """
     if hasattr(ref, "file"):  # multipart UploadFile
         return ref.file.read(), "bytes", getattr(ref, "role", None)
     content = getattr(ref, "content", None)
     if not isinstance(content, str):
         raise ValueError("reference item must carry a 'content' string.")
-    if ref.format == "path" and local_media_path_is_disallowed():
-        raise ValueError(
-            "reference format='path' is disallowed on this server "
-            "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it reads server-side files "
-            "and is only meaningful for co-located clients. Send the file as "
-            "base64 or upload it via multipart/form-data."
-        )
+    if ref.format == "path":
+        try:
+            data = read_allowed_local_media(content)
+        except ValueError as exc:
+            raise ValueError(f"reference format='path': {exc}") from exc
+        return data, "bytes", getattr(ref, "role", None)
     return content, ref.format, getattr(ref, "role", None)
 
 
@@ -159,8 +160,9 @@ def _build_reference_list(value: Any) -> Optional[list]:
 
     ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
     a list of those. Each entry becomes a ``MediaRef`` carrying its transport
-    content plus the declared (or, for an upload, implied) wire format.
-    Resolution to bytes happens later, at the engine choke point.
+    content plus the declared (or, for an upload, implied) wire format. A
+    ``path`` reference is read here under the local media policy; ``url`` and
+    ``base64`` are resolved later, at the engine choke point.
     """
     if value is None:
         return None
@@ -480,8 +482,8 @@ def parse_visual_gen_params(
                 )
             params.num_frames = derived
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
-        # transport content (``bytes`` for an upload, the string otherwise).
-        # The engine resolves it to bytes; the boundary never touches disk.
+        # transport content (``bytes`` for an upload or an allowed local file,
+        # the string otherwise). The engine resolves ``url`` and ``base64``.
         image_refs = _build_reference_list(request.image_reference)
         if image_refs:
             params.image_reference = image_refs

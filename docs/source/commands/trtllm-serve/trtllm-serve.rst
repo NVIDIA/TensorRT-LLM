@@ -247,7 +247,8 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
    resolved path is inside that directory are read. This applies to
    ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
    clients send local paths today must set the variable to the directory
-   that holds those files.
+   that holds those files. VisualGen references sent with ``format='path'``
+   follow the same variable.
 
 .. note::
    To convert images to base64-encoded format, use the utility function
