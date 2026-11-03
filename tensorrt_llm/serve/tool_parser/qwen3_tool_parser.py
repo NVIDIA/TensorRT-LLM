@@ -259,6 +259,10 @@ class Qwen3ToolParser(BaseToolParser):
 
         return result
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit the tool calls the last chunk delivered but no step has reported yet."""
+        return self._flush_buffered_steps(tools)
+
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin='<tool_call>\n{"name":"' + name + '", "arguments":',

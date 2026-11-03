@@ -127,7 +127,7 @@ class DeepSeekV3Parser(BaseToolParser):
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)\n```json\n(.*)\n```.*",
+                pattern=r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```.*",
                 string=current_text,
                 flags=re.DOTALL,
             )
@@ -207,6 +207,10 @@ class DeepSeekV3Parser(BaseToolParser):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=normal_text + current_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit the tool calls the last chunk delivered but no step has reported yet."""
+        return self._flush_buffered_steps(tools)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

@@ -7630,3 +7630,48 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+def _assemble_streamed_calls(calls) -> list[tuple[str, dict]]:
+    """Join streamed ToolCallItems (name first, then argument deltas) per tool."""
+    assembled: dict[int, dict] = {}
+    for call in calls:
+        entry = assembled.setdefault(call.tool_index, {
+            "name": None,
+            "arguments": ""
+        })
+        entry["name"] = call.name or entry["name"]
+        entry["arguments"] += call.parameters or ""
+    return [(entry["name"], json.loads(entry["arguments"]))
+            for _, entry in sorted(assembled.items())]
+
+
+@pytest.mark.parametrize("test_class", [
+    TestKimiK2ToolParser,
+    TestQwen3ToolParser,
+    TestDeepSeekV3Parser,
+    TestDeepSeekV31Parser,
+],
+                         ids=lambda test_class: test_class.__name__)
+def test_streaming_flushes_complete_tool_calls_delivered_in_one_chunk(
+        sample_tools: list[ChatCompletionToolsParam], test_class) -> None:
+    """Complete tool calls in a single chunk must come out with their arguments.
+
+    These parsers emit a tool name on one step and its arguments on the next,
+    while the serving layer makes one `parse_streaming_increment` call per
+    chunk. A chunk holding complete calls (a speculative-decoding step,
+    `stream_interval` > 1, or a short call in the last chunk) therefore ended
+    the stream with the first name and no arguments, and dropped any further
+    calls.
+    """
+    test = test_class()
+    cases = test.make_tool_parser_test_cases()
+
+    for text in (cases.detect_and_parse_single_tool[0],
+                 cases.detect_and_parse_multiple_tools[0]):
+        expected = [(call.name, json.loads(call.parameters)) for call in
+                    test.make_parser().detect_and_parse(text, sample_tools).calls]
+
+        _, calls = _stream(test.make_parser(), text, len(text), sample_tools)
+
+        assert _assemble_streamed_calls(calls) == expected

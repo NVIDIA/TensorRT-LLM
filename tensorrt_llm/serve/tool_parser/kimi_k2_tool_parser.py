@@ -206,6 +206,10 @@ class KimiK2ToolParser(BaseToolParser):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Emit the tool calls the last chunk delivered but no step has reported yet."""
+        return self._flush_buffered_steps(tools)
+
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
 
