@@ -1,6 +1,18 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Keep the EFA functional test from accepting fallback or metadata-only runs."""
 
 import importlib.util
@@ -26,22 +38,21 @@ libfabric:123:1700000000::efa:domain:efa_domain_open():100<info> domain initiali
 def send(request_id: int, size: int) -> str:
     return (
         f"KVSendTask.print_perf_info: unique_rid={request_id}, peer_rank=0, "
-        f"transfer_size={size} byte, entry_count=71, task_latency=172.041 ms\n"
+        f"transfer_size={size} byte, entry_count=1, task_latency=1.0 ms\n"
     )
 
 
 def receive(request_id: int) -> str:
     return (
-        f"KVRecvTask.print_perf_info: unique_rid={request_id}, peer_rank=0, "
-        "task_latency=354.391 ms\n"
+        f"KVRecvTask.print_perf_info: unique_rid={request_id}, peer_rank=0, task_latency=1.0 ms\n"
     )
 
 
 def test_accepts_efa_data_transfers() -> None:
     # Receiver records intentionally have no byte count, as in the runtime logs.
     validate_efa_worker_logs(
-        _STARTUP + send(49127173691932674, 260571136) + send(49127173691932675, 260571136),
-        _STARTUP + receive(49127173691932674) + receive(49127173691932675),
+        _STARTUP + send(1, 4096) + send(2, 8192),
+        _STARTUP + receive(1) + receive(2),
         received_requests=2,
     )
 
