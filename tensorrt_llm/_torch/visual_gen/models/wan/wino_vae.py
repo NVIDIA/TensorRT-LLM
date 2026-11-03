@@ -113,9 +113,13 @@ class WinoVaeOptions:
     # memory over NVLink) and one barrier per exchange replaces the pack copy, the NCCL
     # send/receive and the unpack copy; "nccl": batched point-to-point sends; "auto":
     # "direct" where the ranks can map each other's memory, else "nccl".
-    halo_exchange: str = "auto"
+    halo_exchange: Literal["auto", "nccl", "direct"] = "auto"
 
     def __post_init__(self) -> None:
+        for name in ("encoder_chunk_frames", "frame_buffer_chunks"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an int, got {value!r}")
         if self.halo_exchange not in ("auto", "nccl", "direct"):
             raise ValueError(
                 f"halo_exchange must be 'auto', 'nccl' or 'direct', got {self.halo_exchange!r}"
@@ -242,8 +246,8 @@ def _can_fuse(s: DeferredSum) -> bool:
 
 
 def _add_bias_and_residual(s: DeferredSum, pad_h: int, pad_w: int) -> torch.Tensor:
-    """``s`` added up by the add_bias_and_residual kernel, ``[T, (H+pad_h)*(W+pad_w), C]``, the padding
-    rows and columns zero."""
+    """``s`` added up by the add_bias_and_residual kernel, ``[T, (H+pad_h)*(W+pad_w), C]``,
+    the padding rows and columns zero."""
     src = s.source
     h, w = s.shape[-2:]
     if isinstance(src, torch.Tensor):
@@ -253,13 +257,23 @@ def _add_bias_and_residual(s: DeferredSum, pad_h: int, pad_w: int) -> torch.Tens
     r = s.residual
     r_f = frames_view(_channels_last_3d_if_needed(r)) if r is not None else None
     return add_bias_and_residual(
-        x_f, m_f, s.bias, r_f, s.shape[2], h, w, pad_h, pad_w, products_geometry=geometry
+        x=x_f,
+        m=m_f,
+        bias=s.bias,
+        residual=r_f,
+        frames=s.shape[2],
+        height=h,
+        width=w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        products_geometry=geometry,
     )
 
 
 def materialize(x: "torch.Tensor | DeferredSum") -> torch.Tensor:
-    """``x`` as a tensor. A :class:`DeferredSum` is added up here: one add_bias_and_residual kernel pass, or
-    eager adds where the kernel does not apply (batched input, kernels unavailable).
+    """``x`` as a tensor. A :class:`DeferredSum` is added up here: one add_bias_and_residual
+    kernel pass, or eager adds where the kernel does not apply (batched input, kernels
+    unavailable).
     Winograd products only exist when the kernels ran, so they always take the kernel."""
     if not isinstance(x, DeferredSum):
         return x
@@ -422,15 +436,15 @@ class WinoVaeRMSNorm(WanRMSNorm):
         src = x.source
         products = src if isinstance(src, WinogradProducts) else None
         s, y_tail, d = wino_norm_silu(
-            frames_view(src) if products is None else None,
-            [images_to_pairs(mk) for mk in products.products] if products is not None else None,
-            frames_view(x.residual) if x.residual is not None else None,
-            x.bias,
-            frames_view(cache) if cache is not None and cache.shape[2] > 0 else None,
-            self.gamma,
-            bias,
-            self.scale,
-            frames,
+            x=frames_view(src) if products is None else None,
+            m=[images_to_pairs(mk) for mk in products.products] if products is not None else None,
+            residual=frames_view(x.residual) if x.residual is not None else None,
+            in_bias=x.bias,
+            cache=frames_view(cache) if cache is not None and cache.shape[2] > 0 else None,
+            gamma=self.gamma,
+            bias=bias,
+            scale=self.scale,
+            frames=frames,
             order=temporal_order_for(frames),
             fp16_inputs=_WINOGRAD_DTYPE == torch.float16,
             products_geometry=products.geometry if products is not None else None,
@@ -631,7 +645,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         # cuDNN call and concatenates the output frames.
         self.max_in_frames: int | None = None
         # Tensors derived from the weight (transformed filters, the current-frame slice).
-        self._derived: dict[tuple, tuple[tuple[int, int], Any]] = {}
+        self._derived: dict[tuple, tuple[tuple, Any]] = {}  # key -> (_stamp of the weight, value)
         # Set by the residual block for its two convs: spatial Winograd where selected, and
         # the cuDNN graph API (per-shape plan choice) for the convs that stay direct. Every
         # other conv runs through torch's cuDNN path.

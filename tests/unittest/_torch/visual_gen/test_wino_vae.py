@@ -99,6 +99,16 @@ def test_wino_vae_options_reject_unknown() -> None:
         WinoVaeOptions.from_dict({"nope": True})
 
 
+@pytest.mark.parametrize(
+    "values",
+    [{"encoder_chunk_frames": 8.0}, {"frame_buffer_chunks": 1.5}, {"frame_buffer_chunks": True}],
+)
+def test_wino_vae_options_reject_non_int(values: dict) -> None:
+    name = next(iter(values))
+    with pytest.raises(TypeError, match=name):
+        WinoVaeOptions(**values)
+
+
 @pytest.mark.parametrize("frames,chunk", [(1, 1), (5, 1), (9, 1), (9, 2), (17, 4)])
 def test_matches_native(frames: int, chunk: int) -> None:
     _check_encode_decode(*_pair(), frames, chunk)

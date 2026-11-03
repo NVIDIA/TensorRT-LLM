@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kernel wrappers for WinoVae: the CuTe DSL norm kernel (:mod:`jit_norm`, :mod:`kernels.norm`),
-the compiled ``trtllm::vae_*`` ops and the portable spatial Winograd conv. Each wrapper states
+the upsample gather and the portable spatial Winograd conv. Each wrapper states
 its layout, dtype and shape preconditions; choosing a fallback when they do not hold is the
 caller's job (``can_*`` / ``*_available`` predicates), not the wrapper's. The frame operations
 (:mod:`kernels.frame_ops`) and the Blackwell spatial Winograd (:mod:`kernels.blackwell.spatial`)
@@ -62,7 +62,7 @@ def rms_norm_silu(
     """The norm kernel (:mod:`jit_norm` in row mode): RMSNorm over channels (+ SiLU) of a
     channels-last bf16 CUDA tensor whose channel count is a multiple of 8
     (``rms_norm_silu_supported``); fp32 arithmetic, bf16 result of ``x``'s shape.
-    ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
+    ``silu=False`` returns the RMSNorm (with ``bias``) without the SiLU.
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
     ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
@@ -377,15 +377,15 @@ def add_bias_and_residual(
     appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``products_geometry``: the
     products carry halo rows / columns (spatially sharded decode)."""
     return jit_norm.add_bias_and_residual(
-        x,
-        m,
-        bias.reshape(-1).contiguous() if bias is not None else None,
-        residual,
-        frames,
-        height,
-        width,
-        pad_h,
-        pad_w,
+        x=x,
+        m=m,
+        bias=bias.reshape(-1).contiguous() if bias is not None else None,
+        residual=residual,
+        frames=frames,
+        height=height,
+        width=width,
+        pad_h=pad_h,
+        pad_w=pad_w,
         products_geometry=products_geometry,
     )
 
@@ -408,21 +408,18 @@ def wino_norm_silu(
     inputs_geometry: FrameGeometry | None = None,
     inputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
-    ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
-    ``D[k]`` is input k, fp16 when ``fp16_inputs`` (required for order 4) else bf16. The
-    geometries describe products / Winograd inputs that carry halo rows or columns (sharded decode);
-    ``inputs`` is an optional preallocated ``D``."""
+    """The temporal Winograd norm (:func:`jit_norm.wino_norm_silu`); per-channel tensors may
+    have any shape with ``C`` elements."""
     return jit_norm.wino_norm_silu(
-        x,
-        m,
-        residual,
-        in_bias.reshape(-1) if in_bias is not None else None,
-        cache,
-        gamma.reshape(-1),
-        bias.reshape(-1) if bias is not None else None,
-        float(scale),
-        frames,
+        x=x,
+        m=m,
+        residual=residual,
+        in_bias=in_bias.reshape(-1) if in_bias is not None else None,
+        cache=cache,
+        gamma=gamma.reshape(-1),
+        bias=bias.reshape(-1) if bias is not None else None,
+        scale=float(scale),
+        frames=frames,
         order=order,
         fp16_inputs=fp16_inputs,
         reference_rounding=reference_rounding,

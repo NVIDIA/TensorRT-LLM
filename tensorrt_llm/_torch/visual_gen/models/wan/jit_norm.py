@@ -303,8 +303,22 @@ def wino_norm_silu(
     inputs_geometry: FrameGeometry | None = None,
     inputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
-    ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``.
+    """Temporal Winograd norm: RMSNorm + SiLU of ``T`` frames, written as the order-``order``
+    temporal Winograd inputs of the conv that follows. Every tensor is bf16 frames ``[.., P, C]``
+    of ``P`` logical positions, except the products and the Winograd inputs (fp16 when
+    ``fp16_inputs``).
+
+    Input, exactly one of: ``x`` ``[T, P, C]``, the frames; or ``m``, the ``order + 2``
+    temporal Winograd conv products, each ``[T/order, P, C]``, turned into frames by the output
+    transform first. ``in_bias`` ``[C]`` is a conv bias not yet applied to them, ``residual``
+    ``[T, P, C]`` the block shortcut, both added before the norm. ``cache`` ``[0..2, P, C]``:
+    the previous chunk's last normalized frames (none: zero history). ``gamma`` / ``bias``
+    ``[C]``: the norm's scale and shift.
+
+    Returns ``(sum, y_tail, D)``: ``sum`` ``[T, P, C]``, the pre-norm frames, when there is a
+    residual, an input bias or product input (else None); ``y_tail`` ``[2, P, C]``, the last
+    two normalized frames (the next chunk's cache); ``D`` ``[order + 2, T/order, input
+    positions, C]``, the Winograd inputs.
 
     ``products_geometry`` / ``inputs_geometry``: the products are read from, and the Winograd inputs
     written to, frames with halo rows or columns (``[T/order, rows * cols, C]``); the kernel
@@ -429,7 +443,7 @@ def wino_norm_silu(
 
 
 def rms_norm_silu_rows(
-    x: torch.Tensor | None,
+    x: torch.Tensor,
     gamma: torch.Tensor,
     bias: torch.Tensor | None,
     scale: float,
