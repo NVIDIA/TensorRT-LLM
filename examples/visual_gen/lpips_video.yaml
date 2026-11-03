@@ -1,0 +1,5 @@
+# Reference paths are relative to this YAML file. Quote numeric prompt IDs.
+references:
+  fox: baselines/fox.mp4
+net: alex
+device: cpu
