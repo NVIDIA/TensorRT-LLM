@@ -50,6 +50,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import primitives as prims
 
+from ..common import self_attn_prefill_act_quant_mxf8 as _mxf8
+
 try:
     from cutlass._mlir import ir as _ir
     from cutlass._mlir.dialects import llvm as _llvm
@@ -3116,8 +3118,18 @@ def _twoshot_block_epilogue(
     VECS_PER_THREAD: cutlass.Constexpr[int],
     ROWS_PER_CTA: cutlass.Constexpr[int],
     EMIT_NVFP4: cutlass.Constexpr[bool],
+    q8_base,
+    sf8_base,
+    EMIT_MXF8: cutlass.Constexpr[bool],
 ):
     """`_twoshot_row_epilogue` for the ROWS_PER_CTA rows of one block at once.
+
+    ``EMIT_MXF8`` (push kernel only): the normalized BF16 rows are also written as MXF8
+    (e4m3 ``[M, N]`` at ``q8_base`` + blocked e8m0 scales at ``sf8_base``), the bytes
+    ``self_attn_prefill_act_quant_mxf8`` writes for the BF16 output -- the context kv_a
+    projection's operand without its own quant launch.  Thread ``t`` holds columns
+    ``(t + v * THREADS_PER_BLOCK) * 8``, so a 32-column scale block is threads ``4j .. 4j +
+    3`` (one warp) and the row predicate is CTA-uniform: every lane reaches the shuffles.
 
     ``block_values`` holds the block's reduced rows (row ``rr``, vector ``v`` at
     ``(rr * VECS_PER_THREAD + v) * 8``) and is overwritten with the residual
@@ -3216,6 +3228,21 @@ def _twoshot_block_epilogue(
                 norm_output_array[row, :].store(
                     norm_bf16, col, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
                 )
+                if cutlass.const_expr(EMIT_MXF8):
+                    norm_q8_f32 = norm_bf16.to(cutlass.Float32)
+                    vals8 = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+                    for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                        vals8[lane] = norm_q8_f32[lane]
+                    _mxf8.mxf8_quant_store_x8(
+                        vals8,
+                        q8_base,
+                        cutlass.Int64(row) * cutlass.Int64(N) + cutlass.Int64(col),
+                        sf8_base,
+                        cutlass.Int64(row),
+                        cutlass.Int64(col),
+                        cutlass.Int64(N // 128),
+                        row < m_rows,
+                    )
                 if cutlass.const_expr(EMIT_NVFP4):
                     quant_f32 = norm_bf16.to(cutlass.Float32)
                     local_max = cutlass.Float32(0.0)
@@ -4273,6 +4300,7 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
     USE_PDL: cutlass.Constexpr[bool],
     PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
     EMIT_NVFP4: cutlass.Constexpr[bool],
+    EMIT_MXF8: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -4282,6 +4310,10 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
     VECS_PER_THREAD = N // (_BF16_VEC_SIZE * THREADS_PER_BLOCK)
 
     m_rows = cutlass.Int32(cute.size(input_tensor, mode=[0]))
+    # EMIT_MXF8: fp4_output_tensor is the e4m3 [M, N] output, scale_output_tensor its
+    # blocked e8m0 scales (see `_twoshot_block_epilogue`).
+    q8_base = fp4_output_tensor.iterator
+    sf8_base = scale_output_tensor.iterator
     input_array = cutlass.make_array_view(input_tensor)
     residual_array = cutlass.make_array_view(residual_tensor)
     norm_weight_array = cutlass.make_array_view(norm_weight_tensor)
@@ -4314,6 +4346,15 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
     if cutlass.const_expr(EMIT_NVFP4):
         global_scale = prims.load_ext(
             global_scale_tensor.iterator.raw_ptr(), dtype=cutlass.Float32
+        )
+    if cutlass.const_expr(EMIT_MXF8):
+        # after the PDL wait, like every other store of this kernel
+        _mxf8.mxf8_fill_pad_scales(
+            sf8_base,
+            m_rows,
+            cutlass.Int32(N // 128),
+            bidx * THREADS_PER_BLOCK + tidx,
+            grid_x * THREADS_PER_BLOCK,
         )
 
     signal_i32 = cutlass.Int32(0)
@@ -4570,6 +4611,9 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
                 VECS_PER_THREAD,
                 ROWS_PER_CTA,
                 EMIT_NVFP4,
+                q8_base,
+                sf8_base,
+                EMIT_MXF8,
             )
         # ---- every peer block of the group: its owner's sums arrive in region [ping][owner].
         for peer_ordinal in cutlass.range_constexpr(1, WORLD_SIZE):
@@ -4653,6 +4697,9 @@ def _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
                     VECS_PER_THREAD,
                     ROWS_PER_CTA,
                     EMIT_NVFP4,
+                    q8_base,
+                    sf8_base,
+                    EMIT_MXF8,
                 )
         group = group + grid_x
 
@@ -4714,6 +4761,7 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_twoshot_nvls(
             USE_PDL,
             PDL_RELEASE_AT_ENTRY,
             False,
+            False,
         ).launch(
             grid=(push_grid, 1, 1),
             block=(THREADS_PER_BLOCK, 1, 1),
@@ -4758,6 +4806,71 @@ def _glm_tp_allreduce_residual_rms_norm_bf16_twoshot_nvls(
             stream=stream,
             use_pdl=USE_PDL,
         )
+
+
+@cute.jit
+def _glm_tp_allreduce_residual_rms_norm_out_mxf8_twoshot_push(
+    input_tensor: cute.Tensor,
+    residual_tensor: cute.Tensor,
+    norm_weight_tensor: cute.Tensor,
+    norm_output_tensor: cute.Tensor,
+    q8_output_tensor: cute.Tensor,
+    q8_scale_tensor: cute.Tensor,
+    residual_output_tensor: cute.Tensor,
+    buffers: list[cute.Tensor],
+    ready_flags: list[cute.Tensor],
+    signal_state: cute.Tensor,
+    multicast_base: cutlass.Int64,
+    signal: cutlass.Int64,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    N: cutlass.Constexpr[int],
+    LOCAL_RANK: cutlass.Constexpr[int],
+    WORLD_SIZE: cutlass.Constexpr[int],
+    THREADS_PER_BLOCK: cutlass.Constexpr[int],
+    ROWS_PER_CTA: cutlass.Constexpr[int],
+    USE_DEVICE_SIGNAL_STATE: cutlass.Constexpr[bool],
+    USE_PDL: cutlass.Constexpr[bool],
+    PDL_RELEASE_AT_ENTRY: cutlass.Constexpr[bool],
+) -> None:
+    """op1 two-shot (push) with the normalized rows also emitted as MXF8 (e4m3 + blocked
+    e8m0 1x32 scales, the GLM-5.2 context kv_a projection's operand); same transport, slots
+    and signal state as op1, so the two interleave."""
+    M = input_tensor.shape[0]
+    PUSH_ROWS = _TWOSHOT_PUSH_ROWS if _TWOSHOT_PUSH_ROWS > 0 else ROWS_PER_CTA
+    push_grid = (M + PUSH_ROWS * WORLD_SIZE - 1) // (PUSH_ROWS * WORLD_SIZE)
+    push_grid = cutlass.min(push_grid, cutlass.Int32(_TWOSHOT_PUSH_CTAS))
+    _glm_tp_allreduce_residual_rms_norm_twoshot_push_kernel(
+        input_tensor,
+        residual_tensor,
+        norm_weight_tensor,
+        norm_weight_tensor,
+        norm_output_tensor,
+        q8_output_tensor,
+        q8_scale_tensor,
+        residual_output_tensor,
+        buffers,
+        ready_flags,
+        signal_state,
+        multicast_base,
+        signal,
+        eps,
+        N,
+        LOCAL_RANK,
+        WORLD_SIZE,
+        THREADS_PER_BLOCK,
+        PUSH_ROWS,
+        USE_DEVICE_SIGNAL_STATE,
+        USE_PDL,
+        PDL_RELEASE_AT_ENTRY,
+        False,
+        True,
+    ).launch(
+        grid=(push_grid, 1, 1),
+        block=(THREADS_PER_BLOCK, 1, 1),
+        stream=stream,
+        use_pdl=USE_PDL,
+    )
 
 
 def compile_pure_for_rank(
@@ -5253,8 +5366,14 @@ def _compile_twoshot_common(
     threads_per_block: int,
     rows_per_cta: int,
     emit_nvfp4: bool,
+    emit_mxf8: bool = False,
 ):
     cutlass.cuda.initialize_cuda_context(device_id)
+    if emit_mxf8 and (emit_nvfp4 or not _TWOSHOT_PUSH or n % 128 != 0):
+        raise ValueError(
+            "the MXF8-out two-shot is the push variant (GLM_TWOSHOT_PUSH=1), n % 128 == 0, "
+            f"and excludes NVFP4; got push={_TWOSHOT_PUSH} n={n} nvfp4={emit_nvfp4}"
+        )
     if threads_per_block not in _TWOSHOT_THREADS_PER_BLOCK_CHOICES:
         raise ValueError(
             "threads_per_block must be one of "
@@ -5366,6 +5485,28 @@ def _compile_twoshot_common(
         use_pdl,
         pdl_release_policy == "entry",
     )
+    if emit_mxf8:
+        q8_output_tensor = make_fake_compact_tensor(
+            cutlass.Uint8,
+            (sym_m, n),
+            stride_order=(1, 0),
+            assumed_align=_ALIGNMENT_BYTES,
+        )
+        q8_scale_tensor = make_fake_compact_tensor(
+            cutlass.Uint8, (cute.sym_int32(),), assumed_align=32
+        )
+        return cute.compile(
+            jit_entry,
+            input_tensor,
+            residual_tensor,
+            norm_weight_tensor,
+            norm_output_tensor,
+            q8_output_tensor,
+            q8_scale_tensor,
+            residual_output_tensor,
+            *tail,
+            options="--enable-tvm-ffi",
+        )
     if emit_nvfp4:
         global_scale_tensor = make_fake_compact_tensor(cutlass.Float32, (1,), assumed_align=4)
         fp4_output_tensor = make_fake_compact_tensor(
@@ -5434,4 +5575,38 @@ def compile_fused_twoshot_for_rank(
         threads_per_block=threads_per_block,
         rows_per_cta=rows_per_cta,
         emit_nvfp4=False,
+    )
+
+
+def compile_fused_out_mxf8_twoshot_for_rank(
+    local_rank: int = 0,
+    world_size: int = 1,
+    device_id: int = 0,
+    n: int = _DEFAULT_N,
+    eps: float = _RMS_EPS,
+    use_device_signal_state: bool = _USES_DEVICE_SIGNAL_STATE,
+    use_pdl: bool | None = None,
+    pdl_release_policy: str = "output_safe",
+    threads_per_block: int = _TWOSHOT_THREADS_PER_BLOCK,
+    rows_per_cta: int = _TWOSHOT_ROWS_PER_CTA,
+    **_ignored_oneshot_knobs,
+):
+    """op1 two-shot (push only) that also writes the normalized rows as MXF8:
+    ``fn(input, residual, weight, out, q8 [M, n] uint8, sf uint8 (>= padded(M) * n / 32,
+    32-byte aligned), residual_out, buffers, flags, state, multicast_base, signal, stream)``;
+    q8 / sf are ``self_attn_prefill_act_quant_mxf8.quantize(out)`` bitwise."""
+    return _compile_twoshot_common(
+        _glm_tp_allreduce_residual_rms_norm_out_mxf8_twoshot_push,
+        local_rank=local_rank,
+        world_size=world_size,
+        device_id=device_id,
+        n=n,
+        eps=eps,
+        use_device_signal_state=use_device_signal_state,
+        use_pdl=use_pdl,
+        pdl_release_policy=pdl_release_policy,
+        threads_per_block=threads_per_block,
+        rows_per_cta=rows_per_cta,
+        emit_nvfp4=False,
+        emit_mxf8=True,
     )

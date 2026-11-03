@@ -28,6 +28,7 @@ context rows, the context attention reads the causal window through the block ta
 
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 from typing import cast
 
@@ -58,6 +59,11 @@ from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
 from .ops.activation.cute_dsl_dense_swiglu import cute_dsl_dense_swiglu
 from .ops.activation.cute_dsl_swiglu_rows import cute_dsl_swiglu_rows
+from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
+from .ops.activation.cute_dsl_swiglu_mxf8 import cute_dsl_swiglu_mxf8
+from .ops.attention import cute_dsl_mha_kv_gather_mxf8 as _kv_gather8_op
+from .ops.attention import cute_dsl_mha_prefill as _mha_pre_op
+from .ops.attention import cute_dsl_mha_prefix_gather as _mha_prefix_op
 from .ops.attention import cute_dsl_mla_rope_append_prefill as _ctx_rope_op
 from .ops.attention import cute_dsl_mla_rope_generation as _mla_rope_op
 from .ops.attention import cute_dsl_sparse_mla_decode as _fmha_dec_op
@@ -72,6 +78,9 @@ from .ops.attention.cute_dsl_indexer_topk_decode import build as build_ix_topk_d
 from .ops.attention.cute_dsl_indexer_topk_decode import cute_dsl_indexer_topk_decode
 from .ops.attention.cute_dsl_indexer_topk_prefill import build as build_ix_topk_prefill
 from .ops.attention.cute_dsl_indexer_topk_prefill import cute_dsl_indexer_topk_prefill
+from .ops.attention.cute_dsl_mha_kv_gather_mxf8 import cute_dsl_mha_kv_gather_mxf8
+from .ops.attention.cute_dsl_mha_prefill import cute_dsl_mha_prefill
+from .ops.attention.cute_dsl_mha_prefix_gather import cute_dsl_mha_prefix_gather
 from .ops.attention.cute_dsl_mla_rope_append_prefill import cute_dsl_mla_rope_append_prefill
 from .ops.attention.cute_dsl_mla_rope_generation import cute_dsl_mla_rope_generation
 from .ops.attention.cute_dsl_req_index_to_base import build as build_req_index_to_base
@@ -90,6 +99,7 @@ from .ops.attention.indexer_topk_decode import indexer_topk_decode
 from .ops.attention.mla_rope_append_paged_kv_assign_q import mla_rope_append_paged_kv_assign_q
 from .ops.attention.mla_rope_generation import mla_rope_generation
 from .ops.comm import cute_dsl_allgather_widen as _allgather_op
+from .ops.comm._lamport import TWOSHOT_ABOVE as _AR_TWOSHOT_ABOVE
 from .ops.comm._lamport import build_workspace as build_lamport_workspace
 from .ops.comm.cute_dsl_allgather_widen import cute_dsl_allgather_widen
 from .ops.comm.cute_dsl_allreduce import cute_dsl_allreduce
@@ -109,12 +119,16 @@ from .ops.gemm import cute_dsl_absorbed_bmm as _absorbed_bmm_op
 from .ops.gemm import cute_dsl_indexer_pre_proj_split as _ix_pre_split_op
 from .ops.gemm import cute_dsl_mtp_eh_proj as _mtp_eh
 from .ops.gemm import cute_dsl_projection as _projection_op
+from .ops.gemm import cute_dsl_projection_mxf8 as _mxf8_op
 from .ops.gemm import cute_dsl_shared_gate_up_swiglu as _shared_gu_swiglu_op
+from .ops.gemm import cute_dsl_shared_up_swiglu_mxf8 as _shared_up8_op
+from .ops.gemm.cute_dsl_shared_up_swiglu_mxf8 import cute_dsl_shared_up_swiglu_mxf8
 from .ops.gemm.bmm_out import bmm_out
 from .ops.gemm.cute_dsl_absorbed_bmm import cute_dsl_absorbed_bmm
 from .ops.gemm.cute_dsl_indexer_pre_proj_split import cute_dsl_indexer_pre_proj_split
 from .ops.gemm.cute_dsl_mtp_eh_proj import cute_dsl_mtp_eh_proj
 from .ops.gemm.cute_dsl_projection import cute_dsl_projection
+from .ops.gemm.cute_dsl_projection_mxf8 import cute_dsl_projection_mxf8
 from .ops.gemm.cute_dsl_shared_gate_up_swiglu import cute_dsl_shared_gate_up_swiglu
 from .ops.moe import cute_dsl_moe_merge as _moe_merge_op
 from .ops.moe import cute_dsl_moe_nvfp4_experts as _moe_experts_op
@@ -135,12 +149,16 @@ from .ops.moe.cute_dsl_mtp_moe_experts import cute_dsl_mtp_moe_experts
 from .ops.moe.noaux_tc_op import noaux_tc_op
 from .ops.norm import cute_dsl_hidden_rmsnorm as _hidden_norm_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm as _qkv_a_norm_op
+from .ops.norm import cute_dsl_qkv_a_rmsnorm_q8 as _qkv_a_norm8_op
 from .ops.norm.cute_dsl_hidden_rmsnorm import cute_dsl_hidden_rmsnorm
 from .ops.norm.cute_dsl_mtp_norm_shard import compile as compile_mtp_norm_shard
 from .ops.norm.cute_dsl_mtp_norm_shard import cute_dsl_mtp_norm_shard
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import compile as compile_qkv_a_rmsnorm
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import cute_dsl_qkv_a_rmsnorm
+from .ops.norm.cute_dsl_qkv_a_rmsnorm_q8 import cute_dsl_qkv_a_rmsnorm_q8
+from .ops.quantization import cute_dsl_act_quant_mxf8_rows as _aq_rows_op
 from .ops.quantization import cute_dsl_moe_quantize_nvfp4 as _moe_quant_op
+from .ops.quantization.cute_dsl_act_quant_mxf8_rows import cute_dsl_act_quant_mxf8_rows
 from .ops.quantization.cute_dsl_moe_quantize_nvfp4 import cute_dsl_moe_quantize_nvfp4
 from .ops.sampling import cute_dsl_argmax as _argmax_op
 from .ops.sampling.cute_dsl_argmax import cute_dsl_argmax
@@ -187,6 +205,19 @@ _MLA_ROPE_MTP_WIDTH = 2
 # The decode kernels' widest compiled row count. Above it a projection with no compiled runner
 # takes the prefill GEMM; at or below it, cuBLAS.
 _DECODE_MAX_ROWS = 64
+# The fp8 context attention's dequantization scales are powers of two from strict bounds on
+# its operands (`_mha_fp8_scales`); the bound's margin covers bf16 rounding of the normalized
+# inputs and the e4m3 cached-prefix rows (each within 1/16 of its bf16 value).
+_MHA_FP8_MARGIN = 1.1
+# Extra headroom of the Q bound when q_b runs in MXF8: both of its operands are e4m3, each
+# element within 1/16 of its bf16 value, so the Cauchy-Schwarz bound grows by (17/16)^2.
+_MHA_FP8_Q_MXF8 = (17.0 / 16.0) ** 2
+# The same headroom on the K / V bounds when the expansion GEMMs run in MXF8: the margin
+# covered e4m3 latent rows (1/16 per element); the e4m3 weight adds that factor once more.
+_MHA_FP8_KV_MXF8 = 17.0 / 16.0
+# A mixed step's generation rows' q_b reads at most the last 64 bf16 q_a rows (`_project_tail`),
+# so with no indexer reading q_a the norm need not store the context rows below them.
+_Q_A_TAIL_ROWS = _DECODE_MAX_ROWS
 # The embedding kernel's widest row count. A step above it (a `max_num_tokens` past 8192)
 # gathers in slices.
 _EMBED_MAX_ROWS = 8192
@@ -245,6 +276,20 @@ def _direct_ok(t: torch.Tensor, dtype: torch.dtype) -> bool:
     cannot pass through, so it is skipped for a 128-byte aligned contiguous tensor -- the
     collective's output, whose graph-pool address is stable."""
     return t.dtype is dtype and t.is_contiguous() and t.data_ptr() % 128 == 0
+
+
+def _pow2_ceil(x: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(torch.ceil(torch.log2(x.float().clamp_min(2.0**-100))))
+
+
+def _fold_pow2(w: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """`w [H, rows, K] / s[h]` per head, as a new contiguous tensor in `w`'s dtype. `s` holds
+    powers of two, so the division is exact; checked, since an underflow would not be."""
+    s = s.float().to(w.device).view(-1, 1, 1)
+    out = (w.float() / s).to(w.dtype).contiguous()
+    if not torch.equal(out.float() * s, w.float()):
+        raise ValueError("fp8 context attention: a power-of-two weight scale was not exact")
+    return out
 
 
 def _try_build(what: str, build):
@@ -392,6 +437,17 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._max_ctx_len = 0
         self._mtp: dict | None = None
         self._ctx_rope_compiled: _ctx_rope_op.CompiledMlaRopeAppendPrefill | None = None
+        # The non-absorbed context attention (`PrefillTarget._attn_mha`): its MHA, its
+        # cached-prefix gather and the two kv_b expansion runners; empty or None keeps every
+        # context step on the absorbed path.
+        self._mha_pre: _mha_pre_op.CompiledMhaPrefill | None = None
+        self._mha_prefix: _mha_prefix_op.CompiledMhaPrefixGather | None = None
+        self._kvb_expand: dict = {}
+        # The fp8 form of that attention (`_build_context_mha_fp8`) and its q_b runner.
+        self._mha_fp8 = False
+        self._q8 = None
+        # qkva / o_proj in MXF8 for the context rows (`_build_proj_mxf8`).
+        self._proj_mxf8: dict = {}
         self._fmha_dec_compiled: _fmha_dec_op.CompiledSparseMlaDecode | None = None
         # The routed experts' operand slots: two of each buffer, alternating per layer (trunk)
         # or per call (MTP). See `_build_moe`.
@@ -467,6 +523,304 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             v_b_nk=v_b_nk,
             o=w[f"l{i}_o"].t(),
             norm2=w[f"l{i}_norm2"],
+            # The non-absorbed context attention's weight, set by `_build_context_mha`.
+            kvb_aug=None,
+            # Its fp8 form, also set there: the K / V expansion weights with the per-head
+            # scales folded in (`[4096, 576]`, `[4096, 512]`), q_b with the Q scale folded in
+            # (MXF8 or bf16), and the MHA's per-head factor table.
+            kvb8=None,
+            qb8=None,
+            mha_hs=None,
+            # qkva / o_proj in MXF8 for the context rows, set in `post_load_weights`.
+            qkva8=None,
+            o8=None,
+        )
+
+    def _kv_b_augmented(self, i: int) -> torch.Tensor:
+        """Layer `i`'s kv_b as the non-absorbed context attention's expansion weight,
+        `[heads * (qk + v), kv_lora + rope]` = `[8192, 576]` bf16: the K rows of head h are
+        `[W_UK_h | 0 ; 0 | I_64]` (the nope part, then the roped k_pe copied exactly by the
+        identity block), the V rows `[W_UV_h | 0]`. A new tensor; the absorbed path's views
+        of kv_b are untouched."""
+        kvb = self.w[f"l{i}_kvb"].detach()
+        h, nope, rope, v, lora = self.heads, self.nope, self.rope_dim, self.v_dim, self.kv_lora
+        w = torch.zeros(h * (nope + rope + v), lora + rope, dtype=kvb.dtype, device=kvb.device)
+        wk = w[: h * (nope + rope)].view(h, nope + rope, lora + rope)
+        wk[:, :nope, :lora] = kvb[: h * nope].view(h, nope, lora)
+        wk[:, nope:, lora:] = torch.eye(rope, dtype=kvb.dtype, device=kvb.device)
+        wv = w[h * (nope + rope) :].view(h, v, lora + rope)
+        wv[:, :, :lora] = kvb[h * nope :].view(h, v, lora)
+        return w
+
+    def _build_proj_mxf8(self) -> None:
+        """The context rows' qkva and o_proj as MXF8 GEMMs: e4m3 operands with e8m0 1x32
+        block scales, fp32 accumulation, bf16 out. Each trunk layer's two weights are
+        quantized once here (3.3 GB per rank beside the bf16 copies, which the decode cells
+        keep); `_project` quantizes the activation with one launch per call. On B300 at
+        T ~ 7-8k quant + GEMM takes 0.61-0.76x the bf16 prefill GEMM. Decode cells (rows
+        <= 64) and the MTP layer stay bf16; an entry that fails to build keeps the bf16
+        prefill GEMM."""
+        self._proj_mxf8: dict[str, _mxf8_op.Mxf8ProjectionRunner] = {}
+        for name, attr in (("qkva", "qkva"), ("o_proj", "o")):
+            wq = [
+                _mxf8_op.quantize_weight(getattr(self._attn[i], attr).t())
+                for i in range(self.num_layers)
+            ]
+            runner = _try_build(f"MXF8 {name}", lambda name=name, w=wq[0]: _mxf8_op.build(name, w))
+            if runner is None:
+                continue
+            for i, w in enumerate(wq):
+                setattr(self._attn[i], f"{attr}8", w)
+            self._proj_mxf8[name] = runner
+        self._build_mlp_mxf8()
+
+    def _build_mlp_mxf8(self) -> None:
+        """The context rows' MLPs on MXF8 GEMMs, their weights quantized once here.
+
+        Dense layers: gate|up, the SwiGLU writing the down GEMM's operand
+        (`cute_dsl_swiglu_mxf8`), down (+0.17 GB per rank). At 7-8k rows 0.82 against 1.61 ms
+        per context step in bf16. MoE layers: the shared expert's gate|up with the SwiGLU in
+        the GEMM's epilogue (`cute_dsl_shared_up_swiglu_mxf8`, +0.47 GB per rank), on the
+        operand the pre-MoE all-reduce writes; its down stays bf16 (the MXF8 down moved the
+        output distribution more than the accuracy budget allows). Either part that fails to
+        build keeps its bf16 path."""
+        dev = torch.cuda.current_device()
+        self._dense8: list | None = None
+        dense = range(self.dense_layers)
+        wq = {
+            name: [_mxf8_op.quantize_weight(self.w[f"l{i}_mlp_{key}"]) for i in dense]
+            for name, key in (("dense_gate_up", "gu"), ("dense_down", "dn"))
+        }
+        runners = {
+            name: _try_build(f"MXF8 {name}", lambda name=name: _mxf8_op.build(name, wq[name][0]))
+            for name in wq
+        }
+        swiglu = _try_build("SwiGLU into MXF8", lambda: _swiglu8_op.compile(dev))
+        if swiglu is not None and all(runners.values()):
+            self._proj_mxf8.update(runners)
+            self._swiglu8 = swiglu
+            self._dense8 = list(zip(wq["dense_gate_up"], wq["dense_down"]))
+        self._shared8 = _try_build("shared gate|up MXF8", lambda: _shared_up8_op.compile(dev))
+        self._shared_w8 = [
+            _shared_up8_op.prepare_weight(self.w[f"l{i}_mlp_gu"])
+            if self._shared8 is not None and i >= self.dense_layers
+            else None
+            for i in range(self.num_layers)
+        ]
+
+    def _build_context_mha(self, dev) -> None:
+        """The non-absorbed context attention of dense-causal steps: the causal varlen MHA,
+        its cached-prefix gather, and the kv_b expansion on the prefill GEMM. The fp8 form
+        (`_build_context_mha_fp8`) when it builds, else the bf16 form: the expansion on the
+        `kv_b_k` / `kv_b_v` entries against one augmented weight per trunk layer
+        (`a.kvb_aug`, 9.4 MB each). The MTP layer keeps the absorbed path. If any part fails
+        to build, every context step keeps the absorbed path."""
+        self._mha_fp8 = False
+        # The fp8 form's MXF8 K / V expansion (gather + GEMM runners) and its MHA handle that
+        # writes O as o_proj's MXF8 operand; None where they did not build.
+        self._kvb8 = None
+        self._mha_q8 = None
+        self._mha_prefix = _try_build(
+            "context MHA prefix gather", lambda: _mha_prefix_op.compile(dev)
+        )
+        if self._mha_prefix is None:
+            return
+        if self._build_context_mha_fp8(dev):
+            return
+        self._mha_pre = _try_build("context MHA", lambda: _mha_pre_op.compile(dev))
+        if self._mha_pre is None:
+            return
+        aug = [self._kv_b_augmented(i) for i in range(self.num_layers)]
+        k_rows = self.heads * self.qk_dim
+        expand = {
+            half: _try_build(
+                f"kv_b expansion {half.upper()}",
+                lambda half=half: _projection_op.build_prefill(
+                    f"kv_b_{half}", aug[0][:k_rows] if half == "k" else aug[0][k_rows:]
+                ),
+            )
+            for half in ("k", "v")
+        }
+        if not all(expand.values()):
+            return
+        for i, w in enumerate(aug):
+            self._attn[i].kvb_aug = w
+        self._kvb_expand = expand
+
+    def _build_context_mha_fp8(self, dev) -> bool:
+        """The fp8 context attention: q from q_b's e4m3 output, K / V from e4m3 expansion
+        GEMMs, and the fp8 MHA (e4m3 QK^T and PV, fp32 accumulation, bf16 out). The
+        dequantization scales are powers of two from strict bounds (`_mha_fp8_scales`),
+        folded into route-only weight copies (exact) and read by the MHA as a per-head
+        table, so no context row can leave the e4m3 range. The V expansion reads only the
+        latent row's c_kv part (`[4096, 512]` = W_UV; the augmented V rows' rope block is
+        zero). q_b runs in MXF8 when the MXF8 projections built (the bf16 copy of the
+        folded weight is then not kept), else on the prefill GEMM's e4m3 entry. Against
+        the bf16 form at a ~7.3k-row step on B300: -13..-15 % per layer for q_b, rope,
+        expansion and MHA; attention output 4.3e-2 .. 5.9e-2 relative RMS against fp32
+        (absorbed fp8 chain 6.3e-2 .. 8.1e-2). False (nothing kept) if a part fails.
+
+        With the MXF8 projections built, two more parts when they build: the K / V expansion
+        in MXF8 -- one launch per layer writes the `[cached | new]` latent rows as MXF8
+        (`cute_dsl_mha_kv_gather_mxf8`: pool bytes at 2^0 for a cached row, the new rows
+        block-quantized) and both expansion GEMMs run e4m3 x e4m3 with 1x32 block scales
+        against the folded weights quantized once (their bf16 copies not kept; the K / V
+        bounds take `_MHA_FP8_KV_MXF8` more headroom); and the MHA handle whose epilogue
+        writes O as o_proj's MXF8 operand (`compile(q8=True)`), which o_proj then reads
+        without its own quant launch (on the staircase frontend, MHA + quant + o_proj
+        -11.9 .. -13.5 us per layer at a ~7.3k-row step)."""
+        mha = _try_build("context MHA fp8", lambda: _mha_pre_op.compile(dev, fp8=True))
+        if mha is None:
+            return False
+        mxf8 = "qkva" in self._proj_mxf8
+        q_extra = _MHA_FP8_Q_MXF8 if mxf8 else 1.0
+        h, nope, rope, v, lora = self.heads, self.nope, self.rope_dim, self.v_dim, self.kv_lora
+        kvb8 = self._build_kvb8(dev) if mxf8 else None
+        kv_extra = _MHA_FP8_KV_MXF8 if kvb8 is not None else 1.0
+        ranges: list[tuple[float, ...]] = []
+        layers = []
+        for i in range(self.num_layers):
+            a = self._attn[i]
+            s_q, s_k, s_v = self._mha_fp8_scales(i, q_extra, kv_extra)
+            kvb = self.w[f"l{i}_kvb"].detach()
+            w_k = torch.zeros(h, nope + rope, lora + rope, dtype=kvb.dtype, device=kvb.device)
+            w_k[:, :nope, :lora] = kvb[: h * nope].view(h, nope, lora)
+            w_k[:, nope:, lora:] = torch.eye(rope, dtype=kvb.dtype, device=kvb.device)
+            w_v = kvb[h * nope :].view(h, v, lora)
+            w_k8 = _fold_pow2(w_k, s_k).view(h * (nope + rope), lora + rope)
+            w_v8 = _fold_pow2(w_v, s_v).view(h * v, lora)
+            if kvb8 is not None:
+                w_k8, w_v8 = _mxf8_op.quantize_weight(w_k8), _mxf8_op.quantize_weight(w_v8)
+            qb8 = _fold_pow2(a.qb.t().view(h, nope + rope, -1), torch.full((h,), s_q)).view(
+                h * (nope + rope), -1
+            )
+            layers.append((w_k8, w_v8, _mxf8_op.quantize_weight(qb8) if mxf8 else qb8))
+            hs = _mha_pre_op.fp8_head_scales(s_q, s_k, s_v).to(kvb.device)
+            ranges.append(
+                (s_q, float(s_k.min()), float(s_k.max()), float(s_v.min()), float(s_v.max()))
+            )
+            self._attn[i].mha_hs = hs
+        w_k8, w_v8, qb8 = layers[0]
+        if kvb8 is not None:
+            expand = kvb8.runners
+        else:
+            expand = {
+                "k": _try_build(
+                    "kv_b expansion K e4m3",
+                    lambda: _projection_op.build_prefill("kv_b_k_e4m3", w_k8),
+                ),
+                "v": _try_build(
+                    "kv_b expansion V e4m3",
+                    lambda: _projection_op.build_prefill("kv_b_v512_e4m3", w_v8),
+                ),
+            }
+        q8 = _try_build(
+            "q_b e4m3",
+            lambda: (
+                _mxf8_op.build("q_b_e4m3", qb8)
+                if mxf8
+                else _projection_op.build_prefill("q_b_e4m3", qb8)
+            ),
+        )
+        if not all(expand.values()) or q8 is None:
+            for i in range(self.num_layers):
+                self._attn[i].mha_hs = None
+            return False
+        for i, (w_k8, w_v8, qb8) in enumerate(layers):
+            self._attn[i].kvb8 = (w_k8, w_v8)
+            self._attn[i].qb8 = qb8
+        self._mha_pre, self._kvb_expand, self._q8 = mha, expand, q8
+        self._kvb8 = kvb8
+        self._mha_fp8 = True
+        if "o_proj" in self._proj_mxf8:
+            mha_q8 = _try_build(
+                "context MHA fp8 with the MXF8 O epilogue",
+                lambda: _mha_pre_op.compile(dev, fp8=True, q8=True),
+            )
+            rows_q8 = _try_build("act quant rows", lambda: _aq_rows_op.compile(dev))
+            if mha_q8 is not None and rows_q8 is not None:
+                self._mha_q8 = SimpleNamespace(mha=mha_q8, rows=rows_q8)
+
+        def lg(x: float) -> int:
+            return int(round(math.log2(x)))
+
+        logger.info(
+            "modeling_v2 GLM-5.2: context MHA fp8, q_b "
+            f"{'MXF8' if mxf8 else 'bf16'}, K / V expansion "
+            f"{'MXF8' if kvb8 is not None else 'bf16 MMA'}, o_proj operand "
+            f"{'from the MHA' if self._mha_q8 is not None else 'quantized'}; log2 scales over "
+            f"layers q [{min(lg(r[0]) for r in ranges)}, {max(lg(r[0]) for r in ranges)}] "
+            f"k [{min(lg(r[1]) for r in ranges)}, {max(lg(r[2]) for r in ranges)}] "
+            f"v [{min(lg(r[3]) for r in ranges)}, {max(lg(r[4]) for r in ranges)}]"
+        )
+        return True
+
+    def _build_kvb8(self, dev) -> SimpleNamespace | None:
+        """The MXF8 K / V expansion's gather and its two GEMM runners (built against zero
+        weights: the runners take each layer's weight per call), or None if a part fails."""
+        gather = _try_build("MXF8 K/V gather", lambda: _kv_gather8_op.compile(dev))
+        if gather is None:
+            return None
+        h, qk, v, lat, lora = self.heads, self.qk_dim, self.v_dim, self.lat_dim, self.kv_lora
+        bf = dict(dtype=torch.bfloat16, device=torch.device("cuda", dev))
+        runners = {
+            "k": _try_build(
+                "MXF8 K expansion",
+                lambda: _mxf8_op.build(
+                    "kv_b_k8", _mxf8_op.quantize_weight(torch.zeros(h * qk, lat, **bf))
+                ),
+            ),
+            "v": _try_build(
+                "MXF8 V expansion",
+                lambda: _mxf8_op.build(
+                    "kv_b_v8", _mxf8_op.quantize_weight(torch.zeros(h * v, lora, **bf))
+                ),
+            ),
+        }
+        if not all(runners.values()):
+            return None
+        d = torch.device("cuda", dev)
+        # The gather's pool / index / table operands on a step without a cached prefix: read
+        # by nothing (no cached rows, new rows in order), but they must be valid tensors.
+        idle = (
+            torch.zeros(1, lat, dtype=torch.uint8, device=d),
+            torch.zeros(1, dtype=torch.int64, device=d),
+            torch.zeros(1, dtype=torch.int32, device=d),
+            torch.zeros(1, 1, dtype=torch.int32, device=d),
+        )
+        return SimpleNamespace(gather=gather, runners=runners, idle=idle)
+
+    def _mha_fp8_scales(
+        self, i: int, q_extra: float, kv_extra: float = 1.0
+    ) -> tuple[float, torch.Tensor, torch.Tensor]:
+        """Layer `i`'s power-of-two dequantization scales `(s_q, s_k [H], s_v [H])` of the fp8
+        context attention, from strict bounds so no context row can exceed e4m3's 448: every
+        operand is a linear map of an RMS-normalized vector `n * w` with `|n|_2 <= sqrt(dim)`,
+        so by Cauchy-Schwarz `|(W (n * w))_d| <= |W_d * w|_2 sqrt(dim)`. Q = q_b(q_a norm) per
+        row (nope, and for rope the norm of each rotated pair); K = W_UK c_kv (nope) and the
+        roped k_pe of kv_a(norm1(h)); V = W_UV c_kv. `s = 2^ceil(log2(bound * margin / 448))`,
+        per tensor for Q, per head for K and V."""
+        a, f32 = self._attn[i], torch.float32
+        h, nope, rope, v = self.heads, self.nope, self.rope_dim, self.v_dim
+        q_lora, kv_lora = self.q_lora, self.kv_lora
+        wqb = a.qb.t().detach().to(f32).view(h, nope + rope, q_lora)
+        qb = (wqb * a.q_norm.detach().to(f32)).norm(dim=-1) * math.sqrt(q_lora)
+        q_pair = torch.sqrt(qb[:, nope::2] ** 2 + qb[:, nope + 1 :: 2] ** 2)
+        q_bound = torch.maximum(qb[:, :nope].amax(), q_pair.amax())
+        kv = self.w[f"l{i}_kvb"].detach().to(f32)
+        wkvn = a.kv_norm.detach().to(f32)
+        k_nope = (kv[: h * nope].view(h, nope, kv_lora) * wkvn).norm(dim=-1)
+        v_all = (kv[h * nope :].view(h, v, kv_lora) * wkvn).norm(dim=-1)
+        pe_rows = a.qkva.t().detach().to(f32)[q_lora + kv_lora : q_lora + kv_lora + rope]
+        pe = (pe_rows * a.norm1.detach().to(f32)).norm(dim=-1) * math.sqrt(pe_rows.shape[1])
+        pe_pair = torch.sqrt(pe[0::2] ** 2 + pe[1::2] ** 2).amax()
+        k_bound = torch.maximum(k_nope.amax(-1) * math.sqrt(kv_lora), pe_pair)
+        v_bound = v_all.amax(-1) * math.sqrt(kv_lora)
+        s_q = float(_pow2_ceil(q_bound * _MHA_FP8_MARGIN * q_extra / 448.0))
+        return (
+            s_q,
+            _pow2_ceil(k_bound * _MHA_FP8_MARGIN * kv_extra / 448.0),
+            _pow2_ceil(v_bound * _MHA_FP8_MARGIN * kv_extra / 448.0),
         )
 
     def _derive_indexer(self, i: int) -> SimpleNamespace | None:
@@ -597,7 +951,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 if name in _projection_op.PREFILL_ENTRIES
             }
         )
+        self._build_proj_mxf8()
         self._qkv_a_norm = compile_qkv_a_rmsnorm(dev, self.eps)
+        # The q_a norm that also writes q_a's MXF8 operand for the q_b GEMM reading it.
+        self._qkv_a_norm8 = _try_build(
+            "q_a norm with the MXF8 q copy", lambda: _qkv_a_norm8_op.compile(dev, self.eps)
+        )
         self._dense_swiglu = compile_dense_swiglu()
         # The shared expert's gate/up rows interleaved for the fused SwiGLU kernel, one copy per
         # layer: one copy for every layer runs every layer against one layer's experts.
@@ -650,6 +1009,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._fmha_pre_dc_compiled = _fmha_pre_op.compile(device_index=dev, dense_causal=True)
         self._fmha_bmm1 = torch.tensor(_FMHA_BMM1_SCALE, dtype=torch.float32, device=dev)
         self._fmha_bmm2 = torch.tensor(_FMHA_BMM2_SCALE, dtype=torch.float32, device=dev)
+        self._build_context_mha(dev)
         # A CUDA stream created inside a graph capture is not capturable.
         self._side_stream = torch.cuda.Stream(device=dev)
         self._build_moe(dev)
@@ -1078,24 +1438,53 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._check_rows(partial)
         return cute_dsl_allreduce(partial, torch.empty_like(partial), self._lamport)
 
-    def _project(self, name: str, x, w_colmajor, out_dtype=None, out=None):
+    def _mxf8_takes(self, name: str, x, w8) -> bool:
+        """Whether `_project` sends `x` to the MXF8 GEMM: its runner built, `w8` given, a
+        context row count, and an activation the quant kernel reads."""
+        return (
+            name in self._proj_mxf8
+            and w8 is not None
+            and int(x.shape[0]) > _DECODE_MAX_ROWS
+            and x.dtype == torch.bfloat16
+            and x.stride(-1) == 1
+            and x.stride(0) % 8 == 0
+            and x.data_ptr() % 16 == 0
+        )
+
+    def _project(self, name: str, x, w_colmajor, out_dtype=None, out=None, w8=None, pre=None):
         """`x @ w_colmajor` on the projection's CuTe DSL kernel at a compiled row count, on
         the prefill GEMM above the decode row counts, else cuBLAS. The kernels read
         `w_colmajor.t()`, the row-major weight, same memory. `out` is an optional caller-owned
-        `[rows, N]` buffer; on the cuBLAS path the result is copied in."""
+        `[rows, N]` buffer; on the cuBLAS path the result is copied in. `w8` is the layer's
+        MXF8 copy of the weight (qkva / o_proj): above the decode row counts the MXF8 GEMM
+        takes the call instead of the prefill GEMM. `pre` is `x`'s MXF8 operand written by its
+        producer: the GEMM then skips its activation quant. A caller passes it only where
+        `_mxf8_takes` holds (o_proj's bf16 context rows are not written when it does)."""
         rows = int(x.shape[0])
+        if self._mxf8_takes(name, x, w8) and (
+            out_dtype in (None, torch.bfloat16)
+            and (out is None or (out.dtype == torch.bfloat16 and out.is_contiguous()))
+        ):
+            mx = self._proj_mxf8[name]
+            if out is None:
+                out = torch.empty([rows, mx.n], dtype=torch.bfloat16, device=x.device)
+            self._count("ctx_proj_mxf8", True)
+            if pre is not None:
+                self._count("ctx_proj_mxf8_pre", True)
+            return cute_dsl_projection_mxf8(x, w8, out, mx, pre=pre)
+        assert pre is None, f"{name}: a producer's MXF8 operand reached a non-MXF8 path"
         runner = self._proj.get(name, {}).get(rows)
-        pre = self._proj_pre.get(name)
+        prefill = self._proj_pre.get(name)
         if (
             runner is None
-            and pre is not None
-            and _DECODE_MAX_ROWS < rows <= pre.max_rows
-            and x.dtype == pre.in_dtype
+            and prefill is not None
+            and _DECODE_MAX_ROWS < rows <= prefill.max_rows
+            and x.dtype == prefill.in_dtype
             and x.is_contiguous()
-            and out_dtype in (None, pre.out_dtype)
-            and (out is None or out.dtype == pre.out_dtype)
+            and out_dtype in (None, prefill.out_dtype)
+            and (out is None or out.dtype == prefill.out_dtype)
         ):
-            runner = pre
+            runner = prefill
         if runner is None:
             res = cublas_mm(x, w_colmajor, None, out_dtype)
             if out is None:
@@ -1133,6 +1522,31 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         out = torch.empty_like(partial)
         return cute_dsl_allreduce_add_rmsnorm(partial, residual, weight, out, self._lamport)
 
+    def _reduce_norm_x8(self, partial, residual, weight, want: bool):
+        """`_reduce_norm`, plus the normalized rows' MXF8 operand where the caller's consumer
+        reads one (`want`) and the collective runs two-shot (its epilogue writes the operand;
+        its bf16 rows are the plain two-shot's bytes): `(out, x8)`, `x8` None otherwise."""
+        rows = int(partial.shape[0])
+        if (
+            want
+            and self._lamport.fused_twoshot_x8 is not None
+            and _AR_TWOSHOT_ABOVE < rows <= self._lamport.max_rows
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._check_rows(partial)
+            out = torch.empty_like(partial)
+            n = int(partial.shape[1])
+            x8 = (
+                torch.empty([rows, n], dtype=torch.uint8, device=partial.device),
+                torch.empty(
+                    (rows + 127) // 128 * 128 * (n // 32), dtype=torch.uint8, device=partial.device
+                ),
+            )
+            cute_dsl_allreduce_add_rmsnorm(partial, residual, weight, out, self._lamport, x8=x8)
+            self._count("ar_x8", True)
+            return out, x8
+        return self._reduce_norm(partial, residual, weight), None
+
     def _reduce_norm_quant(self, partial, residual, weight, g1, rows):
         """`_reduce_norm`, plus the routed experts' NVFP4 input when the MoE would quantize
         on its own kernel (a decode width): into the layer's `xq` / `xsf`, exactly the rows
@@ -1165,11 +1579,32 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._mla_rope_compiled[width] = handle
         return handle
 
-    def _qkv(self, x, a):
-        """`(q, q_a, latent)`. The kv norm writes in place, so the latent `[ckv | k_pe]` is the
-        fused projection's tail, a strided view."""
-        qkva = self._project("qkva", x, a.qkva)
+    def _qkv(self, x, a, q_b: bool = True, x8=None, q8_rows: int = 0, q_store_from: int = 0):
+        """`(q, q_a, latent, q8)`. The kv norm writes in place, so the latent `[ckv | k_pe]` is
+        the fused projection's tail, a strided view. `q_b=False` leaves q to the caller (None).
+        `x8` is `x`'s MXF8 operand from the closing all-reduce of the layer before. With
+        `q8_rows` the norm also writes the first `q8_rows` q_a rows as the MXF8 operand `q8` of
+        the fp8 context attention's q_b, where its q8 kernel takes the call (else `q8` is
+        None); `q_store_from` then skips the bf16 q rows below it (no reader)."""
+        qkva = self._project("qkva", x, a.qkva, w8=a.qkva8, pre=x8)
         q_a_raw, ckv_raw, _ = torch.split(qkva, [self.q_lora, self.kv_lora, self.rope_dim], -1)
+        if (
+            q8_rows
+            and self._qkv_a_norm8 is not None
+            and int(q_a_raw.shape[0]) >= _qkv_a_norm_op.WARP_ROW_MIN_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+            and _qkv_a_norm8_op.takes(q_a_raw, a.q_norm, ckv_raw, a.kv_norm)
+        ):
+            q8 = _qkv_a_norm8_op.operand(q8_rows, x.device)
+            q_a = cute_dsl_qkv_a_rmsnorm_q8(
+                q_a_raw, a.q_norm, ckv_raw, a.kv_norm, self.eps, *q8, self._qkv_a_norm8,
+                q_store_from=q_store_from,
+            )  # fmt: skip
+            self._count("qkv_a_q8", True)
+            if q_store_from:
+                self._count("qkv_a_q8_skip", True)
+            latent = torch.split(qkva, [self.q_lora, self.lat_dim], -1)[1]
+            return None, q_a, latent, q8
         # Both kernels are this op's; the counter shows which one a step's row count took.
         wr = _qkv_a_norm_op.takes_warp_row(q_a_raw, a.q_norm, ckv_raw, a.kv_norm)
         self._count("qkv_a_warp_row" if wr else "qkv_a_cta", True)
@@ -1180,7 +1615,36 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             q_a_raw, a.q_norm, ckv_raw, a.kv_norm, self.eps, self._qkv_a_norm
         )
         latent = torch.split(qkva, [self.q_lora, self.lat_dim], -1)[1]
-        return self._project("q_b", q_a, a.qb), q_a, latent
+        return (self._project("q_b", q_a, a.qb) if q_b else None), q_a, latent, None
+
+    def _project_tail(self, name: str, x, start: int, w_colmajor):
+        """The projection of `x[start:]`, a mixed step's generation rows after its context
+        rows. Their count is any 1..63, which the decode buckets rarely match, and a miss
+        goes to cuBLAS; so the smallest compiled bucket `b` above the count runs on the
+        trailing `b` rows of `x` (the last `b - rows` context rows ride along, their outputs
+        unused) and the result is the view of its last rows: no padding copy."""
+        total = int(x.shape[0])
+        rows = total - start
+        runners = self._proj.get(name, {})
+        if rows <= _DECODE_MAX_ROWS and rows not in runners:
+            bucket = min((m for m in runners if m >= rows), default=None)
+            if bucket is not None and bucket <= total:
+                self._count(f"{name}_tail", True)
+                return self._project(name, x[total - bucket :], w_colmajor)[bucket - rows :]
+        return self._project(name, x[start:], w_colmajor)
+
+    def _q_b_e4m3(self, q_a_ctx, a, pre=None):
+        """The fp8 context attention's query: `q_a x (q_b / s_q)` in e4m3, `[T, heads *
+        qk_dim]`, on the MXF8 GEMM or the prefill GEMM's e4m3 entry (`_build_context_mha_fp8`).
+        `pre` is q_a's MXF8 operand written by the norm (`_qkv`'s `q8`)."""
+        rows = int(q_a_ctx.shape[0])
+        q8 = torch.empty(
+            [rows, self.heads * self.qk_dim], dtype=torch.float8_e4m3fn, device=q_a_ctx.device
+        )
+        if isinstance(self._q8, _mxf8_op.Mxf8ProjectionRunner):
+            return cute_dsl_projection_mxf8(q_a_ctx, a.qb8, q8, self._q8, pre=pre)
+        assert pre is None, "the q_a norm's MXF8 operand needs the MXF8 q_b"
+        return cute_dsl_projection(q_a_ctx, a.qb8, q8, self._q8)
 
     def _topk_buf(self, md, rows: int, tc: int, skip_ctx: bool, skip_gen: bool):
         """Where this step's selection lands. A phase the engine marked skippable (every
@@ -1403,11 +1867,31 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             torch.transpose(torch.reshape(out, [gen, heads, self.v_dim]), 0, 1),
         )
 
-    def _shared_mlp(self, x, gu, gu_il, dn, out=None, trunk=False):
+    def _dense_mlp(self, o, gu, dn, w8=None, x8=None):
+        """A dense layer's MLP, this rank's partial. Context rows on the MXF8 trio where it
+        built (`w8`: the layer's quantized gate|up and down; `x8`: `o`'s MXF8 operand from
+        the collective, else gate|up quantizes `o` itself): the SwiGLU writes the down GEMM's
+        operand, no bf16 intermediate. Decode rows: the bf16 GEMMs and SwiGLU."""
+        if w8 is not None and self._mxf8_takes("dense_gate_up", o, w8[0]):
+            rows = int(o.shape[0])
+            gate_up = self._project("dense_gate_up", o, gu, w8=w8[0], pre=x8)
+            act8 = cute_dsl_swiglu_mxf8(
+                gate_up, *_swiglu8_op.operand(rows, gate_up.shape[1] // 2, o.device), self._swiglu8
+            )
+            down = self._proj_mxf8["dense_down"]
+            out = torch.empty([rows, down.n], dtype=torch.bfloat16, device=o.device)
+            self._count("dense_mxf8", True)
+            return cute_dsl_projection_mxf8(act8[0], w8[1], out, down, pre=act8)
+        act = cute_dsl_dense_swiglu(self._project("dense_gate_up", o, gu), self._dense_swiglu)
+        return self._project("dense_down", act, dn)
+
+    def _shared_mlp(self, x, gu, gu_il, dn, out=None, trunk=False, x8=None, w8=None):
         """The shared expert, this rank's slice, a partial sum. `gu_il` is this layer's
         interleaved gate/up weight; `out` is the routed experts' output buffer when FC2 will
         accumulate onto it. A trunk layer's context rows take the prefill shared kernels
-        when they built; the MTP layer's keep the two-launch path."""
+        when they built; the MTP layer's keep the two-launch path. With `x8` (`x`'s MXF8
+        operand from the pre-MoE collective) and `w8` (the layer's MXF8 gate|up) the prefill
+        gate|up + SwiGLU runs as the MXF8 GEMM with the SwiGLU in its epilogue."""
         rows = int(x.shape[0])
         k = self._moe_k
         if trunk and k.shared_down_pre is not None and _MOE_PREFILL_MIN <= rows <= _MOE_MAX_T:
@@ -1419,7 +1903,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 if res is None:
                     res = torch.empty((rows, x.shape[1]), dtype=torch.bfloat16, device=x.device)
                 mid = self._moe_mid[:rows]
-                cute_dsl_shared_gate_up_swiglu(xs, gu_il, mid, k.shared_up_pre)
+                if x8 is not None and w8 is not None:
+                    cute_dsl_shared_up_swiglu_mxf8(xs, w8, mid, self._shared8, pre=x8)
+                    self._count("shared_mxf8", True)
+                else:
+                    cute_dsl_shared_gate_up_swiglu(xs, gu_il, mid, k.shared_up_pre)
                 return cute_dsl_projection(mid, dn.t(), res, k.shared_down_pre)
         runner = self._shared_gu_swiglu.get(rows)
         if runner is None:
@@ -1622,6 +2110,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )  # fmt: skip
         return out[:rows]
 
+    def _moe_quant_first_ok(self, x, rows: int) -> bool:
+        """Whether `_moe_experts` would quantize `x` itself, unstaged and unpadded, on the
+        prefill quantize: then `_routed` may issue that quantize ahead of the router."""
+        return (
+            self._moe_k.quant_pre is not None
+            and self._moe_pair_ok(rows)
+            and self._moe_padded_rows(rows) == rows
+            and x.dtype is torch.bfloat16
+            and x.is_contiguous()
+            and x.data_ptr() % 16 == 0
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
     def _routed(self, x, m, rows: int, prequantized: bool, join, began: bool, acc: bool):
         """This rank's 64-expert window. Router and top-k run on replicated hidden states,
         so every rank selects the same experts and the four windows tile the routing space
@@ -1639,6 +2140,16 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         for chunk in torch.split(x, sizes, 0):
             n = int(chunk.shape[0])
             slot = self._moe_slot
+            # The NVFP4 quantize reads only the chunk: on an exactly sized prefill-pair chunk
+            # it goes ahead of the router, before the shared expert's GEMM on the side stream
+            # takes the SMs, and the latency-bound top-k overlaps the shared down instead
+            # (-16 to -22 us per MoE layer at 7-8k rows on B300). Same kernel and bytes.
+            first = not prequantized and self._moe_quant_first_ok(chunk, n)
+            if first:
+                cute_dsl_moe_quantize_nvfp4(
+                    chunk, m.g1, self._moe_xq[:n], self._moe_xsf[:n], self._moe_k.quant_pre
+                )
+                self._count("moe_quant_first", True)
             # fp32 logits: FC2 reads `token_final_scales` as fp32 and noaux_tc_op's weight
             # dtype follows its logits. bf16 runs clean on garbage.
             logits = self._moe_router(chunk, m, slot)
@@ -1652,7 +2163,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             else:
                 topk_w, topk_ids, maps = selected
             part = self._moe_experts(
-                chunk, topk_ids, topk_w, maps, m, n, prequantized, join, began, acc
+                chunk, topk_ids, topk_w, maps, m, n, prequantized or first, join, began, acc
             )
             if result is None:
                 return part
@@ -1660,25 +2171,38 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             start += n
         return result
 
-    def _mlp_and_close(self, attn_out, residual, i: int, rows: int):
-        """o_proj, the layer's MLP, and the closing collective normed for the next layer."""
+    def _mlp_and_close(self, attn_out, residual, i: int, rows: int, o8=None):
+        """o_proj, the layer's MLP, and the closing collective normed for the next layer.
+        `o8` is `attn_out`'s MXF8 operand when the context attention wrote it (o_proj then
+        reads it instead of `attn_out`). Returns `(x, x8)`: the next layer's input and, on a
+        two-shot context step, its MXF8 operand for the next layer's qkva (else None)."""
         a = self._attn[i]
-        partial = self._project("o_proj", attn_out, a.o)
+        partial = self._project("o_proj", attn_out, a.o, w8=a.o8, pre=o8)
         gu, dn = self._mlp[i]
         m = self._moe[i]
         if m is None:
-            o = self._reduce_norm(partial, residual, a.norm2)
-            act = cute_dsl_dense_swiglu(self._project("dense_gate_up", o, gu), self._dense_swiglu)
-            mlp_out = self._project("dense_down", act, dn)
+            w8 = self._dense8[i] if self._dense8 is not None else None
+            o, x8 = self._reduce_norm_x8(partial, residual, a.norm2, w8 is not None)
+            mlp_out = self._dense_mlp(o, gu, dn, w8, x8)
         else:
-            o, prequant = self._reduce_norm_quant(partial, residual, a.norm2, m.g1, rows)
+            x8 = None
+            w8 = self._shared_w8[i]
+            if rows > _DECODE_MAX_ROWS:
+                # The routed experts quantize context rows themselves: the collective writes
+                # the shared expert's MXF8 operand instead.
+                o, x8 = self._reduce_norm_x8(partial, residual, a.norm2, w8 is not None)
+                prequant = False
+            else:
+                o, prequant = self._reduce_norm_quant(partial, residual, a.norm2, m.g1, rows)
             began = rows <= _MOE_MAX_T
             acc = self._moe_begin_layer(rows) if began else None
             main = torch.cuda.current_stream()
             side = self._side_stream
             side.wait_stream(main)
             with torch.cuda.stream(side):
-                shared = self._shared_mlp(o, gu, self._shared_gu_il[i], dn, out=acc, trunk=True)
+                shared = self._shared_mlp(
+                    o, gu, self._shared_gu_il[i], dn, out=acc, trunk=True, x8=x8, w8=w8
+                )
             routed = self._routed(
                 o, m, rows, prequant, side if acc is not None else None, began, acc is not None
             )
@@ -1699,7 +2223,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     mlp_out = self._add(routed, shared)
             else:
                 mlp_out = routed
-        return self._reduce_norm(mlp_out, residual, self._next_norm[i])
+        if i + 1 < self.num_layers:
+            a_next = self._attn[i + 1]
+            want = "qkva" in self._proj_mxf8 and a_next.qkva8 is not None
+            return self._reduce_norm_x8(mlp_out, residual, self._next_norm[i], want)
+        return self._reduce_norm(mlp_out, residual, self._next_norm[i]), None
 
     def _mtp_front(self, e, h, rows: int):
         """`eh_proj(concat(enorm(e), hnorm(h)))`. At the specialised row counts each rank norms
@@ -1881,7 +2409,9 @@ class PrefillTarget:
         both = staged.to(dev, non_blocking=True)
         return both[: ctx + 1], both[ctx + 1 :]
 
-    def _dense_causal_step(self, md, step, tc: int, skip_ctx: bool, req_idx, dev):
+    def _dense_causal_step(
+        self, md, step, tc: int, skip_ctx: bool, req_idx, dev, rope_ok: bool = False
+    ):
         """The dense-causal context attention's per-step operands, shared by every layer, or
         None when the context rows take the index path.
 
@@ -1890,7 +2420,11 @@ class PrefillTarget:
         window and the kernel's per-token mask reproduces it. The windows are rebuilt here
         rather than read from the metadata: the engine's `cu_seqlen_ks` are batch-flat KV
         offsets, while this kernel reads each request through its own block-table row from
-        position 0, cached prefix included."""
+        position 0, cached prefix included.
+
+        With the non-absorbed context attention built and the step on the rope kernel
+        (`rope_ok`), the trunk layers take that instead (`_attn_mha`): `mha` is its plan, and
+        the absorbed kernel's operands are built only if a layer falls back to it."""
         core = self.core
         if not tc:
             return None
@@ -1907,6 +2441,19 @@ class PrefillTarget:
         ctx = step["num_contexts"]
         host_lens = step["seq_lens"][:ctx].to(torch.int32).cpu()
         assert int(host_lens.sum()) == tc, (host_lens.tolist(), tc)
+        core.dense_causal_steps += 1
+        if rope_ok and core._kvb_expand:
+            return SimpleNamespace(
+                mha=self._mha_plan(md, step, tc, host_lens, req_idx, dev),
+                absorbed=None,
+                rebuild=lambda: self._dense_causal_absorbed(md, step, tc, host_lens, req_idx, dev),
+            )
+        return self._dense_causal_absorbed(md, step, tc, host_lens, req_idx, dev)
+
+    def _dense_causal_absorbed(self, md, step, tc: int, host_lens, req_idx, dev):
+        """The absorbed dense-causal kernel's per-step operands (`_dense_causal_step`)."""
+        core = self.core
+        ctx = step["num_contexts"]
         cached = None
         if int(step["num_ctx_cached_tokens"]):
             cached = torch.diff(step["ctx_cached_token_indptr"][: ctx + 1]).to(torch.int32)
@@ -1916,7 +2463,6 @@ class PrefillTarget:
         if core._dc_uploader is None:
             core._dc_uploader = _DcGroupsUploader(dev)
         groups = core._dc_uploader(_dc_groups_host(host_lens, _fmha_pre_op.DENSE_CAUSAL_GROUP))
-        core.dense_causal_steps += 1
         return SimpleNamespace(
             ks=ks,
             ke=ke,
@@ -1930,16 +2476,242 @@ class PrefillTarget:
             ),
             # Bound on the first layer; later layers re-bind output and layer offset.
             prepared=None,
+            mha=None,
         )
 
-    def _attn_ctx(self, a, layer: int, q, latent, out, slots, tc: int, step, ctx_rope, dc) -> None:
+    def _mha_plan(self, md, step, tc: int, host_lens, req_idx, dev) -> SimpleNamespace:
+        """The non-absorbed context attention's per-step operands, shared by every trunk layer:
+        the K / V scratch (each layer's expansion writes it and its MHA reads it before the
+        next layer's expansion, on one stream) and, when the step's requests have a cached
+        prefix (KV block reuse), the K/V source-row plan.
+
+        Request r's K/V source rows are its `c_r` cached positions followed by its `n_r` new
+        rows, packed at `cu_k[r]`. The cached rows are the pool rows the absorbed dense-causal
+        kernel reads for those positions, gathered per layer by `cute_dsl_mha_prefix_gather`
+        from the index vectors built here on the host from the two host prefix sums and
+        uploaded once (the context step is eager)."""
+        core = self.core
+        ctx = step["num_contexts"]
+        cached = int(step["num_ctx_cached_tokens"])
+        tk = tc + cached
+        rows = core.heads * core.qk_dim
+        kv_dt = torch.float8_e4m3fn if core._mha_fp8 else torch.bfloat16
+        kvb8 = core._mha_fp8 and core._kvb8 is not None
+        plan = SimpleNamespace(
+            max_len=int(host_lens.max()),
+            tk=tk,
+            k=torch.empty([tk, rows], dtype=kv_dt, device=dev),
+            v=torch.empty([tk, core.heads * core.v_dim], dtype=kv_dt, device=dev),
+            cached=None,
+            # The MXF8 expansion's A operands, written per layer by the gather.
+            a8=_kv_gather8_op.buffers(tk, dev) if kvb8 else None,
+        )
+        if not cached:
+            return plan
+        host_cu = step["host_ctx_uncached_token_indptr"][: ctx + 1].to(torch.int64)
+        host_ci = step["host_ctx_cached_token_indptr"][: ctx + 1].to(torch.int64)
+        new_l, cached_l = host_cu[1:] - host_cu[:-1], host_ci[1:] - host_ci[:-1]
+        assert int(new_l.sum()) == tc and int(cached_l.sum()) == cached, (
+            new_l.tolist(),
+            cached_l.tolist(),
+        )
+        cu_k = torch.zeros(ctx + 1, dtype=torch.int64)
+        cu_k[1:] = torch.cumsum(cached_l + new_l, 0)
+        reqs = torch.arange(ctx, dtype=torch.int64)
+        req_c = torch.repeat_interleave(reqs, cached_l)
+        pos_c = torch.arange(cached, dtype=torch.int64) - (host_ci[req_c] - host_ci[0])
+        req_n = torch.repeat_interleave(reqs, new_l)
+        tok_n = torch.arange(tc, dtype=torch.int64) - (host_cu[req_n] - host_cu[0])
+        staged = torch.empty([3 * cached + tc], dtype=torch.int64, pin_memory=True)
+        staged[:cached].copy_(cu_k[req_c] + pos_c)  # dst_c
+        staged[cached : 2 * cached].copy_(host_cu[req_c] - host_cu[0])  # tok_c
+        staged[2 * cached : 3 * cached].copy_(pos_c)  # pos_c
+        staged[3 * cached :].copy_(cu_k[req_n] + cached_l[req_n] + tok_n)  # dst_n
+        staged_cu = torch.empty([ctx + 1], dtype=torch.int32, pin_memory=True)
+        staged_cu.copy_(cu_k)
+        # The caching host allocator keeps the pinned blocks until these copies have run.
+        plan.cached = SimpleNamespace(
+            rows=cached,
+            idx=staged.to(dev, non_blocking=True),
+            cu_k=staged_cu.to(dev, non_blocking=True),
+            req_idx=req_idx[:tc],
+            block_table=md.block_table,
+            pool_rows=step["primary_pool"].view(torch.uint8).reshape(-1, core.lat_dim),
+            # The bf16 [cached | new] rows of the bf16-MMA expansion (the MXF8 one gathers
+            # into `a8` instead).
+            lat=None if kvb8 else torch.empty([tk, core.lat_dim], dtype=torch.bfloat16, device=dev),
+        )
+        return plan
+
+    def _mha_takes(self, a, layer: int, step, ctx_rope) -> bool:
+        """Whether this layer's context rows can take the non-absorbed attention: its weights
+        built, the step on the context rope kernel, and the layer's pool the primary pool."""
+        core = self.core
+        pool_ptrs = step["host_kv_cache_pool_pointers"]
+        pool_idx = int(step["host_kv_cache_pool_mapping"][layer][0])
+        return (
+            (a.kvb8 if core._mha_fp8 else a.kvb_aug) is not None
+            and ctx_rope is not None
+            and core._ctx_rope_compiled is not None
+            and int(pool_ptrs[pool_idx, 0]) == step["primary_pool"].data_ptr()
+            and int(pool_ptrs[pool_idx, 1]) == 0
+        )
+
+    def _attn_mha(self, a, layer: int, q, latent, out, tc: int, step, ctx_rope, mha, o8=None) -> bool:
+        """Context attention in the non-absorbed MLA form, as DLSim models it, on a
+        dense-causal step; False (nothing launched) where the layer cannot take it.
+
+        1. The rope kernel's `q_in_place` mode: rope(q_pe) back into the q_b output, which
+           is then the MHA's query; rope(k_pe) into the latent rows and the latent row as
+           e4m3 into the pool -- the same code as the absorbed mode, so the decode cache is
+           the same.
+        2. With a cached prefix, each request's K/V source rows `[prefix | new]`: the prefix
+           from the fp8 pool, widened to bf16.
+        3. K / V = those latent rows x the augmented kv_b halves (`[T_k, 4096]` each).
+        4. Causal varlen MHA, d 256, scale 1/16, bottom-right aligned over the prefix, into
+           this layer's attention output.
+
+        In the fp8 form (`q` the e4m3 query from `_q_b_e4m3`) rope rotates the e4m3 query in
+        place, K / V are e4m3 (the V expansion on the latent's c_kv part), and the MHA reads
+        the layer's per-head dequantization table. Under the MXF8 expansion steps 2 and 3 are
+        one gather writing the `[prefix | new]` rows as MXF8 and two MXF8 GEMMs. With `o8`
+        (fp8 form, the MXF8-O handle built) the MHA writes the context rows' attention as
+        o_proj's MXF8 operand into `o8` instead of `out`."""
+        core = self.core
+        if not self._mha_takes(a, layer, step, ctx_rope):
+            return False
+        fp8 = q.dtype == torch.float8_e4m3fn
+        pool = step["primary_pool"]
+        pool_idx, layer_in_pool = (int(v) for v in step["host_kv_cache_pool_mapping"][layer][:2])
+        compiled = core._ctx_rope_compiled
+        heads, tpb = core.heads, int(step["tokens_per_block"])
+        q3 = torch.reshape(q, [tc, heads, core.qk_dim])
+        in_place = latent.stride(0) in compiled.kernels_q_in_place and latent.stride(1) == 1
+        lat = latent if in_place else latent.clone(memory_format=torch.contiguous_format)
+        cute_dsl_mla_rope_append_prefill(
+            None,
+            q3[..., core.nope :],
+            lat,
+            None,
+            pool,
+            layer_in_pool,
+            step["kv_cache_block_offsets"][pool_idx, : step["num_contexts"]],
+            *ctx_rope,
+            core._rope["rotary_cos_sin"],
+            tpb,
+            compiled,
+            q_in_place=True,
+            q_e4m3=fp8,
+        )
+        src, cu_k = lat, None
+        if mha.a8 is not None:
+            self._expand_mxf8(a, lat, mha, layer_in_pool * tpb, tpb)
+            cu_k = None if mha.cached is None else mha.cached.cu_k
+            core._count("ctx_kvb_mxf8", True)
+        elif mha.cached is not None:
+            c = mha.cached
+            src = cute_dsl_mha_prefix_gather(
+                c.pool_rows, c.idx, c.rows, c.req_idx, c.block_table, lat, c.lat,
+                layer_in_pool * tpb, core._stride_factor, tpb, compiled=core._mha_prefix,
+            )  # fmt: skip
+            cu_k = c.cu_k
+        # The prefill GEMM serves up to PREFILL_MAX_ROWS rows; with a cached prefix the K/V
+        # rows can exceed it, and the product is row-independent.
+        k_rows = heads * core.qk_dim
+        if mha.a8 is not None:
+            halves = ()
+        elif fp8:
+            halves = (
+                ("k", a.kvb8[0], mha.k, src),
+                ("v", a.kvb8[1], mha.v, src[:, : core.kv_lora]),
+            )
+        else:
+            halves = (
+                ("k", a.kvb_aug[:k_rows], mha.k, src),
+                ("v", a.kvb_aug[k_rows:], mha.v, src),
+            )
+        step_rows = _projection_op.PREFILL_MAX_ROWS
+        for r0 in range(0, mha.tk, step_rows):
+            r1 = min(mha.tk, r0 + step_rows)
+            for half, w, dst, x in halves:
+                cute_dsl_projection(x[r0:r1], w, dst[r0:r1], core._kvb_expand[half])
+        use_o8 = o8 is not None and fp8 and core._mha_q8 is not None
+        cute_dsl_mha_prefill(
+            q3,
+            torch.reshape(mha.k, [mha.tk, heads, core.qk_dim]),
+            torch.reshape(mha.v, [mha.tk, heads, core.v_dim]),
+            torch.reshape(out, [tc, heads, core.v_dim]),
+            ctx_rope[0],
+            mha.max_len,
+            compiled=core._mha_q8.mha if use_o8 else core._mha_pre,
+            cu_seqlens_k=cu_k,
+            head_scales=a.mha_hs if fp8 else None,
+            q8_out=o8 if use_o8 else None,
+        )
+        assert use_o8 == (o8 is not None), "an o_proj operand the MHA did not write"
+        core._count("ctx_mha", True)
+        if use_o8:
+            core._count("ctx_mha_o8", True)
+        if fp8:
+            core._count("ctx_mha_fp8", True)
+        if cu_k is not None:
+            core._count("ctx_mha_cached", True)
+        return True
+
+    def _expand_mxf8(self, a, lat, mha, layer_offset: int, tpb: int) -> None:
+        """K / V of this layer into `mha.k` / `mha.v` (e4m3) on the MXF8 expansion: one gather
+        writes the `[cached prefix | new]` latent rows as MXF8 into `mha.a8` (cached rows as
+        their pool bytes at 2^0, the new rows `lat` block-quantized), then the two GEMMs run
+        on it in row slices of the runners' capacity (a multiple of 128 rows, so a slice's
+        scales start at a 128-row block)."""
+        core = self.core
+        g = core._kvb8
+        if mha.cached is not None:
+            c = mha.cached
+            cute_dsl_mha_kv_gather_mxf8(
+                c.pool_rows, c.idx, c.rows, c.req_idx, c.block_table, lat, mha.a8,
+                layer_offset, core._stride_factor, tpb, True, compiled=g.gather,
+            )  # fmt: skip
+        else:
+            pool, idx, req_idx, block_table = g.idle
+            cute_dsl_mha_kv_gather_mxf8(
+                pool, idx, 0, req_idx, block_table, lat, mha.a8, 0, 1, 1, False,
+                compiled=g.gather,
+            )  # fmt: skip
+        a_k, a_v, sfa_k, sfa_v = mha.a8
+        w_k, w_v = a.kvb8
+        rk, rv = core._kvb_expand["k"], core._kvb_expand["v"]
+        step = rk.launch.max_rows
+        blk_k, blk_v = _kv_gather8_op.sf_bytes_k(128), _kv_gather8_op.sf_bytes_v(128)
+        for r0 in range(0, mha.tk, step):
+            r1 = min(mha.tk, r0 + step)
+            b = r0 // 128
+            cute_dsl_projection_mxf8(a_k[r0:r1], w_k, mha.k[r0:r1], rk, sfa=sfa_k[b * blk_k :])
+            cute_dsl_projection_mxf8(a_v[r0:r1], w_v, mha.v[r0:r1], rv, sfa=sfa_v[b * blk_v :])
+
+    def _attn_ctx(
+        self, a, layer: int, q, latent, out, slots, tc: int, step, ctx_rope, dc, o8=None
+    ) -> bool:
         """Sparse MLA over the context rows, absorbed form, on the sm103 prefill kernel. The
         index rows are already global pool rows spanning the cached prefix, so no gather; under
         `dc` there are none, and the kernel reads the causal window through the block table.
 
         The order is fixed: the rope/KV append mutates `fused_q` and the pool, so the quantize
-        has to read the rotated query, and nothing after the append may fall back."""
+        has to read the rotated query, and nothing after the append may fall back.
+
+        Returns whether the context rows' attention went to `o8` (the non-absorbed fp8 MHA's
+        MXF8 O epilogue) rather than `out`."""
         core = self.core
+        if dc is not None and dc.mha is not None:
+            if self._attn_mha(a, layer, q, latent, out, tc, step, ctx_rope, dc.mha, o8):
+                return o8 is not None
+            # The fp8 query exists only once `_mha_takes` said the layer takes the route.
+            assert q.dtype != torch.float8_e4m3fn, "an fp8 query on the absorbed path"
+            core._count("ctx_mha", False)
+            # This layer takes the absorbed dense-causal kernel: its operands, built once.
+            if dc.absorbed is None:
+                dc.absorbed = dc.rebuild()
+            dc = dc.absorbed
         heads, dev, dt = core.heads, q.device, q.dtype
         q_nope, q_pe = torch.split(
             torch.reshape(q, [tc, heads, core.qk_dim]), [core.nope, core.rope_dim], -1
@@ -2080,6 +2852,7 @@ class PrefillTarget:
             a.v_b_nk,
             torch.transpose(torch.reshape(out, [tc, heads, core.v_dim]), 0, 1),
         )
+        return False
 
     def _layer_attention(
         self,
@@ -2102,13 +2875,34 @@ class PrefillTarget:
         skip_gen,
         ctx_rope=None,
         dc=None,
+        x8=None,
     ):
         """One layer's attention block, both phases, into `attn_out`. `slots_of(topk_buf)` maps
         the request-local selection to this layer's pool rows, `(context, generation)`; the
-        context half is None under the dense-causal context attention (`dc`)."""
+        context half is None under the dense-causal context attention (`dc`). `x8` is `x`'s
+        MXF8 operand (the closing all-reduce of the layer before wrote it).
+
+        Returns o_proj's MXF8 operand `(q8, sf)` when the fp8 context attention wrote the
+        context rows' attention into it (their bf16 rows of `attn_out` are then not written:
+        o_proj must take the operand), else None."""
         core = self.core
         a = core._attn[i]
-        q, q_a, latent = core._qkv(x, a)
+        # The fp8 context attention takes its context rows' query from q_b's e4m3 output;
+        # the generation rows' bf16 query comes from the decode cells.
+        mha8 = (
+            bool(tc)
+            and dc is not None
+            and dc.mha is not None
+            and core._mha_fp8
+            and self._mha_takes(a, pool_layer, step, ctx_rope)
+        )
+        # The q_a norm writes the context rows' q_a as the MXF8 q_b's operand; with no indexer
+        # reading q_a this step, the only bf16 q_a reader is the generation rows' q_b tail.
+        q8_rows = tc if mha8 and isinstance(core._q8, _mxf8_op.Mxf8ProjectionRunner) else 0
+        store_from = tc - _Q_A_TAIL_ROWS if q8_rows and not need_q and tc > _Q_A_TAIL_ROWS else 0
+        q, q_a, latent, qa8 = core._qkv(
+            x, a, q_b=not mha8, x8=x8, q8_rows=q8_rows, q_store_from=store_from
+        )
         ix = core._idx[i]
         if ix is not None:
             q_fp8, weights, k_pre = core._indexer_project(x, q_a, pos, ix, rows, need_q)
@@ -2148,18 +2942,42 @@ class PrefillTarget:
                     md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p
                 )
         slots_ctx, slots_gen = slots_of(topk_buf)
-        q_ctx, q_gen = torch.split(q, [tc, gen], 0)
+        if mha8:
+            q_ctx = core._q_b_e4m3(q_a[:tc], a, pre=qa8)
+            q_gen = core._project_tail("q_b", q_a, tc, a.qb) if gen else None
+        else:
+            q_ctx, q_gen = torch.split(q, [tc, gen], 0)
         lat_ctx, lat_gen = torch.split(latent, [tc, gen], 0)
         attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
+        # o_proj's MXF8 operand from the fp8 MHA's epilogue, where o_proj takes the MXF8 GEMM
+        # (trunk layers only: the MTP layer's close reads the bf16 `attn_out`).
+        o8 = None
+        if (
+            mha8
+            and i < core.num_layers
+            and core._mha_q8 is not None
+            and core._mxf8_takes("o_proj", attn_out, a.o8)
+        ):
+            o8 = (
+                torch.empty([rows, core.heads * core.v_dim], dtype=torch.uint8, device=x.device),
+                torch.empty(_mha_pre_op.sf_bytes(rows), dtype=torch.uint8, device=x.device),
+            )
+        o8_done = False
         if tc:
-            self._attn_ctx(
-                a, pool_layer, q_ctx, lat_ctx, attn_ctx, slots_ctx, tc, step, ctx_rope, dc
+            o8_done = self._attn_ctx(
+                a, pool_layer, q_ctx, lat_ctx, attn_ctx, slots_ctx, tc, step, ctx_rope, dc, o8
             )
         if gen:
             core._attn_gen(
                 a, pool_layer, q_gen, lat_gen, attn_gen, slots_gen, gen, gen_p, ctx, md,
                 INDEX_KIND_GLOBAL, None, False,
             )  # fmt: skip
+        if not o8_done:
+            return None
+        # The generation rows' bf16 attention into the rows after the context rows (none on a
+        # pure context step: then only the padding scale rows).
+        cute_dsl_act_quant_mxf8_rows(attn_gen, *o8, tc, compiled=core._mha_q8.rows)
+        return o8
 
     def forward(
         self,
@@ -2197,12 +3015,15 @@ class PrefillTarget:
         # Both built once per step and shared by every layer; None takes the stock rope/append
         # op, or the index path of the context attention.
         ctx_rope = self._ctx_rope_step(step, tc) if tc else None
-        dc = self._dense_causal_step(md, step, tc, skip_ctx, req_idx, h.device)
+        dc = self._dense_causal_step(
+            md, step, tc, skip_ctx, req_idx, h.device, rope_ok=ctx_rope is not None
+        )
         # Under `dc` the context rows' pool rows are formed inside the attention kernel, so the
         # conversion runs on the generation rows alone, or not at all.
         slot_lo = tc if dc is not None else 0
 
         x = core._rmsnorm(h, core._attn[0].norm1)
+        x8 = None
         residual = h
         for i in range(core.num_layers):
             layer_id = core._pool_layer_id[i]
@@ -2216,11 +3037,11 @@ class PrefillTarget:
                 )  # fmt: skip
                 return (None, slots) if slot_lo else torch.split(slots, [tc, gen], 0)
 
-            self._layer_attention(
+            o8 = self._layer_attention(
                 md, step, x, pos, attn_out, i, i, slots_of, topk_buf, rows, tc, gen, gen_p, ctx,
-                need_q, skip_ctx, skip_gen, ctx_rope, dc,
+                need_q, skip_ctx, skip_gen, ctx_rope, dc, x8,
             )  # fmt: skip
-            x = core._mlp_and_close(attn_out, residual, i, rows)
+            x, x8 = core._mlp_and_close(attn_out, residual, i, rows, o8)
         return x
 
     def mtp_forward(
@@ -2334,7 +3155,7 @@ class DecodeTarget:
     ):
         core = self.core
         a = core._attn[i]
-        q, q_a, latent = core._qkv(x, a)
+        q, q_a, latent, _ = core._qkv(x, a)
         ix = core._idx[i]
         if ix is not None:
             q_fp8, weights, k_pre = core._indexer_project(x, q_a, pos, ix, rows, not skip_gen)
@@ -2396,7 +3217,7 @@ class DecodeTarget:
             self._layer_attention(
                 md, x, pos, attn_out, i, i, slots_of, topk_buf, rows, gen_p, skip_gen, mtp_width
             )
-            x = core._mlp_and_close(attn_out, residual, i, rows)
+            x, _ = core._mlp_and_close(attn_out, residual, i, rows)
         return x
 
     def mtp_forward(

@@ -68,7 +68,8 @@ class ProjectionShape:
 def shape_of(kernel: str) -> ProjectionShape:
     """The operand shapes, dtypes and alignments of `kernel`."""
     if kernel not in _MODULES:
-        # A projection only the prefill GEMM serves (mtp_eh): its entry's contract.
+        # A projection only the prefill GEMM serves (mtp_eh, the kv_b expansion halves,
+        # the fp8 attention's e4m3 entries): its entry's contract.
         abi = _prefill.ABIS[PREFILL_ENTRIES[kernel]]
         return ProjectionShape(
             abi.out_features, abi.in_features, torch.bfloat16, abi.out_dtype, _PREFILL_ALIGN
@@ -164,6 +165,27 @@ PREFILL_ENTRIES = {
     "shared_gate_up": "shared_gate_up",
     "shared_down": "shared_down",
     "mtp_eh": "mtp_eh_proj",
+    # The non-absorbed context attention's K / V expansion: the `[M, 576]` latent rows,
+    # read in place from the q_a | kv_a projection row (row stride 2624), times one half
+    # of the augmented kv_b weight `[4096, 576]`. Prefill only, like mtp_eh.
+    "kv_b_k": "kv_b_expand_k",
+    "kv_b_v": "kv_b_expand_v",
+    # The fp8 context attention's operands, e4m3 out (fp32 accumulator converted nearest,
+    # saturating): K from the K half, V from the V half without its zero rope block (`x`
+    # the latent row's c_kv part `[M, 512]`, W_UV `[4096, 512]`), the context rows' Q from
+    # q_b. The caller folds the power-of-two dequantization scales into the weights.
+    "kv_b_k_e4m3": "kv_b_expand_k_e4m3",
+    "kv_b_v512_e4m3": "kv_b_expand_v512_e4m3",
+    "q_b_e4m3": "q_b_proj_e4m3",
+}
+#: The projections only the prefill GEMM serves (no decode kernel), with their output dtype.
+_PREFILL_ONLY: dict[str, torch.dtype] = {
+    "mtp_eh": torch.bfloat16,
+    "kv_b_k": torch.bfloat16,
+    "kv_b_v": torch.bfloat16,
+    "kv_b_k_e4m3": torch.float8_e4m3fn,
+    "kv_b_v512_e4m3": torch.float8_e4m3fn,
+    "q_b_e4m3": torch.float8_e4m3fn,
 }
 #: The prefill GEMM serves every row count 1..PREFILL_MAX_ROWS.
 PREFILL_MAX_ROWS = _prefill.MAX_ROWS
@@ -188,6 +210,9 @@ class PrefillProjectionRunner:
     out_dtype: torch.dtype
     max_rows: int
     launch: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], object]
+    #: The entry takes `x` with a row stride wider than K (unit inner stride, a multiple
+    #: of 8 elements): the kv_b expansion reads the latent rows in place.
+    row_strided_input: bool = False
 
 
 def build_prefill(kernel: str, weight: torch.Tensor) -> PrefillProjectionRunner:
@@ -209,7 +234,7 @@ def build_prefill(kernel: str, weight: torch.Tensor) -> PrefillProjectionRunner:
     abi = _prefill.ABIS.get(entry)
     if abi is None:
         raise ValueError(f"{kernel}: the vendored prefill GEMM has no {entry!r} entry")
-    expected = torch.bfloat16 if kernel == "mtp_eh" else shape_of(kernel).out_dtype
+    expected = _PREFILL_ONLY.get(kernel) or shape_of(kernel).out_dtype
     if abi.out_dtype != expected:
         raise ValueError(f"{kernel}: the prefill GEMM writes {abi.out_dtype}, not {expected}")
     dev = weight.device
@@ -228,6 +253,7 @@ def build_prefill(kernel: str, weight: torch.Tensor) -> PrefillProjectionRunner:
         abi.out_dtype,
         PREFILL_MAX_ROWS,
         launch,
+        bool(abi.row_strided_input),
     )
 
 
@@ -325,9 +351,14 @@ class CuteDslProjection(OpWrapper):
     A `PrefillProjectionRunner` runs the same product on the prefill GEMM at any row
     count up to 8192: bf16 operands, fp32 accumulation, the entry's output dtype.
     Its entries (`PREFILL_ENTRIES`) are the bf16 projections above except ix_qb, plus
-    the MTP front's replicated eh_proj:
+    the MTP front's replicated eh_proj and the non-absorbed context attention's K / V
+    expansion (`x` the latent rows read in place, row stride 2624):
 
         mtp_eh          [M, 12288] x [6144, 12288]
+        kv_b_k, kv_b_v  [M, 576]   x [4096, 576]   one half of the augmented kv_b
+        kv_b_k_e4m3     [M, 576]   x [4096, 576]   e4m3 out (fp8 attention's K)
+        kv_b_v512_e4m3  [M, 512]   x [4096, 512]   e4m3 out (fp8 attention's V, c_kv only)
+        q_b_e4m3        [M, 2048]  x [4096, 2048]  e4m3 out (fp8 attention's Q)
 
     A `SharedDownPrefillRunner` runs shared_down on the shared expert's own prefill
     kernel at 65..8192 rows, every operand 128-byte aligned.
@@ -466,6 +497,27 @@ class CuteDslProjection(OpWrapper):
             spec=dict(kernel="router", rows=1099, prefill=True),
         ),
         Cell(
+            why="prefill kv_b_k at 987 rows on the latent tail of a 2624-wide row (K = 576, "
+            "row-strided input)",
+            spec=dict(kernel="kv_b_k", rows=987, prefill=True, x_row_stride=2624),
+        ),
+        Cell(
+            why="prefill kv_b_v at 8192 rows, the large-T schedule, row-strided input",
+            spec=dict(kernel="kv_b_v", rows=8192, prefill=True, x_row_stride=2624),
+        ),
+        Cell(
+            why="prefill kv_b_k_e4m3 at 7255 rows, row-strided input, e4m3 out",
+            spec=dict(kernel="kv_b_k_e4m3", rows=7255, prefill=True, x_row_stride=2624),
+        ),
+        Cell(
+            why="prefill kv_b_v512_e4m3 at 1 row, row-strided input, e4m3 out",
+            spec=dict(kernel="kv_b_v512_e4m3", rows=1, prefill=True, x_row_stride=2624),
+        ),
+        Cell(
+            why="prefill q_b_e4m3 at 2049 rows, the second schedule group, e4m3 out",
+            spec=dict(kernel="q_b_e4m3", rows=2049, prefill=True),
+        ),
+        Cell(
             why="prefill mtp_eh at 4100 rows, K = 12288 (the enorm/hnorm concat)",
             spec=dict(kernel="mtp_eh", rows=4100, prefill=True),
         ),
@@ -547,7 +599,11 @@ class CuteDslProjection(OpWrapper):
         """
         acc = torch.float64 if out.dtype == torch.float32 else torch.float32
         with true_fp32_matmul():
-            return (x.to(acc) @ weight.to(acc).t()).to(out.dtype)
+            res = x.to(acc) @ weight.to(acc).t()
+        if out.dtype == torch.float8_e4m3fn:
+            # The kernel converts nearest with saturation; torch's cast does not saturate.
+            res = res.clamp(-448.0, 448.0)
+        return res.to(out.dtype)
 
     def is_valid(
         self,
@@ -582,7 +638,14 @@ class CuteDslProjection(OpWrapper):
             f"weight must be the row-major [N, K] = [{n}, {k}] buffer, got {tuple(weight.shape)}"
         )
         assert tuple(out.shape) == (rows, n), f"out must be [{rows}, {n}], got {tuple(out.shape)}"
+        strided_x = getattr(runner, "row_strided_input", False)
         for name, t in (("x", x), ("weight", weight), ("out", out)):
+            if name == "x" and strided_x:
+                assert x.stride(1) == 1 and x.stride(0) % 8 == 0, (
+                    f"x must have unit inner stride and a row stride that is a multiple of 8, "
+                    f"got {tuple(x.stride())}"
+                )
+                continue
             assert t.is_contiguous(), (
                 f"{name} must be contiguous (a column-major weight view must be passed as .t())"
             )

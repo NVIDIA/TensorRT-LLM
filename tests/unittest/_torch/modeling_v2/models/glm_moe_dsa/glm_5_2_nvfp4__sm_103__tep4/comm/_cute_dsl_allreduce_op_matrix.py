@@ -43,7 +43,7 @@ import torch
 import torch.distributed as dist
 
 _WORKER_FLAG = "--rank-worker"
-#: Five CuTe DSL compiles per rank, then the cells, the largest of which build
+#: Six CuTe DSL compiles per rank, then the cells, the largest of which build
 #: fp64 references over 8192 x 6144. Read by `_rank_job.run`.
 DEADLINE_S = 1800
 
@@ -80,6 +80,7 @@ fp4_quantize: Any = None
 fp4_quantize_mod: Any = None
 validating: Any = None
 assert_within_ulp: Any = None
+act_quant: Any = None
 
 
 # ---- the host mirror of the device slot counter --------------------------
@@ -299,9 +300,17 @@ def _gate_quant(
 class _Call:
     """One entry call: owns its buffers, so it can be refilled and replayed."""
 
-    def __init__(self, kind: str, rows: int) -> None:
+    def __init__(self, kind: str, rows: int, x8: bool = False) -> None:
         self.kind, self.rows = kind, rows
         dev = "cuda"
+        # The fused entry's MXF8 copy of the normalized rows (two-shot rows only).
+        self.x8 = None
+        if x8:
+            self.x8 = (
+                torch.empty(rows, HIDDEN, dtype=torch.uint8, device=dev),
+                torch.empty((rows + 127) // 128 * 128 * (HIDDEN // 32), dtype=torch.uint8,
+                            device=dev),
+            )  # fmt: skip
         self.partial = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
         self.out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
         self.residual = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
@@ -321,6 +330,9 @@ class _Call:
         self.out.fill_(float("nan"))
         self.fp4.fill_(0xAA)
         self.sf.fill_(0xAA)
+        if self.x8 is not None:
+            self.x8[0].fill_(0xAA)
+            self.x8[1].fill_(0xAA)
         if self.kind == "quant":
             norm, _ = fused.reference(partials, residual, weight, self.out, WS)
             self.gs.copy_(_global_scale(norm))
@@ -330,7 +342,8 @@ class _Call:
         if self.kind == "pure":
             assert pure(self.partial, self.out, WS) is self.out
         elif self.kind == "fused":
-            assert fused(self.partial, self.residual, self.weight, self.out, WS) is self.out
+            got = fused(self.partial, self.residual, self.weight, self.out, WS, x8=self.x8)
+            assert got is self.out
         else:
             got = quant(
                 self.partial, self.residual, self.weight, self.gs, self.out, self.fp4, self.sf, WS
@@ -345,6 +358,15 @@ class _Call:
         elif self.kind == "fused":
             ref_norm, ref_res = fused.reference(partials, residual, weight, self.out, WS)
             _gate_fused(self.rows, self.out, self.residual, ref_norm, ref_res, where)
+            if self.x8 is not None:
+                # The MXF8 copy is the activation quant's bytes of the norm the kernel wrote.
+                q8, sf = self.x8
+                want_q8, want_sf = act_quant.reference(self.out)
+                assert torch.equal(q8, want_q8), f"{where}: x8 values are not the act quant's"
+                got = act_quant.dequantize(q8, sf, self.rows, HIDDEN)
+                want = act_quant.dequantize(want_q8, want_sf, self.rows, HIDDEN)
+                assert torch.equal(got, want), f"{where}: x8 scales are not the act quant's"
+                _assert_same_on_every_rank(q8, where)
         else:
             ref = quant.reference(
                 partials, residual, weight, self.gs, self.out, self.fp4, self.sf, WS
@@ -412,6 +434,9 @@ def check_the_workspace_agreed_and_launched_nothing() -> None:
     built: List[Any] = [None] * WORLD
     dist.all_gather_object(built, WS.gather is not None)
     assert all(built), f"the all-gather did not build on every rank: {built}"
+    built_x8: List[Any] = [None] * WORLD
+    dist.all_gather_object(built_x8, WS.fused_twoshot_x8 is not None)
+    assert all(built_x8), f"the MXF8-out two-shot did not build on every rank: {built_x8}"
     _assert_state("after build")
     if RANK == 0:
         print(f"[rank 0] multicast publish {'on' if flags[0] else 'off'}", flush=True)
@@ -435,7 +460,7 @@ def check_every_cell_interleaved_on_one_workspace() -> None:
                 order.append(q.pop(0))
     for kind, cell in order:
         rows = cell.spec["rows"]
-        call = _Call(kind, rows)
+        call = _Call(kind, rows, x8=bool(cell.spec.get("x8")))
         call.fill(_seed(cell.why))
         torch.cuda.synchronize()
         dist.barrier()
@@ -627,7 +652,7 @@ def _run_one_rank() -> int:
     """Body of one spawned rank: run every check; a failing rank exits nonzero
     and the launcher kills its siblings."""
     global RANK, WORLD, WS, TWOSHOT_ABOVE, pure, fused, quant, gather
-    global fp4_quantize, fp4_quantize_mod, validating, assert_within_ulp
+    global fp4_quantize, fp4_quantize_mod, validating, assert_within_ulp, act_quant
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -651,6 +676,9 @@ def _run_one_rank() -> int:
     from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 import (  # noqa: E501
         cute_dsl_allreduce_add_rmsnorm_quant_nvfp4,
     )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
+        self_attn_prefill_act_quant_mxf8 as _act_quant,
+    )
 
     # This file runs as a spawned worker, not under pytest, so the repo's
     # `__extra_import_path__` is not in play: reach the shared helper the
@@ -673,6 +701,7 @@ def _run_one_rank() -> int:
     fp4_quantize_mod = _fp4_mod
     fp4_quantize = _fp4_mod.fp4_quantize
     validating, assert_within_ulp = _validating_cm, _within
+    act_quant = _act_quant
 
     for check in CHECKS:
         try:

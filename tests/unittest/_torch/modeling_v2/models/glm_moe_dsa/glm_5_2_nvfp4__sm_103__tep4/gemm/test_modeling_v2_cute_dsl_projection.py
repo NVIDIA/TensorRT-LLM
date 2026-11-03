@@ -58,7 +58,23 @@ def _compare(kernel: str, out: torch.Tensor, ref: torch.Tensor) -> None:
     signs and 1-2 ulp at the worst element of a row. 4 ulp element-wise and
     2 ulp RMS, in TF32 units; that also holds if the hardware truncates
     instead of rounding.
+
+    e4m3 output (the fp8 attention's entries): both sides accumulate in fp32 and
+    round once to e4m3, so an element differs only where the two fp32 sums straddle an
+    e4m3 rounding boundary: by one e4m3 step (3 mantissa bits), at a small fraction of
+    the elements. At most one step everywhere and at most 1% of the elements off; a
+    wrong product or a lost scale misses most elements by many steps.
     """
+    if out.dtype == torch.float8_e4m3fn:
+        got, want = out.float(), ref.float()
+        assert bool(torch.isfinite(got).all()), "an element was not written"
+        # One e4m3 step at the reference's magnitude (subnormal step 2^-9 below 2^-6).
+        step = torch.exp2(torch.floor(torch.log2(want.abs().clamp_min(2.0**-6))) - 3)
+        diff = (got - want).abs()
+        assert bool((diff <= step).all()), f"max error {float((diff / step).max()):.1f} steps"
+        frac = float((diff > 0).float().mean())
+        assert frac <= 0.01, f"{frac:.2%} of the elements differ from the reference"
+        return
     if kernel == "ix_fused":
         assert_within_ulp(out, ref, element_ulp=4.0, rms_ulp=2.0, ulp=TF32_ULP)
     elif out.dtype == torch.float32:
@@ -103,8 +119,14 @@ def test_certified_cells(cell) -> None:
     weight = _weight(kernel, g)
     # bf16 values even for ix_fused, whose caller passes `x.float()`.
     x = torch.randn(rows, s.k, generator=g, device="cuda").to(torch.bfloat16).to(s.in_dtype)
+    if cell.spec.get("x_row_stride"):
+        # The tail of a wider row, as the kv_b expansion reads the latent in place.
+        wide = torch.zeros(rows, cell.spec["x_row_stride"], dtype=s.in_dtype, device="cuda")
+        wide[:, -s.k :] = x
+        x = wide[:, -s.k :]
     # NaN, so an element the kernel never writes fails the comparison.
-    out = torch.full((rows, s.n), float("nan"), dtype=s.out_dtype, device="cuda")
+    # (e4m3 through a bf16 fill: a float8 fill kernel is not available on every build.)
+    out = torch.full((rows, s.n), float("nan"), dtype=torch.bfloat16, device="cuda").to(s.out_dtype)
     with validating(op):
         assert op(x, weight, out, runner) is out, "the op writes `out` and returns it"
     _compare(kernel, out, op.reference(x, weight, out, runner))

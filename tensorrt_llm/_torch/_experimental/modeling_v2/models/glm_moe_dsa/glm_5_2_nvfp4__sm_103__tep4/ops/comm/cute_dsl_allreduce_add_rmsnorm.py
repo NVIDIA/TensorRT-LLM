@@ -29,6 +29,11 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
     the reduced rows as bf16, so the residual add there rounds twice (sum,
     then sum + residual). The choice is a function of the row count alone and
     is made here, identically on every rank.
+
+    `x8 = (q8 [rows, hidden] uint8, sf)`, two-shot rows only: the same launch also
+    writes the normalized rows as an MXF8 operand -- per 32 elements a power-of-two
+    scale and e4m3 values, the activation quant's exact bytes of `out` -- for the GEMM
+    that reads them next (the next layer's qkva).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -43,6 +48,14 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
         Cell(why="the first two-shot row count, 513: a ragged last row block", spec=dict(rows=513)),
         Cell(why="a two-shot context chunk of 3073 rows", spec=dict(rows=3073)),
         Cell(why="the token budget, 8192 rows, two-shot", spec=dict(rows=8192)),
+        Cell(
+            why="two-shot with the MXF8 copy of the normalized rows, 3073 rows",
+            spec=dict(rows=3073, x8=True),
+        ),
+        Cell(
+            why="two-shot with the MXF8 copy at the token budget",
+            spec=dict(rows=8192, x8=True),
+        ),
     )
 
     note = """
@@ -60,7 +73,14 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
         weight: torch.Tensor,
         out: torch.Tensor,
         workspace: LamportWorkspace,
+        x8: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if x8 is not None:
+            q8, sf = x8
+            workspace.fused_twoshot_x8(
+                partial, residual, weight, out, q8, sf, residual, *tail(workspace, fused=True)
+            )
+            return out
         compiled = workspace.fused_twoshot if partial.shape[0] > TWOSHOT_ABOVE else workspace.fused
         compiled(partial, residual, weight, out, residual, *tail(workspace, fused=True))
         return out
@@ -72,11 +92,13 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
         weight: torch.Tensor,
         out: torch.Tensor,
         workspace: LamportWorkspace,
+        x8: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """`(norm, new_residual)`, both bf16; `residual` is not modified.
 
         `partials` is the group's partials in rank order (the collective
-        exception to mirroring `__call__`). The sum is `cute_dsl_allreduce`'s
+        exception to mirroring `__call__`). `x8`'s bytes are the activation quant of the
+        norm (`self_attn_prefill_act_quant_mxf8`'s rule), which the caller derives from it. The sum is `cute_dsl_allreduce`'s
         reference before its rounding: fp32 in rank order. `new_residual` is
         `bf16(sum + residual)`, rounded once. The norm is computed in fp64 from
         that bf16 residual with `workspace.eps` and rounded once. `out` is
@@ -98,8 +120,24 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
         weight: torch.Tensor,
         out: torch.Tensor,
         workspace: LamportWorkspace,
+        x8: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
-        check_rows(int(partial.shape[0]), workspace)
+        rows = int(partial.shape[0])
+        check_rows(rows, workspace)
+        if x8 is not None:
+            assert workspace.fused_twoshot_x8 is not None, "the group did not build the MXF8 copy"
+            assert rows > TWOSHOT_ABOVE, (
+                f"the MXF8 copy is a two-shot epilogue: rows above {TWOSHOT_ABOVE}, got {rows}"
+            )
+            q8, sf = x8
+            n = int(partial.shape[1])
+            assert q8.dtype == torch.uint8 and q8.is_contiguous() and tuple(q8.shape) == (rows, n), (
+                f"x8's values must be a contiguous uint8 [{rows}, {n}]"
+            )
+            need = (rows + 127) // 128 * 128 * (n // 32)
+            assert sf.dtype == torch.uint8 and sf.numel() >= need and sf.data_ptr() % 32 == 0, (
+                f"x8's scales must hold {need} bytes, 32-byte aligned"
+            )
 
 
 cute_dsl_allreduce_add_rmsnorm = CuteDslAllreduceAddRmsnorm()

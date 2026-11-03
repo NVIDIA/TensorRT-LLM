@@ -39,12 +39,16 @@ LATENT_STRIDES = (LATENT_DIM, Q_LORA_RANK + LATENT_DIM)
 class CompiledMlaRopeAppendPrefill:
     """The kernels `compile` built: the page size and device they are specialised for,
     one kernel per latent row stride in `LATENT_STRIDES`, and the same per stride with
-    `skip_q_base` (only the rope and latent-append groups launch)."""
+    `skip_q_base` (only the rope and latent-append groups launch), with `q_in_place`
+    (rope(q_pe) back into `q_pe`, no fp8 query) and with `q_in_place` on an e4m3 `q_pe`
+    (`q_e4m3`, the fp8 context attention's query)."""
 
     device_index: int
     tokens_per_block: int
     kernels: Mapping[int, object]
     kernels_skip_q_base: Mapping[int, object] = dataclasses.field(default_factory=dict)
+    kernels_q_in_place: Mapping[int, object] = dataclasses.field(default_factory=dict)
+    kernels_q_e4m3: Mapping[int, object] = dataclasses.field(default_factory=dict)
 
 
 def compile(  # noqa: A001 -- the kernel module's own name for this step
@@ -55,19 +59,29 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
 
     The specialization is this target's layout: `q_pe` the rope tail of the
     `[T, 16, 256]` q_b output, and a latent of either stride in `LATENT_STRIDES`.
-    The kernel keys its compile on the latent stride and on `skip_q_base`, so each
-    pair is a separate kernel. Token and request counts are symbolic, so one compile
-    per pair serves every context step. Costs one CuTe DSL compile and one launch on
-    a one-token, one-block case per pair.
+    The kernel keys its compile on the latent stride and on the mode (`skip_q_base`,
+    `q_in_place`, `q_e4m3`), so each pair is a separate kernel. The `q_in_place` modes
+    run all of a token tile's RoPE groups in one CTA (`merge_rope`). Token and request
+    counts are symbolic, so one compile per pair serves every context step. Costs one
+    CuTe DSL compile and one launch on a one-token, one-block case per pair.
     """
     tpb, dev = int(tokens_per_block), torch.device("cuda", int(device_index))
     bf16 = torch.bfloat16
-    q = torch.zeros([1, NUM_HEADS, QK_HEAD_DIM], dtype=bf16, device=dev)
-    kernels, kernels_skip = {}, {}
-    for stride, skip in ((s, k) for s in LATENT_STRIDES for k in (False, True)):
+    tables: dict[str, dict] = {"plain": {}, "skip": {}, "in_place": {}, "e4m3": {}}
+    for stride, mode in ((s, m) for s in LATENT_STRIDES for m in tables):
+        skip, e4m3 = mode == "skip", mode == "e4m3"
+        in_place = mode in ("in_place", "e4m3")
+        q = torch.zeros(
+            [1, NUM_HEADS, QK_HEAD_DIM], dtype=torch.float8_e4m3fn if e4m3 else bf16, device=dev
+        )
         kernel = _kernel._compile_for(
             _kernel.PrefillRopeSpecialization(
-                tokens_per_block=tpb, latent_cache_stride=stride, skip_q_base=skip
+                tokens_per_block=tpb,
+                latent_cache_stride=stride,
+                skip_q_base=skip,
+                q_in_place=in_place,
+                q_e4m3=e4m3,
+                merge_rope=in_place,
             ),
             int(device_index),
         )
@@ -75,10 +89,12 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
         # not on the first served step.
         row = torch.zeros([1, stride], dtype=bf16, device=dev)
         runner = _kernel.prepare_runner(
-            torch.zeros([1, NUM_HEADS, LATENT_DIM], dtype=bf16, device=dev),
+            None if in_place else torch.zeros([1, NUM_HEADS, LATENT_DIM], dtype=bf16, device=dev),
             q[..., QK_HEAD_DIM - ROPE_DIM :],
             row[:, stride - LATENT_DIM :],
-            torch.empty([1, NUM_HEADS, LATENT_DIM], dtype=torch.uint8, device=dev),
+            None
+            if in_place
+            else torch.empty([1, NUM_HEADS, LATENT_DIM], dtype=torch.uint8, device=dev),
             torch.zeros([tpb * LATENT_DIM], dtype=torch.uint8, device=dev),
             torch.zeros([1, 2, 1], dtype=torch.int32, device=dev),
             torch.tensor([0, 1], dtype=torch.int32, device=dev),
@@ -86,11 +102,21 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
             torch.zeros([1, ROPE_DIM, 2], dtype=torch.float32, device=dev),
             tokens_per_block=tpb,
             skip_q_base=skip,
+            q_in_place=in_place,
+            q_e4m3=e4m3,
+            merge_rope=in_place,
         )
         dataclasses.replace(runner, compiled=kernel)()
-        (kernels_skip if skip else kernels)[stride] = kernel
+        tables[mode][stride] = kernel
     torch.cuda.synchronize(dev)
-    return CompiledMlaRopeAppendPrefill(int(device_index), tpb, kernels, kernels_skip)
+    return CompiledMlaRopeAppendPrefill(
+        int(device_index),
+        tpb,
+        tables["plain"],
+        tables["skip"],
+        tables["in_place"],
+        tables["e4m3"],
+    )
 
 
 def _positions(cu_seqlens: torch.Tensor, cached_lens: torch.Tensor, tokens: int):
@@ -149,6 +175,20 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
     (the fp8 q-base K-B writes those bytes itself); only the rope columns
     `[..., 512:]` of `quant_q_buffer` are written and `fused_q[..., :512]` is not
     read. The kernel launches only its rope and latent-append groups.
+
+    `q_in_place=True` (the non-absorbed context attention): `fused_q` and
+    `quant_q_buffer` are None, `rope(q_pe)` is written back into `q_pe` -- the q_b
+    output is then that attention's query -- and no fp8 query is produced. The
+    latent rotation and the pool append are the same code as the absorbed mode, so
+    the decode cache bytes do not depend on the mode. Returns `(q_pe, latent_cache,
+    None, kv_pool)`: the first value is the rotated query in both modes.
+
+    `q_e4m3=True` (with `q_in_place`, the fp8 context attention): `q_pe` is the e4m3
+    rope tail of the e4m3 `[T, 16, 256]` q_b output (its power-of-two scale already
+    applied; rope is linear, so the scale needs no handling). The kernel widens the
+    values exactly, rotates them with the same bf16-rounded arithmetic and writes them
+    back as e4m3 (nearest, saturating). The `q_in_place` modes run all of a token
+    tile's RoPE groups in one CTA; outputs are the same bytes as separate groups.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -205,6 +245,54 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
                 new=[4100], cached=[0], layers=1, layer=0, latent_stride=2624, skip_q_base=True
             ),
         ),
+        Cell(
+            why="q_in_place for the non-absorbed attention: three requests with cached "
+            "prefixes, the in-place latent",
+            spec=dict(
+                new=[37, 64, 300],
+                cached=[0, 32, 100],
+                layers=3,
+                layer=2,
+                latent_stride=2624,
+                q_in_place=True,
+            ),
+        ),
+        Cell(
+            why="q_in_place on an 8 x 987-row step, the served context shape",
+            spec=dict(
+                new=[987] * 8,
+                cached=[0] * 8,
+                layers=2,
+                layer=1,
+                latent_stride=2624,
+                q_in_place=True,
+            ),
+        ),
+        Cell(
+            why="q_e4m3 for the fp8 attention: three requests with cached prefixes, the "
+            "in-place latent",
+            spec=dict(
+                new=[37, 64, 300],
+                cached=[0, 32, 100],
+                layers=3,
+                layer=2,
+                latent_stride=2624,
+                q_in_place=True,
+                q_e4m3=True,
+            ),
+        ),
+        Cell(
+            why="q_e4m3 on an 8 x 987-row step, a partial last tile in none of them",
+            spec=dict(
+                new=[987] * 8,
+                cached=[0] * 8,
+                layers=2,
+                layer=1,
+                latent_stride=2624,
+                q_in_place=True,
+                q_e4m3=True,
+            ),
+        ),
     )
 
     note = """
@@ -214,7 +302,10 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
     primary pool with no secondary pool; otherwise it runs the stock
     `mla_rope_append_paged_kv_assign_q` plus a cast. The latent is the
     projection row's tail, read in place (stride 2624): `k_pe` is rotated
-    inside the projection output, which nothing reads after the append.
+    inside the projection output, which nothing reads after the append. On a
+    dense-causal step the trunk layers call it with `q_in_place`: the q_b
+    output becomes the non-absorbed attention's query (`cute_dsl_mha_prefill`);
+    with the fp8 attention built, `q_in_place` and `q_e4m3` on the e4m3 q_b output.
 
     The kernel validates every call on the host (dtypes, shapes, alignment,
     devices, request count). It keys its compile on the `q_pe` and latent
@@ -227,10 +318,10 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
 
     def __call__(
         self,
-        fused_q: torch.Tensor,
+        fused_q: torch.Tensor | None,
         q_pe: torch.Tensor,
         latent_cache: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: torch.Tensor | None,
         kv_pool: torch.Tensor,
         layer_in_pool: int,
         kv_cache_block_offsets: torch.Tensor,
@@ -240,10 +331,12 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
         skip_q_base: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if fused_q.device.index != compiled.device_index:
+        q_in_place: bool = False,
+        q_e4m3: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        if q_pe.device.index != compiled.device_index:
             raise ValueError(
-                f"the kernel was compiled for device {compiled.device_index}, not {fused_q.device}"
+                f"the kernel was compiled for device {compiled.device_index}, not {q_pe.device}"
             )
         if int(tokens_per_block) != compiled.tokens_per_block:
             raise ValueError(
@@ -251,7 +344,15 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
                 f"not {tokens_per_block}"
             )
         # Another layout selects a specialization nothing compiled at load.
-        table = compiled.kernels_skip_q_base if skip_q_base else compiled.kernels
+        table = (
+            compiled.kernels_q_e4m3
+            if q_in_place and q_e4m3
+            else compiled.kernels_q_in_place
+            if q_in_place
+            else compiled.kernels_skip_q_base
+            if skip_q_base
+            else compiled.kernels
+        )
         kernel = table.get(int(latent_cache.stride(0)))
         if tuple(q_pe.stride()[:2]) != (NUM_HEADS * QK_HEAD_DIM, QK_HEAD_DIM) or kernel is None:
             raise ValueError(
@@ -263,7 +364,7 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
             fused_q,
             q_pe,
             latent_cache,
-            quant_q_buffer.view(torch.uint8),
+            None if quant_q_buffer is None else quant_q_buffer.view(torch.uint8),
             base,
             kv_cache_block_offsets,
             cu_seqlens,
@@ -271,16 +372,21 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
             rotary_cos_sin,
             tokens_per_block=int(tokens_per_block),
             skip_q_base=bool(skip_q_base),
+            q_in_place=bool(q_in_place),
+            q_e4m3=bool(q_e4m3),
+            merge_rope=bool(q_in_place),
         )
         dataclasses.replace(runner, compiled=kernel)()
+        if q_in_place:
+            return q_pe, latent_cache, None, kv_pool
         return fused_q, latent_cache, quant_q_buffer, kv_pool
 
     def reference(
         self,
-        fused_q: torch.Tensor,
+        fused_q: torch.Tensor | None,
         q_pe: torch.Tensor,
         latent_cache: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: torch.Tensor | None,
         kv_pool: torch.Tensor,
         layer_in_pool: int,
         kv_cache_block_offsets: torch.Tensor,
@@ -290,23 +396,28 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
         skip_q_base: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q_in_place: bool = False,
+        q_e4m3: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """`(fused_q, latent_cache, quant_q_buffer, kv_pool)` as the op leaves them,
         as new tensors; nothing passed in is written. `quant_q_buffer` is returned
         as uint8 bytes and `kv_pool` as a flat uint8 byte copy; with `skip_q_base`
-        its first 512 columns of each head are the bytes passed in. `compiled` is
-        ignored.
+        its first 512 columns of each head are the bytes passed in. With
+        `q_in_place` the first value is `rope(q_pe)` and the third None; with `q_e4m3`
+        it is e4m3 (`rope` of the widened values, rounded to bf16, then to e4m3). `compiled`
+        is ignored.
 
         Bit-exact by construction: the rotation reproduces the kernel's fp32
         rounding (see `_rope`), and every other value is a copy or a single
         rounding.
         """
-        t, tpb = int(fused_q.shape[0]), int(tokens_per_block)
+        t, tpb = int(q_pe.shape[0]), int(tokens_per_block)
         req, pos = _positions(cu_seqlens, cached_lens, t)
         table = rotary_cos_sin.reshape(-1, ROPE_DIM, 2).float()[pos, : ROPE_DIM // 2]
         cos, sin = table[..., 0], table[..., 1]
-        q_out = fused_q.clone()
-        q_out[..., KV_LORA_RANK:] = _rope(q_pe, cos[:, None, :], sin[:, None, :])
+        q_rot = _rope(q_pe.to(torch.bfloat16), cos[:, None, :], sin[:, None, :])
+        if q_e4m3:
+            q_rot = _e4m3(q_rot).view(torch.float8_e4m3fn)
         lat_out = latent_cache.clone()
         lat_out[:, KV_LORA_RANK:] = _rope(latent_cache[:, KV_LORA_RANK:], cos, sin)
         pool = kv_pool.reshape(-1).view(torch.uint8).clone()
@@ -314,6 +425,10 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         start = (int(layer_in_pool) + block) * tpb * LATENT_DIM + (pos % tpb) * LATENT_DIM
         cols = torch.arange(LATENT_DIM, device=pool.device)
         pool[start[:, None] + cols[None, :]] = _e4m3(lat_out)
+        if q_in_place:
+            return q_rot, lat_out, None, pool
+        q_out = fused_q.clone()
+        q_out[..., KV_LORA_RANK:] = q_rot
         quant = _e4m3(q_out)
         if skip_q_base:
             quant[..., :KV_LORA_RANK] = quant_q_buffer.view(torch.uint8)[..., :KV_LORA_RANK]
@@ -321,10 +436,10 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
 
     def is_valid(
         self,
-        fused_q: torch.Tensor,
+        fused_q: torch.Tensor | None,
         q_pe: torch.Tensor,
         latent_cache: torch.Tensor,
-        quant_q_buffer: torch.Tensor,
+        quant_q_buffer: torch.Tensor | None,
         kv_pool: torch.Tensor,
         layer_in_pool: int,
         kv_cache_block_offsets: torch.Tensor,
@@ -334,13 +449,24 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
         skip_q_base: bool = False,
+        q_in_place: bool = False,
+        q_e4m3: bool = False,
     ) -> None:
         """Reads the prefix sum and offsets back to the host: never on the serving path."""
-        t, tpb = int(fused_q.shape[0]), int(tokens_per_block)
+        t, tpb = int(q_pe.shape[0]), int(tokens_per_block)
         b = int(cached_lens.shape[0])
-        assert quant_q_buffer.dtype in (torch.float8_e4m3fn, torch.uint8), (
-            f"quant_q_buffer must be e4m3 or its uint8 bytes, got {quant_q_buffer.dtype}"
+        assert not q_e4m3 or q_in_place, "q_e4m3 is a variant of q_in_place"
+        assert q_pe.dtype == (torch.float8_e4m3fn if q_e4m3 else torch.bfloat16), (
+            f"q_pe must be {'e4m3' if q_e4m3 else 'bf16'}, got {q_pe.dtype}"
         )
+        if q_in_place:
+            assert fused_q is None and quant_q_buffer is None and not skip_q_base, (
+                "q_in_place writes no fp8 query: fused_q and quant_q_buffer must be None"
+            )
+        else:
+            assert quant_q_buffer.dtype in (torch.float8_e4m3fn, torch.uint8), (
+                f"quant_q_buffer must be e4m3 or its uint8 bytes, got {quant_q_buffer.dtype}"
+            )
         # The kernel finds a token's request by scanning the boundaries: a token
         # past `cu[B]` lands in the last request at a position past its rows.
         cu = cu_seqlens[: b + 1].cpu().long()

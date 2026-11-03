@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 from ...kernels.gemm import self_attn_indexer_pre_indexer_proj_m64_n160_k6144_tf32 as _kernel
+from ...kernels.gemm import self_attn_indexer_prefill_wk_split_f32 as _wk_split
 from ...kernels.gemm import self_attn_prefill_projections_bf16 as _prefill
 
 #: Decode row counts the target compiles this entry for.
@@ -28,10 +29,13 @@ PREFILL_MAX_ROWS = _prefill.MAX_ROWS
 @dataclass(frozen=True)
 class PrefillSplitHandle:
     """The prefill GEMM's `indexer_wk_weights` entry, any row count 1..`max_rows`.
-    `launch(x, weight, out)` writes the fp32 `[M, 160]` product into `out`."""
+    `launch(x, weight, out)` writes the fp32 `[M, 160]` product into `out`;
+    `split(out, key, head_weights)`, when built, writes its two column ranges to the
+    two buffers in one launch (keys rounded to bf16 as `Tensor.copy_` does)."""
 
     max_rows: int
     launch: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], object]
+    split: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None] | None = None
 
 
 def compile(device_id: int, rows: int) -> _kernel.CompiledSplitOutputs:
@@ -60,14 +64,21 @@ def build_prefill(weight: torch.Tensor) -> PrefillSplitHandle:
 
     The handle takes the weight per call, so one serves every indexer layer. Costs
     one CuTe DSL compile (one schedule serves every row count) and one launch on
-    zeros. Raises if the vendored kernel has no such entry or the build fails.
+    zeros, plus the same for the one-launch column split. Raises if the vendored
+    kernel has no such entry or the GEMM build fails; if only the split fails to
+    build, the handle keeps the two copies.
     """
     dev = weight.device
     with torch.cuda.device(dev):
         launch = _prefill.build(_PREFILL_ENTRY, weight)
         x = torch.zeros([1, _K], dtype=torch.bfloat16, device=dev)
         launch(x, weight, torch.empty([1, _KEY + _HEADS], dtype=torch.float32, device=dev))
-    return PrefillSplitHandle(PREFILL_MAX_ROWS, launch)
+        try:
+            _wk_split.warm(dev)
+            split = _wk_split.split_
+        except Exception:  # noqa: BLE001 -- the handle keeps the two copies
+            split = None
+    return PrefillSplitHandle(PREFILL_MAX_ROWS, launch, split)
 
 
 def compile_all(
@@ -97,7 +108,8 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
     With a `PrefillSplitHandle` the same product runs on the prefill GEMM (one
     fp32 accumulation per tile, no split-K) into an fp32 `[M, 160]` scratch,
-    then two copies: the keys rounded to bf16, the head weights as they are.
+    then one split launch writes the keys rounded to bf16 and the head weights as
+    they are (two `copy_` calls if the split kernel did not build).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -146,8 +158,11 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
         if isinstance(compiled, PrefillSplitHandle):
             full = torch.empty([x.shape[0], _KEY + _HEADS], dtype=torch.float32, device=x.device)
             compiled.launch(x, weight, full)
-            key.copy_(full[:, :_KEY])
-            head_weights.copy_(full[:, _KEY:])
+            if compiled.split is not None:
+                compiled.split(full, key, head_weights)
+            else:
+                key.copy_(full[:, :_KEY])
+                head_weights.copy_(full[:, _KEY:])
         else:
             _kernel.run_split_outputs(compiled, x, weight, key, head_weights)
         return key, head_weights

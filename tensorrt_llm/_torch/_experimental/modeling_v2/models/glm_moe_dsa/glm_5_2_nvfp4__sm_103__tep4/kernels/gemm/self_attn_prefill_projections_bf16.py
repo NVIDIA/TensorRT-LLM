@@ -73,7 +73,9 @@ class PrefillProjectionAbi:
 
     Operands are BF16; the output is ``out_dtype`` (BF16 for the attention
     projections, FP32 for the indexer's fused wk + weights projection whose
-    consumers read FP32 ``weights`` and cast ``indexer_k`` themselves).
+    consumers read FP32 ``weights`` and cast ``indexer_k`` themselves, E4M3 for the
+    FP8 context-MHA operands -- the FP32 accumulator converted RN satfinite; any
+    dequantization scale is folded into the caller's weight).
     """
 
     name: str
@@ -255,6 +257,36 @@ ABIS: dict[str, PrefillProjectionAbi] = {
     ),
     "kv_b_expand_v": PrefillProjectionAbi(
         "kv_b_expand_v", 4_096, 576, row_strided_input=True
+    ),
+    # The V half without its zero rope block: the latent row's c_kv part ([T, 512] view, row
+    # stride 2624) times W_UV [16 * 256, 512]. The augmented V rows' last 64 columns are zero and
+    # form the last k-block of the K = 576 GEMM, so dropping them only removes "+ 0" terms:
+    # the output bytes equal ``kv_b_expand_v``'s, with 1/9 fewer MMAs and B bytes.
+    "kv_b_expand_v512": PrefillProjectionAbi(
+        "kv_b_expand_v512", 4_096, 512, row_strided_input=True
+    ),
+    # FP8 context MHA operands (BF16 MMA, FP32 accumulation, E4M3 output): K and V from the same
+    # expansion GEMMs and the context rows' Q from the q_b GEMM. The caller folds power-of-two
+    # scales into route-only weight copies (per head for K / V, per tensor for Q): a power-of-two
+    # factor on a BF16 weight is exact, and the shared GEMM epilogue converts the FP32
+    # accumulator to the output type before any elementwise epilogue_op could scale it. The
+    # E4M3 conversion saturates (cvt.rn.satfinite): an out-of-range value clamps to +-448.
+    "kv_b_expand_k_e4m3": PrefillProjectionAbi(
+        "kv_b_expand_k_e4m3",
+        4_096,
+        576,
+        out_dtype=torch.float8_e4m3fn,
+        row_strided_input=True,
+    ),
+    "kv_b_expand_v512_e4m3": PrefillProjectionAbi(
+        "kv_b_expand_v512_e4m3",
+        4_096,
+        512,
+        out_dtype=torch.float8_e4m3fn,
+        row_strided_input=True,
+    ),
+    "q_b_proj_e4m3": PrefillProjectionAbi(
+        "q_b_proj_e4m3", 4_096, 2_048, out_dtype=torch.float8_e4m3fn
     ),
 }
 

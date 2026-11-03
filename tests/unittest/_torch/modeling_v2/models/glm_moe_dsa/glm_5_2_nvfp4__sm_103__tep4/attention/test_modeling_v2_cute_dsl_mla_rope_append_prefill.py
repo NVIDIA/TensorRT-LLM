@@ -60,19 +60,29 @@ def _build(spec, seed):
         used += n
     t = sum(new)
     q = torch.randn(t, HEADS, QK, generator=g, device="cuda").to(torch.bfloat16)
+    # The fp8 attention's query: the e4m3 q_b output (values within the e4m3 range).
+    e4m3 = bool(spec.get("q_e4m3", False))
+    if e4m3:
+        q = (q.float() * 64.0).to(torch.float8_e4m3fn)
     # The latent as the target hands it over: the tail of a wider projection row when the
     # cell names a stride, else packed.
     stride = spec.get("latent_stride", LATENT)
     row = torch.randn(t, stride, generator=g, device="cuda").to(torch.bfloat16)
     cu = torch.tensor([0] + torch.tensor(new).cumsum(0).tolist(), dtype=torch.int32)
+    # The non-absorbed attention's mode: no fused or fp8 query, rope(q_pe) back into q.
+    in_place = bool(spec.get("q_in_place", False))
     return dict(
         # The absorbed half random, the rope tail garbage the kernel must overwrite.
-        fused_q=torch.randn(t, HEADS, LATENT, generator=g, device="cuda").to(torch.bfloat16),
+        fused_q=None
+        if in_place
+        else torch.randn(t, HEADS, LATENT, generator=g, device="cuda").to(torch.bfloat16),
         q_pe=q[..., QK - ROPE :],
         latent_cache=row[:, stride - LATENT :],
-        quant_q_buffer=torch.full(
-            (t, HEADS, LATENT), SENTINEL, dtype=torch.uint8, device="cuda"
-        ).view(torch.float8_e4m3fn),
+        quant_q_buffer=None
+        if in_place
+        else torch.full((t, HEADS, LATENT), SENTINEL, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e4m3fn
+        ),
         kv_pool=torch.full(
             (num_pages * layers * PAGE * LATENT,), SENTINEL, dtype=torch.uint8, device="cuda"
         ),
@@ -85,6 +95,8 @@ def _build(spec, seed):
         # After the fp8 q-base K-B: the q-base bytes are already in quant_q_buffer (here
         # the sentinel, which must survive) and fused_q's first 512 columns are not read.
         skip_q_base=bool(spec.get("skip_q_base", False)),
+        q_in_place=in_place,
+        q_e4m3=e4m3,
     )
 
 
@@ -117,10 +129,15 @@ def test_certified_cells(cell, compiled) -> None:
     torch.cuda.synchronize()
     if head is not None:
         assert torch.equal(head[0][:, : head[1].shape[1]], head[1]), "the q_a columns were written"
-    assert got[0] is args["fused_q"] and got[3] is args["kv_pool"]
-    names = ("fused_q", "latent_cache", "quant_q_buffer", "kv_pool")
+    first = "q_pe" if args["q_in_place"] else "fused_q"
+    assert got[0] is args[first] and got[3] is args["kv_pool"]
+    names = (first, "latent_cache", "quant_q_buffer", "kv_pool")
     for name, out, want in zip(names, got, ref):
+        if want is None:
+            assert out is None, f"{name}: the q_in_place mode returns None"
+            continue
         out = out.view(torch.uint8) if out.dtype == torch.float8_e4m3fn else out
+        want = want.view(torch.uint8) if want.dtype == torch.float8_e4m3fn else want
         bad = int((out.reshape(-1) != want.reshape(-1)).sum())
         assert bad == 0, f"{name}: {bad} elements differ from the reference"
 
@@ -144,6 +161,14 @@ def _handle() -> "entry.CompiledMlaRopeAppendPrefill":
 
 def test_is_valid_admits_a_well_formed_call() -> None:
     op.is_valid(**_build(_GUARD, 2), compiled=_handle())
+
+
+def test_is_valid_refuses_e4m3_outside_q_in_place() -> None:
+    """`q_e4m3` only exists as a variant of the in-place mode."""
+    args = _build(_GUARD, 6)
+    args["q_e4m3"] = True
+    with pytest.raises(AssertionError, match="variant of q_in_place"):
+        op.is_valid(**args, compiled=_handle())
 
 
 def test_is_valid_refuses_a_prefix_sum_short_of_the_rows() -> None:

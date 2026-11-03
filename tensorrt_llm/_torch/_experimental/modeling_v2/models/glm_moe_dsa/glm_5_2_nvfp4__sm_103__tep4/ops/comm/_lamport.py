@@ -142,6 +142,9 @@ class LamportWorkspace:
     #: The lm_head's vocabulary all-gather (bf16 `[M, 38720]` shards to fp32 `[M, 154880]`)
     #: on the same buffers and slot state, or None when the group did not build it.
     gather: object = None
+    #: The fused two-shot that also writes the normalized rows as an MXF8 operand (the next
+    #: layer's qkva GEMM input), or None when the group did not build it.
+    fused_twoshot_x8: object = None
 
 
 def build_workspace(
@@ -151,8 +154,9 @@ def build_workspace(
 
     Collective: every rank of the group calls it, with the same `hidden`, `eps` and
     `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter of that
-    in int32 flags of symmetric memory per rank, and compiles five CuTe DSL kernels
-    (pure, fused, fused+quant, fused two-shot, the lm_head all-gather) for this rank on
+    in int32 flags of symmetric memory per rank, and compiles six CuTe DSL kernels
+    (pure, fused, fused+quant, fused two-shot, its MXF8-out variant, the lm_head
+    all-gather) for this rank on
     the current device. Launches nothing beyond the buffer fills and the one-element
     multicast and all-gather agreements.
 
@@ -227,6 +231,24 @@ def build_workspace(
         use_pdl=True,
         pdl_release_policy=_PDL_POLICY,
     )
+    # The MXF8-out two-shot, agreed like the gather: only the next layer's qkva reads its
+    # extra output, so a group without it keeps that GEMM's own activation quant.
+    try:
+        fused_twoshot_x8 = _ar.compile_fused_out_mxf8_twoshot_for_rank(
+            rank,
+            world,
+            dev.index,
+            hidden,
+            eps=eps,
+            use_pdl=True,
+            pdl_release_policy=_PDL_POLICY,
+        )
+    except Exception:  # noqa: BLE001 -- that group's qkva keeps its activation quant
+        fused_twoshot_x8 = None
+    built = torch.tensor([0 if fused_twoshot_x8 is None else 1], dtype=torch.int32, device=dev)
+    dist.all_reduce(built, op=dist.ReduceOp.MIN, group=group)
+    if not bool(built.item()):
+        fused_twoshot_x8 = None
     # The all-gather is separate on purpose: a group that cannot build it keeps its
     # logits on upstream's gather, never its all-reduces. Agreed like multicast: a rank
     # launching the gather while a peer did not would wait on stores that never land.
@@ -263,6 +285,7 @@ def build_workspace(
         fused_quant=fused_quant,
         fused_twoshot=fused_twoshot,
         gather=gather,
+        fused_twoshot_x8=fused_twoshot_x8,
     )
 
 

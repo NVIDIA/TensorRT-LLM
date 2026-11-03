@@ -67,6 +67,20 @@ K_ROPE_GROUP = Q_ROPE_GROUPS
 KV_COPY_START = K_ROPE_GROUP + 1
 Q_BASE_START = KV_COPY_START + KV_COPY_GROUPS
 WORK_GROUPS = Q_BASE_START + NUM_HEADS * Q_BASE_GROUPS_PER_HEAD  # 153
+# Merged RoPE work group for the q_in_place modes (the non-absorbed context attention, BF16 or
+# E4M3 Q). The 16 q-RoPE groups and the k-RoPE group of a token tile run in ONE CTA: each
+# thread locates its token's request and loads its cos/sin once, issues all 17 vector loads,
+# then ropes and stores. Separate groups launch 17 CTAs per tile that each repeat the 6-probe
+# request search for one 16-byte vector per thread; at T ~ 7.3k (q_in_place) that is ~5.7k CTAs
+# of latency-chained work, 12.4 us/layer vs a ~6 us DRAM floor. Measured on B300 at T = 7255:
+# L2-hot 9.11 -> 7.01 us (BF16 Q), 9.20 -> 6.73 us (E4M3 Q), L2-flushed unchanged (17.4 us);
+# the absorbed modes (fused_q / quant_q stores per head) were slower merged (9.97 -> 11.87 us)
+# and keep the separate groups. Same per-element arithmetic and destinations, so outputs are
+# bitwise identical; only the work decomposition changes (grid y: rope 1 + c_kv copy 8
+# [+ q-base 128]).
+MERGE_ROPE_GROUPS = True
+MERGED_KV_COPY_START = 1
+MERGED_Q_BASE_START = MERGED_KV_COPY_START + KV_COPY_GROUPS
 TOKENS_PER_BLOCK = 32
 MAX_REQUESTS = 64  # context requests per step (B32 wave: <= 32)
 DEFAULT_Q_PE_LD = QK_HEAD_DIM
@@ -88,6 +102,26 @@ class PrefillRopeSpecialization:
     # so the 128 q-base quantize groups (and their 129 MB bf16 re-read at
     # T ~ 8k) are skipped. fused_q[..., :512] is then neither read nor needed.
     skip_q_base: bool = False
+    # Non-absorbed context route (dense-causal MHA): rope(q_pe) is written back in place
+    # into q_pe (the q_b projection output, which is then the MHA's Q), and no E4M3 Q is
+    # written at all (no rope tail, no q-base groups). fused_q / quant_q_buffer are not
+    # touched; the k_pe rope, the latent write-back and the paged-pool writes are the same
+    # code path as the served mode, so the decode cache bytes are unchanged.
+    q_in_place: bool = False
+    # FP8 context MHA (with q_in_place): q_pe is a view of the E4M3 Q the q_b GEMM's E4M3 epilogue
+    # wrote ([T,16,256], a per-tensor power-of-two scale already applied); rope(q_pe) is computed
+    # from the widened E4M3 values (E4M3 -> BF16 is exact; rope is linear, so the scale needs no
+    # handling) and written back in place as E4M3 (RN, satfinite). Everything else as q_in_place.
+    q_e4m3: bool = False
+    # One CTA per token tile for all RoPE groups (see MERGE_ROPE_GROUPS; prepare_runner
+    # turns it on for the q_in_place modes only).
+    merge_rope: bool = False
+    # context-step stitch: launch the RoPE groups only (grid y = 1 merged / 17 separate). The caller's
+    # q_a/kv_a RMSNorm (``compile_qkv_a_rmsnorm_warp_row_q8_ctx`` with ``kv_append``) already
+    # wrote every context row's c_kv E4M3 bytes into the pool rows; the k-RoPE group still
+    # writes the k_pe bytes [512:576] and the latent k_pe slot. Needs the copy groups to be
+    # the last launched groups, i.e. ``q_in_place`` or ``skip_q_base``.
+    skip_kv_copy: bool = False
 
     def validate(self) -> None:
         if self.tokens_per_block <= 0 or (self.tokens_per_block & (self.tokens_per_block - 1)):
@@ -102,6 +136,10 @@ class PrefillRopeSpecialization:
             raise ValueError("q_pe_stride must cover all heads and be a multiple of 8")
         if self.latent_cache_stride < HEAD_SIZE or self.latent_cache_stride % 8 != 0:
             raise ValueError("latent_cache_stride must be >= 576 and a multiple of 8")
+        if self.q_e4m3 and not self.q_in_place:
+            raise ValueError("q_e4m3 is a variant of q_in_place")
+        if self.skip_kv_copy and not (self.q_in_place or self.skip_q_base):
+            raise ValueError("skip_kv_copy needs q_in_place or skip_q_base")
 
 
 @dataclass
@@ -187,6 +225,45 @@ def _store_e4m3x8(dst, idx, v0, v1, v2, v3, v4, v5, v6, v7) -> None:
 
 
 @cute.jit
+def _bf16x2_to_f32(packed):
+    """The two BF16 halves of one Int32 as exact FP32 values (low half first)."""
+    lo = (packed << cutlass.Int32(16)).bitcast(cutlass.Float32)
+    hi = (packed & cutlass.Int32(-65536)).bitcast(cutlass.Float32)
+    return lo, hi
+
+
+@cute.jit
+def _load_e4m3x8_words(src, idx):
+    """Eight E4M3 bytes at ``src[idx]`` (8-byte aligned) as two Int32 words (no widening)."""
+    ptr = src.data_ptr(idx)
+    ptr_i32 = cutlass.inttoptr(ptr.toint(), ptr.space, cutlass.Int32)
+    return ptr_i32.load(count=2, alignment=8)
+
+
+@cute.jit
+def _e4m3x8_words_to_f32(words):
+    """The eight E4M3 values of ``_load_e4m3x8_words`` as exact FP32 values, in order."""
+    x0, x1 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[0], 0))
+    x2, x3 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[0], 16))
+    x4, x5 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[1], 0))
+    x6, x7 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[1], 16))
+    return (x0, x1, x2, x3, x4, x5, x6, x7)
+
+
+@cute.jit
+def _load_e4m3x8_f32(src, idx):
+    """Eight E4M3 bytes at ``src[idx]`` (8-byte aligned) as exact FP32 values, in order."""
+    ptr = src.data_ptr(idx)
+    ptr_i32 = cutlass.inttoptr(ptr.toint(), ptr.space, cutlass.Int32)
+    words = ptr_i32.load(count=2, alignment=8)
+    x0, x1 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[0], 0))
+    x2, x3 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[0], 16))
+    x4, x5 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[1], 0))
+    x6, x7 = _bf16x2_to_f32(prims.cvt_e4m3x2_word_to_bf16x2(words[1], 16))
+    return (x0, x1, x2, x3, x4, x5, x6, x7)
+
+
+@cute.jit
 def _store_bf16x8(dst, idx, v0, v1, v2, v3, v4, v5, v6, v7) -> None:
     """Store eight bf16-exact fp32 values as one 16-byte bf16 vector."""
     vec = cutlass.Vector.from_elements(
@@ -268,9 +345,19 @@ def glm52_self_attn_prefill_mla_rope_append_fp8q_kernel(
     q_pe_ld: cutlass.Constexpr[int],
     q_pe_stride: cutlass.Constexpr[int],
     latent_cache_stride: cutlass.Constexpr[int],
+    q_in_place: cutlass.Constexpr[bool],
+    q_e4m3: cutlass.Constexpr[bool],
+    merge_rope: cutlass.Constexpr[bool],
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     token_tile, work_group, _ = cute.arch.block_idx()
+    if cutlass.const_expr(merge_rope):
+        # grid y = [rope (all 17 groups)] + [8 c_kv copy groups] + [q-base groups]: map the
+        # launch index onto the separate-groups numbering the branches below use.
+        if work_group >= cutlass.Int32(MERGED_KV_COPY_START):
+            work_group = work_group + cutlass.Int32(
+                KV_COPY_START - MERGED_KV_COPY_START
+            )
     n_tokens = cutlass.Int32(num_tokens)
     n_req = cutlass.Int32(num_requests)
     max_blocks = cutlass.Int32(max_blocks_per_seq)
@@ -291,17 +378,53 @@ def glm52_self_attn_prefill_mla_rope_append_fp8q_kernel(
             dim_base = lane * cutlass.Int32(8)
             table_base = (position * ROPE_DIM + lane * cutlass.Int32(4)) * 2
             cos_sin = rotary_cos_sin.data_ptr(table_base).load(count=8, alignment=16)
-            if work_group < cutlass.Int32(Q_ROPE_GROUPS):
-                q_head = work_group
-                src = token * q_pe_stride + q_head * q_pe_ld + dim_base
-                q_vec = q_pe.data_ptr(src).load(count=8, alignment=16)
-                y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(q_vec, cos_sin)
-                dst = token * NUM_HEADS * HEAD_SIZE + q_head * HEAD_SIZE + KV_LORA_RANK + dim_base
-                _store_bf16x8(fused_q, dst, y0, y1, y2, y3, y4, y5, y6, y7)
-                _store_e4m3x8(quant_q_buffer, dst, y0, y1, y2, y3, y4, y5, y6, y7)
-            else:
+            if cutlass.const_expr(merge_rope):
+                # merged: this CTA ropes all 16 q heads and k_pe of its token tile; the
+                # request search and the cos/sin load above are shared by all 17. Every
+                # load is issued before the first store (an in-place store could alias a
+                # later head's load, which would serialize 17 round trips per thread).
+                q_srcs = []
+                q_raw = []
+                for q_head_c in cutlass.range_constexpr(Q_ROPE_GROUPS):
+                    src = (
+                        token * q_pe_stride
+                        + cutlass.Int32(q_head_c) * q_pe_ld
+                        + dim_base
+                    )
+                    q_srcs.append(src)
+                    if cutlass.const_expr(q_e4m3):
+                        q_raw.append(_load_e4m3x8_words(q_pe, src))
+                    else:
+                        q_raw.append(q_pe.data_ptr(src).load(count=8, alignment=16))
                 k_src = token * latent_cache_stride + KV_LORA_RANK + dim_base
                 k_vec = latent_cache.data_ptr(k_src).load(count=8, alignment=16)
+                for q_head_c in cutlass.range_constexpr(Q_ROPE_GROUPS):
+                    q_head = cutlass.Int32(q_head_c)
+                    src = q_srcs[q_head_c]
+                    if cutlass.const_expr(q_e4m3):
+                        # FP8 MHA Q: rope the widened E4M3 elements, rewrite them as E4M3
+                        q_vec8 = _e4m3x8_words_to_f32(q_raw[q_head_c])
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(q_vec8, cos_sin)
+                        _store_e4m3x8(q_pe, src, y0, y1, y2, y3, y4, y5, y6, y7)
+                    elif cutlass.const_expr(q_in_place):
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(
+                            q_raw[q_head_c], cos_sin
+                        )
+                        _store_bf16x8(q_pe, src, y0, y1, y2, y3, y4, y5, y6, y7)
+                    else:
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(
+                            q_raw[q_head_c], cos_sin
+                        )
+                        dst = (
+                            token * NUM_HEADS * HEAD_SIZE
+                            + q_head * HEAD_SIZE
+                            + KV_LORA_RANK
+                            + dim_base
+                        )
+                        _store_bf16x8(fused_q, dst, y0, y1, y2, y3, y4, y5, y6, y7)
+                        _store_e4m3x8(
+                            quant_q_buffer, dst, y0, y1, y2, y3, y4, y5, y6, y7
+                        )
                 y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(k_vec, cos_sin)
                 _store_bf16x8(latent_cache, k_src, y0, y1, y2, y3, y4, y5, y6, y7)
                 block_in_seq = position // cutlass.Int32(tokens_per_block)
@@ -324,6 +447,60 @@ def glm52_self_attn_prefill_mla_rope_append_fp8q_kernel(
                         y6,
                         y7,
                     )
+            else:
+                if work_group < cutlass.Int32(Q_ROPE_GROUPS):
+                    q_head = work_group
+                    src = token * q_pe_stride + q_head * q_pe_ld + dim_base
+                    if cutlass.const_expr(q_e4m3):
+                        # FP8 MHA Q: rope the widened E4M3 elements, rewrite them as E4M3
+                        q_vec8 = _load_e4m3x8_f32(q_pe, src)
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(q_vec8, cos_sin)
+                        _store_e4m3x8(q_pe, src, y0, y1, y2, y3, y4, y5, y6, y7)
+                    elif cutlass.const_expr(q_in_place):
+                        q_vec = q_pe.data_ptr(src).load(count=8, alignment=16)
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(q_vec, cos_sin)
+                        # each lane reads and rewrites its own 8 elements (4 whole pairs)
+                        _store_bf16x8(q_pe, src, y0, y1, y2, y3, y4, y5, y6, y7)
+                    else:
+                        q_vec = q_pe.data_ptr(src).load(count=8, alignment=16)
+                        y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(q_vec, cos_sin)
+                        dst = (
+                            token * NUM_HEADS * HEAD_SIZE
+                            + q_head * HEAD_SIZE
+                            + KV_LORA_RANK
+                            + dim_base
+                        )
+                        _store_bf16x8(fused_q, dst, y0, y1, y2, y3, y4, y5, y6, y7)
+                        _store_e4m3x8(
+                            quant_q_buffer, dst, y0, y1, y2, y3, y4, y5, y6, y7
+                        )
+                else:
+                    k_src = token * latent_cache_stride + KV_LORA_RANK + dim_base
+                    k_vec = latent_cache.data_ptr(k_src).load(count=8, alignment=16)
+                    y0, y1, y2, y3, y4, y5, y6, y7 = _rope8_e4m3(k_vec, cos_sin)
+                    _store_bf16x8(latent_cache, k_src, y0, y1, y2, y3, y4, y5, y6, y7)
+                    block_in_seq = position // cutlass.Int32(tokens_per_block)
+                    local_cache_token = position & cutlass.Int32(tokens_per_block - 1)
+                    if block_in_seq < max_blocks:
+                        offset_idx = req * 2 * max_blocks + block_in_seq
+                        block_offset = cutlass.Int32(
+                            kv_cache_block_offsets.load(idx=offset_idx)
+                        )
+                        cache_base = cutlass.Int64(block_offset) * cutlass.Int64(
+                            tokens_per_block * HEAD_SIZE
+                        ) + cutlass.Int64(local_cache_token * HEAD_SIZE)
+                        _store_e4m3x8(
+                            kv_cache_storage,
+                            cache_base + KV_LORA_RANK + dim_base,
+                            y0,
+                            y1,
+                            y2,
+                            y3,
+                            y4,
+                            y5,
+                            y6,
+                            y7,
+                        )
     else:
         # ---- copy groups: 64 lanes x 8 dims = 512 columns, 4 tokens per group ----
         copy_dim_group = tidx & cutlass.Int32(63)
@@ -398,15 +575,25 @@ def _launch(
     q_pe_stride: cutlass.Constexpr[int],
     latent_cache_stride: cutlass.Constexpr[int],
     skip_q_base: cutlass.Constexpr[bool],
+    q_in_place: cutlass.Constexpr[bool],
+    q_e4m3: cutlass.Constexpr[bool],
+    merge_rope: cutlass.Constexpr[bool],
+    skip_kv_copy: cutlass.Constexpr[bool] = False,
 ) -> None:
     num_tokens = fused_q.shape[0]
+    if cutlass.const_expr(q_in_place):
+        num_tokens = q_pe.shape[0]  # fused_q / quant_q_buffer are placeholders
     num_requests = cached_lens.shape[0]
     max_blocks_per_seq = kv_cache_block_offsets.shape[2]
     storage = cute.make_tensor(kv_cache_storage, cute.make_layout((1,), stride=(1,)))
     grid_x = (num_tokens + TOKENS_PER_CTA - 1) // TOKENS_PER_CTA
     grid_y = WORK_GROUPS
-    if cutlass.const_expr(skip_q_base):
+    if cutlass.const_expr(skip_q_base or q_in_place):
         grid_y = Q_BASE_START
+    if cutlass.const_expr(skip_kv_copy):
+        grid_y = KV_COPY_START
+    if cutlass.const_expr(merge_rope):
+        grid_y = grid_y - (KV_COPY_START - MERGED_KV_COPY_START)
     glm52_self_attn_prefill_mla_rope_append_fp8q_kernel(
         fused_q,
         q_pe,
@@ -424,6 +611,9 @@ def _launch(
         q_pe_ld,
         q_pe_stride,
         latent_cache_stride,
+        q_in_place,
+        q_e4m3,
+        merge_rope,
     ).launch(
         grid=(grid_x, grid_y, 1),
         block=(THREADS, 1, 1),
@@ -437,14 +627,17 @@ def _fake_tensors(spec: PrefillRopeSpecialization):
     make_fake_strided = cute.runtime.make_fake_tensor
     num_tokens = cute.sym_int64()
     num_requests = cute.sym_int64()
+    # q_in_place: fused_q / quant_q_buffer are one-row placeholders, so their row
+    # extent is its own symbol (the TVM-FFI entry checks shared symbols for equality)
+    q_rows = cute.sym_int64() if spec.q_in_place else num_tokens
     fused_q = make_fake(
         cutlass.BFloat16,
-        (num_tokens, NUM_HEADS, HEAD_SIZE),
+        (q_rows, NUM_HEADS, HEAD_SIZE),
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
     q_pe = make_fake_strided(
-        cutlass.BFloat16,
+        cutlass.Float8E4M3FN if spec.q_e4m3 else cutlass.BFloat16,
         (num_tokens, NUM_HEADS, ROPE_DIM),
         (spec.q_pe_stride, spec.q_pe_ld, 1),
         assumed_align=16,
@@ -465,7 +658,7 @@ def _fake_tensors(spec: PrefillRopeSpecialization):
         )
     quant_q = make_fake(
         cutlass.Uint8,
-        (num_tokens, NUM_HEADS, HEAD_SIZE),
+        (q_rows, NUM_HEADS, HEAD_SIZE),
         stride_order=(2, 1, 0),
         assumed_align=16,
     )
@@ -497,6 +690,10 @@ def _compile_for(spec: PrefillRopeSpecialization, device_index: int):
         spec.q_pe_stride,
         spec.latent_cache_stride,
         spec.skip_q_base,
+        spec.q_in_place,
+        spec.q_e4m3,
+        spec.merge_rope,
+        spec.skip_kv_copy,
     )
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
@@ -512,6 +709,10 @@ def _compile_for(spec: PrefillRopeSpecialization, device_index: int):
         spec.q_pe_stride,
         spec.latent_cache_stride,
         spec.skip_q_base,
+        spec.q_in_place,
+        spec.q_e4m3,
+        spec.merge_rope,
+        spec.skip_kv_copy,
         options="--enable-tvm-ffi",
     )
     _COMPILE_CACHE[key] = compiled
@@ -542,11 +743,26 @@ def _normalize_rotary_cos_sin(rotary_cos_sin: torch.Tensor) -> torch.Tensor:
     return rotary_cos_sin.reshape(-1, ROPE_DIM, 2)
 
 
+_Q_IN_PLACE_PLACEHOLDERS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _q_in_place_placeholders(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-row fused_q / quant_q stand-ins for the q_in_place mode (never read or written)."""
+    ph = _Q_IN_PLACE_PLACEHOLDERS.get(device)
+    if ph is None:
+        ph = (
+            torch.zeros(1, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16, device=device),
+            torch.zeros(1, NUM_HEADS, HEAD_SIZE, dtype=torch.uint8, device=device),
+        )
+        _Q_IN_PLACE_PLACEHOLDERS[device] = ph
+    return ph
+
+
 def prepare_runner(
-    fused_q: torch.Tensor,
+    fused_q: torch.Tensor | None,
     q_pe: torch.Tensor,
     latent_cache: torch.Tensor,
-    quant_q_buffer: torch.Tensor,
+    quant_q_buffer: torch.Tensor | None,
     kv_cache_storage: torch.Tensor | int,
     kv_cache_block_offsets: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -556,6 +772,10 @@ def prepare_runner(
     tokens_per_block: int = TOKENS_PER_BLOCK,
     refresh_stream: bool = False,
     skip_q_base: bool = False,
+    q_in_place: bool = False,
+    q_e4m3: bool = False,
+    merge_rope: bool | None = None,
+    skip_kv_copy: bool = False,
 ) -> PreparedPrefillRopeRunner:
     """Validate the ABI, pick the specialization, compile (cached), bind pointers.
 
@@ -569,16 +789,38 @@ def prepare_runner(
     ``quant_q_buffer[..., :512]`` (e.g. a K-B GEMM with an e4m3 epilogue); only the
     RoPE columns ``[..., 512:]`` of ``quant_q_buffer`` are written and
     ``fused_q[..., :512]`` is not read.
+    ``q_in_place=True`` (non-absorbed context route): rope(q_pe) is written back into
+    ``q_pe`` and no E4M3 Q is produced; ``fused_q`` / ``quant_q_buffer`` must be None.
+    ``q_e4m3=True`` (with ``q_in_place``, FP8 context MHA): ``q_pe`` is an E4M3 view
+    (``torch.float8_e4m3fn``) of the q_b GEMM's E4M3 output; rope runs on the widened values
+    and the result is written back as E4M3.
+    ``merge_rope``: one CTA per token tile for all RoPE groups (None = ``MERGE_ROPE_GROUPS``
+    for the q_in_place modes, off otherwise); outputs are bitwise identical either way.
+    ``skip_kv_copy=True`` (context-step stitch): the c_kv copy groups are not launched -- the caller's
+    norm already wrote the context rows' c_kv E4M3 bytes into the pool; everything else as
+    without it.
     """
+    _require(not q_e4m3 or q_in_place, "q_e4m3 needs q_in_place")
     rotary_cos_sin = _normalize_rotary_cos_sin(rotary_cos_sin)
-    t = fused_q.shape[0]
+    if q_in_place:
+        _require(
+            fused_q is None and quant_q_buffer is None and not skip_q_base,
+            "q_in_place takes no fused_q / quant_q_buffer and no skip_q_base",
+        )
+        fused_q, quant_q_buffer = _q_in_place_placeholders(q_pe.device)
+        t = q_pe.shape[0]
+    else:
+        t = fused_q.shape[0]
     _require(
         fused_q.dtype == torch.bfloat16 and fused_q.is_cuda and fused_q.is_contiguous(),
         "fused_q",
     )
-    _require(tuple(fused_q.shape) == (t, NUM_HEADS, HEAD_SIZE), "fused_q must be [T,16,576]")
     _require(
-        q_pe.dtype == torch.bfloat16
+        q_in_place or tuple(fused_q.shape) == (t, NUM_HEADS, HEAD_SIZE),
+        "fused_q must be [T,16,576]",
+    )
+    _require(
+        q_pe.dtype == (torch.float8_e4m3fn if q_e4m3 else torch.bfloat16)
         and q_pe.is_cuda
         and tuple(q_pe.shape) == (t, NUM_HEADS, ROPE_DIM),
         "q_pe",
@@ -596,7 +838,7 @@ def prepare_runner(
         "quant_q",
     )
     _require(
-        tuple(quant_q_buffer.shape) == (t, NUM_HEADS, HEAD_SIZE),
+        q_in_place or tuple(quant_q_buffer.shape) == (t, NUM_HEADS, HEAD_SIZE),
         "quant_q_buffer must be [T,16,576]",
     )
     _require(
@@ -660,6 +902,14 @@ def prepare_runner(
         q_pe_stride=int(q_pe.stride(0)),
         latent_cache_stride=int(latent_cache.stride(0)),
         skip_q_base=bool(skip_q_base),
+        q_in_place=bool(q_in_place),
+        q_e4m3=bool(q_e4m3),
+        merge_rope=(
+            MERGE_ROPE_GROUPS and bool(q_in_place)
+            if merge_rope is None
+            else bool(merge_rope)
+        ),
+        skip_kv_copy=bool(skip_kv_copy),
     )
     device_index = _device_index(fused_q)
     compiled = _compile_for(spec, device_index)
