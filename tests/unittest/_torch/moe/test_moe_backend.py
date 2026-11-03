@@ -288,7 +288,9 @@ def test_cutlass_moe_finalize_aligned_matches_offset(
             gemm2_output[permuted.clamp(0, num_tokens * top_k - 1)].float() + bias[expert].float()
         )
         expected += torch.where(is_local[:, None], term, torch.zeros_like(term))
-    torch.testing.assert_close(aligned[rows].float(), expected[rows], atol=5e-2, rtol=2e-2)
+    # The kernel accumulates in FP32 with FMAs, the reference with separate products and sums.
+    atol, rtol = (1e-4, 1e-4) if dtype == torch.float32 else (5e-2, 2e-2)
+    torch.testing.assert_close(aligned[rows].float(), expected[rows], atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize(
