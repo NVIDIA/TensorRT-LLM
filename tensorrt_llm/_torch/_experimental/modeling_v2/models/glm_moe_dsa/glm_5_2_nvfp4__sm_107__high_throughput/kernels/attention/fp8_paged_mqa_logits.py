@@ -1460,7 +1460,7 @@ class FP8MQALogitsKernel:
                     m_coord = tTR_cC[0][0]
                     tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
                     tTR_rAcc_next = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-                    w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                    w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                     q_stage_local = cutlass.Int32(0)
 
                     while has_work:
@@ -1553,7 +1553,7 @@ class FP8MQALogitsKernel:
                     m_coord = tTR_cC[0][0]
                     tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
                     tTR_rAcc_next = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-                    w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                    w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                     q_stage_local = cutlass.Int32(0)
 
                     while has_work:
@@ -1661,7 +1661,7 @@ class FP8MQALogitsKernel:
                     else:
                         MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                     NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads, self.weight_cache_limit)
-                    w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                    w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                     q_stage_local = cutlass.Int32(0)
 
                     while has_work:
@@ -1898,7 +1898,7 @@ class FP8MQALogitsKernel:
                     else:
                         MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
                     NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads, self.weight_cache_limit)
-                    w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
+                    w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                     q_stage_local = cutlass.Int32(0)
 
                     while has_work:
