@@ -585,6 +585,7 @@ def _worker(args: argparse.Namespace) -> None:
     executor._is_kv_manager_v2 = True
     executor._prefetched_request_ids = {request.py_request_id}
     executor.gather_all_responses = False
+    executor._disagg_pp_termination_handler = None
     executor.result_wait_queues = {request.py_request_id: None} if rank == 0 else {}
     assert executor.disagg is not None
     _record(
@@ -849,7 +850,11 @@ def _exercise_live_session(
             # The other endpoint may already have sent cancellation after the gate.
             # Local cancellation must preserve that first drain, not restart grace.
             previous_drain = retirement._drain_started
-            assert not executor._try_cancel_request(request)
+            assert executor._try_cancel_request(request) is (role == "gen" and not context_first)
+            if role == "gen" and not context_first:
+                assert executor.disagg._retiring_gen_receives == {request.py_request_id: request}
+                executor._terminate_request(request)
+                retained()
             assert session.status == SessionStatus.CANCELLED, (session.status, retirement._reason)
             if previous_drain is not None:
                 assert retirement._drain_started == previous_drain
@@ -875,7 +880,11 @@ def _exercise_live_session(
         drain_started = session._retirement._drain_started
         for _ in range(3):
             if case.startswith("cancel_"):
-                assert not executor._try_cancel_request(request)
+                assert executor._try_cancel_request(request) is (
+                    role == "gen" and not context_first
+                )
+                if role == "gen" and not context_first:
+                    executor._terminate_request(request)
                 assert session._retirement._drain_started == drain_started
             status = poll(0)
             assert not any(status)
@@ -993,7 +1002,8 @@ def _exercise_live_session(
         assert all(bool(torch.all(region == expected_byte)) for region in regions)
 
     assert executor._try_cancel_request(request)
-    executor._do_terminate_request(request)
+    executor._terminate_request(request)
+    executor.disagg._retire_cancelled_gen_receives()
     assert request.py_request_id not in executor._prefetched_request_ids
     assert request.py_request_id not in executor.result_wait_queues
     retired_pool = _pool_state(manager)
