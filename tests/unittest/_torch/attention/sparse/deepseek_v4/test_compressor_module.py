@@ -516,13 +516,13 @@ def test_compressed_mask_static_shapes_no_recompile():
 
 
 def _reference_gen_position_ids(
-    cu: List[int],
-    past: List[int],
+    cu: list[int],
+    past: list[int],
     num_contexts: int,
     num_generations: int,
     num_gen_tokens_per_seq: int,
     compress_ratio: int,
-) -> Dict[int, int]:
+) -> dict[int, int]:
     """Slot -> position ID for every generation output slot of one ratio."""
     batch_size = num_contexts + num_generations
     output_offset = cu[num_contexts]
@@ -535,7 +535,7 @@ def _reference_gen_position_ids(
     return expected
 
 
-def test_gen_compressed_position_ids_static_shapes_no_recompile():
+def test_gen_compressed_position_ids_static_shapes_no_recompile() -> None:
     """One compiled graph must serve every mix of context and generation requests.
 
     Serving reaches context+generation compositions that warmup never runs, so
@@ -548,7 +548,13 @@ def test_gen_compressed_position_ids_static_shapes_no_recompile():
     pos_bufs = {r: torch.empty(capacity, dtype=torch.int32, device=DEVICE) for r in ratios}
     gen_params = torch.empty(3, dtype=torch.int32, device=DEVICE)
 
-    def run(num_contexts, num_generations, num_gen_tokens_per_seq, new_comp, past):
+    def run(
+        num_contexts: int,
+        num_generations: int,
+        num_gen_tokens_per_seq: int,
+        new_comp: dict[int, list[int]],
+        past: dict[int, list[int]],
+    ) -> None:
         batch_size = num_contexts + num_generations
         for r in ratios:
             counts = torch.tensor(new_comp[r], dtype=torch.int32, device=DEVICE)

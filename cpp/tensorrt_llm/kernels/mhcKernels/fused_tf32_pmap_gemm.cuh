@@ -1387,11 +1387,27 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         float split_sum = 0.f;
         if (lane_bf <= SHAPE_N)
         {
-#pragma unroll 4
-            for (uint32_t s = 0; s < kNumSplits; ++s)
+            // Load up to kSplitChunk partials with independent loads, then add them in split order, so high split
+            // counts take a few L2 round trips instead of one per few splits.
+            constexpr uint32_t kSplitChunk = kNumSplits < 32 ? kNumSplits : 32;
+#pragma unroll 1
+            for (uint32_t base = 0; base < kNumSplits; base += kSplitChunk)
             {
-                uint64_t const row = static_cast<uint64_t>(s) * shape_m + tok;
-                split_sum += (lane_bf < SHAPE_N) ? D[row * SHAPE_N + lane_bf] : sqr_sum[row];
+                float part[kSplitChunk];
+#pragma unroll
+                for (uint32_t i = 0; i < kSplitChunk; ++i)
+                {
+                    uint64_t const row = static_cast<uint64_t>(base + i) * shape_m + tok;
+                    part[i] = (base + i < kNumSplits)
+                        ? ((lane_bf < SHAPE_N) ? D[row * SHAPE_N + lane_bf] : sqr_sum[row])
+                        : 0.f;
+                }
+#pragma unroll
+                for (uint32_t i = 0; i < kSplitChunk; ++i)
+                {
+                    if (base + i < kNumSplits)
+                        split_sum += part[i];
+                }
             }
         }
         uint32_t const row_lane = lane_bf & (HC_MULT - 1);

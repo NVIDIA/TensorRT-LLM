@@ -25,6 +25,8 @@ l0_b300:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
   # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
   # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
   # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it

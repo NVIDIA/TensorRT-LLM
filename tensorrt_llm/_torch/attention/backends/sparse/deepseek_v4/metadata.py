@@ -1074,12 +1074,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
     def _compute_gen_compressed_position_ids(
-        past_kv_lens_bufs: Dict[int, torch.Tensor],
-        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
-        compressed_position_ids_bufs: Dict[int, torch.Tensor],
+        past_kv_lens_bufs: dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: dict[int, torch.Tensor],
+        compressed_position_ids_bufs: dict[int, torch.Tensor],
         gen_params: torch.Tensor,
-        compress_ratios: list,
-    ):
+        compress_ratios: list[int],
+    ) -> None:
         """Generation position IDs in exact compact compressor output order.
 
         The decode kernel packs valid outputs according to ``cu_new_comp_kv``.

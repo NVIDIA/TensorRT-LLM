@@ -45,8 +45,8 @@ void mhcHcHeadApplyLaunch(float const* mixes, float const* sqrsum, __nv_bfloat16
 void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x, float const* post_mix,
     float const* comb_mix, __nv_bfloat16* out, int B, int hidden_size, cudaStream_t stream);
 
-// Split count the TF32 MMA fused-HC launchers (mhcFusedHcLaunch / mhcFusedHcAllInOneLaunch) run with for a
-// requested `num_k_splits` (<= 0 selects the built-in heuristic). Callers size the per-split workspaces with it.
+//! Split count the TF32 MMA fused-HC launchers (mhcFusedHcLaunch / mhcFusedHcAllInOneLaunch) run with for a
+//! requested `num_k_splits` (<= 0 selects the built-in heuristic). Callers size the per-split workspaces with it.
 int mhcFusedHcMmaKSplits(int M, int num_k_splits, bool all_in_one);
 
 // Single-launch fused hyper-connection boundary op (SM100 only).

@@ -6,6 +6,7 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -15,6 +16,9 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.modules.mhc.hyper_connection as hyper_connection
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
 BENCH_WARMUP = 50
 BENCH_ITERS = 200
@@ -686,12 +690,19 @@ def test_mhc_fused_hc_fused_norm(n: int, hidden_size: int, hc_mult: int):
         (1536, 7168, ("fused_half_mma", 0, 4, 256, 1)),
         (256, 4096, ("fused_half_mma", 0, 32, 256, 1)),
         (256, 4096, ("fused_all_mma", 0, 8, 0, 1)),
+        # Hidden 5120 (DeepSeek-V4.1-Flash): the ladder's 80/40/20 splits at M = 48/96/256.
+        (48, 5120, ("fused_half_mma", 0, 80, 512, 1)),
+        (96, 5120, ("fused_half_mma", 0, 40, 512, 1)),
+        (256, 5120, ("fused_half_mma", 0, 20, 512, 1)),
+        (256, 5120, ("fused_all_mma", 0, 20, 0, 1)),
         # num_k_splits == 0: the launcher's own split heuristic.
         (384, 7168, ("fused_half_mma", 0, 0, 0, 1)),
     ],
 )
 @skip_pre_blackwell
-def test_mhc_fused_hc_mma_split_k_deterministic(n: int, hidden_size: int, tactic):
+def test_mhc_fused_hc_mma_split_k_deterministic(
+    n: int, hidden_size: int, tactic: tuple[str, int, int, int, int]
+) -> None:
     """Split-K MMA fused_hc returns bit-identical outputs for identical inputs.
 
     The split partials are reduced in split order, so repeated calls must not
@@ -764,25 +775,173 @@ def test_mhc_fused_hc_mma_split_k_deterministic(n: int, hidden_size: int, tactic
     torch.testing.assert_close(layer_input_cur, layer_input_ref, rtol=1e-2, atol=1e-2)
 
 
+def test_mhc_ops_reject_short_split_workspaces() -> None:
+    """The split-K ops check their workspaces and backend code before launching anything.
+
+    Each split stores its own partial, so a workspace sized for one split must be rejected
+    when more splits are requested instead of being read out of bounds.
+    """
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_call, mhc_big_fuse_cuda
+
+    m, n, hidden = 8, 4, 4096
+    mix = n * (2 + n)
+    dev = "cuda"
+    one_split_y = torch.zeros((m, mix), dtype=torch.float32, device=dev)
+    one_split_r = torch.zeros((m,), dtype=torch.float32, device=dev)
+    residual = torch.zeros((m, n, hidden), dtype=torch.bfloat16, device=dev)
+    hc_scale = torch.ones((3,), dtype=torch.float32, device=dev)
+    hc_base = torch.zeros((mix,), dtype=torch.float32, device=dev)
+    post_mix = torch.empty((m, n), dtype=torch.float32, device=dev)
+    comb_mix = torch.empty((m, n * n), dtype=torch.float32, device=dev)
+    layer_input = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
+
+    with pytest.raises(RuntimeError, match="num_splits=7"):
+        mhc_big_fuse_cuda(
+            one_split_y,
+            one_split_r,
+            residual,
+            hc_scale,
+            hc_base,
+            post_mix,
+            comb_mix,
+            layer_input,
+            m,
+            n * hidden,
+            hidden,
+            1e-6,
+            1e-6,
+            1e-6,
+            1.0,
+            20,
+            num_splits=7,
+        )
+
+    x_prev = torch.zeros((m, hidden), dtype=torch.bfloat16, device=dev)
+    post_mix_prev = torch.zeros((m, n), dtype=torch.float32, device=dev)
+    comb_mix_prev = torch.zeros((m, n * n), dtype=torch.float32, device=dev)
+    w = torch.zeros((mix, n * hidden), dtype=torch.float32, device=dev)
+    residual_cur = torch.empty_like(residual)
+    done_counter = torch.zeros((1,), dtype=torch.int32, device=dev)
+
+    def fused_hc(backend_code: int, num_k_splits: int) -> None:
+        _fused_hc_call(
+            backend_code,
+            2,
+            num_k_splits,
+            512,
+            1,
+            x_prev,
+            residual,
+            post_mix_prev,
+            comb_mix_prev,
+            w,
+            hc_scale,
+            hc_base,
+            residual_cur,
+            post_mix,
+            comb_mix,
+            layer_input,
+            one_split_y,
+            one_split_r,
+            done_counter,
+            m,
+            hidden,
+            n,
+            1e-6,
+            1e-6,
+            1e-6,
+            1.0,
+            20,
+        )
+
+    with pytest.raises(RuntimeError, match="backend 1 with num_k_splits=4"):
+        fused_hc(1, 4)
+    with pytest.raises(RuntimeError, match="unknown backend code 4"):
+        fused_hc(4, 1)
+
+
+def _fused_hc_summation_key(tactic: tuple[str, int, int, int, int]) -> tuple[str, int, int]:
+    """The tactic parameters that set a fused-HC call's floating-point summation order.
+
+    The split count sets the K partition and the BigFuse block size the fused-norm reduction
+    width; the tile width and the all-in-one FMA tokens-per-CTA only assign work to CTAs.
+    """
+    backend, _tile_n, num_k_splits, bigfuse_bs, _tile_m = tactic
+    return (backend, num_k_splits, bigfuse_bs)
+
+
+def _make_real_scale_fused_hc_case(
+    n: int, hidden_size: int, seed: int
+) -> tuple["MhcFusedHcRunner", list[torch.Tensor], dict[str, torch.Tensor | float]]:
+    """Fused-HC inputs at real scale, with the fused next-layer RMSNorm the models use.
+
+    The GEMM terms are comparable to the logit bias here, so a change in summation order
+    reaches the outputs instead of being rounded away.
+    """
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    hc_mult = 4
+    mix = hc_mult * (2 + hc_mult)
+    torch.random.manual_seed(seed)
+    device = "cuda"
+    inputs = [
+        torch.randn((n, hidden_size), device=device).bfloat16(),
+        torch.randn((n, hc_mult, hidden_size), device=device).bfloat16(),
+        2.0 * torch.sigmoid(torch.randn((n, hc_mult), device=device)),
+        torch.softmax(torch.randn((n, hc_mult, hc_mult), device=device), dim=-1),
+        torch.randn((mix, hc_mult * hidden_size), device=device) * 0.05,
+        torch.tensor([0.10, 0.10, 0.30], device=device),
+        torch.randn((mix,), device=device) * 2.0,
+    ]
+    norm = {
+        "norm_weight": (1.0 + 0.1 * torch.randn((hidden_size,), device=device)).bfloat16(),
+        "norm_eps": 1e-6,
+    }
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=20,
+    )
+    return runner, inputs, norm
+
+
 @pytest.mark.parametrize("n", [1, 6, 8, 16, 32])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
-def test_mhc_fused_hc_small_m_fma_candidates_agree(n: int, hidden_size: int):
-    """The small-M half-FMA candidates the autotuner chooses from compute the same bits.
+def test_mhc_fused_hc_small_m_fma_candidates_agree(n: int, hidden_size: int) -> None:
+    """Small-M fused-HC candidates repeat bit for bit; only the summation-order parameters change bits.
 
-    They share one split count and BigFuse block size and differ only in tile width, so
-    whichever one wins the timing, the outputs are identical.
+    Covers every get_valid_tactics() candidate plus SM103's pinned half-FMA set. Candidates with
+    the same backend, split count and BigFuse block size compute identical bits; in particular
+    the pinned half-FMA candidates differ only in tile width, so whichever one wins the timing,
+    the outputs are the same. Candidates that differ in one of those parameters may differ, and
+    the autotuner still chooses among them (see _FUSED_HC_SMALL_M_FMA_KS).
     """
-    runner, inputs = _make_fused_hc_runner_case(
-        n=n, hidden_size=hidden_size, hc_mult=4, seed=97 + n
-    )
-    half_fma = [t for t in runner.get_valid_tactics(inputs, None) if t[0] == "fused_half_fma"]
-    assert half_fma, "no half-FMA candidate at small M"
-    assert len({(t[2], t[3]) for t in half_fma}) == 1, half_fma
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_small_m_half_fma_tactics
 
-    reference = [t.clone() for t in runner(inputs=inputs, tactic=half_fma[0])]
-    for tactic in half_fma[1:]:
-        for expected, actual in zip(reference, runner(inputs=inputs, tactic=tactic)):
-            assert torch.equal(expected, actual), f"{tactic} differs from {half_fma[0]}"
+    runner, inputs, norm = _make_real_scale_fused_hc_case(n, hidden_size, seed=97 + n)
+    pinned = _fused_hc_small_m_half_fma_tactics(n, 4, pinned=True)
+    assert len({_fused_hc_summation_key(t) for t in pinned}) == 1, pinned
+    tactics = list(dict.fromkeys(list(runner.get_valid_tactics(inputs, None)) + pinned))
+
+    outputs = {}
+    for tactic in tactics:
+        first = [t.clone() for t in runner(inputs=inputs, tactic=tactic, **norm)]
+        again = runner(inputs=inputs, tactic=tactic, **norm)
+        assert all(torch.equal(a, b) for a, b in zip(first, again)), f"{tactic} not reproducible"
+        outputs[tactic] = first
+
+    groups = defaultdict(list)
+    for tactic in tactics:
+        groups[_fused_hc_summation_key(tactic)].append(tactic)
+    for key, members in groups.items():
+        for tactic in members[1:]:
+            assert all(torch.equal(a, b) for a, b in zip(outputs[members[0]], outputs[tactic])), (
+                f"{tactic} differs from {members[0]} although both sum in order {key}"
+            )
 
 
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
