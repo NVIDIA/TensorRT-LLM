@@ -347,6 +347,7 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    bool earlyState = false;
 };
 
 template <typename PackedType, typename T>
@@ -652,7 +653,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int token = blockIdx.x;
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 
-    cudaGridDependencySynchronize();
+    if (!params.earlyState)
+    {
+        cudaGridDependencySynchronize();
+    }
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -667,6 +671,18 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
     bool const inBounds = packedIdx * kELTS_PER_THREAD < params.tokenDim;
 
+    if (params.earlyState)
+    {
+        // The previous call on the workspace completed before the input's producer released this grid (the caller's
+        // guarantee), so the rotation state is final and nobody polls the dirty buffer: read the state, count the CTA
+        // and re-arm that buffer while the producer still runs.
+        flag.ctaArrive();
+        flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaGridDependencySynchronize();
+#endif
+    }
+
     // ==================== Broadcast tokens to each rank =============================
     PackedVec<PackedType, T> val;
     if (inBounds)
@@ -679,10 +695,13 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             = val.packed;
     }
 
-    flag.ctaArrive();
-    // ======================= Lamport Sync and clear the output buffer from previous iteration
-    // =============================
-    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+    if (!params.earlyState)
+    {
+        flag.ctaArrive();
+        // ======================= Lamport Sync and clear the output buffer from previous iteration
+        // =============================
+        flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+    }
 
     if (!inBounds)
     {
@@ -921,7 +940,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, params.earlyState};
 
         switch (params.nRanks)
         {

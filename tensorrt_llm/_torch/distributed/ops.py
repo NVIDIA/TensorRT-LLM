@@ -192,10 +192,15 @@ class MnnvlOwnWorkspace:
     threshold; the workspace is created at that size, for a call site that sends only one-shot
     sizes (``prescale_workspace`` leaves it). Modules built with the same ``name`` and mapping
     share it.
+
+    ``early_state``: the one-shot kernel reads the workspace's state and re-arms the previous
+    call's buffer before its grid dependency wait. Only for a call site whose previous call on
+    the workspace has completed whenever the producer of the next call's input releases it.
     """
 
     name: str
     one_shot_max_bytes: int
+    early_state: bool = False
 
 
 # Key of an MNNVL workspace: the group's mapping, or (mapping, MnnvlOwnWorkspace.name).
@@ -1436,6 +1441,8 @@ class MNNVLAllReduce(nn.Module):
             # -1: the op's global threshold (the shared workspace).
             one_shot_max_bytes=-1
             if self.own_workspace is None else self.one_shot_max_bytes,
+            early_state=self.own_workspace is not None
+            and self.own_workspace.early_state,
         )
         # RMS_NORM returns norm_out alone; match AllReduce.forward's
         # "unwrap a single-element result" contract so callers see a tensor.

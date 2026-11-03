@@ -215,8 +215,9 @@ _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS = 16
 _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
 # The routed latent all-reduce (+ RMSNorm) of the K3 MoE tail on an MNNVL workspace of its own:
 # it no longer orders against the shared expert's all-reduce, and runs one-shot up to 9 MiB of all
-# ranks' input (164 rows of the 3584-wide latent at 8 ranks), above the global threshold.
-_LATENT_ALL_REDUCE_WORKSPACE = MnnvlOwnWorkspace("kimi_k3_routed_latent", 9 << 20)
+# ranks' input (164 rows of the 3584-wide latent at 8 ranks), above the global threshold. One call
+# per MoE layer, a decoder layer apart, so the kernel takes the workspace state early.
+_LATENT_ALL_REDUCE_WORKSPACE = MnnvlOwnWorkspace("kimi_k3_routed_latent", 9 << 20, early_state=True)
 
 
 @contextmanager

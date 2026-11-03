@@ -1058,9 +1058,11 @@ def test_mnnvl_rms_norm_mxfp8_fusion(seq_len, hidden_size, mpi_pool_executor):
 
 
 @torch.inference_mode()
-def run_own_workspace_single_rank(tensor_parallel_size, hidden_size):
+def run_own_workspace_single_rank(tensor_parallel_size, hidden_size,
+                                  early_state):
     """An all-reduce on a workspace of its own (MnnvlOwnWorkspace): its own buffers, one-shot up
-    to its own limit, interleaved with calls on the group's shared workspace."""
+    to its own limit, interleaved with calls on the group's shared workspace; with
+    ``early_state`` bitwise the same calls on a workspace without it."""
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     try:
@@ -1083,7 +1085,7 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size):
                         strategy=AllReduceStrategy.MNNVL,
                         dtype=torch.bfloat16,
                         mnnvl_own_workspace=MnnvlOwnWorkspace(
-                            "test_own", limit))
+                            f"test_own_{early_state}", limit, early_state))
         own_ws = own.mnnvl_allreduce._workspace()
         shared_ws = shared.mnnvl_allreduce._workspace()
         assert own_ws["buffer_size_bytes"] == limit
@@ -1118,6 +1120,14 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size):
                 eps).to(torch.bfloat16)
             out_own = own(x, all_reduce_params=params)
             out_shared = shared(x, all_reduce_params=params)
+            if early_state:
+                # Early state only moves the state read and the re-arm: the same bits.
+                plain = AllReduce(mapping=mapping,
+                                  strategy=AllReduceStrategy.MNNVL,
+                                  dtype=torch.bfloat16,
+                                  mnnvl_own_workspace=MnnvlOwnWorkspace(
+                                      "test_own_False", limit))
+                assert torch.equal(out_own, plain(x, all_reduce_params=params))
             torch.testing.assert_close(out_own, ref, rtol=0.05, atol=0.15)
             if shared.mnnvl_allreduce._transport(m, hidden_size)[0]:
                 # Both one-shot: the same kernel on other buffers.
@@ -1142,14 +1152,16 @@ def run_own_workspace_single_rank(tensor_parallel_size, hidden_size):
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize("early_state", [False, True],
+                         ids=["late_state", "early_state"])
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
-def test_mnnvl_own_workspace(mpi_pool_executor):
-    """The Kimi K3 routed latent all-reduce's own workspace and one-shot limit."""
+def test_mnnvl_own_workspace(mpi_pool_executor, early_state):
+    """The Kimi K3 routed latent all-reduce's own workspace, one-shot limit and early state."""
     world = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")
     results = mpi_pool_executor.map(run_own_workspace_single_rank,
-                                    *zip(*[(world, 3584)] * world))
+                                    *zip(*[(world, 3584, early_state)] * world))
     for r in results:
         assert r is True
 
