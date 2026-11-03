@@ -1943,7 +1943,8 @@ class CoordinatorDelegatingRouter(Router):
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
-        from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
+        from tensorrt_llm.serve._base.latency_logger import \
+            PeriodicLatencyLogger
         self._select_lat = PeriodicLatencyLogger(f"client.select[{role}]")
         self._finish_lat = PeriodicLatencyLogger(f"client.finish[{role}]")
 

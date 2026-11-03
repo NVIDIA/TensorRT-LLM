@@ -15,8 +15,8 @@
 # yapf: disable
 from abc import ABC, abstractmethod
 
+from tensorrt_llm.serve._base.service_types import UCompletionResponseOrGenerator
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
-from tensorrt_llm.serve.responses_utils import UCompletionResponseOrGenerator
 
 # yapf: enable
 

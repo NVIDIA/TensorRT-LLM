@@ -9,7 +9,6 @@ import re
 import time
 import uuid
 # yapf: disable
-from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
 from dataclasses import dataclass
@@ -88,8 +87,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ResponsesResponse,
                                                 ResponseUsage,
                                                 StreamingResponsesResponse,
-                                                UCompletionRequest,
-                                                UCompletionResponse,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
@@ -3522,81 +3519,6 @@ class ServerArrivalTimeMiddleware:
         await self.app(scope, receive, send)
 
 
-class PeriodicLatencyLogger:
-    """Periodically log latency percentiles for a named coordinator API.
-
-    This lock-free, self-resetting logger runs on one asyncio loop and profiles
-    the in-process owner and HTTP client without per-call log spam.
-    """
-
-    def __init__(self, name: str, window: int = 500):
-        self._name = name
-        self._window = window
-        self._samples: List[float] = []
-        self._n = 0
-
-    def record(self, dt_s: float) -> None:
-        self._samples.append(dt_s * 1000.0)  # ms
-        self._n += 1
-        if self._n % self._window == 0:
-            s = sorted(self._samples)
-            m = len(s)
-
-            def percentile(q):
-                return s[min(int(q * m), m - 1)]
-
-            logger.info(f"[coord_api] {self._name} n={self._n} ms: "
-                        f"mean={sum(s)/m:.2f} p50={percentile(0.5):.2f} "
-                        f"p90={percentile(0.9):.2f} "
-                        f"p99={percentile(0.99):.2f} max={s[-1]:.2f}")
-            self._samples = []
-
-
-class ResponseHooks(ABC):
-    """
-    Hooks for response processing and (disagg) service perf observability.
-    """
-
-    @abstractmethod
-    def on_req_begin(self, request: UCompletionRequest):
-        pass
-
-    def on_disagg_request_id(self, disagg_request_id: int):
-        """Receive the request ID immediately after the service allocates it."""
-
-    def on_ctx_dispatch(self, request: UCompletionRequest):
-        """Record when the disaggregated service starts context placement.
-
-        Arrival to this point measures the pre-context wait in the orchestrator
-        or fleet. The default is a no-op for non-instrumented implementations.
-        """
-
-    def on_perf_metrics(self, server: str, role: str, metrics: dict):
-        """Receive request-local metrics carried by an upstream response."""
-
-    @abstractmethod
-    def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
-        pass
-
-    @abstractmethod
-    def on_first_token(self,
-                       gen_server: str,
-                       request: UCompletionRequest,
-                       response: UCompletionResponse = None):
-        pass
-
-    @abstractmethod
-    def on_resp_done(self,
-                     gen_server: str,
-                     request: UCompletionRequest,
-                     response: UCompletionResponse = None):
-        pass
-
-
-async def done_generator() -> AsyncGenerator[bytes, None]:
-    yield "data: [DONE]\n\n".encode('utf-8')
-
-
 def _format_sse_event(event: OpenAIBaseModel) -> str:
     # by_alias: fields such as text.format.schema go out under their wire name.
     return (f"event: {getattr(event, 'type', 'unknown')}\n"
@@ -3628,7 +3550,3 @@ async def responses_done_generator(
             sequence_number=1,
         ))
     yield _sse_event(_stream_terminal_event(response, sequence_number=2))
-
-
-UCompletionResponseOrGenerator = Union[UCompletionResponse,
-                                       AsyncGenerator[Any, None]]

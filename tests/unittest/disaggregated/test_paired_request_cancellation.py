@@ -19,13 +19,13 @@ from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole
 from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.serve._base.service_types import UCompletionResponseOrGenerator
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
-from tensorrt_llm.serve.responses_utils import UCompletionResponseOrGenerator
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, LoadBalancingRouter, Router
 
 pytestmark = pytest.mark.cpu_only
