@@ -26,8 +26,16 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
-from tensorrt_llm._torch.disaggregation.resource.utils import find_replicated_role_mismatch
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    AttentionLayerGroup,
+    CacheKind,
+    KVCachePageTable,
+    MapperKind,
+)
+from tensorrt_llm._torch.disaggregation.resource.utils import (
+    find_replicated_role_mismatch,
+    get_layer_to_layer_group,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -560,12 +568,19 @@ class AttentionPolicy:
     def validate_peer_compatible(
         self_page_table: Optional[KVCachePageTable],
         peer_page_table: Optional[KVCachePageTable],
+        self_tokens_per_block: Optional[int] = None,
+        peer_tokens_per_block: Optional[int] = None,
     ) -> None:
-        """Reject a peer whose PAGED groups declare different replicated roles.
+        """Reject a peer whose PAGED groups declare different replicated roles
+        or different standalone-draft (CP-as-TP) storage.
 
         Pool matching drops a view with no counterpart silently, so an
         index-key side cache the peer never declares would leave the receiver
-        holding zeroed state instead of raising. Raises ``ValueError``.
+        holding zeroed state instead of raising. Given both sides' tokens per
+        block, standalone draft pages must also hold the same bytes per token:
+        they are copied as bytes, so a storage dtype that differs between the
+        peers (a DSpark drafter's ``speculative_config.context_kv_dtype``) would
+        be reinterpreted. Raises ``ValueError``.
         """
         differing = find_replicated_role_mismatch(self_page_table, peer_page_table, CacheKind.PAGED)
         if differing:
@@ -573,6 +588,41 @@ class AttentionPolicy:
                 "AttentionPolicy.validate_peer_compatible: replicated roles differ on "
                 f"overlapping layers: {differing}"
             )
+        if self_page_table is not None and peer_page_table is not None:
+            local_layers = get_layer_to_layer_group(self_page_table)
+            peer_layers = get_layer_to_layer_group(peer_page_table)
+            for layer in local_layers.keys() & peer_layers.keys():
+                local = self_page_table.layer_groups[local_layers[layer]]
+                peer = peer_page_table.layer_groups[peer_layers[layer]]
+                if not isinstance(local, AttentionLayerGroup) or not isinstance(
+                    peer, AttentionLayerGroup
+                ):
+                    continue
+                if local.cp_as_tp != peer.cp_as_tp:
+                    raise ValueError("Attention peers disagree on full-sequence CP-to-TP storage")
+                if local.cp_as_tp and local.total_kv_head_num != peer.total_kv_head_num:
+                    raise ValueError("Standalone draft peers have different global KV head counts")
+                if local.cp_as_tp and self_tokens_per_block and peer_tokens_per_block:
+                    local_bytes = AttentionPolicy._draft_bytes_per_token(
+                        local, self_tokens_per_block
+                    )
+                    peer_bytes = AttentionPolicy._draft_bytes_per_token(peer, peer_tokens_per_block)
+                    if local_bytes != peer_bytes:
+                        raise ValueError(
+                            f"Standalone draft peers store layer {layer} with different bytes "
+                            f"per token (local {local_bytes}, peer {peer_bytes}); set the same "
+                            "speculative_config.context_kv_dtype on the context and generation "
+                            "servers."
+                        )
+
+    @staticmethod
+    def _draft_bytes_per_token(layer_group: AttentionLayerGroup, tokens_per_block: int) -> dict:
+        """Bytes per token of each role's page in a standalone draft layer group."""
+        return {
+            "/".join(sorted(view.pool_role)): view.bytes_per_layer / tokens_per_block
+            for view in layer_group.pool_views
+            if view.bytes_per_layer is not None
+        }
 
     def check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         a = self._ri.attention

@@ -40,7 +40,7 @@ from tensorrt_llm._torch.configs.glm5_next import (
     Glm5NextVisionConfig,
 )
 from tensorrt_llm._torch.configs.k3_dspark import K3DsparkConfig
-from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig
+from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config, KimiK3VisionConfig, KimiK31Config
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.configs.laguna import LagunaConfig
 from tensorrt_llm._torch.configs.minicpmv4_6 import MiniCPMV4_6Config, MiniCPMV4_6VisionConfig
@@ -95,9 +95,10 @@ def _register_custom_configs_with_transformers() -> None:
         "glm5_next_text": Glm5NextTextConfig,
         "glm5_next_vision": Glm5NextVisionConfig,
         "gemma4_assistant": Gemma4AssistantConfig,
-        # Kimi K3 composite multimodal config ("kimi_k3") and its text config
-        # ("kimi_linear"). pyexecutor.config_utils.load_pretrained_config keeps
-        # the composite KimiK3Config when the checkpoint ships text+vision
+        # Kimi K3 / K3.1 composite multimodal configs ("kimi_k3", "kimi_k31")
+        # and their text config ("kimi_linear").
+        # pyexecutor.config_utils.load_pretrained_config keeps
+        # the composite config when the checkpoint ships text+vision
         # sub-configs and multimodal is not disabled, and otherwise flattens to
         # the text config. Registering both here lets AutoConfig / AutoTokenizer
         # resolve them without trust_remote_code.
@@ -105,6 +106,7 @@ def _register_custom_configs_with_transformers() -> None:
         # cannot resolve its model_type on its own.
         "k3_dspark": K3DsparkConfig,
         "kimi_k3": KimiK3Config,
+        "kimi_k31": KimiK31Config,
         "kimi_linear": KimiLinearConfig,
         "laguna": LagunaConfig,
         # minicpmv4_6 is only registered in transformers>=5.7.0; register our
@@ -164,6 +166,7 @@ __all__ = [
     "K3DsparkConfig",
     "KimiK3Config",
     "KimiK3VisionConfig",
+    "KimiK31Config",
     "KimiLinearConfig",
     "LagunaConfig",
     "MiniCPMV4_6Config",

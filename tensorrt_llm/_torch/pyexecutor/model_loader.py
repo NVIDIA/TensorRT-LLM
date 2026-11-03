@@ -58,14 +58,18 @@ from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
-                           resolve_auto_ssm_cache_dtype,
-                           supports_fp4_mla_attention, uses_fp4_mla_attention,
+from .config_utils import (is_hybrid_linear, is_kimi_linear, is_minimax_m3,
+                           is_mla, resolve_auto_ssm_cache_dtype,
+                           supports_fp4_mla_attention, unwrap_kimi_text_config,
+                           uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
+from .input_commit import configure_k31_engine
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
+    # One-byte container of the inline NVFP4 latent records (sparse/nvfp4_ds_mla_kv.py).
+    "nvfp4_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto",
     # Mixed-precision KV: the retained tokens and attention use the second
@@ -75,7 +79,7 @@ _KV_CACHE_MAP = {
     "mixed_nvfp4_float16": None,
     "mixed_nvfp4_bfloat16": None,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
+_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 
@@ -186,10 +190,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     sparse_config = model_config.sparse_attention_config
     uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
+    # DSA gathers selected NVFP4 latent rows into FP8 scratch before invoking
+    # sparse attention, so it does not need a native E2M1 attention kernel.
+    uses_nvfp4_dsa = (getattr(sparse_config, "algorithm", None) == "dsa"
+                      and is_mla(model_config.pretrained_config)
+                      and model_config.attn_backend == "TRTLLM")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and not uses_minimax_m3_msa and torch.cuda.is_available()
-            and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and not uses_nvfp4_dsa
+            and torch.cuda.is_available() and get_sm_version() == 107):
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -252,16 +261,14 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
+    if (model_config.mapping.cp_size != 1
+            and not model_config.mapping.has_cp_helix()):
+        raise ValueError("FP4 MLA supports only Helix context parallelism.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
+    # Chunked prefill and cached context are supported; non-final chunks must
+    # stay FP4-tile aligned (checked in py_executor_creator).
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
@@ -1060,6 +1067,12 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        # Kimi K3.1 (a K3-family text config with a dsa_config) selects its
+        # decode-step paths for this process (input_commit.configure_k31_engine).
+        is_k31 = (is_kimi_linear(config.pretrained_config)
+                  and getattr(unwrap_kimi_text_config(config.pretrained_config),
+                              "dsa_config", None) is not None)
+        configure_k31_engine(is_k31, config.spec_config, config.mapping)
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked

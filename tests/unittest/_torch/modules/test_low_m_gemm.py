@@ -106,6 +106,171 @@ def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# planned_low_m_linear() — measured per-shape plans, no AutoTuner
+# ---------------------------------------------------------------------------
+
+_PLAN = {
+    (256, 1024): (
+        (2, ("direct", 128, 2)),
+        (16, ("splitk", 64, 8, 2, 10)),
+        (24, ("default",)),
+        (48, ("tgv", 21)),
+    )
+}
+
+
+@pytest.fixture
+def _fake_kernels(monkeypatch):
+    calls = []
+
+    def direct_module():
+        module = MagicMock()
+        module.DirectTactic = lambda *t: ("direct",) + t
+        module.run_direct_dense = lambda a, b, out, pdl, tactic: calls.append(tactic) or out
+        return module
+
+    def splitk_module():
+        module = MagicMock()
+        module.SplitKTactic = lambda *t: ("splitk",) + t
+        module.run_splitk_dense = lambda a, b, bias, out, pdl, tactic: calls.append(tactic) or out
+        return module
+
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.gemm.kernels.dense_bf16_gemm_direct", direct_module()
+    )
+
+    def tgv_module():
+        module = MagicMock()
+        module.run_tgv_cute_ext = lambda a, b, bias, out, pdl, tactic: (
+            calls.append(("tgv", tactic)) or out
+        )
+        return module
+
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk", splitk_module()
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer.gemm.kernels.tgv_gemm_cute_ext", tgv_module())
+    monkeypatch.setattr(_mod, "_current_sm", lambda device: 103)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "m,expected",
+    [
+        (1, ("direct", 128, 2, 1)),
+        (2, ("direct", 128, 2, 2)),
+        (3, ("splitk", 64, 8, 2, 10)),
+        (25, ("tgv", 21)),
+        (48, ("tgv", 21)),
+    ],
+)
+def test_planned_low_m_linear_picks_the_row_for_m(_fake_kernels, m, expected) -> None:
+    out = _mod.planned_low_m_linear(
+        _PLAN,
+        torch.empty((m, 1024), dtype=torch.bfloat16),
+        torch.empty((256, 1024), dtype=torch.bfloat16),
+    )
+    assert out.shape == (m, 256) and out.dtype == torch.bfloat16
+    assert _fake_kernels == [expected]
+
+
+@pytest.mark.parametrize(
+    "m,n,dtype",
+    [
+        (17, 256, torch.bfloat16),
+        (24, 256, torch.bfloat16),
+        (49, 256, torch.bfloat16),
+        (1, 512, torch.bfloat16),
+        (1, 256, torch.float16),
+    ],
+    ids=["default_row", "default_row_bound", "m_above_plan", "shape_not_in_plan", "not_bf16"],
+)
+def test_planned_low_m_linear_leaves_other_calls_to_the_caller(_fake_kernels, m, n, dtype) -> None:
+    out = _mod.planned_low_m_linear(
+        _PLAN, torch.empty((m, 1024), dtype=dtype), torch.empty((n, 1024), dtype=dtype)
+    )
+    assert out is None and _fake_kernels == []
+
+
+def test_kda_planned_projection_flattens_verify_rows(_fake_kernels) -> None:
+    """Speculative verify hands the KDA projections [B, T, hidden] rows; the plan runs on B * T."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+
+    stub = SimpleNamespace(_decode_gemm_plan=_PLAN)
+    x = torch.empty((2, 7, 1024), dtype=torch.bfloat16)
+    w = torch.empty((256, 1024), dtype=torch.bfloat16)
+    out = KimiKDALinearAttention._planned_projection(stub, x, w)
+    assert out.shape == (2, 7, 256)
+    assert _fake_kernels == [("splitk", 64, 8, 2, 10)]
+    assert KimiKDALinearAttention._planned_projection(stub, x.transpose(0, 1), w) is None
+
+
+def test_planned_low_m_linear_off_below_sm100(_fake_kernels, monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "_current_sm", lambda device: 90)
+    x, w = (
+        torch.empty((1, 1024), dtype=torch.bfloat16),
+        torch.empty((256, 1024), dtype=torch.bfloat16),
+    )
+    assert _mod.planned_low_m_linear(_PLAN, x, w) is None
+
+
+def test_kimi_k31_decode_plan_only_for_k31(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import tensorrt_llm._torch.modules.low_m_gemm_plans as plans
+
+    monkeypatch.delenv("TRTLLM_KIMI_K31_LOW_M_PLAN", raising=False)
+    monkeypatch.setattr(plans, "get_sm_version", lambda: 103)
+    assert plans.kimi_k31_decode_plan(SimpleNamespace()) is None  # Kimi K3: no DSA indexer
+    k31 = SimpleNamespace(dsa_config={"index_topk": 2048})
+    assert plans.kimi_k31_decode_plan(k31) is plans.KIMI_K31_DECODE_PLAN
+    monkeypatch.setenv("TRTLLM_KIMI_K31_LOW_M_PLAN", "0")
+    assert plans.kimi_k31_decode_plan(k31) is None
+
+
+@pytest.mark.parametrize("sm", [90, 107, 120])
+def test_kimi_k31_decode_plan_only_on_sm100_sm103(monkeypatch, sm) -> None:
+    from types import SimpleNamespace
+
+    import tensorrt_llm._torch.modules.low_m_gemm_plans as plans
+
+    monkeypatch.delenv("TRTLLM_KIMI_K31_LOW_M_PLAN", raising=False)
+    monkeypatch.setattr(plans, "get_sm_version", lambda: sm)
+    assert plans.kimi_k31_decode_plan(SimpleNamespace(dsa_config={"index_topk": 2048})) is None
+
+
+def _k31_plan_shapes():
+    from tensorrt_llm._torch.modules.low_m_gemm_plans import KIMI_K31_DECODE_PLAN
+
+    return sorted(KIMI_K31_DECODE_PLAN)
+
+
+@_skip_non_sm10x
+@pytest.mark.parametrize(
+    "m", [1, 2, 3, 4, 6, 7, 8, 14, 16, 21, 28, 32, 35, 42, 56, 70, 84, 112, 168, 224, 336]
+)
+@pytest.mark.parametrize("n,k", _k31_plan_shapes())
+def test_kimi_k31_decode_plan_matches_cublas(m, n, k) -> None:
+    from tensorrt_llm._torch.modules.low_m_gemm_plans import KIMI_K31_DECODE_PLAN
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    # A module parameter: still requires grad outside a no_grad region.
+    w = torch.nn.Parameter(torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.02)
+    out = _mod.planned_low_m_linear(KIMI_K31_DECODE_PLAN, x, w)
+    rows = KIMI_K31_DECODE_PLAN[(n, k)]
+    choice = next((c for bound, c in rows if m <= bound), None)
+    if choice is None or choice[0] == "default":
+        assert out is None
+        return
+    torch.testing.assert_close(
+        out.float(), (x.float() @ w.detach().float().t()), rtol=2e-2, atol=2e-2
+    )
+
+
+# ---------------------------------------------------------------------------
 # apply() — shape routing and weight transpose
 # ---------------------------------------------------------------------------
 

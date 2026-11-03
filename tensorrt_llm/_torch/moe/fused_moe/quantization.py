@@ -6235,6 +6235,11 @@ def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
     return alignment
 
 
+# Serializes the duplicate-check + slot-claim step of
+# ``load_packed_mxfp4_expert`` across the loader thread pool.
+_PACKED_MXFP4_SLOT_CLAIM_LOCK = threading.Lock()
+
+
 class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
@@ -6381,6 +6386,74 @@ class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
     @abstractmethod
     def setup_quant_scales(self, module: torch.nn.Module):
         pass
+
+    def load_packed_mxfp4_expert(
+        self,
+        module: torch.nn.Module,
+        *,
+        global_expert_id: int,
+        local_slot_id: int,
+        w1_weight: torch.Tensor,
+        w1_weight_scale: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w2_weight_scale: torch.Tensor,
+        w3_weight: torch.Tensor,
+        w3_weight_scale: torch.Tensor,
+    ) -> None:
+        """Load one group-32 packed MXFP4 checkpoint expert into a local slot.
+
+        This adapter is intentionally per-expert so model-specific streaming
+        loaders can keep safetensors mappings short-lived while reusing each
+        backend's own per-expert padding, sharding, shuffle and scale
+        interleave (the CUTLASS and TRTLLM-Gen subclasses supply those).
+        """
+        if not 0 <= local_slot_id < module.expert_size_per_partition:
+            raise IndexError(f"local_slot_id={local_slot_id} is outside "
+                             f"[0, {module.expert_size_per_partition}).")
+        expected_expert_id = module.initial_local_expert_ids[local_slot_id]
+        if global_expert_id != expected_expert_id:
+            raise ValueError(
+                f"local slot {local_slot_id} expects global expert "
+                f"{expected_expert_id}, got {global_expert_id}.")
+
+        tensors = {
+            "w1_weight": w1_weight,
+            "w1_weight_scale": w1_weight_scale,
+            "w2_weight": w2_weight,
+            "w2_weight_scale": w2_weight_scale,
+            "w3_weight": w3_weight,
+            "w3_weight_scale": w3_weight_scale,
+        }
+        for name, value in tensors.items():
+            if value.dtype != torch.uint8:
+                raise TypeError(
+                    f"{name} must contain packed MXFP4 uint8 data, got "
+                    f"{value.dtype}.")
+
+        # Callers stream experts from a thread pool, so the duplicate check
+        # and slot claim must be one atomic step. The slot is claimed BEFORE
+        # the loaders run: a failed load leaves the destination buffer
+        # partially transformed, and a retry must not transform it again.
+        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
+            loaded_slots = getattr(module, "_packed_mxfp4_loaded_slots", None)
+            if loaded_slots is None:
+                loaded_slots = set()
+                module._packed_mxfp4_loaded_slots = loaded_slots
+            if local_slot_id in loaded_slots:
+                raise ValueError(
+                    f"Packed MXFP4 local slot {local_slot_id} was loaded twice."
+                )
+            loaded_slots.add(local_slot_id)
+
+        self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                      module.w3_w1_weight.data[local_slot_id])
+        self.load_expert_w2_weight(module, w2_weight,
+                                   module.w2_weight.data[local_slot_id])
+        self.load_expert_w3_w1_weight_scale_mxfp4(
+            module, w1_weight_scale, w3_weight_scale,
+            module.w3_w1_weight_scale.data[local_slot_id])
+        self.load_expert_w2_weight_scale_mxfp4(
+            module, w2_weight_scale, module.w2_weight_scale.data[local_slot_id])
 
 
 class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
@@ -6577,6 +6650,16 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
         # Step2: Load weight block scales.
         super().load_quant_scales(module, weights)
+
+    def load_packed_mxfp4_expert(self, module: torch.nn.Module, *,
+                                 local_slot_id: int, **kwargs) -> None:
+        super().load_packed_mxfp4_expert(module,
+                                         local_slot_id=local_slot_id,
+                                         **kwargs)
+        # The per-expert path never reaches load_quant_scales, and
+        # create_weights leaves the MXFP8 activation dequant scale
+        # uninitialized, so set this slot's unit scale here.
+        module.fake_input_scale.data[local_slot_id] = 1.0
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesW4A8MXFP4MXFP8(
@@ -6899,11 +6982,6 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             for local_slot_id in sorted(pending_w2):
                 self._swizzle_scale(scale_data[local_slot_id])
             pending_w2.clear()
-
-
-# Serializes the duplicate-check + slot-claim step of
-# ``load_packed_mxfp4_expert`` across the loader thread pool.
-_PACKED_MXFP4_SLOT_CLAIM_LOCK = threading.Lock()
 
 
 class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
@@ -7281,73 +7359,6 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         if not dst_on_gpu:
             dst_w2_weight_scale.copy_(dst_w2_weight_scale_gpu)
-
-    def load_packed_mxfp4_expert(
-        self,
-        module: torch.nn.Module,
-        *,
-        global_expert_id: int,
-        local_slot_id: int,
-        w1_weight: torch.Tensor,
-        w1_weight_scale: torch.Tensor,
-        w2_weight: torch.Tensor,
-        w2_weight_scale: torch.Tensor,
-        w3_weight: torch.Tensor,
-        w3_weight_scale: torch.Tensor,
-    ) -> None:
-        """Load one group-32 packed MXFP4 checkpoint expert into a local slot.
-
-        This adapter is intentionally per-expert so model-specific streaming
-        loaders can keep safetensors mappings short-lived while reusing the
-        TRTLLM-Gen padding, sharding, shuffle, and scale-interleave lifecycle.
-        """
-        if not 0 <= local_slot_id < module.expert_size_per_partition:
-            raise IndexError(f"local_slot_id={local_slot_id} is outside "
-                             f"[0, {module.expert_size_per_partition}).")
-        expected_expert_id = module.initial_local_expert_ids[local_slot_id]
-        if global_expert_id != expected_expert_id:
-            raise ValueError(
-                f"local slot {local_slot_id} expects global expert "
-                f"{expected_expert_id}, got {global_expert_id}.")
-
-        tensors = {
-            "w1_weight": w1_weight,
-            "w1_weight_scale": w1_weight_scale,
-            "w2_weight": w2_weight,
-            "w2_weight_scale": w2_weight_scale,
-            "w3_weight": w3_weight,
-            "w3_weight_scale": w3_weight_scale,
-        }
-        for name, value in tensors.items():
-            if value.dtype != torch.uint8:
-                raise TypeError(
-                    f"{name} must contain packed MXFP4 uint8 data, got "
-                    f"{value.dtype}.")
-
-        # Callers stream experts from a thread pool, so the duplicate check
-        # and slot claim must be one atomic step. The slot is claimed BEFORE
-        # the loaders run: a failed load leaves the destination buffer
-        # partially transformed, and a retry must not transform it again.
-        with _PACKED_MXFP4_SLOT_CLAIM_LOCK:
-            loaded_slots = getattr(module, "_packed_mxfp4_loaded_slots", None)
-            if loaded_slots is None:
-                loaded_slots = set()
-                module._packed_mxfp4_loaded_slots = loaded_slots
-            if local_slot_id in loaded_slots:
-                raise ValueError(
-                    f"Packed MXFP4 local slot {local_slot_id} was loaded twice."
-                )
-            loaded_slots.add(local_slot_id)
-
-        self.load_expert_w3_w1_weight(module, w1_weight, w3_weight,
-                                      module.w3_w1_weight.data[local_slot_id])
-        self.load_expert_w2_weight(module, w2_weight,
-                                   module.w2_weight.data[local_slot_id])
-        self.load_expert_w3_w1_weight_scale_mxfp4(
-            module, w1_weight_scale, w3_weight_scale,
-            module.w3_w1_weight_scale.data[local_slot_id])
-        self.load_expert_w2_weight_scale_mxfp4(
-            module, w2_weight_scale, module.w2_weight_scale.data[local_slot_id])
 
 
 class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):

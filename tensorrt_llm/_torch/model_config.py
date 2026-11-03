@@ -34,7 +34,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
-    is_qwen4_exp, load_pretrained_config)
+    is_qwen4_exp, load_pretrained_config, unwrap_kimi_text_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
@@ -102,6 +102,7 @@ _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 _KIMI_K3_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiLinearForCausalLM",
 }
 
@@ -1212,23 +1213,36 @@ class ModelConfig(Generic[TConfig]):
                 # derive its hash multipliers) has no other way to find it.
                 if not getattr(pretrained_config, '_name_or_path', None):
                     pretrained_config._name_or_path = str(checkpoint_dir)
+                # DSA checkpoints: DeepSeek-V3.2 / GLM-MoE-DSA, and Kimi K3.1
+                # (its text config's dsa_config adds an indexer to every MLA
+                # layer).
+                dsa_pretrained_config = None
                 if pretrained_config.architectures[0] in [
                         "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
                 ]:
+                    dsa_pretrained_config = pretrained_config
+                elif pretrained_config.architectures[
+                        0] in _KIMI_K3_ARCHITECTURES:
+                    kimi_text_config = unwrap_kimi_text_config(
+                        pretrained_config)
+                    if getattr(kimi_text_config, 'dsa_config',
+                               None) is not None:
+                        dsa_pretrained_config = kimi_text_config
+                if dsa_pretrained_config is not None:
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     indexer_rope_interleave = getattr(
-                        pretrained_config, 'indexer_rope_interleave', False)
+                        dsa_pretrained_config, 'indexer_rope_interleave', False)
                     if sparse_attention_config:
-                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
-                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_n_heads = sparse_attention_config.index_n_heads or dsa_pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or dsa_pretrained_config.index_head_dim
                         # Explicit-set check (see V4 path above): only honor a
                         # user-provided index_topk; otherwise take the
                         # checkpoint value rather than a truthy subclass default.
                         if 'index_topk' in sparse_attention_config.model_fields_set:
                             index_topk = sparse_attention_config.index_topk
                         else:
-                            index_topk = pretrained_config.index_topk
+                            index_topk = dsa_pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
@@ -1237,12 +1251,14 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                         use_self_sampling_topk = sparse_attention_config.use_self_sampling_topk
                         use_gvr_emission = sparse_attention_config.use_gvr_emission
+                        gvr_deterministic_topk = sparse_attention_config.gvr_deterministic_topk
+                        seq_len_threshold = sparse_attention_config.seq_len_threshold
                         indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                         index_share_for_mtp_iteration = sparse_attention_config.index_share_for_mtp_iteration
                     else:
-                        index_n_heads = pretrained_config.index_n_heads
-                        index_head_dim = pretrained_config.index_head_dim
-                        index_topk = pretrained_config.index_topk
+                        index_n_heads = dsa_pretrained_config.index_n_heads
+                        index_head_dim = dsa_pretrained_config.index_head_dim
+                        index_topk = dsa_pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
                         use_cute_dsl_topk = False
@@ -1252,6 +1268,8 @@ class ModelConfig(Generic[TConfig]):
                         enable_heuristic_topk = False
                         use_self_sampling_topk = True
                         use_gvr_emission = False
+                        gvr_deterministic_topk = False
+                        seq_len_threshold = None
                         indexer_k_dtype = "fp8"
                         index_share_for_mtp_iteration = None
                     kwargs[
@@ -1270,6 +1288,8 @@ class ModelConfig(Generic[TConfig]):
                             enable_heuristic_topk=enable_heuristic_topk,
                             use_self_sampling_topk=use_self_sampling_topk,
                             use_gvr_emission=use_gvr_emission,
+                            gvr_deterministic_topk=gvr_deterministic_topk,
+                            seq_len_threshold=seq_len_threshold,
                             indexer_k_dtype=indexer_k_dtype,
                             index_share_for_mtp_iteration=
                             index_share_for_mtp_iteration)

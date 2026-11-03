@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -538,6 +538,8 @@ def launch_server(
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None):
 
+    if isinstance(server_role, str):
+        server_role = ServerRole[server_role.upper()]
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
     if server_role is not None:
@@ -546,6 +548,17 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    # MPI workers may predate this launcher process. Send the role through
+    # worker_main's explicit overrides instead of relying on env inheritance.
+    # Clear an inherited CTX role for unspecified-role servers.
+    if (server_role is not None or os.environ.get(
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE) == "context"):
+        llm_args["env_overrides"] = {
+            **(llm_args.get("env_overrides") or {}),
+            DisaggLauncherEnvs.TLLM_DISAGG_ROLE:
+            (server_role.name.lower() if server_role is not None else ""),
+        }
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
@@ -888,6 +901,35 @@ def launch_visual_gen_server(
             )
 
 
+def _default_kimi_k3_parsers(
+        model: str, tool_parser: Optional[str],
+        reasoning_parser: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve the parsers a ``serve`` command uses when it names none.
+
+    Kimi K3.1 puts tool calls and thinking in its own markup, so its
+    checkpoints (``model_type: kimi_k31``) get the ``kimi_k3`` parsers when an
+    option is absent. ``none`` keeps a parser off (e.g. for clients that read
+    only ``content``); every other value is returned unchanged.
+    """
+    config_path = Path(model) / "config.json"
+    model_type = None
+    if config_path.exists():
+        with open(config_path) as f:
+            model_type = json.load(f).get("model_type")
+    if model_type == "kimi_k31":
+        if tool_parser is None:
+            tool_parser = "kimi_k3"
+            logger.info("Kimi K3.1 checkpoint: using tool parser kimi_k3")
+        if reasoning_parser is None:
+            reasoning_parser = "kimi_k3"
+            logger.info("Kimi K3.1 checkpoint: using reasoning parser kimi_k3")
+    if tool_parser == "none":
+        tool_parser = None
+    if reasoning_parser == "none":
+        reasoning_parser = None
+    return tool_parser, reasoning_parser
+
+
 @click.command("serve")
 @click.argument("model", type=str)
 @stability_option(
@@ -1094,18 +1136,20 @@ def launch_visual_gen_server(
     "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
 @stability_option("--reasoning_parser",
-                  type=click.Choice(["auto"] +
+                  type=click.Choice(["auto", "none"] +
                                     list(ReasoningParserFactory.keys())),
                   default=None,
                   help="Specify the parser for reasoning models. "
-                  "Use 'auto' to automatically select based on the model.",
+                  "Use 'auto' to automatically select based on the model, "
+                  "'none' to return the reasoning as part of the content.",
                   status="prototype")
 @stability_option("--tool_parser",
-                  type=click.Choice(["auto"] +
+                  type=click.Choice(["auto", "none"] +
                                     list(ToolParserFactory.parsers.keys())),
                   default=None,
                   help="Specify the parser for tool models. "
-                  "Use 'auto' to automatically select based on the model.",
+                  "Use 'auto' to automatically select based on the model, "
+                  "'none' to return tool calls as part of the content.",
                   status="prototype")
 @stability_option("--metadata_server_config_file",
                   type=str,
@@ -1347,6 +1391,9 @@ def serve(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
             "no longer supported. This option will be removed in a future release."
         )
+
+    tool_parser, reasoning_parser = _default_kimi_k3_parsers(
+        model, tool_parser, reasoning_parser)
 
     if tool_parser == "auto":
         resolved = resolve_auto_tool_parser(model)
@@ -2276,6 +2323,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coordinator_bind_host = disagg_cfg.effective_coordinator_bind_host
     coord_port = int(
         os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
                        public_port - 1))
@@ -2337,14 +2385,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout,
         request_timeout_secs=request_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    logger.info(f"Coordinator serving on {coordinator_bind_host}:{coord_port} "
+                f"(uds={coord_uds}) (fleet on {public_host}:{public_port})")
     set_lifecycle_phase("serving")
 
     async def _serve_and_monitor():
         server_task = asyncio.create_task(
             CoordinatorServer(coordinator)(
-                public_host,
+                coordinator_bind_host,
                 coord_port,
                 uds=coord_uds,
                 keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
@@ -2632,6 +2680,10 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     role_map = {"ctx": "context", "gen": "generation"}
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
         server_cfg.type, "")
+    server_role = {
+        "ctx": ServerRole.CONTEXT,
+        "gen": ServerRole.GENERATION
+    }[server_cfg.type]
 
     logger.info(
         f"rank {mpi_rank()} for index {instance_idx} launch the disagg server")
@@ -2650,6 +2702,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     launch_server(host=server_cfg.hostname,
                   port=server_cfg.port,
                   llm_args=llm_args,
+                  server_role=server_role,
                   **launch_kwargs)
 
 

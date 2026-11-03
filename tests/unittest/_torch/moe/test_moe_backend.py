@@ -140,6 +140,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
 )
@@ -892,7 +893,8 @@ def test_no_hook_skips_the_hook_validation_entirely():
 def test_the_capability_declarations_match_the_kernels():
     """The leaves that plumb ``do_finalize`` through say so; the default does not."""
     assert TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl).supports_unfinalized_output()
-    assert not TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(
+    # The native W4A8 MXFP4 runner has run_moe_unfinalized, so it returns the unfinalized triple.
+    assert TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(
         TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
     ).supports_unfinalized_output()
     for leaf in CUTLASS_LEAVES:
@@ -2186,6 +2188,50 @@ def test_megamoe_streaming_reload_resets_slot_claims():
     method._clear_transformed_weight_cache.assert_called_once_with(module)
 
 
+def test_cutlass_w4a8_mxfp8_packed_mxfp4_expert_load():
+    """CUTLASS loads K3's packed MXFP4 experts and sets the unit MXFP8 scale.
+
+    The per-expert streaming path never calls ``load_quant_scales``, which is
+    what fills ``fake_input_scale``, and ``create_weights`` leaves it
+    uninitialized; a slot left unset would scale that expert's activations by
+    whatever the allocation held.
+    """
+    method = W4A8MXFP4MXFP8CutlassFusedMoEMethod()
+    loaders = (
+        "load_expert_w3_w1_weight",
+        "load_expert_w2_weight",
+        "load_expert_w3_w1_weight_scale_mxfp4",
+        "load_expert_w2_weight_scale_mxfp4",
+    )
+    for name in loaders:
+        setattr(method, name, MagicMock())
+    module = SimpleNamespace(
+        expert_size_per_partition=2,
+        initial_local_expert_ids=[4, 5],
+        w3_w1_weight=torch.empty(2, 2, 1, dtype=torch.uint8),
+        w3_w1_weight_scale=torch.empty(2, 2, 1, dtype=torch.uint8),
+        w2_weight=torch.empty(2, 1, 1, dtype=torch.uint8),
+        w2_weight_scale=torch.empty(2, 1, 1, dtype=torch.uint8),
+        fake_input_scale=torch.full((2,), float("nan")),
+    )
+    weight = torch.ones(1, 1, dtype=torch.uint8)
+    tensors = {
+        f"{w}_{kind}": weight for w in ("w1", "w2", "w3") for kind in ("weight", "weight_scale")
+    }
+
+    method.load_packed_mxfp4_expert(module, global_expert_id=5, local_slot_id=1, **tensors)
+
+    assert module._packed_mxfp4_loaded_slots == {1}
+    assert module.fake_input_scale[1].item() == 1.0
+    assert torch.isnan(module.fake_input_scale[0])  # other slots stay untouched
+    for name in loaders:
+        getattr(method, name).assert_called_once()
+    with pytest.raises(ValueError, match="loaded twice"):
+        method.load_packed_mxfp4_expert(module, global_expert_id=5, local_slot_id=1, **tensors)
+    with pytest.raises(ValueError, match="expects global expert 4"):
+        method.load_packed_mxfp4_expert(module, global_expert_id=5, local_slot_id=0, **tensors)
+
+
 def test_megamoe_cache_derived_state_sets_initial_assignments_once():
     method = W4A8MXFP4MXFP8MegaMoEDeepGemmMethod()
     method.setup_quant_scales = MagicMock()
@@ -3127,7 +3173,7 @@ def test_kimi_k3_nvfp4_expert_loader_forwards_pre_quant_scale(
         )
     )
 
-    _load_nvfp4_expert(backend, "experts", 5, 2, lambda key: key, stored.get)
+    _load_nvfp4_expert(backend, "experts", 5, 5, 2, lambda key: key, stored.get)
 
     assert captured["module"] is backend
     assert captured["global_expert_id"] == 5

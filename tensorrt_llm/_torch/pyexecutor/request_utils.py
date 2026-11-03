@@ -110,7 +110,10 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
+    req_item,
+    all_ranks_num_active_requests: List[int],
+    max_num_active_requests: int,
+    adp_router=None,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -118,10 +121,23 @@ def can_process_attention_dp_request(
         req_item: The request queue item to check.
         all_ranks_num_active_requests: Number of active requests for each rank.
         max_num_active_requests: Maximum number of active requests per rank.
+        adp_router: Optional ADP router; a rank it names through
+            ``sticky_wait_target`` gates the request like an explicit
+            ``attention_dp_rank``.
 
     Returns:
         True if the request can be processed, False otherwise.
     """
+    if adp_router is not None:
+        wait_rank = adp_router.sticky_wait_target(req_item)
+        if wait_rank is not None:
+            if all_ranks_num_active_requests[wait_rank] < max_num_active_requests:
+                all_ranks_num_active_requests[wait_rank] += 1
+                adp_router.note_sticky_wait(req_item, held=False)
+                return True
+            adp_router.note_sticky_wait(req_item, held=True)
+            return False
+
     scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
     if scheduling_params is None:
         return True
@@ -143,6 +159,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[List[int]] = None,
+    adp_router=None,
 ) -> List:
     """Get requests from the waiting queue.
 
@@ -152,6 +169,8 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        adp_router: Optional ADP router that may hold a request back for its
+            conversation's home rank (attention DP only).
 
     Returns:
         List of requests that can be processed.
@@ -177,7 +196,10 @@ def get_from_waiting_queue(
 
         can_process = (
             can_process_attention_dp_request(
-                req_item, scheduling_all_ranks_num_active_requests, max_num_active_requests
+                req_item,
+                scheduling_all_ranks_num_active_requests,
+                max_num_active_requests,
+                adp_router=adp_router,
             )
             if enable_attention_dp
             else True

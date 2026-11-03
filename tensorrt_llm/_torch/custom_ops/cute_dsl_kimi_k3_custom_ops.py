@@ -12,6 +12,40 @@ from functools import lru_cache
 
 import torch
 
+# Token granularity of the optional mid-sequence state snapshots of kda_prefill.
+KDA_PREFILL_SNAPSHOT_CHUNK = 64
+
+
+def _kda_snapshot_checkpoints(
+    cu_seqlens: torch.Tensor,
+    snapshot_rows: torch.Tensor,
+    snapshot_chunks: torch.Tensor,
+    total_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BT16 checkpoint offsets and target rows for per-sequence state snapshots.
+
+    With a ``KDA_PREFILL_SNAPSHOT_CHUNK`` checkpoint interval, sequence ``b`` owns
+    ``len_b // KDA_PREFILL_SNAPSHOT_CHUNK`` checkpoint slots starting at
+    ``cu[b]``; slot ``cu[b] + c - 1`` holds the state after the first
+    ``KDA_PREFILL_SNAPSHOT_CHUNK * c`` tokens. Only the slot selected by
+    ``snapshot_chunks[b]`` maps to ``snapshot_rows[b]``; every other slot is -1
+    (not stored). Built on the device without a host sync.
+    """
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    counts = torch.div(lengths, KDA_PREFILL_SNAPSHOT_CHUNK, rounding_mode="floor")
+    cu_ckpts = torch.zeros_like(cu_seqlens)
+    torch.cumsum(counts, dim=0, out=cu_ckpts[1:])
+    capacity = total_tokens // KDA_PREFILL_SNAPSHOT_CHUNK + 1
+    # The last entry is a sink for sequences without a snapshot; it stays -1.
+    indices = torch.full((capacity,), -1, dtype=torch.int32, device=cu_seqlens.device)
+    chunks = snapshot_chunks.to(torch.int64)
+    valid = (snapshot_rows >= 0) & (chunks > 0) & (chunks <= counts)
+    sink = torch.full_like(chunks, capacity - 1)
+    positions = torch.where(valid, cu_ckpts[:-1] + chunks - 1, sink)
+    values = torch.where(valid, snapshot_rows, torch.full_like(snapshot_rows, -1))
+    indices.index_put_((positions,), values.to(torch.int32))
+    return cu_ckpts, indices
+
 
 @lru_cache(maxsize=32)
 def _compile_prefill(device: torch.device, state_dtype: torch.dtype, lower_bound: float, mode: str):
@@ -53,6 +87,9 @@ def kda_prefill(
     max_seqlen: int = 0,
     seq_order: torch.Tensor | None = None,
     cu_chunks: torch.Tensor | None = None,
+    sm_reserve: int = 0,
+    snapshot_rows: torch.Tensor | None = None,
+    snapshot_chunks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Update unique selected V-first state rows using packed raw Q/K/V.
 
@@ -70,6 +107,18 @@ def kda_prefill(
     upper bound for all replays, or zero to use the total token capacity.
     Small-BH and BT16 decomposition consume aligned, head-contiguous beta
     views directly; the engine requires compact beta storage.
+
+    ``sm_reserve`` SMs, held by a kernel resident for the whole step, are left
+    out of the Small-BH persistent grid; blocks beyond the free SMs would wait
+    behind the whole first wave. The routing above stays on the device SM count
+    so it matches BT16's own router.
+
+    ``snapshot_rows`` / ``snapshot_chunks`` (int32 ``[N]``, both or neither):
+    sequence ``b`` with ``snapshot_chunks[b] = c > 0`` also stores its state
+    after its first ``KDA_PREFILL_SNAPSHOT_CHUNK * c`` tokens into
+    ``state_pool[snapshot_rows[b]]`` (``-1``: no snapshot for ``b``). Snapshot
+    rows must be distinct from ``state_indices``. Runs on BT16 (its state
+    checkpoints), never Small-BH.
     """
     device = q.device
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
@@ -147,7 +196,23 @@ def kda_prefill(
     if max_seqlen < 0 or max_seqlen > q.shape[1]:
         raise ValueError("max_seqlen must be zero or a sequence-length bound within total tokens")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    small_bh_eligible = state_pool.dtype == torch.bfloat16 and q.shape[1] > 1
+    if not 0 <= sm_reserve < sm_count:
+        raise ValueError(f"sm_reserve={sm_reserve} must leave at least one of {sm_count} SMs")
+    has_snapshot = snapshot_rows is not None
+    if (snapshot_chunks is not None) != has_snapshot:
+        raise ValueError("Provide both KDA snapshot rows and snapshot chunks")
+    if has_snapshot:
+        for tensor in (snapshot_rows, snapshot_chunks):
+            if (
+                tensor.device != device
+                or tensor.dtype != torch.int32
+                or tensor.shape != (n,)
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError("KDA snapshot rows/chunks must be contiguous CUDA int32 [N]")
+        if mode == "small-bh":
+            raise ValueError("KDA prefill state snapshots require BT16")
+    small_bh_eligible = state_pool.dtype == torch.bfloat16 and q.shape[1] > 1 and not has_snapshot
     if mode == "small-bh" and not small_bh_eligible:
         raise ValueError("Small-BH requires BF16 state and more than one packed token")
     use_small_bh = mode == "small-bh" or (
@@ -193,7 +258,7 @@ def kda_prefill(
                 state_input=state_pool,
                 state_output=state_pool,
                 state_indices=state_indices,
-                max_active_clusters=sm_count,
+                max_active_clusters=sm_count - sm_reserve,
             )
         return output
     # Torch allocations belong to the CUDA graph's private memory pool during
@@ -210,6 +275,18 @@ def kda_prefill(
     if generate_metadata:
         seq_order = torch.empty(n, dtype=torch.int32, device=device)
         cu_chunks = torch.empty(n + 1, dtype=torch.int32, device=device)
+    snapshot_kwargs = {}
+    if has_snapshot:
+        cu_ckpts, ckpt_rows = _kda_snapshot_checkpoints(
+            cu_seqlens, snapshot_rows, snapshot_chunks, q.shape[1]
+        )
+        # The compiled callable delegates to the checkpoint specialization.
+        snapshot_kwargs = dict(
+            state_ckpt=state_pool,
+            checkpoint_cu_starts=cu_ckpts,
+            ckpt_interval=KDA_PREFILL_SNAPSHOT_CHUNK,
+            checkpoint_state_indices=ckpt_rows,
+        )
     compiled(
         q,
         k,
@@ -230,6 +307,7 @@ def kda_prefill(
         planned_total_chunks=capacity,
         generate_planned_metadata=generate_metadata,
         state_indices=state_indices,
+        **snapshot_kwargs,
     )
     return output
 
@@ -252,6 +330,9 @@ def _kda_prefill_fake(
     max_seqlen=0,
     seq_order=None,
     cu_chunks=None,
+    sm_reserve=0,
+    snapshot_rows=None,
+    snapshot_chunks=None,
 ):
     return torch.empty_like(q)
 

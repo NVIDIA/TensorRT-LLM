@@ -339,3 +339,18 @@ Use the normal commands with `flashinfer-prims-ts`, for example:
 python scripts/vendor/manage.py status flashinfer-prims-ts
 python scripts/vendor/manage.py check flashinfer-prims-ts
 ```
+
+The `flashinfer-prims-ts-next` entry selects the import closure of the sparse
+MLA decode API from `flashinfer/attention/prims_ts` of the public
+`flashinfer-ai/flashinfer` repository at commit
+`4eece64428d2f15b3357c9a9add1b851c83185b2` (92 files, listed in its `include`)
+and materializes it at `tensorrt_llm/_torch/attention/backends/prims_ts_next`.
+FlashInfer is Apache-2.0. Unmodified files are exact upstream copies with
+their upstream headers; the files that
+`3rdparty/vendor_patches/flashinfer-prims-ts-next.patch` modifies also carry an
+NVIDIA copyright line. The Kimi K3.1 DSA decode and prefill paths import it.
+
+```bash
+python scripts/vendor/manage.py status flashinfer-prims-ts-next
+python scripts/vendor/manage.py check flashinfer-prims-ts-next
+```

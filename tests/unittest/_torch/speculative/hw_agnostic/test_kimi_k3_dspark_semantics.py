@@ -32,6 +32,7 @@ from _torch.helpers import dspark_markov_chain_logits_reference
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+from tensorrt_llm._torch.pyexecutor import input_commit
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
 needs_cuda = pytest.mark.skipif(
@@ -586,7 +587,10 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
     pretrained = _tiny_config(True, mask_token_id=None)
     pretrained.dspark_noise_token_id = mask_id
     spec = SimpleNamespace(
-        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+        mask_token_id=mask_id,
+        attention_backend="VANILLA",
+        draft_is_embedded_in_target=False,
+        context_kv_only=False,
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -1385,6 +1389,60 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
     )
     diff = (out[0] - expected).abs().max().item()
     assert diff < 0.03, f"single-page parity failed: max abs diff {diff}"
+
+
+def _k31_scope(monkeypatch, drafts=True, role=""):
+    """Select the drafting Kimi K3.1 paths (input_commit.configure_k31_engine) for this test:
+    ``drafts`` turns on the fused draft tail, ``role="generation"`` also the generation-server
+    paths."""
+    monkeypatch.setattr(input_commit, "_K31", drafts)
+    monkeypatch.setattr(input_commit, "_K31_DRAFTS", drafts)
+    monkeypatch.setattr(input_commit, "_K31_ATTENTION_DP", False)
+    monkeypatch.setattr(input_commit, "_K31_GENERATION", drafts and role == "generation")
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_tail_v2_is_bitwise(monkeypatch):
+    """The fused tail (``tail_v2_enabled``) changes launches, not values.
+
+    The fused block RoPE kernel (query rope half + block latent norm/rope +
+    pool store) and the one-launch context latents must reproduce the
+    separate launches bit for bit: a batch of two unequal requests
+    through the paged cute-dsl block decode, and the layer-major context
+    latents against the per-layer ones.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    g = torch.Generator().manual_seed(42)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    _k31_scope(monkeypatch, drafts=False)
+    base = _run_mla_block_decode(drafter, requests, paged=True)
+    captured = requests[0][0].to("cuda", torch.bfloat16)
+    projected = drafter.project_target_hidden(captured)
+    positions = torch.arange(37, 37 + captured.shape[0], device="cuda")
+    ctx_base, _ = drafter.precompute_context_kv(projected, positions)
+
+    _k31_scope(monkeypatch)
+    fused = _run_mla_block_decode(drafter, requests, paged=True)
+    ctx_fused, _ = drafter.precompute_context_kv(projected, positions)
+
+    assert ctx_base is not None and ctx_fused is not None
+    assert torch.equal(fused.view(torch.int32), base.view(torch.int32))
+    assert torch.equal(ctx_fused.view(torch.int16), ctx_base.view(torch.int16))
 
 
 @needs_cuda

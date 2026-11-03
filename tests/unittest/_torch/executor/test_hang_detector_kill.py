@@ -25,7 +25,7 @@ import threading
 import time
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -203,7 +203,8 @@ def test_status_provider_errors_are_logged(monkeypatch):
     assert events[-1] == ("detected", None)
 
 
-def test_control_request_wait_pauses_detector():
+@pytest.mark.parametrize("with_dwdp", [False, True], ids=["no_dwdp", "dwdp"])
+def test_control_request_wait_pauses_detector(with_dwdp):
     fired = []
     executor = PyExecutor.__new__(PyExecutor)
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
@@ -214,6 +215,7 @@ def test_control_request_wait_pauses_detector():
     executor.dist = SimpleNamespace(pp_size=1, world_size=1)
     executor.disable_overlap_scheduler = True
     executor.enable_attention_dp = False
+    executor.dwdp_manager = Mock() if with_dwdp else None
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
 
     def complete_control_action():
@@ -236,6 +238,9 @@ def test_control_request_wait_pauses_detector():
     assert fired == []
     assert executor.control_requests == []
     assert not executor.control_action_done.is_set()
+    if with_dwdp:
+        # The control action may have changed expert weights already prefetched for the next step.
+        executor.dwdp_manager.invalidate_prefetch.assert_called_once_with()
 
 
 def test_propagate_hard_kill_self_sigkills_without_mpi():

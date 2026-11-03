@@ -602,6 +602,35 @@ public:
                     k->strides()[1] == 1, "Separate-K context FMHA requires contiguous K features within each token");
                 TORCH_CHECK(
                     v->strides()[1] == 1, "Separate-V context FMHA requires contiguous V features within each token");
+                TORCH_CHECK(k->scalar_type() == v->scalar_type(), "MLA context k and v must have the same dtype.");
+                // FP8 k / v: the caller already quantized them for the FP8 context FMHA (and Q too when
+                // quant_q_buffer is given); the kernels pick them up instead of quantizing BF16 inputs.
+                mla_params.fp8_kv_input = k->scalar_type() == torch::kFloat8_e4m3fn;
+                if (mla_params.fp8_kv_input)
+                {
+                    auto const num_heads = op.mNumHeads;
+                    auto const& mla = op.mMLAParams;
+                    TORCH_CHECK(op.mFP8ContextMLA, "FP8 MLA context k / v require the FP8 context MLA FMHA.");
+                    TORCH_CHECK(
+                        k->is_contiguous() && v->is_contiguous(), "FP8 MLA context k and v must be contiguous.");
+                    TORCH_CHECK(k->size(1) == num_heads * (mla.qk_nope_head_dim + mla.qk_rope_head_dim)
+                            && v->size(1) == num_heads * mla.v_head_dim && v->size(0) == k->size(0),
+                        "FP8 MLA context k / v must be [kv_tokens, num_heads * qk_head_dim] / [kv_tokens, num_heads * "
+                        "v_head_dim].");
+                    if (quant_q_buffer.has_value())
+                    {
+                        TORCH_CHECK(quant_q_buffer->scalar_type() == torch::kFloat8_e4m3fn
+                                && quant_q_buffer->is_contiguous() && quant_q_buffer->sizes() == qkv_or_q.sizes(),
+                            "The FP8 MLA context quant_q_buffer must be a contiguous FP8 copy of q.");
+                        mla_params.quant_q_buf = quant_q_buffer->slice(0, token_offset).data_ptr();
+                        mla_params.fp8_q_input = true;
+                    }
+                }
+                else
+                {
+                    TORCH_CHECK(k->scalar_type() == qkv_or_q.scalar_type(),
+                        "MLA context k / v must be FP8 E4M3 or have the dtype of q.");
+                }
 
                 k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
                 v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());

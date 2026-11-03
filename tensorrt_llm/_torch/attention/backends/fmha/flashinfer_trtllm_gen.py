@@ -487,9 +487,13 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     @staticmethod
     def _get_kv_cache_dtype(
         meta: "TrtllmAttentionMetadata",
+        layer_idx: Optional[int] = None,
     ) -> Optional[DataType]:
         kv_cache_manager = meta.kv_cache_manager
         if kv_cache_manager is not None:
+            get_kv_cache_dtype = getattr(kv_cache_manager, "get_kv_cache_dtype", None)
+            if callable(get_kv_cache_dtype) and layer_idx is not None:
+                return get_kv_cache_dtype(layer_idx)
             return kv_cache_manager.dtype
         return None
 
@@ -619,7 +623,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 and q.size(-1) == q_hidden_size
             )
 
-        kv_cache_dtype = self._get_kv_cache_dtype(meta)
+        kv_cache_dtype = self._get_kv_cache_dtype(meta, self.attn.layer_idx)
         # FP8/NVFP4 KV caches use a low-precision context kernel even when the
         # projection output is FP16/BF16, so the FP16/BF16 fallbacks do not apply.
         has_low_precision_kv_cache = kv_cache_dtype in (DataType.FP8, DataType.NVFP4)

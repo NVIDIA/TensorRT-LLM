@@ -686,6 +686,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k25",
     "kimi_k3": "kimi_k3",
+    "kimi_k31": "kimi_k3",
     "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
 }
@@ -1213,12 +1214,22 @@ class KimiK3ReasoningParser(BaseReasoningParser):
     """
 
     needs_raw_special_tokens = True
+    # The generation prompt ends inside the think channel when thinking is on
+    # and inside the response channel when it is off.
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<|open|>think<|sep|>"
+    reasoning_end = "<|close|>think<|sep|>"
 
     OPEN = "<|open|>"
     CLOSE = "<|close|>"
     SEP = "<|sep|>"
     EOM = "<|end_of_msg|>"
     TOOLS_END = CLOSE + "tools" + SEP
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        """A prompt that opens the response channel has thinking off."""
+        return False if tail.endswith(cls.OPEN + "response" + cls.SEP) else None
 
     def __init__(self,
                  *,

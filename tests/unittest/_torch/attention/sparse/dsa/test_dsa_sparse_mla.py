@@ -35,6 +35,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa import DSABackendForwardArgs, DSACacheManager
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import TokenMajorGenView
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -389,7 +390,11 @@ def _build_sparse_topk_indices_context(
 
 
 def _build_sparse_topk_indices_generation(
-    cached_lens: List[int], seq_len_q: int, topk: int, device: torch.device
+    cached_lens: List[int],
+    seq_len_q: int,
+    topk: int,
+    device: torch.device,
+    max_valid: Optional[int] = None,
 ) -> torch.Tensor:
     total_tokens = len(cached_lens) * seq_len_q
     topk_indices = torch.full((total_tokens, topk), -1, dtype=torch.int32, device=device)
@@ -397,7 +402,7 @@ def _build_sparse_topk_indices_generation(
     for cached_len in cached_lens:
         for q_idx in range(seq_len_q):
             max_index = cached_len + q_idx
-            valid_len = min(max_index + 1, topk)
+            valid_len = min(max_index + 1, topk, max_valid or topk)
             indices = torch.randperm(max_index + 1, device=device)[:valid_len]
             indices, _ = torch.sort(indices)
             topk_indices[row, :valid_len] = indices.to(torch.int32)
@@ -434,6 +439,17 @@ scenarios = [
     for kv_cache_dtype in kv_cache_dtype_list
     for num_layers in [1]
     for rope_append in rope_append_values
+]
+# Kimi K3.1 heads per rank: 96 (attention DP; the Q tile must divide the head
+# group, so it splits into three Q32 CTAs), 12 (TP8) and 6 (TP16). The two
+# smaller groups have no prebuilt sparse-MLA cubin and compile through NVRTC.
+scenarios += [
+    Scenario(
+        kv_cache_dtype=torch.bfloat16,
+        num_heads=num_heads,
+        kv_cache_tokens_per_block=tokens_per_block,
+    )
+    for num_heads in (96, 12, 6)
 ]
 
 accuracy_dict = {
@@ -528,6 +544,138 @@ def test_sparse_attention_mla(
     )
 
 
+def _present_kept_rows(attn_metadata, topk_indices: torch.Tensor, seq_len_q: int) -> None:
+    """Present sparse MLA one row per generation token, as long as its kept entries.
+
+    This is the token-major view DSA metadata builds under Helix CP
+    (``DSAtrtllmAttentionMetadata.token_major_gen_view(token_sparse=True)``):
+    the sparse-MLA kernel reads the first min(top-k, kv_len) entries of a row
+    and does not mask -1 inside that range.
+    """
+    num_rows = topk_indices.shape[0]
+    num_seqs = num_rows // seq_len_q
+    device = topk_indices.device
+    lens = (topk_indices >= 0).sum(dim=1, dtype=torch.int32)
+    req_idx = torch.arange(num_seqs, device=device).repeat_interleave(seq_len_q)
+    view = TokenMajorGenView(
+        num_rows=num_rows,
+        sequence_length=lens,
+        host_past_key_value_lengths=lens.cpu(),
+        host_context_lengths=torch.ones(num_rows, dtype=torch.int32),
+        prompt_lens_cuda=torch.ones(num_rows, dtype=torch.int32, device=device),
+        host_request_types=torch.ones(num_rows, dtype=torch.int32),
+        kv_cache_block_offsets=attn_metadata.kv_cache_block_offsets.index_select(1, req_idx),
+        max_num_rows=num_rows,
+    )
+    attn_metadata.token_major_gen_view = lambda token_sparse=False: view if token_sparse else None
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("generation_seq_len_q", [1, 4])
+def test_sparse_mla_generation_rows_with_unused_slots(kv_cache_dtype, generation_seq_len_q):
+    """Top-K rows that keep far fewer entries than the KV length.
+
+    Under Helix CP every rank keeps only its share of the global Top-K, so its
+    rows are mostly -1 within the range the kernel reads (min(top-k, kv_len)).
+    Presented one row per token with its kept count as the length, the output
+    must equal attention over the kept entries alone.
+    """
+    scenario = Scenario(
+        kv_cache_dtype=kv_cache_dtype, num_heads=96, kv_cache_tokens_per_block=tokens_per_block
+    )
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    _run_test_for_backend(
+        "TRTLLM",
+        scenario.num_heads,
+        scenario.num_kv_heads,
+        scenario.num_layers,
+        scenario.q_lora_rank,
+        scenario.kv_lora_rank,
+        scenario.qk_nope_head_dim,
+        scenario.qk_rope_head_dim,
+        scenario.v_head_dim,
+        scenario.rope_append,
+        rope_config,
+        scenario.kv_cache_tokens_per_block,
+        torch.device("cuda"),
+        scenario.dtype,
+        kv_cache_dtype,
+        [3000, 5000],
+        generation_seq_len_q,
+        2,
+        gen_max_valid=128,
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("generation_seq_len_q", [1, 4])
+def test_sparse_mla_generation_rows_at_the_top_k_boundary(generation_seq_len_q):
+    """Verify rows whose valid count crosses top-k inside one group.
+
+    Unsharded, a row's valid entries always fill the range the kernel reads:
+    token t of a group sees min(top_k, kv_len - (seq_len_q - 1) + t) keys, and
+    the indexer returns that many. Contexts just below and above top-k (2048)
+    put both cases in the same verify group.
+    """
+    scenario = Scenario(num_heads=96, kv_cache_tokens_per_block=tokens_per_block)
+    rope_config = RopeConfig(
+        hidden_size=scenario.hidden_size,
+        num_attention_heads=scenario.num_heads,
+        rope_scaling={
+            "beta_fast": scenario.rope_beta_fast,
+            "beta_slow": scenario.rope_beta_slow,
+            "factor": scenario.rope_factor,
+            "mscale": scenario.rope_mscale,
+            "mscale_all_dim": scenario.rope_mscale_all_dim,
+            "original_max_position_embeddings": scenario.rope_original_max_position_embeddings,
+            "type": scenario.rope_type,
+        },
+        max_position_embeddings=scenario.max_position_embeddings,
+        rope_theta=scenario.rope_theta,
+        qk_rope_head_dim=scenario.qk_rope_head_dim,
+        model_type=scenario.model_type,
+    )
+    _run_test_for_backend(
+        "TRTLLM",
+        scenario.num_heads,
+        scenario.num_kv_heads,
+        scenario.num_layers,
+        scenario.q_lora_rank,
+        scenario.kv_lora_rank,
+        scenario.qk_nope_head_dim,
+        scenario.qk_rope_head_dim,
+        scenario.v_head_dim,
+        scenario.rope_append,
+        rope_config,
+        scenario.kv_cache_tokens_per_block,
+        torch.device("cuda"),
+        scenario.dtype,
+        scenario.kv_cache_dtype,
+        [2045, 2047, 2050],
+        generation_seq_len_q,
+        2,
+    )
+
+
 def _run_test_for_backend(
     backend_name,
     num_heads,
@@ -547,6 +695,7 @@ def _run_test_for_backend(
     context_sequence_lengths,
     generation_seq_len_q,
     num_generation_steps,
+    gen_max_valid: Optional[int] = None,
 ):
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=64,
@@ -966,11 +1115,17 @@ def _run_test_for_backend(
                         for ctx_len in context_sequence_lengths
                     ]
                     topk_indices = _build_sparse_topk_indices_generation(
-                        cached_lens, generation_seq_len_q, SPARSE_TOPK, device
+                        cached_lens,
+                        generation_seq_len_q,
+                        SPARSE_TOPK,
+                        device,
+                        max_valid=gen_max_valid,
                     )
                     gen_layers[layer_idx].indexer.forward_from_projected = Mock(
                         return_value=topk_indices
                     )
+                    if gen_max_valid is not None:
+                        _present_kept_rows(attn_metadata, topk_indices, generation_seq_len_q)
 
                     result = gen_layers[layer_idx].forward(
                         fused_q,

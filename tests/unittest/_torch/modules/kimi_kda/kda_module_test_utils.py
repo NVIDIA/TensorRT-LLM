@@ -19,6 +19,7 @@ def make_attention(
     *,
     weight_seed: int = 17,
     bf16_weights: bool = False,
+    kda_fp32_gate_params: bool = False,
 ) -> KimiKDALinearAttention:
     """Build an attention module with reproducible synthetic checkpoint values."""
     import torch
@@ -39,6 +40,7 @@ def make_attention(
             use_full_rank_gate=True,
             gate_lower_bound=-5.0,
         ),
+        kda_fp32_gate_params=kda_fp32_gate_params,
     )
     config = ModelConfig(
         quant_config=QuantConfig()

@@ -129,6 +129,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
+    RMS_NORM_QUANT_FP8_BLOCKSCALE = 10
 
 
 class AllReduceParams:
@@ -157,9 +158,10 @@ class AllReduceParams:
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
-        assert fusion_op in (AllReduceFusionOp.NONE.value,
-                             AllReduceFusionOp.RMS_NORM.value) or (residual
-                                                                   is not None)
+        assert fusion_op in (
+            AllReduceFusionOp.NONE.value, AllReduceFusionOp.RMS_NORM.value,
+            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value) or (
+                residual is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0

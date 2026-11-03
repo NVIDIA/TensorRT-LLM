@@ -34,10 +34,12 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <numeric>
 #include <torch/extension.h>
 #include <tuple>
+#include <variant>
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
@@ -343,11 +345,20 @@ void initBindings(nb::module_& m)
         .def("try_get_encoder_output_len", &GenLlmReq::tryGetEncoderOutputLen)
         .def_prop_ro("encoder_output_len", &GenLlmReq::getEncoderOutputLen);
 
-    nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
+    // input_tokens is either an int32 array, copied with one memcpy, or a sequence of ints, converted
+    // element by element. The array alternative comes first so a numpy array never takes the
+    // per-element sequence path.
+    using InputTokenArray = nb::ndarray<tb::LlmRequest::TokenIdType const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+    using InputTokens = std::variant<InputTokenArray, std::vector<tb::LlmRequest::TokenIdType>>;
+
+    auto llmRequestClass = nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr());
+    // Lets Python check that this build accepts an int32 array for input_tokens.
+    llmRequestClass.attr("accepts_input_token_array") = true;
+    llmRequestClass
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, InputTokens input_tokens,
                 executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<at::Tensor> prompt_embedding_table,
                 std::optional<tb::LlmRequest::SizeType32> prompt_vocab_size,
@@ -385,14 +396,24 @@ void initBindings(nb::module_& m)
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
-                    multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, draft_tokens, exclude_input_from_output, encoder_input_tokens, priority,
-                    encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
-                    return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
-                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
-                    std::move(cache_salt)};
+                std::vector<tb::LlmRequest::TokenIdType> inputTokens;
+                if (auto const* array = std::get_if<InputTokenArray>(&input_tokens))
+                {
+                    inputTokens.assign(array->data(), array->data() + array->shape(0));
+                }
+                else
+                {
+                    inputTokens = std::move(std::get<std::vector<tb::LlmRequest::TokenIdType>>(input_tokens));
+                }
+
+                new (self) tb::LlmRequest{request_id, max_new_tokens, std::move(inputTokens), sampling_config,
+                    is_streaming, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
+                    multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr,
+                    lora_config_tensor_ptr, kv_cache_retention_config, draft_tokens, exclude_input_from_output,
+                    encoder_input_tokens, priority, encoder_input_length, encoder_output_length, llm_request_type,
+                    input_token_extra_ids, return_perf_metrics, context_phase_params, arrival_time,
+                    std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("prompt_embedding_table") = std::nullopt,

@@ -390,6 +390,10 @@ def _make_forward_only_engine(
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
     decoder._trtllm_gen_jit_warmup = False
+    # DecoderRunner.__init__ defaults: no batched input commit outside Kimi K3.1
+    # generation servers (input_commit.batched_input_commit_enabled).
+    decoder._input_commit = None
+    decoder._input_commit_ready = False
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()
@@ -1903,13 +1907,13 @@ class DecoderForwardTestCase(unittest.TestCase):
     def test_mrope_multi_beam_generation_positions(self) -> None:
         """Every beam row gets its request's `past + delta` on all 3 axes."""
         beam_width = 2
-        engine, kv_cache_manager = create_model_engine_and_kvcache(
+        engine, _ = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=4,
                                   max_num_tokens=64,
                                   max_beam_width=beam_width),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         # (num_tokens, delta): one delta arrives on the host and one is
         # already a CUDA int32 scalar.
@@ -1972,12 +1976,12 @@ class DecoderForwardTestCase(unittest.TestCase):
     def test_mrope_mixed_batched_and_fallback_positions_match_fallback(
             self) -> None:
         """Mixed scalar batching matches the old per-request writes exactly."""
-        engine, kv_cache_manager = create_model_engine_and_kvcache(
+        engine, _ = create_model_engine_and_kvcache(
+            self,
             llm_args=TorchLlmArgs(model="dummy",
                                   max_batch_size=2,
                                   max_num_tokens=64),
             model=DummyModel(torch.half, rope_scaling={"type": "mrope"}))
-        self.addCleanup(kv_cache_manager.shutdown)
         preparer = engine._runner._inputs
         sentinel = 123
 
@@ -2660,8 +2664,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             TrtllmAttentionMetadata
         from tensorrt_llm._torch.kernels.spec_step_copies import \
             op as spec_step_copies
-        if not spec_step_copies.is_supported():
-            self.skipTest("the step-copy kernels run on SM 100")
+        if not spec_step_copies.input_gather_is_supported():
+            self.skipTest("the step-copy gather runs on SM 100 / SM 103")
         max_draft_len = 3
         tokens_per_step = max_draft_len + 1
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(

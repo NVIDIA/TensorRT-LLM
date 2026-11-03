@@ -33,10 +33,12 @@ std::tuple<th::Tensor, th::Tensor> indexer_k_cache_gather_op(th::Tensor const& k
     int64_t head_dim)
 {
     // head_dim is the number of payload bytes per token: 128 for FP8 (one byte
-    // per float8 value) or 64 for FP4 (two packed E2M1 codes per byte).
+    // per float8 value), 64 for FP4 (two packed E2M1 codes per byte) or 256 for
+    // BF16 (two bytes per value).
     constexpr int32_t SCALE_SIZE = 4;
-    TORCH_CHECK(head_dim == 128 || head_dim == 64,
-        "indexer_k_cache_gather_op head_dim must be 128 (FP8) or 64 (FP4 packed), got %d", static_cast<int>(head_dim));
+    TORCH_CHECK(head_dim == 128 || head_dim == 64 || head_dim == 256,
+        "indexer_k_cache_gather_op head_dim must be 128 (FP8), 64 (FP4 packed) or 256 (BF16) bytes, got %d",
+        static_cast<int>(head_dim));
     auto head_dim_i32 = static_cast<int32_t>(head_dim);
 
     auto device = k_cache.device();

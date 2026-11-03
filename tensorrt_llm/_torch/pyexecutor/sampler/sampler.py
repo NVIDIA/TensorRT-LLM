@@ -42,6 +42,7 @@ from ...utils import torch_multi_arange
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager
 from ..scheduler import ScheduledRequests
+from ..standalone_draft_cache import DraftHistoryUpdate
 from .beam_search import (
     BeamHistory,
     BeamHistoryBuilder,
@@ -114,6 +115,7 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
     host: Optional[GenericSampleStateTensorsHost] = None
     sampler_event: Optional[SamplerEvent] = None
     runtime_draft_len: Optional[int] = None
+    draft_history_update: DraftHistoryUpdate | None = None
 
 
 # Generic bounds not supported, https://github.com/python/typing/issues/548

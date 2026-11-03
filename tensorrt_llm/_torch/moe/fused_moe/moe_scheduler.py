@@ -50,7 +50,8 @@ import torch
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
-from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor, get_model_extra_attrs
+from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
@@ -60,6 +61,7 @@ from .impl_contract import MoECommPlan, MoERunContext
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
 __all__ = [
+    "MOE_GRAPH_PADDING_ROWS_ATTR",
     "MoEScheduler",
     "ExternalCommMoEScheduler",
     "FusedCommMoEScheduler",
@@ -68,6 +70,41 @@ __all__ = [
 
 if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
+
+
+MOE_GRAPH_PADDING_ROWS_ATTR = "moe_graph_padding_rows"
+"""Model extra attr: ``[num_rows]`` bool device mask of a prefill-CUDA-graph step's padding rows.
+
+A model that publishes it for a forward refreshes it on every graph replay; NVLink one-sided dispatch then routes
+those rows nowhere (no all-to-all bytes, no expert GEMM rows).
+"""
+
+
+def _mask_graph_padding_routes(
+    moe: "ConfigurableMoE",
+    token_selected_experts: Optional[torch.Tensor],
+    row_offset: Optional[int],
+) -> Optional[torch.Tensor]:
+    """``token_selected_experts`` with the published padding rows' routes set to the invalid expert ``-1``."""
+    attrs = get_model_extra_attrs()
+    padding_rows = attrs.get(MOE_GRAPH_PADDING_ROWS_ATTR) if attrs is not None else None
+    if (
+        padding_rows is None
+        or token_selected_experts is None
+        or not isinstance(moe.comm, NVLinkOneSided)
+        or moe.layer_load_balancer
+    ):
+        return token_selected_experts
+    begin = row_offset or 0
+    end = begin + token_selected_experts.shape[0]
+    if end > padding_rows.shape[0]:
+        logger.warning_once(
+            f"MoE graph-padding trim skipped: rows [{begin}, {end}) exceed the "
+            f"{padding_rows.shape[0]}-row padding mask",
+            key="moe_graph_padding_rows_mismatch",
+        )
+        return token_selected_experts
+    return token_selected_experts.masked_fill(padding_rows[begin:end].unsqueeze(-1), -1)
 
 
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
@@ -105,7 +142,15 @@ class MoEScheduler(ABC):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
-    ) -> torch.Tensor: ...
+        moe_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the MoE layer.
+
+        ``moe_output``: optional ``[num_tokens, hidden_size]`` buffer, in the output dtype, for
+        the backend to write the result into. A scheduler hands it to ``run_moe`` (as
+        ``MoECommPlan.moe_output``) only where the backend output is the layer output; the
+        caller compares the returned tensor with it to see whether it was used.
+        """
 
 
 # ============================================================================
@@ -148,6 +193,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``input_ready_event``: ``x`` is written on another stream. The join
         is deferred to the first kernel that reads ``x`` so routing overlaps it.
@@ -225,6 +271,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 lora_params=lora_params,
                 routing_aux=routing_aux,
                 input_ready_event=input_ready_event,
+                moe_output=moe_output,
             )
         else:
             input_ready_event = _wait_input_ready(input_ready_event)
@@ -376,6 +423,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -397,6 +445,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_output=moe_output,
         )
 
     def _forward_chunk_impl(
@@ -415,6 +464,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         row_offset: Optional[int] = 0,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -543,6 +593,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
             )
             token_selected_experts = None
             token_final_scales = None
+
+        # Prefill-graph padding rows (published by the model) route nowhere.
+        token_selected_experts = _mask_graph_padding_routes(moe, token_selected_experts, row_offset)
 
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
@@ -675,6 +728,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
+            moe_output=moe_output,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -1048,6 +1102,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -1072,6 +1127,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 output_dtype,
                 do_finalize,
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+                num_tokens=x.shape[0],
+                moe_output=moe_output,
             ),
         )
 
@@ -1081,21 +1138,37 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         do_finalize: bool,
         use_deep_ep_direct_metadata: bool = False,
+        num_tokens: Optional[int] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
         Backends read the fields they care about and ignore the rest, so the
         set of facts no longer depends on which class is running.
+
+        ``moe_output`` is the caller's output buffer (see ``MoEScheduler.forward``). Without
+        external communication the backend output is the layer output, so a buffer of the
+        output's shape and dtype becomes the plan's output buffer; otherwise it is ignored.
         """
         moe = self.moe
         # Pre-quant dispatch: SFs arrive swizzled; post-quant dispatch: SFs
         # arrive unswizzled. Backends use this to skip a re-swizzle.
         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
+        requested_output = moe_output
         moe_output, payload_in_workspace = self._plan_onesided_workspace(
             all_rank_num_tokens=all_rank_num_tokens,
             output_dtype=output_dtype,
             do_finalize=do_finalize,
         )
+        if (
+            moe_output is None
+            and moe.comm is None
+            and requested_output is not None
+            and requested_output.dtype == output_dtype
+            and tuple(requested_output.shape) == (num_tokens, moe.hidden_size)
+            and requested_output.is_contiguous()
+        ):
+            moe_output = requested_output
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
@@ -1161,8 +1234,11 @@ class FusedCommMoEScheduler(MoEScheduler):
         lora_params: Optional[Dict] = None,
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
+
+        ``moe_output`` is not used: the fused kernels allocate their outputs per chunk.
 
         Single-chunk case is just ``num_chunks == 1`` -- no separate fast
         path. Invariants enforced here (see class docstring): identical
@@ -1171,6 +1247,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        del moe_output
         _wait_input_ready(input_ready_event)
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert

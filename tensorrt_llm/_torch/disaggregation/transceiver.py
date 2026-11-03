@@ -502,10 +502,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The PP loop does not, so _check_compatible rejects attention-DP
             # with both helix CP and pp_size > 1.
             #
-            # Non-DP tp x cp gathers over the world behind the same predicate and
-            # goes through the same step, which lines up its CP ranks but not its
-            # TP ranks; a rank-local cancel or timeout can still skew those, as it
-            # can without CP.
+            # Non-DP gathers over the world behind the same predicate; the pp=1
+            # loops line up its CP ranks with the same step and its TP ranks with
+            # DisaggTransferCoordinator.align_gen_admission_across_tp.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
@@ -664,6 +663,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             excluded_pool_views = exclude(self._page_table, remote_tail_split)
 
         is_gen_only = req.is_generation_only_request
+        # Standalone draft (CP-as-TP) groups hold the full sequence on every
+        # Helix rank, so their positional window spans the global prompt.
+        draft_prompt_blocks = (self._global_prompt_len(req) + tpb - 1) // tpb
         cached_per_lg = (
             adapter.get_cached_token_count_per_layer_group(req, layer_groups)
             if is_gen_only
@@ -682,7 +684,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # prompt positions through beam 0's block table), so the
                 # positional path applies to every beam width.
                 ordinals = adapter.get_block_ordinals(req, idx, lg)
-                group = self._positional_window(ordinals, prompt_blocks, cached_per_lg[idx] // tpb)
+                if getattr(lg, "cp_as_tp", False):
+                    # A helix-sharded draft group holds every cp_as_tp_shards-th
+                    # global page, starting at this rank's draft shard.
+                    group_blocks = len(
+                        range(
+                            getattr(self._kv_cache_manager, "draft_cp_rank", 0),
+                            draft_prompt_blocks,
+                            getattr(lg, "cp_as_tp_shards", 1),
+                        )
+                    )
+                else:
+                    group_blocks = prompt_blocks
+                group = self._positional_window(ordinals, group_blocks, cached_per_lg[idx] // tpb)
             groups.append(group)
 
         return Chunk(
@@ -709,10 +723,69 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         window[: min(cached_blocks, prompt_blocks)] = -1
         return window
 
-    @staticmethod
-    def _need_aux_transfer(req: LlmRequest) -> bool:
+    def _need_aux_transfer(self, req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
-        return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        return bool(getattr(self._kv_cache_manager, "draft_layer_ids", ())) or (
+            params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        )
+
+    def _global_prompt_len(self, req: LlmRequest) -> int:
+        if getattr(self._kv_cache_manager, "_has_cp_helix", False):
+            return req.total_input_len_cp
+        return req.prompt_len
+
+    def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
+        # Full-attention drafters can skip an oversized context store; rolling
+        # drafters retain their complete live suffix. Neither includes scratch.
+        window_size = history["layout"]["window_size"]
+        max_positions = self._kv_cache_manager.draft_max_position_embeddings
+        prompt_len = self._global_prompt_len(req)
+        expected_length = prompt_len
+        if window_size is not None:
+            if type(window_size) is not int or window_size <= 0:
+                raise ValueError("Invalid draft history window size")
+            expected_length = min(expected_length, window_size)
+        elif max_positions is not None and prompt_len > max_positions:
+            expected_length = min(history["valid_length"], max_positions)
+        if history["valid_length"] != expected_length or history["position"] != prompt_len:
+            raise ValueError(
+                "DSpark transfer requires valid draft history and sequence position "
+                f"covering the complete prompt ({prompt_len} tokens, "
+                f"{expected_length} retained)."
+            )
+
+    def _pack_draft_history(self, req: LlmRequest) -> None:
+        manager = getattr(self, "_kv_cache_manager", None)
+        if not getattr(manager, "draft_layer_ids", ()):
+            return
+        history = self._kv_cache_manager.export_draft_history(req.py_request_id)
+        self._validate_draft_history_range(req, history)
+        req.py_draft_transfer_history = history
+
+    def _restore_draft_history(self, req: LlmRequest) -> None:
+        history = getattr(req, "py_draft_transfer_history", None)
+        manager = getattr(self, "_kv_cache_manager", None)
+        has_draft = bool(getattr(manager, "draft_layer_ids", ()))
+        if history is None:
+            if has_draft:
+                raise ValueError(
+                    "Standalone DSpark generation requires draft history from a prefill worker "
+                    "with matching speculative configuration; draft history metadata is missing."
+                )
+            return
+        if not has_draft:
+            raise ValueError(
+                "Received standalone DSpark draft history without a manager-owned draft cache."
+            )
+        self._validate_draft_history_range(req, history)
+        # K/V already occupies receiver-local pages; restore only validity and position.
+        self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
+
+    def _prepare_received_history(self, session: RxSessionBase, req: LlmRequest) -> None:
+        if self._need_aux_transfer(req):
+            self._apply_aux(session, req)
+        self._assert_disagg_history_declared(req)
+        self._restore_draft_history(req)
 
     def _validate_bridge_req(self, req: LlmRequest, synchronous: bool = False) -> bool:
         if not getattr(self, "_fp4_mla_bridge_enabled", False):
@@ -1015,6 +1088,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
+        params = req.py_disaggregated_params
+        if params is not None and params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST:
+            # Context-first tokens and usage already arrived in the context response.
+            session.unpack_draft_history(req)
+            return
         session.unpack_aux(req)
         first_gen_tokens = req.py_first_gen_tokens  # type: ignore[attr-defined]
         draft_tokens = req.py_draft_tokens
@@ -1173,6 +1251,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             PeerPublish(session, req).publish(extent)
 
             if chunk.is_last:
+                self._pack_draft_history(req)
                 self._finalize_send(req, session)
                 if not bridge_enabled:
                     # Preserve the legacy pipelined-transfer state boundary:
@@ -1215,9 +1294,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(self._request_kv_bytes(req, paged_bytes, state_bytes))
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
+                self._prepare_received_history(session, req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1408,43 +1485,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
-
-        completed, failed, cancelled = [], [], []
-        for rid in to_process:
-            session = self._recv_sessions[rid]
-            result = session.wait_complete(blocking=block_all)
-            if session.status == SessionStatus.CANCELLED:
-                if self._ownership_blocks_retirement(session):
-                    continue
-                # Session cancelled — either by local cancel_request() (user
-                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
-                # server timeout).  Return the req objects so the caller can
-                # distinguish the two cases and set the appropriate state.
-                cancelled.append(rid)
-            elif result == WaitResult.COMPLETED:
-                req = self._recv_reqs[rid]
-                if session.transfer_end_time is not None:
-                    req.set_kv_cache_transfer_end(session.transfer_end_time)
-                if session.kv_cache_size_bytes > 0:
-                    req.set_kv_cache_size(session.kv_cache_size_bytes)
-                completed.append(rid)
-            elif result == WaitResult.FAILED:
-                # RxSession.wait_complete() already withholds FAILED while an
-                # ownership-enabled accessor remains active. Keep the caller
-                # boundary fail-closed as well so alternate/test session
-                # implementations cannot authorize request retirement early.
-                if self._ownership_blocks_retirement(session):
-                    continue
-                failed.append(rid)
-            # else: None — KV done but aux still in flight; re-poll next cycle
-
-        # Verified-range reuse admission: a rid qualifies only when this
-        # rank's session attests full write coverage of the published
-        # destination bytes (see RxSession.kv_write_verified).
-        locally_verified = [
-            rid for rid in completed if self._recv_sessions[rid].kv_write_verified()
-        ]
-
+        cancelled, failed, completed, locally_verified = self._classify_recv_sessions(
+            to_process, blocking=block_all
+        )
+        self._stamp_recv_transfer_metrics(completed)
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed, verified = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed, locally_verified
@@ -1481,9 +1525,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.py_kv_transfer_verified = rid in verified
             # transfer_end already stamped at completion detection above.
             req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            if self._need_aux_transfer(req):
-                self._apply_aux(session, req)
-            self._assert_disagg_history_declared(req)
+            self._prepare_received_history(session, req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
@@ -1496,6 +1538,51 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
         return GenTransferStatus(completed, failed, cancelled_reqs)
+
+    def _classify_recv_sessions(self, rids, *, blocking: bool):
+        """This rank's outcome for each receive in ``rids``.
+
+        Returns ``(cancelled, failed, completed, verified)``; a receive whose KV
+        is done while its aux is still in flight, or whose accessor still holds
+        physical resources, is in none of them and is polled again later.
+        """
+        completed, failed, cancelled = [], [], []
+        for rid in rids:
+            session = self._recv_sessions[rid]
+            result = session.wait_complete(blocking=blocking)
+            if session.status == SessionStatus.CANCELLED:
+                if self._ownership_blocks_retirement(session):
+                    continue
+                # Session cancelled — either by local cancel_request() (user
+                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
+                # server timeout).  Return the req objects so the caller can
+                # distinguish the two cases and set the appropriate state.
+                cancelled.append(rid)
+            elif result == WaitResult.COMPLETED:
+                completed.append(rid)
+            elif result == WaitResult.FAILED:
+                # RxSession.wait_complete() already withholds FAILED while an
+                # ownership-enabled accessor remains active. Keep the caller
+                # boundary fail-closed as well so alternate/test session
+                # implementations cannot authorize request retirement early.
+                if self._ownership_blocks_retirement(session):
+                    continue
+                failed.append(rid)
+        # Verified-range reuse admission: a rid qualifies only when this
+        # rank's session attests full write coverage of the published
+        # destination bytes (see RxSession.kv_write_verified).
+        verified = [rid for rid in completed if self._recv_sessions[rid].kv_write_verified()]
+        return cancelled, failed, completed, verified
+
+    def _stamp_recv_transfer_metrics(self, rids) -> None:
+        """Copy the transfer end time and size of completed receives onto their requests."""
+        for rid in rids:
+            session = self._recv_sessions[rid]
+            req = self._recv_reqs[rid]
+            if session.transfer_end_time is not None:
+                req.set_kv_cache_transfer_end(session.transfer_end_time)
+            if session.kv_cache_size_bytes > 0:
+                req.set_kv_cache_size(session.kv_cache_size_bytes)
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
         self._poll_sessions_for_interval(

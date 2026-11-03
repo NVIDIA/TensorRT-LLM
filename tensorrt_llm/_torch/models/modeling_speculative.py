@@ -29,10 +29,12 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.spec_tail_kernels import tail_v2_enabled
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1438,6 +1440,10 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",
@@ -1875,8 +1881,19 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         if self.spec_worker is not None:
             # The target logits, in the layout the worker's acceptance reads.
+            gather_ids = spec_metadata.gather_ids
+            if (tail_v2_enabled() and attn_metadata.num_contexts == 0
+                    and gather_ids is not None
+                    and gather_ids.shape[0] == hidden_states.shape[0]):
+                # Fused DSpark / DFlash tail (tail_v2_enabled, drafting Kimi
+                # K3.1 engines only): a generation-only batch gathers every
+                # token in order (gather ids 0..num_tokens-1), so no gather
+                # copy is needed.
+                head_input = hidden_states
+            else:
+                head_input = hidden_states[gather_ids]
             logits = self.spec_worker.target_logits(
-                hidden_states[spec_metadata.gather_ids],
+                head_input,
                 self.lm_head,
                 self.logits_processor,
                 attn_metadata,

@@ -149,6 +149,9 @@ def _make_projection_sender() -> Sender:
         self_endpoint="tcp://decode:0",
         cp_size=1,
         cp_rank=0,
+        # RankInfo.page_table defaults to None: a peer that published no page
+        # table has no helix-sharded draft groups to stride over.
+        page_table=None,
     )
 
     extractor = MagicMock()

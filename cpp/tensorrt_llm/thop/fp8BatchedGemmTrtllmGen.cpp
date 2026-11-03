@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,7 +21,6 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
-#include <ATen/native/cuda/Resize.h>
 
 #include <cuda_fp16.h>
 
@@ -194,7 +193,7 @@ public:
     {
 
         auto const smVersion = tensorrt_llm::common::getSMVersion();
-        if (smVersion != tensorrt_llm::kernels::kSM_100)
+        if (smVersion != tensorrt_llm::kernels::kSM_100 && smVersion != tensorrt_llm::kernels::kSM_107)
         {
             TLLM_THROW("Unsupported or unimplemented compute capability for fp8 batched gemm: %i", smVersion);
         }

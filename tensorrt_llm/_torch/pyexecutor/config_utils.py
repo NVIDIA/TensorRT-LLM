@@ -148,12 +148,15 @@ def is_kimi_linear(config):
     """True for Kimi K3 ("kimi_linear") hybrid KDA + MLA text models.
 
     Handles both the flattened text config (model_type "kimi_linear") and the
-    composite VLM config (model_type "kimi_k3" with a nested text_config).
+    composite VLM configs (model_type "kimi_k3" / "kimi_k31" with a nested
+    text_config).
     """
+    from tensorrt_llm._torch.configs.kimi_k3 import \
+        KIMI_K3_COMPOSITE_MODEL_TYPES
     model_type = getattr(config, "model_type", None)
     if model_type == "kimi_linear":
         return getattr(config, "linear_attn_config", None) is not None
-    if model_type == "kimi_k3":
+    if model_type in KIMI_K3_COMPOSITE_MODEL_TYPES:
         text_config = getattr(config, "text_config", None)
         return text_config is not None and is_kimi_linear(text_config)
     return False
@@ -163,11 +166,13 @@ def unwrap_kimi_text_config(config):
     """Return the flattened Kimi text config.
 
     ``is_kimi_linear`` accepts both the flattened text config and the
-    composite "kimi_k3" config with a nested ``text_config``; consumers read
-    text-level fields (``linear_attn_config``, ``num_hidden_layers``, ...),
-    so they must unwrap the composite form first.
+    composite "kimi_k3" / "kimi_k31" config with a nested ``text_config``;
+    consumers read text-level fields (``linear_attn_config``,
+    ``num_hidden_layers``, ...), so they must unwrap the composite form first.
     """
-    if getattr(config, "model_type", None) == "kimi_k3":
+    from tensorrt_llm._torch.configs.kimi_k3 import \
+        KIMI_K3_COMPOSITE_MODEL_TYPES
+    if getattr(config, "model_type", None) in KIMI_K3_COMPOSITE_MODEL_TYPES:
         text_config = getattr(config, "text_config", None)
         if text_config is not None:
             return text_config
@@ -403,11 +408,14 @@ def is_mla(config):
 
 
 def supports_fp4_mla_attention(model_config: "ModelConfig") -> bool:
-    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path."""
+    """Whether the model uses the dedicated dense TRTLLM FP4 MLA path.
+
+    Hybrid linear-attention MLA models (e.g. Kimi K3) are included: their V2
+    hybrid cache manager composes the FP4 MLA layout policy.
+    """
     return (is_mla(model_config.pretrained_config)
             and model_config.attn_backend == "TRTLLM"
-            and model_config.sparse_attention_config is None
-            and not is_hybrid_linear(model_config.pretrained_config))
+            and model_config.sparse_attention_config is None)
 
 
 def uses_fp4_mla_attention(model_config: "ModelConfig") -> bool:
@@ -741,16 +749,19 @@ def is_kimi_k3_multimodal_config(config_dict: dict) -> bool:
 
     The released Kimi K3 VLM checkpoint advertises ``model_type: kimi_k3`` with
     nested ``text_config`` (the ``kimi_linear`` text core) and ``vision_config``
-    (the MoonViT-3D tower + projector). When both sub-configs are present and
-    multimodal is not explicitly disabled, TRT-LLM keeps the composite
-    ``KimiK3Config`` and routes the checkpoint to
-    ``KimiK3ForConditionalGeneration``. Text-only ``kimi_linear`` checkpoints (or
-    a ``kimi_k3`` config with ``language_model_only: true`` / no vision_config)
-    fall through to the text-only flatten path.
+    (the MoonViT-3D tower + projector); Kimi K3.1 uses the same layout under
+    ``model_type: kimi_k31``. When both sub-configs are present and
+    multimodal is not explicitly disabled, TRT-LLM keeps the composite config
+    and routes the checkpoint to ``KimiK3ForConditionalGeneration`` /
+    ``KimiK31ForConditionalGeneration``. Text-only ``kimi_linear`` checkpoints
+    (or a composite config with ``language_model_only: true`` / no
+    vision_config) fall through to the text-only flatten path.
     """
+    from tensorrt_llm._torch.configs.kimi_k3 import \
+        KIMI_K3_COMPOSITE_MODEL_TYPES
     text_config = config_dict.get("text_config")
     vision_config = config_dict.get("vision_config")
-    return (config_dict.get("model_type") == "kimi_k3"
+    return (config_dict.get("model_type") in KIMI_K3_COMPOSITE_MODEL_TYPES
             and config_dict.get("language_model_only") is not True
             and isinstance(text_config, dict) and bool(text_config)
             and isinstance(vision_config, dict) and bool(vision_config))
@@ -927,15 +938,20 @@ def load_pretrained_config(model_name_or_path: str,
         _normalize_qwen35_vl_config(model_config,
                                     inner_arch="Qwen3_5ForCausalLM")
     elif is_kimi_k3_multimodal_config(config_dict):
-        # Kimi K3 multimodal VLM: keep the composite KimiK3Config so the vision
-        # tower, projector, and multimodal token id remain available, and route
-        # to KimiK3ForConditionalGeneration. Must precede the text-only flatten
+        # Kimi K3 / K3.1 multimodal VLM: keep the composite config so the
+        # vision tower, projector, and multimodal token id remain available,
+        # and route to the VLM wrapper. Must precede the text-only flatten
         # branch below so vision_config isn't dropped. Built from the in-tree
         # config classes (no trust_remote_code needed for the config).
-        from tensorrt_llm._torch.configs import KimiK3Config
-        model_config = KimiK3Config.from_dict(config_dict, **kwargs)
-        model_config.architectures = ["KimiK3ForConditionalGeneration"]
-    elif model_type in ("kimi_k3", "kimi_linear"):
+        from tensorrt_llm._torch.configs import KimiK3Config, KimiK31Config
+        from tensorrt_llm._torch.configs.kimi_k3 import \
+            KIMI_K3_COMPOSITE_ARCHITECTURES
+        config_class = KimiK31Config if model_type == "kimi_k31" else KimiK3Config
+        model_config = config_class.from_dict(config_dict, **kwargs)
+        model_config.architectures = [
+            KIMI_K3_COMPOSITE_ARCHITECTURES[model_type]
+        ]
+    elif model_type in ("kimi_k3", "kimi_k31", "kimi_linear"):
         # Kimi K3 text-only (or multimodal explicitly disabled): flatten to the
         # in-tree KimiLinearConfig and run the text model only (this also avoids
         # trust_remote_code for the config).
@@ -943,6 +959,8 @@ def load_pretrained_config(model_name_or_path: str,
         text_dict = dict(config_dict.get("text_config") or config_dict)
         model_config = KimiLinearConfig.from_dict(text_dict)
         model_config.architectures = ["KimiLinearForCausalLM"]
+        if model_type == "kimi_k31":
+            model_config.kda_fp32_gate_params = True
     elif is_qwen4_exp_multimodal_config(config_dict):
         # Preserve the composite config for the VLM wrapper. The text-only
         # branch below deliberately flattens the nested text config.

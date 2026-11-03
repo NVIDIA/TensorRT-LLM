@@ -11,13 +11,16 @@ BF16/FP16 output and, for Helix, the per-row (max, sum) softmax stats. Global FP
 scales and KV lengths are read on the device, so CUDA graph replays follow them.
 """
 
+import heapq
 import math
+import os
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_ptr
 
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
@@ -31,12 +34,29 @@ from .fp4_mla_cutedsl_mufu16 import (
     _validate_tensor_pointer_alignment,
 )
 
-_PACKED_REDUCE_COMPILE_CACHE: dict[tuple[int, bool, torch.dtype], Callable] = {}
-_PACKED_PLAN_COMPILE_CACHE: dict[tuple[int, bool, bool], Callable] = {}
+_PACKED_REDUCE_COMPILE_CACHE: dict[
+    tuple[int, bool, bool, torch.dtype, bool, torch.dtype], Callable
+] = {}
+_PACKED_PLAN_COMPILE_CACHE: dict[tuple[int, bool, bool, bool], Callable] = {}
 _REDUCE_THREADS = 128
-_PLAN_THREADS = 128
+# One warp per candidate task length of the wave plan.
+_PLAN_THREADS = 1024
 # Requests one plan CTA stages in shared memory (4 KiB of tiles + begins).
 PLAN_MAX_REQUESTS = 1024
+# The plan simulates the decode grid for this many task lengths, one warp each:
+# the rule's (warp 0) and the longest request cut into 1..PLAN_SIM_CANDIDATES - 1 pieces.
+PLAN_SIM_CANDIDATES = _PLAN_THREADS // 32
+# Waves of more slots (four per lane) or batches of more requests keep the rule's length.
+PLAN_SIM_MAX_SLOTS = 128
+PLAN_SIM_MAX_REQUESTS = 64
+# Candidates of more tasks are skipped: the simulation leaves out the reduction, whose
+# cost grows with the partials.
+PLAN_SIM_MAX_TASKS = 256
+# Fixed cost of one task (Q load, pipeline fill, epilogue) in KV tiles, and the extra cost of
+# a task whose request is split (FP32 partial and row stats, merged by the reduction). Fitted
+# on Rubin to the decode + reduction time of forced plans.
+PLAN_TASK_COST_TILES = 12
+PLAN_SPLIT_COST_TILES = 24
 _VALUE_DIM = 512
 # Tasks whose partial loads a warp issues back-to-back before any is consumed
 # with a full 512-column band (16 vector loads per lane; narrower bands take
@@ -46,6 +66,49 @@ _VALUE_DIM = 512
 _TASKS_PER_CHUNK = 4
 # Persistent reducer grid: up to this many CTAs per SM, one warp per output row.
 _REDUCE_CTAS_PER_SM = 4
+# Opt-in: spread the Helix stats of single-task requests over the whole reducer
+# grid (otherwise every request's row chunks land on the same first CTAs).
+REDUCE_SPREAD_STATS_ENV = "TRTLLM_FP4_MLA_REDUCE_SPREAD_STATS"
+
+
+def reduce_spread_stats_enabled() -> bool:
+    return os.environ.get(REDUCE_SPREAD_STATS_ENV, "0") == "1"
+
+
+# Opt-in: the reduction launches as a programmatic dependent of the decode kernel
+# (which then triggers its dependents as soon as every decode CTA has started) and
+# waits for the decode grid with griddepcontrol.wait after staging the plan.
+REDUCE_PDL_ENV = "TRTLLM_FP4_MLA_REDUCE_PDL"
+
+
+def reduce_pdl_enabled() -> bool:
+    return os.environ.get(REDUCE_PDL_ENV, "0") == "1"
+
+
+# Opt-in: the decode kernel stores each split's normalized output (numerator /
+# row sum, in output units) as FP16 instead of the FP32 max-relative numerator,
+# which halves the partial store and load traffic; the merge then weighs every
+# split by its max-scaled row sum and applies no output scale.
+F16_PARTIALS_ENV = "TRTLLM_FP4_MLA_F16_PARTIALS"
+
+
+def f16_partials_enabled() -> bool:
+    return os.environ.get(F16_PARTIALS_ENV, "0") == "1"
+
+
+@cutlass.dsl_user_op
+def _griddepcontrol_wait(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [],
+        "griddepcontrol.wait;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -72,14 +135,17 @@ def _reduce_packed_row(
 
     Lane ``l`` owns columns ``band * band_columns + i * 128 + 4 * l .. + 4`` for
     ``i < band_columns // 128``, so every vector load and store of the warp
-    covers 512 contiguous bytes. Tasks are consumed in chunks sized to keep 16
+    covers 128 contiguous columns. Tasks are consumed in chunks sized to keep 16
     vector loads in flight per lane; the per-task weights are recomputed by
     every lane from the row state (L1-resident), so no shuffles or shared
     memory are needed. Empty tasks (row sum 0) carry zero weight and a row
     with no visible key anywhere yields O=0 and stats (-inf, 0), the neutral
-    Helix contribution.
+    Helix contribution. FP16 partials are normalized split outputs, weighted
+    by the max-scaled row sums.
     """
     columns_per_lane: cutlass.Constexpr = 4
+    partial_bits: cutlass.Constexpr = mPartial_trc.element_type.width
+    normalized: cutlass.Constexpr = partial_bits == 16
     column_groups: cutlass.Constexpr = band_columns // (32 * columns_per_lane)
     tasks_per_chunk: cutlass.Constexpr = _TASKS_PER_CHUNK * (_VALUE_DIM // band_columns)
     band_base = band * cutlass.Int32(band_columns) + lane * cutlass.Int32(4)
@@ -121,14 +187,19 @@ def _reduce_packed_row(
                         mRowMax_tr[task, local_row] * scale - global_row_max, fastmath=True
                     )
                     denominator += task_row_sum * task_weight
+                    if cutlass.const_expr(normalized):
+                        task_weight = task_weight * task_row_sum
             chunk_weights.append(task_weight)
             partial_row = (task * physical_m + local_row) * cutlass.Int32(_VALUE_DIM) + band_base
             for group in cutlass.range_constexpr(column_groups):
-                chunk_vecs.append(
+                group_vec = (
                     gPartial_arr.subview(partial_row + cutlass.Int32(group * 128))
                     .data_ptr()
-                    .load(count=columns_per_lane, alignment=4 * columns_per_lane)
+                    .load(count=columns_per_lane, alignment=partial_bits // 8 * columns_per_lane)
                 )
+                if cutlass.const_expr(normalized):
+                    group_vec = group_vec.to(cutlass.Float32)
+                chunk_vecs.append(group_vec)
         for slot in cutlass.range_constexpr(tasks_per_chunk):
             # Empty tasks keep zero weight; their payload is never trusted.
             if chunk_weights[slot] != cutlass.Float32(0.0):
@@ -186,6 +257,51 @@ def _reduce_packed_row(
             mStatsSum_r[row] = denominator
 
 
+@cute.jit
+def _reduce_packed_band_item(
+    mPartial_trc: cute.Tensor,
+    mRowMax_tr: cute.Tensor,
+    mRowSum_tr: cute.Tensor,
+    mOut_rc: cute.Tensor,
+    mStatsMax_r: cute.Tensor,
+    mStatsSum_r: cute.Tensor,
+    lane: cutlass.Int32,
+    request: cutlass.Int32,
+    local_item: cutlass.Int32,
+    valid_m: cutlass.Int32,
+    task_begin: cutlass.Int32,
+    request_tasks: cutlass.Int32,
+    physical_m: cutlass.Int32,
+    scale: cutlass.Float32,
+    output_scale: cutlass.Float32,
+    band_columns: cutlass.Constexpr,
+    write_stats: cutlass.Constexpr,
+) -> None:
+    """(row, column band) item ``local_item`` of a split request."""
+    bands: cutlass.Constexpr = _VALUE_DIM // band_columns
+    local_row = local_item // cutlass.Int32(bands)
+    band = local_item - local_row * cutlass.Int32(bands)
+    _reduce_packed_row(
+        mPartial_trc,
+        mRowMax_tr,
+        mRowSum_tr,
+        mOut_rc,
+        mStatsMax_r,
+        mStatsSum_r,
+        lane,
+        request * valid_m + local_row,
+        local_row,
+        band,
+        task_begin,
+        request_tasks,
+        physical_m,
+        scale,
+        output_scale,
+        band_columns,
+        write_stats,
+    )
+
+
 @cute.kernel
 def packed_split_reduce_kernel(
     mPartial_trc: cute.Tensor,
@@ -204,6 +320,8 @@ def packed_split_reduce_kernel(
     physical_m: cutlass.Int32,
     band_columns: cutlass.Constexpr,
     write_stats: cutlass.Constexpr,
+    spread_stats: cutlass.Constexpr,
+    use_pdl: cutlass.Constexpr = False,
 ) -> None:
     """Persistent grid: each warp walks (row, column band) items of multi-task requests.
 
@@ -231,11 +349,18 @@ def packed_split_reduce_kernel(
         sBegins[entry] = mPlan_i[cutlass.Int32(2) + entry]
     cute.arch.sync_threads()
     scale = softmax_scale_log2 / (mQScale[0] * mKvScale[0])
+    if cutlass.const_expr(use_pdl):
+        # Partials and row state come from the decode grid this one depends on;
+        # the plan and the global scales were written before it.
+        _griddepcontrol_wait()
     # Compact item c of the multi-task (row, band) pairs belongs to warp slot
     # c % item_stride.
     item_slot = bidx * cutlass.Int32(warps_per_cta) + warp_idx
     item_stride = grid_x * cutlass.Int32(warps_per_cta)
     compact_offset = cutlass.Int32(0)
+    # With spread_stats, 128-row stats chunk c of the single-task requests
+    # (counted across requests) belongs to CTA c % grid.
+    stats_chunk_offset = cutlass.Int32(0)
     for request in cutlass.range(0, num_requests, 1, unroll=1):
         task_begin = cutlass.Int32(sBegins[request])
         request_tasks = cutlass.Int32(sBegins[request + cutlass.Int32(1)]) - task_begin
@@ -248,9 +373,7 @@ def packed_split_reduce_kernel(
                 first_item, compact_offset + request_items, item_stride, unroll=1
             ):
                 local_item = compact_item - compact_offset
-                local_row = local_item // cutlass.Int32(bands)
-                band = local_item - local_row * cutlass.Int32(bands)
-                _reduce_packed_row(
+                _reduce_packed_band_item(
                     mPartial_trc,
                     mRowMax_tr,
                     mRowSum_tr,
@@ -258,9 +381,9 @@ def packed_split_reduce_kernel(
                     mStatsMax_r,
                     mStatsSum_r,
                     lane,
-                    request * valid_m + local_row,
-                    local_row,
-                    band,
+                    request,
+                    local_item,
+                    valid_m,
                     task_begin,
                     request_tasks,
                     physical_m,
@@ -273,9 +396,14 @@ def packed_split_reduce_kernel(
         else:
             if cutlass.const_expr(write_stats):
                 # Thread-parallel over the request's rows: chunk k of 128 rows
-                # is owned by CTA k % grid.
+                # is owned by CTA k % grid, or by CTA (offset + k) % grid with
+                # spread_stats so that consecutive requests use other CTAs.
                 row_chunks = (valid_m + cutlass.Int32(127)) // cutlass.Int32(128)
-                for chunk in cutlass.range(bidx, row_chunks, grid_x, unroll=1):
+                first_chunk = bidx
+                if cutlass.const_expr(spread_stats):
+                    first_chunk = (bidx - stats_chunk_offset % grid_x + grid_x) % grid_x
+                    stats_chunk_offset += row_chunks
+                for chunk in cutlass.range(first_chunk, row_chunks, grid_x, unroll=1):
                     local_row = chunk * cutlass.Int32(128) + tidx
                     if local_row < valid_m:
                         row = request * valid_m + local_row
@@ -314,6 +442,8 @@ def packed_split_reduce_host(
     grid_ctas: cutlass.Int32,
     band_columns: cutlass.Constexpr,
     write_stats: cutlass.Constexpr,
+    spread_stats: cutlass.Constexpr,
+    use_pdl: cutlass.Constexpr = False,
 ) -> None:
     tasks = num_requests * num_splits
     partial_layout = cute.make_layout(
@@ -351,11 +481,112 @@ def packed_split_reduce_host(
         physical_m,
         band_columns,
         write_stats,
+        spread_stats,
+        use_pdl,
     ).launch(
         grid=(grid_ctas, 1, 1),
         block=(_REDUCE_THREADS, 1, 1),
         stream=stream,
+        use_pdl=use_pdl,
     )
+
+
+@cute.jit
+def _plan_simulated_makespan(
+    sTiles: cute.Tensor,
+    num_requests: cutlass.Int32,
+    tiles_per_task: cutlass.Int32,
+    wave_tasks: cutlass.Int32,
+    lane: cutlass.Int32,
+) -> cutlass.Int32:
+    """Makespan (KV tiles) of the decode grid for one task length, simulated by one warp.
+
+    The grid runs the tasks in the plan's table order (``plan_task_order``): every
+    request's tasks but its last, all ``tiles_per_task`` long, then the last tasks,
+    longest first. Each task takes the slot of ``wave_tasks`` that frees first and
+    holds it for its KV tiles plus PLAN_TASK_COST_TILES, plus PLAN_SPLIT_COST_TILES
+    when its request has several tasks. Slot j lives in lane j % 32, register
+    j // 32; request r's last task in lane r % 32, bit r // 32.
+    """
+    # Every task but a request's last belongs to a split request.
+    task_cost = tiles_per_task + cutlass.Int32(PLAN_TASK_COST_TILES + PLAN_SPLIT_COST_TILES)
+    full_tasks = cutlass.Int32(0)
+    for request_idx in cutlass.range(lane, num_requests, 32, unroll=1):
+        full_tasks = (
+            full_tasks
+            + (sTiles[request_idx] + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
+            - cutlass.Int32(1)
+        )
+    full_tasks = cute.arch.warp_redux_sync(full_tasks, "add")
+    # Equal tasks fill the slots round-robin.
+    full_rounds = full_tasks // wave_tasks
+    full_extra = full_tasks - full_rounds * wave_tasks
+    idle = cutlass.Int32(1 << 30)
+    slot0 = idle
+    slot1 = idle
+    slot2 = idle
+    slot3 = idle
+    if lane < wave_tasks:
+        slot0 = full_rounds * task_cost
+        if lane < full_extra:
+            slot0 = slot0 + task_cost
+    if lane + cutlass.Int32(32) < wave_tasks:
+        slot1 = full_rounds * task_cost
+        if lane + cutlass.Int32(32) < full_extra:
+            slot1 = slot1 + task_cost
+    if lane + cutlass.Int32(64) < wave_tasks:
+        slot2 = full_rounds * task_cost
+        if lane + cutlass.Int32(64) < full_extra:
+            slot2 = slot2 + task_cost
+    if lane + cutlass.Int32(96) < wave_tasks:
+        slot3 = full_rounds * task_cost
+        if lane + cutlass.Int32(96) < full_extra:
+            slot3 = slot3 + task_cost
+    makespan = full_rounds * task_cost
+    if full_extra > cutlass.Int32(0):
+        makespan = makespan + task_cost
+    taken = cutlass.Int32(0)
+    for _ in cutlass.range(0, num_requests, 1, unroll=1):
+        # The longest last task left (ties: lower request), as tail * 1024 + (1023 - request).
+        local_key = cutlass.Int32(-1)
+        for request_idx in cutlass.range(lane, num_requests, 32, unroll=1):
+            taken_bit = (taken >> (request_idx // cutlass.Int32(32))) & cutlass.Int32(1)
+            if taken_bit == cutlass.Int32(0):
+                request_tiles = sTiles[request_idx]
+                request_tasks = (
+                    request_tiles + tiles_per_task - cutlass.Int32(1)
+                ) // tiles_per_task
+                tail = request_tiles - (request_tasks - cutlass.Int32(1)) * tiles_per_task
+                local_key = cutlass.max(
+                    local_key,
+                    tail * cutlass.Int32(PLAN_MAX_REQUESTS)
+                    + cutlass.Int32(PLAN_MAX_REQUESTS - 1)
+                    - request_idx,
+                )
+        key = cute.arch.warp_redux_sync(local_key, "max")
+        request = cutlass.Int32(PLAN_MAX_REQUESTS - 1) - key % cutlass.Int32(PLAN_MAX_REQUESTS)
+        if lane == request % cutlass.Int32(32):
+            taken = taken | (cutlass.Int32(1) << (request // cutlass.Int32(32)))
+        tail_cost = key // cutlass.Int32(PLAN_MAX_REQUESTS) + cutlass.Int32(PLAN_TASK_COST_TILES)
+        if sTiles[request] > tiles_per_task:
+            tail_cost = tail_cost + cutlass.Int32(PLAN_SPLIT_COST_TILES)
+        local_free = cutlass.min(cutlass.min(slot0, slot1), cutlass.min(slot2, slot3))
+        start = cute.arch.warp_redux_sync(local_free, "min")
+        owner_key = cutlass.Int32(32)
+        if local_free == start:
+            owner_key = lane
+        owner = cute.arch.warp_redux_sync(owner_key, "min")
+        if lane == owner:
+            if slot0 == start:
+                slot0 = start + tail_cost
+            elif slot1 == start:
+                slot1 = start + tail_cost
+            elif slot2 == start:
+                slot2 = start + tail_cost
+            else:
+                slot3 = start + tail_cost
+        makespan = cutlass.max(makespan, start + tail_cost)
+    return makespan
 
 
 @cute.kernel
@@ -374,6 +605,7 @@ def packed_plan_kernel(
     query_len_per_seq: cutlass.Constexpr,
     use_helix_kv_bounds: cutlass.Constexpr,
     write_generation_lengths: cutlass.Constexpr,
+    wave_plan: cutlass.Constexpr,
 ) -> None:
     """One CTA: the balanced task plan both decode and reduction kernels read.
 
@@ -385,9 +617,11 @@ def packed_plan_kernel(
 
     ``plan = [tiles_per_task, used_tasks, begins[0..num_requests],
     request[task_capacity], split[task_capacity], count[task_capacity]]``.
-    Request ``r`` owns ``ceil(tiles_r / tiles_per_task)`` consecutive tasks;
-    slots past ``used_tasks`` map to the last request with an out-of-range
-    split and are never scheduled (the decode kernel exits them).
+    Request ``r`` owns ``ceil(tiles_r / tiles_per_task)`` tasks, whose partials
+    sit at ``begins[r] + split``; the tables list them in grid order (every
+    request's tasks but its last, then the last ones longest first, see
+    ``plan_task_order``). Slots past ``used_tasks`` map to the last request
+    with an out-of-range split and are never scheduled (the decode kernel exits them).
 
     Task length: a request is only split when it is at least 1.5x longer than
     the batch's work spread over one wave, ``ceil(total / wave_tasks)``, i.e.
@@ -404,8 +638,15 @@ def packed_plan_kernel(
     ``ceil(total / (capacity - requests))`` and the per-request share
     ``ceil(longest / splits)`` that fits is used. Everything is clamped to
     ``max_tiles_per_task``, the KV the compiled runtime profile covers (the
-    host sizes it so the clamp never needs more than the capacity). The host
-    mirror is ``plan_packed_tasks``.
+    host sizes it so the clamp never needs more than the capacity).
+
+    That length is only a candidate: one warp each, the plan
+    simulates the grid (``_plan_simulated_makespan``) for it and for the
+    longest request cut into 1..PLAN_SIM_CANDIDATES - 1 equal pieces, and
+    takes the length that finishes first (ties keep the longer tasks).
+    Without ``wave_plan`` the plan keeps the rule's length and lists every
+    request's tasks in request order.
+    The host mirror is ``plan_packed_tasks``.
     """
     tidx, _, _ = cute.arch.thread_idx()
     sTiles = cute.make_tensor(
@@ -415,7 +656,8 @@ def packed_plan_kernel(
         cute.arch.alloc_smem(cutlass.Int32, PLAN_MAX_REQUESTS + 1),
         cute.make_layout(PLAN_MAX_REQUESTS + 1),
     )
-    sScalars = cute.make_tensor(cute.arch.alloc_smem(cutlass.Int32, 2), cute.make_layout(2))
+    # The rule's task length, the total and the longest request tiles.
+    sScalars = cute.make_tensor(cute.arch.alloc_smem(cutlass.Int32, 4), cute.make_layout(4))
     for request_idx in cutlass.range(tidx, num_requests, _PLAN_THREADS, unroll=1):
         request_valid_k = cutlass.Int32(mValidK_l[request_idx])
         if cutlass.const_expr(write_generation_lengths):
@@ -500,36 +742,114 @@ def packed_plan_kernel(
                 tiles_per_task = cutlass.min(tiles_per_task, longest)
         tiles_per_task = cutlass.min(tiles_per_task, max_tiles_per_task)
         if tidx == cutlass.Int32(0):
-            task_begin = cutlass.Int32(0)
-            for request_idx in cutlass.range(0, num_requests, 1, unroll=1):
-                sBegins[request_idx] = task_begin
-                mPlan_i[cutlass.Int32(2) + request_idx] = task_begin
-                task_begin = (
-                    task_begin
-                    + (sTiles[request_idx] + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
-                )
-            sBegins[num_requests] = task_begin
-            mPlan_i[cutlass.Int32(2) + num_requests] = task_begin
-            mPlan_i[0] = tiles_per_task
-            mPlan_i[1] = task_begin
             sScalars[0] = tiles_per_task
+            sScalars[1] = total_tiles
+            sScalars[2] = longest
     cute.arch.sync_threads()
-    tiles_per_task = sScalars[0]
-    tables = cutlass.Int32(3) + num_requests
-    for task_idx in cutlass.range(tidx, task_capacity, _PLAN_THREADS, unroll=1):
-        request = num_requests - cutlass.Int32(1)
-        split_idx = cutlass.Int32(1 << 15)
-        request_tasks = cutlass.Int32(1 << 15)
+    if cutlass.const_expr(wave_plan):
+        # Per candidate warp: simulated makespan, then task length.
+        sCandidates = cute.make_tensor(
+            cute.arch.alloc_smem(cutlass.Int32, 2 * PLAN_SIM_CANDIDATES),
+            cute.make_layout(2 * PLAN_SIM_CANDIDATES),
+        )
+        warp_idx = tidx // cutlass.Int32(32)
+        lane = tidx % cutlass.Int32(32)
+        fits = (wave_tasks <= cutlass.Int32(PLAN_SIM_MAX_SLOTS)) & (
+            num_requests <= cutlass.Int32(PLAN_SIM_MAX_REQUESTS)
+        )
+        simulate = (task_capacity > num_requests) & fits
+        if simulate:
+            longest = sScalars[2]
+            candidate = sScalars[0]
+            if warp_idx > cutlass.Int32(0):
+                candidate = cutlass.min(
+                    cutlass.max(
+                        (longest + warp_idx - cutlass.Int32(1)) // warp_idx,
+                        cutlass.Int32(PACKED_MIN_TILES_PER_TASK),
+                    ),
+                    cutlass.min(longest, max_tiles_per_task),
+                )
+            candidate_tasks = cutlass.Int32(0)
+            for request_idx in cutlass.range(lane, num_requests, 32, unroll=1):
+                candidate_tasks = (
+                    candidate_tasks
+                    + (sTiles[request_idx] + candidate - cutlass.Int32(1)) // candidate
+                )
+            candidate_tasks = cute.arch.warp_redux_sync(candidate_tasks, "add")
+            candidate_makespan = cutlass.Int32(-1)
+            if candidate_tasks <= cutlass.min(task_capacity, cutlass.Int32(PLAN_SIM_MAX_TASKS)):
+                candidate_makespan = _plan_simulated_makespan(
+                    sTiles, num_requests, candidate, wave_tasks, lane
+                )
+            if lane == cutlass.Int32(0):
+                sCandidates[warp_idx] = candidate_makespan
+                sCandidates[PLAN_SIM_CANDIDATES + warp_idx] = candidate
+        cute.arch.sync_threads()
+        if simulate & (tidx == cutlass.Int32(0)):
+            best_makespan = cutlass.Int32(-1)
+            best_tiles = sScalars[0]
+            for candidate_idx in cutlass.range(0, PLAN_SIM_CANDIDATES, 1, unroll=1):
+                candidate_makespan = sCandidates[candidate_idx]
+                candidate = sCandidates[PLAN_SIM_CANDIDATES + candidate_idx]
+                if candidate_makespan >= cutlass.Int32(0):
+                    better = (
+                        (best_makespan < cutlass.Int32(0))
+                        | (candidate_makespan < best_makespan)
+                        | ((candidate_makespan == best_makespan) & (candidate > best_tiles))
+                    )
+                    if better:
+                        best_makespan = candidate_makespan
+                        best_tiles = candidate
+            sScalars[0] = best_tiles
+    cute.arch.sync_threads()
+    if tidx == cutlass.Int32(0):
+        tiles_per_task = sScalars[0]
+        task_begin = cutlass.Int32(0)
         for request_idx in cutlass.range(0, num_requests, 1, unroll=1):
-            begin = sBegins[request_idx]
-            end = sBegins[request_idx + cutlass.Int32(1)]
-            if task_idx >= begin and task_idx < end:
-                request = request_idx
-                split_idx = task_idx - begin
-                request_tasks = end - begin
-        mPlan_i[tables + task_idx] = request
-        mPlan_i[tables + task_capacity + task_idx] = split_idx
-        mPlan_i[tables + task_capacity + task_capacity + task_idx] = request_tasks
+            sBegins[request_idx] = task_begin
+            mPlan_i[cutlass.Int32(2) + request_idx] = task_begin
+            task_begin = (
+                task_begin
+                + (sTiles[request_idx] + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
+            )
+        sBegins[num_requests] = task_begin
+        mPlan_i[cutlass.Int32(2) + num_requests] = task_begin
+        mPlan_i[0] = tiles_per_task
+        mPlan_i[1] = task_begin
+    cute.arch.sync_threads()
+    task_tiles = sScalars[0]
+    tables = cutlass.Int32(3) + num_requests
+    used_tasks = sBegins[num_requests]
+    # Grid order with wave_plan (plan_task_order): non-last tasks in request order from
+    # begins[r] - r, then last tasks longest first. Partials stay at begins[r] + split.
+    full_tasks = used_tasks - num_requests
+    for request_idx in cutlass.range(tidx, num_requests, _PLAN_THREADS, unroll=1):
+        begin = sBegins[request_idx]
+        request_tasks = sBegins[request_idx + cutlass.Int32(1)] - begin
+        first_task = begin
+        last_task = begin + request_tasks - cutlass.Int32(1)
+        if cutlass.const_expr(wave_plan):
+            request_tiles = sTiles[request_idx]
+            tail = request_tiles - (request_tasks - cutlass.Int32(1)) * task_tiles
+            rank = cutlass.Int32(0)
+            for other_idx in cutlass.range(0, num_requests, 1, unroll=1):
+                other_tasks = sBegins[other_idx + cutlass.Int32(1)] - sBegins[other_idx]
+                other_tail = sTiles[other_idx] - (other_tasks - cutlass.Int32(1)) * task_tiles
+                if (other_tail > tail) | ((other_tail == tail) & (other_idx < request_idx)):
+                    rank = rank + cutlass.Int32(1)
+            first_task = begin - request_idx
+            last_task = full_tasks + rank
+        for split_idx in cutlass.range(0, request_tasks, 1, unroll=1):
+            task_idx = last_task
+            if split_idx + cutlass.Int32(1) < request_tasks:
+                task_idx = first_task + split_idx
+            mPlan_i[tables + task_idx] = request_idx
+            mPlan_i[tables + task_capacity + task_idx] = split_idx
+            mPlan_i[tables + task_capacity + task_capacity + task_idx] = request_tasks
+    for task_idx in cutlass.range(used_tasks + tidx, task_capacity, _PLAN_THREADS, unroll=1):
+        mPlan_i[tables + task_idx] = num_requests - cutlass.Int32(1)
+        mPlan_i[tables + task_capacity + task_idx] = cutlass.Int32(1 << 15)
+        mPlan_i[tables + task_capacity + task_capacity + task_idx] = cutlass.Int32(1 << 15)
 
 
 @cute.jit
@@ -549,6 +869,7 @@ def packed_plan_host(
     query_len_per_seq: cutlass.Constexpr,
     use_helix_kv_bounds: cutlass.Constexpr,
     write_generation_lengths: cutlass.Constexpr,
+    wave_plan: cutlass.Constexpr,
 ) -> None:
     request_layout = cute.make_layout((num_requests,), stride=(1,))
     mValidK_l = cute.make_tensor(kv_lens_ptr, request_layout)
@@ -560,7 +881,10 @@ def packed_plan_host(
     mGenerationLens_l = cute.make_tensor(generation_lens_ptr, request_layout)
     mPlan_i = cute.make_tensor(
         plan_ptr,
-        cute.make_layout((cutlass.Int32(3) + num_requests + 3 * task_capacity,), stride=(1,)),
+        cute.make_layout(
+            (cutlass.Int32(3) + num_requests + cutlass.Int32(3) * task_capacity,),
+            stride=(1,),
+        ),
     )
     packed_plan_kernel(
         mValidK_l,
@@ -577,7 +901,12 @@ def packed_plan_host(
         query_len_per_seq,
         use_helix_kv_bounds,
         write_generation_lengths,
-    ).launch(grid=(1, 1, 1), block=(_PLAN_THREADS, 1, 1), stream=stream)
+        wave_plan,
+    ).launch(
+        grid=(1, 1, 1),
+        block=(_PLAN_THREADS, 1, 1),
+        stream=stream,
+    )
 
 
 def packed_plan_length(num_requests: int, task_capacity: int) -> int:
@@ -596,6 +925,7 @@ def launch_packed_plan(
     query_len: int,
     helix_kv_bounds: torch.Tensor | None = None,
     generation_lengths: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
+    wave_plan: bool = True,
 ) -> None:
     """Write the balanced task plan for ``num_requests * num_splits`` slots into ``plan``.
 
@@ -606,6 +936,8 @@ def launch_packed_plan(
     generation_len)`` the same launch first writes the per-request generation
     lengths ``kv_lens - prompt_lens + generation_len`` and ``generation_len``
     (``kv_lens`` then being the raw lengths) and plans on the corrected ones.
+    ``wave_plan=False`` keeps the rule's task length and request order (no wave
+    simulation, no tail reordering).
     """
     task_capacity = num_requests * num_splits
     if num_requests <= 0 or num_splits <= 0 or wave_tasks <= 0 or max_tiles_per_task <= 0:
@@ -660,7 +992,7 @@ def launch_packed_plan(
         make_ptr(cutlass.Int32, plan.data_ptr(), gmem, assumed_align=4),
     )
     stream = _current_cu_stream()
-    cache_key = (query_len, use_helix, write_lengths)
+    cache_key = (query_len, use_helix, write_lengths, wave_plan)
     plan_fn = _PACKED_PLAN_COMPILE_CACHE.get(cache_key)
     if plan_fn is None:
         plan_fn = _compile_cutedsl(
@@ -671,6 +1003,7 @@ def launch_packed_plan(
             query_len,
             use_helix,
             write_lengths,
+            wave_plan,
         )
         _PACKED_PLAN_COMPILE_CACHE[cache_key] = plan_fn
     plan_fn(
@@ -699,8 +1032,9 @@ def _make_reduce_ptrs(
         stats.data_ptr() + stats.element_size() if stats is not None else sums.data_ptr()
     )
     gmem = cute.AddressSpace.gmem
+    partial_dtype = cutlass.Float16 if partial.dtype == torch.float16 else cutlass.Float32
     return (
-        make_ptr(cutlass.Float32, partial.data_ptr(), gmem, assumed_align=32),
+        make_ptr(partial_dtype, partial.data_ptr(), gmem, assumed_align=32),
         make_ptr(cutlass.Float32, maxima.data_ptr(), gmem, assumed_align=32),
         make_ptr(cutlass.Float32, sums.data_ptr(), gmem, assumed_align=32),
         make_ptr(_cutlass_output_dtype(output.dtype), output.data_ptr(), gmem, assumed_align=32),
@@ -719,13 +1053,16 @@ def plan_packed_tasks(
     max_tiles_per_task: int = 1 << 30,
     min_tiles_per_task: int = PACKED_MIN_TILES_PER_TASK,
     one_wave: bool = False,
+    wave_plan: bool = True,
 ) -> tuple[int, list[int]]:
     """Host mirror of the kernels' balanced task plan: (tiles per task, task begins).
 
     ``request_tiles`` are the per-request KV tile counts (>= 1), ``task_capacity``
     the grid.z slots (``num_requests * num_splits``) and ``wave_tasks`` the tasks
     that fill one wave of clusters; ``one_wave`` (Helix) never takes the two-wave
-    target. Returns the KV tiles each task may own and the
+    target. With ``wave_plan`` the length competes
+    with the longest request cut into 1..PLAN_SIM_CANDIDATES - 1 pieces by
+    ``plan_simulated_makespan``. Returns the KV tiles each task may own and the
     ``len(request_tiles) + 1`` task prefix, whose last element is the number of
     tasks actually used (<= ``task_capacity``). See ``_packed_tiles_per_task``.
     """
@@ -761,10 +1098,64 @@ def plan_packed_tasks(
                     tiles_per_task = even
             tiles_per_task = min(tiles_per_task, longest)
     tiles_per_task = min(tiles_per_task, max_tiles_per_task)
+    if (
+        wave_plan
+        and task_capacity > num_requests
+        and wave_tasks <= PLAN_SIM_MAX_SLOTS
+        and num_requests <= PLAN_SIM_MAX_REQUESTS
+    ):
+        candidates = [tiles_per_task] + [
+            min(max(math.ceil(longest / pieces), min_tiles_per_task), longest, max_tiles_per_task)
+            for pieces in range(1, PLAN_SIM_CANDIDATES)
+        ]
+        best = None
+        for candidate in candidates:
+            if used(candidate) > min(task_capacity, PLAN_SIM_MAX_TASKS):
+                continue
+            makespan = plan_simulated_makespan(request_tiles, candidate, wave_tasks)
+            if best is None or (makespan, -candidate) < best:
+                best = (makespan, -candidate)
+        if best is not None:
+            tiles_per_task = -best[1]
     begins = [0]
     for tiles in request_tiles:
         begins.append(begins[-1] + math.ceil(tiles / tiles_per_task))
     return tiles_per_task, begins
+
+
+def plan_task_order(
+    request_tiles: list[int], tiles_per_task: int, wave_plan: bool = True
+) -> list[tuple[int, int]]:
+    """Grid order of the plan's tasks as (request, split).
+
+    Every request's tasks but its last in request order, then the last tasks
+    longest first (ties: lower request); without ``wave_plan`` all in request order.
+    """
+    tasks = [math.ceil(tiles / tiles_per_task) for tiles in request_tiles]
+    if not wave_plan:
+        return [(r, split) for r, n in enumerate(tasks) for split in range(n)]
+    order = [(r, split) for r, n in enumerate(tasks) for split in range(n - 1)]
+    tails = [
+        (tiles - (n - 1) * tiles_per_task, r)
+        for r, (tiles, n) in enumerate(zip(request_tiles, tasks))
+    ]
+    order += [(r, tasks[r] - 1) for _, r in sorted(tails, key=lambda tail: (-tail[0], tail[1]))]
+    return order
+
+
+def plan_simulated_makespan(request_tiles: list[int], tiles_per_task: int, wave_tasks: int) -> int:
+    """Host mirror of ``_plan_simulated_makespan``: grid makespan in KV tiles for one length."""
+    slots = [0] * wave_tasks
+    makespan = 0
+    for request, split in plan_task_order(request_tiles, tiles_per_task):
+        start = heapq.heappop(slots)
+        tiles = min(tiles_per_task, request_tiles[request] - split * tiles_per_task)
+        end = start + tiles + PLAN_TASK_COST_TILES
+        if request_tiles[request] > tiles_per_task:
+            end += PLAN_SPLIT_COST_TILES
+        makespan = max(makespan, end)
+        heapq.heappush(slots, end)
+    return makespan
 
 
 def request_kv_tiles(
@@ -816,22 +1207,33 @@ def reduce_packed_splits(
     plan: torch.Tensor,
     stats: torch.Tensor | None = None,
     sm_count: int = 128,
+    use_pdl: bool = False,
 ) -> None:
-    """Reduce ``[splits * requests, physical_m, 512]`` FP32 partials into ``output``.
+    """Reduce ``[splits * requests, physical_m, 512]`` partials into ``output``.
+
+    FP32 partials are max-relative numerators (``output_scale`` converts the
+    merge to output units); FP16 partials are normalized split outputs already
+    in output units (pass ``output_scale=1``).
 
     ``output`` is a contiguous ``[requests * valid_m, 512]`` BF16/FP16 tensor and
     ``stats`` the optional contiguous ``[requests * valid_m, 2]`` FP32 Helix
     (max, sum) buffer. ``q_scale``/``kv_scale`` are the device FP4 global scales
     and ``plan`` the task plan written by ``launch_packed_plan`` for the same
-    ``splits * requests`` slots the decode kernel ran.
+    ``splits * requests`` slots the decode kernel ran. ``use_pdl`` launches it as a
+    programmatic dependent of the preceding (decode) kernel.
     """
     tasks = num_splits * num_requests
     total_rows = num_requests * valid_m
     if num_requests <= 0 or num_splits <= 0 or valid_m <= 0 or physical_m < valid_m:
         raise ValueError("packed reduce needs positive requests/splits and physical_m >= valid_m")
-    if partial.dtype != torch.float32 or partial.shape != (tasks, physical_m, _VALUE_DIM):
+    if partial.dtype not in (torch.float32, torch.float16) or partial.shape != (
+        tasks,
+        physical_m,
+        _VALUE_DIM,
+    ):
         raise ValueError(
-            f"partial must be float32 {(tasks, physical_m, _VALUE_DIM)}, got {tuple(partial.shape)}"
+            f"partial must be float32/float16 {(tasks, physical_m, _VALUE_DIM)}, "
+            f"got {partial.dtype} {tuple(partial.shape)}"
         )
     if maxima.shape != (tasks, physical_m) or sums.shape != (tasks, physical_m):
         raise ValueError("maxima and sums must be [tasks, physical_m]")
@@ -865,13 +1267,20 @@ def reduce_packed_splits(
         _validate_tensor_pointer_alignment(name, tensor, alignment_bytes=32)
     if stats is not None:
         _validate_tensor_pointer_alignment("stats", stats, alignment_bytes=8)
-
     band_columns = select_reduce_columns(total_rows, sm_count)
     grid_ctas = select_reduce_ctas(total_rows * (_VALUE_DIM // band_columns), sm_count)
     write_stats = stats is not None
+    spread_stats = write_stats and reduce_spread_stats_enabled()
     stream = _current_cu_stream()
     ptrs = _make_reduce_ptrs(partial, maxima, sums, output, stats, q_scale, kv_scale, plan)
-    cache_key = (band_columns, write_stats, output.dtype)
+    cache_key = (
+        band_columns,
+        write_stats,
+        spread_stats,
+        output.dtype,
+        use_pdl,
+        partial.dtype,
+    )
     reduce_fn = _PACKED_REDUCE_COMPILE_CACHE.get(cache_key)
     if reduce_fn is None:
         reduce_fn = _compile_cutedsl(
@@ -883,6 +1292,8 @@ def reduce_packed_splits(
             *(cutlass.Int32(1) for _ in range(7)),
             band_columns,
             write_stats,
+            spread_stats,
+            use_pdl,
         )
         _PACKED_REDUCE_COMPILE_CACHE[cache_key] = reduce_fn
     reduce_fn(

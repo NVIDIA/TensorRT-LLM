@@ -121,6 +121,32 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def _take_prerouted(self, k):
+        """The ``(routing tensors, tile)`` the model precomputed for this call's top-k, if any.
+
+        A routing method may hold ``presorted = (tensors, tile, topk_ids)`` (Kimi K3.1's routing
+        tail); it is cleared here and used only for the very ``topk_ids`` tensor it was computed
+        for, with MXFP8 activations and a runner that takes it (an unfinalized call, or a
+        finalized one into a new output).
+        """
+        record = getattr(self.routing_method, "presorted", None)
+        if record is None:
+            return None
+        self.routing_method.presorted = None
+        tensors, tile_n, topk_ids = record
+        if (
+            topk_ids is not k.token_selected_experts
+            or (k.do_finalize and k.moe_output is not None)
+            or not getattr(self.op_backend, "supports_prerouted", False)
+            or not isinstance(self.quant_method, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod)
+        ):
+            return None
+        from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import mxfp4_runner_has_prerouted
+
+        if not mxfp4_runner_has_prerouted(finalized=k.do_finalize):
+            return None
+        return tensors, tile_n
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -140,6 +166,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         output1_scale_scalar = get_data_or_none(self, "fc31_scale_c")
         output1_scale_gate_scalar = get_data_or_none(self, "fc31_alpha")
         output2_scale_scalar = get_data_or_none(self, "fc2_alpha")
+        prerouted = self._take_prerouted(k)
 
         outputs = self.op_backend.run_fp4_block_scale_moe(
             k.router_logits,
@@ -179,6 +206,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
+            **({} if prerouted is None else {"prerouted": prerouted}),
         )
 
         if not k.do_finalize:
@@ -290,6 +318,9 @@ class TRTLLMGenW4a16Mxfp4Base(TRTLLMGenFp4BlockScaleBase):
 class TRTLLMGenW4a8Mxfp4Mxfp8Base(TRTLLMGenFp4BlockScaleBase):
     """MXFP4 weights, MXFP8 activations, group-32 block scales."""
 
+    #: ``quantize_input`` takes an ``MxFp8QuantizedTensor`` (row-major scales) as is.
+    accepts_mxfp8_input = True
+
     supports_gptoss_style = True
     # Group size of the ``Bmm_MxE4m3_MxE2m1MxE4m3_..._siTuGlu_*`` cubins; see
     # ``TRTLLMGenNvfp4Base`` on why ``supports_situ`` is not set alongside it.
@@ -304,8 +335,12 @@ class TRTLLMGenW4a8Mxfp4Mxfp8Base(TRTLLMGenFp4BlockScaleBase):
         return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
 
     def quantize_input(
-        self, x: torch.Tensor, post_quant_comm: bool = True
+        self, x: torch.Tensor | MxFp8QuantizedTensor, post_quant_comm: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(x, MxFp8QuantizedTensor):
+            # Quantized by the caller (row-major scales, the layout mxfp8_quantize writes here).
+            assert not x.is_sf_swizzled, "MxFp8QuantizedTensor should not be swizzled"
+            return x.fp8_tensor, x.scaling_factor.view(x.shape[0], -1)
         x, x_sf = self.op_backend.mxfp8_quantize(
             x, False, alignment=self.quant_method.input_hidden_alignment
         )

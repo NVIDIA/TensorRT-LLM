@@ -32,14 +32,28 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.logits_processor import LogitsProcessor
+from ..pyexecutor.input_commit import k31_draft_engine
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
-from .vocab_parallel import tp_pair_exchange
+from .vocab_parallel import markov_chain_tokens, markov_v3_enabled, tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+
+
+def dspark_adp_markov_tokens_enabled() -> bool:
+    """Whether :meth:`DSparkWorker._local_draft_tokens` applies (drafting Kimi K3.1 engines).
+
+    Without a vocab-parallel selection (attention DP), the greedy Markov draft chain reads the
+    drafter's full-vocab LM head output in its own dtype and returns the tokens
+    (markov_chain_tokens) instead of widening it to float32, writing the biased logits and
+    taking a separate argmax. Same tokens.
+    """
+    return k31_draft_engine()
+
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -1249,6 +1263,9 @@ class DSparkWorker(DFlashWorker):
             return self.max_draft_len
         return super()._draft_block_width(draft_model)
 
+    def _draft_first_slot(self, draft_model) -> int:
+        return 0 if getattr(draft_model, "_dspark_shift_label", False) else 1
+
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
     ) -> torch.Tensor:
@@ -1270,10 +1287,52 @@ class DSparkWorker(DFlashWorker):
             return draft_tokens
         return self._markov_block_tokens
 
+    def _local_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
+        """On drafting Kimi K3.1 engines a Markov drafter whose LM head
+        writes the full vocab on this rank (no vocab-parallel selection, e.g. under
+        attention DP) chains the greedy block straight from that output.
+
+        The same conditions as the vocab-parallel draft tokens: the plain logits
+        processor, no d2t map, no LiLiCorr / DFlash 2 selector, no guided decoder
+        or penalties (both edit logits this path never materializes).
+        """
+        if not dspark_adp_markov_tokens_enabled():
+            return None
+        head = getattr(draft_model, "lm_head", None)
+        markov_w1 = getattr(draft_model, "markov_w1", None)
+        if (
+            not getattr(draft_model, "has_markov_head", False)
+            or self._d2t is not None
+            or self.guided_decoder is not None
+            or self.spec_config.enable_penalty
+            or type(getattr(draft_model, "logits_processor", None)) is not LogitsProcessor
+            or getattr(draft_model, "lilicorr", None) is not None
+            or getattr(draft_model, "has_candidate_selector", False)
+            or head is None
+            or getattr(head, "out_features", None) != draft_model.markov_w2.shape[0]
+            or not markov_w1.is_contiguous()
+        ):
+            return None
+        return self._markov_local_tokens
+
+    def _markov_local_tokens(
+        self, draft_model, local_block: torch.Tensor, inputs: dict
+    ) -> torch.Tensor:
+        return markov_chain_tokens(
+            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+        )
+
     def _markov_block_tokens(
         self, draft_model, local_block: torch.Tensor, inputs: dict
     ) -> torch.Tensor:
-        return self._vocab_parallel.head.markov_tokens(
+        head = self._vocab_parallel.head
+        markov = head.markov_tokens
+        if markov_v3_enabled() and head.markov_v3_supported(
+            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+        ):
+            # The chain as one CuTe DSL launch with a per-CTA key exchange.
+            markov = head.markov_tokens_v3
+        return markov(
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 

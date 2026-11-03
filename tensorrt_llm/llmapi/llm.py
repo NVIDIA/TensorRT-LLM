@@ -1037,6 +1037,12 @@ class BaseLLM:
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
+                # Reject per request: a server built without the vision
+                # encoder would otherwise fail the whole batch in forward().
+                if getattr(self.args, "disable_mm_encoder", False):
+                    raise ValueError(
+                        "Multimodal input is not supported: the vision encoder "
+                        "is disabled on this server (disable_mm_encoder).")
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:

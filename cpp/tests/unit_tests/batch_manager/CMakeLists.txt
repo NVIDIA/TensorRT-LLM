@@ -217,6 +217,19 @@ add_tllm_gtest(
   "unit;batch-manager;gpu")
 
 add_tllm_gtest(
+  kvCacheManagerV2VirtMemTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2VirtMemTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu"
+  REQUIRES_GPU)
+
+add_tllm_gtest(
   kvCacheManagerV2HostMemBackingTest
   OWNER
   batch-manager
@@ -263,6 +276,18 @@ add_tllm_gtest(
   $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
   LABELS
   "unit;batch-manager;host")
+
+add_tllm_gtest(
+  kvCacheManagerV2SlotAllocatorEventTest
+  OWNER
+  batch-manager
+  SOURCES
+  kvCacheManagerV2SlotAllocatorEventTest.cpp
+  LINK_LIBRARIES
+  tllm::kv_cache
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_kv_cache_test_support>
+  LABELS
+  "unit;batch-manager;gpu")
 
 add_tllm_gtest(
   kvCacheManagerV2ReentrantSharedMutexTest

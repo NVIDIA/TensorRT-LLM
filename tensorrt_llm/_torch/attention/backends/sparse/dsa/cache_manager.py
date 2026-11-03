@@ -30,11 +30,33 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, SparseAttentionConfig
 
 
+def get_indexer_k_data_bytes_per_token(index_head_dim: int, indexer_k_dtype: str) -> int:
+    """Return the indexer K payload bytes for one token, excluding its scale."""
+    if indexer_k_dtype == "fp4":
+        return index_head_dim // 2
+    if indexer_k_dtype == "bf16":
+        return index_head_dim * 2
+    return index_head_dim
+
+
+def resolve_indexer_k_dtype(kv_cache_manager) -> str:
+    """Return the indexer K dtype of a DSA-compatible cache manager."""
+    indexer_k_dtype = getattr(kv_cache_manager, "indexer_k_dtype", None)
+    if indexer_k_dtype is not None:
+        return indexer_k_dtype
+    # DeepSeek-V4 managers expose only the FP4 flag.
+    return "fp4" if getattr(kv_cache_manager, "use_fp4", False) else "fp8"
+
+
 def _get_indexer_k_cache_bytes_per_token(
-    index_head_dim: int, quant_block_size: int, use_fp4: bool
+    index_head_dim: int, quant_block_size: int, indexer_k_dtype: str
 ) -> int:
-    """Return the raw indexer K-cache footprint for one token."""
-    data_bytes = index_head_dim // 2 if use_fp4 else index_head_dim
+    """Return the raw indexer K-cache footprint for one token.
+
+    Every dtype keeps the 4-byte scale slot so all share one page layout and
+    slot mapping; BF16 keys store a unit scale there that no kernel reads.
+    """
+    data_bytes = get_indexer_k_data_bytes_per_token(index_head_dim, indexer_k_dtype)
     scale_bytes = index_head_dim // quant_block_size * 4
     return data_bytes + scale_bytes
 
@@ -49,7 +71,13 @@ def _resolve_fp8_ds_mla_head_dim(
     # The Python LLM API config owns ``dtype``; direct cache-manager users and
     # older fixtures may still pass the mirrored pybind config, which does not
     # expose Python-only fields.
-    use_fp8_ds_mla = getattr(kv_cache_config, "dtype", "auto") == "fp8_ds_mla"
+    kv_dtype = getattr(kv_cache_config, "dtype", "auto")
+    if kv_dtype == "nvfp4_ds_mla":
+        raise ValueError(
+            "kv_cache_config.dtype='nvfp4_ds_mla' is supported by the Kimi K3.1 KDA + DSA "
+            "hybrid cache manager only."
+        )
+    use_fp8_ds_mla = kv_dtype == "fp8_ds_mla"
     if not use_fp8_ds_mla:
         return False, head_dim
 
@@ -88,9 +116,7 @@ def _get_indexer_k_cache_size_per_token(
         model_config, mapping, num_layers
     )
     bytes_per_layer = _get_indexer_k_cache_bytes_per_token(
-        sparse_params.index_head_dim,
-        128,
-        sparse_params.indexer_k_dtype == "fp4",
+        sparse_params.index_head_dim, 128, sparse_params.indexer_k_dtype
     )
     return num_attention_layers * bytes_per_layer
 
@@ -162,7 +188,13 @@ class DSACacheManager(KVCacheManager):
         # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
         # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
         # allocates the pool with this smaller stride when the flag is set.
-        self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        if sparse_params.indexer_k_dtype == "bf16":
+            raise ValueError(
+                "indexer_k_dtype='bf16' requires the V2 KV cache manager "
+                "(kv_cache_config.use_kv_cache_manager_v2=True)."
+            )
+        self.indexer_k_dtype = sparse_params.indexer_k_dtype
+        self.use_fp4 = self.indexer_k_dtype == "fp4"
         self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
             kv_cache_config, tokens_per_block, head_dim, dtype
         )
@@ -228,7 +260,7 @@ class DSACacheManager(KVCacheManager):
         """Get indexer k cache buffer from a specific layer pool."""
         block_size = self.tokens_per_block
         per_token_size = _get_indexer_k_cache_bytes_per_token(
-            self.index_head_dim, self.quant_block_size, self.use_fp4
+            self.index_head_dim, self.quant_block_size, self.indexer_k_dtype
         )
         layer_offset = self.layer_offsets[layer_idx]
         pool = self.indexer_k_cache_pool_per_layer[layer_offset]
@@ -285,8 +317,9 @@ class DSACacheManager(KVCacheManager):
         # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
         # the scale bytes are unchanged (4 per token, one int32 holding four
         # UE8M0 exponents at quant_block_size=32 after packing).
-        use_fp4 = sparse_params.indexer_k_dtype == "fp4"
-        indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
+        indexer_data_dim = get_indexer_k_data_bytes_per_token(
+            index_head_dim, sparse_params.indexer_k_dtype
+        )
 
         # Get latent KV-cache bytes. NVFP4 stores two values per data byte
         # plus one E4M3 block scale for every 16 values.
@@ -369,7 +402,9 @@ class DSACacheManager(KVCacheManager):
         # the latent above). Under FP4 the indexer data portion is halved (two
         # E2M1 codes per byte); the scale bytes are unchanged. Shared-indexer
         # layers contribute no bytes because they do not own a cache row.
-        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        indexer_data_dim = get_indexer_k_data_bytes_per_token(
+            self.index_head_dim, self.indexer_k_dtype
+        )
         local_mask = self.indexer_k_cache_local_layer_mask
         if local_mask is not None:
             num_indexer_layers = sum(
@@ -426,7 +461,8 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
         self.quant_block_size = 128
         self.index_head_dim = sparse_params.index_head_dim
-        self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
+        self.indexer_k_dtype = sparse_params.indexer_k_dtype
+        self.use_fp4 = self.indexer_k_dtype == "fp4"
         residual_config = (
             pretrained_config
             if pretrained_config is not None
@@ -612,9 +648,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
         first_head_dim = self.head_dim_per_layer[0]
         first_num_heads = self.num_kv_heads_per_layer[0]
-        if any(head_dim != first_head_dim for head_dim in self.head_dim_per_layer):
+        if any(
+            head_dim != first_head_dim
+            for head_dim in self.head_dim_per_layer[: self.num_local_layers]
+        ):
             raise ValueError("DSA requires a uniform KV head dimension")
-        if any(num_heads != first_num_heads for num_heads in self.num_kv_heads_per_layer):
+        if any(
+            num_heads != first_num_heads
+            for num_heads in self.num_kv_heads_per_layer[: self.num_local_layers]
+        ):
             raise ValueError("DSA requires a uniform KV head count")
 
         first_converter = self.impl.get_page_index_converter(0, Role.KEY)
@@ -657,13 +699,22 @@ class DSACacheManagerV2(KVCacheManagerV2):
         )
         return self._unique_primary_pool
 
+    def _append_standalone_draft_layers(self, config, **kwargs):
+        # DSA masks and fused primary views describe target layers only.
+        return super()._append_standalone_draft_layers(
+            config, register_model_layers=False, **kwargs
+        )
+
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         if data_role == Role.INDEX_KEY:
             return _get_indexer_k_cache_bytes_per_token(
-                self.index_head_dim, self.quant_block_size, self.use_fp4
+                self.index_head_dim, self.quant_block_size, self.indexer_k_dtype
             )
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype == DataType.NVFP4 and self.mla_kv_cache_residual_dim > 0:
+        if (
+            self.dtype_per_layer[local_layer_idx] == DataType.NVFP4
+            and self.mla_kv_cache_residual_dim > 0
+        ):
             if data_role == Role.KEY:
                 cache_bytes += self.mla_kv_cache_residual_dim // 2
             elif data_role == Role.KEY_BLOCK_SCALE:
@@ -673,12 +724,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 cache_bytes += self.mla_kv_cache_residual_dim // 16
         if (
             data_role == Role.ALL
+            and local_layer_idx < self.num_local_layers
             and self._indexer_k_cache_layer_mask[self.pp_layers[local_layer_idx]]
         ):
             cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
         return cache_bytes
 
     def get_cache_bytes_per_token(self) -> int:
+        if self._draft_layer_sizes:
+            return super().get_cache_bytes_per_token()
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
             for local_layer_idx in range(self.num_local_layers)
@@ -709,6 +763,30 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 model_config, mapping, num_layers
             )
             cache_bytes += num_attention_layers * (residual_dim // 2 + math.ceil(residual_dim / 16))
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+            _estimate_draft_cache_size_components,
+            _get_draft_layer_sizes,
+            _get_generation_kv_capacity,
+        )
+
+        draft_sizes = _get_draft_layer_sizes(**kwargs)
+        if draft_sizes:
+            scratch = kwargs.get("draft_scratch_tokens", 0)
+            _, headroom = _get_generation_kv_capacity(kwargs.get("spec_config"), is_draft=False)
+            context, generation, fixed = _estimate_draft_cache_size_components(
+                draft_sizes,
+                kwargs["tokens_per_block"],
+                scratch_tokens=scratch,
+                window_size=kwargs.get("draft_window_size"),
+                generation_capacity_headroom=headroom + scratch,
+                helix_cp_size=mapping.cp_size if mapping.has_cp_helix() else 1,
+            )
+            fixed += scratch * cache_bytes
+            return (
+                cache_bytes + generation,
+                fixed * int(kwargs.get("max_batch_size") or 0)
+                + (context - generation) * int(kwargs.get("max_num_tokens") or 0),
+            )
         return cache_bytes
 
     def shutdown(self) -> None:
@@ -718,5 +796,11 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
 
 def is_dsa_cache_manager(cache_manager: object) -> bool:
-    """Return whether a manager uses native DSA indexer page mapping."""
-    return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2))
+    """Return whether a manager uses native DSA indexer page mapping.
+
+    Besides the DSA managers, a hybrid manager that implements the same
+    indexer K-cache accessors opts in with ``provides_dsa_indexer_k_cache``.
+    """
+    return isinstance(cache_manager, (DSACacheManager, DSACacheManagerV2)) or getattr(
+        cache_manager, "provides_dsa_indexer_k_cache", False
+    )

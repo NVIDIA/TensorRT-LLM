@@ -12,6 +12,9 @@ flat ``KimiK3VisionConfig`` as ``vision_config``.
 (architectures ``KimiK3ForConditionalGeneration``) when the checkpoint ships both
 ``text_config`` and ``vision_config`` and multimodal is not disabled; otherwise
 it flattens to the text config (``KimiLinearForCausalLM``) as before.
+
+Kimi K3.1 checkpoints (``kimi_k31``, ``KimiK31ForConditionalGeneration``) use
+the same composite layout; only their text config adds a ``dsa_config``.
 """
 
 from typing import Optional, Union
@@ -19,6 +22,14 @@ from typing import Optional, Union
 from transformers.configuration_utils import PretrainedConfig
 
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
+
+# Composite (text + vision) Kimi K3-family model types and the architecture
+# each one routes to.
+KIMI_K3_COMPOSITE_ARCHITECTURES = {
+    "kimi_k3": "KimiK3ForConditionalGeneration",
+    "kimi_k31": "KimiK31ForConditionalGeneration",
+}
+KIMI_K3_COMPOSITE_MODEL_TYPES = tuple(KIMI_K3_COMPOSITE_ARCHITECTURES)
 
 
 class KimiK3VisionConfig(PretrainedConfig):
@@ -142,3 +153,22 @@ class KimiK3Config(PretrainedConfig):
             self.quantization_config = self.text_config.quantization_config
 
         super().__init__(pad_token_id=pad_token_id, **kwargs)
+
+
+class KimiK31Config(KimiK3Config):
+    """Top-level composite config for the Kimi K3.1 multimodal model.
+
+    Same layout as :class:`KimiK3Config`; the nested text config additionally
+    carries ``dsa_config`` for the sparse-attention indexer of its MLA layers,
+    and keeps the KDA ``A_log`` / ``dt_bias`` in fp32 (``kda_fp32_gate_params``).
+    """
+
+    model_type = "kimi_k31"
+
+    def __init__(self, **kwargs):
+        # transformers turns a config subclass without its own __init__ into a
+        # dataclass with a generated __init__, which would skip the sub-config
+        # construction in KimiK3Config.__init__.
+        super().__init__(**kwargs)
+        if self.text_config is not None:
+            self.text_config.kda_fp32_gate_params = True

@@ -57,6 +57,7 @@ DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIO
 AggregatedPageDesc = _cpp.AggregatedPageDesc
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 AttentionReusePolicy = _cpp.AttentionReusePolicy
+CacheDomain = _cpp.CacheDomain
 AttnLifeCycle = _cpp.AttnLifeCycle
 BatchDesc = _cpp.BatchDesc
 # BatchDesc is also consumed via dataclasses.replace(): MambaCacheManager's
@@ -223,6 +224,7 @@ __all__ = [
     "BeamIndex",
     "BufferConfig",
     "BufferId",
+    "CacheDomain",
     "CoalescedBuffer",
     "CacheLevel",
     "CacheTier",

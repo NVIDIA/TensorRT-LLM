@@ -82,7 +82,8 @@ def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
     """Build a temporary checkpoint dir truncated to the first N layers.
 
     The doctored ``config.json`` sets ``num_hidden_layers`` and filters the
-    1-indexed ``linear_attn_config`` layer schedules consistently; every
+    1-indexed ``linear_attn_config`` layer schedules (and the K3.1
+    ``dsa_config.dsa_layers`` schedule, when present) consistently; every
     other file (tokenizer, index, weight shards) is symlinked. Extra
     checkpoint layers are ignored at load time, so the full shard set can
     stay in place.
@@ -103,6 +104,10 @@ def _truncated_checkpoint(ckpt: str, num_layers: int) -> str:
     lin["kda_layers"] = [n for n in lin["kda_layers"] if n <= num_layers]
     lin["full_attn_layers"] = [n for n in lin["full_attn_layers"] if n <= num_layers]
     text["linear_attn_config"] = lin
+    if text.get("dsa_config") is not None:
+        dsa = dict(text["dsa_config"])
+        dsa["dsa_layers"] = [n for n in dsa["dsa_layers"] if n <= num_layers]
+        text["dsa_config"] = dsa
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(config, f)
     for entry in os.scandir(ckpt):

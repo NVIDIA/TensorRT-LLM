@@ -154,8 +154,9 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
     S = W - 1 + M
 
     def _conv_cache(section):
-        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.float32).transpose(-1, -2)
-        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d].float()
+        # Raw bf16 projection inputs, dim-contiguous.
+        cache = torch.zeros(B, S, d, device="cuda", dtype=torch.bfloat16).transpose(-1, -2)
+        cache[:, :, : W - 1] = conv_pool[:, section * d : (section + 1) * d]
         return cache
 
     return SimpleNamespace(
@@ -492,6 +493,67 @@ def test_fused_verify_falls_back_without_output_norm_weights():
     assert _rep("fallback vs fused epilogue", fallback_out, fused_out)
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
+    """A verify grid of more (head, request) tiles than SMs runs the two-CTAs-per-SM kernel, with
+    bitwise the outputs, state and replay caches of ``kda_decode_mtp_kernel``, over two rounds
+    with mixed acceptance."""
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops as mtp_ops
+
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = num_sms // H + 4
+    steps = M + 1
+    runtime = _make_runtime(seed=1)
+    runtime.finalize_decode_weights()
+    conv_pool, ssm_pool = _make_pools(batch, seed=2)
+    cache = _make_fused_layer_cache(batch, conv_pool)
+    worlds = []
+    for _ in range(2):
+        worlds.append(
+            (
+                ssm_pool.to(state_dtype, copy=True),
+                SimpleNamespace(
+                    **{
+                        key: value.clone() if isinstance(value, torch.Tensor) else value
+                        for key, value in vars(cache).items()
+                    }
+                ),
+            )
+        )
+    select = mtp_ops._select_verify_kernel
+    selected = []
+
+    def v1_reference(**kwargs):
+        selected.append(select(**kwargs))
+        return "v1"
+
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for rnd in range(2):
+        x = (torch.randn(batch * steps, HIDDEN, generator=gen, device="cuda") * 0.5).bfloat16()
+        with monkeypatch.context() as patch:
+            patch.setattr(mtp_ops, "_select_verify_kernel", v1_reference)
+            ref = runtime.forward_verify_fused(x, steps, worlds[0][1], worlds[0][0], slots)
+        out = runtime.forward_verify_fused(x, steps, worlds[1][1], worlds[1][0], slots)
+        assert selected[-1] == "two_cta"
+        assert torch.equal(out, ref), f"round {rnd} out"
+        assert torch.equal(worlds[1][0], worlds[0][0]), f"round {rnd} state"
+        for key in (
+            "kda_conv_q",
+            "kda_conv_k",
+            "kda_conv_v",
+            "kda_k_cache",
+            "kda_g_cache",
+            "kda_v_cache",
+            "kda_beta_cache",
+        ):
+            assert torch.equal(getattr(worlds[1][1], key), getattr(worlds[0][1], key)), key
+        accept = torch.randint(0, M + 1, (batch,), generator=gen, device="cuda", dtype=torch.int32)
+        for _, world_cache in worlds:
+            world_cache.prev_num_accepted_tokens.copy_(accept)
+
+
 class _PrequantizedProjectionStub(torch.nn.Module):
     """o_proj stand-in that records the prequantized pair it receives."""
 
@@ -576,3 +638,156 @@ def test_fused_verify_mxfp8_output_matches_bf16_projection():
     assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
     assert mxfp8_core.scale.dtype is torch.uint8
     assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)
+
+
+def _verify_worlds(batch, k31_flags):
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream  # noqa: F401
+
+    worlds = []
+    for k31 in k31_flags:
+        rt = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
+        rt.finalize_decode_weights()
+        rt._is_k31 = k31
+        conv_pool, ssm_pool = _make_pools(batch, seed=2)
+        worlds.append((rt, conv_pool, ssm_pool, _make_fused_layer_cache(batch, conv_pool)))
+    return worlds
+
+
+def _verify_rounds(worlds, batch, per_world_setup=None):
+    """Three chained verify rounds in every world with the same inputs; returns the cores per round per world."""
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    rounds = []
+    for accept in (
+        [0] * batch,
+        [i % (M + 1) for i in range(batch)],
+        [(i * 7 + 1) % (M + 1) for i in range(batch)],
+    ):
+        x = (torch.randn(batch * (M + 1), HIDDEN, generator=gen, device="cuda") * 0.5).to(
+            torch.bfloat16
+        )
+        outs = []
+        for i, (rt, conv_pool, ssm_pool, cache) in enumerate(worlds):
+            if per_world_setup is not None:
+                per_world_setup(i)
+            with with_multi_stream(True):
+                outs.append(rt.forward_verify(x, M + 1, cache, conv_pool, ssm_pool, slots).clone())
+            cache.prev_num_accepted_tokens[slots.long()] = torch.tensor(
+                accept, dtype=torch.int32, device="cuda"
+            )
+        rounds.append(outs)
+    return rounds
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("batch", [4, 24])
+def test_k31_aux_first_projection_order_bitwise(batch):
+    """Kimi K3.1 issues the [f_a | b] -> f_b chain before the qkvg GEMM above 63 verify rows (24 x 3 = 72 here):
+    the same kernels on the same inputs, so the results are bitwise those of the default order."""
+    worlds = _verify_worlds(batch, (False, True))
+    for outs in _verify_rounds(worlds, batch):
+        assert torch.equal(outs[0], outs[1])
+    for a, b in zip(worlds[0][1:3], worlds[1][1:3]):
+        assert torch.equal(a, b)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("batch", [1, 3, 24])
+def test_k31_verify_rec_matches_default(monkeypatch, batch):
+    """Recurrent verify (``_verify_rec``, Kimi K3.1 only): the fused verify runs kda_verify_rec, whose cores,
+    committed states and conv windows match the tensor-core kernels' to FP32 / BF16 rounding over chained rounds; a
+    K3 runtime keeps the tensor-core kernels."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import kda_verify_rec
+
+    calls = []
+    real = kda_verify_rec.kda_verify_rec
+
+    def _counting(**kwargs):
+        calls.append((kwargs["x_q"].shape[1], kwargs.get("fa") is not None))
+        return real(**kwargs)
+
+    monkeypatch.setattr(kda_verify_rec, "kda_verify_rec", _counting)
+    # world 0: K3 (rec ignored), world 1: K3.1 (rec)
+    worlds = _verify_worlds(batch, (False,))
+    worlds[0][0]._verify_rec = True
+    rt = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
+    rt._is_k31 = True
+    rt._verify_rec = True
+    rt.finalize_decode_weights()
+    conv_pool, ssm_pool = _make_pools(batch, seed=2)
+    worlds.append((rt, conv_pool, ssm_pool, _make_fused_layer_cache(batch, conv_pool)))
+    for outs in _verify_rounds(worlds, batch):
+        assert _rep("rec vs tensor-core core", outs[1], outs[0])
+        torch.testing.assert_close(outs[1].float(), outs[0].float(), atol=3e-2, rtol=2e-2)
+    assert calls == [(batch * (M + 1), False)] * 3
+    torch.testing.assert_close(worlds[1][2], worlds[0][2], atol=1e-4, rtol=1e-4)  # committed states
+    assert torch.equal(worlds[1][3].kda_conv_v, worlds[0][3].kda_conv_v)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("batch", [1, 3, 24])
+def test_k31_verify_rec_fused_fab_route(monkeypatch, batch):
+    """_KDA_VERIFY_REC_FAB_MAX_REQUESTS (with the recurrent verify): batches of up to that many requests take beta and
+    the forget gate from the fused [f_a | b] -> f_b kernel (k3_kda_fab_proj) beside the QKVG GEMM, larger ones the
+    separate projections. The cores, committed states and conv windows match the tensor-core default's to FP32 /
+    BF16 rounding over chained rounds."""
+    from tensorrt_llm._torch.attention.kernels.blackwell.kimi_k3_kda import k3_kda_fab
+    from tensorrt_llm._torch.modules.kimi_kda import kimi_kda_mixer
+
+    cap = kimi_kda_mixer._KDA_VERIFY_REC_FAB_MAX_REQUESTS
+    # world 0: K3 (rec ignored), world 1: K3.1
+    worlds = _verify_worlds(batch, (False, True))
+    for world in worlds:
+        world[0]._verify_rec = True
+    rt = worlds[1][0]
+    if batch <= cap:
+        assert k3_kda_fab.can_use_k3_kda_fab(
+            torch.empty(batch * (M + 1), HIDDEN, dtype=torch.bfloat16, device="cuda"),
+            rt._bfa_proj_weight,
+            rt.f_b_proj.weight,
+            rt.num_heads,
+        )
+    routes = []
+    project_gate_inputs = rt._project_gate_inputs
+
+    def _recording(x, fused_fab=False, fab_fa=False):
+        routes.append((fused_fab, fab_fa))
+        return project_gate_inputs(x, fused_fab=fused_fab, fab_fa=fab_fa)
+
+    monkeypatch.setattr(rt, "_project_gate_inputs", _recording)
+    for outs in _verify_rounds(worlds, batch):
+        assert _rep("rec + fused fab vs tensor-core core", outs[1], outs[0])
+        torch.testing.assert_close(outs[1].float(), outs[0].float(), atol=3e-2, rtol=2e-2)
+    assert routes == [(batch <= cap, False)] * 3
+    torch.testing.assert_close(worlds[1][2], worlds[0][2], atol=1e-4, rtol=1e-4)  # committed states
+    assert torch.equal(worlds[1][3].kda_conv_v, worlds[0][3].kda_conv_v)
+
+
+@torch.no_grad()
+def test_k31_verify_rec_writes_the_core_in_place():
+    """With a caller buffer (the breakable-CUDA-graph core), kda_verify_rec writes the core into it (no copy) and
+    returns it; the values equal the unbuffered call's."""
+    batch = 4
+    cores = []
+    for buffered in (False, True):
+        rt = _make_runtime(seed=1, aux_stream=torch.cuda.Stream())
+        rt._is_k31 = True
+        rt._verify_rec = True
+        rt.finalize_decode_weights()
+        x = (
+            torch.randn(
+                batch * (M + 1),
+                HIDDEN,
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(4),
+            )
+            * 0.5
+        ).to(torch.bfloat16)
+        output = x.new_empty(batch * (M + 1), H, K) if buffered else None
+        core = _run_one_verify_round(rt, x, batch, seed=6, output=output)
+        if buffered:
+            assert core is output
+        cores.append(core.clone())
+    assert torch.equal(cores[0].reshape(cores[1].shape), cores[1])

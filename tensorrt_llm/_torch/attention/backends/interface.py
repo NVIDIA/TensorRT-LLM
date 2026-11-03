@@ -95,6 +95,8 @@ class AttentionMetadata:
     enable_context_mla_with_cached_kv: bool = False
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
+    # Whether this metadata is being used by a warmup forward.
+    is_warmup: bool = field(default=False, repr=False)
 
     # The length of each sequence in the batch for query.
     # The shape is (batch_size), and located on CPU memory.

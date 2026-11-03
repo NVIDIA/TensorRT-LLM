@@ -19,20 +19,50 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <unistd.h>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace
+{
+
+//! Bytes kGpuChunkSizeEnvVar asks for, or 0 when it is unset or empty.
+size_t requestedGpuChunkBytes()
+{
+    char const* const value = std::getenv(kGpuChunkSizeEnvVar);
+    if (value == nullptr || *value == '\0')
+    {
+        return 0;
+    }
+    std::string_view const text(value);
+    bool const digitsOnly = std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+    errno = 0;
+    unsigned long long const mib = digitsOnly ? std::strtoull(value, nullptr, 10) : 0;
+    constexpr unsigned long long kMaxMib = std::numeric_limits<size_t>::max() >> 20;
+    if (!digitsOnly || errno == ERANGE || mib > kMaxMib)
+    {
+        throw std::invalid_argument(
+            std::string(kGpuChunkSizeEnvVar) + " must be a non-negative integer number of MiB, got '" + value + "'");
+    }
+    return static_cast<size_t>(mib) << 20;
+}
+
+} // namespace
 
 size_t tierAllocationGranularity(CacheTier tier, size_t quota)
 {
@@ -49,6 +79,17 @@ size_t tierAllocationGranularity(CacheTier tier, size_t quota)
     case CacheTier::DISK: return kDiskPoolSizeGranularity;
     default: throw std::invalid_argument("Invalid cache tier");
     }
+}
+
+size_t gpuMaxChunkSize(size_t unit)
+{
+    size_t const requested = requestedGpuChunkBytes();
+    if (requested <= unit)
+    {
+        return unit;
+    }
+    // unit is a power of two (tierAllocationGranularity), so this is unit << k.
+    return std::bit_floor(requested);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +150,16 @@ Slot SlotAllocator::allocate()
     {
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
-    scrubEvents();
+    // Query recycled-slot events only when no recycled slot is already known to be ready.
+    if (mNumReadyRecycledSlots == 0)
+    {
+        scrubEvents();
+    }
+    return takeSlot();
+}
 
+Slot SlotAllocator::takeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -145,11 +194,18 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     {
         throw OutOfPagesError("SlotAllocator: not enough free slots");
     }
+    // One readiness scan for the whole call. The head of the recycled queue is usually still in
+    // flight and shares its event with the slots behind it, so querying it again for every slot
+    // only repeats the same driver call.
+    if (mNumReadyRecycledSlots < numSlots)
+    {
+        scrubEvents();
+    }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeSlot());
     }
     return result;
 }
@@ -177,7 +233,10 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // A request close releases every page it holds while the step that last read them is
+    // usually still running, so a driver query here would almost always find the head slot
+    // not ready. Only count slots whose event is already closed; allocation queries the rest.
+    scrubClosedEvents();
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -315,6 +374,21 @@ void SlotAllocator::scrubEvents()
     }
 }
 
+void SlotAllocator::scrubClosedEvents() noexcept
+{
+    for (size_t i = slotCountToSizeT(mNumReadyRecycledSlots); i < mRecycledSlots.size(); ++i)
+    {
+        if (mRecycledSlots[i].readyEvent.isClosed())
+        {
+            ++mNumReadyRecycledSlots;
+        }
+        else
+        {
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GpuSlotPool
 // ---------------------------------------------------------------------------
@@ -340,7 +414,7 @@ SlotCount GpuSlotPool::computeNumSlots(size_t slotSize, size_t numPhysMem, size_
 
 SlotCount GpuSlotPool::numSlots() const noexcept
 {
-    return computeNumSlots(mSlotSize, mVirtMem.numPhysMem(), mVirtMem.physMemSize());
+    return slotCountValueFromSize(mVirtMem.usableBytes() / mSlotSize);
 }
 
 void GpuSlotPool::destroy()

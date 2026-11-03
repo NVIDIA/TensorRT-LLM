@@ -139,6 +139,50 @@ def test_graph_capture_with_aux_outputs() -> None:
         torch.testing.assert_close(out, x * 2 + (x + 1) + (x - 1) + x * 3)
 
 
+@pytest.mark.parametrize("graphed", [False, True])
+@pytest.mark.parametrize("aux_first", [False, True])
+def test_aux_first_issue_order(aux_first: bool, graphed: bool) -> None:
+    """aux_first issues fn1 on aux_stream before fn0; the results do not change."""
+    aux_stream = torch.cuda.Stream()
+    event0, event1 = torch.cuda.Event(), torch.cuda.Event()
+    x = torch.randn(4096, device="cuda")
+    calls = []
+
+    def fn0():
+        calls.append("fn0")
+        return x * 2
+
+    def fn1():
+        calls.append("fn1")
+        return x + 1
+
+    def run():
+        # The outputs stay referenced: dropping fn1's output inside a capture is a separate case.
+        r0, r1 = maybe_execute_in_parallel(
+            fn0, fn1, event0, event1, aux_stream, aux_first=aux_first
+        )
+        return r0, r1, r0 + r1
+
+    with with_multi_stream(True):
+        if graphed:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                run()
+            torch.cuda.current_stream().wait_stream(side)
+            calls.clear()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                r0, r1, out = run()
+            x.copy_(torch.randn_like(x))
+            graph.replay()
+        else:
+            r0, r1, out = run()
+    torch.cuda.synchronize()
+    assert calls == (["fn1", "fn0"] if aux_first else ["fn0", "fn1"])
+    torch.testing.assert_close(out, x * 2 + (x + 1))
+
+
 def test_aux_outputs_dropped_inside_graph_capture() -> None:
     layers, numel = 8, 1 << 20
     aux_stream = torch.cuda.Stream()

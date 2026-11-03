@@ -15,6 +15,7 @@ import importlib.util
 import inspect
 import json
 import os
+from types import MethodType
 
 import pytest
 import torch
@@ -309,7 +310,9 @@ def test_kimi_linear_model_threads_spec_metadata():
     # (previously it was silently swallowed by **kwargs).
     params = inspect.signature(KimiLinearModel.forward).parameters
     assert "spec_metadata" in params
-    src = inspect.getsource(KimiLinearModel.forward)
+    # forward hands it to the layer loop (_forward_layers), which runs the taps.
+    assert "spec_metadata" in inspect.signature(KimiLinearModel._forward_layers).parameters
+    src = inspect.getsource(KimiLinearModel._forward_layers)
     assert "maybe_capture_hidden_states" in src
 
 
@@ -433,7 +436,11 @@ def test_capture_taps_the_next_layers_aggregated_stream():
         num_attn_res_snapshots=num_layers,
         helix_a2a=None,
         helix_a2a_first_layer=num_layers,
+        # KimiLinearModel.__init__ defaults: no L2 prefetch, no sequence-parallel prefill.
+        _l2pf=None,
+        _seq_parallel=False,
     )
+    fake._forward_layers = MethodType(KimiLinearModel._forward_layers, fake)
 
     KimiLinearModel.forward(
         fake,
@@ -516,6 +523,12 @@ def test_aux_capture_taps_the_selected_stream(monkeypatch, aggregated):
         is_moe=False,
         token_sliced=False,
         mlp=lambda h: torch.zeros_like(h),
+        # KimiLinearDecoderLayer default: no L2 prefetch.
+        _l2pf=None,
+    )
+    # The layer taps through its own helper; bind the real one.
+    layer._capture_hidden_states = MethodType(
+        mkl.KimiLinearDecoderLayer._capture_hidden_states, layer
     )
     spec_md = SimpleNamespace(
         maybe_capture_hidden_states=lambda lid, h, r: seen.__setitem__(lid, h.clone())
@@ -596,7 +609,11 @@ def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
         num_attn_res_snapshots=num_layers,
         helix_a2a=None,
         helix_a2a_first_layer=num_layers,
+        # KimiLinearModel.__init__ defaults: no L2 prefetch, no sequence-parallel prefill.
+        _l2pf=None,
+        _seq_parallel=False,
     )
+    fake._forward_layers = MethodType(mkl.KimiLinearModel._forward_layers, fake)
 
     mkl.KimiLinearModel.forward(
         fake,

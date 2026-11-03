@@ -411,6 +411,102 @@ def test_cute_dsl_fp8_paged_mqa_logits_kernel_split(
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("next_n", [6, 8])
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("avg_ctx", [4096, 40000])
+def test_cute_dsl_fp8_paged_mqa_logits_single_atom_bitwise(next_n, batch_size, avg_ctx):
+    """One in-kernel atom of a whole verify window (32 heads, next_n * heads <= 256) is bitwise identical to the
+    split the indexer metadata picks with FP8 atoms (1, 2, 3, 4): the in-kernel uneven split or the caller-side
+    expand. The indexer runs these windows as one atom (KV read once instead of once per atom)."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
+        _atom_ctx_offsets,
+        _pick_dsl_split,
+    )
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    num_heads, head_dim, block_kv = 32, 128, 64
+    max_model_len = avg_ctx * 2
+    data = _generate_test_data(
+        batch_size, next_n, num_heads, head_dim, block_kv, avg_ctx, max_model_len, fix_length=False
+    )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    ctx = data["context_lens"]
+    q, kv, w, bt = data["q_fp8"], data["kv_fused"], data["weights"], data["block_table"]
+
+    single = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+        q,
+        kv,
+        w,
+        ctx,
+        bt,
+        get_paged_mqa_logits_metadata(ctx.view(-1, 1), 64, num_sms),
+        max_model_len,
+    ).clone()
+
+    # Force a split so every next_n compares against both split forms.
+    for factor, atom, num_atoms in {
+        _pick_dsl_split(next_n, num_sms, batch_size, int(ctx.max()), (1, 2, 3, 4)),
+        (1, -(-next_n // 2), 2),
+    }:
+        if num_atoms > 1:
+            offsets = torch.tensor(
+                _atom_ctx_offsets(next_n, num_atoms), dtype=torch.int32, device="cuda"
+            )
+            sched = get_paged_mqa_logits_metadata(
+                (ctx.unsqueeze(1) - offsets).reshape(-1, 1), 64, num_sms
+            )
+            split = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                q, kv, w, ctx, bt, sched, max_model_len, num_next_n_atoms=num_atoms, atom=atom
+            )
+        else:
+            ctx_x = ctx.repeat_interleave(factor).contiguous()
+            split = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+                q.reshape(batch_size * factor, atom, num_heads, head_dim),
+                kv,
+                w,
+                ctx_x,
+                bt.repeat_interleave(factor, dim=0).contiguous(),
+                get_paged_mqa_logits_metadata(ctx_x.view(-1, 1), 64, num_sms),
+                max_model_len,
+            )
+        rows = torch.arange(batch_size * next_n, device="cuda")
+        valid = torch.arange(max_model_len, device="cuda").unsqueeze(0) < ctx[
+            rows // next_n
+        ].unsqueeze(1)
+        a = single.masked_fill(~valid, 0).view(torch.int32)
+        b = split.masked_fill(~valid, 0).view(torch.int32)
+        assert torch.equal(a, b), f"factor={factor} atom={atom} num_atoms={num_atoms}"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_heads,next_n", [(32, 7)], ids=["h32_n7"])
+@pytest.mark.parametrize("batch_size", [1, 16])
+def test_cute_dsl_fp8_paged_mqa_logits_kv_evict_first_bitwise(num_heads, next_n, batch_size):
+    """The L2 evict-first hint on the K-cache loads only changes cache retention: the logits are bitwise identical."""
+    from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata
+
+    head_dim, block_kv, avg_ctx = 128, 64, 20000
+    max_model_len = avg_ctx * 2
+    data = _generate_test_data(
+        batch_size, next_n, num_heads, head_dim, block_kv, avg_ctx, max_model_len, fix_length=False
+    )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    ctx = data["context_lens"]
+    sched = get_paged_mqa_logits_metadata(ctx.view(-1, 1), 64, num_sms)
+    args = (data["q_fp8"], data["kv_fused"], data["weights"], ctx, data["block_table"], sched)
+    plain = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(*args, max_model_len).clone()
+    hinted = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
+        *args, max_model_len, kv_evict_first=True
+    )
+    row_ctx = ctx[torch.arange(batch_size * next_n, device="cuda") // next_n]
+    valid = torch.arange(max_model_len, device="cuda").unsqueeze(0) < row_ctx.unsqueeze(1)
+    assert torch.equal(
+        plain.masked_fill(~valid, 0).view(torch.int32),
+        hinted.masked_fill(~valid, 0).view(torch.int32),
+    )
+
+
+@skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])

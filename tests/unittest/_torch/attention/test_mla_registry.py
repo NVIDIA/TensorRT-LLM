@@ -147,13 +147,14 @@ def test_output_gate_runs_between_attention_and_output_projection(
     torch.testing.assert_close(output, torch.full((2, 4), 10.0))
 
 
-def test_output_gate_override_rejected_with_sparse_hooks() -> None:
-    class _GatedMLA(MLA):
-        def _apply_output_gate(
-            self, hidden_states: torch.Tensor, attn_output: torch.Tensor
-        ) -> torch.Tensor:
-            return attn_output * 2.0
+class _GatedMLA(MLA):
+    def _apply_output_gate(
+        self, hidden_states: torch.Tensor, attn_output: torch.Tensor
+    ) -> torch.Tensor:
+        return attn_output * 2.0
 
+
+def test_output_gate_override_rejected_with_output_owning_sparse_hooks() -> None:
     config = ModelConfig(skip_create_weights_in_init=True)
     with (
         patch(
@@ -162,11 +163,33 @@ def test_output_gate_override_rejected_with_sparse_hooks() -> None:
         ),
         patch(
             "tensorrt_llm._torch.attention.mla.get_sparse_mla_hooks",
-            return_value=Mock(),
+            return_value=Mock(uses_default_output=False),
         ),
         pytest.raises(NotImplementedError, match="_apply_output_gate"),
     ):
         _make_mla(config, cls=_GatedMLA)
+
+
+def test_output_gate_override_accepted_with_default_output_sparse_hooks() -> None:
+    config = ModelConfig(skip_create_weights_in_init=True)
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.mla.create_attention",
+            side_effect=lambda *args, **kwargs: _FakeAttention(),
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.mla.get_sparse_mla_hooks",
+            return_value=Mock(uses_default_output=True),
+        ),
+    ):
+        mla_layer = _make_mla(config, cls=_GatedMLA)
+    assert isinstance(mla_layer, _GatedMLA)
+
+
+def test_dsa_hooks_keep_default_output() -> None:
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.module import DSAHooks
+
+    assert DSAHooks().uses_default_output
 
 
 def test_duplicate_layer_ids_preserve_all_mla_registrations() -> None:

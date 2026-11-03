@@ -16,6 +16,10 @@ class SeqSlotManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         return 1
 
+    def num_free_slots(self) -> int:
+        """Number of sequence slots no request holds."""
+        return len(self.slot_manager.free_slots)
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         for llm_req in scheduled_batch.all_requests():
             if llm_req.is_disagg_generation_init_state:

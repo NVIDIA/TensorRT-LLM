@@ -86,6 +86,7 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         is_cuda_graph=False,
         is_ragged_verify=False,
         ragged_row_kv_lens=Mock(return_value=None),
+        helix_spec_row_kv_lens=Mock(return_value=None),
         get_empty=lambda buffers, shape, **kwargs: torch.full(shape, -1, dtype=torch.int32),
         skip_indexer_for_ctx_reqs=False,
         skip_indexer_for_gen_reqs=False,
@@ -102,6 +103,9 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         kv_lens_cuda_runtime=torch.full((num_contexts + num_generations,), 16),
         gen_indexer_kv_lens_cuda_runtime=torch.full((num_generations,), 16),
         kv_lens_row_reorder=None,
+        enable_helix=False,
+        in_mtp_draft_loop=False,
+        indexer_share_plan=None,
         # The native CUDA Radix decode path asserts the caller-owned aux
         # workspaces are present before handing them to TopK.
         radix_aux_indices=torch.empty(
@@ -137,7 +141,10 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         extra: dict[str, torch.Tensor | None] | None,
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
+        paged_remap: tuple | None = None,
     ) -> torch.Tensor:
+        # The paged-pool remap in the Top-K (Indexer.gvr_paged_remap) stays off here.
+        assert paged_remap is None
         # Without a prior the indexer hands TopK no GVR kwargs at all, so the
         # dict itself is absent rather than carrying a ``None`` entry.
         prior = extra["gvr_prior_indices"] if extra is not None else None
@@ -171,10 +178,17 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         use_gvr_emission=False,
         mtp_index_share=False,
         use_fp4=False,
+        use_bf16=False,
+        # Indexer.__init__ value for non-FP4 index keys: the prefill logits
+        # keep the default (non-BF16-reduce) epilogue.
+        bf16_prefill_logits=False,
         use_cute_dsl_paged_mqa_logits=False,
+        gvr_paged_remap=False,
         _call_mqa_logits=logits,
         _call_paged_mqa_logits=Mock(return_value=torch.ones((num_gen_tokens, 16))),
         aux_stream=None,
+        # The key-sharded decode indexer stays off here.
+        _key_shard_ready=lambda *args: False,
     )
     indexer.forward_prepared = MethodType(Indexer.forward_prepared, indexer)
     with (

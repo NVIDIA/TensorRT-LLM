@@ -41,7 +41,8 @@ def test_topk_flags_initialized_before_buffer_allocation(
     )
     metadata.is_cuda_graph = False
     enabled = enable_heuristic and sm_version >= 100
-    self_sampling_supported = enabled and dsl_available and sm_version in (100, 103)
+    # use_self_sampling_gvr: datacenter Blackwell and Rubin.
+    self_sampling_supported = enabled and dsl_available and sm_version in (100, 103, 107)
     temporal_supported = enabled and dsl_available and sm_version in (100, 103)
 
     def check_flags(*, capture_graph: bool) -> None:

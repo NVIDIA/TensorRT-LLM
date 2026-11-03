@@ -99,6 +99,21 @@ class MLASparseHooks(ABC):
         """Return an algorithm-specific projection, or ``None`` for the default."""
         return None
 
+    @property
+    def uses_default_output(self) -> bool:
+        """Whether ``attn_output[0]`` stays the input of MLA's default ``o_proj``.
+
+        True when the algorithm keeps the shared output allocation and output
+        projection, so module-level transforms of that tensor (for example an
+        output gate) still compose.
+        """
+        hooks_cls = type(self)
+        return (
+            self.need_default_o_proj
+            and hooks_cls.prepare_outputs is MLASparseHooks.prepare_outputs
+            and hooks_cls.project_output is MLASparseHooks.project_output
+        )
+
 
 class AttentionSparseHooks:
     """Typed module-layer adapter for a sparse Attention algorithm."""

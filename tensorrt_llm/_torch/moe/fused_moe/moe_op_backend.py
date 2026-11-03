@@ -72,6 +72,11 @@ class MoEOpBackend:
     Subclasses register themselves using the @register_op_backend decorator.
     """
 
+    #: ``run_fp4_block_scale_moe`` takes ``prerouted`` (MXFP4 x MXFP8 runner)
+    #: when the native runner has ``run_moe_unfinalized_prerouted`` (and, for
+    #: a finalized call into a new output, ``run_moe_prerouted``).
+    supports_prerouted = False
+
     # ==================== Quantization Operations ====================
 
     def fp4_quantize(
@@ -170,8 +175,14 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        prerouted: Optional[Tuple[List[torch.Tensor], int]] = None,
     ) -> List[torch.Tensor]:
-        """Run FP4 block scale MoE computation."""
+        """Run FP4 block scale MoE computation.
+
+        ``prerouted``: ``(routing tensors, tile)`` the caller computed for
+        ``topk_ids`` (see ``trtllm::mxe4m3_mxe2m1_block_scale_moe_runner_prerouted``);
+        only backends whose ``supports_prerouted`` is true take it.
+        """
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -208,6 +219,8 @@ class MoEOpBackend:
 @register_op_backend("trtllm")
 class TRTLLMOpBackend(MoEOpBackend):
     """TRTLLM native op backend implementation."""
+
+    supports_prerouted = True
 
     def __init__(self):
         from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
@@ -338,6 +351,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -459,6 +473,118 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
+                if do_finalize and prerouted is not None and output is None:
+                    routed, tile_n = prerouted
+                    return (
+                        torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_prerouted_finalized(
+                            router_logits,
+                            routing_bias,
+                            hidden_states,
+                            hidden_states_scale,
+                            gemm1_weights,
+                            gemm1_weights_scale,
+                            gemm1_bias,
+                            gemm1_alpha,
+                            gemm1_beta,
+                            gemm1_clamp_limit,
+                            gemm2_weights,
+                            gemm2_weights_scale,
+                            gemm2_bias,
+                            num_experts,
+                            top_k,
+                            n_group,
+                            topk_group,
+                            intermediate_size,
+                            valid_hidden_size,
+                            valid_intermediate_size,
+                            local_expert_offset,
+                            local_num_experts,
+                            routed_scaling_factor,
+                            routing_method_type,
+                            gated_act_type,
+                            topk_weights,
+                            topk_ids,
+                            routed,
+                            tile_n,
+                            tune_max_num_tokens=tune_max_num_tokens,
+                            use_dp=use_dp,
+                        )
+                    )
+                if not do_finalize and prerouted is not None:
+                    routed, tile_n = prerouted
+                    rows, _ = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_prerouted(
+                        router_logits,
+                        routing_bias,
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        num_experts,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size,
+                        valid_hidden_size,
+                        valid_intermediate_size,
+                        local_expert_offset,
+                        local_num_experts,
+                        routed_scaling_factor,
+                        routing_method_type,
+                        gated_act_type,
+                        topk_weights,
+                        topk_ids,
+                        routed,
+                        tile_n,
+                        tune_max_num_tokens=tune_max_num_tokens,
+                        use_dp=use_dp,
+                    )
+                    # routed[0] is the (token, slot) -> row map either way.
+                    return [rows, topk_weights, routed[0]]
+                if not do_finalize:
+                    rows, weights, expanded_idx = (
+                        torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized(
+                            router_logits,
+                            routing_bias,
+                            hidden_states,
+                            hidden_states_scale,
+                            gemm1_weights,
+                            gemm1_weights_scale,
+                            gemm1_bias,
+                            gemm1_alpha,
+                            gemm1_beta,
+                            gemm1_clamp_limit,
+                            gemm2_weights,
+                            gemm2_weights_scale,
+                            gemm2_bias,
+                            num_experts,
+                            top_k,
+                            n_group,
+                            topk_group,
+                            intermediate_size,
+                            valid_hidden_size,
+                            valid_intermediate_size,
+                            local_expert_offset,
+                            local_num_experts,
+                            routed_scaling_factor,
+                            routing_method_type,
+                            gated_act_type,
+                            topk_weights,
+                            topk_ids,
+                            tune_max_num_tokens=tune_max_num_tokens,
+                            use_dp=use_dp,
+                        )
+                    )
+                    # With precomputed routing the op's weight output is unwritten.
+                    if topk_weights is not None:
+                        weights = topk_weights
+                    return [rows, weights, expanded_idx]
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,

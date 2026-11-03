@@ -33,11 +33,18 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import (
+    InputCommit,
+    batched_input_commit_enabled,
+    input_commit_scope,
+    warmup_input_commit_kernels,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import PendingBeamHistories
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
 from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_manager
@@ -46,8 +53,9 @@ from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -204,6 +212,15 @@ class DecoderRunner(ScheduledModelRunner):
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
         self._graphs = self._make_cuda_graphs()
+        # A drafting DSpark / DFlash engine (input_commit.configure_parallel_draft_fusions): the
+        # host-to-device copies of an eligible decode step's input preparation are staged and
+        # written by a few kernels (see input_commit.py and _input_commit_for_step). Arenas:
+        # about five commits per step, three steps ahead.
+        self._input_commit: InputCommit | None = None
+        self._input_commit_ready = False
+        if batched_input_commit_enabled() and prefer_pinned():
+            self._input_commit = InputCommit(num_arenas=16)
+            warmup_input_commit_kernels(self._input_commit)
         self._initialize_moe_workspace_reclaimer()
         self._warmup = DecoderWarmup(
             config=self._config,
@@ -342,7 +359,66 @@ class DecoderRunner(ScheduledModelRunner):
 
     def warmup(self, resource_manager: ResourceManager) -> None:
         self._eager_workspace_reclaimer = None
+        self._input_commit_ready = False
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
+        self._input_commit_ready = True
+
+    def _input_commit_for_step(
+        self,
+        execution_requests: ScheduledRequests,
+        attn_metadata: Any,
+        can_run_graph: bool,
+        promoted_context_ids: frozenset,
+        *,
+        enable_spec_decode: bool,
+        is_dummy: bool,
+        use_lora_graph: bool,
+    ) -> InputCommit | None:
+        """The batched input commit of this step, or None to copy one by one.
+
+        Limited to the preparation path whose device reads of staged buffers were audited (each
+        such read is preceded by ``flush_input_commit``): a CUDA-graph replay of a
+        generation-only batch on a one-model speculative engine with TRT-LLM attention (DSA
+        included), after warmup, without beam search, MRoPE or LoRA. A multimodal model
+        qualifies: generation steps carry no multimodal inputs. Under attention DP the
+        rank-local step qualifies too (the rank-count exchange runs on the host), except an idle
+        rank's dummy step and the remote-tail phases of conditional disaggregation.
+        """
+        if (
+            self._input_commit is None
+            or not self._input_commit_ready
+            or not can_run_graph
+            or is_dummy
+            or not enable_spec_decode
+            or use_lora_graph
+        ):
+            return None
+        config = self._config
+        if config.enable_attention_dp and (
+            execution_requests.is_attention_dp_phase_idle
+            or execution_requests.attention_dp_phase not in (None, RemoteTailPhase.NONE)
+        ):
+            return None
+        if (
+            config.use_mrope
+            or self._use_beam_search
+            or config.spec_config is None
+            or not config.spec_config.spec_dec_mode.use_one_engine()
+        ):
+            return None
+        if (
+            execution_requests.num_context_requests > 0
+            or promoted_context_ids
+            or execution_requests.num_generation_requests == 0
+        ):
+            return None
+        if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+            return None
+        logger.info_once(
+            "[InputCommit] batched input commit active for CUDA-graph generation steps",
+            key="decoder_input_commit_active",
+        )
+        return self._input_commit
 
     def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
         self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
@@ -626,6 +702,15 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
+            input_commit = self._input_commit_for_step(
+                execution_requests,
+                attn_metadata,
+                can_run_graph,
+                execution_promoted_context_ids,
+                enable_spec_decode=enable_spec_decode,
+                is_dummy=is_dummy,
+                use_lora_graph=use_lora_graph,
+            )
             with self._cuda_graph_metadata_prepare_scope(
                 attn_metadata,
                 key,
@@ -633,27 +718,61 @@ class DecoderRunner(ScheduledModelRunner):
                 execution_promoted_context_ids,
                 enable_spec_decode=enable_spec_decode,
             ):
-                prepared = self._inputs.prepare_inputs(
-                    execution_requests,
-                    kv_cache_manager,
-                    attn_metadata,
-                    spec_metadata,
-                    new_tensors_device,
-                    cache_indirection_buffer,
-                    resource_manager,
-                    can_run_graph,
-                    execution_promoted_context_ids,
-                    use_lora_graph=use_lora_graph,
-                    enable_spec_decode=enable_spec_decode,
-                    runtime_draft_len=runtime_draft_len,
-                    is_dummy=is_dummy,
-                    gather_context_logits=gather_context_logits,
-                )
+                if input_commit is not None:
+                    input_commit.begin()
+                try:
+                    with input_commit_scope(input_commit):
+                        prepared = self._inputs.prepare_inputs(
+                            execution_requests,
+                            kv_cache_manager,
+                            attn_metadata,
+                            spec_metadata,
+                            new_tensors_device,
+                            cache_indirection_buffer,
+                            resource_manager,
+                            can_run_graph,
+                            execution_promoted_context_ids,
+                            use_lora_graph=use_lora_graph,
+                            enable_spec_decode=enable_spec_decode,
+                            runtime_draft_len=runtime_draft_len,
+                            is_dummy=is_dummy,
+                            gather_context_logits=gather_context_logits,
+                        )
+                except BaseException:
+                    if input_commit is not None:
+                        input_commit.abort()
+                    raise
+                if input_commit is not None:
+                    input_commit.commit()
             inputs = prepared.kwargs
             runtime_draft_len = prepared.runtime_draft_len
             if execution_promoted_context_ids:
                 self._inputs.record_promoted_iter_states(scheduled_requests)
             self._inputs.record_input_copy()
+            speculative_model = self._get_speculative_model()
+            spec_worker = (
+                getattr(speculative_model, "spec_worker", None)
+                if speculative_model is not None
+                else None
+            )
+            if spec_worker is not None:
+                # The drafter's managed-cache uploads of the step: one more commit.
+                if input_commit is not None:
+                    input_commit.begin()
+                try:
+                    with input_commit_scope(input_commit):
+                        spec_worker.prepare_managed_draft_cache(
+                            speculative_model.draft_model,
+                            spec_metadata,
+                            attn_metadata,
+                            resource_manager,
+                        )
+                except BaseException:
+                    if input_commit is not None:
+                        input_commit.abort()
+                    raise
+                if input_commit is not None:
+                    input_commit.commit()
 
             def run_model(model_inputs: dict[str, Any]) -> Any:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -698,6 +817,19 @@ class DecoderRunner(ScheduledModelRunner):
             if captures_model_body:
                 return outputs
 
+            graph_runner = self._graphs.cuda_graph_runner
+            if (
+                spec_worker is not None
+                and not is_dummy
+                and not (graph_runner is not None and graph_runner.is_warmup_only)
+            ):
+                draft_history_update = spec_worker.snapshot_managed_draft_history()
+                if draft_history_update is not None:
+                    # Graph output dictionaries persist across replays. Each
+                    # overlapped iteration must retain its own host readback.
+                    outputs = dict(outputs)
+                    outputs["draft_history_update"] = draft_history_update
+
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
@@ -707,6 +839,22 @@ class DecoderRunner(ScheduledModelRunner):
                 return outputs
             outputs = self._restore_attention_dp_semantic_outputs(semantic_requests, outputs)
             return {**outputs, "runtime_draft_len": runtime_draft_len}
+
+    def _get_speculative_model(self) -> Any:
+        """Return the one-engine speculative model, including inside a VLM."""
+        if not self._config.is_spec_decode:
+            return None
+        from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+        from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+
+        model = self._model
+        if isinstance(model, MultimodalModelMixin):
+            model = model.language_model
+        if not isinstance(model, SpecDecOneEngineForCausalLM):
+            # Kimi's legacy multimodal wrapper exposes its decoder as llm
+            # without inheriting MultimodalModelMixin.
+            model = getattr(model, "llm", None)
+        return model if isinstance(model, SpecDecOneEngineForCausalLM) else None
 
     @contextmanager
     def _maybe_bypass_torch_compile(self, bypass: bool = False) -> Iterator[None]:
@@ -878,14 +1026,8 @@ class DecoderRunner(ScheduledModelRunner):
             # The spec worker kept the logits vocabulary-sharded (this TP
             # rank's columns). A post-processor sees the whole vocabulary, so
             # gather them first, only when a request has one. Every TP rank
-            # schedules the same requests, so all of them take the gather;
-            # under attention DP they would not.
-            if self._mapping.enable_attention_dp:
-                raise RuntimeError(
-                    "vocabulary-sharded spec-worker logits need every TP rank "
-                    "to schedule the same requests, which attention DP does "
-                    "not"
-                )
+            # schedules the same requests (the vocab-parallel head is never
+            # bound under attention DP), so all of them take the gather.
             if not any(
                 getattr(request, "py_logits_post_processors", None)
                 for request in scheduled_requests.all_requests()

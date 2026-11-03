@@ -68,6 +68,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
@@ -1818,6 +1819,102 @@ def test_session_has_transferring_tasks_false():
         _shutdown_transfer_worker_setup(setup)
 
 
+def _wait_until(predicate, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "schedule_style",
+    [DisaggScheduleStyle.CONTEXT_FIRST, DisaggScheduleStyle.GENERATION_FIRST],
+    ids=["ctx_first", "gen_first"],
+)
+def test_receive_without_context_session_fails_after_sweep(schedule_style):
+    """A receive that no context TxSession will ever serve must end, not hang.
+
+    A context-first generation request whose context KV cache is gone (its
+    TxSession failed and was closed, or the request names a disagg_request_id the
+    context rank never had) leaves its REQUEST_DATA unclaimed on the sender. Once
+    that entry outlives the sweep TTL the sender reports FAILED, so the RxSession
+    fails instead of holding its KV cache and transfer budget forever.
+    Generation-first entries may legitimately stay unclaimed (ADP broadcast) and
+    are only evicted.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+    sender = ctx_transfer_worker._sender
+    sampling_config = tensorrt_llm.bindings.SamplingConfig(
+        SamplingParams(temperature=0)._get_sampling_config()
+    )
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    gen_request = LlmRequest(
+        request_id=600,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sampling_config,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=599,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
+    page_table = gen_transfer_worker._rank_info.page_table
+    block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+    empty_chunk = Chunk(
+        block_ids_per_layer_groups=block_ids_per_groups,
+        kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+        token_range=TokenRange(start=0, end=gen_request.prompt_len),
+        is_last=True,
+    )
+
+    try:
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        rx_session.receive(empty_chunk)
+        assert _wait_until(lambda: sender._get_req_info(unique_rid) is not None)
+        assert rx_session.wait_complete(blocking=False) is None
+
+        # Inside the TTL the sender keeps waiting for a TxSession.
+        ctx_transfer_worker.sweep_stale_req_infos()
+        time.sleep(0.2)
+        assert sender._get_req_info(unique_rid) is not None
+        assert rx_session.wait_complete(blocking=False) is None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            ctx_transfer_worker.sweep_stale_req_infos()
+        assert sender._get_req_info(unique_rid) is None
+        if schedule_style == DisaggScheduleStyle.CONTEXT_FIRST:
+            assert _wait_until(
+                lambda: rx_session.wait_complete(blocking=False) == WaitResult.FAILED
+            )
+            assert rx_session.has_failed()
+        else:
+            time.sleep(0.2)
+            assert rx_session.wait_complete(blocking=False) is None
+        rx_session.close()
+
+        # The same workers keep serving ordinary transfers.
+        add_and_verify_request(setup, 0, 1, setup["request_len"], send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("replay_flags", [None, (False, True), (True, False)])
 def test_incompatible_peer_fails_only_affected_requests(
@@ -2148,6 +2245,55 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         add_and_verify_request(healthy, 0, 1, healthy["request_len"], send_first=True)
     finally:
         _shutdown_transfer_worker_setup(healthy)
+
+
+def test_failed_write_build_reports_failure_to_the_receiver():
+    """A write that cannot be built still gives its receiver a terminal result.
+
+    The receiver waits for one result from every writer it asked. When the
+    sender cannot build the write (here a geometry mismatch), the request
+    must fail at once instead of waiting out its KV transfer timeout.
+    """
+    import queue
+
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = 3
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda name, rank: SimpleNamespace(self_endpoint="gen-endpoint")
+    )
+
+    def _raise(task, info):
+        raise ValueError("Replicated cache region size mismatch: local=18432, peer=24192")
+
+    sender._build_kv_write_meta = _raise
+    task = transfer_mod.KVSendTask(
+        Chunk(
+            block_ids_per_layer_groups=[[0]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=128),
+            is_last=True,
+        ),
+        DisaggregatedParams(disagg_request_id=42),
+        slice_id=0,
+    )
+    task._unique_rid = 42
+    info = SimpleNamespace(instance_name="gen", instance_rank=5, unique_rid=42, slice_id=0)
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        sender._dispatch_task_to_peer(task, info)
+
+    endpoint, message = sender._send_task_queues[0].get_nowait()
+    assert endpoint == "gen-endpoint"
+    assert message[0] == transfer_mod.MessageType.KV_AGENT_RESULT
+    peer_rank, rid, slice_id, is_last, status, size = transfer_mod._KV_RESULT_PREFIX.unpack(
+        message[1]
+    )
+    assert (peer_rank, rid, slice_id, is_last, size) == (3, 42, 0, True, 0)
+    assert status == transfer_mod._AGENT_RESULT_CODE[transfer_mod.AgentResult.FAILED]
+    assert task.status == transfer_mod.TaskStatus.ERROR
 
 
 if __name__ == "__main__":

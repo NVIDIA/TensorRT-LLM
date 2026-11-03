@@ -1519,6 +1519,16 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
         # Must be None: OpenAIServer reads the resource_governor_queue
         # property at init; the governor lives with the launcher only.
         self._resource_governor_queue = None
+        # /start_profile and /stop_profile land on whichever frontend serves
+        # the HTTP request. The inherited handlers need the same profile
+        # control state the launcher builds in GenerationExecutorProxy.__init__:
+        # one owner thread for every profile-related ZMQ operation and an ack
+        # queue bound on first use (its address travels on the request, so the
+        # worker acks this frontend directly).
+        self.profile_ack_queue = None
+        self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"frontend_{frontend_id}_profile_control")
 
         hmac_key = bytes.fromhex(attach_info["hmac_key"])
         self.request_queue = IpcQueue(
@@ -1575,6 +1585,14 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
     def shutdown(self):
         self.pre_shutdown()
+        # Drain any in-flight profile control call before closing its ack
+        # queue (see GenerationExecutorProxy.shutdown).
+        if self._profile_control_executor is not None:
+            self._profile_control_executor.shutdown(wait=True)
+            self._profile_control_executor = None
+        if self.profile_ack_queue is not None:
+            self.profile_ack_queue.close()
+            self.profile_ack_queue = None
         if self.rpc_client is not None:
             self.rpc_client.close()
             self.rpc_client = None

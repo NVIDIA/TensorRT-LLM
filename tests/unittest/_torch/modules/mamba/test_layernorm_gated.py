@@ -307,6 +307,61 @@ class TestRMSNormBasic:
 
         assert torch.equal(outputs[True], outputs[False])
 
+    @pytest.mark.parametrize(
+        "num_tokens,heads,N", [(8192, 96, 128), (1000, 8, 256), (301, 96, 128)]
+    )
+    @pytest.mark.parametrize("save_rstd", [False, True])
+    def test_multirow_tile_loop_is_bitwise_invariant(
+        self, num_tokens: int, heads: int, N: int, save_rstd: bool
+    ) -> None:
+        """Looping a program over several 4-row tiles (prefill-sized launches) must not change any
+        output (or rstd) bit, including the masked tail tiles."""
+        device = "cuda"
+        dtype = torch.bfloat16
+        torch.manual_seed(13)
+        num_rows = num_tokens * heads
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.randn(N, device=device, dtype=dtype) * 0.1 + 1.0
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+
+        outputs = {}
+        for loop in (1, 4, 3):
+            output = torch.empty_like(x)
+            rstd = torch.empty(num_rows, device=device, dtype=torch.float32) if save_rstd else None
+            layernorm_gated._rms_norm_gated_fwd_multirow_kernel[
+                (triton.cdiv(num_rows, layernorm_gated._MULTIROW_ROWS * loop),)
+            ](
+                x,
+                output,
+                weight,
+                z,
+                rstd,
+                None,
+                x.stride(0),
+                output.stride(0),
+                z.stride(0),
+                num_rows,
+                1e-6,
+                N=N,
+                ROWS=layernorm_gated._MULTIROW_ROWS,
+                HEADS_PER_TOK=heads,
+                GATE_SIGMOID=True,
+                WEIGHT_IS_DELTA=False,
+                LAUNCH_WITH_PDL=False,
+                LOOP=loop,
+                num_warps=layernorm_gated._MULTIROW_NUM_WARPS,
+            )
+            outputs[loop] = (output, rstd)
+
+        for loop in (4, 3):
+            assert torch.equal(outputs[loop][0], outputs[1][0])
+            if save_rstd:
+                assert torch.equal(outputs[loop][1], outputs[1][1])
+        # The public op picks the looped grid for this many rows and matches the single-tile launch.
+        got = torch.ops.trtllm.rms_norm_gated_token_major(x, z, weight, 1e-6, None, "sigmoid")
+        assert torch.equal(got, outputs[1][0])
+
 
 @skip_no_cuda
 class TestRMSNormNVFP4:

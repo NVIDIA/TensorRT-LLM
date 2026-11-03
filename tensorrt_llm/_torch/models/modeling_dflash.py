@@ -363,6 +363,10 @@ class DFlashForCausalLM(nn.Module):
     # tests), so the config cap stands.
     _runtime_position_ceiling = None
 
+    # True for a drafter built for a disaggregated context server: it only
+    # stores the context KV and holds no modules for the block decode.
+    context_kv_only = False
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""
@@ -441,6 +445,12 @@ class DFlashForCausalLM(nn.Module):
             finally:
                 pretrained_cfg.architectures = original_archs
 
+        if dflash_attention_backend == "AUTO":
+            dflash_attention_backend = self._resolve_auto_attention_backend()
+        # The drafter's own helix mapping when its context KV is sharded by page; None keeps it
+        # replicated.
+        self._helix_mapping = None
+
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
         # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
@@ -469,8 +479,6 @@ class DFlashForCausalLM(nn.Module):
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
-        if dflash_attention_backend == "AUTO":
-            dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
         self.check_valid_attention_backend(self.dflash_attention_backend)
         # Each backend loads only its own ops; the rest stay None so the
@@ -587,16 +595,20 @@ class DFlashForCausalLM(nn.Module):
         # and validates the managed pool against this, so a drafter that stores
         # a single tensor must override it (see MLADSparkForCausalLM).
         self._kv_factor = 2
-        # The drafter's TP fusions (see _tp_fusions) run under plain
-        # TP: fc keeps only this rank's input features (_project_features),
-        # and a drafter's block decode may fuse its all-reduces with the
-        # residual add and the following RMSNorm.
+        # The drafter's TP fusions (see _tp_fusions) run over o_proj's
+        # all-reduce group: fc keeps only this rank's input features
+        # (_project_features), and a drafter's block decode may fuse its
+        # all-reduces with the residual add and the following RMSNorm. Under
+        # helix ``mapping`` carries the CP split of the context KV, and o_proj
+        # stays row-parallel over the repurposed (CP folded into TP) group.
         mapping = self.model_config.mapping
+        fc_mapping = mapping.repurpose_helix_cp_to_tp() if mapping.has_cp_helix() else mapping
         self._tp_split = (
-            self._tp_fusions and mapping.tp_size > 1 and not mapping.enable_attention_dp
+            self._tp_fusions and fc_mapping.tp_size > 1 and not fc_mapping.enable_attention_dp
         )
+        self._fc_split_mapping = fc_mapping if self._tp_split else None
         # This rank's input features of fc and the all-reduce that sums the
-        # partial projections, set by _load_target_projection under _tp_split
+        # partial projections, set by _load_target_projection under _fc_split_mapping
         # when the fc input width splits over tp_size.
         self._fc_input_slice: Optional[slice] = None
         self._fc_all_reduce: Optional[AllReduce] = None
@@ -732,6 +744,67 @@ class DFlashForCausalLM(nn.Module):
         normalize the per-aux features first by overriding this method.
         """
         return self._project_features(hidden_states.to(self.fc.weight.dtype))
+
+    def capture_projection_blocks(self, num_captures: int) -> Optional[list[torch.Tensor]]:
+        """``fc.weight`` split into one column block per captured target layer.
+
+        ``fc`` over the concatenated captures equals the sum over captured
+        layers of ``hidden_i @ blocks[i].T``, which lets the capture accumulate
+        the projection layer by layer instead of keeping every layer's hidden
+        states (see ``DFlashSpecMetadata.project_captures``). The blocks are
+        views of ``fc.weight`` ``[out_features, in_features // num_captures]``.
+
+        Returns None when ``project_target_hidden`` is not that plain bias-free
+        ``fc`` followed by ``hidden_norm`` (a subclass override, or the
+        TP-split projection of ``_project_features``), or the input width does
+        not split evenly.
+        """
+        cls = type(self)
+        if (
+            cls.project_target_hidden is not DFlashForCausalLM.project_target_hidden
+            or cls._project_features is not DFlashForCausalLM._project_features
+        ):
+            return None
+        fc = getattr(self, "fc", None)
+        if fc is None or fc.bias is not None or self._fc_input_slice is not None:
+            return None
+        weight = fc.weight
+        width, remainder = divmod(weight.shape[1], num_captures)
+        if remainder:
+            return None
+        return [weight[:, i * width : (i + 1) * width] for i in range(num_captures)]
+
+    def finish_capture_projection(self, projected: torch.Tensor) -> torch.Tensor:
+        """``project_target_hidden``'s result from the summed ``fc`` partials.
+
+        Args:
+            projected: ``[num_tokens, out_features]`` FP32 sum of the captured
+                layers' ``hidden_i @ blocks[i].T`` (``capture_projection_blocks``).
+
+        Returns:
+            ``hidden_norm(fc(captures))`` in the fc weight dtype, rounded once
+            from the FP32 sum like the single fc GEMM.
+        """
+        return self.hidden_norm(projected.to(self.fc.weight.dtype))
+
+    def sharded_context_projection(self):
+        """``(fc, input slice, MNNVL mapping)`` when :meth:`project_target_hidden` is this
+        rank's slice of the features times its ``fc`` columns, then one MNNVL all-reduce
+        with ``hidden_norm`` fused (``_project_features`` on the TP split), so a caller can
+        run the same reduction over its own MNNVL workspace; None otherwise."""
+        cls = type(self)
+        if (
+            cls.project_target_hidden is not DFlashForCausalLM.project_target_hidden
+            or cls._project_features is not DFlashForCausalLM._project_features
+        ):
+            return None
+        fc = getattr(self, "fc", None)
+        if self._fc_input_slice is None or fc is None or fc.bias is not None:
+            return None
+        mnnvl = getattr(self._fc_all_reduce, "mnnvl_allreduce", None)
+        if mnnvl is None or mnnvl.dtype != fc.weight.dtype or self.hidden_norm.eps is None:
+            return None
+        return fc, self._fc_input_slice, mnnvl.mapping
 
     def _project_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``hidden_norm(fc(hidden_states))`` for ``[N, in_features]`` features.
@@ -922,13 +995,13 @@ class DFlashForCausalLM(nn.Module):
         # A drafter with the TP fusions keeps only its rank's slice of the
         # input features (see _project_features); a width that does not split
         # over tp_size keeps the whole fc.
-        mapping = self.model_config.mapping
-        if self._tp_split and weight.shape[1] % mapping.tp_size != 0:
+        mapping = self._fc_split_mapping
+        if mapping is not None and weight.shape[1] % mapping.tp_size != 0:
             logger.info(
                 f"{type(self).__name__}: fc input width {weight.shape[1]} does not split "
                 f"over tp_size={mapping.tp_size}; keeping the unsplit context projection."
             )
-        elif self._tp_split:
+        elif mapping is not None:
             width = weight.shape[1] // mapping.tp_size
             self._fc_input_slice = slice(mapping.tp_rank * width, (mapping.tp_rank + 1) * width)
             self._fc_all_reduce = AllReduce(
@@ -1399,16 +1472,21 @@ class DFlashForCausalLM(nn.Module):
         head_dim: int,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
-        workspace_bytes = trtllm_gen_ops.get_workspace_size(
-            dtype=dtype,
-            num_tokens=max_batch_size * block_size,
-            num_gen_tokens=max_batch_size * block_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_dim,
-            max_num_requests=max_batch_size,
-            rotary_embedding_dim=0,
-            fp8_context_fmha=False,
+        workspace_bytes = max(
+            trtllm_gen_ops.get_workspace_size(
+                dtype=dtype,
+                num_tokens=max_batch_size * block_size,
+                num_gen_tokens=max_batch_size * block_size,
+                num_heads=heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_dim,
+                max_num_requests=max_batch_size,
+                rotary_embedding_dim=0,
+                fp8_context_fmha=False,
+            )
+            # A non-causal block runs as one decode request whose query heads
+            # are the block's queries times the attention heads.
+            for heads in (num_heads, num_heads * block_size)
         )
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1441,7 +1519,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads, max_batch_size, sm_count
+            num_heads * block_size, max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
@@ -1587,6 +1665,7 @@ class DFlashForCausalLM(nn.Module):
         cache_batch_idx_i32 = ctx_cache_batch_idx.to(torch.int32)
         seq_lens_after = cache_seqlens_i32 + block_size
 
+        fp8_cache = False
         if is_paged:
             max_batch_size = ctx_page_table.size(0)
             if self.dflash_attention_backend == "TRTLLM":
@@ -1623,6 +1702,14 @@ class DFlashForCausalLM(nn.Module):
                 .reshape(-1)
                 .contiguous()
             )
+            # An FP8 cache takes the block's K/V through direct page writes
+            # (the same rows and kv positions the append addresses).
+            fp8_cache = ctx_kv_cache[0].dtype == torch.float8_e4m3fn
+            if fp8_cache:
+                append_rows = append_batch_indices.long()
+                append_pos_long = append_positions.long()
+                fp8_pages = block_tables[append_rows, append_pos_long // page_size].long()
+                fp8_offsets = append_pos_long % page_size
         else:  # VANILLA
             # Slot and column that each block K/V row occupies
             self._prepare_dflash_index_buffers(
@@ -1741,23 +1828,35 @@ class DFlashForCausalLM(nn.Module):
             causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
-                trtllm_gen_ops.append_paged_kv_cache(
-                    append_key=k_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    append_value=v_noise_bshd.reshape(
-                        -1, num_kv_heads_per_rank, head_dim
-                    ).contiguous(),
-                    batch_indices=append_batch_indices,
-                    positions=append_positions,
-                    paged_kv_cache=layer_cache,
-                    kv_indices=kv_indices,
-                    kv_indptr=kv_indptr,
-                    kv_last_page_len=kv_last_page_len,
-                    kv_layout="HND",
-                )
+                if fp8_cache:
+                    cache_view = layer_cache.view(torch.uint8)
+                    for plane, new in ((0, k_noise_bshd), (1, v_noise_bshd)):
+                        new = new.reshape(-1, num_kv_heads_per_rank, head_dim).to(layer_cache.dtype)
+                        new = new.view(torch.uint8)
+                        cache_view[fp8_pages, plane, :, fp8_offsets] = new
+                else:
+                    trtllm_gen_ops.append_paged_kv_cache(
+                        append_key=k_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        append_value=v_noise_bshd.reshape(
+                            -1, num_kv_heads_per_rank, head_dim
+                        ).contiguous(),
+                        batch_indices=append_batch_indices,
+                        positions=append_positions,
+                        paged_kv_cache=layer_cache,
+                        kv_indices=kv_indices,
+                        kv_indptr=kv_indptr,
+                        kv_last_page_len=kv_last_page_len,
+                        kv_layout="HND",
+                    )
                 out = torch.empty_like(Q_bshd)
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
+                if fp8_cache:
+                    # TRTLLM-Gen reads an FP8 cache with FP8 queries (the
+                    # context kernels have no BF16-query variant); scales stay
+                    # 1, matching the K/V writes.
+                    q_flat = q_flat.to(layer_cache.dtype)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
                 if causal:
@@ -1783,6 +1882,48 @@ class DFlashForCausalLM(nn.Module):
                         uses_shared_paged_kv_idx=True,
                         bmm1_scale_log2=None,
                         multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                elif window_left == -1:
+                    # Every block query attends the same keys (the history and
+                    # the whole block), so the block runs as one decode request
+                    # with block_size * num_heads query heads. Query (j, head
+                    # g * group + r) becomes head (g, j, r): the GQA group
+                    # grows to block_size * group and the decode kernel, which
+                    # also splits a long history across CTAs, reads each
+                    # history once.
+                    group = num_heads_per_rank // num_kv_heads_per_rank
+                    q_folded = q_flat.reshape(
+                        B, block_size, num_kv_heads_per_rank, group, head_dim
+                    ).permute(0, 2, 1, 3, 4)
+                    q_folded = q_folded.reshape(B, -1, head_dim)
+                    out_folded = q_folded.new_empty(q_folded.shape, dtype=out.dtype)
+                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                        query=q_folded,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=block_tables,
+                        seq_lens=seq_lens_after,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_left,
+                        out=out_folded,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        backend="trtllm-gen",
+                        q_len_per_req=1,
+                        max_q_len=None,
+                        cum_seq_lens_q=None,
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        bmm1_scale_log2=None,
+                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                    )
+                    out_flat.view(B, block_size, num_kv_heads_per_rank, group, head_dim).copy_(
+                        out_folded.view(
+                            B, num_kv_heads_per_rank, block_size, group, head_dim
+                        ).permute(0, 2, 1, 3, 4)
                     )
                 else:
                     cum_seq_lens_q = torch.arange(

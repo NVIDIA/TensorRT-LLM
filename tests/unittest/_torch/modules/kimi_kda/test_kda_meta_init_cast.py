@@ -63,3 +63,40 @@ def test_cast_leaves_integer_buffers_alone() -> None:
 
     # Only floating point storage is retyped; counters must keep their dtype.
     assert module.count.dtype == torch.int32
+
+
+class _GateParamModule(nn.Module):
+    """Own parameters shaped like the KDA mixer's A_log / dt_bias plus a weight."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(4, 8, dtype=torch.float32))
+        self.A_log = nn.Parameter(torch.empty(4, dtype=torch.float32))
+        self.dt_bias = nn.Parameter(torch.empty(8, dtype=torch.float32))
+
+
+def test_cast_keeps_named_params_in_their_dtype() -> None:
+    module = _GateParamModule()
+    # Values a bf16 round trip would change.
+    exact = torch.tensor([1.0 + 2.0**-12, -3.0 - 2.0**-10, 0.1, 5.5e-3], dtype=torch.float32)
+    with torch.no_grad():
+        module.weight.fill_(1.5)
+        module.A_log.copy_(exact)
+        module.dt_bias.copy_(torch.linspace(-7.0, -2.3, 8, dtype=torch.float32))
+    dt_bias = module.dt_bias.detach().clone()
+
+    _meta_safe_cast_dtype(module, torch.bfloat16, keep=("A_log", "dt_bias"))
+
+    assert module.weight.dtype == torch.bfloat16
+    assert module.A_log.dtype == torch.float32 and torch.equal(module.A_log, exact)
+    assert module.dt_bias.dtype == torch.float32 and torch.equal(module.dt_bias, dt_bias)
+
+
+def test_cast_keeps_named_params_under_meta_init() -> None:
+    with MetaInitMode():
+        module = _GateParamModule()
+        _meta_safe_cast_dtype(module, torch.bfloat16, keep=("A_log", "dt_bias"))
+
+    assert module.weight.dtype == torch.bfloat16 and module.weight.is_meta
+    assert module.A_log.dtype == torch.float32 and module.A_log.is_meta
+    assert module.dt_bias.dtype == torch.float32 and module.dt_bias.is_meta

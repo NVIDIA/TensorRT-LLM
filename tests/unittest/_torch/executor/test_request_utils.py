@@ -1289,6 +1289,64 @@ def test_request_input_token_ids_array_matches_prompt():
     assert tokens.tolist() == input_tokens
 
 
+def _gen_only_request(prompt):
+    return trtllm.Request(
+        input_token_ids=prompt,
+        max_tokens=7,
+        streaming=True,
+        sampling_config=trtllm.SamplingConfig(),
+        end_id=2,
+        type=trtllm.RequestType.REQUEST_TYPE_GENERATION_ONLY,
+        context_phase_params=trtllm.ContextPhaseParams([prompt[-1]], 9, bytes(16), [3, 4], 0, None),
+    )
+
+
+def test_llm_request_contents_match_for_array_and_list_prompts():
+    prompt = np.random.default_rng(0).integers(0, 1 << 20, size=4099, dtype=np.int32).tolist()
+    prompt[0] = (1 << 31) - 1
+    from_request = executor_request_to_llm_request(42, _gen_only_request(prompt), [], False)
+    from_list = executor_request_to_llm_request(
+        42, _gen_only_request(prompt), [], False, input_token_ids=list(prompt)
+    )
+    for request in (from_request, from_list):
+        assert request.get_tokens(0) == prompt
+        assert request.prompt_len == request.orig_prompt_len == len(prompt)
+        assert request.py_prompt_len == len(prompt)
+        assert request.max_new_tokens == 7
+        assert request.streaming
+        assert request.py_request_id == 42
+        assert request.llm_request_type == from_list.llm_request_type
+        assert request.context_phase_params.first_gen_tokens == [prompt[-1]]
+        assert request.context_phase_params.draft_tokens == [3, 4]
+
+
+def test_cpp_llm_request_accepts_int32_prompt_array():
+    from tensorrt_llm.bindings.internal.batch_manager import LlmRequest as CppLlmRequest
+
+    if not getattr(CppLlmRequest, "accepts_input_token_array", False):
+        pytest.skip("this build's LlmRequest binding takes only a list of ints")
+    prompt = np.random.default_rng(1).integers(0, 1 << 20, size=1031, dtype=np.int32)
+
+    def make(tokens):
+        return CppLlmRequest(
+            request_id=5,
+            max_new_tokens=3,
+            input_tokens=tokens,
+            sampling_config=trtllm.SamplingConfig(),
+            is_streaming=False,
+        )
+
+    expected = prompt.tolist()
+    assert make(expected).get_tokens(0) == expected
+    assert make(prompt).get_tokens(0) == expected
+    # Arrays the int32 fast path cannot take as-is still give the same prompt.
+    assert make(prompt.astype(np.int64)).get_tokens(0) == expected
+    strided = np.repeat(prompt, 2)[::2]
+    assert not strided.flags.c_contiguous
+    assert make(strided).get_tokens(0) == expected
+    assert make(tuple(expected)).get_tokens(0) == expected
+
+
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
 def test_merge_requests_default(mock_convert):
     """Test merging requests with default configuration."""

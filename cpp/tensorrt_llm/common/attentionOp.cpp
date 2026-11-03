@@ -1689,7 +1689,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     // Fused FP8-Q path: caller pre-fills the nope segment of `quant_q_buf`;
     // route the context-MLA Q pointer to it so the fused RoPE kernel appends
     // rope FP8 in place and the FMHA Q load reads the merged [nope|rope] buffer.
-    if (mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->fuse_q_fp8_in_rope
+    // With `fp8_q_input` the caller's buffer holds the whole FP8 Q.
+    if (mIsMLAEnabled && params.mla_param != nullptr
+        && (params.mla_param->fuse_q_fp8_in_rope || params.mla_param->fp8_q_input)
         && params.mla_param->quant_q_buf != nullptr)
     {
         fp8QBuf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
@@ -2093,8 +2095,21 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
                 fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
-                fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
-                fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+                if (useSparseMLA())
+                {
+                    fmhaParams.kPtr = nullptr;
+                    fmhaParams.vPtr = nullptr;
+                }
+                else if (params.mla_param->fp8_kv_input)
+                {
+                    fmhaParams.kPtr = reinterpret_cast<void const*>(params.k_ptr);
+                    fmhaParams.vPtr = reinterpret_cast<void const*>(params.v_ptr);
+                }
+                else
+                {
+                    fmhaParams.kPtr = reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
+                    fmhaParams.vPtr = reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
+                }
             }
             else
             {

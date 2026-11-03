@@ -84,6 +84,8 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
+from .disagg_gen_prefetch import (num_prefetch_admissions,
+                                  pop_prefetch_requests, prefetch_request_limit)
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -324,6 +326,13 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
                                         time.monotonic() + timeout_s)
 
 
+def _is_prefetchable_queue_item(item: RequestQueueItem) -> bool:
+    """A generation-only request without child requests (KV prefetch admission)."""
+    request = item.request
+    return (request is not None and not item.child_req_ids and
+            request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY)
+
+
 @contextmanager
 def _distributed_warmup_guard(dist: Distributed,
                               mapping: Mapping) -> Iterator[None]:
@@ -430,6 +439,24 @@ def _request_flag(request, name: str) -> bool:
     if callable(value):
         value = value()
     return bool(value)
+
+
+def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
+    """Whether a single-rank attention-DP group can skip ADP dummy padding.
+
+    With one rank there is no peer whose collectives an empty batch would
+    stall, so padding only buys a wasted forward pass. A KV connector that
+    moves KV is the exception: canceled or completed loads release their slots
+    only after a forward pass flushes their responses, so an empty rank must
+    still be padded to make progress.
+
+    A module-level function so the minimal executors that unit tests assemble
+    can use it without the ``PyExecutor`` properties.
+    """
+    if executor.dist.tp_size > 1:
+        return False
+    connector = getattr(executor, "kv_connector_manager", None)
+    return connector is None or connector.capacity_only
 
 
 class PyExecutor:
@@ -1158,6 +1185,16 @@ class PyExecutor:
         # Optional GPU keepalive for the fill gate (TRTLLM_GPU_KEEPALIVE=1).
         # Allocates nothing here; its device side is set up at its first tick.
         self._gpu_keepalive = GpuKeepalive.create_from_env(self.device_id)
+        # TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS: generation-only requests admitted
+        # beyond the batch size so that their KV-cache transfer runs while the
+        # batch is full (see disagg_gen_prefetch.py). Disaggregated workers
+        # without attention DP or pipeline parallelism only.
+        self._disagg_gen_prefetch_limit = 0
+        if (self.kv_cache_transceiver is not None
+                and not self.enable_attention_dp and self.dist.pp_size == 1
+                and not self.is_benchmark_disagg):
+            self._disagg_gen_prefetch_limit = prefetch_request_limit(
+                self.max_num_active_requests)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -2831,7 +2868,13 @@ class PyExecutor:
             if item.request is None:
                 continue
             try:
-                token_count = len(item.request.input_token_ids)
+                # num_input_tokens is O(1); input_token_ids builds a Python
+                # list of the whole prompt on every read.
+                num_input_tokens = getattr(item.request, "num_input_tokens",
+                                           None)
+                token_count = (num_input_tokens if isinstance(
+                    num_input_tokens, int) else len(
+                        item.request.input_token_ids))
             except (AttributeError, TypeError) as e:
                 # Unusual request shape with no usable token payload;
                 # exclude from all queued counters so downstream consumers
@@ -3011,6 +3054,7 @@ class PyExecutor:
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
                  gpu_forward_time_ms))
 
+    @nvtx_range("_process_iter_stats")
     def _process_iter_stats(
         self,
         finished_requests: list[LlmRequest],
@@ -3126,17 +3170,26 @@ class PyExecutor:
                     f"Error waiting on PP send handles during cleanup: "
                     f"{traceback.format_exc()}")
 
+    def _pp_rank_schedules(self) -> bool:
+        """Whether this rank computes the schedule that the other PP ranks receive.
+
+        For TP/CP cases, the first rank schedules the requests. For DP cases,
+        each first PP rank schedules its own requests. Every other rank receives
+        the schedule and runs its scheduler locally, so each rank schedules once
+        per iteration.
+        """
+        if self.dist.rank == 0:
+            return True
+        return (self.dist.is_first_pp_rank and self.dist.tp_size > 1
+                and self.enable_attention_dp)
+
     def _pp_schedule_and_propagate(self, microbatch_id: int):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
 
-        # For TP/CP cases, the first rank schedules the requests.
-        # For DP cases, the first PP rank schedules the requests.
         scheduled_batch = None
         serializable_schedule = None
         wait_for_disagg_gen_transfer_progress = False
-        is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
-        if self.dist.rank == 0 or (self.dist.is_first_pp_rank
-                                   and is_dp_broadcast):
+        if self._pp_rank_schedules():
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
             )
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
@@ -3269,7 +3322,7 @@ class PyExecutor:
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
                 (scheduled_batch, fitting_disagg_gen_init_requests, _,
                  _) = self._pp_schedule_and_propagate(microbatch_id)
-                if self.dist.rank != 0:
+                if not self._pp_rank_schedules():
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
                     # Run scheduler locally because scheduler may change llm requests' state.
@@ -4171,6 +4224,52 @@ class PyExecutor:
 
         return can_queue, can_queue_this_rank
 
+    def _defer_joins_without_seq_slot(self, scheduled_batch) -> int:
+        """Keep joining requests that would find no free sequence slot out of this batch.
+
+        With KV prefetch (``TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS``) a request admitted while the
+        batch was full finishes its KV transfer and waits, transmission-complete, for a seat. When
+        a running request is set to ``GENERATION_TO_COMPLETE`` (its step in flight is its last),
+        the scheduler no longer counts it and gives its seat to the waiting request, but the
+        finishing request holds its sequence slot until that step is processed later in this
+        iteration; the pool holds ``max_batch_size`` slots, so the joining request would get
+        none. Joining requests beyond the free slots stay out of the batch for this iteration
+        (the KV-cache growth the scheduler gave them is undone) and join in a later one. New
+        context requests of the batch take their slots after the joining requests, so their
+        slots are kept for them.
+
+        Args:
+            scheduled_batch: The batch the scheduler returned; its generation requests are
+                filtered in place.
+
+        Returns:
+            The number of requests removed from the batch.
+        """
+        joining = [
+            req for req in scheduled_batch.generation_requests
+            if req.is_disagg_generation_transmission_complete
+        ]
+        if not joining:
+            return 0
+        num_new_context = sum(1 for req in scheduled_batch.context_requests
+                              if req.seq_slot is None)
+        num_free_slots = self.resource_manager.resource_managers[
+            ResourceManagerType.SEQ_SLOT_MANAGER].num_free_slots()
+        deferred = joining[max(0, num_free_slots - num_new_context):]
+        if not deferred:
+            return 0
+        deferred_ids = {id(req) for req in deferred}
+        scheduled_batch.generation_requests = [
+            req for req in scheduled_batch.generation_requests
+            if id(req) not in deferred_ids
+        ]
+        if self._is_kv_manager_v2:
+            for req in deferred:
+                self.kv_cache_manager.revert_allocate_generation(req)
+                if self.enable_joint_kv_cache_reuse:
+                    self.draft_kv_cache_manager.revert_allocate_generation(req)
+        return len(deferred)
+
     def _revert_gen_alloc(self, scheduled_batch):
         """Revert KV cache capacity growth when the batch is skipped.
 
@@ -4512,6 +4611,8 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
+        if getattr(self, "_disagg_gen_prefetch_limit", 0) > 0:
+            self._defer_joins_without_seq_slot(scheduled_batch)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -4526,10 +4627,13 @@ class PyExecutor:
             admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(scheduler_fitting_disagg_gen_init_requests))
             # receive_gen_init enters the gen transfer status collective only
-            # on ranks that admitted something, so every CP rank must start
-            # the same receives.
+            # on ranks that admitted something, so every CP rank, and without
+            # attention DP every TP rank, must start the same receives.
             admitted_disagg_gen_init_requests = (
                 self.disagg.align_gen_admission_across_cp(
+                    admitted_disagg_gen_init_requests))
+            admitted_disagg_gen_init_requests = (
+                self.disagg.align_gen_admission_across_tp(
                     admitted_disagg_gen_init_requests))
             # Prepare KV cache manager resources only for requests admitted
             # into the transfer window this iteration.
@@ -5365,7 +5469,7 @@ class PyExecutor:
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
                             if self.dwdp_manager is not None:
-                                self.dwdp_manager.prefetch_first_layers()
+                                self.dwdp_manager.start_forward()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -5651,6 +5755,10 @@ class PyExecutor:
             self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
+        if self.dwdp_manager is not None:
+            # The action may have changed the expert weights that the last
+            # forward pass already prefetched for the next one.
+            self.dwdp_manager.invalidate_prefetch()
         logger.debug("[control_action] control request finished")
 
     def _sync_and_process_resource_governor_queue(self):
@@ -5973,6 +6081,9 @@ class PyExecutor:
             mgr.impl.adjust()
         except OutOfPagesError as e:
             logger.warning(f"KV pool adjust() failed: {e!r}")
+        check_growth = getattr(mgr, "check_gpu_pool_growth", None)
+        if check_growth is not None:
+            check_growth()
 
         remote_tail_adp = getattr(self, "_enable_remote_tail_adp", False)
         if remote_tail_adp:
@@ -6736,8 +6847,30 @@ class PyExecutor:
         request.py_csa2_remote_tail_start = remote_tail_start
         request.py_csa2_remote_tail_split = split
 
+    def _validate_request_kv_v2_row(self, request: LlmRequest) -> None:
+        """Fail a prompt that cannot fit one KVCacheManagerV2 page-index row.
+
+        The context path resizes a request's KV cache to cover its prompt.
+        Past ``max_request_kv_tokens`` the C++ manager raises from inside the
+        scheduler, which ends the executor loop for every request. The row
+        width follows the manager's own ``max_seq_len``, which can be far
+        below the configured one when the GPU KV pool is small.
+        """
+        kv_cache_manager = self.kv_cache_manager
+        needed = request.orig_prompt_len + kv_cache_manager.num_extra_kv_tokens
+        limit = kv_cache_manager.max_request_kv_tokens
+        if needed > limit:
+            raise ValueError(
+                f"The prompt of {request.orig_prompt_len} tokens needs {needed} KV "
+                f"tokens, more than the {limit} one request can hold in "
+                f"KVCacheManagerV2 (max_seq_len {kv_cache_manager.max_seq_len}, "
+                "lowered to the GPU KV pool capacity). Give the KV cache more GPU "
+                "memory or reduce its fixed per-request cost.")
+
     def _validate_request(self, request: LlmRequest):
         self._configure_csa2_remote_tail(request)
+        if self._is_kv_manager_v2:
+            self._validate_request_kv_v2_row(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:
             if retention.transfer_mode != KvCacheTransferMode.DRAM:
@@ -7061,9 +7194,13 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
-    ) -> List[RequestQueueItem]:
-        """Pop requests from waiting_queue based on available capacity."""
+        all_rank_states: Optional[List[RankState]] = None
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """Pop requests from waiting_queue based on available capacity.
+
+        Returns the requests and, with attention DP, the ranks the router
+        planned for them (request id -> rank; empty when none are planned).
+        """
         admission_capacity = self._get_request_admission_capacity()
 
         max_new_requests = admission_capacity - total_num_active_requests
@@ -7078,17 +7215,40 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
+        if self.enable_attention_dp:
+            # FIFO in warmup and the benchmark fill phase, where every request
+            # must fit at once.
+            kv_balance = not (self.is_warmup or
+                              (self.is_benchmark_disagg
+                               and self._benchmark_fill_phase_active))
+            return self.adp_router.pop_requests(waiting_queue,
+                                                all_rank_states,
+                                                max_new_requests,
+                                                self.max_num_active_requests,
+                                                kv_balance=kv_balance)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
-            enable_attention_dp=self.enable_attention_dp,
-            max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or
-                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                or self.enable_attention_dp):
-            return new_requests
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
+            enable_attention_dp=False,
+            max_num_active_requests=self.max_num_active_requests)
+        prefetch_limit = getattr(self, "_disagg_gen_prefetch_limit", 0)
+        if (prefetch_limit > 0 and not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
+            num_admitted = total_num_active_requests + sum(
+                1 + len(item.child_req_ids or ()) for item in new_requests)
+            num_pending_init = len(new_requests) + sum(
+                1 for request in self.active_requests
+                if request.is_disagg_generation_init_state)
+            num_extra = num_prefetch_admissions(prefetch_limit,
+                                                admission_capacity,
+                                                num_admitted, num_pending_init)
+            if num_extra > 0:
+                new_requests = new_requests + pop_prefetch_requests(
+                    waiting_queue, num_extra, _is_prefetchable_queue_item)
+        if (not new_requests or not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
+            return new_requests, {}
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -7102,7 +7262,7 @@ class PyExecutor:
 
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
-            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # because _pop_from_waiting_queue needs the rank states
             # from the allgather result. Moving it to step 5 would require an
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
@@ -7171,10 +7331,8 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_num_active_requests = sum(s.num_active_requests
+                                            for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -7186,16 +7344,14 @@ class PyExecutor:
                 # should_enable_overlap_headroom). They still count as live.
                 total_num_active_requests -= count_retiring_requests(
                     active_requests)
-            all_ranks_num_active_requests = None
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
-        new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+        new_requests, placement = self._pop_from_waiting_queue(
+            waiting_queue, total_num_active_requests, all_rank_states)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -7213,7 +7369,7 @@ class PyExecutor:
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
-                    self.max_num_active_requests)
+                    self.max_num_active_requests, placement=placement)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -8194,7 +8350,7 @@ class PyExecutor:
         """Pad an idle attention-DP rank with a role-matched dummy request."""
         if getattr(self, "_enable_remote_tail_adp", False):
             return
-        if not self.enable_attention_dp:
+        if not self.enable_attention_dp or _single_rank_adp_skips_padding(self):
             return
 
         expected_num_active_requests = self.expected_num_active_requests
@@ -8249,6 +8405,13 @@ class PyExecutor:
                            and num_active_request == 0)
         if not needs_dummy:
             return
+
+        if (self._adp_dummy_is_gen
+                and getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                            False) is True):
+            # A context-only FP4 MLA cache has no generation V cache, so a
+            # generation dummy fails in attention; pad with a context dummy.
+            self._adp_dummy_is_gen = False
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         token_nums = None
@@ -8363,6 +8526,10 @@ class PyExecutor:
                 in (RemoteTailPhase.CONTEXT, RemoteTailPhase.DECODE) and 0
                 in self.model_engine.cuda_graph_runner.padding_dummy_requests)
             return
+        # With a single attention-DP rank `_can_queue` vetoes only this rank's
+        # own empty batch, so there is no peer to unblock.
+        if _single_rank_adp_skips_padding(self):
+            return
         # A canceled connector load can remove the last local request during
         # recovery while peers still need this owner to participate in forward.
         if self.expected_num_active_requests <= 0:
@@ -8381,10 +8548,13 @@ class PyExecutor:
                for request in self.active_requests):
             return
         # A KDA context-only cache manager keeps no replay or draft-verification
-        # buffers, so it cannot run a generation row; pad with a one-token
-        # context dummy instead.
-        context_dummy = getattr(self.kv_cache_manager, "kda_context_only",
-                                False) is True
+        # buffers, and a context-only FP4 MLA cache has no generation V cache,
+        # so neither can run a generation row; pad with a one-token context
+        # dummy instead.
+        context_dummy = (
+            getattr(self.kv_cache_manager, "kda_context_only", False) is True
+            or getattr(self.kv_cache_manager, "fp4_mla_context_only_cache",
+                       False) is True)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):
@@ -9081,6 +9251,9 @@ class PyExecutor:
                 sample_state = self.sampler.sample_async(
                     scheduled_batch, batch_outputs,
                     num_context_logits_prefix_sum)
+                if sample_state is not None and isinstance(batch_outputs, dict):
+                    sample_state.draft_history_update = batch_outputs.get(
+                        'draft_history_update')
                 self._maybe_record_hang_diagnostic_phase(
                     "sampling_returned", scheduled_batch)
                 return sample_state
@@ -9107,10 +9280,15 @@ class PyExecutor:
 
     @nvtx_range("_update_requests")
     def _update_requests(self,
-                         sample_state: SampleState,
+                         sample_state: SampleState | None,
                          resource_manager: Optional[ResourceManager] = None):
+        if sample_state is None:
+            return
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            if sample_state.draft_history_update is not None:
+                sample_state.draft_history_update.publish()
+                sample_state.draft_history_update = None
             self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
@@ -9946,8 +10124,9 @@ class PyExecutor:
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
+        with nvtx_range("_terminate_finished_requests"):
+            for request in requests_to_terminate:
+                self._terminate_request(request)
         # Under multi-rank ADP the coordinator defers the error response to
         # its synced drain; an in-place tp_allgather here would desync
         # (reached from per-rank-divergent gates).

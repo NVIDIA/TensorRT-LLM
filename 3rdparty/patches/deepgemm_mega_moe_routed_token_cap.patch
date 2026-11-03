@@ -1,0 +1,284 @@
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -43,11 +43,15 @@ get_symm_buffer_size_for_mega_moe(
+     const int& num_max_tokens_per_rank, const int& num_topk,
+     const int& hidden, const int& intermediate_hidden,
+     const std::string& mma_type, const std::string& activation,
+-    const int& num_shared_experts = 0) {
+-    if (mma_type == "fp4xfp4")
++    const int& num_shared_experts = 0,
++    const int& num_max_routed_tokens_per_rank = 0) {
++    DG_HOST_ASSERT(num_max_routed_tokens_per_rank >= 0);
++    if (mma_type == "fp4xfp4") {
++        DG_HOST_ASSERT(num_max_routed_tokens_per_rank == 0);
+         return nvfp4::get_symm_buffer_size_for_mega_moe(
+             num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
+             hidden, intermediate_hidden, mma_type, activation, num_shared_experts);
++    }
+     DG_HOST_ASSERT(num_experts % num_ranks == 0);
+     DG_HOST_ASSERT(activation == "swiglu" or (mma_type == "fp8xfp4" and activation == "situ"));
+     DG_HOST_ASSERT(num_shared_experts >= 0);
+@@ -57,7 +61,18 @@ get_symm_buffer_size_for_mega_moe(
+     const auto num_sms = runtime->get_num_sms();
+     const auto num_experts_per_rank = num_experts / num_ranks;
+     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
+-    const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
++    const auto num_worst_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
++
++    // A positive `num_max_routed_tokens_per_rank` sizes the rings for at most that many routed tokens received per
++    // rank in one call instead of the worst case (every token of every rank routed here). The caller must keep every
++    // call within the cap; the kernel traps on a call whose live pool blocks exceed the ring. Capped buffers also
++    // skip the candidate BLOCK_M that the heuristic never selects, which otherwise inflate the SF rings.
++    const bool is_routed_capped = num_max_routed_tokens_per_rank > 0;
++    const auto num_max_routed_tokens = is_routed_capped ?
++        std::min(num_worst_routed_tokens, num_max_routed_tokens_per_rank) : num_worst_routed_tokens;
++    const auto is_sized_block_m = [=](const int& block_m) {
++        return not is_routed_capped or is_selectable_block_m_for_mega_moe(block_m);
++    };
+ 
+     // Shared
+     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+@@ -65,6 +80,8 @@ get_symm_buffer_size_for_mega_moe(
+     // Iterate all block candidates to get the maximum ring size
+     int num_ring_tokens = 0;
+     for (const auto& block_m: layout::kCandidateBlockM) {
++        if (not is_sized_block_m(block_m))
++            continue;
+         const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+         const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+             num_pool_blocks, num_sms, hidden, intermediate_hidden);
+@@ -80,6 +97,8 @@ get_symm_buffer_size_for_mega_moe(
+     int num_sf_ring_tokens = 0;
+     if (with_sf) {
+         for (auto block_m: layout::kCandidateBlockM) {
++            if (not is_sized_block_m(block_m))
++                continue;
+             num_sf_ring_tokens = std::max(
+                 num_sf_ring_tokens,
+                 layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+@@ -178,7 +197,9 @@ static void fp8_fp4_mega_moe(
+     const std::optional<float>& activation_clamp_opt,
+     const bool& fast_math,
+     const std::optional<float>& situ_beta_opt,
+-    const std::optional<float>& situ_linear_beta_opt
++    const std::optional<float>& situ_linear_beta_opt,
++    const int& num_max_routed_tokens_per_rank,
++    const std::optional<torch::Tensor>& skip_flag_opt
+ ) {
+     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+@@ -269,11 +290,19 @@ static void fp8_fp4_mega_moe(
+         num_max_tokens_per_rank, num_topk,
+         hidden, intermediate_hidden,
+         weight_dtype == torch::kFloat8_e4m3fn ? "fp8xfp8" : "fp8xfp4",
+-        activation, num_shared_experts
++        activation, num_shared_experts, num_max_routed_tokens_per_rank
+     );
+     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+     DG_HOST_ASSERT(num_experts == num_experts_);
+ 
++    // Optional device-side skip predicate (see the kernel): one int32 on the output device
++    const int* skip_flag = nullptr;
++    if (skip_flag_opt.has_value()) {
++        DG_HOST_ASSERT(skip_flag_opt->scalar_type() == torch::kInt and skip_flag_opt->numel() >= 1);
++        DG_HOST_ASSERT(skip_flag_opt->device() == y.device());
++        skip_flag = skip_flag_opt->data_ptr<int>();
++    }
++
+     // Already registered tensors
+     const auto [x, x_sf, topk_idx, topk_weights,
+                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+@@ -298,7 +327,8 @@ static void fp8_fp4_mega_moe(
+                                num_tokens, num_topk,
+                                hidden, intermediate_hidden,
+                                activation_clamp, fast_math,
+-                               use_situ, situ_beta, situ_linear_beta);
++                               use_situ, situ_beta, situ_linear_beta,
++                               skip_flag);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+     }
+--- a/csrc/jit_kernels/heuristics/mega_moe.hpp
++++ b/csrc/jit_kernels/heuristics/mega_moe.hpp
+@@ -4,6 +4,7 @@
+ #include <cmath>
+ #include <format>
+ #include <iostream>
++#include <iterator>
+ #include <string>
+ #include <tuple>
+ #include <unordered_set>
+@@ -77,6 +78,15 @@ static bool is_mma_with_sf(const MmaKind& mma_kind) {
+     return mma_kind == MmaKind::MXFP8FP4;
+ }
+ 
++// Every BLOCK_M that `get_block_config_for_mega_moe` can return. Routed-token capped SymmBuffers size their rings
++// for these only, so the heuristic below asserts that it stays within this set.
++static constexpr int kSelectableBlockMForMegaMoE[] = {16, 32, 64, 128, 192, 240};
++
++static bool is_selectable_block_m_for_mega_moe(const int& block_m) {
++    return std::any_of(std::begin(kSelectableBlockMForMegaMoE), std::end(kSelectableBlockMForMegaMoE),
++                       [=](const auto& candidate) { return candidate == block_m; });
++}
++
+ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+     const int& num_ranks, const int& num_experts,
+     const int& num_max_tokens_per_rank, const int& num_topk,
+@@ -103,11 +113,12 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+     const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
+     const int block_k = 128 / get_num_mma_elem_bytes(mma_kind);
+ 
+-    // Check whether our `block_m` lies in `kCandidateBlockM`
++    // Check whether our `block_m` lies in `kCandidateBlockM` and in `kSelectableBlockMForMegaMoE`
+     DG_HOST_ASSERT(std::any_of(
+         layout::kCandidateBlockM, layout::kCandidateBlockM + layout::kNumCandidateBlockMs,
+         [=](const auto& candidate) { return candidate == block_m; })
+     );
++    DG_HOST_ASSERT(is_selectable_block_m_for_mega_moe(block_m));
+ 
+     // Return configs: 2-CTA clusters and 2 epilogue warpgroups
+     return {2, block_m, store_block_m, block_k, 2 * 128};
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -34,7 +34,8 @@ static void sm100_fp8_fp4_mega_moe(
+     const bool& fast_math,
+     const bool& use_situ,
+     const float& situ_beta,
+-    const float& situ_linear_beta
++    const float& situ_linear_beta,
++    const int* skip_flag
+ ) {
+     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+     const auto num_experts = num_experts_per_rank * num_ranks;
+@@ -223,2 +224,3 @@ static void __instantiate_kernel() {{
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
++        skip_flag,
+         tensor_map_l1_acts,
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -64,2 +64,3 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
++                            const int* skip_flag,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+@@ -81,6 +82,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
++    // Optional device-side predicate: a non-zero `*skip_flag` skips the whole call. Every rank must read the same
++    // value, so the call is skipped everywhere before any barrier, NVLink signal or allocation.
++    if (skip_flag != nullptr) {
++        cudaGridDependencySynchronize();
++        if (*skip_flag != 0)
++            return;
++    }
++
+     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+     using Allocator = cute::TMEM::Allocator2Sm;
+ 
+--- a/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
+@@ -292,6 +292,13 @@ struct MegaMoEScheduler {
+         __syncwarp();
+ 
+         num_total_m_blocks = get_num_total_pool_blocks();
++
++        // The ring must hold every live pool block of this call. Worst-case sized buffers always do; a buffer sized
++        // for a routed-token cap does only while the caller keeps the received tokens within the cap, and a call
++        // above it would deadlock the ring, so trap instead.
++        DG_DEVICE_ASSERT(get_num_max_live_pool_blocks(
++            static_cast<int>(num_total_m_blocks), static_cast<int>(kNumSMs),
++            static_cast<int>(L1_SHAPE_K), static_cast<int>(L2_SHAPE_K)) <= static_cast<int>(kNumRingBlocks));
+         const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
+         const uint32_t num_total_l1_waves = math::ceil_div(num_total_l1_tasks, kNumSMs / 2);
+         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -23,13 +23,19 @@ class SymmBuffer:
+                  num_shared_experts: int = 0,
+                  mma_type: str = 'fp8xfp4',
+                  activation: str = 'swiglu',
+-                 base: Optional['SymmBuffer'] = None):
++                 base: Optional['SymmBuffer'] = None,
++                 num_max_routed_tokens_per_rank: int = 0):
+         # Align token count
+         num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe(mma_type))
+ 
+         # Init
+         assert activation in ('swiglu', 'situ'), f'Only `swiglu` and `situ` activations are supported, got `{activation}`'
+         assert activation != 'situ' or mma_type == 'fp8xfp4', '`situ` activation requires `fp8xfp4` MMA'
++        # A positive `num_max_routed_tokens_per_rank` sizes the routed-token rings for at most that many tokens
++        # received per rank in one call (0: the worst case). Every call on the buffer must stay within it.
++        assert num_max_routed_tokens_per_rank >= 0, 'The routed-token cap must be non-negative'
++        assert num_max_routed_tokens_per_rank == 0 or mma_type != 'fp4xfp4', \
++            'The routed-token cap does not support `fp4xfp4` MMA'
+         self.group = group
+         self.num_experts = num_experts
+         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+@@ -39,6 +45,7 @@ class SymmBuffer:
+         self.num_shared_experts = num_shared_experts
+         self.mma_type = mma_type
+         self.activation = activation
++        self.num_max_routed_tokens_per_rank = num_max_routed_tokens_per_rank
+         if mma_type == 'fp4xfp4':
+             self._nvfp4_layout_key = _nvfp4_layout_key(self)
+         if base is not None:
+@@ -55,7 +62,7 @@ class SymmBuffer:
+             num_max_tokens_per_rank, num_topk,
+             hidden, intermediate_hidden,
+             mma_type, activation,
+-            num_shared_experts
++            num_shared_experts, num_max_routed_tokens_per_rank
+         )
+         if base is None:
+             allocator = torch if group.size() == 1 else symm_mem
+@@ -101,7 +108,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
+                                  num_shared_experts: int = 0,
+                                  use_fp8_dispatch: Union[bool, None] = None,
+                                  mma_type: str = 'fp8xfp4',
+-                                 activation: str = 'swiglu') -> SymmBuffer:
++                                 activation: str = 'swiglu',
++                                 num_max_routed_tokens_per_rank: int = 0) -> SymmBuffer:
+     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
+     if use_fp8_dispatch is not None:
+         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
+@@ -115,7 +123,8 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
+         num_max_tokens_per_rank, num_topk,
+         hidden, intermediate_hidden,
+         num_shared_experts,
+-        mma_type=mma_type, activation=activation
++        mma_type=mma_type, activation=activation,
++        num_max_routed_tokens_per_rank=num_max_routed_tokens_per_rank
+     )
+ 
+ 
+@@ -240,7 +249,10 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      activation_clamp: Optional[float] = None,
+                      fast_math: bool = True,
+                      situ_beta: Optional[float] = None,
+-                     situ_linear_beta: Optional[float] = None):
++                     situ_linear_beta: Optional[float] = None,
++                     skip_flag: Optional[torch.Tensor] = None):
++    # `skip_flag`: optional one-element int32 device tensor; non-zero skips the whole call. It must hold the same
++    # value on every rank, since all ranks take part in each call.
+     if not isinstance(sym_buffer, SymmBuffer):
+         raise ValueError('Main MegaMoE requires a SymmBuffer')
+     if sym_buffer.mma_type == 'fp4xfp4':
+@@ -257,7 +269,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         sym_buffer.num_experts, sym_buffer.num_topk,
+         recipe,
+         activation, activation_clamp,
+-        fast_math, situ_beta, situ_linear_beta
++        fast_math, situ_beta, situ_linear_beta,
++        sym_buffer.num_max_routed_tokens_per_rank, skip_flag
+     )
+ 
+ def bf16_mega_moe(y: torch.Tensor,
+@@ -274,6 +287,8 @@ def bf16_mega_moe(y: torch.Tensor,
+         raise ValueError('Main MegaMoE requires a SymmBuffer')
+     if sym_buffer.mma_type == 'fp4xfp4':
+         raise ValueError('BF16 MegaMoE cannot use an NVFP4 symmetric buffer')
++    if sym_buffer.num_max_routed_tokens_per_rank != 0:
++        raise ValueError('BF16 MegaMoE does not support a routed-token capped symmetric buffer')
+     _validate_shared_weights(sym_buffer, shared_l1_weights, shared_l2_weights)
+     _C.bf16_mega_moe(
+         y,

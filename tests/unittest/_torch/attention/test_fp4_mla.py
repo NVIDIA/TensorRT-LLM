@@ -3,7 +3,7 @@
 
 """TRTLLM FP4 MLA helper tests."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -45,7 +45,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.mla import MLA
-from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     KVCacheManagerV2,
@@ -377,6 +377,12 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
     num_tokens, num_heads = 2, 2
     qk_nope_head_dim, qk_rope_head_dim = 2, 2
     kv_lora_rank = 4
+    weight_dtype = torch.bfloat16
+    latent_cache = torch.empty(
+        num_tokens,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.bfloat16,
+    )
 
     class ReachedFusedCacheUpdate(Exception):
         pass
@@ -409,15 +415,25 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
             num_heads,
             kv_lora_rank,
             qk_nope_head_dim,
-            dtype=torch.bfloat16,
+            dtype=weight_dtype,
         ),
+        k_b_proj_trans_scale=None,
+        k_b_proj_trans_dequant=None,
+        use_cute_dsl_blockscaling_bmm=False,
         apply_rotary_emb=False,
         aux_stream=None,
         ln_events=[None, None],
         _bmm_bf16_out=lambda *args: None,
         # MLA.__init__ default; the BF16 k_b_proj BMM passes it through.
         _locality_domain_k_b_proj_trans_shards=None,
+        # MLA.__init__ default (set only by NoPE subclasses).
+        fp8_nope_q_absorb=False,
+        # MLA.__init__ default without a DSA sparse config: no early Top-K fork.
+        _dsa_indexer_early=False,
     )
+    # The generation path first offers the sparse indexer an early fork; run the
+    # real method so the stand-in takes the same no-fork branch as an MLA layer.
+    mla._start_sparse_indexer_early = MethodType(MLA._start_sparse_indexer_early, mla)
     metadata = SimpleNamespace(
         num_seqs=num_tokens,
         num_ctx_tokens=0,
@@ -437,11 +453,7 @@ def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
             attn_metadata=metadata,
             output=torch.empty(0),
             position_ids=torch.arange(num_tokens),
-            latent_cache=torch.empty(
-                num_tokens,
-                kv_lora_rank + qk_rope_head_dim,
-                dtype=torch.bfloat16,
-            ),
+            latent_cache=latent_cache,
         )
 
 
@@ -629,6 +641,7 @@ def test_fp4_mla_v2_encoded_page_capacity_is_layer_invariant(layer_offset: int) 
 
 def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             kv_lora_rank=512,
@@ -649,11 +662,11 @@ def test_fp4_mla_v2_cache_size_accounts_for_hp_intercept(monkeypatch) -> None:
     assert intercept == 3 * 2 * (HP_BLOCK_SIZE + 3) * 576 * 2 * 2
 
 
-def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
+def test_fp4_mla_v2_cache_size_accounts_for_fp8_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.setenv(KIMI_K3_BF16_KV_LAYERS_ENV, "3")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(
             model_type="kimi_linear",
@@ -674,7 +687,7 @@ def test_fp4_mla_v2_cache_size_accounts_for_bf16_fallback(
     )
 
     fp4_bytes_per_token = 320 + 40 + 32
-    assert slope == fp4_bytes_per_token + 576 * torch.bfloat16.itemsize
+    assert slope == fp4_bytes_per_token + 576 * torch.float8_e4m3fn.itemsize
     assert intercept == 3 * (HP_BLOCK_SIZE + 3) * 576 * 2
 
 
@@ -1524,7 +1537,8 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
-        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        # The state's query buffer has room for the batch capacity; its first rows are this step's.
+        torch.testing.assert_close(state.prequantized_q[: expected_q_fp4.shape[0]], expected_q_fp4)
         q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
         valid_q_sf_offsets = torch.tensor(
             [

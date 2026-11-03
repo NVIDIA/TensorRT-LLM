@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -37,11 +38,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+    _get_draft_layer_sizes,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -1079,7 +1082,7 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
         max_seq_len=4096,
         max_batch_size=3,
         kv_cache_config=KvCacheConfig(
-            max_attention_window=[64],
+            max_attention_window=[63],
             max_util_for_resume=1.0,
         ),
         spec_config=spec_config,
@@ -1118,7 +1121,7 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
                 | {
                     "kv_cache_config": KvCacheConfig(
                         enable_block_reuse=False,
-                        max_attention_window=[64],
+                        max_attention_window=[63],
                         max_util_for_resume=1.0,
                     )
                 }
@@ -1126,9 +1129,14 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
         )
     )
 
-    # W=64 plus the base generation token can retain two boundary pages.
-    # One-model draft reuse extends retention to W+D=65; its two-token
-    # generation step can therefore cross into a third page.
+    # A page count is ceil((W + headroom - 2) / tokens_per_block) + 1
+    # (_estimate_swa_cache_size). Without a draft the headroom is the base
+    # generation token, so W=63 retains two pages. MTP D=1 has headroom
+    # tokens_per_gen_step (2) + the overlap-scheduler reserve (1) = 3
+    # (_get_generation_kv_capacity), which still fits two pages at W=63.
+    # One-model draft reuse extends retention to W+D=64, which crosses into a
+    # third page; managers without reuse backoff, or with block reuse off,
+    # keep W=63.
     assert no_draft == CacheCost(slope=0, intercept=3 * 128 * 64)
     assert unsupported == no_draft
     assert block_reuse_disabled == no_draft
@@ -1725,6 +1733,7 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 def _one_model_draft_creator(target_pool_ratio, mapping, draft_config) -> KvCacheCreator:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = Mock(max_cuda_graph_batch_size=4)
+    creator._model_engine.model.draft_model = None
     creator._kv_cache_config = KvCacheConfig(
         pool_ratio=target_pool_ratio,
         max_attention_window=None,
@@ -2059,3 +2068,48 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+@pytest.mark.parametrize(
+    "attention_backend,dtype,bytes_per_layer",
+    [("TRTLLM", torch.float8_e4m3fn, 2048), ("VANILLA", torch.bfloat16, 4096)],
+)
+def test_standalone_draft_kv_dtype_follows_the_drafter_attention(
+    attention_backend, dtype, bytes_per_layer
+) -> None:
+    """The TRTLLM drafter attention stores the drafter's history in FP8; VANILLA keeps BF16."""
+    creator = object.__new__(KvCacheCreator)
+    draft = SimpleNamespace(
+        fc=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        dflash_attention_backend=attention_backend,
+        config=SimpleNamespace(max_position_embeddings=4096),
+    )
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(draft_model=draft))
+    creator._speculative_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
+        draft_is_embedded_in_target=False,
+        attention_backend="AUTO",
+        max_draft_len=3,
+    )
+    creator._mapping = SimpleNamespace(
+        has_cp_helix=lambda: False, enable_attention_dp=True, tp_size=16
+    )
+    # RadixArk K3 drafter shapes, unsharded under attention DP.
+    creator._draft_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=64,
+            num_key_value_heads=16,
+            head_dim=64,
+            hidden_size=4096,
+            num_hidden_layers=5,
+        ),
+        mapping=creator._mapping,
+    )
+
+    kwargs = creator._get_unified_draft_cache_kwargs()
+
+    assert kwargs["draft_dtype"] == torch_dtype_to_binding(dtype)
+    assert _get_draft_layer_sizes(**kwargs) == (bytes_per_layer,) * 5
+    # Every key must reach the manager through the creator's factory.
+    factory = inspect.signature(_create_kv_cache_manager).parameters
+    assert set(kwargs) <= set(factory), set(kwargs) - set(factory)

@@ -641,6 +641,202 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
     assert calc_diff(got, want) < 0.02
 
 
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "next_n,num_next_n_atoms,atom",
+    [(7, 3, 3)],
+)
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
+def test_cute_dsl_fp4_paged_mqa_logits_single_atom_bitwise(
+    next_n, num_next_n_atoms, atom, batch_size
+):
+    """32 heads: one in-kernel atom over the whole verify window (N = next_n * 32 <= 224) writes the same fp32
+    logits bits as the in-kernel atom split (also with the evict-first KV loads), and matches the reference."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+
+    torch.manual_seed(batch_size * 10 + next_n)
+    num_heads, head_dim, phys_block_kv, avg_ctx, device = 32, 128, 64, 4096, "cuda"
+    max_model_len = avg_ctx * 2
+    context_lens = torch.randint(
+        int(0.7 * avg_ctx), int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = num_blocks_per_seq.sum().item() + batch_size * 2
+    block_table = torch.zeros(
+        (batch_size, num_blocks_per_seq.max().item()), dtype=torch.int32, device=device
+    )
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[offset : offset + n_blks]
+        offset += n_blks
+
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_simulated = cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True).view(
+        batch_size, next_n, num_heads, head_dim
+    )
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+    num_sms = deep_gemm.get_num_sms()
+
+    direct = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        deep_gemm.get_paged_mqa_logits_metadata(context_lens.view(-1, 1), 64, num_sms),
+        max_model_len,
+    )
+    offsets_t = torch.tensor(
+        _atom_ctx_offsets(next_n, num_next_n_atoms), dtype=torch.int32, device=device
+    )
+    atom_ctx = (context_lens.unsqueeze(1) - offsets_t).reshape(-1, 1)
+    split = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        deep_gemm.get_paged_mqa_logits_metadata(atom_ctx, 64, num_sms),
+        max_model_len,
+        num_next_n_atoms=num_next_n_atoms,
+        atom=atom,
+    )
+
+    positions = torch.arange(max_model_len, device=device).unsqueeze(0)
+    rows = torch.arange(batch_size * next_n, device=device)
+    limits = (context_lens[rows // next_n] - next_n + rows % next_n).unsqueeze(1)
+    mask = positions <= limits
+    got = direct.masked_fill(~mask, 0)
+    assert torch.equal(got.view(torch.int32), split.masked_fill(~mask, 0).view(torch.int32))
+    evict_first = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        deep_gemm.get_paged_mqa_logits_metadata(context_lens.view(-1, 1), 64, num_sms),
+        max_model_len,
+        kv_evict_first=True,
+    )
+    assert torch.equal(evict_first.masked_fill(~mask, 0).view(torch.int32), got.view(torch.int32))
+    ref = _ref_paged_mqa_logits(
+        q_simulated.float(),
+        kv_simulated.float(),
+        weights,
+        context_lens,
+        block_table,
+        max_model_len=max_model_len,
+    )
+    assert calc_diff(got, ref.float().masked_fill(~mask, 0)) < 0.02
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size", [2, 16])
+def test_cute_dsl_fp4_paged_mqa_logits_decode_bf16_epilogue(batch_size):
+    """Single-atom verify window (next_n 7, 32 heads): the BF16 epilogue with the fused cvt.rn.relu.bf16x2 ReLU gives
+    the same FP32 logits bits as the unfused BF16 epilogue, and stays close to the FP32 epilogue; its BF16 logits widen
+    to the same bits."""
+    torch.manual_seed(batch_size + 70)
+    next_n, num_heads, head_dim, phys_block_kv, avg_ctx, device = 7, 32, 128, 64, 4096, "cuda"
+    max_model_len = avg_ctx * 2
+    context_lens = torch.randint(
+        int(0.7 * avg_ctx), int(1.3 * avg_ctx) + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
+    num_total_blocks = num_blocks_per_seq.sum().item() + batch_size * 2
+    block_table = torch.zeros(
+        (batch_size, num_blocks_per_seq.max().item()), dtype=torch.int32, device=device
+    )
+    pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
+    offset = 0
+    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
+        block_table[i, :n_blks] = pool[offset : offset + n_blks]
+        offset += n_blks
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn(
+        (num_total_blocks, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+    q_packed, sf_q_packed = per_token_cast_to_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    kv_fused, _ = kv_cache_cast_to_fp4(kv_cache)
+    schedule = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.view(-1, 1), 64, deep_gemm.get_num_sms()
+    )
+
+    def logits(**kw):
+        return torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+            q_fp4,
+            sf_q,
+            kv_fused,
+            weights,
+            context_lens,
+            block_table,
+            schedule,
+            max_model_len,
+            kv_evict_first=True,
+            **kw,
+        )
+
+    positions = torch.arange(max_model_len, device=device).unsqueeze(0)
+    rows = torch.arange(batch_size * next_n, device=device)
+    limits = (context_lens[rows // next_n] - next_n + rows % next_n).unsqueeze(1)
+    mask = positions <= limits
+    fp32 = logits().masked_fill(~mask, 0)
+    bf16 = logits(epi_dtype=torch.bfloat16).masked_fill(~mask, 0)
+    fused = logits(epi_dtype=torch.bfloat16, fused_relu_cvt=True)
+    assert fused.dtype == torch.float32
+    fused = fused.masked_fill(~mask, 0)
+    assert torch.equal(fused.view(torch.int32), bf16.view(torch.int32))
+    assert not torch.equal(fused, fp32)
+    assert calc_diff(fused, fp32) < 1e-3
+    fused16 = logits(epi_dtype=torch.bfloat16, fused_relu_cvt=True, output_dtype=torch.bfloat16)
+    assert fused16.dtype == torch.bfloat16
+    assert fused16.stride(1) == 1 and fused16.stride(0) % 4 == 0 and fused16.data_ptr() % 16 == 0
+    widened = fused16.float().masked_fill(~mask, 0)
+    assert torch.equal(widened.view(torch.int32), fused.view(torch.int32))
+
+
+def test_decode_logits_bf16_gate():
+    """The BF16 decode epilogue runs only when enabled, for single-atom windows without emission and with at least the
+    minimum row count; a BF16 reader also gets BF16 logits on those windows."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer
+
+    min_rows = indexer._DECODE_LOGITS_BF16_MIN_ROWS
+    assert indexer._decode_logits_bf16_kwargs(False, 224, True, False) == {}
+    assert indexer._decode_logits_bf16_kwargs(False, 224, True, False, bf16_reader=True) == {}
+    on = dict(epi_dtype=torch.bfloat16, fused_relu_cvt=True)
+    assert indexer._decode_logits_bf16_kwargs(True, 224, True, False) == on
+    assert indexer._decode_logits_bf16_kwargs(True, min_rows, True, False) == on
+    assert indexer._decode_logits_bf16_kwargs(True, min_rows - 1, True, False) == {}
+    assert indexer._decode_logits_bf16_kwargs(True, 7, True, False) == {}
+    assert indexer._decode_logits_bf16_kwargs(True, 224, False, False) == {}
+    assert indexer._decode_logits_bf16_kwargs(True, 224, True, True) == {}
+    out16 = dict(on, output_dtype=torch.bfloat16)
+    assert indexer._decode_logits_bf16_kwargs(True, 224, True, False, bf16_reader=True) == out16
+    assert (
+        indexer._decode_logits_bf16_kwargs(True, min_rows - 1, True, False, bf16_reader=True) == {}
+    )
+    assert indexer._decode_logits_bf16_kwargs(True, 224, False, False, bf16_reader=True) == {}
+    assert indexer._decode_logits_bf16_kwargs(True, 224, True, True, bf16_reader=True) == {}
+
+
 # ---------------------------------------------------------------------------
 # Block-meta emission (emit_block_meta — fused-GVR support).
 # ---------------------------------------------------------------------------
@@ -1139,7 +1335,10 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
     )
     torch.cuda.synchronize()
     lf = logits.float()
-    torch.testing.assert_close(lf, lf0, atol=0.0, rtol=0.0)
+    # Columns at or past a row's context length are not written (uninitialized padding): compare the written window.
+    for row in range(num_rows):
+        ctx = int(context_lens[row // next_n].item())
+        torch.testing.assert_close(lf[row, :ctx], lf0[row, :ctx], atol=0.0, rtol=0.0)
 
     pairs = cand.view(num_rows, cap, 2)
     vals_bits = pairs[..., 0]

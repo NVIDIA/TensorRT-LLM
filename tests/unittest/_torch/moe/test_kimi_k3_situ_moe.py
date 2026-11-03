@@ -1104,6 +1104,8 @@ def _load_bank(moe, bank, tp_size=1, tp_rank=0):
                 w3_w1_weight_scale=backend.w3_w1_weight_scale,
                 w2_weight_scale=backend.w2_weight_scale,
             )
+            if hasattr(backend, "fake_input_scale"):  # CUTLASS W4A8 MXFP8
+                loader_module.fake_input_scale = backend.fake_input_scale
         for expert_id, tensors in enumerate(bank):
             backend.quant_method.load_packed_mxfp4_expert(
                 loader_module,
@@ -1213,6 +1215,59 @@ def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
         torch.cuda.empty_cache()
 
     check_accuracy(partial_sum.to(torch.bfloat16), out_whole, atol=0.08, rtol=0.08, percent=0.98)
+
+
+def _dequantize_packed_mxfp4_bank(bank):
+    """Group-32 packed MXFP4 experts (UE8M0 scales) back in float32, as the kernels see them."""
+
+    def deq(weight, scale):
+        return torch.ops.tensorrt_llm.e2m1_and_ufp8sf_scale_to_float_v2(
+            weight.cpu(), scale.cpu().reshape(-1), None, 32, 0, False
+        ).cuda()
+
+    return tuple([deq(expert[w], expert[f"{w}_sf"]) for expert in bank] for w in ("w1", "w2", "w3"))
+
+
+@situ_supported
+def test_cutlass_packed_mxfp4_experts_match_situ_reference():
+    """K3's packed MXFP4 checkpoint layout on CUTLASS, against the golden SiTU MoE.
+
+    CUTLASS shares ``load_packed_mxfp4_expert`` with TRTLLM-Gen and keeps its
+    own padding and scale interleave; its W4A8 method also sets the unit MXFP8
+    activation scale per slot, which the per-expert path would otherwise leave
+    uninitialized. Both backends are scored against the same dequantized
+    weights, so what remains is each kernel's MXFP8 activation rounding, and
+    CUTLASS must land in TRTLLM-Gen's error band.
+    """
+    bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
+    gate = _make_test_gate()
+    trtllm_gen = _load_bank(_make_routed_moe(_TP_INTERMEDIATE, gate), bank)
+    cutlass = _load_bank(_make_routed_moe(_TP_INTERMEDIATE, gate, moe_backend="CUTLASS"), bank)
+    # `_load_bank` loads through a proxy module, which shares this tensor.
+    assert torch.all(cutlass.backend.fake_input_scale == 1.0)
+
+    torch.manual_seed(5)
+    x = torch.randn(16, _TP_HIDDEN, dtype=torch.bfloat16, device="cuda") * 0.5
+    router_logits = gate.compute_logits(x)
+    w1, w2, w3 = _dequantize_packed_mxfp4_bank(bank)
+    expected = _situ_reference_moe(
+        x, router_logits, gate.routing_method, w1, w2, w3, beta=4.0, linear_beta=25.0
+    )
+
+    def score(moe):
+        actual = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+        cosine = torch.nn.functional.cosine_similarity(actual.flatten(), expected.flatten(), dim=0)
+        rel_l2 = torch.linalg.vector_norm(actual - expected) / torch.linalg.vector_norm(expected)
+        return cosine.item(), rel_l2.item()
+
+    ref_cos, ref_l2 = score(trtllm_gen)
+    cos, l2 = score(cutlass)
+    print(
+        f"mxfp4 vs golden: TRTLLM cosine={ref_cos:.6f} rel_l2={ref_l2:.6f}; "
+        f"CUTLASS cosine={cos:.6f} rel_l2={l2:.6f}"
+    )
+    assert cos > 0.99, f"CUTLASS cosine {cos:.4f}"
+    assert l2 <= 1.5 * ref_l2 + 0.01, f"CUTLASS rel_l2 {l2:.4f} vs TRTLLM-Gen {ref_l2:.4f}"
 
 
 @situ_supported

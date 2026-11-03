@@ -71,12 +71,13 @@ void indexer_k_cache_scatter_op(th::Tensor const& k_fp8, th::Tensor const& k_sca
     int32_t const cache_dim_3 = static_cast<int32_t>(k_cache.size(3));
 
     // Validation for indexer k cache pool.
-    // head_dim = 128 (FP8 path) or 64 (FP4 path; two packed E2M1 codes per byte).
-    // scale_size stays 4 bytes in both modes at head_dim=128: FP8 uses one
-    // float32 per token, FP4 packs four UE8M0 exponents into one int32.
+    // head_dim = 128 (FP8 path), 64 (FP4 path; two packed E2M1 codes per byte)
+    // or 256 (BF16 keys passed as bytes). scale_size stays 4 bytes in all modes
+    // at head_dim=128: FP8 uses one float32 per token, FP4 packs four UE8M0
+    // exponents into one int32, BF16 stores an unused unit scale.
     TORCH_CHECK(cache_dim_2 == 1, "k_cache dimension 2 must be 1, got %d", cache_dim_2);
-    TORCH_CHECK(
-        head_dim == 128 || head_dim == 64, "k_fp8 head_dim must be 128 (FP8) or 64 (FP4 packed), got %d", head_dim);
+    TORCH_CHECK(head_dim == 128 || head_dim == 64 || head_dim == 256,
+        "k_fp8 head_dim must be 128 (FP8), 64 (FP4 packed) or 256 (BF16) bytes, got %d", head_dim);
     TORCH_CHECK(scale_size == 4, "k_scale scale_size must be 4 bytes, got %d", scale_size);
 
     int64_t const cache_stride_0 = static_cast<int64_t>(k_cache.stride(0));

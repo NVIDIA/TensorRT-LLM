@@ -18,9 +18,12 @@ SiLU: the accumulator is h = x/2 (pre-halved weights, exact). The fast form
 silu(x) = h + h*tanh.approx(h) has relative error <= 2^-11 * |tanh(h)| / (1 + tanh(h)),
 which is <= 1.3% for h >= -2 but grows without bound as h -> -inf (cancellation).
 Each lane keeps the minimum h of the current 8-token group; one warp vote per group
-flags groups where some h < -2, and flagged groups are recomputed after the loop with
-x*e/(1+e), e = exp(-|x|) (ex2/rcp, subnormal-preserving), stored over the fast results
-by the same thread in program order.
+flags groups where some h < -2, and flagged groups use x*e/(1+e), e = exp(-|x|) (ex2/rcp,
+subnormal-preserving) instead. By default (INLINE_EXACT) each group is done in two passes
+over its inputs, which a lane keeps in registers: the convolution and the vote, then the
+convolution again with the SiLU form the vote selected, and one store. Otherwise flagged
+groups are recomputed after the loop from global memory and stored over the fast results
+by the same thread in program order. Both give the same bits.
 
 cp.async ring (aligned sources): per lane, the prologue packs ASYNC_GROUP adjacent
 tokens into each commit group (empty copies are omitted). Each token pack waits until
@@ -53,6 +56,7 @@ semantics would need a cross-sequence ordering of state reads and writes that on
 launch does not provide.
 """
 
+import os
 from collections.abc import Callable
 from functools import cache
 
@@ -74,6 +78,9 @@ SLOT = 32 * 16  # bytes per ring slot: one 16-byte granule per lane
 # Fast SiLU only while every accumulator h = x/2 of the warp step is >= this.
 FAST_MIN_H = -2.0
 H_INIT = 3.0e38  # running-min start value
+# Two register passes per token group (one store per output) instead of the global re-read
+# and second store of flagged groups after the loop; same results.
+INLINE_EXACT = os.environ.get("KIMI_K3_KDA_CONV_INLINE_EXACT", "1") != "0"
 NEG_2LOG2E = -2.8853900817779268  # -2*log2(e)
 
 
@@ -400,8 +407,10 @@ class KdaConv:
         depth=8,
         warps=4,
         st_vec=False,
+        inline_exact=False,
     ):
         self.W = warps
+        self.inline_exact = inline_exact
         self.MB = FORCE_MB
         self.heads = heads
         self.P = heads * 128
@@ -686,132 +695,179 @@ class KdaConv:
             flag = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Int32)
             flag[0] = cutlass.Int32(0)
             if slot >= 0:
-                ngroup = count // U
-                for g in cutlass.range(ngroup, unroll=1):
+                if cutlass.const_expr(self.inline_exact):
+                    ngroup = count // U
+                    for g in cutlass.range(ngroup, unroll=1):
+                        self.group(
+                            g * U,
+                            U,
+                            True,
+                            src,
+                            src_base,
+                            row0,
+                            cc,
+                            ring_lane,
+                            count,
+                            wt,
+                            hist,
+                            cvalid,
+                            q,
+                            k,
+                            v,
+                            sec,
+                            inner,
+                            gbase,
+                            sbase,
+                        )
+                    if ngroup * U < count:
+                        self.group(
+                            ngroup * U,
+                            count - ngroup * U,
+                            False,
+                            src,
+                            src_base,
+                            row0,
+                            cc,
+                            ring_lane,
+                            count,
+                            wt,
+                            hist,
+                            cvalid,
+                            q,
+                            k,
+                            v,
+                            sec,
+                            inner,
+                            gbase,
+                            sbase,
+                        )
+                else:
+                    ngroup = count // U
+                    for g in cutlass.range(ngroup, unroll=1):
+                        hm[0] = cutlass.Float32(H_INIT)
+                        # Group base addresses: per-token offsets below are immediates.
+                        gg = gbase + cutlass.Int64(g * U) * (self.SR * 2)
+                        sg = sbase + cutlass.Int64(g * U) * (P * 2)
+                        for p in cutlass.range_constexpr(U // ASYNC_GROUP):
+                            if cutlass.const_expr(self.src_vec):
+                                cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                            for pe in cutlass.range_constexpr(ASYNC_GROUP):
+                                u = ASYNC_GROUP * p + pe
+                                self.step(
+                                    g * U + u,
+                                    u,
+                                    True,
+                                    src,
+                                    src_base,
+                                    row0,
+                                    cc,
+                                    ring_lane,
+                                    count,
+                                    wt,
+                                    hist,
+                                    yw,
+                                    hm,
+                                    cvalid,
+                                    q,
+                                    k,
+                                    v,
+                                    sec,
+                                    inner,
+                                    gg,
+                                    sg,
+                                )
+                            if cutlass.const_expr(self.src_vec):
+                                cute.arch.cp_async_commit_group()
+                        deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
+                        flag[0] = flag[0] | (cutlass.Int32(deep) << g)
                     hm[0] = cutlass.Float32(H_INIT)
-                    # Group base addresses: per-token offsets below are immediates.
-                    gg = gbase + cutlass.Int64(g * U) * (self.SR * 2)
-                    sg = sbase + cutlass.Int64(g * U) * (P * 2)
-                    for p in cutlass.range_constexpr(U // ASYNC_GROUP):
+                    first = ngroup * U
+                    npack = (count - first + (ASYNC_GROUP - 1)) // ASYNC_GROUP
+                    for p in cutlass.range(npack, unroll=1):
+                        i = first + ASYNC_GROUP * p
                         if cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
-                        for pe in cutlass.range_constexpr(ASYNC_GROUP):
-                            u = ASYNC_GROUP * p + pe
-                            self.step(
-                                g * U + u,
-                                u,
-                                True,
-                                src,
-                                src_base,
-                                row0,
-                                cc,
-                                ring_lane,
-                                count,
-                                wt,
-                                hist,
-                                yw,
-                                hm,
-                                cvalid,
-                                q,
-                                k,
-                                v,
-                                sec,
-                                inner,
-                                gg,
-                                sg,
-                            )
+                        gg = gbase + cutlass.Int64(i) * (self.SR * 2)
+                        sg = sbase + cutlass.Int64(i) * (P * 2)
+                        self.step(
+                            i,
+                            0,
+                            True,
+                            src,
+                            src_base,
+                            row0,
+                            cc,
+                            ring_lane,
+                            count,
+                            wt,
+                            hist,
+                            yw,
+                            hm,
+                            cvalid,
+                            q,
+                            k,
+                            v,
+                            sec,
+                            inner,
+                            gg,
+                            sg,
+                        )
+                        for pe in cutlass.range_constexpr(1, ASYNC_GROUP):
+                            if i + pe < count:
+                                self.step(
+                                    i + pe,
+                                    pe,
+                                    True,
+                                    src,
+                                    src_base,
+                                    row0,
+                                    cc,
+                                    ring_lane,
+                                    count,
+                                    wt,
+                                    hist,
+                                    yw,
+                                    hm,
+                                    cvalid,
+                                    q,
+                                    k,
+                                    v,
+                                    sec,
+                                    inner,
+                                    gg,
+                                    sg,
+                                )
                         if cutlass.const_expr(self.src_vec):
                             cute.arch.cp_async_commit_group()
                     deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
-                    flag[0] = flag[0] | (cutlass.Int32(deep) << g)
-                hm[0] = cutlass.Float32(H_INIT)
-                first = ngroup * U
-                npack = (count - first + (ASYNC_GROUP - 1)) // ASYNC_GROUP
-                for p in cutlass.range(npack, unroll=1):
-                    i = first + ASYNC_GROUP * p
-                    if cutlass.const_expr(self.src_vec):
-                        cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
-                    gg = gbase + cutlass.Int64(i) * (self.SR * 2)
-                    sg = sbase + cutlass.Int64(i) * (P * 2)
-                    self.step(
-                        i,
-                        0,
-                        True,
-                        src,
-                        src_base,
-                        row0,
-                        cc,
-                        ring_lane,
-                        count,
-                        wt,
-                        hist,
-                        yw,
-                        hm,
-                        cvalid,
-                        q,
-                        k,
-                        v,
-                        sec,
-                        inner,
-                        gg,
-                        sg,
-                    )
-                    for pe in cutlass.range_constexpr(1, ASYNC_GROUP):
-                        if i + pe < count:
-                            self.step(
-                                i + pe,
-                                pe,
-                                True,
-                                src,
-                                src_base,
-                                row0,
-                                cc,
-                                ring_lane,
-                                count,
-                                wt,
-                                hist,
-                                yw,
-                                hm,
-                                cvalid,
-                                q,
-                                k,
-                                v,
-                                sec,
-                                inner,
-                                gg,
-                                sg,
-                            )
-                    if cutlass.const_expr(self.src_vec):
-                        cute.arch.cp_async_commit_group()
-                deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
-                flag[0] = flag[0] | (cutlass.Int32(deep) << ngroup)
-                # Rare, warp-uniform: exact SiLU for flagged groups. hist is dead here.
-                if flag[0] != 0:
-                    for g in cutlass.range(ngroup + 1, unroll=1):
-                        if (flag[0] >> g) & 1:
-                            first = g * U
-                            self.redo(
-                                first,
-                                cutlass.min(count - first, U),
-                                src,
-                                src_base,
-                                begin,
-                                t0,
-                                init,
-                                state_slot,
-                                row0,
-                                cc,
-                                wt,
-                                hist,
-                                yw,
-                                cvalid,
-                                q,
-                                k,
-                                v,
-                                sec,
-                                inner,
-                                sbase,
-                            )
+                    flag[0] = flag[0] | (cutlass.Int32(deep) << ngroup)
+                    # Rare, warp-uniform: exact SiLU for flagged groups. hist is dead here.
+                    if flag[0] != 0:
+                        for g in cutlass.range(ngroup + 1, unroll=1):
+                            if (flag[0] >> g) & 1:
+                                first = g * U
+                                self.redo(
+                                    first,
+                                    cutlass.min(count - first, U),
+                                    src,
+                                    src_base,
+                                    begin,
+                                    t0,
+                                    init,
+                                    state_slot,
+                                    row0,
+                                    cc,
+                                    wt,
+                                    hist,
+                                    yw,
+                                    cvalid,
+                                    q,
+                                    k,
+                                    v,
+                                    sec,
+                                    inner,
+                                    sbase,
+                                )
             else:
                 npack = (count + (ASYNC_GROUP - 1)) // ASYNC_GROUP
                 for p in cutlass.range(npack, unroll=1):
@@ -909,6 +965,215 @@ class KdaConv:
     def state_addr(self, state, slot, cc):
         """Byte address of state[slot, cc, 0] (vector path: 16-byte aligned by the host check)."""
         return state.iterator.toint() + (cutlass.Int64(slot) * self.SS[0] + cc * self.SS[1]) * 2
+
+    @cute.jit
+    def conv8(
+        self,
+        xt: cute.Tensor,
+        off: cutlass.Constexpr,
+        wt: cute.Tensor,
+        hist: cute.Tensor,
+        hs: cute.Tensor,
+    ):
+        """Convolution of one token's 8 channels (xt[off:off+4], packed BF16x2) into hs[0:8] (h = x/2, same
+        operation order as step), then roll the causal history."""
+        xs = cute.make_rmem_tensor(cute.make_layout(VEC), cutlass.Float32)
+        for e2 in cutlass.range_constexpr(4):
+            xs[2 * e2] = bf_lo(xt[off + e2])
+            xs[2 * e2 + 1] = bf_hi(xt[off + e2])
+        for j in cutlass.range_constexpr(4):
+            a, b = 2 * j, 2 * j + 1
+            acc0, acc1 = mul2(wt[a], wt[b], hist[a], hist[b])
+            acc0, acc1 = fma2(wt[VEC + a], wt[VEC + b], hist[VEC + a], hist[VEC + b], acc0, acc1)
+            acc0, acc1 = fma2(
+                wt[2 * VEC + a], wt[2 * VEC + b], hist[2 * VEC + a], hist[2 * VEC + b], acc0, acc1
+            )
+            acc0, acc1 = fma2(wt[3 * VEC + a], wt[3 * VEC + b], xs[a], xs[b], acc0, acc1)
+            hs[a] = acc0
+            hs[b] = acc1
+            for e3 in cutlass.range_constexpr(2):
+                ch = a + e3
+                hist[ch] = hist[VEC + ch]
+                hist[VEC + ch] = hist[2 * VEC + ch]
+                hist[2 * VEC + ch] = xs[ch]
+
+    @cute.jit
+    def group_token(
+        self,
+        u: cutlass.Constexpr,
+        first,
+        src,
+        src_base,
+        row0,
+        cc,
+        ring_lane,
+        count,
+        wt: cute.Tensor,
+        hist: cute.Tensor,
+        hs: cute.Tensor,
+        hm: cute.Tensor,
+        grp: cute.Tensor,
+        gg,
+    ):
+        """Pass 1 for token first + u of a group: ring slot -> grp[4u:4u+4], convolution, running minimum of h,
+        refill of the slot (same order as step)."""
+        D = self.D
+        i = first + u
+        sl = ring_lane + (i % D) * SLOT
+        if cutlass.const_expr(self.src_vec):
+            w4 = lds_v4(sl)
+            for j in cutlass.range_constexpr(4):
+                grp[4 * u + j] = w4[j]
+        else:
+            self.loadw(src, src_base, row0 + i, cc, grp, 4 * u)
+        self.conv8(grp, 4 * u, wt, hist, hs)
+        hm[0] = fmin3(
+            fmin3(hs[0], hs[1], hs[2]), fmin3(hs[3], hs[4], hs[5]), fmin3(hs[6], hs[7], hm[0])
+        )
+        if cutlass.const_expr(self.src_vec):
+            if i + D < count:
+                cp_async16(sl, gg + (u + D) * (self.SR * 2))
+
+    @cute.jit
+    def group(
+        self,
+        first,
+        n,
+        full: cutlass.Constexpr,
+        src,
+        src_base,
+        row0,
+        cc,
+        ring_lane,
+        count,
+        wt: cute.Tensor,
+        hist: cute.Tensor,
+        cvalid,
+        q,
+        k,
+        v,
+        sec,
+        inner,
+        gbase,
+        sbase,
+    ):
+        """Tokens [first, first + n) of this run (n == U when `full`): convolution and warp vote over the group,
+        then the convolution again from the inputs kept in registers with the SiLU form the vote selected, and
+        one store per token. Same results as the fast pass plus redo."""
+        U, D = self.U, self.D
+        grp = cute.make_rmem_tensor(cute.make_layout(4 * U), cutlass.Int32)
+        hsave = cute.make_rmem_tensor(cute.make_layout(4 * (WIDTH - 1)), cutlass.Int32)
+        hs = cute.make_rmem_tensor(cute.make_layout(VEC), cutlass.Float32)
+        hm = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
+        yw = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32)
+        # The history values are BF16 inputs (or zeros), so the packed copy is exact.
+        for j in cutlass.range_constexpr(WIDTH - 1):
+            for w in cutlass.range_constexpr(4):
+                hsave[4 * j + w] = pack_bf16x2(hist[j * VEC + 2 * w], hist[j * VEC + 2 * w + 1])
+        hm[0] = cutlass.Float32(H_INIT)
+        gg = gbase + cutlass.Int64(first) * (self.SR * 2)
+        sg = sbase + cutlass.Int64(first) * (self.P * 2)
+        for p in cutlass.range_constexpr(U // ASYNC_GROUP):
+            if cutlass.const_expr(full):
+                if cutlass.const_expr(self.src_vec):
+                    cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                for pe in cutlass.range_constexpr(ASYNC_GROUP):
+                    self.group_token(
+                        ASYNC_GROUP * p + pe,
+                        first,
+                        src,
+                        src_base,
+                        row0,
+                        cc,
+                        ring_lane,
+                        count,
+                        wt,
+                        hist,
+                        hs,
+                        hm,
+                        grp,
+                        gg,
+                    )
+                if cutlass.const_expr(self.src_vec):
+                    cute.arch.cp_async_commit_group()
+            else:
+                if ASYNC_GROUP * p < n:
+                    if cutlass.const_expr(self.src_vec):
+                        cute.arch.cp_async_wait_group(D // ASYNC_GROUP - 1)
+                    for pe in cutlass.range_constexpr(ASYNC_GROUP):
+                        if ASYNC_GROUP * p + pe < n:
+                            self.group_token(
+                                ASYNC_GROUP * p + pe,
+                                first,
+                                src,
+                                src_base,
+                                row0,
+                                cc,
+                                ring_lane,
+                                count,
+                                wt,
+                                hist,
+                                hs,
+                                hm,
+                                grp,
+                                gg,
+                            )
+                    if cutlass.const_expr(self.src_vec):
+                        cute.arch.cp_async_commit_group()
+        deep = cute.arch.vote_any_sync(hm[0] < FAST_MIN_H)
+        # Pass 2 from the group-start history; it ends at the same history as pass 1.
+        for j in cutlass.range_constexpr(WIDTH - 1):
+            for w in cutlass.range_constexpr(4):
+                xlo, xhi = unpack_bf16x2(hsave[4 * j + w])
+                hist[j * VEC + 2 * w] = xlo
+                hist[j * VEC + 2 * w + 1] = xhi
+        for u in cutlass.range_constexpr(U):
+            if cutlass.const_expr(full):
+                self.group_out(
+                    u, first, deep, wt, hist, hs, grp, yw, cvalid, q, k, v, sec, row0, inner, sg
+                )
+            else:
+                if u < n:
+                    self.group_out(
+                        u, first, deep, wt, hist, hs, grp, yw, cvalid, q, k, v, sec, row0, inner, sg
+                    )
+
+    @cute.jit
+    def group_out(
+        self,
+        u: cutlass.Constexpr,
+        first,
+        deep,
+        wt: cute.Tensor,
+        hist: cute.Tensor,
+        hs: cute.Tensor,
+        grp: cute.Tensor,
+        yw: cute.Tensor,
+        cvalid,
+        q,
+        k,
+        v,
+        sec,
+        row0,
+        inner,
+        sg,
+    ):
+        """Pass 2 for token first + u: convolution from grp, the selected SiLU form, store."""
+        self.conv8(grp, 4 * u, wt, hist, hs)
+        if deep:
+            for j in cutlass.range_constexpr(4):
+                y0, y1 = silu2_exact(hs[2 * j], hs[2 * j + 1])
+                yw[j] = pack_bf16x2(y0, y1)
+        else:
+            for j in cutlass.range_constexpr(4):
+                h0, h1 = hs[2 * j], hs[2 * j + 1]
+                y0, y1 = fma2(h0, h1, tanh_approx(h0), tanh_approx(h1), h0, h1)
+                yw[j] = pack_bf16x2(y0, y1)
+        if cvalid:
+            if cutlass.const_expr(self.out_vec):
+                st_v4(sg + u * (self.P * 2), yw[0], yw[1], yw[2], yw[3])
+            else:
+                self.storew(q, k, v, sec, row0 + first + u, inner, yw)
 
     @cute.jit
     def step(
@@ -1096,6 +1361,9 @@ FORCE_L = 32
 FORCE_D = 8
 FORCE_W = 1
 FORCE_MB = 16
+# The two-pass groups keep 8 tokens of inputs per lane: a lower occupancy bound gives them the registers
+# (GB300, 8192 x 96 heads: 16 -> 12 removes the spills, 280 -> 233 us).
+FORCE_MB_INLINE = 12
 
 
 def _pick_tokens(heads, max_seqlen, batch):
@@ -1133,6 +1401,7 @@ def compile_prefill_conv(
     out_vec: bool,
     st_vec: bool,
     seq_loop: bool,
+    inline_exact: bool = False,
 ) -> Callable:
     """Compile and cache a convolution layout without retaining caller-owned tensors."""
     with torch.cuda.device(device):
@@ -1168,6 +1437,7 @@ def compile_prefill_conv(
             depth,
             warps,
             st_vec,
+            inline_exact,
         )
         op.MB = min_blocks_per_mp
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
@@ -1270,11 +1540,12 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         U,
         D,
         W,
-        FORCE_MB,
+        FORCE_MB_INLINE if INLINE_EXACT else FORCE_MB,
         src_vec,
         w_vec,
         out_vec,
         st_vec,
         seq_loop,
+        INLINE_EXACT,
     )
     fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stream)

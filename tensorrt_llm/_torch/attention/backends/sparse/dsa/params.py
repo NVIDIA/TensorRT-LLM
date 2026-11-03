@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Optional
 
@@ -19,12 +20,38 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 if TYPE_CHECKING:
     pass
 
+# Set while a Kimi K3.1 model (Kimi K3 MLA layers with a DSA indexer) is built in this process; its tuned DSA
+# decode / prefill paths key on it so that DeepSeek-V3.2, GLM-5 and DeepSeek-V4 keep the generic ones.
+_KIMI_K31_DSA = False
+
+
+def mark_kimi_k31_dsa() -> None:
+    """Record that this process serves Kimi K3.1 (called by its MLA layers before they build the indexer)."""
+    global _KIMI_K31_DSA
+    _KIMI_K31_DSA = True
+
+
+def is_kimi_k31_dsa() -> bool:
+    """Whether this process serves Kimi K3.1."""
+    return _KIMI_K31_DSA
+
+
+def disagg_role() -> str:
+    """This server's disaggregated role: "context", "generation", or "" (aggregated serving).
+
+    trtllm-serve exports it from --server_role.
+    """
+    return os.environ.get("TRTLLM_DISAGG_ROLE", "")
+
 
 @dataclass(kw_only=True, slots=True)
 class DSABackendForwardArgs(SparseBackendForwardArgs):
     """DSA inputs passed from the MLA module to its backend."""
 
     indexer_intermediates: Optional[List[torch.Tensor]] = None
+    # Paged Top-K of a generation-only call that the MLA module already predicted (on its auxiliary stream,
+    # concurrently with the query absorption); the backend then skips its own prediction.
+    precomputed_attn_indices: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +81,11 @@ class DSAParams(SparseParams):
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
     index_topk: Optional[int] = None
+    # Rotated channels of each indexer head. None means the MLA's
+    # qk_rope_head_dim; 0 means a position-free (NoPE) indexer.
+    index_rope_dim: Optional[int] = None
+    # Epsilon of the indexer key LayerNorm. None means DeepSeek-V3.2's 1e-6.
+    index_k_norm_eps: Optional[float] = None
     indexer_max_chunk_size: Optional[int] = None
     skip_indexer_for_short_seqs: bool = True
     use_cute_dsl_topk: bool = False
@@ -71,7 +103,7 @@ class DSAParams(SparseParams):
     # Deterministic self-sampling GVR: repeatable index set and output order
     # (only meaningful with enable_heuristic_topk=True, use_self_sampling_topk=True).
     gvr_deterministic_topk: bool = False
-    indexer_k_dtype: Literal["fp8", "fp4"] = "fp8"
+    indexer_k_dtype: Literal["fp8", "fp4", "bf16"] = "fp8"
     # Shared layers reuse the preceding full layer's top-k.
     is_full_indexer_layer: bool = True
     mtp_index_share: bool = False

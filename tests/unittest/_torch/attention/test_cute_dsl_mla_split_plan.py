@@ -54,15 +54,21 @@ def test_plan_mla_split_kv_policy(kv_lens: list[int], rows: int, expected: list[
     assert plan == expected
 
 
-def test_plan_kernel_matches_host_mirror() -> None:
+@pytest.mark.parametrize("piece_cost", [None, 0, 30])
+def test_plan_kernel_matches_host_mirror(piece_cost) -> None:
+    """Every batch size (the kernel's block is the batch's power of two, one to
+    four warps) and piece cost (default: the target's)."""
     mod = _plan_mod()
     generator = torch.Generator().manual_seed(3)
+    cost = {} if piece_cost is None else {"piece_cost": piece_cost}
     for rows in (1, 4, 8):
-        for batch in (1, 3, 8, 16, 37, 128):
+        for batch in (1, 3, 8, 16, 33, 37, 128, 300, 1024):
             kv = torch.randint(1, 300_000, (batch,), generator=generator)
             kv[0] = 262144  # a long one
             kv_lens = kv.tolist()
-            expected = mod.plan_mla_split_kv(kv_lens, rows_per_request=rows, wave_clusters=WAVE)
+            expected = mod.plan_mla_split_kv(
+                kv_lens, rows_per_request=rows, wave_clusters=WAVE, **cost
+            )
             cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
             plan = torch.full((batch + 3,), -5, dtype=torch.int32, device="cuda")
             mod.launch_mla_split_kv_plan(
@@ -71,6 +77,7 @@ def test_plan_kernel_matches_host_mirror() -> None:
                 num_requests=batch,
                 rows_per_request=rows,
                 wave_clusters=WAVE,
+                **cost,
             )
             torch.cuda.synchronize()
             assert plan[:batch].tolist() == expected, (rows, batch, kv_lens[:4])
@@ -212,3 +219,127 @@ def test_runner_variable_split_matches_uniform_split(
         torch.testing.assert_close(
             log_partition[finite], ref_log_partition[finite], rtol=1e-4, atol=1e-4
         )
+
+
+def _k3_block_decode_case(input_dtype: torch.dtype, seq_len_q: int, kv_lens: list[int]):
+    """A K3-shaped (64 heads) decode through the runner with Helix stats.
+
+    Returns ``run(block_split_kvs, split_kv) -> (out, stats)``; ``block_split_kvs``
+    is None (uniform ``split_kv``), a list, or an int32 CUDA tensor.
+    """
+    import cutlass
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch_size, num_heads = len(kv_lens), 64
+    latent_dim, rope_dim, page_size = 512, 64, 64
+    blocks_per_sequence = math.ceil(max(kv_lens) / page_size)
+    num_pages = batch_size * blocks_per_sequence
+    softmax_scale = 1.0 / math.sqrt(128 + rope_dim)
+    q_storage = (
+        torch.randn(batch_size, seq_len_q, num_heads, latent_dim + rope_dim, device=device) * 0.1
+    ).to(input_dtype)
+    cache_storage = (
+        torch.randn(num_pages, page_size, latent_dim + rope_dim, device=device) * 0.1
+    ).to(input_dtype)
+    page_table = (
+        torch.arange(num_pages, dtype=torch.int32, device=device)
+        .view(batch_size, blocks_per_sequence)
+        .transpose(0, 1)
+    )
+    cache_seqs = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    # Every query token sees the whole KV (the DSpark block decode's bounds).
+    kv_bounds = cache_seqs.repeat_interleave(seq_len_q)
+    cutlass_dtype = cutlass.Float8E4M3FN if input_dtype == torch.float8_e4m3fn else cutlass.BFloat16
+    runner = CuteDSLNVMlaDecodeBlackwellRunner(
+        in_dtype=cutlass_dtype,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        max_batch_size=batch_size,
+        emit_softmax_stats=True,
+    )
+    workspace = torch.empty(
+        runner.get_max_padded_workspace_size(
+            num_heads, seq_len_q, latent_dim, batch_size, cutlass.Float32
+        ),
+        device=device,
+        dtype=torch.uint8,
+    )
+    output_storage = torch.empty(
+        batch_size, seq_len_q, num_heads, latent_dim, device=device, dtype=torch.bfloat16
+    )
+    stats = torch.empty(batch_size * seq_len_q, num_heads, 2, device=device)
+    fp8_scales = [
+        torch.tensor([softmax_scale], device=device),
+        torch.tensor([1.0], device=device),
+    ]
+
+    def run(block_split_kvs, split_kv):
+        inputs = [
+            q_storage[..., :latent_dim].permute(2, 3, 1, 0),
+            q_storage[..., latent_dim:].permute(2, 3, 1, 0),
+            cache_storage[..., :latent_dim].permute(1, 2, 0),
+            cache_storage[..., latent_dim:].permute(1, 2, 0),
+            page_table,
+            cache_seqs,
+            output_storage.permute(2, 3, 1, 0),
+            workspace,
+            stats,
+            kv_bounds,
+        ]
+        kwargs = {"softmax_scale": softmax_scale, "output_scale": 1.0}
+        if input_dtype == torch.float8_e4m3fn:
+            inputs.extend(fp8_scales)
+            kwargs = {}
+        if block_split_kvs is not None:
+            if not isinstance(block_split_kvs, torch.Tensor):
+                block_split_kvs = torch.tensor(block_split_kvs, dtype=torch.int32, device=device)
+            inputs.append(block_split_kvs)
+        runner.forward(inputs, tactic=((128, 128), (128, 256), split_kv, False), **kwargs)
+        return output_storage, stats
+
+    return run
+
+
+@pytest.mark.parametrize("seq_len_q", [5, 7])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_split_plan_is_bitwise_the_uniform_split(input_dtype: torch.dtype, seq_len_q: int) -> None:
+    """Each request of a planned launch (per-request splits under an 8-slot grid)
+    is bit for bit that request in the uniform launch at its planned split:
+    outputs and Helix softmax stats."""
+    # KV tiles (128 tokens): 8, 1, 17 -- one, one and six effective splits.
+    kv_lens = [1024, 128, 2176]
+    plan = [3, 1, 8]
+    run = _k3_block_decode_case(input_dtype, seq_len_q, kv_lens)
+    out, stats = run(plan, 8)
+    torch.cuda.synchronize()
+    planned_out, planned_stats = out.clone(), stats.clone()
+    for request, split_kv in enumerate(plan):
+        out, stats = run(None, split_kv)
+        torch.cuda.synchronize()
+        assert torch.equal(
+            planned_out[request].view(torch.int16), out[request].view(torch.int16)
+        ), (request, split_kv)
+        rows = slice(request * seq_len_q, (request + 1) * seq_len_q)
+        assert torch.equal(planned_stats[rows].view(torch.int32), stats[rows].view(torch.int32))
+
+
+def test_split_plan_under_cuda_graph() -> None:
+    """The plan is a device tensor: a captured planned launch replays bitwise."""
+    run = _k3_block_decode_case(torch.bfloat16, 7, [1024, 128, 2176])
+    plan = torch.tensor([2, 1, 5], dtype=torch.int32, device="cuda")
+    out, stats = run(plan, 8)
+    torch.cuda.synchronize()
+    eager = (out.clone(), stats.clone())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(plan, 8)
+    out.fill_(float("nan"))
+    stats.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), eager[0].view(torch.int16))
+    assert torch.equal(stats.view(torch.int32), eager[1].view(torch.int32))

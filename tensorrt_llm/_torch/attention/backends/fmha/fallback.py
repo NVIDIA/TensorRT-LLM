@@ -269,11 +269,16 @@ class FallbackFmha(Fmha):
         # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
         # gate both assume the new KV entries are the trailing slots of one
         # rank's kv_len. Reject rather than run it silently wrong; being last
-        # in the library list, this makes dispatch raise.
+        # in the library list, this makes dispatch raise. Token-sparse MLA is
+        # exempt: it attends only to its per-token Top-K rows, which the DSA
+        # indexer bounds by ``helix_kv_bounds``, and the DSA metadata presents
+        # one row per token as long as its kept entries
+        # (``DSAtrtllmAttentionMetadata.token_major_gen_view``).
         if (
             metadata.helix_position_offsets is not None
             and metadata._helix_spec_tokens_valid
             and metadata.num_generations > 0
+            and forward_args.sparse_runtime_params.sparse_attn_indices is None
             # Count generation tokens only: in a mixed batch ``q`` also holds
             # the context tokens, which would otherwise trip this on a batch
             # that has exactly one query token per generation sequence.

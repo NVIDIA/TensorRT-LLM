@@ -45,6 +45,9 @@ class Fmha(ABC):
     supports_per_tensor_fp8: ClassVar[bool] = False
     supports_workspace_reclamation: bool = False
     supports_fp4_mla: ClassVar[bool] = False
+    # Inline NVFP4 latent records (kv_cache_config.dtype="nvfp4_ds_mla"): only libraries that append and
+    # read them themselves.
+    supports_nvfp4_ds_mla: ClassVar[bool] = False
 
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
@@ -79,6 +82,8 @@ class Fmha(ABC):
             )
             return False
         if getattr(attn, "uses_fp4_mla_attention", False) and not cls.supports_fp4_mla:
+            return False
+        if getattr(attn, "use_nvfp4_ds_mla", False) and not cls.supports_nvfp4_ds_mla:
             return False
         return cls._is_available(attn)
 

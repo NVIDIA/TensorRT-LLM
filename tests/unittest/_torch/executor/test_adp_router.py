@@ -20,9 +20,12 @@ Tests for:
 - ADPRouter interface and DefaultADPRouter
 - Piggybacking per-rank iter-stats payloads on the existing ADP allgather
 - Strict/relaxed attention-DP request routing while respecting rank capacity
+- KV-balanced admission of generation-only requests
 """
 
 import inspect
+import random
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import numpy as np
@@ -33,6 +36,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+    KV_BALANCE_MAX_SKIPPED_ROUNDS,
+    KV_BALANCE_WINDOW,
     ADPRouter,
     ConversationAwareADPRouter,
     DefaultADPRouter,
@@ -43,8 +48,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     build_active_requests_for_overlap,
     count_retiring_requests,
     is_retiring_request,
+    plan_kv_balanced_admission,
 )
+from tensorrt_llm.bindings.executor import RequestType
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm_args import AttentionDpConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -1920,6 +1928,338 @@ class TestConversationAwareADPRouter:
         assert sum(len(v) for v in assign.values()) == 8  # nothing dropped
 
 
+class TestConversationAwareADPRouterOptInKnobs:
+    """TLLM_ADP_NEW_CONV_BALANCE and TLLM_ADP_STICKY_WAIT_ITERS (default off)."""
+
+    @staticmethod
+    def _router(monkeypatch, tp_size=4, **env):
+        for key in (
+            "TLLM_ADP_NEW_CONV_BALANCE",
+            "TLLM_ADP_STICKY_WAIT_ITERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size), new_conv_placement="least_queued"
+        )
+
+    @staticmethod
+    def _place_one_by_one(router, tp_size, n):
+        placed = []
+        for i in range(n):
+            states = [RankState(rank=r, num_active_requests=0) for r in range(tp_size)]
+            assign, _ = router.route_requests(
+                states, [_make_conv_request_item(i, f"c{i}")], max_num_active_requests=8
+            )
+            placed.append(next(r for r, items in assign.items() if items))
+        return placed
+
+    def test_least_queued_default_breaks_ties_to_rank_zero(self, monkeypatch):
+        router = self._router(monkeypatch)
+        assert self._place_one_by_one(router, 4, 6) == [0] * 6
+
+    def test_balance_spreads_new_conversations_over_idle_ranks(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_NEW_CONV_BALANCE="1")
+        assert self._place_one_by_one(router, 4, 8) == [0, 1, 2, 3, 0, 1, 2, 3]
+
+    def test_balance_live_conversations_expire(self, monkeypatch):
+        router = self._router(
+            monkeypatch, TLLM_ADP_NEW_CONV_BALANCE="1", TLLM_ADP_LIVE_CONV_WINDOW="2"
+        )
+        self._place_one_by_one(router, 4, 6)
+        assert sum(router._live_count) == 2
+
+    def test_sticky_wait_holds_request_for_full_home_rank(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_STICKY_WAIT_ITERS="2")
+        states = [RankState(rank=r, num_active_requests=0) for r in range(4)]
+        router.route_requests(states, [_make_conv_request_item(1, "A")], max_num_active_requests=2)
+        home = router._conv_to_rank["A"]
+
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        active = [0] * 4
+        active[home] = 2  # home rank at the cap
+        assert (
+            get_from_waiting_queue(
+                waiting_queue, 8, True, 2, all_ranks_num_active_requests=active, adp_router=router
+            )
+            == []
+        )
+        assert len(waiting_queue) == 1
+        # Released to the normal path once held TLLM_ADP_STICKY_WAIT_ITERS times.
+        get_from_waiting_queue(
+            waiting_queue, 8, True, 2, all_ranks_num_active_requests=active, adp_router=router
+        )
+        popped = get_from_waiting_queue(
+            waiting_queue, 8, True, 2, all_ranks_num_active_requests=active, adp_router=router
+        )
+        assert [item.id for item in popped] == [2]
+
+    def test_sticky_wait_admits_when_home_rank_has_room(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_STICKY_WAIT_ITERS="5")
+        states = [RankState(rank=r, num_active_requests=0) for r in range(4)]
+        router.route_requests(states, [_make_conv_request_item(1, "A")], max_num_active_requests=2)
+        home = router._conv_to_rank["A"]
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        active = [0] * 4
+        active[home] = 1
+        popped = get_from_waiting_queue(
+            waiting_queue, 8, True, 2, all_ranks_num_active_requests=active, adp_router=router
+        )
+        assert [item.id for item in popped] == [2]
+        assign, _ = router.route_requests(
+            [RankState(rank=r, num_active_requests=active[r]) for r in range(4)],
+            popped,
+            max_num_active_requests=2,
+        )
+        assert [item.id for item in assign[home]] == [2]
+
+    def test_knobs_off_keep_default_behavior(self, monkeypatch):
+        router = self._router(monkeypatch)
+        assert router.sticky_wait_target(_make_conv_request_item(1, "A")) is None
+
+    # The executor pops attention-DP requests through ``router.pop_requests`` and
+    # places them with ``route_requests``; the tests below drive that pair.
+
+    @staticmethod
+    def _bind(router, conv_id, home, tp_size=4):
+        """Route the first turn of ``conv_id`` so that it binds to ``home``."""
+        states = [
+            RankState(rank=r, num_active_requests=0 if r == home else 1) for r in range(tp_size)
+        ]
+        router.route_requests(states, [_make_conv_request_item(1, conv_id)], 8)
+        assert router._conv_to_rank[conv_id] == home
+
+    @staticmethod
+    def _fetch(router, waiting_queue, active, cap):
+        """One executor fetch: pop, then route what was popped."""
+        states = [RankState(rank=r, num_active_requests=n) for r, n in enumerate(active)]
+        popped, placement = router.pop_requests(waiting_queue, states, 64, cap)
+        assert placement == {}
+        assign, _ = router.route_requests(states, popped, cap, placement=placement)
+        return {item.id: r for r, items in assign.items() for item in items}
+
+    def test_full_home_rank_overflows_without_sticky_wait(self, monkeypatch):
+        router = self._router(monkeypatch)
+        self._bind(router, "A", home=2)
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        routed = self._fetch(router, waiting_queue, active=[0, 0, 2, 0], cap=2)
+        assert list(routed) == [2] and routed[2] != 2
+        assert router._conv_to_rank["A"] == 2  # an overflow does not rebind
+
+    def test_sticky_wait_keeps_turn_on_full_home_rank(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_STICKY_WAIT_ITERS="3")
+        self._bind(router, "A", home=2)
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        for _ in range(2):
+            assert self._fetch(router, waiting_queue, active=[0, 0, 2, 0], cap=2) == {}
+            assert len(waiting_queue) == 1
+        # A seat frees on the home rank before the wait runs out.
+        assert self._fetch(router, waiting_queue, active=[0, 0, 1, 0], cap=2) == {2: 2}
+        assert not waiting_queue
+        assert router._sticky_wait_counts == {}
+
+    def test_sticky_wait_releases_to_overflow_after_n_holds(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_STICKY_WAIT_ITERS="2")
+        self._bind(router, "A", home=2)
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        for _ in range(2):
+            assert self._fetch(router, waiting_queue, active=[0, 0, 2, 0], cap=2) == {}
+        routed = self._fetch(router, waiting_queue, active=[0, 0, 2, 0], cap=2)
+        assert list(routed) == [2] and routed[2] != 2
+        assert router._sticky_wait_counts == {}
+        assert router._conv_to_rank["A"] == 2
+
+    def test_sticky_wait_does_not_block_requests_behind_it(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_STICKY_WAIT_ITERS="5")
+        self._bind(router, "A", home=2)
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        waiting_queue.add_request(_make_conv_request_item(3, "B"))
+        routed = self._fetch(router, waiting_queue, active=[0, 0, 2, 0], cap=2)
+        assert list(routed) == [3] and routed[3] != 2
+        assert [item.id for item in waiting_queue.peek_requests(4)] == [2]
+
+    @pytest.mark.parametrize("sticky", [False, True])
+    def test_sticky_wait_routes_bound_turns_before_new_conversations(self, monkeypatch, sticky):
+        env = {"TLLM_ADP_STICKY_WAIT_ITERS": "5"} if sticky else {}
+        router = self._router(monkeypatch, tp_size=2, **env)
+        self._bind(router, "A", home=0, tp_size=2)
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(3, "X"))  # new conversation first
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        routed = self._fetch(router, waiting_queue, active=[1, 1], cap=2)
+        # Without the knob the new conversation takes the home rank's last seat.
+        assert routed == ({2: 0, 3: 1} if sticky else {3: 0, 2: 1})
+
+    def test_balance_spreads_new_conversations_across_fetches(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_NEW_CONV_BALANCE="1")
+        placed = []
+        for i in range(8):
+            waiting_queue = FCFSWaitingQueue()
+            waiting_queue.add_request(_make_conv_request_item(i, f"c{i}"))
+            placed += list(self._fetch(router, waiting_queue, active=[0] * 4, cap=8).values())
+        assert placed == [0, 1, 2, 3, 0, 1, 2, 3]
+
+    def test_other_routers_ignore_sticky_wait(self, monkeypatch):
+        monkeypatch.setenv("TLLM_ADP_STICKY_WAIT_ITERS", "5")
+        router = DefaultADPRouter(dist=_mock_dist(tp_size=2))
+        waiting_queue = FCFSWaitingQueue()
+        waiting_queue.add_request(_make_conv_request_item(2, "A"))
+        states = [RankState(rank=r, num_active_requests=1) for r in range(2)]
+        popped, _ = router.pop_requests(waiting_queue, states, 8, 2)
+        assert [item.id for item in popped] == [2]
+
+
+class TestConversationAwareADPRouterQueuedUncached:
+    """TRTLLM_ADP_NEW_CONV_BY_QUEUED_UNCACHED (default off): new conversations go
+    to the rank with the fewest queued uncached prompt tokens."""
+
+    ENV = "TRTLLM_ADP_NEW_CONV_BY_QUEUED_UNCACHED"
+
+    @classmethod
+    def _router(cls, monkeypatch, tp_size=4, enabled=True, has_cp_helix=False, **env):
+        for key in (
+            cls.ENV,
+            "TLLM_ADP_NEW_CONV_BALANCE",
+            "TLLM_ADP_STICKY_WAIT_ITERS",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        if enabled:
+            monkeypatch.setenv(cls.ENV, "1")
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size, has_cp_helix=has_cp_helix),
+            new_conv_placement="least_queued",
+        )
+
+    @staticmethod
+    def _route(router, queued, items, active=None, cap=8):
+        """One routing call with the given allgathered queued-uncached counts."""
+        tp_size = len(queued)
+        router._receive_routing_payloads({r: [q] for r, q in enumerate(queued)})
+        active = active or [0] * tp_size
+        states = [RankState(rank=r, num_active_requests=active[r]) for r in range(tp_size)]
+        assign, _ = router.route_requests(states, items, max_num_active_requests=cap)
+        return {item.id: r for r, routed in assign.items() for item in routed}
+
+    @staticmethod
+    def _ctx_request(req_id, prompt, position=0, probed_estimate=None):
+        req = Mock(
+            state=LlmRequestState.CONTEXT_INIT,
+            py_request_id=req_id,
+            py_orig_prompt_len=prompt,
+            context_current_position=position,
+            context_remaining_length=prompt - position,
+            py_uncached_prefill_probed=probed_estimate is not None,
+            py_uncached_prefill_tokens=probed_estimate,
+        )
+        return req
+
+    def test_new_conversation_goes_to_fewest_queued_uncached(self, monkeypatch):
+        router = self._router(monkeypatch)
+        routed = self._route(router, [40000, 9000, 200, 7000], [_make_conv_request_item(1, "A")])
+        assert routed == {1: 2}
+        assert router._conv_to_rank["A"] == 2
+
+    def test_ties_use_the_least_queued_rule(self, monkeypatch):
+        router = self._router(monkeypatch)
+        # Ranks 1 and 3 tie on queued tokens; least_queued takes the fewer active.
+        routed = self._route(
+            router, [500, 0, 900, 0], [_make_conv_request_item(1, "A")], active=[0, 1, 0, 0]
+        )
+        assert routed == {1: 3}
+
+    def test_ties_use_the_live_count_rule_under_balance(self, monkeypatch):
+        router = self._router(monkeypatch, TLLM_ADP_NEW_CONV_BALANCE="1")
+        router._live_count = [0, 3, 0, 1]
+        routed = self._route(router, [500, 0, 900, 0], [_make_conv_request_item(1, "A")])
+        assert routed == {1: 3}
+
+    def test_admissions_of_the_same_call_count(self, monkeypatch):
+        router = self._router(monkeypatch, tp_size=2)
+        items = [
+            _make_conv_request_item(1, "A", num_tokens=6000),
+            _make_conv_request_item(2, "B", num_tokens=6000),
+        ]
+        routed = self._route(router, [0, 1000], items)
+        assert routed == {1: 0, 2: 1}
+
+    def test_sticky_turn_stays_on_its_busy_home_rank(self, monkeypatch):
+        router = self._router(monkeypatch)
+        assert self._route(router, [0, 10, 10, 10], [_make_conv_request_item(1, "A")]) == {1: 0}
+        second = _make_conv_request_item(2, "A", num_tokens=20)
+        assert self._route(router, [90000, 0, 0, 0], [second]) == {2: 0}
+        # The sticky turn's estimate is its prompt growth on the home rank.
+        assert router._routed_uncached[2] == 10
+
+    def test_requests_without_conversation_keep_the_least_queued_rule(self, monkeypatch):
+        router = self._router(monkeypatch)
+        routed = self._route(
+            router, [0, 0, 0, 5], [_make_conv_request_item(1, None)], active=[3, 2, 2, 0]
+        )
+        assert routed == {1: 3}
+
+    def test_off_by_default(self, monkeypatch):
+        router = self._router(monkeypatch, enabled=False)
+        assert router._local_routing_payload([self._ctx_request(1, 100)]) == []
+        routed = self._route(
+            router, [40000, 9000, 200, 7000], [_make_conv_request_item(1, "A")], active=[0, 1, 1, 1]
+        )
+        assert routed == {1: 0}
+        assert router._routed_uncached == {}
+
+    def test_helix_turns_the_knob_off(self, monkeypatch):
+        router = self._router(monkeypatch, has_cp_helix=True)
+        assert router._new_conv_by_queued_uncached is False
+
+    def test_queued_uncached_tokens_of_a_rank(self, monkeypatch):
+        router = self._router(monkeypatch)
+        router._routed_uncached[11] = 3000
+        active = [
+            self._ctx_request(10, 9000, position=4096),  # mid-prefill: exact remainder
+            self._ctx_request(11, 150000),  # waiting: router estimate
+            self._ctx_request(12, 150000, probed_estimate=700),  # waiting: probed estimate
+            self._ctx_request(13, 5000),  # waiting, no estimate: whole prompt
+            Mock(state=LlmRequestState.GENERATION_IN_PROGRESS, py_request_id=14),
+        ]
+        assert router._local_routing_payload(active) == [4904 + 3000 + 700 + 5000]
+
+    def test_started_request_drops_its_router_estimate(self, monkeypatch):
+        router = self._router(monkeypatch)
+        router._routed_uncached[10] = 3000
+        router._local_routing_payload([self._ctx_request(10, 9000, position=1024)])
+        assert 10 not in router._routed_uncached
+
+    def test_gather_appends_and_strips_the_payload(self, monkeypatch):
+        router = self._router(monkeypatch, tp_size=2)
+        active = [self._ctx_request(10, 9000, position=1000)]
+        other = RankState(rank=1, num_active_requests=4, num_active_tokens=77)
+        router.dist.tp_allgather.side_effect = lambda payload: [
+            payload,
+            other.serialize() + [123],
+        ]
+        states = router.gather_all_rank_states(active_requests=active)
+        assert states[0].num_active_requests == 1
+        assert states[0].num_active_tokens == 9000
+        assert states[1] == other
+        assert router._queued_uncached_by_rank == {0: 8000, 1: 123}
+
+    def test_gather_payload_unchanged_when_off(self, monkeypatch):
+        router = self._router(monkeypatch, enabled=False)
+        router.dist.tp_allgather.side_effect = lambda payload: [payload]
+        states = router.gather_all_rank_states(active_requests=[self._ctx_request(10, 9000)])
+        sent = router.dist.tp_allgather.call_args[0][0]
+        assert sent == states[0].serialize()
+        assert router._queued_uncached_by_rank == {}
+
+
 class TestNumInputTokens:
     """The cheap token-count accessor used by the routers (avoids copying the
     full input_token_ids list just to count it)."""
@@ -1939,3 +2279,268 @@ class TestNumInputTokens:
                 raise AssertionError("input_token_ids must not be materialized")
 
         assert _num_input_tokens(_Req()) == 1234
+
+
+def _gen_item(
+    req_id,
+    num_tokens,
+    priority=DEFAULT_REQUEST_PRIORITY,
+    request_type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+):
+    request = SimpleNamespace(
+        num_input_tokens=num_tokens,
+        request_type=request_type,
+        py_scheduling_params=None,
+        py_conversation_params=None,
+        priority=priority,
+    )
+    return RequestQueueItem(req_id, request)
+
+
+def _gen_queue(token_counts):
+    return FCFSWaitingQueue([_gen_item(i, n) for i, n in enumerate(token_counts)])
+
+
+def _states(tokens, active):
+    return [
+        RankState(rank=r, num_active_requests=a, num_active_tokens=t)
+        for r, (t, a) in enumerate(zip(tokens, active))
+    ]
+
+
+def _ids(items):
+    return [item.id for item in items]
+
+
+def _kv_router(tp_size):
+    return DefaultADPRouter(dist=_mock_dist(tp_size=tp_size), kv_balanced_admission=True)
+
+
+@pytest.mark.parametrize(
+    "tokens,loads,counts,slots,budget,forced,groups,expected",
+    [
+        # More candidates than slots: closest to the mean load.
+        ([5000, 200, 1500], [15000, 6000], [3, 3], 4, 2, None, None, [(0, 1), (1, 0)]),
+        ([1, 2, 3, 4, 5], [0, 0, 0], [2, 0, 3], 2, 5, None, None, [(1, 1), (0, 1)]),
+        # The largest request count is not raised while another rank can take the request.
+        ([100, 100, 100], [0, 50000, 60000], [2, 1, 1], 16, 2, None, None, [(0, 1), (1, 2)]),
+        ([20000], [100000, 10000, 95000, 99000], [6, 4, 2, 2], 16, 1, None, None, [(0, 1)]),
+        # Whole window: largest first, best fit below the KV maximum.
+        ([1000, 9000], [0, 5000], [0, 0], 4, 4, None, None, [(1, 0), (0, 1)]),
+        ([30000], [100000, 20000, 60000], [4, 3, 3], 16, 1, None, None, [(0, 2)]),
+        # Forced candidates first.
+        ([9000, 100], [100, 50], [0, 0], 1, 1, [True, False], None, [(0, 1)]),
+        # Groups go in order, even against a better fit or a forced candidate.
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, None, [(1, 0)]),
+        ([9000, 100], [50000, 50000], [7, 8], 8, 1, None, [0, 1], [(0, 0)]),
+        ([300, 9000], [0, 0], [7, 8], 8, 1, [False, True], [0, 1], [(0, 0)]),
+        ([100, 200, 9000, 50], [0, 0], [0, 0], 8, 3, None, [0, 0, 1, 1], [(1, 0), (0, 1), (3, 0)]),
+        # Requests of different groups admitted together are placed largest first:
+        # best fit when the whole window is admitted, else the least-loaded rank.
+        ([1000, 50000], [100000, 0], [7, 7], 8, 2, None, [0, 1], [(1, 1), (0, 0)]),
+        ([1000, 50000, 3000], [100000, 0], [7, 7], 8, 2, None, [0, 1, 2], [(1, 1), (0, 0)]),
+        # A round of 7 admissions on 3 ranks may fill a rank up to ceil(7 / 3) = 3.
+        (
+            [90] + [10] * 6,
+            [0, 0, 0],
+            [0, 0, 0],
+            4,
+            7,
+            None,
+            None,
+            [(0, 0), (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 2)],
+        ),
+        ([1], [0], [0], 1, 0, None, None, []),
+    ],
+)
+def test_plan_kv_balanced_admission(tokens, loads, counts, slots, budget, forced, groups, expected):
+    forced = forced or [False] * len(tokens)
+    assert (
+        plan_kv_balanced_admission(tokens, forced, loads, counts, slots, budget, groups) == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens,loads,counts,slots,budget,forced,groups,expected",
+    [
+        # Within the KV ceiling (1.2 x the mean after admission) the fewest requests win.
+        ([100], [30000, 30000, 30000], [5, 3, 4], 16, 1, None, None, [(0, 1)]),
+        # Only rank 0 stays under the ceiling, even with the most requests.
+        ([100], [0, 50000, 60000], [2, 1, 1], 16, 1, None, None, [(0, 0)]),
+        # No rank fits: the least-KV rank, then the fewest requests.
+        ([90000], [0, 10, 10], [3, 0, 0], 16, 1, None, None, [(0, 0)]),
+        # Largest first; the ceiling then steers the small one away from the big one.
+        ([1000, 9000], [0, 0], [1, 0], 4, 4, None, None, [(1, 1), (0, 0)]),
+        # The first group that does not fit is taken in queue order, forced first.
+        ([9000, 100, 200], [0, 0], [7, 8], 8, 1, [False, True, False], None, [(1, 0)]),
+        ([9000, 100, 200], [0, 0], [6, 8], 8, 2, None, None, [(0, 0), (1, 0)]),
+    ],
+)
+def test_plan_kv_balanced_admission_count_first(
+    tokens, loads, counts, slots, budget, forced, groups, expected
+):
+    forced = forced or [False] * len(tokens)
+    assert (
+        plan_kv_balanced_admission(
+            tokens, forced, loads, counts, slots, budget, groups, count_first_slack=1.2
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [(None, None), ("0", None), ("1", 1.0), ("1.2", 1.2), ("0.5", ValueError), ("x", ValueError)],
+)
+def test_kv_balance_count_first_slack_env(monkeypatch, raw, expected):
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+        KV_BALANCE_COUNT_FIRST_ENV,
+        kv_balance_count_first_slack,
+    )
+
+    if raw is None:
+        monkeypatch.delenv(KV_BALANCE_COUNT_FIRST_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KV_BALANCE_COUNT_FIRST_ENV, raw)
+    if expected is ValueError:
+        with pytest.raises(ValueError):
+            kv_balance_count_first_slack()
+    else:
+        assert kv_balance_count_first_slack() == expected
+
+
+class TestDefaultADPRouterKVBalance:
+    @pytest.mark.parametrize(
+        "config,enabled",
+        [
+            (None, False),
+            (AttentionDpConfig(), False),
+            (AttentionDpConfig(enable_kv_balanced_admission=True), True),
+        ],
+    )
+    def test_config_turns_it_on(self, config, enabled):
+        router = ADPRouter.create(
+            dist=_mock_dist(tp_size=2), has_seq_slot_headroom=False, attention_dp_config=config
+        )
+        assert type(router) is DefaultADPRouter and router.kv_balanced_admission is enabled
+        chosen, placement = router.pop_requests(
+            _gen_queue([8000, 300, 400]), _states([20000, 21000], [8, 7]), 1, 8
+        )
+        assert (_ids(chosen), placement) == (([2], {2: 1}) if enabled else ([0], {}))
+
+    def test_pop_plans_the_rank_and_ages_the_rest(self):
+        router = _kv_router(2)
+        queue = _gen_queue([8000, 300, 400])
+        states = _states([20000, 21000], [8, 7])  # only rank 1 has a slot
+        chosen, placement = router.pop_requests(queue, states, 4, max_num_active_requests=8)
+        assert _ids(chosen) == [2] and placement == {2: 1} and _ids(queue) == [0, 1]
+        assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
+        # A round that admits nothing does not age.
+        assert router.pop_requests(queue, _states([0, 0], [8, 8]), 4, 8) == ([], {})
+        assert router._kv_balance_skipped_rounds == {0: 1, 1: 1}
+
+    def test_request_passed_over_too_often_is_admitted_next(self):
+        router = _kv_router(2)
+        router._kv_balance_skipped_rounds = {0: KV_BALANCE_MAX_SKIPPED_ROUNDS}
+        chosen, _ = router.pop_requests(
+            _gen_queue([8000, 300]), _states([20000, 21300], [7, 8]), 4, 8
+        )
+        assert _ids(chosen) == [0]
+        assert router._kv_balance_skipped_rounds == {1: 1}
+
+    def test_only_the_head_window_is_considered(self):
+        router = _kv_router(2)
+        # The best fit (10 tokens) sits just behind the window.
+        queue = _gen_queue([1000] * KV_BALANCE_WINDOW + [10])
+        chosen, _ = router.pop_requests(
+            queue, _states([0, 0], [0, 1]), 1, max_num_active_requests=1
+        )
+        assert _ids(chosen) == [0]
+
+    def test_burst_is_planned_in_one_round(self):
+        router = _kv_router(4)
+        queue = _gen_queue([1000 * (1 + i % 7) for i in range(2 * KV_BALANCE_WINDOW)])
+        chosen, placement = router.pop_requests(queue, _states([0] * 4, [0] * 4), 64, 16)
+        assert len(chosen) == 2 * KV_BALANCE_WINDOW and not queue
+        assert set(placement) == set(_ids(chosen))
+
+    @pytest.mark.parametrize(
+        "case", ["config_off", "kv_balance_off", "context_request", "single_rank"]
+    )
+    def test_fifo_fallback(self, case):
+        single_rank = case == "single_rank"
+        router = DefaultADPRouter(
+            dist=_mock_dist(tp_size=1 if single_rank else 2),
+            kv_balanced_admission=case != "config_off",
+        )
+        queue = _gen_queue([8000, 300, 400])
+        if case == "context_request":
+            context_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
+            queue.append(_gen_item(3, 400, request_type=context_type))
+        states = _states([0], [7]) if single_rank else _states([20000, 21000], [8, 7])
+        chosen, placement = router.pop_requests(
+            queue, states, 1, 8, kv_balance=case != "kv_balance_off"
+        )
+        assert _ids(chosen) == [0] and placement == {}
+        assert router._kv_balance_skipped_rounds == {}
+
+    def test_route_follows_the_plan_and_uses_the_heap_without_one(self):
+        router = _kv_router(2)
+        items = [_gen_item(i, n) for i, n in enumerate([9000, 3000, 3000, 3000])]
+        states = _states([0, 0], [0, 0])
+        assignment, expected = router.route_requests(states, items, 4)
+        assert [len(assignment[r]) for r in range(2)] == [2, 2] and expected == 2
+        plan = {item.id: 1 for item in items}
+        assignment, expected = router.route_requests(states, items, 4, plan)
+        assert assignment == {0: [], 1: items} and expected == 4
+
+    def test_no_capacity_does_not_touch_the_queue(self):
+        class _UntouchableQueue(FCFSWaitingQueue):
+            def peek_requests(self, k):
+                raise AssertionError("queue read without capacity")
+
+            def __iter__(self):
+                raise AssertionError("queue read without capacity")
+
+        router = _kv_router(2)
+        queue = _UntouchableQueue([_gen_item(i, 100) for i in range(4)])
+        assert router.pop_requests(queue, _states([0, 0], [0, 0]), 0, 8) == ([], {})
+
+    def test_requests_not_admitted_keep_their_queue_order(self):
+        items = [_gen_item(i, 8000 if i % 3 else 300, priority=(i * 3 % 4) / 10) for i in range(40)]
+        queue = FCFSWaitingQueue(items)
+        order = _ids(queue)
+        router = _kv_router(2)
+        admitted, _ = router.pop_requests(queue, _states([20000, 21000], [7, 7]), 2, 8)
+        chosen = set(_ids(admitted))
+        assert len(chosen) == 2 and chosen <= set(order[:KV_BALANCE_WINDOW])
+        assert [queue.pop_request().id for _ in range(len(queue))] == [
+            i for i in order if i not in chosen
+        ]
+
+    def test_trickle_fill_keeps_the_largest_request_count_at_the_fair_share(self):
+        """Gen-only fill without departures: no rank goes above ceil(requests / ranks)."""
+        num_ranks, slots = 16, 16
+        rng = random.Random(0)
+        router = _kv_router(num_ranks)
+        tokens, counts = [0] * num_ranks, [0] * num_ranks
+        queue = FCFSWaitingQueue()
+        next_id = 0
+        while next_id < num_ranks * slots or queue:
+            for _ in range(min(rng.choice([1, 2]), num_ranks * slots - next_id)):
+                queue.append(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
+                next_id += 1
+            states = _states(tokens, counts)
+            chosen, placement = router.pop_requests(queue, states, len(queue), slots)
+            assignment, _ = router.route_requests(states, chosen, slots, placement)
+            for rank, items in assignment.items():
+                counts[rank] += len(items)
+                tokens[rank] += sum(item.request.num_input_tokens for item in items)
+            assert max(counts) == -(-sum(counts) // num_ranks), counts
+        assert counts == [slots] * num_ranks
+
+    def test_affinity_routers_keep_fifo_admission(self):
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        queue = _gen_queue([8000, 300, 400])
+        chosen, placement = router.pop_requests(queue, _states([20000, 21000], [8, 7]), 1, 8)
+        assert _ids(chosen) == [0] and placement == {}

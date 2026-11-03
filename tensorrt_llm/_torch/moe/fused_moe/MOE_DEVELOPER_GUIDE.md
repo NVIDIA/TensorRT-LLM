@@ -53,7 +53,7 @@ def forward_impl(self, x, router_logits, ...):
         self.dwdp_manager.wait_and_bind(self.backend, self.layer_idx)
     outputs = self.scheduler.forward(x, router_logits, ...)
     if self.enable_dwdp:
-        self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+        self.dwdp_manager.finish_layer(self.layer_idx)
     self.repeat_idx = (self.repeat_idx + 1) % self.repeat_count
     return outputs
 ```
@@ -79,12 +79,17 @@ Executor construction
   → after weight loading: create VMM transport + composite VA + page pool
 
 PyExecutor forward start
-  → DwdpManager.prefetch_first_layers() for the first two MoE layers
+  → DwdpManager.start_forward(): first MoE layers, unless the previous
+    pass already prefetched them
   → ConfigurableMoE.wait_and_bind(composite VA)
   → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
   → main stream joins scheduler auxiliary work
   → DwdpManager records current-slot consumption
-  → prefetch the MoE layer two positions ahead
+  → prefetch the next MoE layer in the cyclic sequence whose slot is now free
+    (the last layers of a pass prefetch the first layers of the next pass)
+
+Control action (weight update, sleep/wakeup)
+  → DwdpManager.invalidate_prefetch()
 
 Executor shutdown or construction rollback
   → detach model references

@@ -8,6 +8,14 @@ config. The top-level Kimi K3 checkpoints use a composite VLM config
 (``model_type: kimi_k3``) whose ``text_config`` is this class;
 ``load_pretrained_config`` flattens the composite config to this text config
 (TRT-LLM runs the text model only).
+
+Kimi K3.1 adds an optional ``dsa_config``: its MLA layers carry a DeepSeek
+sparse-attention (DSA) indexer that selects the ``index_topk`` cached tokens
+each query attends to.
+
+``kda_fp32_gate_params`` keeps the KDA layers' ``A_log`` and ``dt_bias`` at the
+checkpoint's fp32 instead of rounding them to bf16 with the rest of the KDA
+mixer. It is off for Kimi K3 and set for Kimi K3.1 checkpoints.
 """
 
 from typing import Optional
@@ -66,6 +74,8 @@ class KimiLinearConfig(PretrainedConfig):
         max_position_embeddings: int = 4096,
         routed_expert_hidden_size: Optional[int] = None,
         topk_method: str = "noaux_tc",
+        dsa_config: Optional[dict] = None,
+        kda_fp32_gate_params: bool = False,
         **kwargs,
     ):
         # NOTE: unlike the checkpoint-shipped config class, do not accept a
@@ -126,6 +136,18 @@ class KimiLinearConfig(PretrainedConfig):
             assert linear_attn_config["full_attn_layers"] is not None
         self.linear_attn_config = linear_attn_config
 
+        if dsa_config is not None:
+            assert dsa_config["dsa_layers"] is not None
+            # The reference defaults to an RMSNorm key norm; only LayerNorm is implemented.
+            k_norm_type = dsa_config.get("index_k_norm_type", "rmsnorm")
+            if k_norm_type != "layernorm":
+                raise NotImplementedError(
+                    f"dsa_config.index_k_norm_type={k_norm_type!r} is not supported; "
+                    "the DSA indexer key norm is a LayerNorm."
+                )
+        self.dsa_config = dsa_config
+        self.kda_fp32_gate_params = kda_fp32_gate_params
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -173,3 +195,43 @@ class KimiLinearConfig(PretrainedConfig):
             self.linear_attn_config is not None
             and (layer_idx + 1) in self.linear_attn_config["full_attn_layers"]
         )
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """0-indexed layer check; ``dsa_layers`` is 1-indexed."""
+        return self.dsa_config is not None and (layer_idx + 1) in self.dsa_config["dsa_layers"]
+
+    def _dsa_value(self, name: str, default=None):
+        if self.dsa_config is None:
+            return default
+        return self.dsa_config.get(name, default)
+
+    # DSA indexer fields under the flat names the sparse-attention config
+    # resolves from the pretrained config (DeepSeek-V3.2 spells them this way).
+    @property
+    def index_n_heads(self) -> Optional[int]:
+        return self._dsa_value("index_num_heads")
+
+    @property
+    def index_head_dim(self) -> Optional[int]:
+        return self._dsa_value("index_head_dim")
+
+    @property
+    def index_topk(self) -> Optional[int]:
+        return self._dsa_value("index_topk")
+
+    @property
+    def index_rope_dim(self) -> Optional[int]:
+        return self._dsa_value("index_rope_dim")
+
+    @property
+    def index_k_norm_eps(self) -> Optional[float]:
+        # The indexer key LayerNorm uses the model's norm epsilon.
+        return None if self.dsa_config is None else self.rms_norm_eps
+
+    @property
+    def index_topk_freq(self) -> int:
+        return self._dsa_value("index_topk_freq", 1)
+
+    @property
+    def index_skip_topk_offset(self) -> int:
+        return self._dsa_value("index_skip_topk_offset", 2)

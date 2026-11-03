@@ -95,6 +95,12 @@ TestStep3p7SpeculativeDecoding::test_step3p7_mtp:
 TestKimiK3DSpark::test_gsm8k_tep8:
   ref_al: 4.323
   min_al: 4.0
+TestKimiK31::test_gsm8k_dep16:
+  ref_al: 3.9295
+  min_al: 3.733
+TestKimiK31::test_gsm8k_tep8:
+  ref_al: 3.8917
+  min_al: 3.6971
 disagg::TestDeepSeekV3Lite::test_auto_dtype:
   ref_al: 2.581477287026551
   min_al: 2.452403422675223

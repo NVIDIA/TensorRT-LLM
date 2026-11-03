@@ -187,3 +187,50 @@ def validate_dflash_trtllm_gen_runtime(
         raise RuntimeError(
             f"DFlash TRTLLM context attention does not support head dimension {head_dim}."
         )
+
+
+# FP8 E4M3 storage of an MLA drafter's context latent: one per-tensor scale of
+# 1.0 for the latent and for the query that reads it -- the scheme of the
+# target MLA's FP8 KV cache without calibrated kv scales (quant_scale_kv and
+# quant_scale_q default to 1, bmm1_scale = softmax_scale * dq_q * dq_kv,
+# bmm2_scale = dq_kv). Values saturate at the format's largest finite value, as
+# the target's FP8 cache writes do, instead of overflowing to NaN.
+DRAFT_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+DRAFT_FP8_KV_SCALE = 1.0
+
+
+def to_draft_fp8(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as saturated FP8 E4M3 at the drafter's unit per-tensor scale."""
+    return x.clamp(-DRAFT_FP8_MAX, DRAFT_FP8_MAX).to(torch.float8_e4m3fn)
+
+
+@dataclass(frozen=True)
+class HelixDraftShard:
+    """One rank's share of a drafter's paged context KV under helix.
+
+    Global page ``g`` of a request belongs to CP rank ``g % cp_size``, which
+    stores its pages back to back: local page ``g // cp_size``. Every helper
+    maps global token positions or lengths into that rank-local layout.
+    """
+
+    cp_size: int
+    cp_rank: int
+    page_size: int
+
+    def local_slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rank-local slot of each global position, and whether this rank owns it.
+
+        An unowned position maps to the slot this rank keeps for the token one
+        or more pages away, never one of the ``page_size`` tokens around it.
+        """
+        page = torch.div(positions, self.page_size, rounding_mode="floor")
+        slots = torch.div(page, self.cp_size, rounding_mode="floor") * self.page_size
+        return slots + positions % self.page_size, page % self.cp_size == self.cp_rank
+
+    def local_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        """Number of owned positions below each global length."""
+        span = self.page_size * self.cp_size
+        rem = lengths % span - self.cp_rank * self.page_size
+        return torch.div(lengths, span, rounding_mode="floor") * self.page_size + rem.clamp(
+            0, self.page_size
+        )

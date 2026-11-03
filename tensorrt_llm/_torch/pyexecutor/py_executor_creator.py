@@ -72,6 +72,7 @@ _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
     f"SM{sm_version}"
     for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 FP4_MLA_TOKENS_PER_BLOCK = 128
+FP4_MLA_QUANTIZATION_TILE_SIZE = 16
 
 
 class _ExecutorMemoryMonitor:
@@ -342,6 +343,22 @@ def _branch_snapshot_ctx_chunk_config(
     chunk_unit_size = (ctx_chunk_config[1]
                        if ctx_chunk_config is not None else tokens_per_block)
     return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+
+
+def _validate_fp4_mla_chunk_size(
+    model_config,
+    *,
+    enable_chunked_prefill: bool,
+    max_num_tokens: int,
+) -> None:
+    """Require tile-aligned non-final chunks for dense FP4 MLA cache writes."""
+    if (enable_chunked_prefill and uses_fp4_mla_attention(model_config)
+            and max_num_tokens % FP4_MLA_QUANTIZATION_TILE_SIZE != 0):
+        raise ValueError(
+            "Dense NVFP4 MLA chunked prefill requires max_num_tokens to be "
+            f"a multiple of {FP4_MLA_QUANTIZATION_TILE_SIZE}, got "
+            f"{max_num_tokens}. Only the final chunk may contain a partial "
+            "FP4 quantization tile backed by the HP pool.")
 
 
 def _get_mapping(_mapping: Mapping) -> Mapping:
@@ -761,6 +778,13 @@ def _create_py_executor(
                 "tp_size=1 (disaggregated context worker) or "
                 "enable_attention_dp=True (aggregated serving), but got "
                 f"tp_size={mapping.tp_size}, dp_size={mapping.dp_size}.")
+        # The host issues the expert prefetch as the MoE layers run, and the
+        # last layers of a pass already prefetch the next pass; a replayed
+        # CUDA graph would bind buffer slots the host schedule does not track.
+        if llm_args.cuda_graph_config is not None:
+            raise ValueError(
+                "DWDP does not support CUDA graphs; set cuda_graph_config=None."
+            )
         dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
@@ -861,12 +885,6 @@ def _create_py_executor(
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FP4 MLA attention"
             )
-            if kv_cache_config.enable_block_reuse:
-                logger.warning(
-                    "FP4 MLA cached-context attention is not supported yet; "
-                    "disabling KV cache block reuse.")
-                kv_cache_config.enable_block_reuse = False
-                model_engine.attn_runtime_features.cache_reuse = False
         elif model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
             # Propagate the override back to kv_cache_config so any consumer
@@ -898,13 +916,15 @@ def _create_py_executor(
                                     and getattr(sparse_attention_config,
                                                 "algorithm", None)
                                     in ("dsa", "deepseek_v4"))
+        fp4_mla_cache_reuse = uses_fp4_mla_attention(
+            model_engine.model.model_config)
         if kv_cache_config.enable_block_reuse and not (
                 kv_cache_quant_algo is None or kv_cache_quant_algo
                 == QuantAlgo.NO_QUANT or kv_cache_quant_algo == QuantAlgo.FP8
-                or nvfp4_sparse_cache_reuse):
+                or nvfp4_sparse_cache_reuse or fp4_mla_cache_reuse):
             logger.warning(
                 f"KV cache reuse for MLA can only be enabled without KV cache quantization, with FP8 quantization, "
-                f"or with NVFP4 quantization on the DSA or DeepSeek-V4 sparse paths, "
+                f"or with NVFP4 quantization on the dense FP4 MLA, DSA or DeepSeek-V4 sparse paths, "
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
@@ -929,6 +949,12 @@ def _create_py_executor(
             "encoder tokens or input discriminator to key cache entries.")
         kv_cache_config.enable_block_reuse = False
         model_engine.attn_runtime_features.cache_reuse = False
+
+    _validate_fp4_mla_chunk_size(
+        model_engine.model.model_config,
+        enable_chunked_prefill=enable_chunked_context,
+        max_num_tokens=max_num_tokens,
+    )
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a

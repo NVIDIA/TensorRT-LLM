@@ -173,6 +173,9 @@ class DisaggServerConfig():
     # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
     # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
+    # Address used only by the implicit coordinator listener. This is separate
+    # from hostname, which remains the public/advertised fleet address.
+    coordinator_bind_host: Optional[str] = None
     # HTTP keep-alive timeout (seconds) of the uvicorn listeners: the
     # client-facing one, plus the coordinator's when it runs in-process.
     # Raise it (e.g. 3600) when clients hold large idle connection pools and hit
@@ -184,6 +187,10 @@ class DisaggServerConfig():
     conversation_affinity_header_for_subagents: Optional[str] = None
     # Apply parent affinity to context only (default), or context and generation.
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
+
+    @property
+    def effective_coordinator_bind_host(self) -> str:
+        return self.coordinator_bind_host or self.hostname
 
 
 @dataclass
@@ -274,6 +281,7 @@ def extract_disagg_cfg(
         gen_tokids_ctxbytes: bool = False,
         num_workers: int = 1,
         disagg_coordinator_url: Optional[str] = None,
+        coordinator_bind_host: Optional[str] = None,
         server_keep_alive_timeout: int = 10,
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
@@ -352,6 +360,7 @@ def extract_disagg_cfg(
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url
+    config.coordinator_bind_host = coordinator_bind_host
     config.server_keep_alive_timeout = validate_config_non_negative_int(
         server_keep_alive_timeout, "server_keep_alive_timeout")
     config.internal_request_auth_key = internal_request_auth_key

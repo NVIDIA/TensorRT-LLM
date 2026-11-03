@@ -29,6 +29,7 @@ from .config import (
     _fp4_mla_cutedsl_fused_v_transpose_enabled,
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
+    ull2_mla_decode_pdl_enabled,
 )
 from .layout import (
     _ensure_workspace_tensor,
@@ -784,12 +785,18 @@ def _run_cutedsl_packed_decode(
     helix_kv_bounds: torch.Tensor | None,
     softmax_stats_tensor: torch.Tensor | None,
     plan_geometry: _PackedPlanGeometry | None = None,
+    metadata_launches: int | None = None,
 ) -> None:
     """Packed CuTe DSL decode: one kernel over (split, request) tasks.
 
     A single split writes the output (and Helix stats) directly; several
-    splits write FP32 partials that one reduction kernel folds into the
-    output and stats. Nothing pads, replicates, or copies Q or the output.
+    splits write partials (FP32, or normalized FP16 with
+    ``TRTLLM_FP4_MLA_F16_PARTIALS=1``) that one reduction kernel folds into
+    the output and stats. Nothing pads, replicates, or copies Q or the output.
+
+    ``metadata_launches`` is the metadata-launch count when the decode call began; with
+    ``TRTLLM_K3_ULL2_MLA_DEC_PDL`` the decode is launched programmatically only if no
+    metadata kernel was launched since and the query rows come from another kernel.
     """
     valid_m, physical_m = module.packed_query_rows(num_heads, query_len)
     if physical_m != rows_per_seq:
@@ -815,6 +822,13 @@ def _run_cutedsl_packed_decode(
         if plan_geometry is None:
             raise RuntimeError("FP4 MLA packed decode requires generation cache pages.")
     splits = plan_geometry.splits
+    state = metadata.fp4_mla_state
+    use_pdl_wait = (
+        ull2_mla_decode_pdl_enabled()
+        and metadata_launches is not None
+        and state.q_rows_external
+        and (state.query_launch_mark is None or state.query_launch_mark == metadata_launches)
+    )
     output_rows = output.view(num_requests * valid_m, 512)
     stats_rows = None
     if softmax_stats_tensor is not None:
@@ -844,11 +858,19 @@ def _run_cutedsl_packed_decode(
             kv_lens,
             output_rows,
             softmax_stats=stats_rows,
+            pdl_wait=use_pdl_wait and state.metadata_launches == metadata_launches,
             **common,
         )
         return
-    from .fp4_mla_packed_reduce import reduce_packed_splits
+    from .fp4_mla_packed_reduce import (
+        f16_partials_enabled,
+        reduce_packed_splits,
+        reduce_pdl_enabled,
+    )
 
+    reduce_pdl = reduce_pdl_enabled()
+    launch_dependents = reduce_pdl
+    f16_partials = f16_partials_enabled()
     tasks = splits * num_requests
     task_capacity = plan_geometry.task_capacity
     plan = plan_geometry.plan
@@ -858,9 +880,9 @@ def _run_cutedsl_packed_decode(
         _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
     partial = _ensure_workspace_tensor(
         metadata,
-        "_fp4_mla_packed_split_partial",
+        "_fp4_mla_packed_split_partial_f16" if f16_partials else "_fp4_mla_packed_split_partial",
         (task_capacity, physical_m, 512),
-        dtype=torch.float32,
+        dtype=torch.float16 if f16_partials else torch.float32,
         device=device,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
@@ -891,6 +913,8 @@ def _run_cutedsl_packed_decode(
         output_rows,
         split_kv_buffers=(partial, maxima, sums),
         plan=plan,
+        launch_dependents=launch_dependents,
+        pdl_wait=use_pdl_wait and state.metadata_launches == metadata_launches,
         **common,
     )
     reduce_packed_splits(
@@ -906,9 +930,11 @@ def _run_cutedsl_packed_decode(
         physical_m=physical_m,
         sm_scale=sm_scale,
         plan=plan,
-        output_scale=1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
+        # FP16 partials are already in output units.
+        output_scale=1.0 if f16_partials else 1.0 / module.FP4_MLA_P_GLOBAL_SCALE,
         stats=stats_rows,
         sm_count=_get_sm_count(device),
+        use_pdl=reduce_pdl,
     )
 
 
@@ -938,6 +964,7 @@ def run_fp4_mla_attention_decode(
     and scales produced by the fused generation cache update.
     """
     head_dim = kv_lora_rank + qk_rope_head_dim
+    metadata_launches = getattr(getattr(metadata, "fp4_mla_state", None), "metadata_launches", 0)
     if qk_rope_head_dim != FP4_MLA_K_RESIDUAL_DIM:
         raise ValueError(
             "FP4 MLA K residual attention requires "
@@ -1292,6 +1319,7 @@ def run_fp4_mla_attention_decode(
                 helix_kv_bounds=helix_kv_bounds,
                 softmax_stats_tensor=softmax_stats_tensor,
                 plan_geometry=plan_geometry,
+                metadata_launches=metadata_launches,
             )
             return
 

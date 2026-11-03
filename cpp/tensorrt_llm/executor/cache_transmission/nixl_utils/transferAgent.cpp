@@ -907,6 +907,19 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     // falls within a single cuMemCreate allocation (required by gdr_copy / cuda_ipc).
     size_t detectedChunkSize = 0;
     auto splitDescs = VmmDescSplitter::splitVmmDescs(descs, detectedChunkSize);
+    if (descs.getType() == MemoryType::kVRAM)
+    {
+        // Each registered region is one cuda_ipc export that every peer writing here maps separately.
+        size_t totalBytes = 0;
+        for (auto const& desc : descs.getDescs())
+        {
+            totalBytes += desc.getLen();
+        }
+        TLLM_LOG_INFO(
+            "NixlTransferAgent::registerMemory: %zu VRAM descriptors (%zu MiB) -> %zu registered regions "
+            "(largest VMM chunk %zu MiB)",
+            descs.getDescs().size(), totalBytes >> 20, splitDescs.getDescs().size(), detectedChunkSize >> 20);
+    }
 
     // Record per-desc VMM chunk info for use in deregisterMemory / submitTransferRequests
     auto detectedRegionMap = VmmDescSplitter::detectVramRegionMap(descs);
@@ -932,12 +945,14 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(splitDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
 
-    // Remove entries from registry
+    // Remove entries from registry: every region (run of equal chunks) the desc was registered as
     if (descs.getType() == MemoryType::kVRAM)
     {
         for (auto const& desc : descs.getDescs())
         {
-            mLocalVramRegionInfo.erase(desc.getAddr());
+            auto const end = desc.getAddr() + std::max<size_t>(desc.getLen(), 1);
+            mLocalVramRegionInfo.erase(
+                mLocalVramRegionInfo.lower_bound(desc.getAddr()), mLocalVramRegionInfo.lower_bound(end));
         }
     }
 }

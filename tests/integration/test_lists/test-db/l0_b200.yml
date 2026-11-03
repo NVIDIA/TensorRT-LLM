@@ -179,6 +179,7 @@ l0_b200:
   - unittest/_torch/moe/test_workspace_cuda.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
+  - unittest/_torch/modeling/test_kimi_k31_load_quantization.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
@@ -199,6 +200,9 @@ l0_b200:
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies; the peer-GPU gather
+  # cases skip below 2 GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
@@ -211,6 +215,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/kernels/parallel/test_kimi_k3_moe_input_glue.py
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/moe/test_megamoe_streaming_load.py

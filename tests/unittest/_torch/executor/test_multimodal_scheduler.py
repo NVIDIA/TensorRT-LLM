@@ -925,7 +925,7 @@ def test_mm_admission_does_not_charge_ready_active_request():
     waiting = FCFSWaitingQueue([_waiting_item(2, [8])])
     executor = _executor_for_mm_admission([active])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == [2]
     assert not waiting
@@ -943,7 +943,7 @@ def test_mm_admission_charges_only_eligible_active_items(chunk_unit, eager, expe
     executor.scheduler.context_chunk_unit_size = chunk_unit
     executor.scheduler.prepares_future_items = eager
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == expected_admitted
     assert [item.id for item in waiting] == ([] if expected_admitted else [2])
@@ -960,7 +960,7 @@ def test_mm_admission_charges_next_chunk_after_context_advance() -> None:
     executor = _executor_for_mm_admission([active], max_batch_size=1, max_num_tokens=4)
     executor.scheduler.context_chunk_unit_size = 2
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert not admitted
     assert [item.id for item in waiting] == [2, 3]
@@ -970,7 +970,7 @@ def test_mm_admission_passes_oversized_request_to_validation():
     waiting = FCFSWaitingQueue([_waiting_item(1, [9]), _waiting_item(2, None)])
     executor = _executor_for_mm_admission([], max_num_tokens=8)
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1, 2]
     assert not waiting
@@ -982,7 +982,7 @@ def test_mm_admission_uses_active_request_state_snapshot():
     waiting = FCFSWaitingQueue([_waiting_item(2, [4])])
     executor = _executor_for_mm_admission([active])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 1)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 1)
 
     assert [item.id for item in admitted] == [2]
     assert not waiting
@@ -994,7 +994,7 @@ def test_mm_admission_passes_malformed_metadata_to_validation():
     waiting = FCFSWaitingQueue([malformed, _waiting_item(2, [8])])
     executor = _executor_for_mm_admission([])
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1, 2]
     assert not waiting
@@ -1004,7 +1004,7 @@ def test_mm_admission_respects_encoder_batch_size():
     waiting = FCFSWaitingQueue([_waiting_item(1, [1, 1]), _waiting_item(2, [1])])
     executor = _executor_for_mm_admission([], max_batch_size=1)
 
-    admitted = executor._pop_from_waiting_queue(waiting, 0)
+    admitted, _ = executor._pop_from_waiting_queue(waiting, 0)
 
     assert [item.id for item in admitted] == [1]
     assert [item.id for item in waiting] == [2]
@@ -1230,6 +1230,7 @@ def _make_v2_multimodal_scheduler(
     kv_allocated = {}
     manager = Mock(spec=KVCacheManagerV2)
     manager.context_replay_tokens.return_value = None
+    manager.can_share_inflight_prefix = False
     manager.tokens_per_block = 10
     manager.enable_block_reuse = False
     manager.enable_joint_kv_cache_reuse = False
@@ -1621,3 +1622,70 @@ def test_v2_shared_cache_entry_does_not_block_older_context(
     stats = cache.stats()
     assert stats.reserved_bytes == stats.in_use_bytes == 0
     assert stats.current_bytes == (3 * _BYTES_PER_ROW if retain_cache_entries else 0)
+
+
+def test_wrapped_v2_waits_for_finished_senders_instead_of_deadlocking():
+    """A disaggregated context server keeps finished sends' KV pinned off the active list.
+
+    PyExecutor hands the transfer manager to whichever scheduler it holds. The
+    wrapper must pass it on, or the V2 deadlock detector reads the wait for
+    those pages as a deadlock and kills the server.
+    """
+    scheduler, allocated = _make_v2_multimodal_scheduler(
+        kv_capacity=40, max_num_tokens=40, encoder_max_num_tokens=4, encoder_batch_size=1
+    )
+    v2_scheduler = scheduler.scheduler
+    manager = v2_scheduler.kv_cache_manager
+    manager.kv_connector_manager = None
+    manager.has_cache_tier_below_gpu = True
+    manager.has_pending_preemption.return_value = False
+    v2_scheduler._DEADLOCK_STALL_ITERS = 3
+    transfer_manager = Mock()
+    transfer_manager.has_any_inflight_requests.return_value = True
+    assert hasattr(scheduler, "set_async_transfer_manager")
+    scheduler.set_async_transfer_manager(transfer_manager)
+    # Two sent requests hold the whole pool after leaving active_requests.
+    allocated[100] = 20
+    allocated[101] = 20
+    waiting = _make_v2_request(1, 20)
+
+    for _ in range(v2_scheduler._DEADLOCK_STALL_ITERS + 2):
+        assert scheduler.schedule_request([waiting], set()).context_requests == []
+    assert v2_scheduler._stalled_schedules == 0
+
+    # One send lands and its pages return.
+    allocated.pop(100)
+    output = scheduler.schedule_request([waiting], set())
+    assert [request.py_request_id for request in output.context_requests] == [1]
+
+
+def test_wrapped_v2_still_reports_a_deadlock_with_no_send_in_flight():
+    scheduler, allocated = _make_v2_multimodal_scheduler(
+        kv_capacity=40, max_num_tokens=40, encoder_max_num_tokens=4, encoder_batch_size=1
+    )
+    v2_scheduler = scheduler.scheduler
+    manager = v2_scheduler.kv_cache_manager
+    manager.kv_connector_manager = None
+    manager.has_cache_tier_below_gpu = True
+    manager.has_pending_preemption.return_value = False
+    v2_scheduler._DEADLOCK_STALL_ITERS = 3
+    transfer_manager = Mock()
+    transfer_manager.has_any_inflight_requests.return_value = False
+    scheduler.set_async_transfer_manager(transfer_manager)
+    allocated[100] = 40
+    waiting = _make_v2_request(1, 20)
+
+    for _ in range(v2_scheduler._DEADLOCK_STALL_ITERS - 1):
+        scheduler.schedule_request([waiting], set())
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        scheduler.schedule_request([waiting], set())
+
+
+def test_wrapper_exposes_the_v2_long_prefill_demotion_threshold(monkeypatch):
+    """PyExecutor reads it to decide whether the router publishes prefill estimates."""
+    monkeypatch.setenv("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "4096")
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=40, max_num_tokens=40, encoder_max_num_tokens=4, encoder_batch_size=1
+    )
+    assert scheduler.scheduler.ctx_demote_uncached_tokens == 4096
+    assert scheduler.ctx_demote_uncached_tokens == 4096

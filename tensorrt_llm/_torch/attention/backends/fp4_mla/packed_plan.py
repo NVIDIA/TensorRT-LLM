@@ -13,6 +13,7 @@ from .config import (
     _FP4_MLA_SPLIT_KV_ENV,
     FP4_MLA_SCALE_ROW_GROUP,
     _ceil_div,
+    _count_fp4_mla_metadata_launch,
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
 )
@@ -217,6 +218,7 @@ def _launch_fp4_mla_packed_plan(
     """Write the step's packed split plan, fused with the generation lengths when given."""
     from .fp4_mla_packed_reduce import launch_packed_plan
 
+    _count_fp4_mla_metadata_launch(metadata)
     launch_packed_plan(
         kv_lens,
         geometry.plan,

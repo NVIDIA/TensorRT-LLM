@@ -17,11 +17,12 @@ cache-slot indexing, and speculative-verification state handling directly.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from fla.modules import ShortConvolution
@@ -30,11 +31,20 @@ from torch import nn
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
+from ...cute_dsl_utils import sm_reserve
 from ...distributed import AllReduce, AllReduceStrategy
+from ...distributed.ops import (
+    LamportPending,
+    LamportResult,
+    bf16_oproj_ar_finish_enabled,
+    push_bf16_projection,
+)
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
 from ..linear import Linear
+from ..low_m_gemm import planned_low_m_linear
+from ..low_m_gemm_plans import kimi_k31_decode_plan
 from ..mamba.causal_conv1d import causal_conv1d_fn
 from ..mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
 from ..mamba.layernorm_gated import RMSNorm, rms_norm_gated_token_major
@@ -45,6 +55,9 @@ from ._kda_kernels import KDAKernelDispatch, fused_kda_post_conv
 if TYPE_CHECKING:
     from ..mamba.mamba2_metadata import Mamba2Metadata
 
+if TYPE_CHECKING:
+    from .kimi_k3_mamba_metadata import KDASnapshotPlan
+
 _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "1") == "1"
 # Heuristic ported from SGLang's Blackwell cutoff:
 # https://github.com/sgl-project/sglang/blob/e84bbf68efb683c9e2eef4168c5198042544599d/python/sglang/srt/models/kimi_k3.py#L946-L954
@@ -52,6 +65,47 @@ _KDA_INDEXED_STATE_POOL_ENABLED = os.environ.get("TLLM_KDA_ENABLE_INDEXED_STATE_
 # projection kernels. Verify intentionally counts B * num_steps because those
 # flattened token rows form the projection GEMMs' M dimension.
 _KDA_BFA_MULTISTREAM_MAX_ROWS = 128
+# Kimi K3.1 verify projections with more rows than the aux-first minimum issue the [f_a | b] -> f_b chain on the
+# aux stream before the qkvg GEMM: otherwise the gate GEMMs only get SMs once the wide qkvg GEMM drains and then
+# hold up the verify kernel (GB300 TEP8 DSpark6 batch 16: verify start 6.8 us after the qkvg GEMM). Smaller
+# batches run the planned qkvg GEMM better issued first: the minimum is 63 rows with 12+ heads per rank (TEP8),
+# 32 with fewer (TEP16). Such batches also take the aux stream up to _KDA_AUX_FIRST_MAX_ROWS rows instead of
+# _KDA_BFA_MULTISTREAM_MAX_ROWS. Same kernels on the same inputs: bitwise the default order.
+_KDA_AUX_FIRST_MAX_ROWS = 256
+# With the recurrent verify (BF16 full-rank gate): verify batches of up to _KDA_VERIFY_REC_FAB_MAX_REQUESTS
+# requests compute beta and the forget gate with one k3_kda_fab_proj launch ([f_a | b], then f_b on its BF16 f_a) on
+# the aux stream beside the QKVG GEMM, instead of the [f_a | b] GEMM, its split-K reduce and the f_b GEMM. The
+# fused kernel accumulates in another order, so beta and the f_a it feeds to f_b can differ from the separate
+# GEMMs by one BF16 rounding step (not bitwise). Larger batches keep the separate projections: the fused kernel's
+# few CTAs lose to the split-K chain once its tile count grows.
+_KDA_VERIFY_REC_FAB_MAX_REQUESTS = 4
+# Decode verify computes beta and the forget gate with one fused CuTe kernel ([f_a | b]
+# projection, then f_b on its BF16 f_a), sized to run next to the QKVG GEMM, for up to this
+# many rows on the aux stream (full-rank output gate only).
+_KDA_FAB_FUSED = os.environ.get("TRTLLM_K3_KDA_FAB_FUSED", "0") == "1"
+_KDA_FAB_FUSED_MAX_ROWS = 256
+# Decode verify without the forget-gate round trip (takes precedence over
+# TRTLLM_K3_KDA_FAB_FUSED). Up to _KDA_FAB_FUSED_MAX_ROWS rows, k3_kda_fab runs in f_a mode
+# (BF16 [f_a | b] only) next to the QKVG GEMM and the verify kernel computes the forget gate
+# from f_a itself, when that kernel runs in one wave or the QKVG GEMM has left the low-M
+# kernel (more rows than _KDA_FUSED_FB_LOWM_ROWS: DeepGEMM on every SM, which the full fab
+# kernel slows down more). The f_b MMA costs every wave of the verify kernel, so multi-wave
+# low-M batches keep the full fab kernel. Larger row counts run the [f_a | b] -> f_b chain on
+# the aux stream as well, with f_b reading the strided f_a view directly.
+_KDA_DECODE_FUSED_FAB = os.environ.get("TRTLLM_K3_KDA_DECODE_FUSED_FAB", "0") == "1"
+_KDA_FUSED_FB_LOWM_ROWS = 224
+# Launch the verify kernel as a programmatic dependent of the QKVG projection: its state, replay
+# and weight loads run before griddepcontrol.wait. Defaults to TRTLLM_K3_KDA_DECODE_FUSED_FAB.
+_KDA_DECODE_PDL = (
+    os.environ.get("TRTLLM_K3_KDA_DECODE_PDL", "1" if _KDA_DECODE_FUSED_FAB else "0") == "1"
+)
+# A PDL launch always takes the v2 verify kernel, so with TRTLLM_K3_KDA_DECODE_PDL a multi-wave
+# verify (more (head, request) tiles than SMs: DEP16 from 2 requests, TEP8 from 14) loses the
+# two-CTA kernel (K3 GB300: b32 18.3 -> 16.1 us, b128 51.5 ->
+# 41.9 us per layer with the two-CTA kernel). TRTLLM_K3_KDA_PDL_MULTIWAVE=0 (default) launches
+# those grids without PDL so they keep the two-CTA kernel; 1 restores the PDL v2 launch. Both
+# kernels give the same bits.
+_KDA_PDL_MULTIWAVE = os.environ.get("TRTLLM_K3_KDA_PDL_MULTIWAVE", "0") == "1"
 
 
 class _KdaPrequantizedCore(NamedTuple):
@@ -75,13 +129,101 @@ class _KDAPrefillState:
     use_indexed_state: bool
 
 
-def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
+def _use_fused_fab(
+    x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether ``trtllm::k3_kda_fab_proj`` is enabled and accepts these operands."""
+    if not (_KDA_FAB_FUSED or _KDA_DECODE_FUSED_FAB):
+        return False
+    return _fab_accepts(x, bfa_weight, fb_weight, num_heads)
+
+
+def _fab_accepts(
+    x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether ``trtllm::k3_kda_fab_proj`` accepts these operands (outside ``torch.compile``)."""
+    if torch.compiler.is_compiling() or not x.is_contiguous():
+        return False
+    from ...attention.kernels.blackwell.kimi_k3_kda import k3_kda_fab
+
+    return k3_kda_fab.can_use_k3_kda_fab(
+        x.reshape(-1, x.shape[-1]), bfa_weight, fb_weight, num_heads
+    )
+
+
+def _disagg_role() -> str:
+    """``TRTLLM_DISAGG_ROLE`` exported by trtllm-serve: "context", "generation" or "" (aggregated)."""
+    return os.environ.get("TRTLLM_DISAGG_ROLE", "")
+
+
+@functools.cache
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _verify_kernel_single_wave(num_heads: int, num_requests: int, device: torch.device) -> bool:
+    """Whether ``kda_mtp_decode``'s v2 grid (value-row split, cluster pairs up to
+    ``SPLIT_MAX_TILES`` tiles, or one CTA per tile) fits in one wave of one CTA per SM."""
+    from ...custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import verify_ctas
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    ctas = verify_ctas(num_heads, num_requests, device, use_pdl=_KDA_DECODE_PDL)
+    return ctas <= _num_sms(index)
+
+
+def _verify_two_cta(num_heads: int, num_requests: int, device: torch.device) -> bool:
+    """Whether ``kda_mtp_decode`` runs its two-CTA kernel: grids with more (head, request) tiles
+    than SMs (the kernel's selection rule)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return num_heads * num_requests > _num_sms(index)
+
+
+def _use_fab_fa(
+    x: torch.Tensor, bfa_weight: torch.Tensor, fb_weight: torch.Tensor, num_heads: int
+) -> bool:
+    """Whether the verify gate comes from ``trtllm::k3_kda_fab_fa`` + the in-kernel f_b.
+
+    ``x`` is the ``[requests, steps, hidden]`` verify input."""
+    if not _KDA_DECODE_FUSED_FAB or torch.compiler.is_compiling() or not x.is_contiguous():
+        return False
+    num_rows = x.shape[0] * x.shape[1]
+    if num_rows <= _KDA_FUSED_FB_LOWM_ROWS and not _verify_kernel_single_wave(
+        num_heads, x.shape[0], x.device
+    ):
+        return False
+    if _verify_two_cta(num_heads, x.shape[0], x.device):
+        # the two-CTA verify kernel reads the forget gate; the full fab kernel produces it
+        return False
+    if (
+        fb_weight.dtype != torch.bfloat16
+        or not fb_weight.is_contiguous()
+        or tuple(fb_weight.shape) != (num_heads * 128, 128)
+        or fb_weight.data_ptr() % 16
+    ):
+        return False
+    from ...attention.kernels.blackwell.kimi_k3_kda import k3_kda_fab
+
+    return k3_kda_fab.can_use_k3_kda_fab_fa(
+        x.reshape(-1, x.shape[-1]), bfa_weight, num_heads, fb_weight
+    )
+
+
+def _o_proj_takes_mxfp8(o_proj: nn.Module) -> bool:
+    """Whether ``o_proj`` takes the Rubin MXFP8 operand of the verify kernel's epilogue
+    (``forward_prequantized``) rather than BF16."""
+    return bool(getattr(o_proj, "supports_prequantized_input", False))
+
+
+def _meta_safe_cast_dtype(
+    module: nn.Module, dtype: torch.dtype, keep: Tuple[str, ...] = ()
+) -> None:
     """Cast floating parameters while preserving meta-device construction.
 
     ``Module.to`` dispatches ``aten._to_copy``, which ``MetaInitMode`` rejects
     and would force the full model to fall back to eager CPU construction.
     Meta values are uninitialized, so dtype-only reallocation via
     ``empty_like`` is equivalent there; materialized tensors use ``to``.
+    The module's own parameters named in ``keep`` stay in their dtype.
     """
 
     def _cast(tensor: torch.Tensor) -> torch.Tensor:
@@ -96,6 +238,8 @@ def _meta_safe_cast_dtype(module: nn.Module, dtype: torch.dtype) -> None:
             continue
         child._apply(_cast)
     for name, param in module.named_parameters(recurse=False):
+        if name in keep:
+            continue
         # Pass the parameter, not param.data: reading .data detaches, and
         # MetaInitMode rejects aten.detach on a meta tensor, so casting the
         # module's own parameters under meta init raised MetaInitException
@@ -117,6 +261,32 @@ def _writeback_state_rows(
 ) -> None:
     """Scatter dense state rows back into the pool, rounded to the pool dtype."""
     ssm_pool.index_copy_(0, slot_indices.long(), rows.to(ssm_pool.dtype))
+
+
+def _store_snapshot_conv_windows(
+    conv_input: torch.Tensor,
+    conv_pool: torch.Tensor,
+    snapshot: "KDASnapshotPlan",
+    token_major: bool,
+) -> None:
+    """Copy the raw convolution window ending before each snapshot point into its slot.
+
+    ``conv_input`` is the pre-convolution projection, ``[3D, T]`` or with
+    ``token_major`` ``[T, 3D]`` (or ``[T, 4D]`` with the gate columns last,
+    which are not part of the window); ``conv_pool`` is ``[slots, 3D, W - 1]``. A
+    snapshot point is at least one KDA chunk into its sequence's step, so the
+    window never reaches the sequence's previous convolution state.
+    """
+    window = conv_pool.shape[-1]
+    offsets = torch.arange(-window, 0, device=conv_input.device)
+    token_indices = (snapshot.token_indices[:, None] + offsets).reshape(-1)
+    if token_major:
+        rows = conv_input[:, : conv_pool.shape[1]].index_select(0, token_indices)
+        windows = rows.view(snapshot.num_snapshots, window, -1).transpose(1, 2)
+    else:
+        columns = conv_input.index_select(1, token_indices)
+        windows = columns.view(-1, snapshot.num_snapshots, window).transpose(0, 1)
+    conv_pool.index_copy_(0, snapshot.slots, windows.to(conv_pool.dtype))
 
 
 def _kda_split_conv_sections(
@@ -155,9 +325,15 @@ def _extract_kda_extra_attrs(layer_idx: str):
 
 
 def kda_core_inplace(hidden_states: torch.Tensor, layer_idx: str, output: torch.Tensor) -> None:
-    """Run the metadata-dependent KDA core and write it into ``output``."""
+    """Run the metadata-dependent KDA core and write it into ``output``.
+
+    Rows past the live batch (prefill-graph padding) are zeroed: the buffer is graph-pool memory another
+    capture may have left non-finite, and the rows reach the MoE router after ``o_proj``.
+    """
     metadata, kda_layer = _extract_kda_extra_attrs(layer_idx)
     kda_layer._forward_impl(hidden_states, metadata, output=output)
+    if output.shape[0] > metadata.num_tokens:
+        output[metadata.num_tokens :].zero_()
 
 
 maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
@@ -165,6 +341,10 @@ maybe_bcg_kda_core_inplace = eager_on_graph(kda_core_inplace)
 
 class KimiKDALinearAttention(nn.Module):
     """Production Kimi K3 KDA module with direct cache-pool ownership."""
+
+    # TRTLLM_K3_L2PF_V2: set by the model to its prefetch controller's "attention_moe" fork of this
+    # layer, called with the verify rows once the projections are issued.
+    l2pf_attention_hook: Optional[Callable[[int], None]] = None
 
     def __init__(
         self,
@@ -187,12 +367,29 @@ class KimiKDALinearAttention(nn.Module):
         self.gate_lower_bound = lin.get("gate_lower_bound", None)
         self.rms_norm_eps = cfg.rms_norm_eps
         self._use_indexed_ssm_pool = _KDA_INDEXED_STATE_POOL_ENABLED
+        self._decode_gemm_plan = kimi_k31_decode_plan(cfg)
+        # Kimi K3.1 (the config whose MLA layers carry a DSA indexer): K3.1-only verify schedules.
+        self._is_k31 = getattr(cfg, "dsa_config", None) is not None
 
         if mapping is not None and mapping.tp_size > 1 and not mapping.enable_attention_dp:
             self._kda_tp_size = mapping.tp_size
         else:
             self._kda_tp_size = 1
         self._kda_tp_rank = mapping.tp_rank if self._kda_tp_size > 1 else 0
+        # Recurrent verify (Kimi K3.1 disaggregated generation servers without attention DP, FP32
+        # state, BF16 output with the fused gated RMSNorm): the fused verify runs kda_verify_rec, an
+        # FP32 CUDA-core delta-rule recurrence over a cluster of CTAs per (head, request), instead of
+        # the 3xTF32 chunk-form kernels; same contract and replay semantics, caches and conv windows,
+        # outputs / committed state equal to FP32 rounding (not bitwise). It runs as a programmatic
+        # dependent (state, replay entries, conv windows and weights loaded before
+        # griddepcontrol.wait) that releases o_proj right after the wait and writes the core straight
+        # into the caller's buffer. Attention-DP, context and aggregated servers keep the tensor-core
+        # kernels.
+        self._verify_rec = (
+            mapping is not None
+            and not mapping.enable_attention_dp
+            and _disagg_role() == "generation"
+        )
         # reduce_output=False returns the row-sharded o_proj partials; the
         # caller owns the reduction (helix_a2a reduce-scatters them).
         self._o_allreduce = (
@@ -200,6 +397,12 @@ class KimiKDALinearAttention(nn.Module):
             if self._kda_tp_size > 1 and reduce_output
             else None
         )
+        # Set by the decoder layer for one forward (A_mid's in-place read): a pushed o_proj
+        # all-reduce may be finished in place and returned as a LamportResult.
+        self.ar_result_in_place = False
+        # Set by the decoder layer for one forward (A_mid's fused finish): a pushed o_proj
+        # all-reduce may be returned unfinished, as a LamportPending that A_mid finishes.
+        self.ar_finish_deferred = False
 
         num_heads = lin["num_heads"]
         if num_heads % self._kda_tp_size != 0:
@@ -207,6 +410,7 @@ class KimiKDALinearAttention(nn.Module):
                 f"KDA num_heads {num_heads} not divisible by tp_size {self._kda_tp_size}"
             )
         self.num_heads = num_heads // self._kda_tp_size
+        self._aux_first_min_rows = 63 if self.num_heads >= 12 else 32
         self.num_k_heads = self.num_heads
         projection_size = self.num_heads * self.head_dim
         self.proj_size = projection_size
@@ -293,7 +497,11 @@ class KimiKDALinearAttention(nn.Module):
         # [q | k | v | g] projection and its output-section metadata.
         self.qkvg_proj: Optional[nn.Module] = None
         self.qkvg_split_sizes: Optional[List[int]] = None
-        _meta_safe_cast_dtype(self, torch.bfloat16)
+        # The checkpoint stores A_log and dt_bias in fp32 and the gate math
+        # consumes them in fp32. Kimi K3 rounds them to bf16 with the rest of
+        # the module; Kimi K3.1 (kda_fp32_gate_params) keeps the fp32 values.
+        keep = ("A_log", "dt_bias") if getattr(cfg, "kda_fp32_gate_params", False) else ()
+        _meta_safe_cast_dtype(self, torch.bfloat16, keep=keep)
 
         # The optimized decode/verify kernels specialize the Kimi K3
         # K == V == 128 shape. Other shapes must use the portable fallback.
@@ -310,6 +518,9 @@ class KimiKDALinearAttention(nn.Module):
             use_optimized_decode=kernel_shape_ok,
             use_optimized_verify=kernel_shape_ok,
         )
+        # SMs kept out of the prefill's persistent grids for a kernel resident
+        # for the whole step; fixed before the model is built.
+        self._prefill_sm_reserve = sm_reserve()
 
         self._fuse_prefill_conv = True
 
@@ -425,6 +636,17 @@ class KimiKDALinearAttention(nn.Module):
         # projection views only after each scale grid has been prepared.
         return fused
 
+    def _planned_projection(self, x: torch.Tensor, weight: torch.Tensor) -> Optional[torch.Tensor]:
+        """The decode GEMM plan's kernel for ``x @ weight.T``, or None to keep F.linear.
+
+        ``x`` may carry leading batch dims (speculative verify views the rows as
+        ``[B, T, hidden]``); the plan runs on the flattened rows.
+        """
+        if self._decode_gemm_plan is None or not x.is_contiguous():
+            return None
+        out = planned_low_m_linear(self._decode_gemm_plan, x.reshape(-1, x.shape[-1]), weight)
+        return None if out is None else out.view(*x.shape[:-1], weight.shape[0])
+
     @staticmethod
     def _merge_projection_weights(
         modules: tuple[nn.Linear, ...], pad_rows_to: int = 1
@@ -461,9 +683,17 @@ class KimiKDALinearAttention(nn.Module):
         self._build_mtp_conv_weights()
 
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
-        """Select the eager path or breakable-CUDA-graph path."""
+        """Select the eager path or breakable-CUDA-graph path.
+
+        ``reduce_output=False`` returns this rank's row-parallel ``o_proj``
+        partial; the caller owns the TP reduction (sequence-parallel prefill
+        reduce-scatters it).
+        """
         if self.register_to_config and is_in_breakable_cuda_graph():
             core = hidden_states.new_empty(
                 (hidden_states.shape[0], self.num_heads, self.head_dim),
@@ -472,8 +702,16 @@ class KimiKDALinearAttention(nn.Module):
             maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
         else:
             core = self._forward_impl(hidden_states, attn_metadata)
-
-        return self._project_output(core)
+            num_padding_rows = hidden_states.shape[0] - attn_metadata.num_tokens
+            if num_padding_rows > 0:
+                # A step padded for a prefill CUDA graph but run eagerly (graph warmup, or a bucket
+                # without a capture): the core covers the live rows, the padding rows are zero.
+                core = torch.cat([core, core.new_zeros((num_padding_rows,) + core.shape[1:])])
+        return self._project_output(
+            core,
+            generation_only=attn_metadata.num_contexts == 0,
+            reduce_output=reduce_output,
+        )
 
     def _forward_impl(
         self,
@@ -556,8 +794,12 @@ class KimiKDALinearAttention(nn.Module):
                     generation_state_indices,
                     output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
                     # The MXFP8 core cannot be concatenated with a prefill
-                    # core or stored into the BCG buffer.
-                    allow_prequantized_output=output is None and num_prefills == 0,
+                    # core, prefill-graph padding rows or stored into the BCG buffer.
+                    allow_prequantized_output=(
+                        output is None
+                        and num_prefills == 0
+                        and hidden_states.shape[0] == num_tokens
+                    ),
                 )
                 if output is None:
                     cores.append(verify_core)
@@ -565,13 +807,87 @@ class KimiKDALinearAttention(nn.Module):
             return output
         return cores[0] if len(cores) == 1 else torch.cat(cores, dim=0)
 
-    def _project_output(self, core: Union[torch.Tensor, _KdaPrequantizedCore]) -> torch.Tensor:
-        """Project the post-o_norm KDA core and reduce TP partials."""
+    def _o_proj_pushes(self) -> bool:
+        """Whether o_proj has the all-reduce push epilogue (``next_ar_push``)."""
+        return hasattr(self.o_proj, "next_ar_push")
+
+    def _o_proj_ar_push_target(self, rows: int, generation_only: bool):
+        """Pushed all-reduces, generation-only batches: the Lamport push target o_proj stores its
+        ``rows`` partials into (where the low-M GEMM serves it), or None. An o_proj without the
+        push epilogue gets a deferred target only (the BF16 o_proj's deferred finish: a copy kernel
+        pushes its output and A_mid finishes the call)."""
+        pushes = self._o_proj_pushes()
+        bf16_finish = (
+            not pushes
+            and self.ar_finish_deferred
+            and bf16_oproj_ar_finish_enabled(rows, *self.o_proj.weight.shape)
+        )
+        if not (generation_only and self._o_allreduce is not None and (pushes or bf16_finish)):
+            return None
+        target = self._o_allreduce.lamport_push_target(
+            rows,
+            self.hidden_size,
+            in_place=self.ar_result_in_place,
+            deferred=self.ar_finish_deferred,
+        )
+        if target is not None and not pushes and not target.deferred:
+            return None
+        return target
+
+    def _project_output(
+        self,
+        core: Union[torch.Tensor, _KdaPrequantizedCore],
+        generation_only: bool = False,
+        reduce_output: bool = True,
+    ) -> torch.Tensor:
+        """Project the post-o_norm KDA core and reduce TP partials (``reduce_output=False``:
+        return this rank's partial, the caller reduces it)."""
+        # Pushed all-reduces, generation-only batches: o_proj stores its partial straight into
+        # the all-reduce's Lamport buffers where the low-M GEMM serves it.
+        rows = core.activation.shape[0] if isinstance(core, _KdaPrequantizedCore) else core.shape[0]
+        pushes = self._o_proj_pushes()
+        ar_push = self._o_proj_ar_push_target(rows, generation_only)
+        if pushes:
+            self.o_proj.next_ar_push = ar_push
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
         else:
-            out = self.o_proj(core.reshape(-1, self.proj_size))
-        if self._o_allreduce is not None:
+            core_2d = core.reshape(-1, self.proj_size)
+            out = None
+            if (
+                ar_push is not None
+                and not pushes
+                and isinstance(self.o_proj, nn.Linear)
+                and push_bf16_projection(core_2d, self.o_proj.weight, ar_push)
+            ):
+                # BF16 o_proj push GEMM: the GEMM stored its rows into the Lamport slots.
+                out = ar_push.output
+            if (
+                out is None
+                and (ar_push is None or not pushes)
+                and isinstance(self.o_proj, nn.Linear)
+            ):
+                out = self._planned_projection(core_2d, self.o_proj.weight)
+            if out is None:
+                out = self.o_proj(core_2d)
+        if ar_push is not None and pushes:
+            self.o_proj.next_ar_push = None
+        if ar_push is not None and ar_push.pushed:
+            # The decoder layer sets ar_result_in_place where A_mid reads the result from the
+            # Lamport workspace (A_mid's in-place read): then this returns a LamportResult, or
+            # with ar_finish_deferred (A_mid's fused finish) a LamportPending.
+            out_shape = out.shape
+            out = self._o_allreduce.finish_lamport_push(
+                ar_push, in_place=self.ar_result_in_place, deferred=self.ar_finish_deferred
+            )
+            if not isinstance(out, (LamportResult, LamportPending)):
+                out = out.view(out_shape)
+        elif ar_push is not None and ar_push.deferred:
+            # A_mid's fused finish: o_proj ran without the push epilogue (e.g. the MXFP8 GEMM
+            # on the prequantized verify output); a copy kernel pushes it and A_mid finishes.
+            self._o_allreduce.lamport_push_tensor(ar_push, out.reshape(ar_push.output.shape))
+            out = self._o_allreduce.finish_lamport_push(ar_push, deferred=True)
+        elif self._o_allreduce is not None and reduce_output:
             # Head-sharded TP: every rank ran its head shard on the same
             # local batch; sum the row-sharded o_proj partials.
             out = self._o_allreduce(out)
@@ -594,7 +910,7 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache.commit_conv_window(slot_indices, conv_pool)
 
     def _project_gate_inputs(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, fused_fab: bool = False, fab_fa: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """``(beta, forget_gate, onorm_g)`` from the fused ``[f_a | (g_a) | b]`` GEMM.
 
@@ -604,6 +920,26 @@ class KimiKDALinearAttention(nn.Module):
         ``finalize_decode_weights`` to have published ``_bfa_proj_weight``.
         """
         hd, H = self.head_dim, self.num_heads
+        if fab_fa:
+            # ``trtllm::k3_kda_fab_fa`` (full-rank gate): ``(beta, f_a, None)``; the verify kernel
+            # derives the forget gate from f_a. W_fb is warmed in L2 for its per-head load.
+            fb_weight = self.f_b_proj.weight
+            bfa = torch.ops.trtllm.k3_kda_fab_fa(
+                x.reshape(-1, x.shape[-1]), self._bfa_proj_weight, H, fb_weight
+            ).view(*x.shape[:-1], self._bfa_proj_weight.shape[0])
+            return bfa[..., hd : hd + H], bfa[..., :hd], None
+        if fused_fab:
+            # ``trtllm::k3_kda_fab_proj``: [f_a | b] projection and f_b in one launch
+            # (full-rank gate; see ``_use_fused_fab``).
+            fb_weight = self.f_b_proj.weight
+            beta, forget_gate = torch.ops.trtllm.k3_kda_fab_proj(
+                x.reshape(-1, x.shape[-1]), self._bfa_proj_weight, fb_weight, H
+            )
+            return (
+                beta.view(*x.shape[:-1], H),
+                forget_gate.view(*x.shape[:-1], fb_weight.shape[0]),
+                None,
+            )
         bfa = torch.nn.functional.linear(x, self._bfa_proj_weight)
         if self.use_full_rank_gate:
             return bfa[..., hd : hd + H], self.f_b_proj(bfa[..., :hd]), None
@@ -703,6 +1039,20 @@ class KimiKDALinearAttention(nn.Module):
             slot_indices = mamba_metadata.state_indices[:num_prefills]
 
         packed_conv, onorm_g = self._project_packed_conv_input(x, x2d)
+
+        # Mid-chunk snapshots: the recurrent state and convolution window of a
+        # sequence after its first tokens of this step, stored in a separate
+        # pool slot. The window is read before the convolution below, which
+        # may overwrite its input in place.
+        snapshot = getattr(mamba_metadata, "kda_snapshot", None)
+        if snapshot is not None:
+            _store_snapshot_conv_windows(
+                packed_conv,
+                conv_pool,
+                snapshot,
+                token_major=self._dispatch.prefill_kernel_path == "optimized"
+                and self._fuse_prefill_conv,
+            )
 
         # Initial states: present for continuation chunks (chunked prefill)
         # and for prefix-cache hits (block reuse), where the previous
@@ -808,6 +1158,10 @@ class KimiKDALinearAttention(nn.Module):
         if use_indexed_state:
             # The packed convolution clears fresh convolution rows itself.
             reset_recurrent_state_rows(kernel_pool, kernel_indices, has_init)
+        elif getattr(mamba_metadata, "kda_snapshot", None) is not None:
+            raise RuntimeError(
+                "Kimi K3 KDA mid-chunk snapshots require the optimized indexed prefill path."
+            )
         elif mamba_metadata.use_initial_states:
             # The FLA core carries the state in fp32 (no-op for fp32 pools).
             recurrent_in = (
@@ -852,6 +1206,7 @@ class KimiKDALinearAttention(nn.Module):
             )
         kernel_pool, kernel_indices = state.kernel_pool, state.kernel_indices
         recurrent_in, staged_state = state.recurrent_in, state.staged_state
+        snapshot = getattr(mamba_metadata, "kda_snapshot", None)
         use_indexed_state = state.use_indexed_state
 
         if isinstance(packed_conv, tuple):
@@ -885,6 +1240,10 @@ class KimiKDALinearAttention(nn.Module):
             max_seqlen=getattr(mamba_metadata, "kda_max_seqlen", 0),
             seq_order=getattr(mamba_metadata, "kda_seq_order", None),
             cu_chunks=getattr(mamba_metadata, "kda_cu_chunks", None),
+            sm_reserve=self._prefill_sm_reserve,
+            # The kernel updates the pool in place, so snapshots go to their pool rows.
+            snapshot_rows=None if snapshot is None else snapshot.pool_rows,
+            snapshot_chunks=None if snapshot is None else snapshot.chunks,
         )
 
         # The packed convolution persisted the live convolution pool in place.
@@ -999,6 +1358,9 @@ class KimiKDALinearAttention(nn.Module):
 
         def _project_qkvg() -> torch.Tensor:
             if self._qkvg_proj_weight is not None:
+                out = self._planned_projection(x2d, self._qkvg_proj_weight)
+                if out is not None:
+                    return out
                 return torch.nn.functional.linear(x2d, self._qkvg_proj_weight)
             return self.qkvg_proj(x2d)
 
@@ -1263,23 +1625,24 @@ class KimiKDALinearAttention(nn.Module):
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int, preserve_section_strides: bool = False
-    ) -> Optional[
-        tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            Optional[torch.Tensor],
-        ]
-    ]:
+        self,
+        x: torch.Tensor,
+        num_rows: int,
+        preserve_section_strides: bool = False,
+        gate_from_fa: bool = False,
+        rec_verify: bool = False,
+    ) -> Optional[tuple]:
         """Project fused QKVG and [f_a | b] inputs for target verification.
 
-        With ``preserve_section_strides`` the q/k/v/gate sections stay
-        strided views of the fused QKVG output (and beta of the fused
-        ``[f_a | b]`` output); the packed fused verify kernel reads them in
-        place instead of paying one copy per section.
+        Returns ``(q, k, v, forget_gate, beta, onorm_g)``. With
+        ``preserve_section_strides`` the q/k/v/gate sections stay strided
+        views of the fused QKVG output (and beta of the fused ``[f_a | b]``
+        output); the packed fused verify kernel reads them in place instead of
+        paying one copy per section. With ``gate_from_fa`` a seventh element is
+        appended: the BF16 ``f_a`` view when the f_a-mode fab kernel served
+        these rows (``forget_gate`` is then ``None`` and the verify kernel
+        computes it), else ``None``. ``rec_verify``: the verify runs ``kda_verify_rec``; batches of
+        up to ``_KDA_VERIFY_REC_FAB_MAX_REQUESTS`` requests then take the fused fab kernel.
         """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
@@ -1288,23 +1651,58 @@ class KimiKDALinearAttention(nn.Module):
 
         def _project_qkvg() -> torch.Tensor:
             if qkvg_weight is not None:
+                out = self._planned_projection(x, qkvg_weight)
+                if out is not None:
+                    return out
                 return torch.nn.functional.linear(x, qkvg_weight)
             return fused_qkvg(x)
 
         onorm_lowrank = None
+        fab_fa = False
         if self._bfa_proj_weight is not None:
+            fb_weight = self.f_b_proj.weight
+            fab_fa = (
+                gate_from_fa
+                and self.use_full_rank_gate
+                and _use_fab_fa(x, self._bfa_proj_weight, fb_weight, self.num_heads)
+            )
+            # Low-batch recurrent verify: the fused [f_a | b] -> f_b kernel beside the QKVG GEMM.
+            rec_fab = rec_verify and x.shape[0] <= _KDA_VERIFY_REC_FAB_MAX_REQUESTS
+            fused_fab = (
+                not fab_fa
+                and self.use_full_rank_gate
+                and (
+                    _use_fused_fab(x, self._bfa_proj_weight, fb_weight, self.num_heads)
+                    or (
+                        rec_fab
+                        and _fab_accepts(x, self._bfa_proj_weight, fb_weight, self.num_heads)
+                    )
+                )
+            )
+            if fab_fa or fused_fab:
+                max_rows = _KDA_FAB_FUSED_MAX_ROWS
+            elif _KDA_DECODE_FUSED_FAB:
+                # Large batches: the unfused chain still overlaps the (all-SM) QKVG GEMM better
+                # than it runs after it.
+                max_rows = num_rows
+            else:
+                max_rows = _KDA_BFA_MULTISTREAM_MAX_ROWS
+            aux_first = (
+                self._is_k31 and not (fab_fa or fused_fab) and num_rows > self._aux_first_min_rows
+            )
+            if aux_first:
+                max_rows = max(max_rows, _KDA_AUX_FIRST_MAX_ROWS)
             projection_aux_stream = (
-                self._projection_aux_stream
-                if 0 < num_rows <= _KDA_BFA_MULTISTREAM_MAX_ROWS
-                else None
+                self._projection_aux_stream if 0 < num_rows <= max_rows else None
             )
             qkvg, (beta, forget_gate, onorm_lowrank) = maybe_execute_in_parallel(
                 _project_qkvg,
-                lambda: self._project_gate_inputs(x),
+                lambda: self._project_gate_inputs(x, fused_fab=fused_fab, fab_fa=fab_fa),
                 self._projection_fork_event,
                 self._projection_join_event,
                 projection_aux_stream,
                 disable_on_compile=True,
+                aux_first=aux_first,
             )
         else:
             qkvg = _project_qkvg()
@@ -1327,6 +1725,9 @@ class KimiKDALinearAttention(nn.Module):
             q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
             if onorm_g is not None:
                 onorm_g = onorm_g.contiguous()
+        if gate_from_fa:
+            f_a = forget_gate if fab_fa else None
+            return q_proj, k_proj, v_proj, None if fab_fa else forget_gate, beta, onorm_g, f_a
         return q_proj, k_proj, v_proj, forget_gate, beta, onorm_g
 
     def forward_verify_fused(
@@ -1368,9 +1769,31 @@ class KimiKDALinearAttention(nn.Module):
         T_total = num_generations * num_steps
 
         can_fuse_output_norm = self._onorm_w_f32 is not None
-        projections = self._project_verify_inputs(
-            x, T_total, preserve_section_strides=can_fuse_output_norm
+        # The fused epilogue's MXFP8 output (Rubin CuTe scale layout) needs o_proj to take a
+        # prequantized activation; the in-kernel forget gate runs on the BF16-output kernel.
+        prequantized_output_ok = (
+            allow_prequantized_output
+            and output is None
+            and _o_proj_takes_mxfp8(self.o_proj)
+            and callable(getattr(self.o_proj, "forward_prequantized", None))
         )
+        rec_verify = (
+            can_fuse_output_norm
+            and not prequantized_output_ok
+            and self._use_verify_rec(ssm_pool, num_spec)
+        )
+        projections = self._project_verify_inputs(
+            x,
+            T_total,
+            preserve_section_strides=can_fuse_output_norm,
+            gate_from_fa=(_KDA_DECODE_FUSED_FAB or rec_verify)
+            and can_fuse_output_norm
+            and not prequantized_output_ok,
+            rec_verify=rec_verify,
+        )
+        if self.l2pf_attention_hook is not None:
+            self.l2pf_attention_hook(T_total)
+        f_a = None
         if projections is None:
             q_proj = self.q_proj(x)
             k_proj = self.k_proj(x)
@@ -1379,8 +1802,14 @@ class KimiKDALinearAttention(nn.Module):
             beta_proj = self.b_proj(x)
             onorm_g = None
         else:
-            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections
+            q_proj, k_proj, v_proj, forget_gate, beta_proj, onorm_g = projections[:6]
+            if len(projections) > 6:
+                f_a = projections[6]
         fuse_output_norm = can_fuse_output_norm and onorm_g is not None
+        if f_a is not None and not fuse_output_norm:
+            # Only the fused-norm verify computes the forget gate from f_a.
+            forget_gate = self.f_b_proj(f_a)
+            f_a = None
         if not fuse_output_norm:
             # The legacy layout has only ever seen dense projections.
             q_proj, k_proj, v_proj = q_proj.contiguous(), k_proj.contiguous(), v_proj.contiguous()
@@ -1390,8 +1819,8 @@ class KimiKDALinearAttention(nn.Module):
         x_v = v_proj.view(1, T_total, H, self.head_dim)
         # Raw gate / beta: the kernel applies dt_bias, A_log, the
         # lower-bound sigmoid gate, and the beta sigmoid itself.
-        g = forget_gate.view(1, T_total, H, K)
         beta = beta_proj.view(1, T_total, H)
+        g = None if forget_gate is None else forget_gate.view(1, T_total, H, K)
 
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         verify_kwargs = dict(
@@ -1421,13 +1850,54 @@ class KimiKDALinearAttention(nn.Module):
             scale=self.head_k_dim**-0.5,
         )
 
-        if fuse_output_norm:
-            mxfp8_output = (
-                allow_prequantized_output
-                and output is None
-                and bool(getattr(self.o_proj, "supports_prequantized_input", False))
-                and callable(getattr(self.o_proj, "forward_prequantized", None))
+        if rec_verify and fuse_output_norm and (f_a is not None or g is not None):
+            from ...attention.kernels.blackwell.kimi_k3_kda import kda_verify_rec
+
+            rec_kwargs = {}
+            if f_a is not None:
+                # low-batch path: the forget gate bf16(f_a @ W_fb^T) inside the verify kernel
+                verify_kwargs.pop("g")
+                rec_kwargs.update(
+                    g=None, fa=f_a.view(1, T_total, K), w_fb=self.f_b_proj.weight.detach()
+                )
+            core_out = None
+            if output is not None and output.is_contiguous():
+                core_out = output.view(1, T_total, H, self.head_dim)
+            out = kda_verify_rec.kda_verify_rec(
+                **verify_kwargs,
+                **rec_kwargs,
+                num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
+                onorm_g=onorm_g.view(1, T_total, H, self.head_dim),
+                onorm_weight=self._onorm_w_f32,
+                onorm_eps=self.o_norm.eps,
+                out=core_out,
+                use_pdl=True,
+                trigger=1,
             )
+            if core_out is not None:
+                return output
+            return self._store_core(out, output)
+
+        if fuse_output_norm and f_a is not None:
+            # Forget gate bf16(f_a @ W_fb^T) inside the verify kernel (BF16 output).
+            verify_kwargs.pop("g")
+            out = self._dispatch.mtp_verify_fused_fb(
+                **verify_kwargs,
+                fa=f_a.view(1, T_total, K),
+                w_fb=self.f_b_proj.weight.detach(),
+                num_accepted_tokens=layer_cache.prev_num_accepted_tokens,
+                onorm_g=onorm_g.view(1, T_total, H, self.head_dim),
+                onorm_weight=self._onorm_w_f32,
+                onorm_eps=self.o_norm.eps,
+                use_pdl=_KDA_DECODE_PDL,
+            )
+            return self._store_core(out, output)
+
+        if fuse_output_norm:
+            mxfp8_output = prequantized_output_ok
+            two_cta = _verify_two_cta(H, num_generations, x2d.device)
+            # PDL for this call, unless it would cost a multi-wave grid its two-CTA kernel.
+            use_pdl = _KDA_DECODE_PDL and (_KDA_PDL_MULTIWAVE or not two_cta)
             out = self._dispatch.mtp_verify(
                 **verify_kwargs,
                 cu_seqlens=None,
@@ -1438,6 +1908,7 @@ class KimiKDALinearAttention(nn.Module):
                 onorm_eps=self.o_norm.eps,
                 fuse_output_norm=True,
                 mxfp8_output=mxfp8_output,
+                use_pdl=use_pdl and not mxfp8_output,
             )
             if mxfp8_output:
                 return _KdaPrequantizedCore(*out)
@@ -1461,6 +1932,16 @@ class KimiKDALinearAttention(nn.Module):
         core = self._output_gate(x, o, onorm_g)
         # Can be removed once attention writes the core in place.
         return self._store_core(core, output)
+
+    def _use_verify_rec(self, ssm_pool: torch.Tensor, num_spec: int) -> bool:
+        """Whether this verify runs ``kda_verify_rec`` (see ``_verify_rec``; Kimi K3.1 only)."""
+        if not (self._verify_rec and self._is_k31) or torch.compiler.is_compiling():
+            return False
+        from ...attention.kernels.blackwell.kimi_k3_kda import kda_verify_rec
+
+        return kda_verify_rec.supported(
+            ssm_pool, num_spec, self.head_k_dim, self.head_dim, self.conv_size
+        )
 
     def _build_mtp_conv_weights(self) -> None:
         """Prebuild packed-prefill and fused-verify convolution weights.

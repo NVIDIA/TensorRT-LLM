@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {
@@ -309,6 +314,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
     },
     {
       "capture_policy": "bool",
@@ -659,6 +669,7 @@
         "float32",
         "fp8",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
         "nvfp4",
         "mixed_nvfp4_fp8",
         "mixed_nvfp4_float16",
@@ -1478,7 +1489,8 @@
     {
       "allowed_values": [
         "fp8",
-        "fp4"
+        "fp4",
+        "bf16"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
@@ -1697,6 +1709,20 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.block_size"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "fp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.context_kv_dtype"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.context_kv_only"
     },
     {
       "capture_policy": "int|none",

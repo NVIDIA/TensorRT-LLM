@@ -456,6 +456,9 @@ def _build_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
+            # A context-KV-only drafter reads the captures only through fc.
+            project_captures=bool(getattr(spec_config, 'context_kv_only',
+                                          False)),
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
@@ -754,9 +757,9 @@ def get_spec_worker(spec_config,
     if spec_dec_mode.is_dflash():
         return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     # DSpark splits by deployment form, mirroring the draft-model side. The
-    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose rolling-window
-    # plumbing reads V4-draft-only attributes (num_stages, write_context_windows,
-    # forward_batched). A standalone drafter is DFlash lineage and is served by
+    # embedded DeepSeek-V4-Pro draft needs DSv4DSparkWorker, whose captured-context
+    # plumbing reads V4-draft-only attributes (num_stages, write_context_pages,
+    # forward). A standalone drafter is DFlash lineage and is served by
     # DSparkWorker, which adds only the Markov bias and the shift_label
     # slot convention on top of DFlashWorker.
     if spec_dec_mode.is_dspark():

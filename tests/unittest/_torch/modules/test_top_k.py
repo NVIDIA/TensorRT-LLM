@@ -352,6 +352,39 @@ def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
     }
 
 
+def test_gvr_v2_deterministic_decode_reads_bf16(monkeypatch) -> None:
+    """The deterministic self-sampling engine gets BF16 scores as they are; the other engines do not read BF16."""
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_deterministic=True,
+    )
+    assert top_k.decode_reads_bf16
+    scores = torch.randn(1, 8, dtype=torch.bfloat16)
+    top_k(
+        scores,
+        torch.empty(1, 2, dtype=torch.int32),
+        is_prefill=False,
+        sequence_lengths=torch.tensor([32], dtype=torch.int32),
+        scan_lengths=torch.tensor([8], dtype=torch.int32),
+        next_n=1,
+        max_seq_len=16,
+    )
+    args, kwargs = runner.call_args
+    assert args[0] is scores
+    assert kwargs["deterministic"] is True
+
+    assert not TopK(2, decode_implementation=TopKImplementation.CUTE_DSL_GVR).decode_reads_bf16
+    assert not TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=False,
+        gvr_deterministic=True,
+    ).decode_reads_bf16
+    assert not TopK(2, gvr_deterministic=True).decode_reads_bf16
+
+
 def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()

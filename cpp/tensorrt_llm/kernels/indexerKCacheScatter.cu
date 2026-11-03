@@ -61,7 +61,7 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
  * @param slot_mapping_fp8  Flat element index for FP8 data start position [num_tokens]
  * @param slot_mapping_scale Flat element index for scale data start position [num_tokens]
  * @param num_tokens        Number of tokens
- * @param head_dim          Payload byte width (128 for FP8, 64 for packed FP4)
+ * @param head_dim          Payload byte width (128 for FP8, 64 for packed FP4, 256 for BF16)
  * @param scale_size        Scale size in bytes (must be 4)
  * @param cache_stride_0    Stride for k_cache dimension 0 (in bytes)
  * @param cache_stride_1    Stride for k_cache dimension 1 (in bytes)
@@ -132,11 +132,11 @@ void invokeIndexerKCacheScatter(uint8_t const* k_fp8_bytes, uint8_t const* k_sca
     }
 
     // Each thread writes 4 bytes (VEC_SIZE in the kernel). head_dim is the
-    // number of bytes per token (128 for FP8, 64 for FP4 packed). Scale is a
-    // single 4-byte word per token, written by thread 0.
+    // number of bytes per token (128 for FP8, 64 for FP4 packed, 256 for BF16).
+    // Scale is a single 4-byte word per token, written by thread 0.
     constexpr int32_t VEC_SIZE = 4;
-    TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 64,
-        "head_dim must be 128 (FP8) or 64 (FP4 packed) for the indexer cache (got %d)", head_dim);
+    TLLM_CHECK_WITH_INFO(head_dim == 128 || head_dim == 64 || head_dim == 256,
+        "head_dim must be 128 (FP8), 64 (FP4 packed) or 256 (BF16) bytes for the indexer cache (got %d)", head_dim);
     TLLM_CHECK_WITH_INFO(head_dim % VEC_SIZE == 0, "head_dim (%d) must be a multiple of %d", head_dim, VEC_SIZE);
     TLLM_CHECK_WITH_INFO(scale_size == 4,
         "scale_size must equal 4 bytes (packed UE8M0 x4 for FP4, 1 float32 for FP8, got %d)", scale_size);

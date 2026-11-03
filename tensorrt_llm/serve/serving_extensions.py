@@ -40,7 +40,11 @@ if TYPE_CHECKING:
     from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
 
-RequiredToolChoiceMode = Literal["template", "grammar"]
+# "template": the chat template asks for a tool call; "grammar": a mandatory
+# tool-call grammar enforces it; "prefer_grammar": the grammar when the request
+# can carry one (xgrammar, request-level tools, a rendered chat prompt),
+# otherwise the template.
+RequiredToolChoiceMode = Literal["template", "grammar", "prefer_grammar"]
 
 
 class OutputMode(enum.Enum):

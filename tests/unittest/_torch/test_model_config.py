@@ -15,7 +15,10 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
-from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    MiniMaxM3SparseAttentionConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -192,6 +195,36 @@ def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
     validate_and_set_kv_cache_quant(model_config, "auto")
     for layer_quant_config in model_config.quant_config_dict.values():
         assert layer_quant_config.kv_cache_quant_algo is None
+
+
+@pytest.mark.parametrize("sm_version", [103, 107])
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
+def test_dsa_nvfp4_kv_quantization(
+    monkeypatch: pytest.MonkeyPatch, sm_version: int, requested_dtype: str
+) -> None:
+    """DSA's FP8 gather consumer accepts NVFP4 storage on Blackwell and Rubin."""
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.get_sm_version", lambda: sm_version
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.model_loader.torch.cuda.is_available", lambda: True
+    )
+    model_config = _make_mixed_precision_model_config()
+    model_config.pretrained_config = types.SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64)
+    model_config.attn_backend = "TRTLLM"
+    model_config.sparse_attention_config = DeepSeekSparseAttentionConfig(
+        index_n_heads=64, index_head_dim=128, index_topk=2048
+    )
+    if requested_dtype == "auto":
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        for quant_config in model_config.quant_config_dict.values():
+            quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    for quant_config in model_config.quant_config_dict.values():
+        assert quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 @pytest.mark.parametrize("implementation", [None, "triton", "msa"])

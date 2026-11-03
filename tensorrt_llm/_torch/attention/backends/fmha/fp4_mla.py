@@ -112,7 +112,10 @@ class Fp4MlaFmha(PhasedFmha):
         state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
-        if state.v_scale_pool is None:
+        if state.v_scale_pool is None and not (
+            forward_args.attention_input_type == AttentionInputType.context_only
+            and getattr(metadata.kv_cache_manager, "fp4_mla_context_only_cache", False)
+        ):
             raise RuntimeError("FP4 MLA requires the V-scale pool.")
 
         attention_input_type = forward_args.attention_input_type

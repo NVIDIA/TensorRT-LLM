@@ -3,7 +3,7 @@
 
 import functools
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -646,10 +646,69 @@ def apply_low_m_gemm(
     return dispatcher.apply(module, input_tensor, weight, bias, force_active=force_active)
 
 
+# A measured kernel plan for decode-shaped projections: ``(N, K) -> ((M upper
+# bound, choice), ...)`` in ascending M. A choice is ``("direct", block_size,
+# outputs_per_block)`` -- run with rows_per_block = M --, ``("splitk", mma_m,
+# mma_n, split_k, ab_stages)`` (M <= 32), ``("tgv", tactic)`` -- FlashInfer's TGV
+# GEMM tactic id -- or ``("default",)``, which leaves that M range to the caller's
+# GEMM. An M above the last bound, and any (N, K) the plan does not list, is left
+# to the caller.
+LowMGemmPlan = Dict[Tuple[int, int], Tuple[Tuple[int, tuple], ...]]
+
+
+def planned_low_m_linear(
+    plan: LowMGemmPlan,
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """``input_tensor @ weight.T`` with the kernel *plan* names for this shape, or ``None``.
+
+    Skips the AutoTuner: the plan holds choices measured offline (cold L2,
+    CUDA-graph replay), which a launch-bound timing would not reproduce.
+    """
+    if input_tensor.dim() != 2 or not is_sm_100f(_current_sm(input_tensor.device)):
+        return None
+    rows = plan.get((int(weight.shape[0]), int(weight.shape[1])))
+    m = int(input_tensor.shape[0])
+    choice = next((c for bound, c in rows if m <= bound), None) if rows else None
+    if (
+        choice is None
+        or choice[0] == "default"
+        or m < 1
+        or input_tensor.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not input_tensor.is_contiguous()
+        or not weight.is_contiguous()
+        or input_tensor.data_ptr() % 32
+        or weight.data_ptr() % 32
+    ):
+        return None
+    out = torch.empty((m, weight.shape[0]), dtype=torch.bfloat16, device=input_tensor.device)
+    # DLPack export refuses tensors that require grad, which module parameters still do.
+    weight = weight.detach()
+    if choice[0] == "direct":
+        from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
+
+        tactic = DirectTactic(choice[1], choice[2], m)
+        return run_direct_dense(input_tensor, weight.t(), out, get_env_enable_pdl(), tactic)
+    if choice[0] == "tgv":
+        from flashinfer.gemm.kernels.tgv_gemm_cute_ext import run_tgv_cute_ext
+
+        return run_tgv_cute_ext(
+            input_tensor, weight.t(), None, out, get_env_enable_pdl(), choice[1]
+        )
+    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic, run_splitk_dense
+
+    tactic = SplitKTactic(*choice[1:])
+    return run_splitk_dense(input_tensor, weight.t(), None, out, get_env_enable_pdl(), tactic)
+
+
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "LOW_M_GEMM_OPT_IN_ATTR",
+    "LowMGemmPlan",
     "_MAX_M",
     "apply_low_m_gemm",
+    "planned_low_m_linear",
     "prepare_low_m_gemm",
 ]

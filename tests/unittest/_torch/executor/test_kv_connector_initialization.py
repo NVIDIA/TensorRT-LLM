@@ -94,6 +94,7 @@ def test_connector_retention_request_validation(
     executor._configure_csa2_remote_tail = Mock()
     executor._validate_token_id_range = Mock()
     executor._validate_request_budget = Mock()
+    executor._validate_request_kv_v2_row = Mock()
     executor.sampler = Mock()
     request = SimpleNamespace(
         kv_cache_retention_config=KvCacheRetentionConfig([]) if with_retention else None,

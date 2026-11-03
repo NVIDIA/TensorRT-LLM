@@ -28,6 +28,7 @@ The following is a table of supported models for the PyTorch backend:
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-20b`, `openai/gpt-oss-120b`  |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
 | `KimiK3ForConditionalGeneration` [^15]| Kimi-K3                            | `moonshotai/Kimi-K3`                         |
+| `KimiK31ForConditionalGeneration` [^15]| Kimi-K3.1-Pro                     | `moonshotai/Kimi-K3.1-Pro`                   |
 | `KimiLinearForCausalLM` [^15]        | Kimi-K3 (text decoder)             | `moonshotai/Kimi-K3`                         |
 | `LagunaForCausalLM`                  | Laguna-XS                          | `poolside/laguna-XS.2`                       |
 | `LiLiCorrDraftModel`                | [LiLiCorr draft model](../features/speculative-decoding.md#dflash) | Compatible checkpoint via `DFlashDecodingConfig.speculative_model` |

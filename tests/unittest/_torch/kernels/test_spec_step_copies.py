@@ -60,12 +60,14 @@ def _op():
     return op
 
 
-def _supported() -> bool:
-    return torch.cuda.is_available() and _op().is_supported()
+def _gather_supported() -> bool:
+    return torch.cuda.is_available() and _op().input_gather_is_supported()
 
 
+# The engine launches SlotScatter where is_supported() holds (SM 100) and StepInputGather where
+# input_gather_is_supported() does (SM 100, SM 103); both kernels are checked wherever the gather runs.
 pytestmark = pytest.mark.skipif(
-    not _supported(), reason="the step-copy kernels run on SM 100 with the CuTe DSL"
+    not _gather_supported(), reason="the step-copy kernels run on SM 100 / SM 103 with the CuTe DSL"
 )
 
 
@@ -460,6 +462,27 @@ def test_gather(rows, tokens):
     assert not bad, bad
 
 
+# Generation-server shapes: K3-class drafters run T = 6 or 7 tokens per row at 19..256 rows, past one CTA of threads.
+SERVING = [(r, t) for t in (6, 7) for r in (19, 24, 64, 192, 256)]
+
+
+@pytest.mark.parametrize("rows,tokens", SERVING, ids=[f"{r}x{t}" for r, t in SERVING])
+def test_gather_at_serving_batch_sizes(rows, tokens):
+    """The engine's layout behind 3 requests without a previous batch, with as many slots as rows plus a few and twice
+    as many."""
+    first = 3
+    begins = (first * tokens, first * (tokens - 1), first * tokens, first)
+    for i, num_slots in enumerate((rows + 5, 2 * rows)):
+        st = Step(rows, tokens, _seed(5, rows, tokens, i), num_slots=num_slots, begins=begins)
+        bad = compare(
+            st.bufs,
+            lambda b: torch_gather(*st.gather_args(b)),
+            lambda b: kernel_gather(st.gather_args(b)),
+        )
+        row = result(f"{rows}x{tokens}, {num_slots} slots, begins {begins}", **bad)
+        assert row["ok"], row
+
+
 @pytest.mark.parametrize("tokens", TOKENS, ids=[f"Rx{t}" for t in TOKENS])
 def test_graph_replay(tokens):
     bad = [r for r in measure_graph(tokens) if not r["ok"]]
@@ -519,11 +542,20 @@ def test_scatter_zeros_past_accepted_length(poison):
     assert torch.equal(store_new, want), (store_new, want)
 
 
+def test_env_keeps_the_torch_path(monkeypatch):
+    """TRTLLM_SPEC_STEP_INPUT_GATHER=0 turns the gather off; the engine then runs the torch path."""
+    op = _op()
+    monkeypatch.setenv("TRTLLM_SPEC_STEP_INPUT_GATHER", "0")
+    assert not op.input_gather_is_supported()
+    monkeypatch.setenv("TRTLLM_SPEC_STEP_INPUT_GATHER", "1")
+    assert op.input_gather_is_supported()
+
+
 def test_contract():
     """rows == 0 launches nothing; every call the kernels do not cover returns False and launches nothing, so the
     caller keeps its torch path."""
     op = _op()
-    assert op.is_supported()
+    assert op.input_gather_is_supported()
     st = Step(MAX_BATCH, STORE_WIDTH, _seed(6, 0, 0, 0))
     b = clone_bufs(st.bufs)
     before = clone_bufs(b)

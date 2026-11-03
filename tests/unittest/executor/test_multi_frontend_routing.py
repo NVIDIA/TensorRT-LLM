@@ -298,3 +298,114 @@ class TestClassicFrontendProxyEndToEnd:
             assert client_id not in proxy._results
 
             self._stop_dispatch_thread(proxy, result_addrs, hmac_key)
+
+
+class TestClassicFrontendProfileControl:
+    """Profile control through an attached frontend (num_serve_frontends > 1).
+
+    ``/start_profile`` and ``/stop_profile`` reach whichever frontend serves the
+    HTTP request; an attached frontend must forward them to the rank0 worker and
+    wait for the worker's ack on its own ack queue, like the launcher does.
+    """
+
+    @staticmethod
+    def _run_fake_worker(worker_ingress, replies, seen, errors):
+        """Serve len(replies) profile requests from the ingress, acking each with its reply."""
+        from tensorrt_llm.executor.request import StartProfileRequest
+        from tensorrt_llm.executor.worker import ProfileAckSender
+
+        sender = ProfileAckSender()
+        try:
+            for err in replies:
+                if not worker_ingress.poll(20):
+                    errors.append("no profile request reached the worker ingress")
+                    return
+                req = worker_ingress.get()
+                seen.append(req)
+                kind = "start" if isinstance(req, StartProfileRequest) else "stop"
+                sender.send(kind, err, req)
+        except Exception as e:  # surfaced by the test body
+            errors.append(repr(e))
+        finally:
+            sender.close()
+
+    def test_attached_frontend_start_stop_profile_round_trip(self):
+        import threading
+
+        from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, _, _ = (
+                TestClassicFrontendProxyEndToEnd._make_proxy_and_fake_worker(tmpdir)
+            )
+            seen, errors = [], []
+            worker = threading.Thread(
+                target=self._run_fake_worker, args=(worker_ingress, [None, None], seen, errors)
+            )
+            worker.start()
+            try:
+                proxy.start_profile(num_steps=4, activities=["CUDA_PROFILER"])
+                proxy.stop_profile()
+            finally:
+                worker.join(timeout=30)
+            assert not worker.is_alive()
+            assert not errors, errors
+            assert isinstance(seen[0], StartProfileRequest)
+            assert seen[0].num_steps == 4 and seen[0].activities == ["CUDA_PROFILER"]
+            assert isinstance(seen[1], StopProfileRequest)
+            # Both requests carry this frontend's own ack address.
+            assert seen[0].ack_addr is not None and seen[0].ack_addr == seen[1].ack_addr
+
+            proxy.shutdown()
+            assert proxy._profile_control_executor is None
+            assert proxy.profile_ack_queue is None
+
+    def test_attached_frontend_propagates_worker_rejection(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, worker_ingress, _, _ = (
+                TestClassicFrontendProxyEndToEnd._make_proxy_and_fake_worker(tmpdir)
+            )
+            seen, errors = [], []
+            worker = threading.Thread(
+                target=self._run_fake_worker,
+                args=(worker_ingress, ["profile already in progress"], seen, errors),
+            )
+            worker.start()
+            try:
+                with pytest.raises(RuntimeError, match="already in progress"):
+                    proxy.start_profile(num_steps=4)
+            finally:
+                worker.join(timeout=30)
+            assert not errors, errors
+            proxy.shutdown()
+
+    def test_profile_control_after_frontend_shutdown_raises(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proxy, _, _, _ = TestClassicFrontendProxyEndToEnd._make_proxy_and_fake_worker(tmpdir)
+            proxy.shutdown()
+            with pytest.raises(RuntimeError, match="shutting down"):
+                proxy.start_profile(num_steps=1)
+
+    def test_worker_acks_each_requesting_proxy(self):
+        """The worker connects one ack socket per requesting proxy address."""
+        from tensorrt_llm.executor.ipc import IpcQueue
+        from tensorrt_llm.executor.worker import ProfileAckSender
+
+        launcher_ack = IpcQueue(is_server=True, name="test_launcher_ack")
+        frontend_ack = IpcQueue(is_server=True, name="test_frontend_ack")
+        sender = ProfileAckSender()
+        try:
+            sender.send("start", None, SimpleNamespace(ack_addr=launcher_ack.address))
+            sender.send("start", "busy", SimpleNamespace(ack_addr=frontend_ack.address))
+            sender.send("stop", None, SimpleNamespace(ack_addr=launcher_ack.address))
+            sender.send("stop", None, SimpleNamespace(ack_addr=None))  # no ack channel: no-op
+            assert launcher_ack.get(timeout=5) == ("start", None)
+            assert frontend_ack.get(timeout=5) == ("start", "busy")
+            assert launcher_ack.get(timeout=5) == ("stop", None)
+            assert len(sender._queues) == 2
+        finally:
+            sender.close()
+            launcher_ack.close()
+            frontend_ack.close()

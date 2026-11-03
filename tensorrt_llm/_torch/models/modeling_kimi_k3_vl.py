@@ -21,6 +21,8 @@ text-only core (:class:`KimiLinearForCausalLM`):
 - PatchMergerMLPV2 vision->text projector
 - ``KimiK3ForConditionalGeneration`` that fuses vision embeddings into the
   KimiLinear text backbone.
+- ``KimiK31ForConditionalGeneration`` for Kimi K3.1 checkpoints, whose text
+  backbone adds a DSA indexer to its MLA layers (see ``KimiLinearConfig``).
 
 The structure closely mirrors the in-tree K2.5 model
 (``modeling_kimi_k25.py``); this file only carries the K3-specific deltas and
@@ -297,6 +299,10 @@ class KimiK3VisionModel(KimiK25VisionModel):
         # for cache-less vision attention it could only steer kernel selection
         # (a past instance of that failure mode is #12851).
         self.model_config.quant_config = QuantConfig()
+        # The tower runs dense full-mask attention. The text model's sparse
+        # attention (the Kimi K3.1 DSA indexer) would otherwise swap in a
+        # sparse backend for every vision attention layer.
+        self.model_config.sparse_attention_config = None
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -428,6 +434,8 @@ class KimiK3InputProcessor(KimiK25InputProcessor):
     duplicates to ``(h // merge_kh) * (w // merge_kw)`` tokens per image.
     """
 
+    supports_video = False
+
 
 # ---------------------------------------------------------------------------
 # Full VLM Model
@@ -453,13 +461,21 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     """Kimi K3 vision-language model: MoonViT3d + KimiLinear text backbone.
 
     Reuses the K2.5 wrapper's spec-dec / weight-loading property forwarding,
-    :meth:`forward`, and :meth:`load_weights` (which builds the tower through
-    ``_VISION_MODEL_CLS``); only ``__init__`` differs (vision encoder + text
-    backbone classes).
+    :meth:`forward`, :meth:`load_weights` (which builds the tower through
+    ``_VISION_MODEL_CLS``), and its MM encoder item hooks; ``__init__`` differs
+    (vision encoder + text backbone classes), and MM encoder item scheduling is
+    on.
     """
 
     _VISION_MODEL_CLS = KimiK3VisionModel
     mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
+    # K3 is image-only, and the processor's patch limits bound every image.
+    supports_mm_encoder_item_scheduling = True
+
+    @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config=None) -> bool:
+        """Follow the text backbone: Kimi K3.1 DSA requires KV cache manager V2."""
+        return KimiLinearForCausalLM.requires_kv_cache_manager_v2(pretrained_config)
 
     def __init__(
         self,
@@ -492,7 +508,10 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
         # --- Vision encoder (deferred under MetaInitMode, recreated in
         # load_weights) ---
         self.mm_encoder = None
-        if not DISAGG:
+        # Text-only serving (disable_mm_encoder) and E/P disaggregation both
+        # run without a local vision tower.
+        self._skip_mm_encoder = DISAGG or model_config.disable_mm_encoder
+        if not self._skip_mm_encoder:
             try:
                 mm_encoder = self._VISION_MODEL_CLS(model_config)
                 if _has_meta_tensors(mm_encoder):
@@ -543,3 +562,40 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     # load_weights is inherited from KimiK25ForConditionalGeneration: the
     # MetaInitMode deferral/recreation logic is identical and constructs the
     # tower via _VISION_MODEL_CLS, which this class overrides above.
+
+
+@register_vision_encoder(KimiK3VisionModel)
+@register_auto_model("KimiK31ForConditionalGeneration")
+@register_input_processor(
+    KimiK3InputProcessor,
+    model_type="kimi_k31",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|kimi_image_placeholder|>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
+    ),
+)
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Kimi K3.1 vision-language model.
+
+    The vision tower, projector, and prompt format are unchanged from K3. The
+    text backbone reads the K3.1 ``dsa_config`` from its own config.
+    """
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs) -> None:
+        if hasattr(self, "llm"):
+            return
+        from .kimi_k31_load_quantization import K31LoadQuantization
+
+        adapter = K31LoadQuantization.configure(model_config)
+        super().__init__(model_config, *args, **kwargs)
+        self._load_quantization = adapter
+
+    def load_weights(self, weights) -> None:
+        if self._load_quantization is not None:
+            weights = self._load_quantization.prepare_weights(self.llm, weights)
+        super().load_weights(weights)
+        if self._load_quantization is not None:
+            torch.cuda.empty_cache()

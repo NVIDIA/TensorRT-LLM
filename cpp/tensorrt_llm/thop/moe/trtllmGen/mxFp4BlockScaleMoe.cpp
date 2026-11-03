@@ -35,7 +35,7 @@ using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::RoutingMethodTy
 using MoeRunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 using tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::computeSelectedTileN;
 
-torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
+std::vector<torch::Tensor> dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor> const& routing_logits,
     torch::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
     std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
     torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
@@ -51,9 +51,11 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     btg::Dtype const dtype, MoeRunnerType& moe_runner, int64_t moeConfigIndex,
     torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
-    torch::optional<torch::Tensor> const& out_tensor)
+    torch::optional<torch::Tensor> const& out_tensor, bool const do_finalize,
+    std::optional<std::vector<torch::Tensor>> const& prerouted = std::nullopt)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by MXFP4 block scale MOE");
+    TORCH_CHECK(do_finalize || !out_tensor.has_value(), "out_tensor is only supported when do_finalize=true.");
     TORCH_CHECK(tile_tokens_dim == 8 || tile_tokens_dim == 16 || tile_tokens_dim == 32 || tile_tokens_dim == 64
             || tile_tokens_dim == 128 || tile_tokens_dim == 256,
         "tile_tokens_dim must be 8, 16, 32, 64, 128, 256");
@@ -296,16 +298,52 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     auto const dtypeRoutingLogits = routing_logits.has_value()
         ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
         : btg::Dtype::Bfloat16;
-    routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
-        /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
-        args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
-        expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
-        expanded_idx_to_permuted_idx.data_ptr<int>(), nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
-        permuted_idx_to_token_idx.data_ptr<int>(), expert_weights_ptr, args.topk_ids,
-        num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
-        cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
-        false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
-        static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
+
+    // Routing buffers the grouped GEMMs read: this op's own, or the caller's precomputed ones.
+    int32_t* ptr_total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
+    int32_t* ptr_expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.data_ptr<int>();
+    int32_t* ptr_permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>();
+    int32_t* ptr_cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
+    int32_t* ptr_cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
+    int32_t* ptr_num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
+    if (prerouted.has_value())
+    {
+        // The caller already ran top-k and the permutation for this tile size, in the layout the routing kernels
+        // write: (expanded_idx_to_permuted_idx, permuted_idx_to_token_idx, total_num_padded_tokens,
+        // cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit, num_non_exiting_ctas).
+        auto const& routed = prerouted.value();
+        TORCH_CHECK(routed.size() == 6, "prerouted must hold 6 tensors, got ", routed.size());
+        TORCH_CHECK(topk_ids.has_value() && topk_weights.has_value(), "prerouted needs topk_ids and topk_weights.");
+        int64_t const min_numel[6] = {args.num_tokens * args.top_k,
+            tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::getRouteMapAllocCount(max_num_padded_tokens), 1,
+            max_num_ctas, max_num_ctas, 1};
+        for (size_t i = 0; i < routed.size(); ++i)
+        {
+            TORCH_CHECK(routed[i].scalar_type() == at::ScalarType::Int && routed[i].is_contiguous()
+                    && routed[i].device() == routing_device,
+                "prerouted[", i, "] must be a contiguous int32 tensor on the routing device.");
+            TORCH_CHECK(routed[i].numel() >= min_numel[i], "prerouted[", i, "] has ", routed[i].numel(),
+                " elements, needs at least ", min_numel[i], ".");
+        }
+        ptr_expanded_idx_to_permuted_idx = routed[0].data_ptr<int>();
+        ptr_permuted_idx_to_token_idx = routed[1].data_ptr<int>();
+        ptr_total_num_padded_tokens = routed[2].data_ptr<int>();
+        ptr_cta_idx_xy_to_batch_idx = routed[3].data_ptr<int>();
+        ptr_cta_idx_xy_to_mn_limit = routed[4].data_ptr<int>();
+        ptr_num_non_exiting_ctas = routed[5].data_ptr<int>();
+    }
+    else
+    {
+        routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
+            /* num_fused_shared_expert */ 0, args.n_group, args.topk_group, args.local_expert_offset,
+            args.local_num_experts, args.routed_scaling_factor, expert_indexes.data_ptr<int>(),
+            expert_count_histogram.data_ptr<int>(), ptr_total_num_padded_tokens, ptr_expanded_idx_to_permuted_idx,
+            nullptr, /*permuted_idx_to_expanded_idx.data_ptr<int>(),*/
+            ptr_permuted_idx_to_token_idx, expert_weights_ptr, args.topk_ids, num_tokens_per_expert.data_ptr<int>(),
+            ptr_cta_idx_xy_to_batch_idx, ptr_cta_idx_xy_to_mn_limit, ptr_num_non_exiting_ctas, args.mDtypeElt,
+            false /* use_routing_scales_on_input */, false /* use_deep_seek_fp8 */,
+            static_cast<RoutingMethodType>(routing_method_type), stream, dtypeRoutingLogits, args.mDtypeBias);
+    }
 
     //
     // FC13 (gemm1) + FC2 (gemm2)
@@ -463,18 +501,17 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     }
 
     // setup workspace
-    workspace.total_num_padded_tokens = total_num_padded_tokens.data_ptr<int>();
+    workspace.total_num_padded_tokens = ptr_total_num_padded_tokens;
     workspace.total_max_padded_tokens = std::max(max_num_padded_tokens_gemm1, max_num_padded_tokens_gemm2);
     workspace.routing_expert_indexes = expert_indexes.data_ptr<int>();
-    workspace.permuted_idx_size = total_num_padded_tokens.data_ptr<int>();
-    workspace.expanded_idx_to_permuted_idx
-        = expanded_idx_to_permuted_idx.data_ptr<int>(); // Needed by permute/finalize kernels
-    workspace.permuted_idx_to_token_idx = permuted_idx_to_token_idx.data_ptr<int>(); // Needed by permuteGemm1 kernel
-    workspace.expert_weights = expert_weights_ptr;                                   // Consumed by finalize kernel
+    workspace.permuted_idx_size = ptr_total_num_padded_tokens;
+    workspace.expanded_idx_to_permuted_idx = ptr_expanded_idx_to_permuted_idx; // Needed by permute/finalize kernels
+    workspace.permuted_idx_to_token_idx = ptr_permuted_idx_to_token_idx;       // Needed by permuteGemm1 kernel
+    workspace.expert_weights = expert_weights_ptr;                             // Consumed by finalize kernel
 
-    workspace.cta_idx_xy_to_batch_idx = cta_idx_xy_to_batch_idx.data_ptr<int>();
-    workspace.cta_idx_xy_to_mn_limit = cta_idx_xy_to_mn_limit.data_ptr<int>();
-    workspace.num_non_exiting_ctas = num_non_exiting_ctas.data_ptr<int>();
+    workspace.cta_idx_xy_to_batch_idx = ptr_cta_idx_xy_to_batch_idx;
+    workspace.cta_idx_xy_to_mn_limit = ptr_cta_idx_xy_to_mn_limit;
+    workspace.num_non_exiting_ctas = ptr_num_non_exiting_ctas;
 
     // gemm1 intermediate ws
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -486,6 +523,7 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     workspace.gemm2_output_scale = nullptr;
     args.output = output.data_ptr();
     args.output_scale = nullptr;
+    args.do_finalize = do_finalize;
 
     auto workspace_sizes = moe_runner.getWorkspaceSizeInBytes(args, moeConfigIndex);
     at::Tensor workspace_fc1 = at::detail::empty_cuda(
@@ -496,7 +534,15 @@ torch::Tensor dtype_mxe2m1_block_scale_moe_runner(torch::optional<torch::Tensor>
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
     auto const& moe_stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     moe_runner.run(args, workspace, hidden_states.get_device(), moe_stream, moeConfigIndex);
-    return output;
+    if (!do_finalize)
+    {
+        // The per-(token, slot) FC2 rows in permuted order, the routing kernel's weights (unwritten when the caller
+        // passed topk_weights: those are the weights the finalize would apply) and the map from (token, slot) to the
+        // permuted row (-1: the expert is not local; unwritten when the caller passed prerouted: its first tensor is
+        // the map). Never an input tensor, so the op output does not alias one.
+        return {gemm2_output, expert_weights, expanded_idx_to_permuted_idx};
+    }
+    return {output};
 }
 
 // Wrapped the TRTLLM-Gen kernel runner in a Torch custom class to allow
@@ -633,7 +679,7 @@ public:
             gemm2_weights_scale, gemm2_bias, std::nullopt, std::nullopt, std::nullopt, num_experts, top_k, n_group,
             topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size, local_expert_offset,
             local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct, *runner, configToRun,
-            topk_weights, topk_ids, output);
+            topk_weights, topk_ids, output, /* do_finalize */ true)[0];
     }
 
 private:
@@ -733,6 +779,120 @@ public:
         torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
         torch::optional<torch::Tensor> const& output)
     {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, output,
+            /* do_finalize */ true)[0];
+    }
+
+    // Skips the finalize: returns the per-(token, slot) FC2 rows in permuted order, the routing weights and the
+    // (token, slot) -> permuted-row map, for a consumer that fuses the weighted top-k reduction.
+    [[nodiscard]] std::vector<torch::Tensor> runUnfinalized(torch::optional<torch::Tensor> const& routing_logits,
+        std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids)
+    {
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, torch::nullopt,
+            /* do_finalize */ false);
+    }
+
+    // runUnfinalized with the routing precomputed by the caller (top-k and the permutation for tile
+    // prerouted_tile_n, see dtype_mxe2m1_block_scale_moe_runner): the routing kernel is not launched. The tactic must
+    // be an explicit one with that tile.
+    [[nodiscard]] std::vector<torch::Tensor> runUnfinalizedPrerouted(
+        torch::optional<torch::Tensor> const& routing_logits, std::optional<torch::Tensor> const& routing_bias,
+        torch::Tensor const& hidden_states, std::optional<torch::Tensor> const& hidden_states_scale,
+        torch::Tensor const& gemm1_weights, torch::Tensor const& gemm1_weights_scale,
+        std::optional<torch::Tensor> const& gemm1_bias, std::optional<torch::Tensor> const& gemm1_alpha,
+        std::optional<torch::Tensor> const& gemm1_beta, std::optional<torch::Tensor> const& gemm1_clamp_limit,
+        torch::Tensor const& gemm2_weights, torch::Tensor const& gemm2_weights_scale,
+        std::optional<torch::Tensor> const& gemm2_bias, std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        std::vector<torch::Tensor> prerouted, int64_t prerouted_tile_n)
+    {
+        TORCH_CHECK(tile_config_pair.size() == 2 && tile_config_pair[0] == prerouted_tile_n && tile_config_pair[1] >= 0,
+            "prerouted routing for tile ", prerouted_tile_n, " needs an explicit tactic with that tile.");
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, torch::nullopt,
+            /* do_finalize */ false, prerouted);
+    }
+
+    // run (finalized) with the routing precomputed by the caller, as runUnfinalizedPrerouted.
+    [[nodiscard]] torch::Tensor runPrerouted(torch::optional<torch::Tensor> const& routing_logits,
+        std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& output, std::vector<torch::Tensor> prerouted, int64_t prerouted_tile_n)
+    {
+        TORCH_CHECK(tile_config_pair.size() == 2 && tile_config_pair[0] == prerouted_tile_n && tile_config_pair[1] >= 0,
+            "prerouted routing for tile ", prerouted_tile_n, " needs an explicit tactic with that tile.");
+        return runImpl(routing_logits, routing_bias, hidden_states, hidden_states_scale, gemm1_weights,
+            gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, gemm2_weights,
+            gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
+            local_expert_offset, local_num_experts, routed_scaling_factor, routing_method_type, tile_config_pair,
+            topk_weights, topk_ids, output,
+            /* do_finalize */ true, prerouted)[0];
+    }
+
+    [[nodiscard]] std::vector<torch::Tensor> runImpl(torch::optional<torch::Tensor> const& routing_logits,
+        std::optional<torch::Tensor> const& routing_bias, torch::Tensor const& hidden_states,
+        std::optional<torch::Tensor> const& hidden_states_scale, torch::Tensor const& gemm1_weights,
+        torch::Tensor const& gemm1_weights_scale, std::optional<torch::Tensor> const& gemm1_bias,
+        std::optional<torch::Tensor> const& gemm1_alpha, std::optional<torch::Tensor> const& gemm1_beta,
+        std::optional<torch::Tensor> const& gemm1_clamp_limit, torch::Tensor const& gemm2_weights,
+        torch::Tensor const& gemm2_weights_scale, std::optional<torch::Tensor> const& gemm2_bias,
+        std::optional<torch::Tensor> const& output1_scale_scalar,
+        std::optional<torch::Tensor> const& output1_scale_gate_scalar,
+        std::optional<torch::Tensor> const& output2_scale_scalar, int64_t num_experts, int64_t top_k,
+        std::optional<int64_t> const n_group, std::optional<int64_t> const topk_group, int64_t intermediate_size,
+        std::optional<int64_t> const valid_hidden_size, std::optional<int64_t> const valid_intermediate_size,
+        int64_t local_expert_offset, int64_t local_num_experts, std::optional<double> routed_scaling_factor,
+        int64_t routing_method_type, std::vector<int64_t> tile_config_pair,
+        torch::optional<torch::Tensor> const& topk_weights, torch::optional<torch::Tensor> const& topk_ids,
+        torch::optional<torch::Tensor> const& output, bool do_finalize,
+        std::optional<std::vector<torch::Tensor>> const& prerouted = std::nullopt)
+    {
         int64_t tileN = tile_config_pair[0];
         int64_t config = tile_config_pair[1];
         bool const useFineGrained = tensorrt_llm::common::getEnvUseFineGrainedSync();
@@ -782,7 +942,7 @@ public:
             gemm2_weights_scale, gemm2_bias, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
             num_experts, top_k, n_group, topk_group, intermediate_size, valid_hidden_size, valid_intermediate_size,
             local_expert_offset, local_num_experts, routed_scaling_factor, tileN, routing_method_type, mDtypeAct,
-            *runner, configToRun, topk_weights, topk_ids, output);
+            *runner, configToRun, topk_weights, topk_ids, output, do_finalize, prerouted);
     }
 
 private:
@@ -810,5 +970,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.class_<tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, bool>())
         .def("get_valid_configs", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
-        .def("run_moe", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
+        .def("run_moe", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run)
+        .def("run_moe_unfinalized", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::runUnfinalized)
+        .def("run_moe_unfinalized_prerouted",
+            &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::runUnfinalizedPrerouted)
+        .def("run_moe_prerouted", &tensorrt_llm::torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::runPrerouted);
 }

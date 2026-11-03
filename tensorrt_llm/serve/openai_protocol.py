@@ -1058,11 +1058,13 @@ class ChatCompletionThinkingParam(OpenAIBaseModel):
     `keep` is fixed to `"all"` when thinking is enabled and ignored when
     disabled; `effort` is only meaningful when enabled. An explicit
     `effort` wins over a request-level `reasoning_effort`, which applies
-    only when `effort` is absent (and never for a disabled request).
+    only when `effort` is absent (and never for a disabled request). The
+    model's serving extension accepts the efforts its chat template renders
+    (`medium` is Kimi K3.1 only).
     """
     type: Literal["enabled", "disabled"] = "enabled"
     keep: Optional[Literal["all"]] = None
-    effort: Optional[Literal["low", "high", "max"]] = None
+    effort: Optional[Literal["low", "medium", "high", "max"]] = None
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -1103,6 +1105,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # emits per turn, so parallel emission remains model behavior either way.
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
+    # Standard OpenAI field that some agent clients send on every request
+    # (kimi-code, Codex). Accepted and ignored: the prefix cache matches by
+    # content, so a per-session key would only fragment it.
+    prompt_cache_key: Optional[str] = Field(
+        default=None,
+        description=("Accepted for OpenAI client compatibility; ignored."),
+    )
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,

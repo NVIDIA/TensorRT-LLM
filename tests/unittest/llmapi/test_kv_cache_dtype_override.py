@@ -63,16 +63,20 @@ def test_kv_cache_config_dtype_validation():
     cfg = KvCacheConfig(dtype="FP8_DS_MLA")
     assert cfg.dtype == "fp8_ds_mla"
 
+    cfg = KvCacheConfig(dtype="NVFP4_DS_MLA")
+    assert cfg.dtype == "nvfp4_ds_mla"
+
     with pytest.raises(ValueError, match="kv_cache_config.dtype must be one of"):
         KvCacheConfig(dtype="invalid_dtype")
 
 
-def test_kv_cache_config_rejects_fp8_ds_mla_pool_rebalance():
+@pytest.mark.parametrize("dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_kv_cache_config_rejects_packed_sparse_mla_pool_rebalance(dtype):
     with pytest.raises(
         ValueError,
-        match=r"fp8_ds_mla.*enable_kv_pool_rebalance",
+        match=rf"{dtype}.*enable_kv_pool_rebalance",
     ):
-        KvCacheConfig(dtype="fp8_ds_mla", enable_kv_pool_rebalance=True)
+        KvCacheConfig(dtype=dtype, enable_kv_pool_rebalance=True)
 
 
 def test_torch_llm_args_syncs_nvfp4_kv_cache_dtype(tmp_path):
@@ -80,11 +84,13 @@ def test_torch_llm_args_syncs_nvfp4_kv_cache_dtype(tmp_path):
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
-def test_torch_llm_args_syncs_fp8_ds_mla_kv_cache_dtype(tmp_path):
+@pytest.mark.parametrize("dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_torch_llm_args_syncs_packed_sparse_mla_kv_cache_dtype(tmp_path, dtype):
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
-        kv_cache_config=KvCacheConfig(dtype="fp8_ds_mla"),
+        kv_cache_config=KvCacheConfig(dtype=dtype),
     )
+    assert llm_args.kv_cache_config.dtype == dtype
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
@@ -112,12 +118,13 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
-def test_update_from_hf_quant_config_fp8_ds_mla_overrides(tmp_path):
+@pytest.mark.parametrize("dtype", ["fp8_ds_mla", "nvfp4_ds_mla"])
+def test_update_from_hf_quant_config_packed_sparse_mla_overrides(tmp_path, dtype):
     _write_hf_quant_config(tmp_path, kv_cache_quant_algo="NVFP4")
 
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
-        kv_cache_config=KvCacheConfig(dtype="fp8_ds_mla"),
+        kv_cache_config=KvCacheConfig(dtype=dtype),
     )
     llm_args.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
     model_loader = ModelLoader(llm_args)

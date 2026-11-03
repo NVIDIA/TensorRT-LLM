@@ -56,6 +56,7 @@ __all__ = [
     "K3DsparkForCausalLM",
     "KimiK25ForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiLinearForCausalLM",
     "LagunaForCausalLM",
     "LlamaForCausalLM",

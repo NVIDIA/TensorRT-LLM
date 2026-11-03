@@ -236,6 +236,8 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         try_commit_generation_blocks=lambda request: None,
         # No lender attached, so a resize has no one to tell.
         _sharing=None,
+        # KVCacheManagerV2.__init__ default: no standalone-drafter layers.
+        draft_layer_ids=(),
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
@@ -354,6 +356,8 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
         kv_cache_manager=SimpleNamespace(try_allocate_generation=lambda req: False),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
+        # Blocked generation requests end the pass (no skipping).
+        _skip_blocked_generation=False,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched
@@ -387,6 +391,8 @@ def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
         is_disagg=is_disagg,
         kv_cache_map={7: kv},
         num_extra_kv_tokens=0,
+        # KVCacheManagerV2 default: no standalone-drafter scratch reserve.
+        _standalone_draft_reserve=0,
         _connector_reservations_enabled=lambda: False,
         _fill_fresh_kv_pages=lambda req_id: None,
         _log_window_crossing=lambda *args: None,

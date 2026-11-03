@@ -40,6 +40,12 @@ ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
 FinishReason = tllm_executor.FinishReason
 
+# Builds whose LlmRequest binding takes the prompt as an int32 array (one memcpy) as
+# well as a list of ints (one conversion per token).
+_LLM_REQUEST_ACCEPTS_INPUT_TOKEN_ARRAY = getattr(
+    tensorrt_llm.bindings.internal.batch_manager.LlmRequest,
+    "accepts_input_token_array", False)
+
 REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION:
     LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
@@ -862,6 +868,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # any. The V2 scheduler drops it when the demotion aging bound lets the
         # request through.
         self.py_uncached_prefill_tokens: int | None = None
+        # Set once the V2 scheduler has checked that estimate against the prefix cache.
+        self.py_uncached_prefill_probed = False
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
@@ -1571,7 +1579,14 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    elif _LLM_REQUEST_ACCEPTS_INPUT_TOKEN_ARRAY:
+        # Request.input_token_ids would build a Python list of the whole prompt
+        # only for the binding to convert it back.
+        input_tokens = executor_request.get_input_token_ids_array()
+    else:
+        input_tokens = executor_request.input_token_ids
     if position_ids is None:
         position_ids = executor_request.position_ids
 

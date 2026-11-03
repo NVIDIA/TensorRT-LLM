@@ -137,6 +137,53 @@ _FP4_MLA_PACKED_MAX_M = 1024
 _FP4_MLA_PACKED_MAX_SPLITS = 16
 _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT = 2
 _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
+# Opt-in (Kimi-K3 ULL): the packed decode is a programmatic dependent of the kernel that
+# writes its query (k3_mla_q_fused, which then releases its dependents at entry). The
+# decode's prologue (barriers, TMEM, plan, page table, the first KV tile) runs before its
+# griddepcontrol.wait, the query load right after it. Applies when the query rows come from that
+# kernel and everything else the decode reads was written by kernels that completed before it
+# was launched (the KV update on the aux stream; no plan / lengths / page-table launch in the
+# decode call itself).
+ULL2_MLA_DECODE_PDL_ENV = "TRTLLM_K3_ULL2_MLA_DEC_PDL"
+
+
+def ull2_mla_decode_pdl_enabled() -> bool:
+    return _env_enabled_default(ULL2_MLA_DECODE_PDL_ENV, False)
+
+
+# Opt-in (Kimi-K3 ULL3): where a packed decode whose split reduction a consumer folds
+# (``DeferredPackedReduce(release_early=False)``: the fused Helix tail of a small batch) releases
+# that consumer. "epilogue": once its producer warps have finished the last KV tile, so the
+# consumer stages what does not depend on the decode (W_UV, the task plan) during the decode's
+# partial store instead of after the decode's completion. Unset / "0": only the completion
+# releases it (the ULL2 late tail).
+ULL3_MLA_TAIL_TRIGGER_ENV = "TRTLLM_K3_ULL3_MLA_TAIL_TRIGGER"
+
+
+def ull3_mla_tail_trigger() -> int:
+    """The decode's ``launch_dependents`` mode for a late-released fold consumer (0: none)."""
+    from .fp4_mla_cutedsl_mufu16 import LAUNCH_DEPENDENTS_EPILOGUE
+
+    value = os.environ.get(ULL3_MLA_TAIL_TRIGGER_ENV, "0").strip().lower()
+    if value == "epilogue":
+        return LAUNCH_DEPENDENTS_EPILOGUE
+    if value not in ("", "0"):
+        raise ValueError(f"{ULL3_MLA_TAIL_TRIGGER_ENV}={value!r}: expected 0 or epilogue")
+    return 0
+
+
+def _count_fp4_mla_metadata_launch(metadata: Any) -> None:
+    """Count a kernel that writes decode metadata (plan, lengths, page table) on the current
+    stream; a decode launched right after one must not read that metadata before its wait."""
+    metadata.fp4_mla_state.metadata_launches += 1
+
+
+def mark_fp4_mla_query_launch(metadata: Any) -> None:
+    """Record that the kernel writing this step's query rows was just launched (the fused
+    query, ``TRTLLM_K3_ULL2_MLA_DEC_PDL``): a decode launched as its programmatic dependent
+    requires that no metadata kernel was launched since."""
+    state = metadata.fp4_mla_state
+    state.query_launch_mark = state.metadata_launches
 
 
 def _fp4_mla_packed_q_enabled() -> bool:

@@ -101,6 +101,62 @@ TEST(KvCacheManagerV2SlotAllocatorTest, ShrinkTouchedPool)
     releaseSlots(allocator, slots, 0, 8);
 }
 
+std::vector<SlotId> slotIds(std::vector<Slot> const& slots)
+{
+    std::vector<SlotId> ids;
+    ids.reserve(slots.size());
+    for (auto const& slot : slots)
+    {
+        ids.push_back(slot.slotId());
+    }
+    return ids;
+}
+
+// Released slots come back first-in first-out ahead of never-issued ids, whether the next request
+// takes them one at a time or in one allocateMultiple() call. Slots here carry no event (always
+// ready), so release() alone makes them reusable.
+TEST(KvCacheManagerV2SlotAllocatorTest, ReleaseHeavyThenAllocateHeavyReusesRecycledSlotsInOrder)
+{
+    SlotAllocator allocator{SlotCount{32}};
+    auto slots = allocateSlots(allocator, 16);
+    ASSERT_EQ(slotIds(slots).front(), SlotId{0});
+    ASSERT_EQ(slotIds(slots).back(), SlotId{15});
+
+    // Release every other slot, then the rest: FIFO recycle order 0, 2, ..., 14, 1, 3, ..., 15.
+    std::vector<SlotId> expected;
+    for (std::size_t first : {std::size_t{0}, std::size_t{1}})
+    {
+        for (std::size_t i = first; i < slots.size(); i += 2)
+        {
+            expected.push_back(slots[i].slotId());
+            releaseSlots(allocator, slots, i, i + 1);
+        }
+    }
+    EXPECT_EQ(allocator.numOccupiedSlots(), 0);
+
+    auto batch = allocator.allocateMultiple(SlotCount{12});
+    auto single = allocator.allocate();
+    auto rest = allocator.allocateMultiple(SlotCount{5});
+    std::vector<SlotId> got = slotIds(batch);
+    got.push_back(single.slotId());
+    for (SlotId id : slotIds(rest))
+    {
+        got.push_back(id);
+    }
+    // 16 recycled slots in release order, then never-issued ids 16 and 17.
+    expected.push_back(SlotId{16});
+    expected.push_back(SlotId{17});
+    EXPECT_EQ(got, expected);
+    EXPECT_EQ(allocator.numActiveSlots(), 18);
+
+    releaseSlots(allocator, batch);
+    std::vector<Slot> singleVec;
+    singleVec.push_back(std::move(single));
+    releaseSlots(allocator, singleVec);
+    releaseSlots(allocator, rest);
+    allocator.synchronize();
+}
+
 // SlotId is signed, so an upper-bound-only test admits negative ids, which convert to a huge
 // size_t and index far outside the pool.
 TEST(KvCacheManagerV2SlotAllocatorTest, RejectsSlotIdsOutsideThePool)

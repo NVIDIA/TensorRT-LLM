@@ -50,11 +50,31 @@ Productization deltas vs the drop's host wrapper (``reference.py``):
 Kernel shape contract: ``K == V == 128``, conv width ``W == 4``,
 ``HV == H``, one V pass (TILE_V=128, 512 threads). ``num_spec`` is a
 compile-time constant per cache allocation.
+
+Kernel selection (``_select_verify_kernel``). The runtime verify contract is
+packed token rows, the fused gated RMSNorm and the 3xTF32 recurrence (at most
+``MAX_NUM_SPEC`` drafts, vector-aligned bf16 operands). The three kernels have
+the same arithmetic in the same order and bitwise identical results:
+
+* ``kda_decode_mtp_kernel``: every call off the contract (replay-only commits,
+  the shifted-metadata layout, the raw output, the BF16 recurrence of
+  ``TRTLLM_KDA_MTP_BF16_MATH=1``). Its MXFP8 epilogue serves only that BF16
+  recurrence and is the bitwise reference of the two-CTA kernel's.
+* ``kda_decode_mtp_2cta_kernel`` (``kda_mtp_decode_2cta.py``, two CTAs per
+  SM): contract calls with more ``(head, request)`` tiles than SMs or with the
+  MXFP8 output.
+* ``kda_decode_mtp_v2_kernel`` (``kda_mtp_decode_v2.py``, one CTA or a cluster
+  pair per tile): the other contract calls (BF16 output, one wave).
+
+``TRTLLM_K3_KDA_DECODE_DV_SPLIT`` (``auto`` / 2 / 4 / 8, off by default) runs the v2
+kernel with each (head, request) tile split over a cluster of CTAs that own disjoint
+state rows, also for the MXFP8 output (bitwise the same results, see
+:func:`dv_split_for`).
 """
 
 import os
 from math import gcd
-from typing import Optional, Tuple
+from typing import Callable, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -71,20 +91,190 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from cutlass.cute.runtime import from_dlpack
 
     from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode import (
+        MAX_NUM_SPEC,
         NUM_THREADS,
         SPLIT_MAX_TILES,
         T_PAD,
         TILE_K,
         kda_decode_mtp_kernel,
     )
+    from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode_2cta import (
+        kda_decode_mtp_2cta_kernel,
+    )
+    from ..attention.kernels.blackwell.kimi_k3_kda.kda_mtp_decode_v2 import kda_decode_mtp_v2_kernel
 else:
     raise ImportError("Kimi K3 KDA MTP decode requires NVIDIA CUTLASS DSL")
 
 # One V pass: the kernel runs 16 warps x 8 rows over the full 128-row state.
 _TILE_V = 128
+# CTAs per SM kda_decode_mtp_2cta_kernel is compiled for (64 registers per thread).
+_TWO_CTA_BLOCKS_PER_SM = 2
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
+
+    class _VerifyMmaAtoms(NamedTuple):
+        """tcgen05 MMA atoms and operand smem layouts shared by the verify kernels."""
+
+        tiled_mma1: "cute.TiledMma"
+        smem_layout_b1: "cute.ComposedLayout"
+        tiled_mma_f32a: "cute.TiledMma"
+        tiled_mma1k: "cute.TiledMma"
+        smem_layout_b1k: "cute.ComposedLayout"
+        tiled_mma2h: "cute.TiledMma"
+        smem_layout_b2h: "cute.ComposedLayout"
+        smem_layout_a2: "cute.ComposedLayout"
+        tiled_mma2q: "cute.TiledMma"
+        smem_layout_b2q: "cute.ComposedLayout"
+        tiled_mma3: "cute.TiledMma"
+        smem_layout_a3: "cute.ComposedLayout"
+        smem_layout_b3: "cute.ComposedLayout"
+        tiled_mma4: "cute.TiledMma"
+
+    def _verify_mma_atoms(op_dtype, V: int, K: int, n1: int) -> _VerifyMmaAtoms:
+        """The verify MMAs for ``op_dtype`` operands (fp32 = 3xTF32, or bf16) with fp32
+        accumulators.
+
+        GEMM1: M = V rows of the state (TMEM), N = ``n1`` operand rows ([K~; Q~; K~lo] for
+        tf32). ``tiled_mma_f32a`` is the fp32 A-fragment layout of the (V x K) state in TMEM
+        (the GEMM2 accumulator seed / state store views); for 3xTF32 it is GEMM1's atom.
+        GEMM1b: the S0_lo sweep only needs K~hi (N = T_PAD). GEMM2: (V x T_PAD) x (T_PAD x K),
+        both operands in smem, issued as two N = K/2 column halves so the state store can start
+        on half 0; half 0 also carries the output-combination GEMM (N = T_PAD (Bcoef) + K/2).
+        GEMM3: T x T coupling matrices, A3 = [Kf; Qf] padded to 64 rows, B3 = Kb (16 rows).
+        ``tiled_mma4`` only provides the accumulator layout of the output combination
+        D4[v, t] = sum_s V'[s, v] Bcoef[t, s], the first T_PAD columns of GEMM2 half 0.
+        """
+        f32 = cutlass.Float32
+
+        def mma(dtype, shape_mn, source):
+            return sm100_utils.make_trivial_tiled_mma(
+                dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                f32,
+                tcgen05.CtaGroup.ONE,
+                shape_mn,
+                source,
+            )
+
+        tmem, smem = tcgen05.OperandSource.TMEM, tcgen05.OperandSource.SMEM
+        tiled_mma_f32a = mma(f32, (V, 3 * T_PAD), tmem)
+        if op_dtype is f32 and n1 == 3 * T_PAD:
+            tiled_mma1 = tiled_mma_f32a
+        else:
+            tiled_mma1 = mma(op_dtype, (V, n1), tmem)
+        tiled_mma1k = mma(f32, (V, T_PAD), tmem)
+        tiled_mma2h = mma(op_dtype, (V, K // 2), smem)
+        tiled_mma2q = mma(op_dtype, (V, T_PAD + K // 2), smem)
+        tiled_mma3 = mma(op_dtype, (4 * T_PAD, T_PAD), smem)
+        return _VerifyMmaAtoms(
+            tiled_mma1=tiled_mma1,
+            smem_layout_b1=sm100_utils.make_smem_layout_b(tiled_mma1, (V, n1, K), op_dtype, 1),
+            tiled_mma_f32a=tiled_mma_f32a,
+            tiled_mma1k=tiled_mma1k,
+            smem_layout_b1k=sm100_utils.make_smem_layout_b(tiled_mma1k, (V, T_PAD, K), f32, 1),
+            tiled_mma2h=tiled_mma2h,
+            smem_layout_b2h=sm100_utils.make_smem_layout_b(
+                tiled_mma2h, (V, K // 2, T_PAD), op_dtype, 1
+            ),
+            smem_layout_a2=sm100_utils.make_smem_layout_a(
+                tiled_mma2h, (V, K // 2, T_PAD), op_dtype, 1
+            ),
+            tiled_mma2q=tiled_mma2q,
+            smem_layout_b2q=sm100_utils.make_smem_layout_b(
+                tiled_mma2q, (V, T_PAD + K // 2, T_PAD), op_dtype, 1
+            ),
+            tiled_mma3=tiled_mma3,
+            smem_layout_a3=sm100_utils.make_smem_layout_a(
+                tiled_mma3, (4 * T_PAD, T_PAD, K), op_dtype, 1
+            ),
+            smem_layout_b3=sm100_utils.make_smem_layout_b(
+                tiled_mma3, (4 * T_PAD, T_PAD, K), op_dtype, 1
+            ),
+            tiled_mma4=mma(f32, (V, T_PAD), smem),
+        )
+
+    class _StateTmaAtoms(NamedTuple):
+        """TMA load of the initial state S0 and bulk store of the committed state."""
+
+        tma_atom_l: "cpasync.CopyAtom"
+        mS_tma: "cute.Tensor"
+        box_layout: "cute.ComposedLayout"
+        tma_atom_t: "cpasync.CopyAtom"
+        mT_tma: "cute.Tensor"
+        box_layout_t: "cute.ComposedLayout"
+
+    def _state_tiles(state: cute.Tensor, V: int, K: int) -> cute.Tensor:
+        """(V, K, tiles) view of a V-first state pool with its own strides (the per-layer state
+        cache may be a strided slice of a larger buffer); the tile mode is the pool index (flat
+        ``[pool, V, K]`` layout) or the (head, slot) pair (``[pool, H, V, K]``)."""
+        stride = state.layout.stride
+        if cute.rank(state.shape) == 3:
+            return cute.make_tensor(
+                state.iterator,
+                cute.make_layout((V, K, state.shape[0]), stride=(stride[1], stride[2], stride[0])),
+            )
+        return cute.make_tensor(
+            state.iterator,
+            cute.make_layout(
+                (V, K, (state.shape[1], state.shape[0])),
+                stride=(stride[2], stride[3], (stride[1], stride[0])),
+            ),
+        )
+
+    def _state_tma_atoms(
+        h0: cute.Tensor, ht: cute.Tensor, V: int, K: int, split_v: int, dv: int = 1
+    ) -> _StateTmaAtoms:
+        """S0 is loaded from ``h0`` and the committed state stored to ``ht`` in 128B-swizzled
+        boxes of 32 fp32 or 64 bf16 state columns; each CTA of a ``split_v`` group stores its
+        V / split_v rows. With the value-row split (``dv > 1``) a CTA loads and stores only its
+        V / dv rows."""
+        box_cols = 128 // (h0.element_type.width // 8)
+        box_atom = sm100_utils.make_smem_layout_atom(
+            tcgen05.SmemLayoutAtomKind.K_SW128, h0.element_type
+        )
+        box_layout = cute.tile_to_shape(box_atom, (V // dv, box_cols), order=(0, 1))
+        box_layout_t = cute.tile_to_shape(box_atom, (V // (split_v * dv), box_cols), order=(0, 1))
+        tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(),
+            _state_tiles(h0, V, K),
+            box_layout,
+            (V // dv, box_cols),
+        )
+        tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            _state_tiles(ht, V, K),
+            box_layout_t,
+            (V // (split_v * dv), box_cols),
+        )
+        return _StateTmaAtoms(tma_atom_l, mS_tma, box_layout, tma_atom_t, mT_tma, box_layout_t)
+
+    def _launch_verify(
+        launched, HV: int, N, split_v: int, stream, dv: int = 1, **launch_kwargs
+    ) -> None:
+        if dv > 1:
+            # value-row split: the dv CTAs of a (head, request) exchange outputs through DSMEM
+            launched.launch(
+                grid=(HV, N, dv),
+                block=[NUM_THREADS, 1, 1],
+                cluster=(1, 1, dv),
+                stream=stream,
+                **launch_kwargs,
+            )
+        elif split_v == 2:
+            # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
+            launched.launch(
+                grid=(HV, N, 2),
+                block=[NUM_THREADS, 1, 1],
+                cluster=(1, 1, 2),
+                stream=stream,
+                **launch_kwargs,
+            )
+        else:
+            launched.launch(
+                grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream, **launch_kwargs
+            )
 
     @cute.jit
     def _run_kda_decode_mtp(
@@ -147,159 +337,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             t_max = 2 * NUM_SPEC + 1
         smem_qk_layout = cute.make_layout((t_max, K), stride=(K, 1))
         # BF16_MMA: bf16 tensor-core operands ([K~; Q~] only, K = 16 per instruction).
-        OP_DTYPE = cutlass.BFloat16 if BF16_MMA else cutlass.Float32
-        N1 = 2 * T_PAD if BF16_MMA else 3 * T_PAD
-        # GEMM1: M = V rows of the state (TMEM), N = operand rows ([K~; Q~; K~lo] for tf32).
-        tiled_mma1 = sm100_utils.make_trivial_tiled_mma(
-            OP_DTYPE,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, N1),
-            tcgen05.OperandSource.TMEM,
+        mma = _verify_mma_atoms(
+            cutlass.BFloat16 if BF16_MMA else cutlass.Float32,
+            V,
+            K,
+            2 * T_PAD if BF16_MMA else 3 * T_PAD,
         )
-        smem_layout_b1 = sm100_utils.make_smem_layout_b(tiled_mma1, (V, N1, K), OP_DTYPE, 1)
-        # fp32 A-fragment layout of the (V x K) state in TMEM: the GEMM2 accumulator seed / state
-        # store views use it in every mode.
-        tiled_mma_f32a = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, 3 * T_PAD),
-            tcgen05.OperandSource.TMEM,
-        )
-        # GEMM1b: the S0_lo sweep only needs K~hi (N = T_PAD) -> a third of the N=48 work.
-        tiled_mma1k = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, T_PAD),
-            tcgen05.OperandSource.TMEM,
-        )
-        smem_layout_b1k = sm100_utils.make_smem_layout_b(
-            tiled_mma1k, (V, T_PAD, K), cutlass.Float32, 1
-        )
-        # TMA bulk store of the committed state: (V, K, tiles) view of ht, one 128B-swizzled
-        # (V/SPLIT_V x 32 fp32 | 64 bf16) box per 128 B-wide column slab. The view takes ht's own strides (the
-        # per-layer state cache is a strided slice of a larger buffer); the tile mode is the pool
-        # index (flat layout) or the (head, slot) pair.
-        if cutlass.const_expr(cute.rank(ht.shape) == 3):
-            mT_vkl = cute.make_tensor(
-                ht.iterator,
-                cute.make_layout(
-                    (V, K, ht.shape[0]),
-                    stride=(ht.layout.stride[1], ht.layout.stride[2], ht.layout.stride[0]),
-                ),
-            )
-        else:
-            mT_vkl = cute.make_tensor(
-                ht.iterator,
-                cute.make_layout(
-                    (V, K, (ht.shape[1], ht.shape[0])),
-                    stride=(
-                        ht.layout.stride[2],
-                        ht.layout.stride[3],
-                        (ht.layout.stride[1], ht.layout.stride[0]),
-                    ),
-                ),
-            )
-        # 128 B swizzled box rows: 32 fp32 or 64 bf16 state columns per box
-        box_cols = 128 // (h0.element_type.width // 8)
-        box_atom = sm100_utils.make_smem_layout_atom(
-            tcgen05.SmemLayoutAtomKind.K_SW128, h0.element_type
-        )
-        box_layout = cute.tile_to_shape(box_atom, (V, box_cols), order=(0, 1))
-        # committed-state store: each CTA writes its V/SPLIT_V rows through (V/SPLIT_V x box_cols) boxes
-        box_layout_t = cute.tile_to_shape(box_atom, (V // SPLIT_V, box_cols), order=(0, 1))
-        tma_atom_t, mT_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileS2GOp(), mT_vkl, box_layout_t, (V // SPLIT_V, box_cols)
-        )
-        # TMA bulk load of the initial state S0 into the same box layout (issued at kernel start).
-        if cutlass.const_expr(cute.rank(h0.shape) == 3):
-            mS_vkl = cute.make_tensor(
-                h0.iterator,
-                cute.make_layout(
-                    (V, K, h0.shape[0]),
-                    stride=(h0.layout.stride[1], h0.layout.stride[2], h0.layout.stride[0]),
-                ),
-            )
-        else:
-            mS_vkl = cute.make_tensor(
-                h0.iterator,
-                cute.make_layout(
-                    (V, K, (h0.shape[1], h0.shape[0])),
-                    stride=(
-                        h0.layout.stride[2],
-                        h0.layout.stride[3],
-                        (h0.layout.stride[1], h0.layout.stride[0]),
-                    ),
-                ),
-            )
-        tma_atom_l, mS_tma = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), mS_vkl, box_layout, (V, box_cols)
-        )
-        # GEMM2: (V x T_PAD) x (T_PAD x K), both operands in smem, tf32; issued as two N = K/2
-        # column halves so the state store can start on half 0.
-        tiled_mma2h = sm100_utils.make_trivial_tiled_mma(
-            OP_DTYPE,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, K // 2),
-            tcgen05.OperandSource.SMEM,
-        )
-        smem_layout_b2h = sm100_utils.make_smem_layout_b(
-            tiled_mma2h, (V, K // 2, T_PAD), OP_DTYPE, 1
-        )
-        smem_layout_a2 = sm100_utils.make_smem_layout_a(
-            tiled_mma2h, (V, K // 2, T_PAD), OP_DTYPE, 1
-        )
-        # GEMM2 half 0 also carries the output-combination GEMM: N = T_PAD (Bcoef) + K/2 (Kbar rows 0..63).
-        tiled_mma2q = sm100_utils.make_trivial_tiled_mma(
-            OP_DTYPE,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, T_PAD + K // 2),
-            tcgen05.OperandSource.SMEM,
-        )
-        smem_layout_b2q = sm100_utils.make_smem_layout_b(
-            tiled_mma2q, (V, T_PAD + K // 2, T_PAD), OP_DTYPE, 1
-        )
-        # GEMM3: T x T coupling matrices, A3 = [Kf; Qf] padded to 64 rows, B3 = Kb (16 rows).
-        tiled_mma3 = sm100_utils.make_trivial_tiled_mma(
-            OP_DTYPE,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (4 * T_PAD, T_PAD),
-            tcgen05.OperandSource.SMEM,
-        )
-        smem_layout_a3 = sm100_utils.make_smem_layout_a(
-            tiled_mma3, (4 * T_PAD, T_PAD, K), OP_DTYPE, 1
-        )
-        smem_layout_b3 = sm100_utils.make_smem_layout_b(
-            tiled_mma3, (4 * T_PAD, T_PAD, K), OP_DTYPE, 1
-        )
-        # Output combination D4[v, t] = sum_s V'[s, v] Bcoef[t, s]: computed as the first 16 columns
-        # of GEMM2 half 0; this tiled MMA only provides the accumulator layout of those columns.
-        tiled_mma4 = sm100_utils.make_trivial_tiled_mma(
-            cutlass.Float32,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            cutlass.Float32,
-            tcgen05.CtaGroup.ONE,
-            (V, T_PAD),
-            tcgen05.OperandSource.SMEM,
-        )
+        state_tma = _state_tma_atoms(h0, ht, V, K, SPLIT_V)
         launched = kda_decode_mtp_kernel(
             h0,
             x_q,
@@ -349,37 +393,275 @@ if IS_CUTLASS_DSL_AVAILABLE:
             QUANTIZE_OUTPUT,
             stage_timing,
             PROFILE_STAGES,
-            tiled_mma1,
-            tiled_mma3,
-            tiled_mma1k,
-            smem_layout_b1,
-            smem_layout_a2,
-            smem_layout_a3,
-            smem_layout_b3,
-            smem_layout_b1k,
-            tiled_mma4,
-            tma_atom_t,
-            mT_tma,
-            box_layout,
-            tma_atom_l,
-            mS_tma,
-            tiled_mma2h,
-            smem_layout_b2h,
-            box_layout_t,
-            tiled_mma2q,
-            smem_layout_b2q,
+            mma.tiled_mma1,
+            mma.tiled_mma3,
+            mma.tiled_mma1k,
+            mma.smem_layout_b1,
+            mma.smem_layout_a2,
+            mma.smem_layout_a3,
+            mma.smem_layout_b3,
+            mma.smem_layout_b1k,
+            mma.tiled_mma4,
+            state_tma.tma_atom_t,
+            state_tma.mT_tma,
+            state_tma.box_layout,
+            state_tma.tma_atom_l,
+            state_tma.mS_tma,
+            mma.tiled_mma2h,
+            mma.smem_layout_b2h,
+            state_tma.box_layout_t,
+            mma.tiled_mma2q,
+            mma.smem_layout_b2q,
             SPLIT_V,
             BF16_MMA,
-            tiled_mma_f32a,
+            mma.tiled_mma_f32a,
             REPLAY_ONLY,
         )
-        if cutlass.const_expr(SPLIT_V == 2):
-            # cluster pair: the two CTAs of a (head, request) must be co-scheduled (in-place state)
-            launched.launch(
-                grid=(HV, N, 2), block=[NUM_THREADS, 1, 1], cluster=(1, 1, 2), stream=stream
+        _launch_verify(launched, HV, N, SPLIT_V, stream)
+
+    @cute.jit
+    def _run_kda_decode_mtp_v2(
+        h0: cute.Tensor,
+        x_q: cute.Tensor,
+        x_k: cute.Tensor,
+        x_v: cute.Tensor,
+        w_q: cute.Tensor,
+        w_k: cute.Tensor,
+        w_v: cute.Tensor,
+        cs_q: cute.Tensor,
+        cs_k: cute.Tensor,
+        cs_v: cute.Tensor,
+        A_log: cute.Tensor,
+        g: cute.Tensor,
+        dt_bias: cute.Tensor,
+        beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
+        o: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        v_cache: cute.Tensor,
+        beta_cache: cute.Tensor,
+        ssm_state_indices: cute.Tensor,
+        num_accepted_tokens: cute.Tensor,
+        fa: cute.Tensor,
+        w_fb: cute.Tensor,
+        o8: cute.Tensor,
+        osf: cute.Tensor,
+        N: cutlass.Int32,
+        scale: cutlass.Constexpr[float],
+        HV: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        V: cutlass.Constexpr[int],
+        NUM_SPEC: cutlass.Constexpr[int],
+        KERNEL_WIDTH: cutlass.Constexpr[int],
+        lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        SPLIT_V: cutlass.Constexpr[int],
+        PDL: cutlass.Constexpr[bool],
+        FUSED_FB: cutlass.Constexpr[bool],
+        stream: cuda.CUstream,
+        DV: cutlass.Constexpr[int] = 1,
+        MXFP8_OUT: cutlass.Constexpr[bool] = False,
+    ):
+        """Host side of ``kda_decode_mtp_v2_kernel`` (packed rows, fused gated RMSNorm, bf16
+        output, 3xTF32): the tf32 MMA atoms, operand smem layouts and state TMA atoms of
+        ``_run_kda_decode_mtp``, then the launch. With ``FUSED_FB``, ``fa`` is the BF16
+        ``[1, T, 128]`` f_a view and ``w_fb`` the BF16 ``[HV * 128, 128]`` f_b weight (else both
+        are unused placeholders). ``DV > 1``: value-row split over clusters of ``DV`` CTAs, whose
+        state TMA boxes cover ``V / DV`` rows. With ``MXFP8_OUT`` the kernel writes the E4M3
+        ``o8`` and the R128c4 scales ``osf`` instead of ``o`` (else both are placeholders)."""
+        mma = _verify_mma_atoms(cutlass.Float32, V, K, 3 * T_PAD)
+        state_tma = _state_tma_atoms(h0, h0, V, K, SPLIT_V, DV)
+        if cutlass.const_expr(FUSED_FB):
+            # W_fb rows of one head: two 128 x 64 BF16 boxes with 128B swizzle.
+            fb_atom = sm100_utils.make_smem_layout_atom(
+                tcgen05.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
             )
+            mFb = cute.make_tensor(
+                w_fb.iterator, cute.make_layout((w_fb.shape[0], K), stride=(K, 1))
+            )
+            tma_atom_fb, mFb_tma = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mFb,
+                cute.tile_to_shape(fb_atom, (K, 64), order=(0, 1)),
+                (K, 64),
+            )
+            fb_layout = cute.tile_to_shape(fb_atom, (K, 64, K // 64), (0, 1, 2))
         else:
-            launched.launch(grid=(HV, N, 1), block=[NUM_THREADS, 1, 1], stream=stream)
+            tma_atom_fb, mFb_tma, fb_layout = (
+                state_tma.tma_atom_l,
+                state_tma.mS_tma,
+                state_tma.box_layout,
+            )
+        launched = kda_decode_mtp_v2_kernel(
+            h0,
+            x_q,
+            x_k,
+            x_v,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            A_log,
+            g,
+            dt_bias,
+            beta,
+            onorm_g,
+            onorm_weight,
+            o,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            num_accepted_tokens,
+            cute.make_layout((2 * NUM_SPEC + 1, K), stride=(K, 1)),
+            mma.tiled_mma1,
+            mma.tiled_mma3,
+            mma.tiled_mma1k,
+            mma.smem_layout_b1,
+            mma.smem_layout_a2,
+            mma.smem_layout_a3,
+            mma.smem_layout_b3,
+            mma.smem_layout_b1k,
+            mma.tiled_mma4,
+            state_tma.tma_atom_t,
+            state_tma.mT_tma,
+            state_tma.box_layout,
+            state_tma.tma_atom_l,
+            state_tma.mS_tma,
+            mma.tiled_mma2h,
+            mma.smem_layout_b2h,
+            state_tma.box_layout_t,
+            mma.tiled_mma2q,
+            mma.smem_layout_b2q,
+            fa,
+            tma_atom_fb,
+            mFb_tma,
+            fb_layout,
+            o8,
+            osf,
+            scale,
+            HV,
+            K,
+            V,
+            NUM_SPEC,
+            KERNEL_WIDTH,
+            lower_bound,
+            onorm_eps,
+            USE_FLAT_LAYOUT,
+            SPLIT_V,
+            PDL,
+            FUSED_FB,
+            DV,
+            MXFP8_OUT,
+        )
+        _launch_verify(launched, HV, N, SPLIT_V, stream, DV, use_pdl=PDL)
+
+    @cute.jit
+    def _run_kda_decode_mtp_2cta(
+        h0: cute.Tensor,
+        x_q: cute.Tensor,
+        x_k: cute.Tensor,
+        x_v: cute.Tensor,
+        w_q: cute.Tensor,
+        w_k: cute.Tensor,
+        w_v: cute.Tensor,
+        cs_q: cute.Tensor,
+        cs_k: cute.Tensor,
+        cs_v: cute.Tensor,
+        A_log: cute.Tensor,
+        g: cute.Tensor,
+        dt_bias: cute.Tensor,
+        beta: cute.Tensor,
+        onorm_g: cute.Tensor,
+        onorm_weight: cute.Tensor,
+        o: cute.Tensor,
+        k_cache: cute.Tensor,
+        g_cache: cute.Tensor,
+        v_cache: cute.Tensor,
+        beta_cache: cute.Tensor,
+        ssm_state_indices: cute.Tensor,
+        num_accepted_tokens: cute.Tensor,
+        o8: cute.Tensor,
+        osf: cute.Tensor,
+        N: cutlass.Int32,
+        scale: cutlass.Constexpr[float],
+        HV: cutlass.Constexpr[int],
+        K: cutlass.Constexpr[int],
+        V: cutlass.Constexpr[int],
+        NUM_SPEC: cutlass.Constexpr[int],
+        KERNEL_WIDTH: cutlass.Constexpr[int],
+        lower_bound: cutlass.Constexpr[float],
+        onorm_eps: cutlass.Constexpr[float],
+        USE_FLAT_LAYOUT: cutlass.Constexpr[bool],
+        MXFP8_OUT: cutlass.Constexpr[bool],
+        stream: cuda.CUstream,
+    ):
+        """Host side of ``kda_decode_mtp_2cta_kernel`` (fp32 or bf16 state), launched for two
+        CTAs per SM (64 registers per thread)."""
+        mma = _verify_mma_atoms(cutlass.Float32, V, K, 3 * T_PAD)
+        state_tma = _state_tma_atoms(h0, h0, V, K, 1)
+        launched = kda_decode_mtp_2cta_kernel(
+            h0,
+            x_q,
+            x_k,
+            x_v,
+            w_q,
+            w_k,
+            w_v,
+            cs_q,
+            cs_k,
+            cs_v,
+            A_log,
+            g,
+            dt_bias,
+            beta,
+            onorm_g,
+            onorm_weight,
+            o,
+            k_cache,
+            g_cache,
+            v_cache,
+            beta_cache,
+            ssm_state_indices,
+            num_accepted_tokens,
+            o8,
+            osf,
+            mma.tiled_mma1,
+            mma.tiled_mma3,
+            mma.tiled_mma1k,
+            mma.smem_layout_b1,
+            mma.smem_layout_a2,
+            mma.smem_layout_a3,
+            mma.smem_layout_b3,
+            mma.smem_layout_b1k,
+            mma.tiled_mma4,
+            mma.tiled_mma2h,
+            mma.smem_layout_b2h,
+            mma.tiled_mma2q,
+            mma.smem_layout_b2q,
+            state_tma.tma_atom_l,
+            state_tma.mS_tma,
+            state_tma.box_layout,
+            state_tma.tma_atom_t,
+            state_tma.mT_tma,
+            scale,
+            HV,
+            K,
+            V,
+            NUM_SPEC,
+            KERNEL_WIDTH,
+            lower_bound,
+            onorm_eps,
+            USE_FLAT_LAYOUT,
+            MXFP8_OUT,
+        )
+        _launch_verify(launched, HV, N, 1, stream, min_blocks_per_mp=_TWO_CTA_BLOCKS_PER_SM)
 
 
 def _require_stride_layout(
@@ -418,6 +700,8 @@ def _require_stride_layout(
     packed_token_layout,
     fuse_output_norm,
     quantize_output,
+    fa=None,
+    w_fb=None,
 ):
     if x_q.ndim != 4 or x_k.ndim != 4 or x_v.ndim != 4:
         raise ValueError("Expected x_q/x_k/x_v to have shape [1, T, H, D].")
@@ -425,7 +709,14 @@ def _require_stride_layout(
         raise ValueError(f"Expected x_q/x_k shape [1, {T_total}, {H}, {K}].")
     if x_v.shape != (1, T_total, HV, V):
         raise ValueError(f"Expected x_v shape [1, {T_total}, {HV}, {V}].")
-    if g.ndim != 4 or g.shape != (1, T_total, HV, K):
+    if fa is not None:
+        if fa.ndim != 3 or fa.shape != (1, T_total, K) or fa.dtype != torch.bfloat16:
+            raise ValueError(f"Expected bf16 fa shape [1, {T_total}, {K}].")
+        if w_fb.shape != (HV * K, K) or w_fb.dtype != torch.bfloat16 or not w_fb.is_contiguous():
+            raise ValueError(f"Expected a contiguous bf16 w_fb of shape [{HV * K}, {K}].")
+        if w_fb.data_ptr() % 16:
+            raise ValueError("Expected w_fb to be 16-byte aligned (TMA source).")
+    elif g.ndim != 4 or g.shape != (1, T_total, HV, K):
         raise ValueError(f"Expected g shape [1, {T_total}, {HV}, {K}].")
     if beta.ndim != 3 or beta.shape != (1, T_total, HV):
         raise ValueError(f"Expected beta shape [1, {T_total}, {HV}].")
@@ -456,7 +747,7 @@ def _require_stride_layout(
         "x_q": x_q,
         "x_k": x_k,
         "x_v": x_v,
-        "g": g,
+        "g": g if fa is None else fa,
         "beta": beta,
         "recurrent_state": recurrent_state,
         "k_cache": k_cache,
@@ -601,6 +892,163 @@ def _layout_key(tensor: torch.Tensor, dynamic_layout: bool = False, *, assumed_a
     return (tensor.dtype, shape, stride, _fits_32bit_stride(tensor), assumed_align)
 
 
+_DV_SPLIT_VALUES = (2, 4, 8)
+
+
+def _dv_split_setting() -> Optional[str]:
+    """``TRTLLM_K3_KDA_DECODE_DV_SPLIT``: unset / ``0`` / ``1`` off, ``auto`` (see
+    :func:`dv_split_for`), or a fixed split ``2``, ``4`` or ``8``."""
+    value = os.environ.get("TRTLLM_K3_KDA_DECODE_DV_SPLIT")
+    if value in (None, "", "0", "1"):
+        return None
+    if value != "auto" and value not in tuple(str(v) for v in _DV_SPLIT_VALUES):
+        raise ValueError(f"TRTLLM_K3_KDA_DECODE_DV_SPLIT must be 0, auto, 2, 4 or 8, got {value!r}")
+    return value
+
+
+_max_active_clusters_cache = {}
+
+
+def _max_active_clusters(device: torch.device, cluster_size: int) -> int:
+    """Clusters of ``cluster_size`` CTAs the device runs at once (``HardwareInfo``'s occupancy
+    query; a cluster stays inside a GPC, so for the larger clusters this is below
+    ``SMs / cluster_size``)."""
+    dev = torch.device(device)
+    key = (dev.index if dev.index is not None else torch.cuda.current_device(), cluster_size)
+    if key not in _max_active_clusters_cache:
+        import cutlass.utils as cutlass_utils
+
+        with torch.cuda.device(key[0]):
+            _max_active_clusters_cache[key] = cutlass_utils.HardwareInfo().get_max_active_clusters(
+                cluster_size
+            )
+    return _max_active_clusters_cache[key]
+
+
+def dv_split_for(
+    num_heads: int,
+    num_requests: int,
+    device: torch.device,
+    *,
+    use_pdl: bool = False,
+    mxfp8_output: bool = False,
+) -> int:
+    """CTAs per (head, request) tile of the v2 verify kernel's value-row split (1: off), from
+    ``TRTLLM_K3_KDA_DECODE_DV_SPLIT``; the results are bitwise those of the kernel without it.
+
+    A fixed value applies whenever the call runs the v2 kernel. ``auto`` follows the per-call
+    times measured on Rubin (12 heads per rank, seven drafts): clusters of 4 CTAs while all of
+    them run at once (1 and 2 requests), else pairs while they do (4 and 8 requests), and no
+    split for a PDL launch (whose prologue overlaps the producer GEMM, which leaves fewer SMs to
+    place clusters on) or an MXFP8 output (the default kernel for it is faster).
+    """
+    setting = _dv_split_setting()
+    if setting is None:
+        return 1
+    if setting != "auto":
+        return int(setting)
+    if use_pdl or mxfp8_output:
+        return 1
+    tiles = num_heads * num_requests
+    for dv in (4, 2):
+        if tiles * dv <= _num_sms(device) and tiles <= _max_active_clusters(device, dv):
+            return dv
+    return 1
+
+
+def verify_ctas(
+    num_heads: int, num_requests: int, device: torch.device, *, use_pdl: bool = False
+) -> int:
+    """CTAs of the v2 verify kernel's grid for these tiles (value-row split, cluster pairs up to
+    ``SPLIT_MAX_TILES`` tiles, or one CTA per tile)."""
+    tiles = num_heads * num_requests
+    dv = dv_split_for(num_heads, num_requests, device, use_pdl=use_pdl)
+    if dv > 1:
+        return tiles * dv
+    return tiles * (2 if tiles <= SPLIT_MAX_TILES else 1)
+
+
+def _vec4_rows(tensor: torch.Tensor, dim: int = -1) -> bool:
+    """True when every group of four consecutive elements along the unit-stride dimension `dim`
+    that starts at a multiple of four is one aligned 8 B (bf16) or 16 B (fp32) access: the v2
+    kernel moves its per-token rows with such vector loads and stores."""
+    if tensor.dtype not in (torch.bfloat16, torch.float32) or tensor.stride(dim) != 1:
+        return False
+    if tensor.data_ptr() % (4 * tensor.element_size()):
+        return False
+    return all(
+        stride % 4 == 0 for d, stride in enumerate(tensor.stride()) if d != dim % tensor.ndim
+    )
+
+
+def _verify_operands_ok(*, w_q, w_k, w_v, state, projections, rows, conv_caches, g_cache) -> bool:
+    """Operands of the runtime verify contract that ``kda_decode_mtp_v2_kernel`` and
+    ``kda_decode_mtp_2cta_kernel`` take.
+
+    Layouts for their vector accesses (see `_vec4_rows`): token rows and replay caches
+    vectorized along their last dimension, the dim-contiguous conv caches along the channel
+    dimension, conv weights as contiguous [channel][4] rows. Dtypes: fp32 or bf16 state, bf16
+    new-token projections and conv caches, fp32 replay gates.
+    """
+    weights_ok = all(
+        w.dtype == w_q.dtype and w.is_contiguous() and w.shape[1] == 4 and _vec4_rows(w)
+        for w in (w_q, w_k, w_v)
+    )
+    return (
+        weights_ok
+        and all(_vec4_rows(t) for t in rows)
+        and all(_vec4_rows(t, dim=1) for t in conv_caches)
+        and state.dtype in (torch.float32, torch.bfloat16)
+        and all(t.dtype == torch.bfloat16 for t in (*projections, *conv_caches))
+        and g_cache.dtype == torch.float32
+    )
+
+
+_num_sms_cache = {}
+
+
+def _num_sms(device: torch.device) -> int:
+    dev = torch.device(device)
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    if index not in _num_sms_cache:
+        _num_sms_cache[index] = torch.cuda.get_device_properties(index).multi_processor_count
+    return _num_sms_cache[index]
+
+
+def _select_verify_kernel(
+    *,
+    packed_token_layout: bool,
+    fuse_output_norm: bool,
+    quantize_output: bool,
+    bf16_math: bool,
+    replay_only: bool,
+    num_spec: int,
+    num_tiles: int,
+    num_sms: int,
+    operands_ok: Callable[[], bool],
+) -> Literal["v1", "v2", "two_cta"]:
+    """The verify kernel a call runs, by the rule in the module docstring. A call on the
+    contract whose operands fail ``operands_ok`` (`_verify_operands_ok`, evaluated last) is
+    rejected."""
+    if not (
+        packed_token_layout
+        and fuse_output_norm
+        and not bf16_math
+        and not replay_only
+        and num_spec <= MAX_NUM_SPEC
+    ):
+        return "v1"
+    if not operands_ok():
+        raise ValueError(
+            "KDA MTP verify: the packed, fused-norm verify takes 16-byte-vectorizable bf16 "
+            "projections and conv caches, contiguous conv weights, fp32 replay gates and an fp32 "
+            "or bf16 state"
+        )
+    if quantize_output or num_tiles > num_sms:
+        return "two_cta"
+    return "v2"
+
+
 # (device_index, enabled) -> persistent int32 [1] control tensor. Keys are
 # plain values (not tensor identities), so entries never go stale.
 _precompute_control_cache = {}
@@ -692,6 +1140,9 @@ def kda_mtp_decode_impl(
     fuse_output_norm: bool = False,
     quantize_output: bool = False,
     replay_only: bool = False,
+    fa: Optional[torch.Tensor] = None,
+    w_fb: Optional[torch.Tensor] = None,
+    use_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -702,8 +1153,10 @@ def kda_mtp_decode_impl(
             or packed uniformly by request.
         w_q/w_k/w_v: conv weights ``[H*128, W]`` fp32, width-contiguous.
         cs_q/cs_k/cs_v: extended conv caches ``[pool, H*128, >= W-1+M]``
-            fp32, dim-contiguous. Columns ``[0, W-1)`` are the committed
-            window; tail columns hold raw pending-draft inputs. Mutated.
+            of raw projection inputs, bf16 (the runtime's caches; the packed
+            fused-norm verify requires bf16), dim-contiguous. Columns
+            ``[0, W-1)`` are the committed window; tail columns hold raw
+            pending-draft inputs. Mutated.
         g, beta: raw gate ``[1, T, H, 128]`` and beta ``[1, T, H]`` bf16.
         A_log, dt_bias: fp32 ``[H]`` / ``[H*128]``.
         recurrent_state: pool ``[pool, H, V, K]`` fp32 or bf16, **V-first** layout
@@ -736,6 +1189,14 @@ def kda_mtp_decode_impl(
             constants, conv caches, ``cu_seqlens`` and ``out`` are not
             accessed. Takes the shifted-metadata layout without hints, output
             norm or quantization.
+        fa, w_fb: fused forget gate (v2 contract only): ``fa`` is the BF16
+            ``[1, T_total, 128]`` f_a projection (rows may be strided, e.g. the
+            first 128 columns of the ``[f_a | b]`` output) and ``w_fb`` the BF16
+            ``[H * 128, 128]`` f_b weight; the kernel computes the forget gate
+            ``bf16(f_a @ w_fb^T)`` itself and ``g`` must be ``None``.
+        use_pdl: launch as a programmatic dependent of the previous grid (v2
+            contract only); the kernel loads its state, replay entries and
+            weights before ``griddepcontrol.wait``.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -743,7 +1204,10 @@ def kda_mtp_decode_impl(
     """
     _, T_total, _, D = x_q.shape
     H = A_log.shape[0]
-    HV = g.shape[2] if g.ndim == 4 else H
+    fused_fb = fa is not None
+    if fused_fb != (w_fb is not None) or fused_fb == (g is not None):
+        raise ValueError("pass either g, or fa and w_fb (fused forget gate)")
+    HV = H if fused_fb else (g.shape[2] if g.ndim == 4 else H)
     K = D
     V_dim = x_v.shape[-1]
     W = w_q.shape[1]
@@ -839,6 +1303,8 @@ def kda_mtp_decode_impl(
         packed_token_layout=packed_token_layout,
         fuse_output_norm=fuse_output_norm,
         quantize_output=quantize_output,
+        fa=fa,
+        w_fb=w_fb,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -886,6 +1352,130 @@ def kda_mtp_decode_impl(
     # Two CTAs per (head, request) while they fit in one wave (see SPLIT_MAX_TILES).
     split_v = 2 if HV * N <= SPLIT_MAX_TILES else 1
     bf16_math = _bf16_math_enabled()
+
+    gate_rows = (fa,) if fused_fb else (g,)
+    kernel = _select_verify_kernel(
+        packed_token_layout=packed_token_layout,
+        fuse_output_norm=fuse_output_norm,
+        quantize_output=quantize_output,
+        bf16_math=bf16_math,
+        replay_only=replay_only,
+        num_spec=num_spec,
+        num_tiles=HV * N,
+        num_sms=_num_sms(x_q.device),
+        operands_ok=lambda: _verify_operands_ok(
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            state=h0_arg,
+            projections=(x_q, x_k, x_v),
+            rows=(x_q_arg, x_k_arg, x_v_arg, *gate_rows, onorm_g, k_cache, g_cache, v_cache),
+            conv_caches=(cs_q, cs_k, cs_v),
+            g_cache=g_cache,
+        ),
+    )
+    # Value-row split of the v2 kernel (TRTLLM_K3_KDA_DECODE_DV_SPLIT, 1: off): dv CTAs per tile,
+    # bitwise the same results as the unsplit kernels. With MXFP8 output it replaces the two-CTA
+    # kernel (the v2 kernel then runs the same quantization epilogue).
+    dv = 1
+    if kernel != "v1":
+        dv = dv_split_for(
+            HV, N, x_q.device, use_pdl=bool(use_pdl), mxfp8_output=bool(quantize_output)
+        )
+    use_v2_mxfp8 = dv > 1 and bool(quantize_output)
+    if dv > 1:
+        kernel = "v2"
+    if fused_fb or use_pdl:
+        # Only kda_decode_mtp_v2_kernel has the fused forget gate and the PDL prologue; it also
+        # covers the multi-wave grids the two-CTA kernel would otherwise take.
+        if kernel == "v1" or (quantize_output and not use_v2_mxfp8):
+            raise ValueError(
+                "the fused forget gate and PDL launch need the v2 kernel contract (packed rows, "
+                "fused output norm, bf16 output, 3xTF32, vector-aligned operands)"
+            )
+        kernel = "v2"
+    if kernel != "v1":
+        # Placeholders for the operands of the other gate mode (compile-time dead).
+        g_arg = onorm_g if fused_fb else g
+        fa_arg = fa if fused_fb else beta
+        w_fb_arg = w_fb if fused_fb else w_q
+        # Shared operands of kda_decode_mtp_v2_kernel and kda_decode_mtp_2cta_kernel.
+        args = [
+            (h0_arg, 16),
+            (x_q_arg, 16),
+            (x_k_arg, 16),
+            (x_v_arg, 16),
+            (w_q, 16),
+            (w_k, 16),
+            (w_v, 16),
+            (cs_q, 16),
+            (cs_k, 16),
+            (cs_v, 16),
+            (A_log, 16),
+            (g_arg, 16),
+            (dt_bias, 16),
+            (beta, 16),
+            (onorm_g, 16),
+            (onorm_weight, 16),
+            (out, 16),
+            (k_cache, 16),
+            (g_cache, 16),
+            (v_cache, 16),
+            (beta_cache, beta_cache_assumed_align),
+            (ssm_state_indices, 4),
+            (num_accepted_tokens, 4),
+        ]
+        if kernel == "two_cta":
+            runner = _run_kda_decode_mtp_2cta
+            # E4M3 values and R128c4 UE8M0 scales of the MXFP8 output (placeholders without it)
+            args += [(out, 16), (output_scale if quantize_output else out, 16)]
+            variant = {"MXFP8_OUT": bool(quantize_output)}
+        else:
+            runner = _run_kda_decode_mtp_v2
+            if dv > 1:
+                # the value-row split replaces the cluster pair
+                split_v = 1
+            if use_v2_mxfp8:
+                # E4M3 [T, HV * V] and the R128c4 UE8M0 scales; the BF16 output is not written
+                # (the output-gate view stands in for it)
+                args[16] = (onorm_g, 16)
+                o8_args = [(out, 16), (output_scale, 16)]
+            else:
+                o8_args = [(out, 16), (out, 16)]
+            args += [(fa_arg, 16 if fused_fb else 2), (w_fb_arg, 16), *o8_args]
+            variant = {"SPLIT_V": split_v, "PDL": bool(use_pdl), "FUSED_FB": fused_fb}
+            if dv > 1:
+                variant.update(DV=dv, MXFP8_OUT=use_v2_mxfp8)
+        constexprs = dict(
+            scale=scale,
+            HV=HV,
+            K=K,
+            V=V_dim,
+            NUM_SPEC=num_spec,
+            KERNEL_WIDTH=W,
+            lower_bound=float(lower_bound),
+            onorm_eps=float(onorm_eps),
+            USE_FLAT_LAYOUT=use_flat_layout,
+            **variant,
+        )
+        key = (
+            kernel,
+            tuple(_layout_key(t, dynamic_layout=True, assumed_align=a) for t, a in args),
+            tuple(sorted(constexprs.items())),
+        )
+        if key not in _compiled_cache:
+            logger.info(f"kda_mtp_decode: compiling {kernel} variant {constexprs}")
+            _compiled_cache[key] = cute.compile(
+                runner,
+                *[_dlpack_arg(t, assumed_align=a) for t, a in args],
+                N,
+                **constexprs,
+                stream=stream,
+            )
+        _compiled_cache[key](*[_dlpack_arg(t, assumed_align=a) for t, a in args], N, stream)
+        if quantize_output:
+            return out, output_scale
+        return out
 
     key = (
         x_q.dtype,
@@ -1189,6 +1779,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        use_pdl: bool = False,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -1223,6 +1814,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
             fuse_output_norm=fuse_output_norm,
+            use_pdl=use_pdl,
         )
 
     @kda_mtp_decode.register_fake
@@ -1258,8 +1850,124 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        use_pdl: bool = False,
     ) -> torch.Tensor:
-        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, use_pdl
+        return x_q.new_empty(x_v.shape)
+
+    @torch.library.custom_op(
+        "trtllm::kda_mtp_decode_fused_fb",
+        mutates_args=(
+            "cs_q",
+            "cs_k",
+            "cs_v",
+            "recurrent_state",
+            "k_cache",
+            "g_cache",
+            "v_cache",
+            "beta_cache",
+        ),
+        device_types="cuda",
+    )
+    def kda_mtp_decode_fused_fb(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> torch.Tensor:
+        """KDA multi-token verify that computes its forget gate from ``f_a`` (packed rows,
+        fused gated RMSNorm, BF16 output): ``fa`` is ``[1, T, 128]`` BF16 (rows may be
+        strided), ``w_fb`` the ``[H * 128, 128]`` BF16 f_b weight."""
+        return kda_mtp_decode_impl(
+            x_q=x_q,
+            x_k=x_k,
+            x_v=x_v,
+            w_q=w_q,
+            w_k=w_k,
+            w_v=w_v,
+            cs_q=cs_q,
+            cs_k=cs_k,
+            cs_v=cs_v,
+            g=None,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            recurrent_state=recurrent_state,
+            k_cache=k_cache,
+            g_cache=g_cache,
+            v_cache=v_cache,
+            beta_cache=beta_cache,
+            ssm_state_indices=ssm_state_indices,
+            cu_seqlens=None,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            lower_bound=lower_bound,
+            scale=scale,
+            packed_token_layout=True,
+            onorm_g=onorm_g,
+            onorm_weight=onorm_weight,
+            onorm_eps=onorm_eps,
+            fuse_output_norm=True,
+            fa=fa,
+            w_fb=w_fb,
+            use_pdl=use_pdl,
+        )
+
+    @kda_mtp_decode_fused_fb.register_fake
+    def _(
+        x_q: torch.Tensor,
+        x_k: torch.Tensor,
+        x_v: torch.Tensor,
+        w_q: torch.Tensor,
+        w_k: torch.Tensor,
+        w_v: torch.Tensor,
+        cs_q: torch.Tensor,
+        cs_k: torch.Tensor,
+        cs_v: torch.Tensor,
+        fa: torch.Tensor,
+        w_fb: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        k_cache: torch.Tensor,
+        g_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        beta_cache: torch.Tensor,
+        ssm_state_indices: torch.Tensor,
+        num_spec: int,
+        num_accepted_tokens: torch.Tensor,
+        lower_bound: float,
+        scale: float,
+        onorm_g: torch.Tensor,
+        onorm_weight: torch.Tensor,
+        onorm_eps: float,
+        use_pdl: bool,
+    ) -> torch.Tensor:
         return x_q.new_empty(x_v.shape)
 
     @torch.library.custom_op(

@@ -362,6 +362,13 @@ moonshotai/Kimi-K3:
   # 1,319 samples on SM107; 96.0 keeps margin for run-to-run variation.
   - quant_algo: MIXED_PRECISION
     accuracy: 96.0
+moonshotai/Kimi-K3.1-Pro:
+  # TestKimiK31::test_gsm8k_dep16 (nvfp4_ds_mla KV, FP4 index keys) and test_gsm8k_tep8 (FP8 KV,
+  # FP8 index keys) share this key: nvfp4_ds_mla reads as kv_cache_quant_algo FP8. Mean of the two
+  # measurements on GB300 (DEP16 97.84, TEP8 98.03).
+  - kv_cache_quant_algo: FP8
+    spec_dec_algo: DSpark
+    accuracy: 97.94
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

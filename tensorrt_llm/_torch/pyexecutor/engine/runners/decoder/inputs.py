@@ -19,6 +19,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.input_commit import stage_or_copy
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
 from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_tokens
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
+from tensorrt_llm._torch.speculative.dspark_glue_kernels import glue_fusion_enabled
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
@@ -346,7 +348,7 @@ class DecoderInputPreparer:
         self._staged_previous_pos_indices: list[int] | None = None
         self._step_input_gather: spec_step_copies.StepInputGather | None = (
             spec_step_copies.StepInputGather()
-            if config.is_spec_decode and spec_step_copies.is_supported()
+            if config.is_spec_decode and spec_step_copies.input_gather_is_supported()
             else None
         )
         # Steady-state generation-only prepare cache (non-speculative overlap
@@ -2033,9 +2035,7 @@ class DecoderInputPreparer:
                     generation_positions.view(1, 1, -1).expand(3, 1, -1),
                 )
         else:
-            self._buffers.position_ids_cuda[:total_num_tokens].copy_(
-                host_position_ids, non_blocking=True
-            )
+            stage_or_copy(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
 
         host.host_position_ids = host_position_ids
 
@@ -2423,8 +2423,19 @@ class DecoderInputPreparer:
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # The overlap-scheduler KV-length correction below calls on_update_kv_lens
+        # again; with the DSpark glue fusion (dspark_glue_kernels) only that second call runs (it
+        # recomputes everything the first one would).
+        refreshed_below = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+            and glue_fusion_enabled("pre_meta")
+        )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        if attn_meta is not None and not refreshed_below:
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:

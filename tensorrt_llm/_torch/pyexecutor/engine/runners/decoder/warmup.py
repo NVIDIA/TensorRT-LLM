@@ -873,8 +873,9 @@ class DecoderWarmup:
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        if self.guided_decoder is None:
-            # doesn't support guided decoding
+        supports_generation = self._dummy_requests.supports_generation_requests(resource_manager)
+        if self.guided_decoder is None and supports_generation:
+            # doesn't support guided decoding or a context-only cache
             warmup_requests_configs.append(
                 (1 + self._config.max_total_draft_tokens, 1)
             )  # one generation request
@@ -890,7 +891,7 @@ class DecoderWarmup:
         # here: they always run on a ``MambaHybridCacheManager``, so
         # ``can_run_general_warmup`` is False and the configs above never run.
 
-        if self.guided_decoder is None and can_run_general_warmup:
+        if self.guided_decoder is None and supports_generation and can_run_general_warmup:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to
             # warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
@@ -1099,7 +1100,11 @@ class DecoderWarmup:
             warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
-            if self.guided_decoder is None and not self.mapping.has_pp():
+            if (
+                self.guided_decoder is None
+                and not self.mapping.has_pp()
+                and self._dummy_requests.supports_generation_requests(resource_manager)
+            ):
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 

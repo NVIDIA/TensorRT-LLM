@@ -76,6 +76,15 @@ class TopK(nn.Module):
         self._gvr_emission_armed = False
 
     @property
+    def decode_reads_bf16(self) -> bool:
+        """Return whether decode reads BFloat16 scores as they are (deterministic self-sampling GVR)."""
+        return (
+            self.decode_implementation == TopKImplementation.CUTE_DSL_GVR
+            and self.gvr_self_sampling
+            and self.gvr_deterministic
+        )
+
+    @property
     def needs_gvr_prior(self) -> bool:
         """Return whether decode consumes previous-step Top-K indices."""
         return (
@@ -99,6 +108,8 @@ class TopK(nn.Module):
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None = None,
         radix_aux_indices: torch.Tensor | None = None,
         radix_aux_logits: torch.Tensor | None = None,
+        prefill_tier_rows: int | None = None,
+        paged_remap: tuple | None = None,
     ) -> torch.Tensor:
         """Write prefill or decode Top-K indices into ``output_indices``.
 
@@ -129,15 +140,27 @@ class TopK(nn.Module):
                 Radix split work.
             radix_aux_logits: Caller-owned float32 workspace for native CUDA
                 Radix split work.
+            prefill_tier_rows: Self-sampling GVR prefill only: pick the engine
+                plan as if the launch had this many rows, so a slice of a larger
+                row tile gets the tile's per-row output (index order included).
+            paged_remap: Deterministic self-sampling GVR decode only:
+                ``(block_table, block_size, stride_factor, layer_offset)`` of
+                ``convertReqIndexToGlobal`` (request ``r // next_n`` per row).
+                Where the engine's main family serves the rows it writes the
+                paged-pool indices instead of the local ones;
+                ``last_decode_paged`` tells the caller which it got.
 
         Returns:
             ``output_indices`` after the selected implementation writes it.
         """
         if is_prefill:
             assert row_starts is not None and row_ends is not None
-            return self._forward_prefill(scores, row_starts, row_ends, output_indices)
+            return self._forward_prefill(
+                scores, row_starts, row_ends, output_indices, prefill_tier_rows
+            )
 
         assert sequence_lengths is not None and scan_lengths is not None
+        self.last_decode_paged = False
         return self._forward_decode(
             scores,
             sequence_lengths,
@@ -149,6 +172,7 @@ class TopK(nn.Module):
             gvr_ext_kwargs,
             radix_aux_indices,
             radix_aux_logits,
+            paged_remap,
         )
 
     def _forward_prefill(
@@ -157,6 +181,7 @@ class TopK(nn.Module):
         row_starts: torch.Tensor,
         row_ends: torch.Tensor,
         output_indices: torch.Tensor,
+        tier_rows: int | None = None,
     ) -> torch.Tensor:
         if self.prefill_implementation == TopKImplementation.TORCH:
             return self._forward_prefill_torch(
@@ -185,10 +210,12 @@ class TopK(nn.Module):
                     selfsampling_topk_run_prefill,
                 )
 
+                tier_kwargs = {"tier_rows": tier_rows} if tier_rows is not None else {}
                 if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
                     scores,
                     output_indices,
                     **({"deterministic": True} if self.gvr_deterministic else {}),
+                    **tier_kwargs,
                 ):
                     # the engine never JIT-compiles under capture; an engine
                     # missed by warmup takes the exact radix path in the graph
@@ -208,7 +235,12 @@ class TopK(nn.Module):
                     # writes the local (column - ks) frame with -1 pad and no
                     # host reads (envelope from scores.shape[1]).
                     selfsampling_topk_run_prefill(
-                        scores, row_starts, row_ends, output_indices, **self._gvr_det_kwargs
+                        scores,
+                        row_starts,
+                        row_ends,
+                        output_indices,
+                        **self._gvr_det_kwargs,
+                        **tier_kwargs,
                     )
                     return output_indices
             else:
@@ -271,6 +303,7 @@ class TopK(nn.Module):
         gvr_ext_kwargs: dict[str, torch.Tensor | None] | None,
         radix_aux_indices: torch.Tensor | None,
         radix_aux_logits: torch.Tensor | None,
+        paged_remap: tuple | None = None,
     ) -> torch.Tensor:
         if row_kv_lens is not None:
             if (
@@ -305,6 +338,7 @@ class TopK(nn.Module):
                 max_seq_len=max_seq_len,
                 radix_aux_indices=radix_aux_indices,
                 radix_aux_logits=radix_aux_logits,
+                paged_remap=paged_remap,
                 **(gvr_ext_kwargs or {}),
             )
 
@@ -392,6 +426,7 @@ class TopK(nn.Module):
         radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
+        paged_remap: tuple | None = None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
@@ -404,7 +439,12 @@ class TopK(nn.Module):
                 # derive their row window from shape[1] (arena last-row
                 # safety), so that width must satisfy the same float4 rule —
                 # otherwise run_varlen raises instead of falling through.
-                scores.dtype == torch.float32
+                # The deterministic engine also reads BF16 scores (same
+                # selection as on the scores widened to fp32).
+                (
+                    scores.dtype == torch.float32
+                    or (scores.dtype == torch.bfloat16 and self.gvr_deterministic)
+                )
                 and scores.stride(1) == 1
                 and scores.stride(0) % 4 == 0
                 and scores.data_ptr() % 16 == 0
@@ -427,7 +467,15 @@ class TopK(nn.Module):
                 # max_seq_len in compressed index space; run_varlen's value
                 # is in KV-token space like sequence_lengths, so multiply it
                 # back by the compression ratio.
-                selfsampling_topk_run_varlen(
+                remap_kwargs = (
+                    {"remap": paged_remap}
+                    if paged_remap is not None
+                    and self._gvr_det_kwargs.get("deterministic")
+                    and self._gvr_det_kwargs.get("sorting") is None
+                    and self.compress_ratio == 1
+                    else {}
+                )
+                paged = selfsampling_topk_run_varlen(
                     scores,
                     sequence_lengths,
                     output_indices,
@@ -435,7 +483,9 @@ class TopK(nn.Module):
                     compress_ratio=self.compress_ratio,
                     max_seq_len=max_seq_len * self.compress_ratio,
                     **self._gvr_det_kwargs,
+                    **remap_kwargs,
                 )
+                self.last_decode_paged = bool(remap_kwargs) and bool(paged)
                 return output_indices
             logger.warning_once(
                 "self-sampling GVR is selected but the decode scores do not "

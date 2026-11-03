@@ -14,11 +14,17 @@
 # limitations under the License.
 """``trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8``."""
 
+import functools
 import os
+from typing import Sequence, Tuple
 
 import torch
 
-from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
+from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
+    pin_mxe4m3_mxe2m1_moe_row_tactics,
+    pin_mxe4m3_mxe2m1_moe_tactics,
+)
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, MxFp8QuantizedTensor
 from tensorrt_llm._utils import is_sm_100f
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
@@ -27,6 +33,13 @@ from ..routing import DeepSeekV3MoeRoutingMethod
 from .eligibility import check_trtllm_gen_leaf
 from .fp4_block_scale import TRTLLMGenW4a8Mxfp4Mxfp8Base
 from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
+from .kernel_inputs import to_trtllm_gen_act_type
+
+
+@functools.cache
+def _runner_has_unfinalized() -> bool:
+    runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(0, True)
+    return hasattr(runner, "run_moe_unfinalized")
 
 
 @register_moe_impl
@@ -42,6 +55,60 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
     #: The group-32 fused SiTu cubins; see ``TrtllmTrtllmGenNvfp4Impl`` on why
     #: this is declared per leaf rather than on the shared format base.
     supports_situ = True
+
+    def pin_decode_tactics(
+        self,
+        pins: Sequence[Tuple[int, int, int, int]],
+        row_tactics: Sequence[Tuple[int, int, int, int]] = (),
+    ) -> None:
+        """Offer the autotuner only tactic ``[tile_n, config]`` for tuned token counts in ``[lo, hi]``.
+
+        ``pins`` holds ``(lo, hi, tile_n, config)`` entries. They apply to every
+        runner call with this layer's local intermediate size, hidden size and
+        activation; a pinned tactic the runner does not list for a shape is
+        ignored there. ``row_tactics`` (same layout, over the real token count
+        of a call) replace the bucket's choice for those row counts; only
+        tactics bitwise-equal to it belong there. Takes effect once the expert
+        weights exist (now, or when the loader binds them).
+        """
+        self._decode_tactic_pins = tuple(tuple(pin) for pin in pins)
+        self._decode_row_tactics = tuple(tuple(row) for row in row_tactics)
+        self._register_decode_tactic_pins()
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        self._register_decode_tactic_pins()
+
+    def _register_decode_tactic_pins(self) -> None:
+        pins = getattr(self, "_decode_tactic_pins", ())
+        weight = getattr(self, "w3_w1_weight", None)
+        if not pins or weight is None:
+            return
+        act_type = to_trtllm_gen_act_type(self.activation_type)
+        gated = act_type not in (int(ActType_TrtllmGen.Relu2), int(ActType_TrtllmGen.Silu))
+        pin_mxe4m3_mxe2m1_moe_tactics(
+            intermediate_size=weight.shape[-2] // (2 if gated else 1),
+            hidden_size=self.hidden_size,
+            act_type=act_type,
+            pins=pins,
+        )
+        rows = getattr(self, "_decode_row_tactics", ())
+        if rows:
+            pin_mxe4m3_mxe2m1_moe_row_tactics(
+                intermediate_size=weight.shape[-2] // (2 if gated else 1),
+                hidden_size=self.hidden_size,
+                act_type=act_type,
+                rows=rows,
+            )
+
+    def supports_unfinalized_output(self) -> bool:
+        """The native runner returns the unfinalized triple when the build has it.
+
+        ``trtllm::mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized`` needs the
+        runner's ``run_moe_unfinalized`` method; builds that predate it can only
+        finalize.
+        """
+        return _runner_has_unfinalized()
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -65,6 +132,10 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         if os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1" or isinstance(
             x, MxFp8QuantizedTensor
         ):
+            return None
+        # A top-k precomputed together with the runner's routing (Kimi K3.1's routing tail,
+        # ``presorted``) replaces the fused op's routing.
+        if getattr(self.routing_method, "presorted", None) is not None:
             return None
 
         # Direct construction reaches here without a resolution query, so the

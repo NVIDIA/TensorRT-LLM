@@ -37,6 +37,7 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
     "kimi_k3": "kimi_k3",
+    "kimi_k31": "kimi_k3",
     "glm4": "glm4",
     "glm4_moe": "glm47",
     "glm4_moe_lite": "glm47",

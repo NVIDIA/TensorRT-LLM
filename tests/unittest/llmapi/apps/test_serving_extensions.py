@@ -34,7 +34,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "model_type,expected",
     [
-        ("kimi_k3", "template"),
+        ("kimi_k3", "prefer_grammar"),
         ("nemotron_h_omni", "grammar"),
         ("nemotron_h", "grammar"),
         ("qwen3", None),
@@ -176,7 +176,7 @@ class TestBuiltinExtensions:
 
     @pytest.mark.parametrize(
         "model_type,expected",
-        [("kimi_k3", "template"), ("nemotron_h", "grammar"), ("nemotron_h_omni", "grammar")],
+        [("kimi_k3", "prefer_grammar"), ("nemotron_h", "grammar"), ("nemotron_h_omni", "grammar")],
     )
     def test_required_tool_choice_loads_builtins(self, clean_registry, model_type, expected):
         assert required_tool_choice_mode(model_type) == expected
@@ -575,7 +575,10 @@ class TestOpenAIChatIntegration:
             {"prompt_token_ids": [1, 2]},
             {"prompt_token_ids_b64": "AQAAAA=="},
             {"add_generation_prompt": False},
-            {"disaggregated_params": {"request_type": "context_only"}},
+            {
+                "prompt_token_ids": [1, 2],
+                "disaggregated_params": {"request_type": "generation_only"},
+            },
             {"response_format": {"type": "json_object"}},
         ],
     )
@@ -586,6 +589,27 @@ class TestOpenAIChatIntegration:
         expected_status = 422 if change.get("tools") == [] else 400
         assert response.status_code == expected_status, response.text
         assert "generation" not in rendered
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"disaggregated_params": {"request_type": "context_only"}},
+            {
+                "prompt_token_ids": [1, 2],
+                "disaggregated_params": {
+                    "request_type": "generation_only",
+                    "resolved_thinking": False,
+                },
+            },
+        ],
+    )
+    def test_required_grammar_on_disaggregated_workers(self, required_chat_client, change):
+        # The context worker renders the prompt; the generation worker builds the
+        # same grammar from the reasoning mode the context worker relayed.
+        client, server, rendered = required_chat_client
+        response = client.post("/v1/chat/completions", json={**self.required_body(), **change})
+        assert response.status_code == 200, response.text
+        assert rendered["generation"]["sampling_params"].guided_decoding is not None
 
     @pytest.mark.parametrize(
         "model_type,parser,backend",

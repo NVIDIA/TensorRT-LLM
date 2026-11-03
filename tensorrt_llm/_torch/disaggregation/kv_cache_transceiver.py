@@ -7,6 +7,8 @@ from typing import Any, Dict, List, NamedTuple, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation.cuda_ipc_cache import \
+    bound_cuda_ipc_cache
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.llmapi.llm_args import (_CACHE_TRANSCEIVER_BACKEND_ENV_VARS,
@@ -152,6 +154,11 @@ def create_kv_cache_transceiver(
             "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             "hangs or lower-than-expected performance.")
+
+    if cache_transceiver_config.backend in ("UCX", "NIXL"):
+        # Before any transfer agent opens UCX: cap the peer mappings each
+        # sender keeps cached (see cuda_ipc_cache).
+        bound_cuda_ipc_cache()
 
     # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver.

@@ -40,9 +40,9 @@ if not torch.cuda.is_available():
 if not IS_CUTLASS_DSL_AVAILABLE:
     pytest.skip("cutlass DSL is required for gvr_selfsampling_topk tests", allow_module_level=True)
 
-if getSMVersion() not in (100, 103):
+if getSMVersion() not in (100, 103, 107):
     pytest.skip(
-        "self-sampling GVR kernels target datacenter Blackwell (sm_100/103) "
+        "self-sampling GVR kernels target datacenter Blackwell/Rubin (sm_100/103/107) "
         "— same gate as the production dispatch; consumer Blackwell "
         "(sm_120/121) lacks thread-block clusters",
         allow_module_level=True,

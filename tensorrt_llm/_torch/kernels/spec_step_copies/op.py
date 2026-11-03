@@ -20,12 +20,14 @@ inputs (one launch for the engine's four). Each kernel takes every size and addr
 compiled once per process, on the first launch, which must happen outside CUDA-graph capture. The kernels are called
 through TVM-FFI: a launch costs a few microseconds of host time.
 
-Callers use them only where ``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches
-nothing and returns False; the caller then does that work itself.
+Callers use ``SlotScatter`` only where ``is_supported()`` holds and ``StepInputGather`` where
+``input_gather_is_supported()`` does. A call whose arguments are outside what the kernel covers launches nothing and
+returns False; the caller then does that work itself.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, ClassVar
 
 import torch
@@ -41,6 +43,18 @@ def is_supported() -> bool:
     architecture, but they are validated on SM 100 only; SM 103 and SM 107 keep the torch path.
     """
     return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 100
+
+
+def input_gather_is_supported() -> bool:
+    """Whether ``StepInputGather`` runs on the current device: SM 100 or SM 103 (GB300) with the CuTe DSL installed,
+    unless ``TRTLLM_SPEC_STEP_INPUT_GATHER=0`` keeps the torch path.
+
+    The gather moves int32 values only, so its result is the torch path's bit for bit wherever it runs; it is validated
+    on SM 100 and SM 103 (tests/unittest/_torch/kernels/test_spec_step_copies.py).
+    """
+    if os.environ.get("TRTLLM_SPEC_STEP_INPUT_GATHER", "1") == "0":
+        return False
+    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() in (100, 103)
 
 
 def _is_i32(t: torch.Tensor) -> bool:

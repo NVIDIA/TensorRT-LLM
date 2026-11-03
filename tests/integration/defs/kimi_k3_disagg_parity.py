@@ -335,6 +335,22 @@ def compare_pair(ref, cand, prompt, failures, lp_tol, tie_tol):
     return record
 
 
+def _align_variants(endpoints):
+    """Pin every endpoint to the weakest negotiated request variant.
+
+    An ids+logprobs completion carries no text, so it cannot be compared with
+    a text-only one. Returns True when an endpoint was downgraded and its
+    completion must be fetched again.
+    """
+    weakest = max((ep.variant for ep in endpoints.values()), key=_VARIANTS.index)
+    changed = False
+    for ep in endpoints.values():
+        if ep.variant != weakest:
+            ep.variant = weakest
+            changed = True
+    return changed
+
+
 def _aggregate(outcomes, failures):
     """Apply the kimi_k3_sa_harness systemic check.
 
@@ -570,6 +586,13 @@ def main(argv=None) -> int:
             try:
                 ref = endpoints["reference"].complete(prompt)
                 cand = endpoints["candidate"].complete(prompt)
+                if _align_variants(endpoints):
+                    print(
+                        "[parity] NOTE: comparing both endpoints with "
+                        f"'{endpoints['reference'].variant}' requests"
+                    )
+                    ref = endpoints["reference"].complete(prompt)
+                    cand = endpoints["candidate"].complete(prompt)
             except (urllib.error.URLError, OSError, KeyError) as e:
                 failures.append(f"endpoint error for {prompt!r}: {e}")
                 records.append({"prompt": prompt, "error": str(e)})
@@ -734,7 +757,19 @@ def _self_test() -> int:
         "top-2 gap excludes chosen duplicate", len(d) == 2 and abs((top[0] - top[1]) - 3.45) < 1e-9
     )
 
-    # 10. gsm8k diff: within-tolerance passes, above-tolerance fails.
+    # 10. endpoints that negotiated different variants are pinned to the
+    #     weaker one, so an ids-only reference is not text-compared.
+    eps = {
+        "reference": SimpleNamespace(variant="ids+logprobs"),
+        "candidate": SimpleNamespace(variant="text-only"),
+    }
+    first = _align_variants(eps)
+    check(
+        "variants aligned to the weakest",
+        first and not _align_variants(eps) and {ep.variant for ep in eps.values()} == {"text-only"},
+    )
+
+    # 11. gsm8k diff: within-tolerance passes, above-tolerance fails.
     f = []
     _diff_gsm8k({"exact_match,strict-match": 0.90}, {"exact_match,strict-match": 0.89}, 0.02, f)
     ok_within = not f
@@ -742,7 +777,7 @@ def _self_test() -> int:
     _diff_gsm8k({"exact_match,strict-match": 0.90}, {"exact_match,strict-match": 0.80}, 0.02, f)
     check("gsm8k tolerance", ok_within and len(f) == 1)
 
-    # 11. _served_model returns None for malformed /v1/models payloads,
+    # 12. _served_model returns None for malformed /v1/models payloads,
     #     invalid JSON, and connection failures; extracts the id otherwise.
     global _http_json
     orig_http_json = _http_json

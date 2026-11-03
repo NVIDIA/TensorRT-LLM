@@ -712,6 +712,43 @@ def test_convert_req_index_to_global(
     )
 
 
+@pytest.mark.parametrize(
+    "num_tokens,num_topk,stride_factor,layer_id", [(300, 2048, 192, 1), (257, 1024, 64, 0)]
+)
+def test_triton_remap_matches_cpp(num_tokens, num_topk, stride_factor, layer_id):
+    """The Triton remap the indexer uses for prefill-sized batches gives the C++ op's integers, including
+    -1 for invalid indices, indices past the block table and padding block-table entries."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.kernels import (
+        triton_convert_req_index_to_global_index,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(7)
+    block_size, num_requests, max_blocks = 64, 3, 80
+    req_id = torch.randint(0, num_requests, (num_tokens,), dtype=torch.int32, device=device)
+    block_table = torch.randint(
+        0, 5000, (num_requests, max_blocks), dtype=torch.int32, device=device
+    )
+    block_table[:, 60:] = -1
+    token_indices = torch.randint(
+        -1, (max_blocks + 4) * block_size, (num_tokens, num_topk), dtype=torch.int32, device=device
+    )
+    cpp_out = torch.ops.trtllm.convert_req_index_to_global(
+        req_id, block_table, token_indices, block_size, num_topk, stride_factor, layer_id
+    )
+    tri_out = triton_convert_req_index_to_global_index(
+        req_id,
+        block_table,
+        token_indices,
+        block_size,
+        num_topk,
+        BLOCK_N=1024,
+        stride_factor=stride_factor,
+        layer_id=layer_id,
+    ).view(num_tokens, num_topk)
+    assert torch.equal(tri_out, cpp_out.view(num_tokens, num_topk))
+
+
 def test_convert_req_index_to_global_all_invalid():
     """All token_indices are -1 → entire output should be -1."""
     device = torch.device("cuda")

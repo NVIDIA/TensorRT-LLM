@@ -36,6 +36,10 @@ from tensorrt_llm._torch.models.modeling_dspark import (
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
 )
+from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+__extra_import_path__ = [".."]
+
 
 # The captured-context attention primitives were folded into
 # modeling_dspark; keep the historical alias so monkeypatch targets
@@ -528,3 +532,43 @@ def test_attention_forward_does_not_mutate_kv_cache():
     before = g["kv_cache0"].clone()
     _run(g)
     torch.testing.assert_close(g["kv_cache0"], before)
+
+
+# Helix-sharded drafter context KV: page ownership.
+
+
+@pytest.mark.parametrize("cp_size,page_size", [(2, 4), (4, 8)])
+def test_local_layout_is_dense_per_rank(cp_size, page_size):
+    positions = torch.arange(10 * cp_size * page_size + 3)
+    for rank in range(cp_size):
+        shard = HelixDraftShard(cp_size, rank, page_size)
+        slots, owned = shard.local_slots(positions)
+        # Owned positions fill rank-local slots 0, 1, 2, ... in order.
+        assert torch.equal(slots[owned], torch.arange(int(owned.sum())))
+        lengths = shard.local_lengths(positions)
+        counted = torch.cumsum(owned.long(), 0) - owned.long()
+        assert torch.equal(lengths, counted)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 32])
+def test_k_local_pages_cover_k_spans_of_global_pages(cp_size):
+    """dflash.py bounds the attended context at local pages x cp_size x page_size."""
+    page_size = 4
+    for local_pages in (1, 3):
+        positions = torch.arange(local_pages * cp_size * page_size)
+        for rank in (0, cp_size - 1):
+            slots, _ = HelixDraftShard(cp_size, rank, page_size).local_slots(positions)
+            assert int(slots.max()) < local_pages * page_size
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_unowned_alias_is_outside_a_page_wide_window(cp_size):
+    page_size = 8
+    for rank in range(cp_size):
+        shard = HelixDraftShard(cp_size, rank, page_size)
+        for start in range(0, 6 * cp_size * page_size):
+            window = torch.arange(start, start + page_size)
+            slots, owned = shard.local_slots(window)
+            # An unowned position's slot never coincides with an owned one in
+            # the same write, so the rewrite-in-place store cannot race it.
+            assert not set(slots[~owned].tolist()) & set(slots[owned].tolist())

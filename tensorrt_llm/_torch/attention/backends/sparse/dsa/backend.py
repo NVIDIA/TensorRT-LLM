@@ -162,6 +162,9 @@ class DSATrtllmAttention(TrtllmAttention):
         """Run the DSA indexer and convert its local TopK to paged indices."""
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         sparse_backend_args = forward_args.sparse_backend_args
+        precomputed = getattr(sparse_backend_args, "precomputed_attn_indices", None)
+        if precomputed is not None and is_generation:
+            return precomputed, None
         phase_start = metadata.num_ctx_tokens if is_generation else 0
         phase_end = metadata.num_tokens if is_generation else metadata.num_ctx_tokens
         shared_topk_indices = metadata.shared_topk_indices
@@ -233,7 +236,15 @@ class DSATrtllmAttention(TrtllmAttention):
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
             return compact_indices, None
 
-        topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
+        if (
+            is_generation
+            and self.indexer is not None
+            and getattr(self.indexer, "decode_topk_paged", False)
+        ):
+            # Indexer.gvr_paged_remap: the generation Top-K already wrote the paged-pool indices.
+            topk_indices_global = topk_indices
+        else:
+            topk_indices_global = self._remap_topk_to_global(topk_indices, metadata, is_generation)
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
             scratch = metadata.nvfp4_mla_fp8_scratch
@@ -265,6 +276,27 @@ class DSATrtllmAttention(TrtllmAttention):
             return compact_indices, None
 
         return topk_indices_global, None
+
+    def sparse_attn_predict_early(
+        self,
+        q: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        sparse_backend_args,
+    ) -> Optional[torch.Tensor]:
+        """Paged Top-K of a generation-only call ahead of the attention call (see ``sparse_attn_predict``).
+
+        Only the dense-KV generation path qualifies: the NVFP4 KV paths gather into scratch pools the attention call
+        itself sets up. ``q`` only provides the row count.
+        """
+        kv_cache_dtype = getattr(metadata.kv_cache_manager, "dtype", None)
+        if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            return None
+        forward_args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            sparse_backend_args=sparse_backend_args,
+        )
+        indices, _ = self.sparse_attn_predict(q, None, metadata, forward_args)
+        return indices
 
     def _remap_topk_to_global(
         self,

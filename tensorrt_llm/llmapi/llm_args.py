@@ -910,6 +910,11 @@ class GuidedDecodingConfig(StrictBaseModel):
     tokenizer_str: Optional[str] = Field(
         default=None,
         description="The tokenizer string for guided decoding config.")
+    vocab_type: Optional[Literal["raw", "byte_fallback", "byte_level"]] = Field(
+        default=None,
+        description=
+        "How encoded_vocab spells tokens (xgrammar VocabType) when no "
+        "tokenizer_str is given to detect it from. Defaults to raw.")
     stop_token_ids: Optional[List[int]] = Field(
         default=None,
         description="The stop token ids for guided decoding config.")
@@ -1388,7 +1393,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "prefill). Costs about 0.2-3 us per Top-K launch. Only takes effect "
         "with enable_heuristic_topk=True and use_self_sampling_topk=True; "
         "ignored otherwise.")
-    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+    indexer_k_dtype: Literal["fp8", "fp4", "bf16"] = Field(
         default="fp8",
         description=
         "Data type used for the indexer K cache. `fp8` stores one FP8 E4M3 "
@@ -1396,7 +1401,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "E2M1 codes per byte with a per-32 UE8M0 exponent, halving the "
         "per-token indexer K footprint (132 B to 68 B at index_head_dim=128). "
         "`fp4` requires Blackwell+ (SM>=100) at runtime and "
-        "index_head_dim=128.",
+        "index_head_dim=128. `bf16` keeps the indexer queries and keys in "
+        "BF16 and accumulates the index scores in FP32, closer to the exact "
+        "scores at twice the FP8 indexer K footprint (260 B per token at "
+        "index_head_dim=128); it requires the V2 KV cache manager and is not "
+        "available for DeepSeek-V4.",
     )
     index_share_for_mtp_iteration: Optional[bool] = Field(
         default=None,
@@ -1505,6 +1514,10 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             is_full = True
         return is_full
 
+    def _use_cute_dsl_paged_mqa_logits(self) -> bool:
+        # The CuTe DSL paged MQA logits kernels read FP8/FP4 keys only.
+        return self.use_cute_dsl_paged_mqa_logits and self.indexer_k_dtype != "bf16"
+
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAParams
 
@@ -1522,10 +1535,13 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_n_heads=_value("index_n_heads"),
             index_head_dim=_value("index_head_dim"),
             index_topk=_value("index_topk"),
+            index_rope_dim=getattr(pretrained_config, "index_rope_dim", None),
+            index_k_norm_eps=getattr(pretrained_config, "index_k_norm_eps",
+                                     None),
             indexer_max_chunk_size=self.indexer_max_chunk_size,
             skip_indexer_for_short_seqs=self.skip_indexer_for_short_seqs,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
-            use_cute_dsl_paged_mqa_logits=self.use_cute_dsl_paged_mqa_logits,
+            use_cute_dsl_paged_mqa_logits=self._use_cute_dsl_paged_mqa_logits(),
             q_split_threshold=self.q_split_threshold,
             indexer_rope_interleave=self.indexer_rope_interleave,
             enable_heuristic_topk=self.enable_heuristic_topk,
@@ -1568,7 +1584,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             use_gvr_emission=self.use_gvr_emission,
             gvr_deterministic_topk=self.gvr_deterministic_topk,
             use_cute_dsl_topk=self.use_cute_dsl_topk,
-            use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
+            use_cute_dsl_paged_mqa_logits=self._use_cute_dsl_paged_mqa_logits(),
             q_split_threshold=self.q_split_threshold,
             has_shared_indexer_layers=has_shared_indexer_layers,
             mtp_index_share=bool(_value("index_share_for_mtp_iteration",
@@ -2015,6 +2031,20 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_balanced_admission: bool = Field(
+        default=False,
+        description=
+        "Admit generation-only requests by per-rank KV load. When True and "
+        "the first 32 queued requests are all generation-only requests "
+        "without an attention_dp_rank, the attention DP router chooses which "
+        "of them to admit and which rank takes each, keeping the largest "
+        "per-rank request count and KV token count low, instead of admitting "
+        "them in queue order. Request priorities are respected, and a request "
+        "passed over in 64 admitting rounds is admitted next. Useful on "
+        "disaggregated generation workers. Has no effect with "
+        "kv_cache_routing_conversation_affinity, or with "
+        "enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+        status="prototype")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
         description="Enable internal KV cache-aware routing for attention DP. "
@@ -3727,6 +3757,30 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
 
+    context_kv_only: bool = Field(
+        default=False,
+        description=
+        "Set on the context servers of disaggregated serving with a standalone "
+        "MLA DSpark drafter. The context server never drafts: it builds the "
+        "drafter's context KV from the target hidden states during prefill and "
+        "transfers it to the generation server with the prompt KV. With this "
+        "set it loads only what that needs (the context projection and each "
+        "drafter layer's latent projection and norm) and rejects generation "
+        "requests. Requires the KV cache manager V2.")
+
+    context_kv_dtype: Literal["auto", "fp8"] = Field(
+        default="auto",
+        description=
+        "Storage dtype of a standalone MLA DSpark drafter's context KV (one "
+        "latent per token and drafter layer) in the unified draft cache of the "
+        "KV cache manager V2. 'auto' keeps the drafter's weight dtype (BF16). "
+        "'fp8' stores FP8 E4M3 latents at a unit per-tensor scale, halving the "
+        "draft cache bytes per token and the context-to-generation transfer of "
+        "them, and the generation server's block decode reads them with the "
+        "FP8 CuTe DSL MLA decode, so it requires attention_backend CUTEDSL "
+        "(the MLA drafter's AUTO choice). The context and generation servers "
+        "of disaggregated serving must set the same value.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
@@ -5002,8 +5056,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "is inherited as-is); 'fp8', 'fp8_ds_mla', 'nvfp4_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'nvfp4_ds_mla' (prototype, Kimi K3.1) selects 352-byte inline NVFP4 latent records for DSA sparse MLA "
+        "on SM100/SM103 (E2M1 NoPE with E4M3 block scales, E4M3 RoPE), read in place by the PrimTS "
+        "sparse MLA kernels. "
         "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
         "keeps the first and last N tokens of every sequence in <dtype> "
         "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
@@ -5013,7 +5070,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4",
+                                             "nvfp4_ds_mla", "nvfp4",
                                              *_MIXED_PRECISION_KV_DTYPES))
 
     mixed_precision_first_n: NonNegativeInt = Field(
@@ -5244,7 +5301,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v in ("auto", "fp8", "fp8_ds_mla",
+        if v in ("auto", "fp8", "fp8_ds_mla", "nvfp4_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
         if _MIXED_PRECISION_KV_DTYPE.match(v):
@@ -5252,7 +5309,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
+            '"nvfp4_ds_mla", "nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
             'torch.dtype string')
 
     @property
@@ -5268,9 +5325,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
         """Reject resizing while packed sparse-MLA pool views are fixed."""
-        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+        if self.dtype in ("fp8_ds_mla",
+                          "nvfp4_ds_mla") and self.enable_kv_pool_rebalance:
             raise ValueError(
-                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
+                f"kv_cache_config.dtype='{self.dtype}' is incompatible with "
                 "kv_cache_config.enable_kv_pool_rebalance=True because packed "
                 "sparse-MLA pool views are fixed at cache-manager construction time."
             )
@@ -5704,7 +5762,7 @@ class DwdpConfig(StrictBaseModel):
     Each worker holds a subset of experts locally and asynchronously prefetches
     the remaining experts from peer workers via CUDA VMM + MNNVL fabric
     handles (composite virtual-address layout with zero-copy local mapping and
-    double-buffered P2P remote regions), enabling fully asynchronous execution
+    P2P remote prefetch slots), enabling fully asynchronous execution
     across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
@@ -5726,6 +5784,14 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -7939,7 +8005,7 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla', 'nvfp4_ds_mla',
                                             'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':

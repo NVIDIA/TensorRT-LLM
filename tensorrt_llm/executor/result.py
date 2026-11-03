@@ -977,6 +977,22 @@ class GenerationResultBase:
                                    time_correction) * 1e9))
 
 
+def _text_token_ids(output: CompletionOutput, token_ids: List[int],
+                    sampling_params: SamplingParams) -> List[int]:
+    """Token ids to detokenize for ``output``'s text.
+
+    A sequence that finished on its end token keeps that token in
+    ``token_ids`` but not in its text, like a trimmed stop word; otherwise it
+    would surface when special tokens are kept (``skip_special_tokens=False``).
+    """
+    end_id = sampling_params.end_id
+    if (token_ids and end_id is not None and token_ids[-1] == end_id
+            and output.finish_reason == 'stop' and output.stop_reason is None
+            and not sampling_params.include_stop_str_in_output):
+        return token_ids[:-1]
+    return token_ids
+
+
 class DetokenizedGenerationResultBase(GenerationResultBase):
     """The base class for the generation result with detokenization support."""
     # import once and avoid cyclic import
@@ -1027,7 +1043,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         self.tokenizer, 'decode_incrementally'
                 ) and self._streaming and not self.sampling_params.use_beam_search:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                        beam_output.token_ids_diff,
+                        _text_token_ids(beam_output, beam_output.token_ids_diff,
+                                        self.sampling_params),
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
                         flush=self._done,
@@ -1035,7 +1052,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         **kwargs)
                 else:
                     beam_output.text = self.tokenizer.decode(
-                        beam_output.token_ids, **kwargs)
+                        _text_token_ids(beam_output, beam_output.token_ids,
+                                        self.sampling_params), **kwargs)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (

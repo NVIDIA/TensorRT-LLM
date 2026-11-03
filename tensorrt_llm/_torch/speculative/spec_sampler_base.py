@@ -22,15 +22,20 @@ output into slot-indexed buffers, starts the async D2H copy, and updates
 requests host-side. Buffer shapes derive entirely from ``TorchSampler.Args``.
 """
 
+import hashlib
+import json
+import os
+from array import array
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from ..._device_copy import DeviceCopyBuffer
-from ..._utils import prefer_pinned
+from ..._utils import mpi_rank, prefer_pinned
 from ...sampling_params import SamplingParams
 from ..kernels.spec_step_copies import op as spec_step_copies
+from ..pyexecutor.input_commit import scatter_spec_store, spec_sampler_fused_scatter_enabled
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
@@ -47,6 +52,12 @@ from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
 from ..pyexecutor.scheduler import ScheduledRequests
+from .force_replay import (
+    force_replay_path,
+    load_reference_streams,
+    replay_start_by_length,
+    start_reference,
+)
 
 # Rejection messages for the sampling features the one-model speculative path
 # cannot honor. They are module constants because two places raise them: the
@@ -125,6 +136,71 @@ def one_model_sampling_rejection_reason(
     if min_p and min_p > 0.0 and not fused_sampling:
         return UNSUPPORTED_MIN_P_MSG
     return None
+
+
+#: A directory: every rank appends one JSON line per finished request to ``rank<rank>.jsonl`` in it
+#: with fingerprints of the request's generated tokens (see :class:`_StreamLog`).
+STREAM_LOG_ENV_VAR = "TLLM_SPEC_DECODE_STREAM_LOG"
+
+
+def _digest(values: list[int]) -> str:
+    return hashlib.sha1(array("q", values).tobytes(), usedforsecurity=False).hexdigest()[:16]
+
+
+class _StreamLog:
+    """Fingerprints of the token stream each request generates (benchmark aid, host side only).
+
+    With ``TLLM_SPEC_DECODE_STREAM_LOG=<dir>`` every rank appends, when a request finishes, its
+    prompt length (global under helix), its number of steps, its generated token ids and per-step
+    accepted counts and digests of both to ``<dir>/rank<rank>.jsonl``. Two runs, or the ranks of
+    one run, generated the same streams when the digests match; the lists locate the first
+    difference. No output has to be saved by the client. With ``TLLM_SPEC_DECODE_FORCE_REPLAY`` a
+    record also names the recorded stream the request started replaying (``replay_ref``, -1 for
+    none) and how many of its leading tokens equal that stream (``replay_match``).
+    """
+
+    def __init__(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        self._path = os.path.join(directory, f"rank{mpi_rank()}.jsonl")
+        self._accepted: dict[int, list[int]] = {}
+        replay_path = force_replay_path()
+        self._replay_streams = load_reference_streams(replay_path) if replay_path else None
+
+    def on_step(self, request: LlmRequest, num_new_tokens: int) -> None:
+        accepted = self._accepted.setdefault(request.py_request_id, [])
+        accepted.append(num_new_tokens)
+        if request.state != LlmRequestState.GENERATION_COMPLETE:
+            return
+        del self._accepted[request.py_request_id]
+        tokens = request.get_tokens(DEFAULT_BEAM_IDX)[request.py_prompt_len :]
+        record = {
+            "request_id": request.py_request_id,
+            "prompt_len": getattr(request, "total_input_len_cp", request.py_prompt_len),
+            "steps": len(accepted),
+            "tokens": len(tokens),
+            "first_tokens": tokens[:8],
+            "token_digest": _digest(tokens),
+            "accept_digest": _digest(accepted),
+            "token_ids": tokens,
+            "accepted": accepted,
+        }
+        if self._replay_streams is not None:
+            ref = start_reference(
+                self._replay_streams,
+                record["prompt_len"],
+                tokens[0] if tokens else -1,
+                by_length=replay_start_by_length(),
+            )
+            match = 0
+            if ref >= 0:
+                for got, want in zip(tokens, self._replay_streams[ref][1]):
+                    if got != want:
+                        break
+                    match += 1
+            record["replay_ref"] = ref
+            record["replay_match"] = match
+        with open(self._path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 @dataclass(kw_only=True)
@@ -287,6 +363,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
         self._fused_sampling = fused_sampling
+        # Drafting Kimi K3.1 engines without attention DP: one kernel for the four store
+        # scatters, and the slot tensor reused while the batch's slots do not change.
+        self._fused_scatter = spec_sampler_fused_scatter_enabled()
+        self._slots_key: Optional[list] = None
+        self._slots_device: Optional[torch.Tensor] = None
+        stream_log_dir = os.environ.get(STREAM_LOG_ENV_VAR)
+        self._stream_log = _StreamLog(stream_log_dir) if stream_log_dir else None
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
@@ -396,6 +479,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
                     req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
                 ):
                     break
+            if self._stream_log is not None:
+                self._stream_log.on_step(req, num_new_tokens)
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
             # Pair the acceptance count with the draft count of the SAME step,
             # snapshotted at sample_async time: _request_common_handling below
@@ -415,8 +500,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
     ) -> None:
         """Move rows ``num_skip`` onward of the forward's outputs into the stores at ``slots``."""
         num_sampling_requests = len(slots)
-        slots_device = torch.as_tensor(slots, dtype=torch.long)
-        slots_device = slots_device.to(device="cuda", non_blocking=True)
+        if self._fused_scatter and slots == self._slots_key:
+            # The previous upload of these slots; the tensor is never written after it.
+            slots_device = self._slots_device
+        else:
+            slots_device = torch.as_tensor(slots, dtype=torch.long)
+            slots_device = slots_device.to(device="cuda", non_blocking=True)
+            if self._fused_scatter:
+                self._slots_key, self._slots_device = list(slots), slots_device
 
         o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
         o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
@@ -450,11 +541,25 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         elif o_next_new_tokens.shape[1] > next_new_tokens_width:
             o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
-        # Use index_copy_ for efficient copying (slots are unique)
-        self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
-        self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
-        self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
-        self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
+        # One kernel when fused (spec_sampler_fused_scatter_enabled), else index_copy_ (slots are unique).
+        if not (
+            self._fused_scatter
+            and scatter_spec_store(
+                slots_device,
+                self.store.new_tokens.squeeze(-1),
+                self.store.next_new_tokens.squeeze(-1),
+                self.store.new_tokens_lens,
+                self.store.next_draft_tokens,
+                o_new_tokens,
+                o_next_new_tokens,
+                o_new_tokens_lens,
+                o_next_draft_tokens,
+            )
+        ):
+            self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_new_tokens)
+            self.store.next_new_tokens.squeeze(-1).T.index_copy_(0, slots_device, o_next_new_tokens)
+            self.store.new_tokens_lens.index_copy_(0, slots_device, o_new_tokens_lens)
+            self.store.next_draft_tokens.index_copy_(0, slots_device, o_next_draft_tokens)
 
     def sample_async(
         self,

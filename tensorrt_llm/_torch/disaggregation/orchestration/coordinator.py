@@ -8,9 +8,10 @@ hold a reference to it: services are injected, executor-owned behavior is
 reached through the ``interfaces`` Protocols.
 """
 
+import hashlib
 import os
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Set, Tuple
 
 from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
@@ -60,6 +61,12 @@ def transfer_window_bypass_eligible(transceiver, dist, is_kv_manager_v2: bool) -
         and dist.pp_size == 1
         and is_kv_manager_v2
     )
+
+
+def _request_ids_digest(request_ids: Sequence[int]) -> int:
+    """A signed 64-bit digest of a set of request ids, equal on every process."""
+    payload = ",".join(str(rid) for rid in sorted(request_ids)).encode("ascii")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little", signed=True)
 
 
 def attach_ctx_usage(request: LlmRequest, response) -> None:
@@ -359,6 +366,48 @@ class DisaggTransferCoordinator:
         if len(common_ids) == len(local_ids):
             return admitted
         aligned = [request for request in admitted if request.py_request_id in common_ids]
+        self.revert_deferred_gen_init(admitted, aligned)
+        return aligned
+
+    @nvtx_range("align_gen_admission_across_tp")
+    def align_gen_admission_across_tp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        """Keep only the gen-init requests that every TP rank admitted.
+
+        Without attention DP every TP rank holds a replica of every request
+        and runs its own scheduler, and the gen transfer status collective
+        that ends ``receive_gen_init`` spans all of them (the world, for
+        ``KvCacheTransceiverV2``). As with CP, the replicas admit alike only
+        while their KV caches agree: cancelling a request whose receive is
+        still mid-write on one rank succeeds on its peers, which finish it and
+        free its KV while that rank keeps it, and a transfer timeout reads each
+        rank's own clock. A rank with room then admits a request its peers
+        cannot fit and waits alone in that collective. The pp=1 loops call this
+        on every rank every iteration, after ``align_gen_admission_across_cp``;
+        the dropped requests give back their V2 KV and are retried on a later
+        iteration. Ranks that agree exchange only the admitted count and a
+        digest of the ids and keep ``admitted`` as it is. Under attention DP
+        each TP rank owns its own requests and nothing is aligned.
+        """
+        if self._enable_attention_dp or self._dist.tp_size == 1:
+            return admitted
+        local_ids = [request.py_request_id for request in admitted]
+        summaries = self._dist.tp_allgather_int64([len(local_ids), _request_ids_digest(local_ids)])
+        if (summaries == summaries[0]).all():
+            return admitted
+        common_ids = set(local_ids)
+        # small_payload: at most one iteration's gen-init request ids.
+        for peer_ids in self._dist.tp_allgather(local_ids, small_payload=True):
+            common_ids.intersection_update(peer_ids)
+        aligned = [request for request in admitted if request.py_request_id in common_ids]
+        logger.warning_once(
+            "TP ranks admitted different generation requests; each rank keeps only "
+            "the requests every TP rank admitted",
+            key="disagg_tp_admission_skew",
+        )
+        logger.debug(
+            f"TP admission skew on rank {self._dist.rank}: deferring "
+            f"{[rid for rid in local_ids if rid not in common_ids]}"
+        )
         self.revert_deferred_gen_init(admitted, aligned)
         return aligned
 
@@ -966,6 +1015,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         return None
 
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        return admitted
+
+    def align_gen_admission_across_tp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
         return admitted
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:

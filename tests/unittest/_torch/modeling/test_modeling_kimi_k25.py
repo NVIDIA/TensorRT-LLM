@@ -557,6 +557,12 @@ class TestKimiK25Structure(unittest.TestCase):
             self.assertGreater(
                 placeholder_count, 0, "Video input should expand placeholders to vision tokens"
             )
+
+            # The 8 frames form 2 chunks of 4; the video is one encoder item over both.
+            self.assertEqual(mm_data["image"]["video_chunk_counts"], [2])
+            metadata = processor.get_mm_item_metadata(token_ids, mm_data)
+            self.assertEqual(metadata.item_refs, (("video", 0),))
+            self.assertEqual(sum(metadata.output_embedding_lengths), placeholder_count)
         finally:
             os.unlink(video_path)
 
@@ -611,6 +617,13 @@ class TestKimiK25Structure(unittest.TestCase):
             self.assertGreater(
                 placeholder_count, 0, "Mixed input should produce expanded placeholder tokens"
             )
+
+            metadata = processor.get_mm_item_metadata(token_ids, mm_data)
+            self.assertEqual(metadata.item_refs, (("image", 0), ("video", 0)))
+            self.assertEqual(
+                metadata.output_embedding_lengths[0], processor.get_num_tokens_per_image(image=img)
+            )
+            self.assertEqual(sum(metadata.output_embedding_lengths), placeholder_count)
         finally:
             os.unlink(video_path)
 

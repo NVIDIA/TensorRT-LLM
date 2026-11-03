@@ -347,10 +347,11 @@ def test_kda_verify_matches_sequential_decode(batch, t_steps):
     w = lin["short_conv_kernel_size"]
 
     runtime = KimiKDALinearAttention(cfg, layer_idx=0).to(device)
-    # dt_bias is torch.empty at construction and only filled by
-    # load_weights(); with random weights it holds heap garbage, and a
-    # NaN/Inf bit pattern poisons both paths identically (nvbug 6599150).
-    torch.nn.init.normal_(runtime.dt_bias, std=0.1)
+    # Initialize every floating parameter for stable parity coverage; dt_bias
+    # is allocated with torch.empty and otherwise may contain NaN or Inf bits.
+    for param in runtime.parameters():
+        if param.is_floating_point():
+            torch.nn.init.normal_(param, std=0.02)
     slots = batch + 2  # non-trivial slot mapping
     cache = _LayerCache(slots, 3 * dim, w - 1, h, lin["head_dim"], lin["head_dim"], t_steps, device)
     slot_indices = torch.arange(2, 2 + batch, device=device, dtype=torch.long)

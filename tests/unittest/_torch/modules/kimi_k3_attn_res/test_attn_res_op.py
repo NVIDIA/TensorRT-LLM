@@ -51,6 +51,9 @@ def _similarity(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, fl
         (1024, 11),
         (300, 5),
         (16384, 11),
+        # Above the op's 16384-token limit the wrapper runs it in slices.
+        (24576, 7),
+        (32768, 3),
     ],
 )
 @torch.no_grad()

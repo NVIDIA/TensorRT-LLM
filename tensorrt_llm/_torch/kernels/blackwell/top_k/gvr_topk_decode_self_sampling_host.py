@@ -46,6 +46,7 @@ CUDA-graph capture.
 
 import math
 import operator
+import os
 import threading
 from collections.abc import Sequence
 
@@ -872,6 +873,97 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int, det: bool = False) -> tu
     return lc
 
 
+#: TRTLLM_GVR_VARLEN_SHORT_TILE=0 keeps the envelope-sized U of the deterministic SPLIT main family.
+_VARLEN_SHORT_TILE = os.environ.get("TRTLLM_GVR_VARLEN_SHORT_TILE", "1") == "1"
+
+
+def _varlen_split_tile(tpl: tuple, r_const: int) -> tuple:
+    """U (float4 vectors per thread per tile) of the deterministic SPLIT main family under varlen.
+
+    route_streaming sizes U for rows of the envelope's length (the server's max_seq_len, e.g. 1M), but each of
+    the R CTAs of a row only streams n / R of it and decode rows are mostly far shorter than the envelope.
+    With R >= 24 CTAs per row a 2-vector tile, with R >= 12 a 4-vector tile is as fast or faster from 64k to
+    1M scores per row on GB300 (6 rows: 150k 19.5 -> 12.5 us, 1M 16.4 -> 16.6; 12 rows: 150k 15.2 -> 13.0,
+    1M 18.2 -> 18.7). The deterministic emission order does not depend on U, so the rows are the same bits.
+    """
+    if not _VARLEN_SHORT_TILE:
+        return tpl
+    u = tpl[1]
+    if r_const >= 24:
+        u = min(u, 2)
+    elif r_const >= 12:
+        u = min(u, 4)
+    return tpl[:1] + (u,) + tpl[2:]
+
+
+#: ROW SPLIT (``enable_row_split``): deterministic varlen launches of the one-CTA-per-row main family (1024 threads at
+#: 75..148 rows, 512 threads at 149..256 rows) run a long row's row pass over several CTAs (GvrMainKernel ``psplit``:
+#: same rows, bitwise), so the launch no longer lasts as long as its longest row. _CTAS: CTAs per launch (0 = the
+#: family's residency: 1 per SM at 1024 threads, 2 per SM at 512), _MIN_TILES: smallest part in row-pass tiles.
+#: Row-split launches use one workspace per device and size (not run_varlen's ``workspace``): concurrent launches on
+#: one device must not overlap.
+_ROW_SPLIT = False
+_ROW_SPLIT_CTAS = 0
+_ROW_SPLIT_MIN_TILES = 1
+#: _MIN_ROW: a launch splits only when its longest row spans at least this many scores (rounded up to whole row-pass
+#: tiles; shorter launches keep one CTA per row and skip the map search); -1 = the family default, the GB300
+#: break-even of a split vs one CTA per row: 12 tiles of 16384 at 512 threads, 10 tiles of 32768 at 1024 threads.
+_ROW_SPLIT_MIN_ROW = -1
+_ROW_SPLIT_MIN_ROW_DEFAULT = {512: 12 * 16384, 1024: 10 * 32768}
+#: _MIN_ROWS: launches with fewer rows keep one CTA per row; 149 limits ROW SPLIT to the 512-thread family.
+_ROW_SPLIT_MIN_ROWS = 149
+_ps_ws_keep: dict = {}
+
+
+def enable_row_split() -> None:
+    """Turn on ROW SPLIT for this process's deterministic varlen launches (Kimi K3.1 attention-DP generation servers;
+    call before warmup and CUDA graph capture)."""
+    global _ROW_SPLIT
+    _ROW_SPLIT = True
+
+
+def _row_split_ctas(num_rows: int, num_sms: int, det: bool) -> int:
+    """CTAs of a ROW SPLIT launch for ``num_rows`` (0: no row split)."""
+    if not (_ROW_SPLIT and det) or num_rows < _ROW_SPLIT_MIN_ROWS:
+        return 0
+    # route(): up to 148 rows take the 1024-thread family (1 CTA per SM), above it the 512-thread one (2 per SM)
+    ctas = _ROW_SPLIT_CTAS if _ROW_SPLIT_CTAS > 0 else (1 if num_rows <= 148 else 2) * num_sms
+    dev = _device()
+    if num_rows > ctas or num_rows > 32 * dev.PS_RMAX:
+        return 0
+    return ctas
+
+
+def _row_split_guard(tpl: tuple) -> int:
+    """Row-pass tiles (BLK * U float4 vectors) the longest row needs before a ROW SPLIT launch splits."""
+    tile = 4 * int(tpl[0]) * int(tpl[1])
+    tokens = (
+        _ROW_SPLIT_MIN_ROW
+        if _ROW_SPLIT_MIN_ROW >= 0
+        else _ROW_SPLIT_MIN_ROW_DEFAULT.get(int(tpl[0]), 0)
+    )
+    return max(1, -(-tokens // tile))
+
+
+def _ps_workspace(d: int, nbytes: int, ref: torch.Tensor) -> torch.Tensor:
+    """Per-(device, size) ROW SPLIT workspace: zeroed arrival counters (the kernel restores the zeros it consumes)
+    followed by one part slot per CTA. Allocated on the first (eager) launch; never replaced, so captured graphs
+    keep a live buffer."""
+    ws = _ps_ws_keep.get((d, nbytes))
+    if ws is not None:
+        return ws
+    if _is_capturing():
+        raise RuntimeError(
+            "ROW SPLIT workspace not allocated for this shape -- warm up before CUDA graph capture"
+        )
+    with _mu:
+        ws = _ps_ws_keep.get((d, nbytes))
+        if ws is None:
+            ws = torch.zeros(nbytes, dtype=torch.uint8, device=ref.device).view(torch.int32)
+            _ps_ws_keep[(d, nbytes)] = ws
+    return ws
+
+
 def _varlen_launcher(
     num_rows: int,
     npad: int,
@@ -882,16 +974,29 @@ def _varlen_launcher(
     num_sms: int = 148,
     sm_version: int = 100,
     det: bool = False,
+    remap: bool = False,
+    in_bf16: bool = False,
+    psplit_ctas: int = 0,
 ) -> tuple:
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
-    the in-tree runner's pick_tuning(graph_capture=...) discipline."""
+    the in-tree runner's pick_tuning(graph_capture=...) discipline.
+    ``remap`` (det only): the main family is compiled with the paged-pool remap epilogue (run_varlen ``remap``);
+    the other families are not, and run_varlen then reports that it left the indices local."""
     profile = _pack_device_profile(num_sms, sm_version)
-    key = (num_rows, npad, k, n_env, next_n, cr, profile) + ((True,) if det else ())
+    key = (
+        (num_rows, npad, k, n_env, next_n, cr, profile)
+        + ((True,) if det else ())
+        + (("remap",) if remap else ())
+        + (("bf16",) if in_bf16 else ())
+        + (("psplit", psplit_ctas, _ROW_SPLIT_MIN_TILES, _ROW_SPLIT_MIN_ROW) if psplit_ctas else ())
+    )
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
+    # BF16 logits: only the main family reads them (the caller routes BF16 rows here only where FP32 rows take main).
+    assert not in_bf16 or det, "BF16 logits: deterministic engine only"
     # Two envelopes: the kernel gets the PHYSICAL bound (never past the row
     # stride, so a row whose kv length exceeds the logits width clamps and
     # takes the short path instead of reading into the next row); the router
@@ -906,6 +1011,8 @@ def _varlen_launcher(
     # choice is a pure function of this cache key, so CUDA-graph replay
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
     plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
+    if in_bf16:
+        plan_free = dict(plan_free, kernel="main")
     if plan_free["kernel"] == "reg_clus":
         fn = dev.get_compiled__regclus(
             tuple(plan_free["tpl"]),
@@ -1012,12 +1119,16 @@ def _varlen_launcher(
         return lc
     plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
+    if det and tpl[5]:
+        tpl = _varlen_split_tile(tpl, plan["rt"]["R"])
     if k == 512 and num_rows > 2 * num_sms and sm_version in (100, 103):
         n4 = n_route >> 2
         if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
             tpl = (256, 4, 4, tpl[3], 2, False, False)
     rt = plan["rt"]
     r_const = rt["R"]
+    # ROW SPLIT: the one-CTA-per-row families (512 / 1024 threads)
+    psplit = bool(psplit_ctas) and det and r_const == 1 and not tpl[5] and tpl[0] in (512, 1024)
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
@@ -1028,6 +1139,13 @@ def _varlen_launcher(
         fused_k=k,
         warp_rank=k == 2048 and sm_version in (100, 103),
         staged_k=k if k == 2048 and r_const == 1 and sm_version in (100, 103) else 0,
+        **({"remap": True} if remap and det else {}),
+        **({"in_bf16": True} if in_bf16 else {}),
+        **(
+            {"psplit": True, "ps_cmin": _ROW_SPLIT_MIN_TILES, "ps_guard": _row_split_guard(tpl)}
+            if psplit
+            else {}
+        ),
     )
     big = num_rows * r_const <= 148
     aim_base = (
@@ -1047,9 +1165,17 @@ def _varlen_launcher(
     # staged floor (a distribution-dependent tail regression); the kernel
     # gates TSH per row at runtime anyway.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
-    pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
     tail = (aim_base, sfac, amin, sd_en, tsh_en)
-    lc = ("main", fn, pre, tail)
+    if psplit:
+        # the launch's CTA count rides the dead SCAP slot; the kernel gets the ROW SPLIT workspace in the ws slot
+        pre = (0, npad, k, psplit_ctas, rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+        ps_bytes = dev.ps_workspace_bytes(
+            tpl[:6] + (False,) + (next_n, cr_shift, r_const), k, psplit_ctas
+        )
+        lc = ("main_ps", fn, pre, tail, ps_bytes)
+    else:
+        pre = (0, npad, k, rt["SCAP_"], rt["CMP_"], r_const, 0, 0, 0, 0, 0)
+        lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
     return lc
 
@@ -1571,8 +1697,15 @@ def run_varlen(
     workspace: torch.Tensor | None = None,
     deterministic: bool = False,
     sorting: str | None = None,
-) -> None:
+    remap: tuple | None = None,
+) -> bool:
     """Run hint-free self-sampling Top-K with per-request device KV lengths.
+
+    ``remap = (block_table, block_size, stride_factor, layer_offset)`` (deterministic, ``compress_ratio`` 1, no
+    ``values`` / ``sorting``): where the main family serves the launch, its writer CTAs also map every selected index
+    to its paged-pool index in place, the integers of ``convertReqIndexToGlobal`` with ``req_id[r] = r // next_n``
+    (``block_table`` int32 ``[batch, max_blocks]``, rows contiguous, 4-byte aligned). Returns whether the indices are
+    pool indices on return (False: local indices, the caller converts them).
 
     ``deterministic=True`` selects the deterministic kernels (fixed selected set — ties broken by the
     smaller index — and a fixed per-route output order); ``sorting="ascending"`` additionally sorts
@@ -1610,10 +1743,10 @@ def run_varlen(
     selection (streaming main / clustered register-resident) is a pure
     function of the capture-stable launcher key.
     """
-    if logits.dtype is not torch.float32:
+    if logits.dtype is not torch.float32 and not (logits.dtype is torch.bfloat16 and deterministic):
         raise RuntimeError(
-            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
-            "are a follow-up — see the PR roadmap"
+            f"logits must be float32 (got {logits.dtype}); bfloat16 rows need deterministic=True, "
+            "fp16 is a follow-up"
         )
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
@@ -1631,7 +1764,7 @@ def run_varlen(
         raise RuntimeError("logits must be 2-D")
     num_rows = logits.shape[0]
     if num_rows == 0:
-        return
+        return remap is not None
     if num_rows % nn:
         raise RuntimeError(f"num_rows {num_rows} not divisible by next_n {nn}")
     batch = num_rows // nn
@@ -1658,8 +1791,11 @@ def run_varlen(
     # out of bounds).
     if not (logits.is_cuda and indices.is_cuda):
         raise RuntimeError("all tensors must be CUDA")
-    if logits.dtype is not _F32 or indices.dtype is not _I32:
-        raise RuntimeError("logits must be float32; indices must be int32")
+    in_bf16 = logits.dtype is torch.bfloat16
+    if (logits.dtype is not _F32 and not (in_bf16 and deterministic)) or indices.dtype is not _I32:
+        raise RuntimeError(
+            "logits must be float32 (bfloat16 with deterministic=True); indices must be int32"
+        )
     if len(indices.shape) != 2 or indices.shape[0] != num_rows:
         raise RuntimeError(
             f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
@@ -1678,7 +1814,7 @@ def run_varlen(
     lg = logits
     if not logits.is_contiguous():
         need = logits.storage_offset() + num_rows * npad
-        if logits.untyped_storage().size() // 4 < need:
+        if logits.untyped_storage().size() // logits.element_size() < need:
             raise RuntimeError("logits view storage too small to widen to its row stride")
         lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
     if npad & 3:
@@ -1714,8 +1850,43 @@ def run_varlen(
         n_env = 1 << max(n_env - 1, 1).bit_length()
     n_env = min(max(n_env, 1), npad)
     det = _check_det_args(deterministic, sorting)
+    if remap is not None:
+        if not det or sorting is not None or values is not None or cr != 1:
+            raise RuntimeError(
+                "remap needs deterministic=True, compress_ratio 1, no sorting / values"
+            )
+        block_table = remap[0]
+        if (
+            not block_table.is_cuda
+            or block_table.dtype is not _I32
+            or block_table.dim() != 2
+            or block_table.stride(1) != 1
+            or block_table.stride(0) != block_table.shape[1]
+            or block_table.shape[0] < num_rows // nn
+            or block_table.data_ptr() & 3
+        ):
+            raise RuntimeError(
+                "remap block_table must be a row-major int32 [batch, blocks] CUDA tensor"
+            )
     profile = _device_profile_key(d)
-    key = (num_rows, npad, k, n_env, nn, cr, profile) + ((True,) if det else ())
+    if in_bf16:
+        # BF16 rows take the main family only where FP32 rows of this launch would (its det rows end in the
+        # canonical ascending order, so the BF16 launch writes the FP32 launch's bits); elsewhere widen them.
+        num_sms_r, sm_version_r = _unpack_device_profile(profile)
+        n_route = max(min(n_env, npad), k + 1)
+        if route(num_rows, n_route, npad, k, num_sms_r, sm_version_r, det=det)["kernel"] != "main":
+            lg = lg.float()
+            in_bf16 = False
+    ps_ctas = (
+        _row_split_ctas(num_rows, _unpack_device_profile(profile)[0], det) if _ROW_SPLIT else 0
+    )
+    key = (
+        (num_rows, npad, k, n_env, nn, cr, profile)
+        + ((True,) if det else ())
+        + (("remap",) if remap is not None else ())
+        + (("bf16",) if in_bf16 else ())
+        + (("psplit", ps_ctas, _ROW_SPLIT_MIN_TILES, _ROW_SPLIT_MIN_ROW) if ps_ctas else ())
+    )
     lc = _VARLEN_CACHE.get(key)
     if lc is None:
         if _is_capturing():
@@ -1724,7 +1895,18 @@ def run_varlen(
             )
         num_sms, sm_version = _unpack_device_profile(profile)
         lc = _varlen_launcher(
-            num_rows, npad, k, n_env, nn, cr, num_sms, sm_version, **({"det": True} if det else {})
+            num_rows,
+            npad,
+            k,
+            n_env,
+            nn,
+            cr,
+            num_sms,
+            sm_version,
+            **({"det": True} if det else {}),
+            **({"remap": True} if remap is not None else {}),
+            **({"in_bf16": True} if in_bf16 else {}),
+            **({"psplit_ctas": ps_ctas} if ps_ctas else {}),
         )
     idx = indices
     if idx.shape[1] != k:
@@ -1745,15 +1927,33 @@ def run_varlen(
         #                SCAP, CMP, dead DYN x5)
         lc[1](lg, pre_arg, kv_lens, idx, *lc[2])
     else:
-        _, fn, pre, tail = lc
+        if lc[0] == "main_ps":
+            _, fn, pre, tail, ps_bytes = lc
+            ws = _ps_workspace(d, ps_bytes, lg)
+        else:
+            _, fn, pre, tail = lc
+        if remap is not None:
+            # REMAP: block table in the (hint-free, unread) pre_idx slot; stride factor / layer offset x block size /
+            # blocks per request / block size in the dead varlen SMP / TGT / Q / TGT2 slots.
+            block_table, block_size, stride_factor, layer_offset = remap
+            pre_arg = block_table
+            pre = pre[:6] + (
+                int(stride_factor),
+                int(layer_offset) * int(block_size),
+                int(block_table.shape[1]),
+                pre[9],
+                int(block_size),
+            )
         fn(lg, pre_arg, idx, ws, *pre, kv_lens, *tail)
+        if remap is not None:
+            return True
     if sorting == "ascending":
         _sort_rows(idx)
     if vals is not None:
         idx64 = idx.to(torch.int64)
         vals.copy_(lg.gather(1, idx64.clamp_min(0)))
         vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
-    return
+    return False
 
 
 def run_prefill(
@@ -1765,12 +1965,18 @@ def run_prefill(
     workspace: torch.Tensor | None = None,
     deterministic: bool = False,
     sorting: str | None = None,
+    tier_rows: int | None = None,
 ) -> None:
     """Hint-free self-sampling Top-K for prefill: row ``r`` selects the Top-K of
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
     No device reads, never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
-    ``deterministic`` / ``sorting`` as in ``run_varlen``."""
+    ``deterministic`` / ``sorting`` as in ``run_varlen``.
+
+    The engine plan (row tier) follows the launch's row count, and the order a row's
+    indices come out in depends on the plan. ``tier_rows`` picks the plan as if the
+    launch had that many rows, so a slice of a larger tile gets the tile's per-row
+    output bit for bit (every plan is correct for any row count)."""
     det = _check_det_args(deterministic, sorting)
     if logits.dtype is not _F32:
         raise RuntimeError(
@@ -1839,7 +2045,7 @@ def run_prefill(
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0, n_env, k)
+        tier = _prefill_tier(tier_rows if tier_rows is not None else r1 - r0, n_env, k)
         lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, det))
         if lc is None:
             if _is_capturing():
@@ -1863,12 +2069,13 @@ def prefill_ready(
     indices: torch.Tensor,
     max_row_len: int | None = None,
     deterministic: bool = False,
+    tier_rows: int | None = None,
 ) -> bool:
     """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
     without compiling — the same (tier, k, envelope bucket) keys it looks up, so
     a caller can route around the engine under CUDA graph capture. Host-only.
-    Pass the same ``max_row_len`` as the ``run_prefill`` call (the envelope
-    bucket, and with it the tier, is derived from it)."""
+    Pass the same ``max_row_len`` / ``tier_rows`` as the ``run_prefill`` call (the
+    envelope bucket, and with it the tier, is derived from them)."""
     num_rows = logits.shape[0]
     if num_rows == 0:
         return True
@@ -1878,7 +2085,8 @@ def prefill_ready(
     n_env = min(max(n_env, 1), max(npad, 1))
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
+        rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
+        tier = _prefill_tier(tier_rows if tier_rows is not None else rows, n_env, k)
         if _prefill_cache_key(tier, k, n_bucket, bool(deterministic)) not in _PREFILL_CACHE:
             return False
     return True
@@ -2042,6 +2250,7 @@ def warmup_varlen(
     # CUDA-graph capture at any requested geometry finds its key immediately.
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     for r in req_rows:
+        ps_ctas = _row_split_ctas(r, num_sms, bool(deterministic))
         _varlen_launcher(
             r,
             npad,
@@ -2052,6 +2261,7 @@ def warmup_varlen(
             num_sms,
             sm_version,
             det=deterministic,
+            **({"psplit_ctas": ps_ctas} if ps_ctas else {}),
         )
     if not bands_done:
         with _VARLEN_WARMUP_LOCK:

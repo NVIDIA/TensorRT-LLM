@@ -531,7 +531,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.mma_tiler_sfa = (
             self.mma_inst_shape_mn[0],
             self.mma_inst_shape_mn[1],
-            mma_inst_shape_k * mma_inst_tile_k // 16,
+            mma_inst_shape_k * mma_inst_tile_k // self.sf_vec_size,
         )
 
         self.mma_tiler_sfb = (
@@ -1564,7 +1564,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             # Setup LDGSTS copy atoms for A and SFA
             # A: 8x LDGSTS.128 per thread with swizzle_128B for A matrix (32 elements per thread)
-            # SFA: 4x LDGSTS.32 per thread with 512-element block swizzling for scale factor A (4 elements per thread)
+            # SFA: one LDGSTS.32 per scale-factor atom of the K-tile per thread with 512-element block swizzling
+            # for scale factor A (4 elements per copy)
             #
             a_atom_copy = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -1584,6 +1585,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 mSFA_mkl.element_type,
                 num_bits_per_copy=32,
             )
+            # Scale-factor atoms (4 columns each) per K-tile of A.
+            num_sfa_k_atoms = self.cta_tile_shape_mnk[2] // self.sf_vec_size // 4
             tidx_in_warpgroup = tidx % 128
 
             sA_tiled = cute.make_tensor(
@@ -1778,13 +1781,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             a_atom_copy, tAgA_slice, tAsA_slice, pred=a_predicate_slice
                         )
 
-                    for i in range(4):
+                    for i in range(num_sfa_k_atoms):
                         #
-                        # Load SFA: 4x LDGSTS.32 per thread with 512-element block swizzling
+                        # Load SFA: one LDGSTS.32 per 4-column scale-factor atom of the K-tile (4 for
+                        # sf_vec_size 16, 2 for 32) with 512-element block swizzling
                         # Each LDGSTS.32 loads 4 scale factor elements (32 bits) from GMEM to SMEM
                         # Uses same token offset as A matrix for consistent gather operation
                         #
                         swizzled_iterator = (tidx_in_warpgroup % 32) // 8 ^ i
+                        if cutlass.const_expr(num_sfa_k_atoms != 4):
+                            swizzled_iterator = swizzled_iterator % num_sfa_k_atoms
                         tAgSFA_slice_ptr = tAgSFA_ktile.iterator + 4 * swizzled_iterator
                         tAgSFA_slice = cute.make_tensor(
                             tAgSFA_slice_ptr, layout=cute.make_layout((4,))

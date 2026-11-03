@@ -139,6 +139,11 @@ def _layer_norm_fwd_1pass_kernel(
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+# Prefill-sized launches loop over this many 4-row tiles per program (the same
+# tile layout, so the same reduction order and bitwise-identical output): with
+# one tile per program the launch is CTA-scheduling-bound (Kimi K3.1 KDA output
+# norm, 8192 tokens x 96 heads x 128: 145 -> 112 us).
+_MULTIROW_LOOP = 4
 
 
 @functools.lru_cache(maxsize=None)
@@ -157,29 +162,41 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
     return allowed and grid_size < num_sms
 
 
+def _multirow_grid(rows: int, device_index: int) -> tuple[int, int]:
+    """(grid size, tiles per program) of the multi-row kernel for ``rows`` rows:
+    loop over _MULTIROW_LOOP tiles once the looped grid still fills every SM
+    eight times over."""
+    _, num_sms = _pdl_device_policy(device_index)
+    loop = _MULTIROW_LOOP
+    if triton.cdiv(rows, _MULTIROW_ROWS * loop) < 8 * num_sms:
+        loop = 1
+    return triton.cdiv(rows, _MULTIROW_ROWS * loop), loop
+
+
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
 def _rms_norm_gated_fwd_multirow_kernel(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    Z,  # pointer to the gate branch
-    Rstd,  # optional pointer to the 1/std
-    FP8_SCALE,  # static scale for an optional FP8 output
-    stride_x_row,
-    stride_y_row,
-    stride_z_tok,
-    M,  # number of rows in X
-    eps,
-    N: tl.constexpr,  # row length; power of two, whole row per program
-    ROWS: tl.constexpr,  # rows per program
-    HEADS_PER_TOK: tl.constexpr,
-    GATE_SIGMOID: tl.constexpr,
-    WEIGHT_IS_DELTA: tl.constexpr,
-    SAVE_RSTD: tl.constexpr,
-    OUTPUT_FP8: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr,
+        X,  # pointer to the input
+        Y,  # pointer to the output
+        W,  # pointer to the weights
+        Z,  # pointer to the gate branch
+        Rstd,  # optional pointer to the 1/std
+        FP8_SCALE,  # static scale for an optional FP8 output
+        stride_x_row,
+        stride_y_row,
+        stride_z_tok,
+        M,  # number of rows in X
+        eps,
+        N: tl.constexpr,  # row length; power of two, whole row per program
+        ROWS: tl.constexpr,  # rows per tile
+        HEADS_PER_TOK: tl.constexpr,
+        GATE_SIGMOID: tl.constexpr,
+        WEIGHT_IS_DELTA: tl.constexpr,
+        SAVE_RSTD: tl.constexpr,
+        OUTPUT_FP8: tl.constexpr,
+        LAUNCH_WITH_PDL: tl.constexpr,
+        LOOP: tl.constexpr = 1,  # tiles per program
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -190,39 +207,40 @@ def _rms_norm_gated_fwd_multirow_kernel(
     view whose (heads, N) block is contiguous per token, e.g. a column slice
     of a wider projection.
     """
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    row_mask = rows < M
     cols = tl.arange(0, N)
-    mask2d = row_mask[:, None]
     if LAUNCH_WITH_PDL:
         tl.extra.cuda.gdc_wait()
-    x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
-    x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=1) / N
-    rstd = 1.0 / tl.sqrt(var + eps)
-    if SAVE_RSTD:
-        tl.store(Rstd + rows, rstd, mask=row_mask)
-    w = tl.load(W + cols).to(tl.float32)
-    if WEIGHT_IS_DELTA:
-        w += 1.0
-    y = x * rstd[:, None] * w[None, :]
-    tok = rows // HEADS_PER_TOK
-    head = rows % HEADS_PER_TOK
-    z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
-             cols[None, :])
-    z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
-    gate = tl.sigmoid(z)
-    if not GATE_SIGMOID:
-        gate *= z
-    y *= gate
-    if OUTPUT_FP8:
-        # Match the existing two-kernel path: RMSNorm first stores to the
-        # input dtype, then static quantization reloads and multiplies by the
-        # rounded reciprocal of its input scale.
-        y = y.to(X.dtype.element_ty).to(tl.float32)
-        y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
-    y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
-    tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    for it in tl.static_range(LOOP):
+        rows = (tl.program_id(0) * LOOP + it) * ROWS + tl.arange(0, ROWS)
+        row_mask = rows < M
+        mask2d = row_mask[:, None]
+        x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
+        x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=1) / N
+        rstd = 1.0 / tl.sqrt(var + eps)
+        if SAVE_RSTD:
+            tl.store(Rstd + rows, rstd, mask=row_mask)
+        w = tl.load(W + cols).to(tl.float32)
+        if WEIGHT_IS_DELTA:
+            w += 1.0
+        y = x * rstd[:, None] * w[None, :]
+        tok = rows // HEADS_PER_TOK
+        head = rows % HEADS_PER_TOK
+        z_off = (tok[:, None].to(tl.int64) * stride_z_tok + head[:, None] * N +
+                 cols[None, :])
+        z = tl.load(Z + z_off, mask=mask2d, other=0.0).to(tl.float32)
+        gate = tl.sigmoid(z)
+        if not GATE_SIGMOID:
+            gate *= z
+        y *= gate
+        if OUTPUT_FP8:
+            # Match the existing two-kernel path: RMSNorm first stores to the
+            # input dtype, then static quantization reloads and multiplies by
+            # the rounded reciprocal of its input scale.
+            y = y.to(X.dtype.element_ty).to(tl.float32)
+            y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
+        y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
+        tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
     if LAUNCH_WITH_PDL:
         # Release only after both Rstd (when present) and Y have been stored.
         tl.extra.cuda.gdc_launch_dependents()
@@ -283,8 +301,8 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
     device_index = x.device.index
+    grid_size, loop = _multirow_grid(M, device_index)
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
         _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
@@ -301,6 +319,7 @@ def rms_norm_gated_token_major(
             eps,
             N=N,
             ROWS=_MULTIROW_ROWS,
+            LOOP=loop,
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
@@ -374,8 +393,8 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
         device_index = x.device.index
+        grid_size, loop = _multirow_grid(M, device_index)
         launch_with_pdl = _multirow_pdl(grid_size, device_index)
         with torch.cuda.device(device_index):
             _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
@@ -392,6 +411,7 @@ def _layer_norm_fwd(
                 eps,
                 N=group_size,
                 ROWS=_MULTIROW_ROWS,
+                LOOP=loop,
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,

@@ -40,7 +40,12 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from ..kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    presorted_moe_sort,
+    quantize_input_nvfp4,
+)
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
@@ -112,6 +117,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # _join_pending_x_ready).
         self._x_quant_event = torch.cuda.Event()
         self._pending_x_ready_event: torch.cuda.Event | None = None
+        # When set by the caller, recorded (once) right after the FC1 grid of
+        # the next run and cleared: work ordered after it runs beside FC2.
+        self.post_fc1_event: torch.cuda.Event | None = None
 
     def _get_quant_method(self) -> object:
         return NVFP4CuteDslFusedMoEMethod()
@@ -386,6 +394,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         else:
             if use_count_native_expert_metadata:
                 raise RuntimeError("Count-native metadata requires DeepEP receive counts")
+            # A Kimi-K3 router that also sorts may attach this rank's moe_sort outputs to the ids.
             (
                 tile_idx_to_expert_idx,
                 tile_idx_to_mn_limit,
@@ -393,7 +402,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 permuted_idx_to_expanded_idx,
                 _total_num_padded_tokens,
                 num_non_exiting_tiles,
-            ) = torch.ops.trtllm.moe_sort(
+            ) = presorted_moe_sort(
+                token_selected_experts, slot_start, esp, tile_size
+            ) or torch.ops.trtllm.moe_sort(
                 token_selected_experts=token_selected_experts,
                 token_final_scales=token_final_scales,
                 num_experts=self.num_slots,
@@ -485,6 +496,9 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         # ran on the main stream in parallel with the quantization.
         self._join_pending_x_ready()
         x, x_sf = gather_act_op(**gather_act_kwargs)
+        if self.post_fc1_event is not None:
+            self.post_fc1_event.record()
+            self.post_fc1_event = None
 
         if self.use_fused_finalize:
             if has_aux_streams:

@@ -63,11 +63,19 @@ PhysMemWrapper::~PhysMemWrapper()
 // PooledPhysMemAllocator
 // ---------------------------------------------------------------------------
 
-PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
+PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize, size_t maxChunkSize)
     : mPhysMemSize(physMemSize)
     , mPool([this]() -> PhysMemWrapper* { return new PhysMemWrapper(mPhysMemSize, mProp); },
           [](PhysMemWrapper* chunk) { delete chunk; })
 {
+    TLLM_CHECK_WITH_INFO(physMemSize > 0, "PooledPhysMemAllocator: physMemSize must be positive");
+    for (size_t size = physMemSize << 1; size > physMemSize && size <= maxChunkSize; size <<= 1)
+    {
+        auto create = [this, size]() -> PhysMemWrapper* { return new PhysMemWrapper(size, mProp); };
+        auto destroy = [](PhysMemWrapper* chunk) { delete chunk; };
+        mLargerPools.push_back(std::make_unique<SimplePool<PhysMemWrapper>>(create, destroy));
+    }
+
     // Get current device.
     cuCheck(cuCtxGetDevice(&mDeviceId));
 
@@ -116,12 +124,39 @@ PooledPhysMemAllocator::PooledPhysMemAllocator(size_t physMemSize)
 
 PooledPhysMemAllocator::~PooledPhysMemAllocator()
 {
-    mPool.clear();
+    clear();
 }
 
 PooledPhysMemAllocator::PooledPhysMem PooledPhysMemAllocator::acquire()
 {
     return mPool.get();
+}
+
+PooledPhysMemAllocator::PooledPhysMem PooledPhysMemAllocator::acquire(size_t chunkSize)
+{
+    if (chunkSize == mPhysMemSize)
+    {
+        return mPool.get();
+    }
+    for (size_t k = 0; k < mLargerPools.size(); ++k)
+    {
+        if (chunkSize == mPhysMemSize << (k + 1))
+        {
+            return mLargerPools[k]->get();
+        }
+    }
+    TLLM_THROW(
+        "PooledPhysMemAllocator: no %zu-byte chunks (unit %zu, max %zu)", chunkSize, mPhysMemSize, maxChunkSize());
+}
+
+size_t PooledPhysMemAllocator::chunkSizeAt(size_t offset, size_t remaining) const noexcept
+{
+    size_t size = maxChunkSize();
+    while (size > mPhysMemSize && (offset % size != 0 || size > remaining))
+    {
+        size >>= 1;
+    }
+    return size;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +169,10 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, size_t
 {
     TLLM_CHECK_DEBUG(vmSize % physMemAllocator.physMemSize() == 0);
 
-    cuCheck(cuMemAddressReserve(&mAddr, vmSize, 0, 0, 0));
+    // With larger chunks, align the range to the largest so the chunks land on aligned addresses.
+    size_t const alignment
+        = physMemAllocator.maxChunkSize() > physMemAllocator.physMemSize() ? physMemAllocator.maxChunkSize() : 0;
+    cuCheck(cuMemAddressReserve(&mAddr, vmSize, alignment, 0, 0));
 
     mAccessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     mAccessDesc.location.id = physMemAllocator.deviceId();
@@ -159,69 +197,76 @@ VirtMem::~VirtMem() noexcept
     KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
 }
 
-void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
+void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle, size_t size)
 {
-    size_t physSize = mPhysMemAllocator.physMemSize();
-    CUdeviceptr offset = mAddr + physSize * static_cast<size_t>(mPhysHandles.size());
-    TLLM_CHECK_DEBUG(physSize * (mPhysHandles.size() + 1) <= mVmSize);
+    CUdeviceptr offset = mAddr + mMappedBytes;
+    TLLM_CHECK_DEBUG(mMappedBytes + size <= mVmSize);
 
-    cuCheck(cuMemMap(offset, physSize, 0, handle->handle(), 0));
-    cuCheck(cuMemSetAccess(offset, physSize, &mAccessDesc, 1));
+    cuCheck(cuMemMap(offset, size, 0, handle->handle(), 0));
+    cuCheck(cuMemSetAccess(offset, size, &mAccessDesc, 1));
     mPhysHandles.push_back(std::move(handle));
+    mChunkSizes.push_back(size);
+    mMappedBytes += size;
 }
 
 void VirtMem::pop()
 {
     TLLM_CHECK_DEBUG(!mPhysHandles.empty());
-    size_t physSize = mPhysMemAllocator.physMemSize();
-    CUdeviceptr offset = mAddr + physSize * (mPhysHandles.size() - 1);
-    cuCheck(cuMemUnmap(offset, physSize));
+    size_t const size = mChunkSizes.back();
+    CUdeviceptr offset = mAddr + mMappedBytes - size;
+    cuCheck(cuMemUnmap(offset, size));
     mPhysHandles.pop_back(); // PhysMemHandle destructor returns to pool
+    mChunkSizes.pop_back();
+    mMappedBytes -= size;
 }
 
 void VirtMem::extend(size_t numToAdd)
 {
-    size_t old = numPhysMem();
-    try
-    {
-        for (size_t i = 0; i < numToAdd; ++i)
-        {
-            push(mPhysMemAllocator.acquire());
-        }
-    }
-    catch (...)
-    {
-        // Rollback: remove any newly-mapped chunks.
-        while (numPhysMem() > old)
-        {
-            pop();
-        }
-        throw;
-    }
+    realloc(mUsableBytes + numToAdd * physMemSize());
 }
 
 void VirtMem::shrink(size_t numToRemove)
 {
-    cuCheck(cuCtxSynchronize());
-    for (size_t i = 0; i < numToRemove; ++i)
-    {
-        pop();
-    }
+    size_t const bytes = numToRemove * physMemSize();
+    TLLM_CHECK_DEBUG(bytes <= mUsableBytes);
+    realloc(mUsableBytes - bytes);
 }
 
 void VirtMem::realloc(size_t numBytes)
 {
-    size_t physSize = mPhysMemAllocator.physMemSize();
-    size_t required = divUp(numBytes, physSize);
-    size_t current = numPhysMem();
-    if (required > current)
+    size_t const unit = physMemSize();
+    size_t const target = divUp(numBytes, unit) * unit;
+    if (target > mMappedBytes)
     {
-        extend(required - current);
+        size_t const old = numPhysMem();
+        try
+        {
+            while (mMappedBytes < target)
+            {
+                size_t const size = mPhysMemAllocator.chunkSizeAt(mMappedBytes, target - mMappedBytes);
+                push(mPhysMemAllocator.acquire(size), size);
+            }
+        }
+        catch (...)
+        {
+            // Rollback: remove any newly-mapped chunks.
+            while (numPhysMem() > old)
+            {
+                pop();
+            }
+            throw;
+        }
     }
-    else if (required < current)
+    else if (!mPhysHandles.empty() && mMappedBytes - mChunkSizes.back() >= target)
     {
-        shrink(current - required);
+        // Unmap only whole chunks above the target: one that straddles it holds live bytes below it.
+        cuCheck(cuCtxSynchronize());
+        while (!mPhysHandles.empty() && mMappedBytes - mChunkSizes.back() >= target)
+        {
+            pop();
+        }
     }
+    mUsableBytes = target;
 }
 
 void VirtMem::destroy()
@@ -238,6 +283,7 @@ void VirtMem::destroy()
     cuCheck(cuMemAddressFree(mAddr, mVmSize));
     mAddr = 0;
     mVmSize = 0;
+    mUsableBytes = 0;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

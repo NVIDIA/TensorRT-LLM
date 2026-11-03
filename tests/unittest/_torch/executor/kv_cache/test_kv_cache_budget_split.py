@@ -29,7 +29,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.config_utils import uses_vswa_kv_cache_layout
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -76,6 +76,9 @@ def _make_creator(
     c._mapping = Mock()
     c._draft_config = None
     c._model_engine = Mock(cuda_graph_batch_sizes=[], cuda_graph_padding_enabled=False)
+    # The target model has no drafter; a Mock attribute here would read as a
+    # drafter that shards its context KV over helix CP (_get_draft_helix_mapping).
+    c._model_engine.model.draft_model = None
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._disable_overlap_scheduler = False
 
@@ -327,6 +330,8 @@ class TestSplitGpuBudgetForDraft:
         target_kv_config = KvCacheConfig(enable_block_reuse=False)
         mode = Mock()
         mode.is_external_drafter.return_value = False
+        # A standalone DSpark drafter shares the target's manager instead.
+        mode.is_dspark.return_value = False
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
@@ -518,6 +523,7 @@ class TestSplitGpuBudgetForDraft:
         c._get_effective_draft_config = Mock(return_value=effective_draft_config)
         c._get_num_draft_layers = Mock(return_value=2)
         c._model_engine.model.model_config.pretrained_config.num_hidden_layers = 40
+        c._model_engine.model.draft_model = None  # no helix-sharded drafter
         c._fallback_if_unsupported_kv_cache_manager_v2 = Mock(
             side_effect=lambda manager_cls, *_: manager_cls
         )
@@ -711,7 +717,7 @@ def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
     c._cache_transceiver_config = None
     c._llm_args = SimpleNamespace(kv_cache_compression_config=None, sleep_config=None)
     c._mapping = helix
-    c._speculative_config = DSparkDecodingConfig(max_draft_len=7)
+    c._speculative_config = DFlashDecodingConfig(max_draft_len=7)
     c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
     c._draft_model_engine = None
     c._draft_config = draft_model_config
@@ -1181,8 +1187,10 @@ class TestExternalDrafterKvDtype:
         c._mapping.is_last_pp_rank.return_value = True
         # The real config, not Mock() or SimpleNamespace: a bare Mock answers True
         # to every predicate, and a SimpleNamespace needs a new attribute stubbed
-        # each time the cost path reads one more spec-config field.
-        c._speculative_config = DSparkDecodingConfig(max_draft_len=4)
+        # each time the cost path reads one more spec-config field. DFLASH keeps a
+        # separate draft KV cache manager; a standalone DSpark drafter shares the
+        # target's manager V2.
+        c._speculative_config = DFlashDecodingConfig(max_draft_len=4)
         c._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=target_model_config))
         c._draft_config = draft_model_config
         draft_model_config.mapping = c._mapping

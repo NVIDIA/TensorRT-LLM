@@ -502,11 +502,12 @@ def parse_chat_messages_coroutines(
     for msg in messages:
         # kimi_k3's reference renderer keeps unparsable tool-call argument
         # strings verbatim; other templates expect the strict dict contract.
+        is_kimi_k3_family = model_type in ("kimi_k3", "kimi_k31")
         parsed_msg = parse_chat_message_content(
             msg,
             mm_data_tracker,
-            lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"))
+            lenient_tool_call_arguments=is_kimi_k3_family,
+            keep_message_tools=is_kimi_k3_family)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

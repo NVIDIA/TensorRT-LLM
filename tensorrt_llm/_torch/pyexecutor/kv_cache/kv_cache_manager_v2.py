@@ -15,7 +15,8 @@
 import math
 import os
 import sys
-from collections import OrderedDict, defaultdict, deque
+import time
+from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import (
@@ -78,6 +79,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BeamIndex,
     BufferConfig,
+    CacheDomain,
     CacheLevel,
     CacheTier,
     CacheTierConfig,
@@ -109,6 +111,11 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
+from ..input_commit import (
+    block_offsets_triton_enabled,
+    copy_batch_block_offsets_from_host,
+    k31_tp_generation_server,
+)
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -137,12 +144,15 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
+from ..standalone_draft_cache import StandaloneDraftHistory
+from .block_offsets_copy import copy_batch_block_offsets_columns
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
+
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
     "iter_full_reused_blocks",
@@ -667,7 +677,10 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
     headroom = (
-        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+        get_num_extra_kv_tokens(spec_config)
+        + spec_config.tokens_per_gen_step
+        + dynamic_reserve
+        + reserve  # K3's overlap scheduler can be one verification round ahead.
     )
     return reserve, headroom
 
@@ -680,12 +693,16 @@ def _estimate_cache_size_components(
     scratch: bool,
     generation_capacity_headroom: int,
     layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+    standalone_draft_reserve: int = 0,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
     Static profiling and runtime quota conversion must charge the same SWA
-    retention pages and context scratch space. Resume-watermark normalization
-    is separate from these usable-capacity costs.
+    retention pages and context scratch space. The standalone draft reserve
+    is a shared allocation envelope, including windowed attention groups;
+    it does not represent committed history. Resume-watermark normalization
+    is separate from these usable-capacity costs. Callers estimate target and
+    draft layers separately so only target layers can share context scratch.
     """
     full_attn_size = _estimate_full_attn_size_per_token(layer_sizes, attention_windows)
     context_swa_size, _ = _estimate_swa_cache_size(
@@ -708,7 +725,7 @@ def _estimate_cache_size_components(
     return (
         full_attn_size + context_swa_size,
         full_attn_size + generation_swa_size,
-        generation_swa_per_request,
+        generation_swa_per_request + standalone_draft_reserve * sum(layer_sizes),
     )
 
 
@@ -736,6 +753,80 @@ def _resolve_v2_max_attention_window_vec(
     clamped_window_pattern = _clamp_max_attention_window_vec(max_attention_window_vec, max_seq_len)
     local_windows = _project_max_attention_window_vec(clamped_window_pattern, pp_layers)
     return [None if window == max_seq_len else window for window in local_windows]
+
+
+def _get_draft_layer_sizes(
+    *,
+    draft_num_layers: int = 0,
+    draft_num_kv_heads: int = 0,
+    draft_head_dim: int = 0,
+    draft_dtype: DataType = DataType.BF16,
+    draft_kv_factor: int = 2,
+    **kwargs,
+) -> tuple[int, ...]:
+    if draft_num_layers < 0:
+        raise ValueError("Draft layer count must be nonnegative")
+    if draft_num_layers:
+        if min(draft_num_kv_heads, draft_head_dim) <= 0:
+            raise ValueError("Standalone draft cache dimensions must be positive")
+        if draft_dtype not in (DataType.HALF, DataType.BF16, DataType.FP8):
+            raise ValueError("Standalone draft KV supports FP16, BF16 and FP8 storage")
+        if draft_kv_factor not in (1, 2):
+            raise ValueError("KV storage requires one or two planes")
+    size = get_size_in_bytes(draft_num_kv_heads * draft_head_dim * draft_kv_factor, draft_dtype)
+    return (size,) * draft_num_layers
+
+
+def _estimate_draft_cache_size_components(
+    layer_sizes: Sequence[int],
+    tokens_per_block: int,
+    *,
+    generation_capacity_headroom: int,
+    scratch_tokens: int = 0,
+    window_size: int | None = None,
+    helix_cp_size: int = 1,
+) -> tuple[int, int, int]:
+    """Draft storage cost, with history and scratch requirements supplied separately."""
+    retention_window = window_size + 1 if window_size is not None else None
+    context, generation, per_request = _estimate_cache_size_components(
+        layer_sizes,
+        [retention_window] * len(layer_sizes),
+        tokens_per_block,
+        scratch=False,
+        generation_capacity_headroom=generation_capacity_headroom,
+        standalone_draft_reserve=scratch_tokens,
+    )
+    extra_bytes_per_token = (helix_cp_size - 1) * sum(layer_sizes)
+    return context + extra_bytes_per_token, generation + extra_bytes_per_token, per_request
+
+
+def _draft_ratio_for_token_parity(
+    draft_block_bytes: int,
+    target_ratios: Sequence[float],
+    target_block_bytes: Sequence[Optional[int]],
+) -> Optional[float]:
+    """Quota share of a draft pool group that holds as many tokens as the target.
+
+    ``target_block_bytes[i]`` is what one block of tokens costs target pool group
+    ``i`` (its slot size times the token-bearing lifecycles sharing it), or None for
+    a group whose usage does not grow with the token count (recurrent state,
+    sliding windows). A request needs every token in every token-bearing group, so
+    the target holds as many tokens as the scarcest one. With the draft group at
+    ``d`` of the quota and the target groups splitting ``1 - d`` by their ratios,
+    equal block counts give ``d / draft_block_bytes == (1 - d) * k`` with
+    ``k = min_i(ratio_i / target_block_bytes_i)``. Returns None when no target group
+    is token-bearing.
+    """
+    total = sum(target_ratios)
+    blocks_per_byte = [
+        ratio / total / block_bytes
+        for ratio, block_bytes in zip(target_ratios, target_block_bytes)
+        if block_bytes
+    ]
+    if not blocks_per_byte or draft_block_bytes <= 0:
+        return None
+    k = min(blocks_per_byte)
+    return k * draft_block_bytes / (k * draft_block_bytes + 1)
 
 
 def _extend_swa_windows_for_reuse(
@@ -795,7 +886,7 @@ def _derive_request_windows_from_layer_types(
 def _gpu_alloc_granularity(quota: int) -> int:
     """GPU pool allocation granularity for a given quota.
 
-    Mirrors ``CacheLevelManager::cacheTierGranularity`` (storageManager.cpp):
+    Mirrors ``tierAllocationGranularity`` (kv_cache_manager_v2/storage/core.cpp):
     2 MiB physical chunks, doubled up to 32 MiB as the quota grows past
     multiples of 1 GiB.
     """
@@ -1227,6 +1318,8 @@ def _update_kv_cache_draft_token_location(
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:
         return
+    if getattr(cache_manager, "draft_layer_ids", ()):
+        raise ValueError("Unified standalone draft KV does not support tree-token relocation")
     requests = scheduled_batch.all_requests()
     (
         accepted_draft_token_offsets,
@@ -1772,6 +1865,13 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
+    _draft_layer_sizes: tuple[int, ...] = ()
+    cp_as_tp_layer_ids: frozenset[int] = frozenset()
+    draft_window_size: int | None = None
+    draft_layer_ids: tuple[int, ...] = ()
+    _standalone_draft_reserve: int = 0
+    _draft_registered_as_model_layers: bool = False
+    _draft_cp_size: int = 1
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1795,6 +1895,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
     _record_branch_snapshots = False
+    # Request id -> points of its prompt that requests waiting for its prefix
+    # need snapshotted (request_prefix_snapshot); kept apart from the request's
+    # own expect_snapshot_points, which other code rewrites. Created on first use.
+    _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
 
     def __init__(
         self,
@@ -1831,8 +1935,45 @@ class KVCacheManagerV2(BaseResourceManager):
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        draft_num_layers: int = 0,
+        draft_num_kv_heads: int = 0,
+        draft_head_dim: int = 0,
+        draft_dtype: DataType = DataType.BF16,
+        draft_kv_factor: int = 2,
+        draft_total_num_kv_heads: int | None = None,
+        draft_scratch_tokens: int = 0,
+        draft_window_size: int | None = None,
+        draft_attention_backend: str | None = None,
+        draft_max_position_embeddings: int | None = None,
+        draft_cp_size: int = 1,
         **kwargs,
     ) -> None:
+        self._draft_layer_sizes = _get_draft_layer_sizes(
+            draft_num_layers=draft_num_layers,
+            draft_num_kv_heads=draft_num_kv_heads,
+            draft_head_dim=draft_head_dim,
+            draft_dtype=draft_dtype,
+            draft_kv_factor=draft_kv_factor,
+        )
+        if draft_total_num_kv_heads is not None and draft_total_num_kv_heads < draft_num_kv_heads:
+            raise ValueError("Total draft KV heads must cover the rank-local heads")
+        self._draft_total_num_kv_heads = draft_total_num_kv_heads
+        if draft_scratch_tokens < 0:
+            raise ValueError("Standalone draft scratch capacity must be nonnegative")
+        if draft_window_size is not None and draft_window_size <= 0:
+            raise ValueError("Draft history window must be positive")
+        self.draft_window_size = draft_window_size
+        # The typical sequence length the pools are split for (kv_cache_config.avg_seq_len); None
+        # when it is unset.
+        self._pool_split_avg_seq_len = kv_cache_config.avg_seq_len
+        self.draft_attention_backend = draft_attention_backend
+        self.draft_max_position_embeddings = draft_max_position_embeddings
+        self.draft_layer_ids: tuple[int, ...] = ()
+        self.draft_history: dict[int, StandaloneDraftHistory] = {}
+        self._draft_dummy_request_ids: set[int] = set()
+        self._standalone_draft_reserve = draft_scratch_tokens
+        if self._draft_layer_sizes and layer_specs is not None:
+            raise ValueError("Unified standalone draft layers do not support explicit layer_specs")
         self.mapping = mapping
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
@@ -1964,6 +2105,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._helix_cp_rank = mapping.cp_rank if self._has_cp_helix else 0
         self._helix_cp_size = mapping.cp_size if self._has_cp_helix else 1
         self._ledger_tokens_per_block = tokens_per_block * self._helix_cp_size
+        # Standalone draft pages per rank per ledger block: all cp_size of them
+        # for a head-TP drafter, cp_size // draft_cp_size for one whose context
+        # KV is itself helix-sharded (global page g on draft CP rank g % draft_cp_size).
+        if draft_cp_size < 1 or self._helix_cp_size % draft_cp_size:
+            raise ValueError(
+                f"Draft CP size {draft_cp_size} must divide the helix CP size {self._helix_cp_size}"
+            )
+        self._draft_cp_size = draft_cp_size
         if self._has_cp_helix:
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
@@ -2028,6 +2177,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
             _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
         )
+        self._generation_kv_capacity_headroom += self._standalone_draft_reserve
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -2178,6 +2328,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"unique values={set(self.head_dim_per_layer)}"
                 )
 
+        if self.layer_specs is not None:
+            self.dtype_per_layer = [layer.dtype for layer in self.layer_specs]
+            self.kv_factor_per_layer = [layer.kv_factor for layer in self.layer_specs]
+        else:
+            self.dtype_per_layer = [self.dtype] * self.num_local_layers
+            self.kv_factor_per_layer = [self.kv_factor] * self.num_local_layers
+
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
@@ -2319,6 +2476,14 @@ class KVCacheManagerV2(BaseResourceManager):
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
         config = self._add_mixed_precision_layers(config)
+        config = self._append_standalone_draft_layers(
+            config,
+            num_kv_heads=draft_num_kv_heads,
+            head_dim=draft_head_dim,
+            dtype=draft_dtype,
+            kv_factor=draft_kv_factor,
+        )
+        config = self._configure_unified_draft_pool_ratio(config)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -2513,6 +2678,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.enable_joint_kv_cache_reuse
             and not self._has_cp_helix
         )
+        self.can_share_inflight_prefix = self._can_share_inflight_prefix()
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -2589,6 +2755,8 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         self._log_kv_cache_pool_lifecycle_mapping()
+        self._warn_windowed_draft_pool()
+        self._zero_gpu_pool_memory()
         self._reserve_guard_page()
 
         # Last: bind the publisher socket and start its thread only once every check
@@ -2649,6 +2817,69 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         first = self.pp_layers[0]
         return f"(layer {first} -> page {self._guard_page_by_layer.get(first)})"
+
+    def _gpu_pool_regions(self) -> List[Tuple[Tuple[int, int], int, int]]:
+        """``((pool group, pool), base address, mapped bytes)`` of every GPU pool."""
+        return [
+            (
+                (int(group.pool_group_index), int(pool.pool_index)),
+                int(pool.base_address),
+                int(group.num_slots) * int(pool.slot_bytes),
+            )
+            for group in self.impl.pool_group_descs
+            for pool in group.pools
+        ]
+
+    def _zero_gpu_pool_memory(self) -> None:
+        """Zero every byte of the GPU pools once, before the first request.
+
+        The pools are mapped from physical memory that is never cleared, and pages pass from
+        one request to the next without being scrubbed. Paged decode kernels load whole tiles
+        and mask the keys past a request's length: the CuTe DSL MLA decode, for one, reads to
+        the end of its 128-key tile, i.e. the rest of the request's last page and the pages
+        the next page-table entries name. A masked score is replaced, but its value row is
+        still multiplied by a zero probability, so a NaN or Inf bit pattern there (FP8 E4M3
+        0x7F / 0xFF) makes the output NaN. After this every pool byte is zero or a value a
+        cache writer stored, and the writers store finite values. Pools that grow later (pool
+        rebalancing) are checked by ``check_gpu_pool_growth``.
+        """
+        # Wait for this stream only: a device-wide synchronize would also wait for unrelated
+        # work in flight on other streams. The events time the zero itself.
+        start = time.perf_counter()
+        stream = torch.cuda.current_stream()
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        regions = self._gpu_pool_regions()
+        begin.record(stream)
+        for _, base, size in regions:
+            if size:
+                convert_to_torch_tensor(TensorWrapper(base, torch.uint8, [size])).zero_()
+        end.record(stream)
+        end.synchronize()
+        self._zeroed_gpu_pool_bytes = {key: size for key, _, size in regions}
+        self._gpu_pool_growth_warned = False
+        total = sum(size for _, _, size in regions)
+        logger.info(
+            f"KVCacheManagerV2: zeroed {total / (1 << 30):.2f} GiB of GPU KV pools in "
+            f"{begin.elapsed_time(end):.1f} ms on the GPU "
+            f"({(time.perf_counter() - start) * 1e3:.1f} ms on the host, incl. earlier work on the stream)"
+        )
+
+    def check_gpu_pool_growth(self) -> bool:
+        """Whether a GPU pool has mapped memory since ``_zero_gpu_pool_memory`` (pool
+        rebalancing); warns once, since that memory was not zeroed."""
+        grown = [
+            key
+            for key, _, size in self._gpu_pool_regions()
+            if size > getattr(self, "_zeroed_gpu_pool_bytes", {}).get(key, 0)
+        ]
+        if grown and not self._gpu_pool_growth_warned:
+            self._gpu_pool_growth_warned = True
+            logger.warning(
+                f"KVCacheManagerV2: GPU pools (pool group, pool) {grown} mapped memory after the "
+                "construction-time zero; it is not zeroed, so a decode that loads past a request's "
+                "length can read NaN bit patterns from it"
+            )
+        return bool(grown)
 
     def _reserve_guard_page(self) -> None:
         """Diagnostic: park masked-out page-table entries on a page nobody owns.
@@ -2884,12 +3115,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_id = self._pool_layer_ids_by_role[(pool_id, Role.KEY)]
             roles = self._get_layer_roles_by_local_id(int(layer_id))
             return Role.KEY, Role.VALUE if Role.VALUE in roles else None
+        if self._draft_layer_sizes:
+            # Unified standalone draft pools can differ from the target in K/V planes.
+            layer_id = int(self.impl.layer_grouping[pool_id][0])
+            kv_factor = self._get_layer_kv_factor_by_local_id(layer_id)
+            return Role.KEY, Role.VALUE if kv_factor == 2 else None
         role_b = None if self.kv_cache_type == CacheTypeCpp.SELFKONLY else Role.VALUE
         return Role.KEY, role_b
 
     def _get_layer_kv_factor_by_local_id(self, local_layer_id: int) -> int:
         if self.layer_specs is not None:
             return self.layer_specs[local_layer_id].kv_factor
+        kv_factor_per_layer = getattr(self, "kv_factor_per_layer", None)
+        if kv_factor_per_layer is not None and local_layer_id < len(kv_factor_per_layer):
+            return kv_factor_per_layer[local_layer_id]
         return self.kv_factor
 
     def _get_layer_page_table_roles(
@@ -2902,6 +3141,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_layer_dtype_by_local_id(self, local_layer_id: int) -> DataType:
         if self.layer_specs is not None:
             return self.layer_specs[local_layer_id].dtype
+        dtype_per_layer = getattr(self, "dtype_per_layer", None)
+        if dtype_per_layer is not None and local_layer_id < len(dtype_per_layer):
+            return dtype_per_layer[local_layer_id]
         return self.dtype
 
     def _get_layer_roles_by_local_id(self, local_layer_id: int) -> tuple[DataRole, ...]:
@@ -3194,12 +3436,48 @@ class KVCacheManagerV2(BaseResourceManager):
             layer_sizes.append(
                 self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx, data_role=Role.ALL)
             )
-            attention_windows.append(self.max_attention_window_vec[local_layer_idx])
+            if self._is_standalone_draft_layer(local_layer_idx):
+                attention_windows.append(self.draft_retention_window_size)
+            else:
+                attention_windows.append(self.max_attention_window_vec[local_layer_idx])
+        # Quota sizing precedes specialized target-layer construction. Include
+        # draft storage then; after append it is already in the per-layer arrays.
+        if self._draft_layer_sizes and not self._draft_registered_as_model_layers:
+            layer_sizes.extend(self._draft_layer_sizes)
+            attention_windows.extend(
+                [self.draft_retention_window_size] * len(self._draft_layer_sizes)
+            )
         return layer_sizes, attention_windows
 
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
         return self.max_batch_size
+
+    def _get_runtime_cache_size_components(self) -> tuple[int, int, int]:
+        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
+        num_target_layers = len(layer_sizes) - len(self._draft_layer_sizes)
+        context_size, generation_size, fixed_size = _estimate_cache_size_components(
+            layer_sizes[:num_target_layers],
+            attention_windows[:num_target_layers],
+            self.tokens_per_block,
+            scratch=self.enable_swa_scratch_reuse,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+            layer_specs=self.layer_specs,
+            standalone_draft_reserve=self._standalone_draft_reserve,
+        )
+        if self._draft_layer_sizes:
+            draft_context, draft_generation, draft_fixed = _estimate_draft_cache_size_components(
+                self._draft_layer_sizes,
+                self.tokens_per_block,
+                scratch_tokens=self._standalone_draft_reserve,
+                window_size=self.draft_window_size,
+                generation_capacity_headroom=self._generation_kv_capacity_headroom,
+                helix_cp_size=self._draft_page_expansion,
+            )
+            context_size += draft_context
+            generation_size += draft_generation
+            fixed_size += draft_fixed
+        return context_size, generation_size, fixed_size
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""
@@ -3213,19 +3491,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return tokens
 
     def _get_max_tokens_from_quota_impl(self, quota: int) -> float:
-        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         (
             context_size_per_token,
             generation_size_per_token,
             generation_swa_size_per_request,
-        ) = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
-            self.tokens_per_block,
-            scratch=self.enable_swa_scratch_reuse,
-            generation_capacity_headroom=self._generation_kv_capacity_headroom,
-            layer_specs=self.layer_specs,
-        )
+        ) = self._get_runtime_cache_size_components()
         size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
             return 0
@@ -3250,25 +3520,43 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._get_quota_from_max_tokens_impl(max_tokens)
 
     def _get_quota_from_max_tokens_impl(self, max_tokens: int) -> int:
-        layer_sizes, attention_windows = self._get_runtime_cache_size_layer_components()
         (
             context_size_per_token,
             generation_size_per_token,
             generation_swa_size_per_request,
-        ) = _estimate_cache_size_components(
-            layer_sizes,
-            attention_windows,
-            self.tokens_per_block,
-            scratch=self.enable_swa_scratch_reuse,
-            generation_capacity_headroom=self._generation_kv_capacity_headroom,
-            layer_specs=self.layer_specs,
-        )
+        ) = self._get_runtime_cache_size_components()
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
         return int(
             context_tokens * context_size_per_token
             + generation_tokens * generation_size_per_token
             + self._get_generation_request_capacity() * generation_swa_size_per_request
+        )
+
+    def _get_draft_quota_from_max_tokens(self, max_tokens: float) -> int:
+        """Draft bytes within the unified manager's usable token capacity."""
+        assert self._draft_layer_sizes
+        if self._has_cp_helix:
+            # Each target ledger block retains all of its draft subpages.
+            max_tokens = (
+                math.ceil(max_tokens / self._ledger_tokens_per_block)
+                * self._ledger_tokens_per_block
+                // self._draft_cp_size
+            )
+        context_size, generation_size, fixed_size = _estimate_draft_cache_size_components(
+            self._draft_layer_sizes,
+            self.tokens_per_block,
+            scratch_tokens=self._standalone_draft_reserve,
+            window_size=self.draft_window_size,
+            generation_capacity_headroom=self._generation_kv_capacity_headroom,
+        )
+        context_tokens = (
+            max_tokens if self.max_num_tokens is None else min(max_tokens, self.max_num_tokens)
+        )
+        return math.ceil(
+            context_tokens * context_size
+            + (max_tokens - context_tokens) * generation_size
+            + self._get_generation_request_capacity() * fixed_size
         )
 
     def _get_event_num_blocks_per_cache_level(
@@ -3388,6 +3676,58 @@ class KVCacheManagerV2(BaseResourceManager):
                             )
         return f"role={role!s}, pool_group_id=?, layer_group_id=?"
 
+    def _windowed_draft_pool_windows(self) -> Optional[int]:
+        """Retained draft windows the draft pool group holds, for a windowed standalone draft
+        history; None otherwise or when the pool layout cannot be read."""
+        if (
+            not self.draft_layer_ids
+            or self.draft_window_size is None
+            or self._draft_history_uses_kv_history()
+        ):
+            return None
+        layer_id = self.layer_offsets[self.draft_layer_ids[0]]
+        try:
+            stats = self._get_storage_statistics(GPU_LEVEL)
+            pool_group = next(
+                int(group.pool_group_index)
+                for group in self.impl.pool_group_descs
+                for variant in group.slot_desc.variants
+                for coalesced in variant.coalesced_buffers
+                for buffer_id in coalesced.buffer_ids
+                if int(buffer_id.layer_id) == int(layer_id)
+            )
+        except (AttributeError, RuntimeError, StopIteration):
+            return None
+        # A window starting mid-block spans one block more than it holds.
+        blocks_per_window = -(-self.draft_window_size // self.tokens_per_block) + 1
+        return stats[pool_group].total // blocks_per_window
+
+    def _warn_windowed_draft_pool(self) -> None:
+        """Name the cap a windowed draft history puts on long requests.
+
+        The pools are split once, for ``max_batch_size`` requests at the typical sequence length
+        (``kv_cache_config.avg_seq_len``, else max_seq_len / 2 or less). A windowed draft group
+        sized there holds as many windows as the target holds typical requests, so traffic
+        shorter than the typical length leaves the draft pool binding first: warn when the
+        typical length was not set.
+        """
+        windows = self._windowed_draft_pool_windows()
+        if windows is None:
+            return
+        cap = (
+            f"The draft pool keeps {self.draft_window_size} positions per request and holds "
+            f"{windows} such windows (max_batch_size {self.max_batch_size}): at most {windows} "
+            "requests longer than the window fit in it at once."
+        )
+        if self._pool_split_avg_seq_len is None:
+            logger.warning(
+                f"{cap} kv_cache_config.avg_seq_len is not set, so the pools were split for "
+                "a typical length far above most workloads; set avg_seq_len to the traffic's "
+                "mean sequence length."
+            )
+        else:
+            logger.info(cap)
+
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
         for layer in self.kv_cache_manager_py_config.layers:
@@ -3428,6 +3768,12 @@ class KVCacheManagerV2(BaseResourceManager):
             ]
             for role_idx, role in enumerate(roles):
                 converter = self.impl.get_page_index_converter(layer_id, role)
+                if converter.expansion != 1 and self._is_standalone_draft_layer(layer_id):
+                    pool_ids[local_layer_idx, role_idx] = pool_id
+                    scales[local_layer_idx, role_idx] = 1
+                    layer_offsets[local_layer_idx, role_idx] = 0
+                    scratch_pages[local_layer_idx, role_idx] = 0
+                    continue
                 if converter.expansion != 1:
                     raise NotImplementedError(
                         "SWA scratch block-table conversion does not support "
@@ -3612,18 +3958,15 @@ class KVCacheManagerV2(BaseResourceManager):
         """Return the primary cache roles allocated for one local layer."""
         if self.layer_specs is not None:
             return list(self.layer_specs[local_layer_idx].buffer_roles)
-        roles = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            roles.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
+        kv_factor = self._get_layer_kv_factor_by_local_id(local_layer_idx)
+        roles = [Role.KEY, Role.VALUE][:kv_factor]
+        if self._get_layer_dtype_by_local_id(local_layer_idx) == DataType.NVFP4:
             head_dim = self.head_dim_per_layer[local_layer_idx]
             assert head_dim % 2 == 0, (
                 f"head_dim must be divisible by 2 for nvfp4 kv cache, "
                 f"but layer {local_layer_idx} has head_dim={head_dim}"
             )
-            roles.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                roles.append(Role.VALUE_BLOCK_SCALE)
+            roles += [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE][:kv_factor]
         return roles
 
     def _build_base_config(
@@ -3643,7 +3986,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.enable_swa_scratch_reuse:
             # Context requests allocate num_extra_kv_tokens for spec decoding.
             # They should not count toward the scratch range.
-            scratch_reuse_config = SwaScratchReuseConfig(max_rewind_len=self.num_extra_kv_tokens)
+            # Unwritten speculative and draft reserves must stay outside the
+            # scratch range when a context chunk advances its history.
+            scratch_reuse_config = SwaScratchReuseConfig(
+                max_rewind_len=self.num_extra_kv_tokens + self._standalone_draft_reserve
+            )
 
         # Beam search only replicates blocks from the prompt tail onward, so
         # KVCacheDesc splits each request into a shared prefix (prompt_length)
@@ -3911,6 +4258,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self.layer_offsets = {layer_id: offset for offset, layer_id in enumerate(self.pp_layers)}
         self.num_kv_heads_per_layer = [self.num_kv_heads_per_layer[i] for i in retained_layer_ids]
         self.head_dim_per_layer = [self.head_dim_per_layer[i] for i in retained_layer_ids]
+        if hasattr(self, "dtype_per_layer"):
+            self.dtype_per_layer = [self.dtype_per_layer[i] for i in retained_layer_ids]
+            self.kv_factor_per_layer = [self.kv_factor_per_layer[i] for i in retained_layer_ids]
         self.max_attention_window_vec = [
             self.max_attention_window_vec[i] for i in retained_layer_ids
         ]
@@ -3970,6 +4320,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Whether this local layer stores its history in the low-precision pool."""
         return (
             self.low_precision_dtype is not None
+            and not self._is_standalone_draft_layer(local_layer_idx)
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
             and self.pp_layers[local_layer_idx] not in self._shared_kv_layers
@@ -4121,6 +4472,236 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return typical_seq_len
 
+    def _append_standalone_draft_layers(
+        self,
+        config: KVCacheManagerConfigPy,
+        *,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: DataType,
+        kv_factor: int,
+        register_model_layers: bool = True,
+    ) -> KVCacheManagerConfigPy:
+        if not self._draft_layer_sizes:
+            return config
+        first_global_id = max(self.pp_layers, default=-1) + 1
+        first_local_id = len(config.layers)
+        # FP4 MLA adds native HP-tail layers outside the model-layer arrays.
+        register_model_layers = register_model_layers and first_local_id == len(self.pp_layers)
+        self._draft_registered_as_model_layers = register_model_layers
+        # Specialized managers can replace model layers with multiple native layers.
+        padding = first_local_id - len(self.dtype_per_layer)
+        assert padding >= 0
+        num_draft_layers = len(self._draft_layer_sizes)
+        self.dtype_per_layer.extend([self.dtype] * padding + [dtype] * num_draft_layers)
+        self.kv_factor_per_layer.extend([self.kv_factor] * padding + [kv_factor] * num_draft_layers)
+        self.num_kv_heads_per_layer.extend([0] * padding + [num_kv_heads] * num_draft_layers)
+        self.head_dim_per_layer.extend([0] * padding + [head_dim] * num_draft_layers)
+        self.cp_as_tp_layer_ids = frozenset(
+            range(first_local_id, first_local_id + num_draft_layers)
+        )
+        self.draft_layer_ids = tuple(
+            range(first_global_id, first_global_id + len(self._draft_layer_sizes))
+        )
+        layers = list(config.layers)
+        for offset, global_id in enumerate(self.draft_layer_ids):
+            local_id = first_local_id + offset
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(local_id),
+                    buffers=[
+                        BufferConfig(
+                            role=role,
+                            size=KVCacheManagerV2.get_layer_bytes_per_token(self, local_id, role)
+                            * self.tokens_per_block,
+                            tokens_per_block_override=(
+                                self.tokens_per_block * self._draft_cp_size
+                                if self._draft_page_expansion > 1
+                                else None
+                            ),
+                        )
+                        for role in self._get_buffer_roles_for_layer(local_id)
+                    ],
+                    sliding_window_size=self.draft_retention_window_size,
+                    cache_domain=CacheDomain.STANDALONE_DRAFT,
+                )
+            )
+            self.layer_offsets[global_id] = local_id
+            if register_model_layers:
+                self.pp_layers.append(global_id)
+                self.max_attention_window_vec.append(self.draft_retention_window_size)
+                self.total_num_kv_heads_per_layer.append(
+                    self._draft_total_num_kv_heads or num_kv_heads
+                )
+        if register_model_layers:
+            self.num_local_layers = len(self.pp_layers)
+            self.num_layers += len(self._draft_layer_sizes)
+
+        def reserve_scratch(batch: BatchDesc) -> BatchDesc:
+            return BatchDesc(
+                [
+                    KVCacheDesc(
+                        capacity=desc.capacity
+                        + (self._standalone_draft_reserve if desc.capacity else 0),
+                        history_length=desc.history_length,
+                    )
+                    for desc in batch.kv_caches
+                ],
+                system_prompt_length=batch.system_prompt_length,
+            )
+
+        return replace(
+            config,
+            layers=layers,
+            constraints=[reserve_scratch(batch) for batch in config.constraints],
+            typical_step=reserve_scratch(config.typical_step)
+            if config.typical_step is not None
+            else None,
+        )
+
+    def _predict_pool_group_block_bytes(
+        self, config: KVCacheManagerConfigPy
+    ) -> tuple[list[Optional[int]], list[Optional[int]]]:
+        """Bytes one block of tokens costs each standalone-draft and target pool group.
+
+        Each list is in storage order; an entry is None for a pool group whose usage
+        does not grow with the token count (recurrent state, sliding windows). Mirrors
+        the C++ createStorageConfig: a lifecycle's buffers coalesce by expanded buffer
+        size into one slot whose pool sizes sort descending, lifecycles of one cache
+        domain with equal pool sizes share a pool group, and pool groups sort by
+        (cache domain, pool sizes), the standalone-draft domain first.
+        """
+        _, pool_groups = self._predict_pool_groups(config)
+        draft_block_bytes: list[Optional[int]] = []
+        target_block_bytes: list[Optional[int]] = []
+        for (is_target, pool_sizes), num_token_life_cycles in pool_groups:
+            block_bytes = sum(pool_sizes) * num_token_life_cycles or None
+            (target_block_bytes if is_target else draft_block_bytes).append(block_bytes)
+        return draft_block_bytes, target_block_bytes
+
+    def _predict_pool_groups(
+        self, config: KVCacheManagerConfigPy
+    ) -> tuple[list[tuple[bool, tuple[int, ...]]], list[tuple[tuple[bool, tuple[int, ...]], int]]]:
+        """The pool group of each lifecycle and the pool groups in storage order.
+
+        Returns ``(life_cycle_groups, pool_groups)``: ``life_cycle_groups[i]`` is the
+        ``(is target, pool sizes)`` key of lifecycle ``i`` in the C++ registration
+        order (first appearance in ``config.layers``, the order of
+        ``initial_pool_ratio``); ``pool_groups`` lists ``(key, number of lifecycles
+        that hold every token)`` sorted as the C++ storage orders its pool groups.
+        """
+        tokens_per_block = config.tokens_per_block
+        # Native lifecycle equality includes window, rounded sink blocks, sparsity,
+        # reuse policy and cache domain. All SSM layers share one lifecycle, represented by None.
+        life_cycles: list[tuple[AttnLifeCycle | None, bool, bool, defaultdict[int, int]]] = []
+        for layer in config.layers:
+            if isinstance(layer, AttentionLayerConfig):
+                life_cycle = AttnLifeCycle.make(
+                    layer.sliding_window_size,
+                    layer.num_sink_tokens,
+                    tokens_per_block,
+                    bool(layer.buffers) and layer.buffers[0].is_sparse,
+                    layer.reuse_policy,
+                    layer.cache_domain,
+                )
+                is_draft = layer.cache_domain == CacheDomain.STANDALONE_DRAFT
+                # A window that covers max_seq_len never drops a block.
+                window = layer.sliding_window_size
+                holds_every_token = window is None or window >= self.max_seq_len
+            else:
+                life_cycle, is_draft, holds_every_token = None, False, False
+            entry = next(
+                (
+                    existing
+                    for existing in life_cycles
+                    if type(existing[0]) is type(life_cycle) and existing[0] == life_cycle
+                ),
+                None,
+            )
+            if entry is None:
+                entry = (life_cycle, is_draft, holds_every_token, defaultdict(int))
+                life_cycles.append(entry)
+            buffer_counts = entry[3]
+            for buffer in layer.buffers:
+                override = buffer.tokens_per_block_override or tokens_per_block
+                buffer_counts[buffer.size * exact_div(tokens_per_block, override)] += 1
+
+        # (is target, pool sizes) -> token-bearing lifecycles sharing that pool group.
+        pool_groups: defaultdict[tuple[bool, tuple[int, ...]], int] = defaultdict(int)
+        life_cycle_groups: list[tuple[bool, tuple[int, ...]]] = []
+        for _, is_draft, holds_every_token, buffer_counts in life_cycles:
+            pool_sizes = tuple(
+                sorted((size * count for size, count in buffer_counts.items()), reverse=True)
+            )
+            key = (not is_draft, pool_sizes)
+            life_cycle_groups.append(key)
+            pool_groups[key] += holds_every_token
+        return life_cycle_groups, sorted(pool_groups.items())
+
+    def _estimate_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> float:
+        """Draft share of the quota for the target's estimated token capacity."""
+        # Use the same model-specific capacity accounting as quota selection;
+        # specialized targets can include compressed KV or recurrent snapshots.
+        usable_quota = int(config.cache_tiers[GPU_LEVEL].quota * config.max_util_for_resume)
+        max_tokens = self._get_max_tokens_from_quota(usable_quota)
+        if math.isinf(max_tokens):
+            max_tokens = self.max_num_tokens or self.max_seq_len
+        if usable_quota <= 0 or self._get_quota_from_max_tokens(max_tokens) > usable_quota:
+            raise ValueError("Unified KV cache quota cannot hold the target and draft reserves")
+        return self._get_draft_quota_from_max_tokens(max_tokens) / usable_quota
+
+    def _configure_unified_draft_pool_ratio(
+        self, config: KVCacheManagerConfigPy
+    ) -> KVCacheManagerConfigPy:
+        """Split an explicit pool ratio between the standalone draft and the target.
+
+        ``kv_cache_config.pool_ratio`` names the target's pool groups only; the
+        storage layout puts the standalone-draft pool group before them. The drafter
+        keeps one context entry per target token, so a full-history draft group gets
+        the share that holds as many tokens as the target's full-attention groups:
+        draft blocks beyond that can never be used, and every byte of them shrinks
+        all target groups. The target groups keep their split of the rest.
+        """
+        if not self.draft_layer_ids:
+            return config
+        target_ratios = config.initial_pool_ratio
+        if target_ratios is None:
+            return config
+
+        draft_block_bytes, target_block_bytes = self._predict_pool_group_block_bytes(config)
+        if len(target_ratios) != len(target_block_bytes):
+            raise ValueError(
+                "kv_cache_config.pool_ratio must have one entry per target pool group "
+                f"({len(target_block_bytes)}), got {len(target_ratios)}"
+            )
+        # The draft layers share one lifecycle and form one pool group.
+        assert len(draft_block_bytes) == 1, draft_block_bytes
+        draft_ratio = None
+        if draft_block_bytes[0] is not None:
+            draft_ratio = _draft_ratio_for_token_parity(
+                draft_block_bytes[0], target_ratios, target_block_bytes
+            )
+        if draft_ratio is None:
+            # A windowed draft history, or a target without a full-attention group:
+            # no token count to mirror, so charge the estimated capacity.
+            draft_ratio = self._estimate_draft_pool_ratio(config)
+        if not 0 < draft_ratio < 1:
+            raise ValueError("Unified KV cache quota must leave room for target and draft pools")
+
+        # The native initial_pool_ratio has one entry per lifecycle (registration order)
+        # and sums a pool group's lifecycles: give each lifecycle an equal part of its
+        # pool group's share.
+        group_ratios = [draft_ratio] + [ratio * (1 - draft_ratio) for ratio in target_ratios]
+        life_cycle_groups, pool_groups = self._predict_pool_groups(config)
+        group_index = {key: index for index, (key, _) in enumerate(pool_groups)}
+        members = Counter(life_cycle_groups)
+        return replace(
+            config,
+            initial_pool_ratio=[
+                group_ratios[group_index[key]] / members[key] for key in life_cycle_groups
+            ],
+        )
+
     def _extra_buffers_per_layer(
         self, *, tokens_per_block: int
     ) -> Optional[dict[int, List[BufferConfig]]]:
@@ -4205,7 +4786,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_layer_owner(self, global_layer_id: int) -> KVCacheLayerOwner:
         if self.layer_specs is not None:
             return self.get_layer_cache_spec(global_layer_id).owner
-        if global_layer_id in self._legacy_draft_layer_ids:
+        if (
+            global_layer_id in self._legacy_draft_layer_ids
+            or global_layer_id in self.draft_layer_ids
+        ):
             return KVCacheLayerOwner.DRAFT
         if global_layer_id not in self.layer_offsets:
             raise KeyError(f"global layer {global_layer_id} is not local to this rank")
@@ -4215,7 +4799,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.layer_specs is None:
             if global_layer_id not in self.layer_offsets:
                 raise KeyError(f"global layer {global_layer_id} is not local to this rank")
-            return self.dtype
+            return self._get_layer_dtype_by_local_id(self.layer_offsets[global_layer_id])
         return self.get_layer_cache_spec(global_layer_id).dtype
 
     def get_layer_buffer_roles(self, global_layer_id: int) -> tuple[DataRole, ...]:
@@ -4237,7 +4821,9 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     @property
-    def draft_layer_ids(self) -> tuple[int, ...]:
+    def owned_draft_layer_ids(self) -> tuple[int, ...]:
+        """Local layers owned by a draft model (``draft_layer_ids`` holds the
+        unified standalone draft layers only)."""
         return tuple(
             layer_id
             for layer_id in self.pp_layers
@@ -4246,7 +4832,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_draft_kv_cache_view(self) -> Optional["KVCacheManagerV2"]:
         """Return this manager when explicit draft layers share its request timeline."""
-        if self.layer_specs is None or not self.draft_layer_ids:
+        if self.layer_specs is None or not self.owned_draft_layer_ids:
             return None
         return self
 
@@ -4352,6 +4938,8 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> Optional[torch.Tensor]:
         """Return a zero-copy KV view; its slot dimension may be strided."""
         layer_offset = self.layer_offsets[layer_idx]
+        if self._is_standalone_draft_layer(layer_offset):
+            return self._get_layer_buffer_view(layer_offset, kv_layout)
         if layer_offset in self.high_layers:
             return self._get_mixed_precision_buffers(layer_offset, kv_layout, mixed_precision_pool)
         addr_key = self.impl.get_mem_pool_base_address(layer_offset, Role.KEY, PageIndexMode.SHARED)
@@ -4412,6 +5000,270 @@ class KVCacheManagerV2(BaseResourceManager):
                 *[math.prod(shape[i + 1 :]) for i in range(2, len(shape))],
             ]
         return convert_to_torch_tensor(wrapper)
+
+    def _get_layer_buffer_view(self, local_layer_idx: int, kv_layout: str) -> torch.Tensor:
+        return self._get_kv_buffer_view(
+            local_layer_idx,
+            dtype=self.dtype_per_layer[local_layer_idx],
+            kv_factor=self.kv_factor_per_layer[local_layer_idx],
+            num_kv_heads=self.num_kv_heads_per_layer[local_layer_idx],
+            head_dim=self.head_dim_per_layer[local_layer_idx],
+            kv_layout=kv_layout,
+            page_expansion=(
+                self._draft_page_expansion if local_layer_idx in self.cp_as_tp_layer_ids else 1
+            ),
+        )
+
+    def _get_kv_buffer_view(
+        self,
+        layer_id: int,
+        *,
+        dtype: DataType | torch.dtype,
+        kv_factor: int,
+        num_kv_heads: int,
+        head_dim: int,
+        kv_layout: str,
+        page_expansion: int = 1,
+    ) -> torch.Tensor:
+        """View shared pool pages for a manager-local layer and its KV geometry."""
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"Unsupported KV layout: {kv_layout}")
+        addr_key = self.impl.get_mem_pool_base_address(layer_id, Role.KEY, PageIndexMode.SHARED)
+        if kv_factor == 2:
+            addr_value = self.impl.get_mem_pool_base_address(
+                layer_id, Role.VALUE, PageIndexMode.SHARED
+            )
+            page_size_key = self.impl.get_page_stride(layer_id, Role.KEY)
+            page_size_value = self.impl.get_page_stride(layer_id, Role.VALUE)
+            if (
+                addr_key + page_size_key * page_expansion != addr_value
+                or page_size_key != page_size_value
+            ):
+                raise ValueError("K/V buffers must have adjacent equal-sized pages")
+
+        element_per_container = 1
+        if dtype == DataType.NVFP4:
+            element_per_container = 2
+            dtype = torch.int8
+
+        dimensions = (
+            [self.tokens_per_block, num_kv_heads]
+            if kv_layout == "NHD"
+            else [num_kv_heads, self.tokens_per_block]
+        )
+        head_dim //= element_per_container
+        page_upper = self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
+        num_pages = page_upper // kv_factor
+        strides = None
+        if page_expansion > 1:
+            # Each ledger slot contains all of its K subpages, then all V
+            # subpages. Expanded KEY indices skip the V spans between slots.
+            num_pages = page_upper - (kv_factor - 1) * page_expansion
+            page_elements = self.tokens_per_block * num_kv_heads * head_dim
+            strides = [
+                page_elements,
+                page_expansion * page_elements,
+                dimensions[1] * head_dim,
+                head_dim,
+                1,
+            ]
+        return convert_to_torch_tensor(
+            TensorWrapper(
+                addr_key,
+                dtype,
+                [
+                    num_pages,
+                    kv_factor,
+                    *dimensions,
+                    head_dim,
+                ],
+                strides=strides,
+            )
+        )
+
+    def get_kv_cache_dtype(self, layer_idx: Optional[int] = None) -> DataType:
+        """Return the storage dtype for a layer, or the manager default."""
+        return (
+            self.dtype
+            if layer_idx is None
+            else self._get_layer_dtype_by_local_id(self.layer_offsets[layer_idx])
+        )
+
+    def _is_standalone_draft_layer(self, local_layer_idx: int) -> bool:
+        return local_layer_idx in self.cp_as_tp_layer_ids
+
+    def get_draft_buffers(self, local_layer_idx: int, kv_layout: str = "HND") -> torch.Tensor:
+        """View one draft layer using the same storage contract as every other layer."""
+        if not 0 <= local_layer_idx < len(self.draft_layer_ids):
+            raise ValueError("No standalone draft cache layer at this index")
+        layer_idx = self.draft_layer_ids[local_layer_idx]
+        return self._get_layer_buffer_view(self.layer_offsets[layer_idx], kv_layout)
+
+    @property
+    def draft_cp_rank(self) -> int:
+        """This rank's draft CP rank over the flattened helix TP x CP grid."""
+        flat_rank = self.mapping.tp_rank * self._helix_cp_size + self._helix_cp_rank
+        return flat_rank % self._draft_cp_size
+
+    @property
+    def _draft_page_expansion(self) -> int:
+        """Physical draft pages this rank keeps per ledger block."""
+        return self._helix_cp_size // self._draft_cp_size
+
+    @property
+    def draft_max_blocks_per_seq(self) -> int:
+        """Maximum physical draft pages, including every Helix ledger subpage."""
+        return self.max_blocks_per_seq * self._draft_page_expansion
+
+    def get_draft_num_blocks(self, request_id: int) -> int:
+        """Allocated draft pages covering the request's global token positions."""
+        return self.kv_cache_map[request_id].num_blocks * self._draft_page_expansion
+
+    @property
+    def draft_retention_window_size(self) -> int | None:
+        return self.draft_window_size + 1 if self.draft_window_size is not None else None
+
+    def get_draft_transfer_identity(self) -> dict:
+        local_layer_idx = self.layer_offsets[self.draft_layer_ids[0]]
+        return {
+            "num_layers": len(self.draft_layer_ids),
+            "num_kv_heads": self._draft_total_num_kv_heads
+            or self.num_kv_heads_per_layer[local_layer_idx],
+            "head_dim": self.head_dim_per_layer[local_layer_idx],
+            "dtype": str(binding_to_torch_dtype(self.dtype_per_layer[local_layer_idx])),
+            # Standalone drafters page their context the same way under every
+            # attention backend (dtype, heads and kv_factor carry the format);
+            # only embedded DSpark (DSv4) stores a different history.
+            "attention_backend": ("DSv4" if self.draft_attention_backend == "DSv4" else "VANILLA"),
+            "kv_factor": self.kv_factor_per_layer[local_layer_idx],
+            "window_size": self.draft_window_size,
+        }
+
+    def _draft_history_uses_kv_history(self) -> bool:
+        """Embedded DSpark writes the complete live suffix of target history."""
+        return getattr(self, "draft_attention_backend", None) == "DSv4"
+
+    def get_draft_block_indices(
+        self,
+        request_ids: List[int],
+        histories: Optional[Sequence[StandaloneDraftHistory]] = None,
+    ) -> List[List[int]]:
+        """Validated rank-local mappings for allocated draft pages, without padding."""
+        for request_id in request_ids:
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or not cache.is_active:
+                raise ValueError(f"Standalone draft request {request_id} has no active cache")
+        expanded = self._helix_cp_size > 1
+        layer_idx = self.draft_layer_ids[0]
+        batch_indices = self.get_batch_cache_indices(request_ids, layer_idx, raw_indices=expanded)
+        if expanded:
+            converter = self.impl.get_page_index_converter(self.layer_offsets[layer_idx], Role.KEY)
+            batch_indices = [converter(indices, PageIndexMode.SHARED) for indices in batch_indices]
+        for row, indices in enumerate(batch_indices):
+            cache = self.kv_cache_map[request_ids[row]]
+            if (
+                len(indices) != self.get_draft_num_blocks(request_ids[row])
+                or len(indices) > self.draft_max_blocks_per_seq
+            ):
+                raise ValueError("Standalone draft cache has an incomplete or oversized page table")
+            first_required_block = 0
+            if self.draft_window_size is not None:
+                history = None
+                if not self._draft_history_uses_kv_history():
+                    history = (
+                        histories[row]
+                        if histories is not None
+                        else self.get_draft_history(request_ids[row])
+                    )
+                history_start = (
+                    history.position - history.valid_length
+                    if history is not None
+                    else max(0, cache.history_length - self.draft_window_size)
+                )
+                first_required_block = history_start // self.tokens_per_block
+            if any(index == BAD_PAGE_INDEX for index in indices[first_required_block:]):
+                raise ValueError(
+                    "Draft cache contains missing pages in its required history or scratch"
+                )
+        return batch_indices
+
+    def get_draft_block_table(
+        self,
+        request_ids: List[int],
+        histories: Optional[Sequence[StandaloneDraftHistory]] = None,
+    ) -> torch.Tensor:
+        """Current rank-local page mappings; unused tail entries point to page zero."""
+        batch_indices = self.get_draft_block_indices(request_ids, histories)
+        table = torch.zeros((len(request_ids), self.draft_max_blocks_per_seq), dtype=torch.int32)
+        for row, indices in enumerate(batch_indices):
+            table[row, : len(indices)] = torch.tensor(indices, dtype=torch.int32)
+        return table
+
+    def get_draft_history(self, request_id: int) -> Optional[StandaloneDraftHistory]:
+        return self.draft_history.get(request_id)
+
+    def set_draft_history(self, request_id: int, valid_length: int, position: int) -> None:
+        cache = self.kv_cache_map.get(request_id)
+        if cache is None or not cache.is_active:
+            raise ValueError(
+                f"Standalone draft request {request_id} has no active cache allocation"
+            )
+        history = StandaloneDraftHistory(valid_length, position)
+        if history.position > cache.capacity:
+            raise ValueError("Standalone draft history exceeds allocated capacity")
+        if self.draft_window_size is not None and history.valid_length > self.draft_window_size:
+            raise ValueError("Draft history exceeds its retention window")
+        self.draft_history[request_id] = history
+
+    def export_draft_history(self, request_id: int) -> Optional[dict]:
+        if not self.draft_layer_ids:
+            return None
+        if self._draft_history_uses_kv_history():
+            cache = self.kv_cache_map[request_id]
+            if not cache.is_active:
+                raise ValueError("Embedded DSpark transfer requires an active cache")
+            return {
+                "valid_length": min(cache.history_length, self.draft_window_size),
+                "position": cache.history_length,
+                "layout": self.get_draft_transfer_identity(),
+            }
+        history = self.get_draft_history(request_id)
+        if history is None:
+            raise ValueError(
+                f"Standalone draft request {request_id} has no valid history to transfer"
+            )
+        return {
+            "valid_length": history.valid_length,
+            "position": history.position,
+            "layout": self.get_draft_transfer_identity(),
+        }
+
+    def restore_draft_history(self, request_id: int, metadata: dict) -> None:
+        expected = self.get_draft_transfer_identity() if self.draft_layer_ids else None
+        if expected is None or metadata.get("layout") != expected:
+            raise ValueError(
+                "Standalone draft transfer layout does not match the receiving worker: "
+                f"sent {metadata.get('layout')}, expected {expected}"
+            )
+        valid_length = metadata.get("valid_length")
+        position = metadata.get("position")
+        if self._draft_history_uses_kv_history():
+            cache = self.kv_cache_map[request_id]
+            # Receive admission establishes the global prompt watermark; the
+            # transfer completion path validates that the received KV covers it.
+            if (
+                type(position) is not int
+                or type(valid_length) is not int
+                or position != cache.history_length
+                or valid_length != min(position, self.draft_window_size)
+            ):
+                raise ValueError("Embedded DSpark transfer does not match the admitted KV history")
+            self.get_draft_block_table([request_id])
+            return
+        history = StandaloneDraftHistory(valid_length, position)
+        # Validate receiver-local allocation before publishing history.
+        self.get_draft_block_table([request_id], [history])
+        self.set_draft_history(request_id, valid_length, position)
 
     def get_index_k_buffer(
         self,
@@ -4547,7 +5399,9 @@ class KVCacheManagerV2(BaseResourceManager):
         replicates all tokens on every rank, so both bounds constrain the
         same request-length variable.
         """
-        extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
+        extra_tokens = (
+            self.num_extra_kv_tokens + max_num_draft_tokens + self._standalone_draft_reserve
+        )
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = (
@@ -4560,6 +5414,14 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._gpu_max_tokens is not None:
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
+
+    def _get_attention_pool_num_blocks(self, local_layer_idx: int) -> int:
+        """Count ledger blocks without counting expanded physical subpages."""
+        layer_id = LayerId(local_layer_idx)
+        expansion = self.impl.get_page_index_converter(layer_id, Role.KEY).expansion
+        return self.impl.get_page_index_upper_bound(layer_id, Role.KEY) // (
+            self._get_layer_kv_factor_by_local_id(local_layer_idx) * expansion
+        )
 
     def get_num_free_blocks(self) -> int:
         """Estimate warmup block capacity when only permanent reservations remain.
@@ -4589,10 +5451,10 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         # Legacy managers estimate primary-pool capacity from page indices.
-        max_num_pages = max(
+        max_num_blocks = max(
             [
-                self.impl.get_page_index_upper_bound(layer_id, Role.KEY)
-                for layer_id in typed_range(LayerId(self.num_local_layers))
+                self._get_attention_pool_num_blocks(local_layer_idx)
+                for local_layer_idx in range(self.num_local_layers)
             ]
         )
         # Subtract the pages the reserved sequences hold, not the count of
@@ -4600,7 +5462,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # page (the guard is today). Summing ``num_blocks`` keeps this a page
         # count if a reservation ever spans more than one.
         reserved_pages = sum(int(self.kv_cache_map[req_id].num_blocks) for req_id in reserved)
-        return max_num_pages // self.kv_factor - reserved_pages
+        return max_num_blocks - reserved_pages
 
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or (not self.enable_stats and not self._request_stats_enabled_ids):
@@ -4898,12 +5760,25 @@ class KVCacheManagerV2(BaseResourceManager):
         """Resume context pages; subclasses may select model-specific reuse groups."""
         return self._resume_and_restore(req.py_request_id, kv_cache)
 
+    def _draft_context_exceeds_limit(self, req: LlmRequest) -> bool:
+        """Whether draft prefill skips this prompt, preventing unified block reuse."""
+        if (
+            not self.draft_layer_ids
+            or self.draft_window_size is not None
+            or self.draft_max_position_embeddings is None
+        ):
+            return False
+        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+        return prompt_len > min(self.max_seq_len, self.draft_max_position_embeddings)
+
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
     ) -> Sequence[TokenIdExt]:
         """Radix-tree evidence for one context prefix. Raw prompt, so block hashes
         stay comparable with KV cache events, the cache-aware router and disagg peers.
         """
+        if self._draft_context_exceeds_limit(req):
+            return []
         all_tokens = self._reuse_token_source(req)
         # The target must recompute the last prompt token, but a one-model draft
         # also reads D prompt tokens ahead. Include those tokens as match evidence;
@@ -4942,17 +5817,96 @@ class KVCacheManagerV2(BaseResourceManager):
         point = _swa_branch_snapshot_point(
             divergence, num_lookup_tokens, reused, req.prompt_len, self.tokens_per_block
         )
-        if point is None:
-            # Drop a point left by an earlier lookup of this request.
-            req.expect_snapshot_points = []
-            return
-        # Only recurrent-state managers rewrite this list each scheduler pass, so
-        # the point persists here until the request finishes.
-        req.expect_snapshot_points = [point]
-        logger.debug(
-            f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
-            f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+        # A fresh lookup replaces the point of an earlier lookup of this request.
+        # Points requested by waiting requests (request_prefix_snapshot) may
+        # already be in the list, so they are merged back in.
+        req.expect_snapshot_points = [] if point is None else [point]
+        self._merge_waiter_snapshot_points(req)
+        if point is not None:
+            logger.debug(
+                f"[KVCacheManagerV2] request {req.py_request_id} branch snapshot at {point} "
+                f"(divergence={divergence}, reused={reused}, prompt_len={req.prompt_len})"
+            )
+
+    def _can_share_inflight_prefix(self) -> bool:
+        """Whether a request can wait for another to make a shared prefix reusable.
+
+        Without SWA layers whose window reaches the radix tree only at a context
+        chunk end, every block a request computes is committed, at the latest
+        when its context ends. Otherwise the request computing the prefix must
+        end a chunk at the shared depth, which needs SWA branch snapshots.
+        Decided at construction; see :meth:`request_prefix_snapshot`.
+        """
+        if not (self.enable_block_reuse and self._can_publish_block_reuse):
+            return False
+        if self._record_branch_snapshots:
+            return True
+        # Only the SWA window at a context chunk end reaches the radix tree: SWA
+        # scratch reuse gives no other window real pages, and a policy other
+        # than all_reusable commits the window at a prompt end only.
+        swa_window_only_at_chunk_end = (
+            self.enable_swa_scratch_reuse
+            or self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
         )
+        return not (
+            swa_window_only_at_chunk_end
+            and any(
+                getattr(layer, "sliding_window_size", None)
+                for layer in self.impl.init_config.layers
+            )
+        )
+
+    def request_prefix_snapshot(self, owner: LlmRequest, num_tokens: int) -> bool:
+        """Make the first ``num_tokens`` of ``owner``'s prompt reusable once computed.
+
+        ``owner`` is a context request that has not finished its context; a
+        request sharing that prefix waits for it (``PrefixWaitPlanner``). Only
+        called when :attr:`can_share_inflight_prefix`. Where only the SWA window
+        at a context chunk end reaches the radix tree (SWA branch snapshots, see
+        :meth:`_record_branch_snapshot_point`), ``owner`` ends a chunk at the
+        block-aligned depth. Returns False when that is no longer possible.
+        """
+        if not self._record_branch_snapshots:
+            return True
+        return self._add_waiter_snapshot_point(owner, num_tokens)
+
+    def _add_waiter_snapshot_point(self, owner: LlmRequest, point: int) -> bool:
+        """Add the block-aligned ``point`` to ``owner``'s snapshot points.
+
+        The point is also kept apart from the request, so that whatever rewrites
+        ``expect_snapshot_points`` later (a fresh lookup's branch point, or a
+        recurrent-state manager's per-pass placement) merges it back in with
+        :meth:`_merge_waiter_snapshot_points`. Returns False when the point is
+        not inside ``owner``'s prompt or not past the context ``owner`` has
+        computed or holds pages for: a chunk already allocated (an in-flight
+        chunk, or one grown under SWA scratch reuse whose forward was skipped)
+        cannot end at the point any more.
+        """
+        point = point // self.tokens_per_block * self.tokens_per_block
+        allocated_end = owner.context_current_position
+        kv_cache = self.kv_cache_map.get(owner.py_request_id)
+        if kv_cache is not None:
+            allocated_end = max(allocated_end, kv_cache.capacity - self.num_extra_kv_tokens)
+        if not allocated_end < point < owner.prompt_len:
+            return False
+        if self._waiter_snapshot_points is None:
+            self._waiter_snapshot_points = {}
+        self._waiter_snapshot_points.setdefault(owner.py_request_id, set()).add(point)
+        self._merge_waiter_snapshot_points(owner)
+        return True
+
+    def _merge_waiter_snapshot_points(self, request: LlmRequest) -> None:
+        """Merge into ``request``'s snapshot points the waiters' points it has not passed yet."""
+        points_by_id = self._waiter_snapshot_points
+        points = points_by_id.get(request.py_request_id) if points_by_id else None
+        if not points:
+            return
+        start = request.context_current_position
+        points.difference_update([point for point in points if point <= start])
+        if not points:
+            del points_by_id[request.py_request_id]
+            return
+        request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -5045,7 +5999,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.cuda_stream = self._cache_stream(req.py_request_id)
 
-            if not self.enable_block_reuse:
+            if not self.enable_block_reuse or self._draft_context_exceeds_limit(req):
                 kv_cache.stop_committing()
             else:
                 self._record_branch_snapshot_point(req, kv_cache, num_lookup_tokens)
@@ -5074,6 +6028,19 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_context_cache(req, kv_cache):
                 return None
+            if (
+                self.draft_layer_ids
+                and not self._draft_history_uses_kv_history()
+                and req.py_request_id not in self.draft_history
+            ):
+                # The reuse match covers every cache domain. Initialize once,
+                # after resume succeeds, so overlap/chunk retries cannot rewind
+                # draft history that has already advanced on the device.
+                reused = kv_cache.num_committed_tokens
+                valid_length = reused
+                if self.draft_window_size is not None:
+                    valid_length = min(valid_length, self.draft_window_size)
+                self.set_draft_history(req.py_request_id, valid_length, reused)
             return kv_cache.num_committed_tokens
 
         # Subsequent chunk: cache must exist from first chunk. It may be
@@ -5148,7 +6115,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
+        target = (
+            req.context_current_position
+            + num_tokens
+            + self.num_extra_kv_tokens
+            + self._standalone_draft_reserve
+        )
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
@@ -5225,7 +6197,12 @@ class KVCacheManagerV2(BaseResourceManager):
             else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
         )
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        target = (
+            prompt_len
+            + get_draft_token_length(req)
+            + self.num_extra_kv_tokens
+            + self._standalone_draft_reserve
+        )
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
@@ -6535,6 +7512,32 @@ class KVCacheManagerV2(BaseResourceManager):
             sum(pool.total for pool in stats),
         )
 
+    def token_growth_slots_per_block(self) -> dict[int, int]:
+        """GPU pool group -> slots it gives a request for each block of tokens the request grows.
+
+        Every full-attention layer group placed in a pool group takes one slot of it per
+        ``tokens_per_block`` tokens of capacity. Sliding-window groups release a stale page for
+        each new one once past the window, and SSM state does not grow with tokens, so neither
+        is counted. The layout is fixed at construction.
+        """
+        growth = getattr(self, "_token_growth_slots_per_block", None)
+        if growth is None:
+            growth = defaultdict(int)
+            for pool_group_id, window_size, kind in self._stats_life_cycle_metadata().values():
+                if (
+                    kind == "attention"
+                    and window_size is not None
+                    and window_size >= self.max_seq_len
+                ):
+                    growth[pool_group_id] += 1
+            growth = dict(growth)
+            self._token_growth_slots_per_block = growth
+        return growth
+
+    def get_available_primary_slots(self) -> list[int]:
+        """Available slots of each GPU pool group, indexed by pool group."""
+        return [pool.available for pool in self._get_storage_statistics(GPU_LEVEL)]
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -6828,7 +7831,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if not success:
                 release_resources(req)
                 return None
-            dummy_capacity = token_num + self.num_extra_kv_tokens
+            dummy_capacity = token_num + self.num_extra_kv_tokens + self._standalone_draft_reserve
             if is_gen and not materialize_history:
                 kv_cache.enable_swa_scratch_reuse = False
             # Need to hint the committed history to activate stale-block
@@ -6908,6 +7911,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.enable_block_reuse
             and self._can_publish_block_reuse
             and not request.is_dummy_request
+            and not self._draft_context_exceeds_limit(request)
         )
         if not should_block_reuse:
             return
@@ -7029,7 +8033,12 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.reset_request_state(request)
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.pop(request.py_request_id, None)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        if self.draft_layer_ids:
+            self.draft_history.pop(request.py_request_id, None)
+            self._draft_dummy_request_ids.discard(request.py_request_id)
         self._inflight_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
@@ -7209,18 +8218,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_cache_bytes_per_token(self) -> int:
         if self.layer_specs is not None:
             return sum(layer.bytes_per_token() for layer in self.layer_specs)
-        data_roles = [Role.KEY]
-        if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-            data_roles.append(Role.VALUE)
-        if self.dtype == DataType.NVFP4:
-            data_roles.append(Role.KEY_BLOCK_SCALE)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                data_roles.append(Role.VALUE_BLOCK_SCALE)
-
         return sum(
-            self.get_layer_bytes_per_token(local_layer_idx=local_layer_idx, data_role=data_role)
-            for local_layer_idx in range(self.num_local_layers)
-            for data_role in data_roles
+            self.get_layer_bytes_per_token(local_id, Role.ALL)
+            * (self._draft_page_expansion if local_id in self.cp_as_tp_layer_ids else 1)
+            for local_id in range(
+                len(self.dtype_per_layer) if self._draft_layer_sizes else self.num_local_layers
+            )
         )
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
@@ -7232,24 +8235,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if self._is_mixed_precision_layer(local_layer_idx):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
-        if self.dtype not in (
+        if data_role not in (Role.ALL, *self._get_buffer_roles_for_layer(local_layer_idx)):
+            return 0
+        layer_dtype = self._get_layer_dtype_by_local_id(local_layer_idx)
+        if layer_dtype not in (
             DataType.FP8,
             DataType.HALF,
             DataType.BF16,
             DataType.FLOAT,
             DataType.NVFP4,
         ):
-            raise ValueError(f"Cannot support {self.dtype} KV cache.")
+            raise ValueError(f"Cannot support {layer_dtype} KV cache.")
 
         if data_role == Role.ALL:
-            kv_factor = self.kv_factor
+            kv_factor = self._get_layer_kv_factor_by_local_id(local_layer_idx)
         elif data_role in [Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
             if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
-                assert self.dtype == DataType.NVFP4, (
+                assert layer_dtype == DataType.NVFP4, (
                     "NVFP4 is the only supported dtype for block quant data roles"
                 )
             if data_role == Role.VALUE:
-                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, (
+                assert self._get_layer_kv_factor_by_local_id(local_layer_idx) == 2, (
                     "VALUE data role is not supported for SELFKONLY cache type"
                 )
             kv_factor = 1
@@ -7262,14 +8268,14 @@ class KVCacheManagerV2(BaseResourceManager):
             * self.head_dim_per_layer[local_layer_idx]
         )
 
-        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, self.dtype)
+        cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token, layer_dtype)
 
         if data_role in [Role.KEY, Role.VALUE]:
             return cache_size_bytes_per_token
 
         quant_size_per_token = 0
 
-        if self.dtype == DataType.NVFP4:
+        if layer_dtype == DataType.NVFP4:
             quant_size_per_token = self.calculate_scaling_factor_size_bytes(
                 cache_size_per_token,
                 quant_vector_size=16,
@@ -7323,26 +8329,29 @@ class KVCacheManagerV2(BaseResourceManager):
             [False], dtype=torch.bool, device=torch.cuda.current_device()
         )
 
-        for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
-            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
-                some_checks_unavailable = True
-            if fill_with_zero:
-                buffer.zero_()
-                # warmup runs this with fill_with_zero=True to scrub the cache
-                # before inference, but that must not wipe the guard-page
-                # sentinel -- doing so would leave the startup warning claiming
-                # a guard that no longer exists. Rewrite the guard page after
-                # the zero. Explicit specs expose one view per layer here;
-                # contiguous legacy views use a single representative.
-                guard_page = self._guard_page_by_layer.get(layer_id)
-                if guard_page is not None and self._guard_page_value is not None:
-                    if self.layer_specs is not None:
-                        scale = self.get_layer_page_index_scale(layer_id)
-                        view_stride = self._get_cache_view_page_stride(
-                            scale, self.get_layer_kv_factor(layer_id)
-                        )
-                        guard_page = exact_div(guard_page, exact_div(scale, view_stride))
-                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
+        # Cached cache views may have been created under inference mode (inference
+        # tensors, e.g. the FP4 MLA role views); scrub them in that mode as well.
+        with torch.inference_mode():
+            for layer_id, buffer in self._iter_cache_buffers_for_invalid_check():
+                if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                    some_checks_unavailable = True
+                if fill_with_zero:
+                    buffer.zero_()
+                    # warmup runs this with fill_with_zero=True to scrub the cache
+                    # before inference, but that must not wipe the guard-page
+                    # sentinel -- doing so would leave the startup warning claiming
+                    # a guard that no longer exists. Rewrite the guard page after
+                    # the zero. Explicit specs expose one view per layer here;
+                    # contiguous legacy views use a single representative.
+                    guard_page = self._guard_page_by_layer.get(layer_id)
+                    if guard_page is not None and self._guard_page_value is not None:
+                        if self.layer_specs is not None:
+                            scale = self.get_layer_page_index_scale(layer_id)
+                            view_stride = self._get_cache_view_page_stride(
+                                scale, self.get_layer_kv_factor(layer_id)
+                            )
+                            guard_page = exact_div(guard_page, exact_div(scale, view_stride))
+                        _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:
@@ -7362,6 +8371,9 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
+        if self.draft_layer_ids:
+            self.draft_history.clear()
+            self._draft_dummy_request_ids.clear()
         self._disagg_receive_ready.clear()
         self._on_allocation_stream.clear()
         self._allocation_ready.clear()
@@ -7371,6 +8383,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        if self._waiter_snapshot_points is not None:
+            self._waiter_snapshot_points.clear()
         self.impl.shutdown()
         if self._sharing is not None:
             # After the runtime's shutdown, which raises while any cache is open, in the map or not;
@@ -7387,6 +8401,17 @@ class KVCacheManagerV2(BaseResourceManager):
     def get_max_resource_count(self) -> int:
         # TODO: implement this
         return 1
+
+    @property
+    def max_request_kv_tokens(self) -> int:
+        """KV tokens one request can address: its page-index row width.
+
+        Every request's base page-index row holds ``max_blocks_per_seq``
+        ledger blocks. That width follows ``max_seq_len``, which the
+        constructor lowers to the token capacity of the GPU pool, and the C++
+        manager rejects a resize past it.
+        """
+        return self.max_blocks_per_seq * self._ledger_tokens_per_block
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: implement this
@@ -7414,6 +8439,8 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        draft_scratch_tokens: int = 0,
+        draft_window_size: int | None = None,
         **kwargs,
     ):
         if layer_specs is not None:
@@ -7451,6 +8478,35 @@ class KVCacheManagerV2(BaseResourceManager):
         _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
+        draft_layer_sizes = _get_draft_layer_sizes(**kwargs)
+        if draft_layer_sizes:
+            # Unified standalone draft layers: target and draft costs are
+            # estimated separately so only target layers share context scratch.
+            headroom = generation_capacity_headroom + draft_scratch_tokens
+            context, generation, fixed = _estimate_cache_size_components(
+                layer_sizes,
+                attention_windows,
+                tokens_per_block,
+                scratch=bool(kv_cache_config and kv_cache_config.enable_swa_scratch_reuse),
+                generation_capacity_headroom=headroom,
+                layer_specs=layer_specs,
+                standalone_draft_reserve=draft_scratch_tokens,
+            )
+            draft_context, draft_generation, draft_fixed = _estimate_draft_cache_size_components(
+                draft_layer_sizes,
+                tokens_per_block,
+                scratch_tokens=draft_scratch_tokens,
+                window_size=draft_window_size,
+                generation_capacity_headroom=headroom,
+                helix_cp_size=(mapping.cp_size if mapping.has_cp_helix() else 1)
+                // int(kwargs.get("draft_cp_size") or 1),
+            )
+            return (
+                generation + draft_generation,
+                (fixed + draft_fixed) * int(max_batch_size or 0)
+                + (context + draft_context - generation - draft_generation)
+                * int(max_num_tokens or 0),
+            )
         (
             context_size_per_token,
             cache_size_per_token,
@@ -7750,7 +8806,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sizing registers capacity constraints that become per-pool slot floors
         scaled by ``1 / max_util_for_resume`` and rounded up to the GPU
         allocation granularity (``StorageManager::computeSlotsFromConstraints``
-        and ``cacheTierGranularity``). The allocator raises any smaller quota
+        and ``tierAllocationGranularity``). The allocator raises any smaller quota
         to that floor no matter what the budget split assigned, so the split
         must reserve at least this much for the manager. The estimate rounds
         per layer with the granularity implied by this one-request quota; the
@@ -7821,6 +8877,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.enable_block_reuse
                 and self._can_publish_block_reuse
                 and not req.is_dummy_request
+                and not self._draft_context_exceeds_limit(req)
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             # A chunk that ends at a branch point commits there. History has
@@ -7915,6 +8972,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
+            embedded_draft = KVCacheManagerV2._draft_history_uses_kv_history(self)
+            if self.draft_layer_ids and not embedded_draft and new_capacity is not None:
+                draft_history = self.get_draft_history(req.py_request_id)
+                if draft_history is not None:
+                    # Rejected target verification slots do not revoke draft
+                    # feature history. Retain it and its next-forward scratch.
+                    new_capacity = max(
+                        new_capacity, draft_history.position + self._standalone_draft_reserve
+                    )
             history_length = (
                 None
                 # Reuse (history's consumer) is disabled under helix, and
@@ -7922,6 +8988,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )
+            if embedded_draft and self._has_cp_helix:
+                # HELIX stores rank-local prompt tokens but generated tokens
+                # are replicated. The cache ledger uses global positions.
+                history_length = (
+                    req.total_input_len_cp + req.max_beam_num_tokens - req.py_prompt_len - 1
+                )
+            if embedded_draft and new_capacity is not None and history_length is not None:
+                new_capacity = max(new_capacity, history_length)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
@@ -7981,15 +9055,68 @@ class KVCacheManagerV2(BaseResourceManager):
 
         if self._page_table_materializer.uses_device_expansion:
             self._page_table_materializer.copy_block_offsets_to(dst_tensor, copy_idx)
-        else:
-            copy_batch_block_offsets_to_device(
-                self.host_kv_cache_block_offsets,
-                dst_tensor,
-                copy_idx,
-                self.index_scales,
-                self.kv_offset,
-                self._stream.cuda_stream,
-            )
+            return
+        num_cols = self._batch_page_table_columns(request_ids)
+        if num_cols is not None and copy_batch_block_offsets_columns(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+            num_cols,
+            self._stream,
+        ):
+            return
+        if block_offsets_triton_enabled():
+            # Drafting Kimi K3.1 engines: the same host-reading copy split over
+            # many CTAs (the C++ kernel uses one CTA per pool and sequence, which is
+            # bound by host-read latency).
+            with torch.cuda.stream(self._stream):
+                if copy_batch_block_offsets_from_host(
+                    self.host_kv_cache_block_offsets,
+                    dst_tensor,
+                    copy_idx,
+                    self.index_scales,
+                    self.kv_offset,
+                ):
+                    return
+        copy_batch_block_offsets_to_device(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+            self._stream.cuda_stream,
+        )
+
+    def _batch_page_table_columns(self, request_ids: List[int]) -> Optional[int]:
+        """Page-table columns that can hold a page of the batch, or None to copy the whole width.
+
+        Narrow copies run on Kimi K3.1 generation servers without attention DP
+        (``input_commit.k31_tp_generation_server``).
+
+        A request's pages cover its KV capacity (every token any kernel reads, draft slots included), so columns
+        at or past ceil(max capacity / tokens_per_block) hold no page of the batch. The copy then scales with the
+        batch's context instead of ``max_seq_len``; the columns it skips keep earlier values that no kernel reads.
+        """
+        if (
+            not k31_tp_generation_server()
+            or self.kv_cache_type == CacheTypeCpp.CROSS
+            or not self.host_kv_cache_block_offsets.is_pinned()
+            or not self.host_kv_cache_block_offsets.is_contiguous()
+            or self.host_kv_cache_block_offsets.dim() != 4
+        ):
+            return None
+        width = self.host_kv_cache_block_offsets.shape[-1]
+        capacity = 0
+        for request_id in request_ids:
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None:
+                return None
+            capacity = max(capacity, int(kv_cache.capacity))
+        num_cols = max(1, -(-capacity // self.tokens_per_block))
+        # Narrow batches only: near the full width the full copy is as cheap.
+        return num_cols if num_cols * 2 <= width else None
 
     def materialize_block_offsets_snapshot(
         self,
@@ -8092,6 +9219,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.stop_committing()
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
+            if self.draft_layer_ids:
+                self._draft_dummy_request_ids.add(request_id)
         index = self.index_mapper.add_new_sequence(request_id)
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.add(kv_cache, index)

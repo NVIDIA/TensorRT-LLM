@@ -69,19 +69,19 @@ def _plan_mod():
     [
         # Even batch under one wave (helix16 B4, 6 m-tiles -> 17 wave tasks): one wave of 32-tile tasks.
         ([128, 128, 128, 128], 24, 17, 32, [0, 4, 8, 12, 16]),
-        # One long request among short ones takes most of the slots (two-wave target, fit by the fallback share).
-        ([1, 79, 3, 176], 24, 17, 13, [0, 1, 8, 9, 23]),
-        # Full machine, longest 1.5x above the wave share: two-wave target, the short requests also halve.
-        ([128] * 15 + [200], 48, 17, 67, list(range(0, 32, 2)) + [33]),
+        # One long request among short ones: 16-tile tasks; the one task past the wave is a short tail.
+        ([1, 79, 3, 176], 24, 17, 16, [0, 1, 6, 7, 18]),
+        # Full machine, longest 1.5x above the wave share: 100-tile tasks, the tails in a second wave.
+        ([128] * 15 + [200], 48, 17, 100, list(range(0, 34, 2))),
         # Full machine, longest within 1.5x of the wave share: no split at all.
         ([128] * 15 + [130], 48, 17, 130, list(range(17))),
-        # Strong skew in a full machine: the long request gets twelve tasks.
-        ([128] * 15 + [1024], 48, 17, 86, list(range(0, 32, 2)) + [42]),
-        # Strong skew in a small batch: two-wave target, fit by the fallback share.
-        ([128, 128, 128, 1024], 24, 17, 71, [0, 2, 4, 6, 21]),
-        # A single request fills one wave with 16 tasks, or honours the minimum.
+        # Strong skew in a full machine: eleven 94-tile tasks for the long request, short tails behind.
+        ([128] * 15 + [1024], 48, 17, 94, list(range(0, 32, 2)) + [41]),
+        # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
+        ([128, 128, 128, 1024], 24, 17, 94, [0, 2, 4, 6, 17]),
+        # A single request fills one wave with 16 tasks; a short one is not worth splitting.
         ([128], 16, 17, 8, [0, 16]),
-        ([8], 16, 17, 2, [0, 4]),
+        ([8], 16, 17, 8, [0, 1]),
         # No spare slots: one task per request, however long.
         ([5, 900], 2, 17, 900, list(range(3))),
     ],
@@ -102,13 +102,16 @@ def test_plan_packed_tasks_balances_by_kv_length(
         assert (end - begin - 1) * tiles_per_task < request_tiles <= (end - begin) * tiles_per_task
 
 
-def test_plan_packed_tasks_one_wave_for_helix() -> None:
+def test_plan_packed_tasks_simulates_helix_ranks() -> None:
     plan = _plan_mod().plan_packed_tasks
-    # helix16 bs16 (6 m-tiles, 17 wave tasks), per-rank KV skewed 3.5x: the two-wave
-    # target cuts 12-tile pieces (42 tasks); a Helix rank keeps one wave of 28-tile tasks.
+    # helix16 bs16 (6 m-tiles, 17 wave tasks), per-rank KV skewed 3.5x: the Helix rule targets one
+    # wave of 28-tile tasks (21 tasks, a second wave); the simulation keeps the 16 requests whole.
     tiles = [16] * 12 + [40, 48, 56, 56]
-    assert plan(tiles, 48, 17) == (12, list(range(0, 26, 2)) + [28, 32, 37, 42])
-    assert plan(tiles, 48, 17, one_wave=True) == (28, list(range(13)) + [14, 16, 18, 20])
+    assert plan(tiles, 48, 17, one_wave=True, wave_plan=False) == (
+        28,
+        list(range(13)) + [14, 16, 18, 20],
+    )
+    assert plan(tiles, 48, 17, one_wave=True) == (56, list(range(17)))
     # Even Helix batches are unchanged.
     assert plan([128] * 4, 24, 17, one_wave=True) == plan([128] * 4, 24, 17)
 
@@ -145,17 +148,17 @@ def test_plan_packed_tasks_random_batches_fit_their_budget() -> None:
     reason="the CuTe DSL plan kernel is compiled for Rubin SM107",
 )
 @pytest.mark.parametrize(
-    "kv_lens,splits,wave_tasks,query_len,helix",
+    "kv_lens,splits,wave_tasks,query_len,helix,wave_plan",
     [
-        ([32768] * 15 + [262144], 4, 17, 8, False),
-        ([131, 20000, 600, 45000], 10, 17, 8, False),
-        ([131, 20000, 600, 45000], 10, 17, 8, True),
-        ([300, 70000, 2200], 16, 106, 1, False),
-        ([5, 5, 5], 2, 106, 4, False),
+        ([32768] * 15 + [262144], 4, 17, 8, False, True),
+        ([131, 20000, 600, 45000], 10, 17, 8, False, True),
+        ([131, 20000, 600, 45000], 10, 17, 8, True, True),
+        ([300, 70000, 2200], 16, 106, 1, False, True),
+        ([5, 5, 5], 2, 106, 4, False, True),
     ],
 )
 def test_packed_plan_kernel_matches_host_mirror(
-    kv_lens: list[int], splits: int, wave_tasks: int, query_len: int, helix: bool
+    kv_lens: list[int], splits: int, wave_tasks: int, query_len: int, helix: bool, wave_plan: bool
 ) -> None:
     reduce_mod = _plan_mod()
     requests = len(kv_lens)
@@ -174,7 +177,7 @@ def test_packed_plan_kernel_matches_host_mirror(
     tiles = reduce_mod.request_kv_tiles(kv_lens, query_len, bounds_list)
     cap = max(tiles)
     expected_tiles, expected_begins = reduce_mod.plan_packed_tasks(
-        tiles, tasks, wave_tasks, cap, one_wave=helix
+        tiles, tasks, wave_tasks, cap, one_wave=helix, wave_plan=wave_plan
     )
     plan = torch.full(
         (reduce_mod.packed_plan_length(requests, tasks),), -7, dtype=torch.int32, device="cuda"
@@ -188,6 +191,7 @@ def test_packed_plan_kernel_matches_host_mirror(
         max_tiles_per_task=cap,
         query_len=query_len,
         helix_kv_bounds=bounds,
+        wave_plan=wave_plan,
     )
     torch.cuda.synchronize()
     plan = plan.tolist()
@@ -200,13 +204,15 @@ def test_packed_plan_kernel_matches_host_mirror(
         plan[tables + tasks : tables + 2 * tasks],
         plan[tables + 2 * tasks : tables + 3 * tasks],
     )
-    for request, (begin, end) in enumerate(zip(expected_begins, expected_begins[1:])):
-        for task in range(begin, end):
-            assert (request_of[task], split_of[task], count_of[task]) == (
-                request,
-                task - begin,
-                end - begin,
-            )
+    # Tasks are listed in grid order; each request still owns begins[r + 1] - begins[r] of them.
+    order = reduce_mod.plan_task_order(tiles, expected_tiles, wave_plan)
+    assert len(order) == expected_begins[-1]
+    for task, (request, split) in enumerate(order):
+        assert (request_of[task], split_of[task], count_of[task]) == (
+            request,
+            split,
+            expected_begins[request + 1] - expected_begins[request],
+        )
     # Unused slots point past every request's tiles and are never scheduled.
     for task in range(expected_begins[-1], tasks):
         assert request_of[task] == requests - 1 and split_of[task] * expected_tiles >= tiles[-1]
@@ -282,6 +288,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
             generation_lengths_num_contexts=-1,
             generation_lengths_capture_recorded=False,
             packed_plan_key=None,
+            metadata_launches=0,
         ),
     )
     geometry = fp4_mla_packed_plan._PackedPlanGeometry(
@@ -341,6 +348,7 @@ def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) 
             page_table_stride=3904,
             generation_kv_lens=torch.zeros(4, dtype=torch.int32, device=device),
             workspaces={},
+            metadata_launches=0,
         ),
     )
     geometry = fp4_mla_packed_plan._fp4_mla_packed_plan_geometry(

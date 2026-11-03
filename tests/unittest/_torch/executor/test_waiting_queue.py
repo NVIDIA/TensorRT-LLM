@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for WaitingQueue implementations.
 
 This module tests the waiting queue functionality including:
@@ -95,6 +110,20 @@ class TestFCFSWaitingQueue:
 
         with pytest.raises(IndexError):
             queue.peek_request()
+
+    def test_peek_requests(self):
+        """peek_requests(k) returns the first k requests in pop order without
+        removing them; they form one admission group."""
+        queue = FCFSWaitingQueue()
+        queue.add_requests([create_mock_request_item(i) for i in range(2, 6)])
+        queue.prepend_requests([create_mock_request_item(i) for i in [0, 1]])
+
+        assert [item.id for item in queue.peek_requests(3)] == [0, 1, 2]
+        assert queue.admission_groups(queue.peek_requests(3)) == [0, 0, 0]
+        assert [item.id for item in queue.peek_requests(10)] == [0, 1, 2, 3, 4, 5]
+        assert queue.peek_requests(0) == []
+        assert len(queue) == 6
+        assert FCFSWaitingQueue().peek_requests(4) == []
 
     def test_prepend_request(self):
         """Test prepending a request to the front."""

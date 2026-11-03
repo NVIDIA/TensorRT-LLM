@@ -44,7 +44,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -683,6 +688,7 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        moe_output: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -699,6 +705,9 @@ class ConfigurableMoE(MoE):
 
         ``input_ready_event``: ``x`` is written on another stream; the join is
         deferred to the first kernel that reads ``x``, so routing overlaps it.
+
+        ``moe_output``: optional output buffer (see ``MoEScheduler.forward``); the result is
+        written into it only where the scheduler and backend support that.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -707,7 +716,8 @@ class ConfigurableMoE(MoE):
         ):
             raise ValueError("routing_aux must have one row per router-logit row")
 
-        if isinstance(x, Fp4QuantizedTensor):
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
+            # A quantized input does not carry the activation dtype.
             assert output_dtype is not None
         else:
             output_dtype = x.dtype
@@ -730,13 +740,14 @@ class ConfigurableMoE(MoE):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_output=moe_output,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
         # Owned at the wrapper because schedulers must not run it twice (external-comm
         # might enter via single- or multi-chunk paths).
         if self.enable_dwdp:
-            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+            self.dwdp_manager.finish_layer(self.layer_idx)
 
         # EPLB repeat counter: advance once per forward, regardless of chunk count.
         # Schedulers are forbidden from rotating ``repeat_idx`` themselves.

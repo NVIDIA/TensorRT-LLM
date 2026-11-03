@@ -8,7 +8,12 @@ import torch
 import triton
 import triton.language as tl
 
-from .config import _FP4_MLA_PAGE_TABLE_TILE_SIZE, FP4_MLA_TOKENS_PER_BLOCK, _ceil_div
+from .config import (
+    _FP4_MLA_PAGE_TABLE_TILE_SIZE,
+    FP4_MLA_TOKENS_PER_BLOCK,
+    _ceil_div,
+    _count_fp4_mla_metadata_launch,
+)
 from .packed_plan import _launch_fp4_mla_packed_plan, _PackedPlanGeometry
 
 
@@ -807,6 +812,7 @@ def _fp4_mla_uniform_generation_lengths(
                 ),
             )
         else:
+            _count_fp4_mla_metadata_launch(metadata)
             populate_fp4_mla_generation_lengths(
                 kv_lens_gen,
                 prompt_lens_gen,
@@ -848,6 +854,7 @@ def _materialize_fp4_mla_device_page_table_for_forward(
             )
         else:
             generation_kv_lens = metadata.kv_lens_cuda_runtime[num_contexts:num_sequences]
+    _count_fp4_mla_metadata_launch(metadata)
     materialize_fp4_mla_device_page_table(
         metadata,
         metadata.kv_lens_cuda_runtime[:num_sequences],

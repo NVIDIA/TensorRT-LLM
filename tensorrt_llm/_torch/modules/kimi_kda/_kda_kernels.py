@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from types import ModuleType
 from typing import Optional, Tuple
 
@@ -469,6 +470,18 @@ def is_intree_prefill_available() -> bool:
         return False
 
 
+def kda_prefill_supports_state_snapshots() -> bool:
+    """True when Kimi K3 KDA layers prefill with the indexed kernel, which takes state snapshots.
+
+    Mirrors the prefill path ``KimiKDALinearAttention`` selects.
+    """
+    return (
+        os.getenv("TLLM_KDA_ENABLE_OPT_PREFILL", "1") == "1"
+        and is_kda_optimized_supported()
+        and is_intree_prefill_available()
+    )
+
+
 # ---------------------------------------------------------------------------
 # In-tree KDA multi-token verify op (CuTe DSL, trtllm::kda_mtp_decode).
 # ---------------------------------------------------------------------------
@@ -564,6 +577,12 @@ class KDAKernelDispatch:
         ``trtllm::kda_mtp_decode`` replay kernel) or ``"fla"`` (sequential
         per-step ``fused_recurrent_kda`` with intermediate-buffer state
         promotion).
+    prefill_mode : str
+        ``trtllm::kda_prefill`` engine selection for the optimized prefill.
+        ``"bt16"`` (default) keeps the BT16 engine/decomposition routing and
+        never selects Small-BH: Small-BH intermittently writes garbage into
+        single output token rows of long sequences (seen at 6000-16384
+        tokens with 96 heads on SM107), while BT16 is bitwise reproducible.
     Notes
     -----
     Prefill, decode, and verify dispatch are decided independently. All
@@ -589,6 +608,7 @@ class KDAKernelDispatch:
         self.verify_kernel_path = "fla"
         if use_optimized_verify and optimized_supported and is_intree_mtp_available():
             self.verify_kernel_path = "optimized"
+        self.prefill_mode = "bt16"
         # One line per process so runs record which paths actually executed
         # (the fallback is otherwise silent).
         if not KDAKernelDispatch._selection_logged:
@@ -627,8 +647,20 @@ class KDAKernelDispatch:
         if mxfp8_output:
             if not kwargs.pop("fuse_output_norm", True):
                 raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            kwargs.pop("use_pdl", None)
             return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+
+    def mtp_verify_fused_fb(self, **kwargs) -> torch.Tensor:
+        """Fused KDA multi-token verify that computes its forget gate from ``f_a``.
+
+        Thin passthrough to ``trtllm::kda_mtp_decode_fused_fb`` (packed rows, fused gated
+        RMSNorm, BF16 output; see ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py``).
+        """
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError("mtp_verify_fused_fb needs the optimized verify path")
+        _load_mtp_module()
+        return torch.ops.trtllm.kda_mtp_decode_fused_fb(**kwargs)
 
     def can_use_indexed_prefill(
         self,
@@ -708,12 +740,25 @@ class KDAKernelDispatch:
         max_seqlen: int = 0,
         seq_order: Optional[torch.Tensor] = None,
         cu_chunks: Optional[torch.Tensor] = None,
+        sm_reserve: int = 0,
+        snapshot_rows: Optional[torch.Tensor] = None,
+        snapshot_chunks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run prefill on raw Q/K/V and gate/beta logits.
 
         FlashInfer updates indexed BF16/FP32 V-first state directly; FLA uses
         dense FP32 initial/final states. Both normalize Q/K internally.
+
+        ``sm_reserve`` SMs are left out of the optimized kernels' persistent
+        grids for a kernel that runs concurrently with prefill.
+
+        ``snapshot_rows`` / ``snapshot_chunks`` (int32 ``[num_sequences]``,
+        optimized indexed path only) also store each selected sequence's state
+        after its first ``64 * snapshot_chunks[b]`` tokens into
+        ``state_pool[snapshot_rows[b]]``; ``-1`` skips a sequence.
         """
+        if snapshot_rows is not None and state_pool is None:
+            raise RuntimeError("KDA prefill state snapshots require the optimized prefill path.")
         if state_pool is not None:
             if self.prefill_kernel_path != "optimized" or initial_state is not None:
                 raise ValueError("Indexed prefill requires FlashInfer and no dense initial state")
@@ -733,10 +778,13 @@ class KDAKernelDispatch:
                 dt_bias.float().contiguous(),
                 scale,
                 lower_bound,
-                getattr(self, "prefill_mode", "auto"),
+                self.prefill_mode,
                 max_seqlen,
                 seq_order,
                 cu_chunks,
+                sm_reserve,
+                snapshot_rows,
+                snapshot_chunks,
             )
             return out, None
 

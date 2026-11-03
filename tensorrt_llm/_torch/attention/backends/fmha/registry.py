@@ -38,6 +38,7 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
     from .msa_decode import MsaDecodeFmha
     from .msa_prefill import MsaPrefillFmha
     from .prims_ts_block_sparse import PrimsTSBlockSparseFmha
+    from .prims_ts_dsa_mla import PrimsTSDsaMlaFmha
     from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
 
     return {
@@ -57,6 +58,9 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # DSA (Kimi K3.1) D576 generation on the PrimTS sparse MLA kernel. In the
+        # default set but only available for kv_cache_config.dtype='nvfp4_ds_mla' layers.
+        "prims_ts_dsa_mla": PrimsTSDsaMlaFmha,
         "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
         "fallback": FallbackFmha,
     }

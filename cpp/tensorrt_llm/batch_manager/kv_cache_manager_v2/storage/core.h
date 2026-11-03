@@ -188,7 +188,14 @@ public:
     void synchronize();
 
 private:
+    // Hands out the next slot: a recycled slot known to be ready, else a never-issued id, else the
+    // oldest recycled slot (whose readyEvent the caller must wait on). Does not query events.
+    Slot takeSlot();
+    // Advances the ready prefix of mRecycledSlots, querying each event (one driver call per
+    // in-flight event).
     void scrubEvents();
+    // Advances the ready prefix over slots whose event is already closed, without driver calls.
+    void scrubClosedEvents() noexcept;
     [[nodiscard]] bool check() const noexcept;
 
     SlotCount mCapacity;
@@ -216,6 +223,23 @@ inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
 //! differ -- see StorageManager::tierCommitUnit -- because every GPU level
 //! shares one allocator.
 [[nodiscard]] size_t tierAllocationGranularity(CacheTier tier, size_t quota);
+
+//! Largest physical chunk, in MiB, the GPU pools map (rounded down to a power-of-two
+//! multiple of the tier's unit). Unset, empty, 0, or a value at or below the unit keeps
+//! one chunk per unit.
+//!
+//! Only the mapping changes: pools are still sized and resized in units of
+//! tierAllocationGranularity, and are mapped from the largest chunks their offsets
+//! allow (PooledPhysMemAllocator::chunkSizeAt), so pool sizes and slot counts are the
+//! same as without it. Every chunk is one cuMemCreate allocation, which a transfer
+//! agent registers -- and every peer writing into it imports and maps -- separately
+//! (NIXL/UCX cuda_ipc). Disaggregated serving with many peers per pool can raise it
+//! to cut that count.
+inline constexpr char const* kGpuChunkSizeEnvVar = "TLLM_KV_CACHE_MANAGER_V2_GPU_CHUNK_MB";
+
+//! The largest chunk kGpuChunkSizeEnvVar asks for a GPU tier with allocation unit
+//! `unit`: `unit` when it is unset or at most `unit`. Throws on a malformed value.
+[[nodiscard]] size_t gpuMaxChunkSize(size_t unit);
 
 // ---------------------------------------------------------------------------
 // SlotPoolBase — abstract base for a single memory pool.

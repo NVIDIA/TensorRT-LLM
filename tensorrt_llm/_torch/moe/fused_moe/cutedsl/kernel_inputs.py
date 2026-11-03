@@ -43,6 +43,25 @@ class NvFp4WeightView:
     slot_start: int
 
 
+def presorted_moe_sort(
+    token_selected_experts: torch.Tensor,
+    local_expert_offset: int,
+    local_num_experts: int,
+    tile_size: int,
+) -> tuple[torch.Tensor, ...] | None:
+    """The ``moe_sort`` outputs a router attached to the top-k ids for this rank, or ``None``.
+
+    Routers that also sort (the Kimi-K3 fused router and routing tail) attach
+    ``((local_expert_offset, local_num_experts, tile_size), outputs)`` to the top-k ids as
+    ``_k3_presorted``, where ``outputs`` are the six tensors ``moe_sort`` returns for that
+    expert range and tile size.
+    """
+    presorted = getattr(token_selected_experts, "_k3_presorted", None)
+    if presorted is None or presorted[0] != (local_expert_offset, local_num_experts, tile_size):
+        return None
+    return tuple(presorted[1])
+
+
 def finalize_routing_scales(backend: MoEImplBase, ctx: MoERunContext) -> torch.Tensor:
     """Per-token expert weights for a CuteDSL finalize epilogue.
 

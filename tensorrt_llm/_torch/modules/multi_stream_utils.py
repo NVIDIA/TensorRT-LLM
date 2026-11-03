@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -59,13 +61,13 @@ def _record_stream(obj: Any, stream: torch.cuda.Stream) -> None:
             _record_stream(item, stream)
 
 
-def maybe_execute_in_parallel(
-        fn0: Callable,
-        fn1: Callable,
-        event0: torch.cuda.Event,
-        event1: torch.cuda.Event,
-        aux_stream: Optional[torch.cuda.Stream] = None,
-        disable_on_compile: bool = False) -> tuple[Any, Any]:
+def maybe_execute_in_parallel(fn0: Callable,
+                              fn1: Callable,
+                              event0: torch.cuda.Event,
+                              event1: torch.cuda.Event,
+                              aux_stream: Optional[torch.cuda.Stream] = None,
+                              disable_on_compile: bool = False,
+                              aux_first: bool = False) -> tuple[Any, Any]:
     """Utility function to run two functions in two cuda streams in parallel. Multi-stream is
     only enabled when cuda graph is turned on because switch stream has extra host overhead.
 
@@ -99,6 +101,11 @@ def maybe_execute_in_parallel(
             should set this to True so that stream/event ops are not captured
             by dynamo. Callers inside custom ops (e.g. attention, MoE) should
             leave this as False since custom ops are opaque to the compiler.
+        aux_first (bool): with multi-stream, issue fn1() on aux_stream before
+            fn0() on the calling stream (default: fn0() first). Under CUDA-graph
+            capture the issue order is the order in which the graph launches the
+            two branches, which decides which one the GPU schedules first when
+            fn0()'s first kernel would otherwise hold the SMs fn1() needs.
 
     Returns:
         tuple[Any, Any]: the return values of fn0() and fn1().
@@ -109,12 +116,15 @@ def maybe_execute_in_parallel(
 
     if multi_stream:
         event0.record()
-        result0 = fn0()
+        if not aux_first:
+            result0 = fn0()
 
         with torch.cuda.stream(aux_stream):
             event0.wait()
             result1 = fn1()
             event1.record()
+        if aux_first:
+            result0 = fn0()
         event1.wait()
         # Without the record, freeing fn1's outputs hands their memory to later
         # aux_stream work (caching allocator) or frees it in aux_stream order

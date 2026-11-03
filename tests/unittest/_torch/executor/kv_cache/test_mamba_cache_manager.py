@@ -1365,6 +1365,127 @@ def test_replay_inactive_without_spec_config():
     assert mgr.get_replay_state_update_metadata() is None
 
 
+@contextlib.contextmanager
+def _no_host_sync():
+    """Fail on any host-device synchronization inside the block."""
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        yield
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+
+
+@skip_no_cuda
+def test_python_mamba_slot_assignment_without_sync():
+    """Requests and dummies joining the v1 manager reset their slots' replay state and
+    seeds without synchronizing the stream (the previous decode step is still queued)."""
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    mgr = PythonMambaCacheManager(
+        d_state=8,
+        d_conv=4,
+        num_heads=4,
+        n_groups=1,
+        head_dim=8,
+        num_layers=2,
+        max_batch_size=_get_mamba_hybrid_pool_size(4, mapping),
+        spec_state_size=4,
+        mapping=mapping,
+        dtype=torch.float16,
+        ssm_cache_dtype=torch.float16,
+        speculative_num_draft_tokens=2,
+        use_replay_state_update=True,
+        mamba_ssm_stochastic_rounding=True,
+    )
+    assert mgr.use_replay_state_update
+    cache = mgr.mamba_cache
+    cache.prev_num_accepted_tokens.fill_(5)
+    cache.cache_buf_idx.fill_(1)
+    seeds = mgr.get_mamba_ssm_rand_seed()
+    seeds_before = seeds.clone()
+
+    with _no_host_sync():
+        mgr._prepare_mamba_cache_blocks([100, 101])
+        # 100 is known: its slot is reset in place; 200 takes a new slot.
+        mgr.add_dummy_requests([100, 200])
+
+    slots = [mgr.mamba_cache_index[r] for r in (100, 101, 200)]
+    for slot in slots:
+        assert int(cache.prev_num_accepted_tokens[slot]) == 0
+        assert int(cache.cache_buf_idx[slot]) == 0
+    # Fresh assignments rotate their seeds; the dummy never reaches the seed rotation.
+    for slot in slots[:2]:
+        assert int(seeds[slot]) != int(seeds_before[slot])
+
+
+@skip_no_cuda
+def test_python_mamba_kda_replay_seed_without_sync():
+    """The v1 manager's disagg replay seed stages its slots and seeds the replay caches
+    without synchronizing the stream."""
+    num_layers, num_slots, dim, committed, num_spec = 2, 4, 6, 3, 2
+
+    class _SpecState:
+        pass
+
+    cache = _SpecState()
+    cache.conv = torch.randn(num_layers, num_slots, 3 * dim, committed, device="cuda")
+    for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v"):
+        setattr(
+            cache,
+            name,
+            torch.full((num_layers, num_slots, dim, committed + num_spec), 7.0, device="cuda"),
+        )
+    for name in ("kda_k_cache", "kda_g_cache", "kda_v_cache"):
+        setattr(cache, name, torch.full((num_layers, num_slots, num_spec, dim), 7.0, device="cuda"))
+    cache.kda_beta_cache = torch.full((num_layers, num_slots, num_spec, 3), 7.0, device="cuda")
+    cache.prev_num_accepted_tokens = torch.full((num_slots,), 5, dtype=torch.int32, device="cuda")
+    mgr = object.__new__(PythonMambaCacheManager)
+    mgr._use_kda_replay_update = True
+    mgr.SpeculativeState = _SpecState
+    mgr.mamba_cache = cache
+    mgr.mamba_cache_index = {101: 1, 202: 3}
+
+    with _no_host_sync():
+        mgr.seed_kda_replay_caches_for_disagg_gen([101, 202])
+
+    assert cache.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+    for slot in (1, 3):
+        assert torch.equal(cache.kda_conv_q[:, slot, :, :committed], cache.conv[:, slot, :dim])
+        assert not cache.kda_conv_q[:, slot, :, committed:].any()
+        assert not cache.kda_k_cache[:, slot].any()
+    assert (cache.kda_conv_q[:, 0] == 7.0).all()
+
+
+@skip_no_cuda
+def test_v2_kda_replay_commit_clears_draft_count_without_sync():
+    """Committing a suspended request's pending drafts clears its draft count without
+    synchronizing the stream."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
+
+    if not is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    mgr = _v2_kda_replay_manager_with_large_slots()
+    request = None
+    try:
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=2
+        )
+        slot = mgr._request_id_to_state_index[1]
+        replay = mgr._kda_replay
+        # The first commit compiles its kernel.
+        replay.prev_num_accepted_tokens[slot] = 1
+        replay.commit_pending_drafts(slot)
+        replay.prev_num_accepted_tokens[slot] = 2
+        with _no_host_sync():
+            replay.commit_pending_drafts(slot)
+        assert int(replay.prev_num_accepted_tokens[slot]) == 0
+    finally:
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
 @skip_no_cuda
 def test_padding_slot_not_held_by_parked_real():
     """Padding must not resolve to a slot owned by a parked real
@@ -1727,6 +1848,7 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 
 def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.dtype = DataType.HALF
     mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -1753,6 +1875,7 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 
 def test_v2_hybrid_prepare_expect_snapshot_points_without_periodic_snapshots():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.dtype = DataType.HALF
     mgr.enable_block_reuse = True
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -2043,8 +2166,11 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
         enable_attention_dp=enable_attention_dp,
     )
 
+    # A non-MLA model without a quantized KV cache: the generic attention
+    # estimate (patched above) applies.
+    model_config = SimpleNamespace(pretrained_config=SimpleNamespace(), quant_config=None)
     assert MambaHybridCacheManagerV2.get_cache_size_per_token(
-        object(),
+        model_config,
         mapping,
         max_batch_size=4,
         kv_cache_config=KvCacheConfig(),
@@ -2114,7 +2240,7 @@ def test_v2_hybrid_typical_batch_splits_capacity_across_ssm_states_and_dummies()
     mgr.enable_swa_scratch_reuse = False
     mgr.enable_stats = False
     mgr.num_extra_kv_tokens = 0
-    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    mgr.get_layer_bytes_per_token = lambda *args, **kwargs: 8
     mgr._minimum_live_gpu_quota = lambda: 0
     kv_cache_config = KvCacheConfig(
         enable_partial_reuse=True,
@@ -2305,7 +2431,7 @@ def test_v2_hybrid_rejects_quota_below_live_state_floor():
     mgr.max_attention_window_vec = [128, 128]
     mgr.max_num_tokens = 128
     mgr.enable_swa_scratch_reuse = False
-    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    mgr.get_layer_bytes_per_token = lambda *args, **kwargs: 8
     mgr._attention_cache_bytes_per_token = lambda: 16
     mgr.kv_cache_config = KvCacheConfig(enable_partial_reuse=False)
     minimum_quota = mgr._minimum_live_gpu_quota()
@@ -2390,7 +2516,7 @@ def test_v2_hybrid_pure_mamba_rank_does_not_reserve_attention_page():
     mgr.max_attention_window_vec = [128]
     mgr.max_num_tokens = 128
     mgr.enable_swa_scratch_reuse = False
-    mgr.get_layer_bytes_per_token = lambda **kwargs: 0
+    mgr.get_layer_bytes_per_token = lambda *args, **kwargs: 0
     mgr._attention_cache_bytes_per_token = lambda: 0
     mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
@@ -2563,6 +2689,7 @@ def test_add_dummy_requests_forwards_capture_sampling_params(mocker, manager_cls
 )
 def test_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled(manager_cls):
     mgr = object.__new__(manager_cls)
+    mgr.dtype = DataType.HALF
     mgr.enable_block_reuse = False
     mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     request = SimpleNamespace(prompt_len=64, expect_snapshot_points=[64])
@@ -2624,10 +2751,12 @@ def test_v2_hybrid_pool_ratio_controls_allocated_memory():
         _install_default_v2_state(mgr)
         mgr._num_reserved_dummy_slots = 1
         mgr.dtype = DataType.HALF
+        mgr.dtype_per_layer = [mgr.dtype] * mgr.num_local_layers
+        mgr.kv_factor_per_layer = [2] * mgr.num_local_layers
         mgr.enable_swa_scratch_reuse = False
         mgr.enable_stats = False
         mgr.num_extra_kv_tokens = 0
-        mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+        mgr.get_layer_bytes_per_token = lambda *args, **kwargs: 8
 
         kv_cache_config = KvCacheConfig(
             pool_ratio=pool_ratio,
@@ -3495,6 +3624,91 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         mgr.shutdown()
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_v2_hybrid_shares_an_inflight_prefix_without_branch_snapshots(enable_block_reuse):
+    """The recurrent manager snapshots a prefilling request where a waiting
+    request asks, so it needs neither block_reuse_config.enable_branch_snapshot
+    nor a reuse policy that commits every chunk. An attention-only SWA cache
+    with scratch reuse and branch snapshots off cannot (see
+    test_kv_cache_v2_inflight_prefix.py)."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=enable_block_reuse,
+        enable_branch_snapshot=False,
+        enable_swa_scratch_reuse=True,
+    )
+    try:
+        assert mgr.can_share_inflight_prefix is enable_block_reuse
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_waiter_points_after_history_advanced_commit():
+    """Two waiters ask a prefilling owner for snapshots after its history passed
+    its committed tokens. commit_min_snapshot accepts a commit only if it starts
+    or ends at history_length, so each commit must still meet that."""
+    mgr = _build_v2_hybrid_with_mamba_layer(enable_block_reuse=True)
+    owner = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=list(range(100)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    probes = [
+        LlmRequest(
+            request_id=2 + i,
+            max_new_tokens=1,
+            input_tokens=list(range(shared)) + [1000],
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        for i, shared in enumerate((64, 96))
+    ]
+
+    def run_chunk(end: int) -> None:
+        mgr.prepare_expect_snapshot_points([owner])
+        assert mgr.prepare_context(owner)
+        assert mgr.resize_context(owner, num_tokens=end - owner.context_current_position)
+        batch = ScheduledRequests()
+        batch.append_context_request(owner)
+        mgr.prepare_resources(batch)
+        owner.context_current_position = end
+        mgr.update_context_resources(batch)
+
+    try:
+        assert mgr.block_reuse_policy is BlockReusePolicy.PER_REQUEST
+        run_chunk(32)
+        kv_cache = mgr.kv_cache_map[owner.py_request_id]
+        # No snapshot point is pending, so history follows the context.
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (0, 32)
+
+        assert mgr.request_prefix_snapshot(owner, 64)
+        assert mgr.request_prefix_snapshot(owner, 96)
+        run_chunk(64)
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (64, 64)
+        run_chunk(96)
+        assert (kv_cache.num_committed_tokens, kv_cache.history_length) == (96, 96)
+        run_chunk(100)
+        assert kv_cache.num_committed_tokens == 96
+
+        # Both waiters reuse their whole shared prefix.
+        for probe, shared in zip(probes, (64, 96)):
+            mgr.prepare_expect_snapshot_points([probe])
+            assert mgr.prepare_context(probe)
+            batch = ScheduledRequests()
+            batch.append_context_request(probe)
+            mgr.prepare_resources(batch)
+            assert probe.prepopulated_prompt_len == shared
+            mgr.free_resources(probe)
+    finally:
+        for request in (owner, *probes):
+            if request.py_request_id in mgr.kv_cache_map:
+                mgr.free_resources(request)
+        mgr.shutdown()
+
+
 def _branch_snapshot_manager(
     enable_branch_snapshot=True,
     enable_block_reuse=True,
@@ -3505,6 +3719,7 @@ def _branch_snapshot_manager(
 ):
     """Bare V2 hybrid manager carrying only what branch snapshotting reads."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.dtype = DataType.HALF
     mgr.enable_block_reuse = enable_block_reuse
     mgr.tokens_per_block = tokens_per_block
     mgr.local_num_mamba_layers = local_num_mamba_layers
@@ -3548,6 +3763,7 @@ def _fake_context_request(
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
         expect_snapshot_points=list(expect_snapshot_points or []),
+        py_conversation_params=None,
     )
 
 
@@ -3933,6 +4149,7 @@ def test_branch_snapshot_coexists_with_per_conversation_and_zero_interval():
 
 def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
     mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.dtype = DataType.HALF
     mgr.enable_block_reuse = True
     mgr.is_draft = False
     mgr.local_num_mamba_layers = 1
@@ -4306,7 +4523,7 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
     mgr.enable_swa_scratch_reuse = False
     mgr.enable_stats = False
     mgr.num_extra_kv_tokens = 0
-    mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+    mgr.get_layer_bytes_per_token = lambda *args, **kwargs: 8
     # Layer 1's 256-byte pages of 32 tokens (_base_attention_layer_configs; layer 0 becomes the SSM layer).
     mgr._attention_cache_bytes_per_token = lambda: 8
     mgr._kda_replay = KDAReplayState(2, draft_records=kda_draft_records)
@@ -4634,6 +4851,12 @@ def _v2_kda_replay_stub(num_slots=4, manager_cls=KimiK3HybridCacheManager, draft
     channels, a committed window of 3), for the state-index setup that prepare_resources runs. Committing pending drafts
     is recorded instead of run (it needs the GPU kernels)."""
     mgr = object.__new__(manager_cls)
+    if issubclass(manager_cls, KimiK3HybridCacheManager):
+        # KimiK3HybridCacheManager.__init__ state with mid-chunk snapshots off.
+        mgr._kda_midchunk_snapshot_alignment = None
+        mgr._kda_midchunk_snapshots = {}
+        mgr._kda_midchunk_snapshots_taken_total = 0
+        mgr._kda_midchunk_snapshots_skipped_total = 0
     mgr.local_num_mamba_layers = 1
     mgr._kda_replay = KDAReplayState(2, draft_records=draft_records)
     mgr._speculative_state = mgr._kda_replay
@@ -6725,3 +6948,56 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
 
 
 _KDA_REPLAY_FIELDS = (*_KDA_REPLAY_BUFFERS, "prev_num_accepted_tokens")
+
+
+def _kda_replay_seed_state(stacked: bool):
+    """Two KDA layers whose state and replay buffers are per-layer views of
+    one allocation each, like the KVCM pool views."""
+    generator = torch.Generator().manual_seed(0)
+    state = KDAReplayState(2)
+    state.prev_num_accepted_tokens = torch.full((4,), 5, dtype=torch.int32, device="cuda")
+    conv = torch.randn(2, 4, 6, 4, generator=generator).to("cuda", torch.bfloat16)
+    state._conv_states = tuple(conv[layer] for layer in range(2))
+    state._conv_section_dims = (2, 2, 2)
+    state._committed_window = 4
+    replay = {
+        name: torch.randn(2, 4, 6, 2, generator=generator)
+        .to("cuda", torch.bfloat16)
+        .transpose(-1, -2)
+        for name in ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+    }
+    for name, dtype in (
+        ("kda_k_cache", torch.bfloat16),
+        ("kda_g_cache", torch.float32),
+        ("kda_v_cache", torch.bfloat16),
+    ):
+        replay[name] = torch.randn(2, 4, 2, 2, generator=generator).to("cuda", dtype)
+    replay["kda_beta_cache"] = torch.randn(2, 4, 2, 4, generator=generator).to(
+        "cuda", torch.bfloat16
+    )[..., :2]
+    state.pool_layers = [
+        {name: buffer[layer] for name, buffer in replay.items()} for layer in range(2)
+    ]
+    if stacked:
+        state._stack_seed_views()
+        assert state._stacked_seed_replay is not None
+    return state, replay
+
+
+@skip_no_cuda
+def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
+    per_layer, per_layer_replay = _kda_replay_seed_state(stacked=False)
+    stacked, stacked_replay = _kda_replay_seed_state(stacked=True)
+    slots = torch.tensor([1, 3], device="cuda")
+
+    per_layer.seed_transferred_slots(slots)
+    stacked.seed_transferred_slots(slots)
+
+    for name, buffer in per_layer_replay.items():
+        assert torch.equal(stacked_replay[name], buffer), name
+    assert torch.equal(stacked.prev_num_accepted_tokens, per_layer.prev_num_accepted_tokens)
+    # The seeded slots hold the committed windows, the others are untouched.
+    assert torch.equal(
+        stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
+    )
+    assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]

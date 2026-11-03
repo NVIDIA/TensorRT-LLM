@@ -56,7 +56,12 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    presorted_moe_sort,
+    quantize_input_nvfp4,
+)
 from .runners import CuteDslFusedMoENvfp4Runner
 
 
@@ -331,6 +336,18 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             workload_identity=self._epilogue_identity(),
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output, weight_view]
+        # Routing tables a router attached for this rank (see presorted_moe_sort) fix
+        # the tile size: running at their tile skips moe_sort (the Kimi-K3 routing
+        # tail emits 128-row tiles, the best FC12 tile at decode batch sizes).
+        presorted = getattr(token_selected_experts, "_k3_presorted", None)
+        if presorted is not None:
+            offset, num_local, presorted_tile = presorted[0]
+            if (
+                offset == weight_view.slot_start
+                and num_local == weight_view.expert_size_per_partition
+                and presorted_tile in CuteDslFc12FusedMoENvfp4Runner._tile_sizes()
+            ):
+                return runner(inputs, tactic=presorted_tile)
         _, best_tactic = tuner.choose_one(
             "CuteDslFc12FusedMoE::run_moe_nvfp4",
             [runner],
@@ -383,6 +400,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         situ_beta, situ_linear_beta = self._situ_betas()
         slot_start = weight_view.slot_start
 
+        # A Kimi-K3 router that also sorts may attach this rank's moe_sort outputs to the ids.
         (
             tile_idx_to_expert_idx,
             tile_idx_to_mn_limit,
@@ -390,7 +408,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             permuted_idx_to_expanded_idx,
             total_num_padded_tokens,
             num_non_exiting_tiles,
-        ) = torch.ops.trtllm.moe_sort(
+        ) = presorted_moe_sort(
+            token_selected_experts, slot_start, esp, tile_size
+        ) or torch.ops.trtllm.moe_sort(
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.num_slots,
@@ -405,11 +425,11 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # workspace).
         # fc1_alpha/fc2_alpha map 1:1 to the two-op path's per-expert global
         # scales (the kernel takes split alphas). The three atomic counters are
-        # allocated + memset inside the op runner. The moe_output zeroing memset
-        # is issued inside the op too (right before the fused kernel, so it is
-        # the kernel's immediate stream predecessor and the PDL prologue can
-        # overlap it); expanded_idx_to_permuted_idx / ep_size / enable_alltoall
-        # are passed through for that memset.
+        # allocated + zeroed inside the op runner, and the moe_output zeroing
+        # memset is issued there right before the fused kernel (so it is the
+        # kernel's immediate stream predecessor and the PDL prologue can overlap
+        # it; expanded_idx_to_permuted_idx / ep_size / enable_alltoall are passed
+        # through for it).
         torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
             input=x.view(torch.float4_e2m1fn_x2),
             fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),

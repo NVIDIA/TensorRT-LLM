@@ -336,6 +336,8 @@ def _make_cache_config_for_test(
     cache_manager.layer_specs = None
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
+    # Mirrors __init__: without per-layer specs the K/V factor follows the cache type.
+    cache_manager.kv_factor = 1 if kv_cache_type == CacheType.SELFKONLY else 2
     cache_manager.dtype = dtype
     cache_manager.head_dim_per_layer = [128] * len(pp_layers)
     cache_manager.enable_swa_scratch_reuse = False

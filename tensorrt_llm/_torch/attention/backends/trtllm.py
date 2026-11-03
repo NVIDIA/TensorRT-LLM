@@ -40,13 +40,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.input_commit import stage_or_copy
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.manager import FmhaManager
-from .fp4_mla import (can_fuse_fp4_mla_q_quant, populate_helix_spec_buffers,
-                      scatter_fp4_mla_kv_cache)
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -920,11 +922,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Restore backend state modified for draft-forward execution."""
         return None
 
-    def token_major_gen_view(self) -> Optional["TokenMajorGenView"]:
+    def token_major_gen_view(self,
+                             token_sparse: bool = False
+                             ) -> Optional["TokenMajorGenView"]:
         """The token-major generation presentation, or None.
 
-        None on every backend but DSA, and on every uniform DSA batch. See
-        ``DSAtrtllmAttentionMetadata.token_major_gen_view``.
+        None on every backend but DSA, and on every uniform DSA batch outside
+        Helix verify groups. ``token_sparse`` marks a sparse-MLA attention call.
+        See ``DSAtrtllmAttentionMetadata.token_major_gen_view``.
         """
         return None
 
@@ -1011,8 +1016,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        stage_or_copy(self.prompt_lens_cuda[:self.num_seqs],
+                      self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1065,9 +1070,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        stage_or_copy(self.kv_lens_cuda[:self.num_seqs],
+                      maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1754,6 +1758,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.sparse_params = sparse_params
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+        # Inline NVFP4 latent records (sparse/nvfp4_ds_mla_kv.py): the KV append, RoPE and attention
+        # of both phases run in the PrimTS DSA FMHA library, never in the attention op.
+        self.use_nvfp4_ds_mla = kv_cache_dtype == "nvfp4_ds_mla"
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
@@ -1906,8 +1913,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
                 model_config, mapping)
 
-        fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
+        fp8_fallback_layers = frozenset()
+        if quant_mode is not None and getattr(quant_mode, "has_fp4_kv_cache",
+                                              lambda: False)():
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True)
+        has_local_fp8_fallback = bool(
+            fp8_fallback_layers and fp8_fallback_layers.intersection(
+                mapping.pp_layers(config.num_hidden_layers)))
+        # FP8 fallback layers stage the same context buffers as an all-FP8
+        # model, even though the model-wide cache quantization is NVFP4.
+        fp8_context_mla = (quant_mode is not None
+                           and (quant_mode.has_fp8_kv_cache()
+                                or has_local_fp8_fallback)
                            and get_sm_version() in (90, 100, 103, 107, 120))
         if not fp8_context_mla:
             return 0
@@ -2256,9 +2274,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
-        token_major_view = (metadata.token_major_gen_view()
-                            if forward_args.attention_input_type
-                            == AttentionInputType.generation_only else None)
+        token_major_view = None
+        if (forward_args.attention_input_type ==
+                AttentionInputType.generation_only):
+            # Sparse indices are predicted further down; the backend's sparse
+            # params already say whether this call is token-sparse.
+            token_major_view = metadata.token_major_gen_view(
+                token_sparse=self.is_mla_enable
+                and self.sparse_params is not None)
         if metadata.enable_flash_mla and token_major_view is not None:
             raise ValueError(
                 "FlashMLA does not support ragged token-major generation; "
@@ -2340,6 +2363,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # scheduler buffers (the flashinfer trtllm-gen decode kernel ignores them).
         if (self.is_mla_enable and forward_args.skip_mla_rope_generation
                 and not getattr(self, "use_fp8_ds_mla", False)
+                and not getattr(self, "use_nvfp4_ds_mla", False)
                 and forward_args.attention_input_type
                 == AttentionInputType.generation_only):
             num_ctx = metadata.num_contexts
@@ -2673,6 +2697,78 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         return compressed_kv, k_pe
 
+    def append_fp4_mla_context_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        """Apply Q/K RoPE and append one context chunk to FP4 MLA V2 storage."""
+        if not self.uses_fp4_mla_attention or self.mla_params is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires dense FP4 MLA attention.")
+        state = getattr(metadata, "fp4_mla_state", None)
+        if state is None or state.positions is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires token positions.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache[:metadata.num_ctx_tokens],
+            self.layer_idx,
+            token_offset=0,
+            phase="context",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.mla_params.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_context=q,
+            q_nope_head_dim=self.mla_params.qk_nope_head_dim,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA context scatter did not update the HP pool.")
+
+    def forward_fp4_mla_context_partition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one dense FP4 MLA chunk partition through FP8 context FMHA."""
+        fp4_mla_fmha = self._get_fp4_mla_fmha()
+        if fp4_mla_fmha is None:
+            raise RuntimeError(
+                "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
+        output = fp4_mla_fmha.forward_context_partition(
+            q,
+            k,
+            v,
+            metadata,
+            forward_args,
+            kv_lens_cuda=kv_lens_cuda,
+            kv_lens_cpu=kv_lens_cpu,
+        )
+        return output[0] if isinstance(output, tuple) else output
+
+    def _get_fp4_mla_fmha(self):
+        """Return this layer's dense FP4 MLA FMHA library, if enabled."""
+        fp4_mla_fmha = getattr(self, "_fp4_mla_fmha_cache", False)
+        if fp4_mla_fmha is False:
+            from .fmha import Fp4MlaFmha
+
+            fp4_mla_fmha = next(
+                (fmha for fmha in self._fmha_manager.fmha_libs
+                 if isinstance(fmha, Fp4MlaFmha)),
+                None,
+            )
+            self._fp4_mla_fmha_cache = fp4_mla_fmha
+        return fp4_mla_fmha
+
     def load_chunked_kv_cache_for_mla(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -2685,6 +2781,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert out_dtype in [torch.float16, torch.bfloat16, torch.float32]
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
+
+        if self.uses_fp4_mla_attention:
+            return load_fp4_mla_chunked_kv_cache(
+                metadata,
+                self.layer_idx,
+                num_ctx_cached_tokens=num_ctx_cached_tokens,
+                cu_chunked_seq_len=cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
+                out_dtype=out_dtype,
+                kv_lora_rank=self.mla_params.kv_lora_rank,
+                qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
+            )
 
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
@@ -2968,7 +3077,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.head_dim,
             getattr(metadata.kv_cache_manager, "mla_kv_cache_residual_dim", 0),
             metadata.kv_cache_manager.tokens_per_block,
-            metadata.max_seq_len,  # attention_window_size
+            int(metadata.max_seq_len),  # attention_window_size
             metadata.beam_width,
             self.quant_mode,
             self.q_scaling,

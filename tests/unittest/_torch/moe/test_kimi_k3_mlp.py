@@ -100,6 +100,8 @@ def _make_pair(hidden_size, intermediate_size, situ_beta, situ_linear_beta, devi
 def _runtime_config() -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=512,
+        num_hidden_layers=4,
+        first_k_dense_replace=1,
         num_experts=8,
         num_experts_per_token=2,
         moe_intermediate_size=256,
@@ -115,6 +117,33 @@ def _runtime_config() -> SimpleNamespace:
         num_expert_group=1,
         topk_group=1,
     )
+
+
+def _set_k3_layer_path_state(runtime) -> None:
+    """Set the per-layer path state ``KimiK3MoERuntime.__init__`` gives a Kimi K3 layer
+    (a config without ``dsa_config``) whose routed partial is not reduced by this module
+    (``_reduce_routed_output`` False), for runtimes built with ``__new__``.
+
+    With these values the merged all-reduce, the sharded MoE front, the K3.1 routing
+    sort / DEP routing tail and the fused latent-MoE tail stay off, as they do for
+    such a layer (the packed MoE front stays off through its class default).
+    """
+    # No merged MoE all-reduce without the routed reduction.
+    runtime._merge_moe_allreduce = False
+    # kimi_k31_decode_plan returns None without dsa_config.
+    runtime._decode_gemm_plan = None
+    # Sharded MoE front: no head workspace, weight or shared-expert part.
+    runtime._k31f_ws = None
+    runtime._k31f_weight = None
+    runtime._k31f_shared = None
+    runtime._k31f_shared_act = None
+    # KIMI_K31_ROUTER_SORT / KIMI_K31_ROUTER_TAIL_DEP apply to K3.1 configs only.
+    runtime._k31_router_sort_wanted = False
+    runtime._k31_router_tail_dep_wanted = False
+    # The fused tail replaces only the routed reduction done by this module.
+    runtime._fused_tail_mapping = None
+    runtime._fused_tail_wanted = False
+    runtime._fused_tail = None
 
 
 @requires_cuda
@@ -246,11 +275,14 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     class _FakeAllReduce(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, mapping=None, *args, **kwargs):
             super().__init__()
+            # ``AllReduce`` keeps its mapping; the runtime reads the routed
+            # all-reduce's to place the fused latent-MoE tail.
+            self.mapping = mapping
 
     class _FakeMoE(ConfigurableMoE):
-        def __init__(self):
+        def __init__(self, mapping):
             nn.Module.__init__(self)
             # ``scheduler_kind`` is a class attribute on the ``MoE`` interface
             # (default ``EXTERNAL_COMM``), so every real backend carries it and
@@ -261,17 +293,17 @@ def test_kimi_k3_shared_expert_parallel_construction(
             )
             self.comm = None
             self.layer_load_balancer = None
-            self.all_reduce = _FakeAllReduce()
-
-    fake_moe = _FakeMoE()
+            # ``MoE.__init__`` builds the all-reduce over its model config's mapping.
+            self.all_reduce = _FakeAllReduce(mapping=mapping)
 
     create_moe_kwargs = {}
+
+    def _create_moe(**kwargs):
+        create_moe_kwargs.update(kwargs)
+        return _FakeMoE(kwargs["model_config"].mapping)
+
     monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
-    monkeypatch.setattr(
-        modeling_kimi_linear,
-        "create_moe",
-        lambda **kwargs: create_moe_kwargs.update(kwargs) or fake_moe,
-    )
+    monkeypatch.setattr(modeling_kimi_linear, "create_moe", _create_moe)
     monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
     monkeypatch.setattr(torch.cuda, "Event", lambda: object())
 
@@ -306,6 +338,12 @@ def test_kimi_k3_shared_expert_parallel_construction(
     if runtime._defer_shared_allreduce:
         assert runtime.moe_routed_event is not runtime.moe_main_event
         assert runtime.moe_routed_event is not runtime.moe_shared_event
+    # The fused latent-MoE tail can replace only the direct MoE-TP tail, which reduces
+    # the routed partial over the routed all-reduce's group.
+    direct_tail = not attention_dp and tp_size > 1 and not runtime._defer_shared_allreduce
+    assert runtime._fused_tail_mapping is (
+        runtime.routed_experts.all_reduce.mapping if direct_tail else None
+    )
     assert create_moe_kwargs["aux_stream_dict"] is aux_stream_dict
     assert AuxStreamType.MoeBalancer in create_moe_kwargs["aux_stream_dict"]
     assert runtime.shared_expert_stream is aux_stream_dict[AuxStreamType.MoeShared]
@@ -436,6 +474,7 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.latent_down_stream = None
     runtime.moe_latent_fork_event = None
     runtime.moe_latent_ready_event = None
+    _set_k3_layer_path_state(runtime)
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     # maybe_execute_in_parallel records the aux outputs on the calling stream
@@ -543,6 +582,7 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
     runtime.latent_down_stream = latent_stream
     runtime.moe_latent_fork_event = _Event("latent_fork")
     runtime.moe_latent_ready_event = _Event("latent_ready")
+    _set_k3_layer_path_state(runtime)
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)

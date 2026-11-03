@@ -34,11 +34,12 @@ def mla_dsa_proj(
     update the indexer k cache — that happens in Op 2 (mla_dsa_attn_inplace)
     because the scatter kernel accesses batch-specific metadata.
 
-    Returns [q, compressed_kv, k_pe, latent_cache] when the short-MHA path
-    handles all tokens, or [q, compressed_kv, k_pe, latent_cache, q_fp8,
-    k_fp8, k_scale, weights, q_scale] when the indexer runs.  Under torch
-    compile, _should_use_short_mha returns False so the result is always
-    length 9, keeping control flow straight-line for CUDA graph capture.
+    Returns [q, compressed_kv, k_pe, latent_cache, k_fp8, k_scale] when the
+    short-MHA path handles all tokens (only the indexer K is projected), or
+    [q, compressed_kv, k_pe, latent_cache, q_fp8, k_fp8, k_scale, weights,
+    q_scale] when the indexer runs.  Under torch compile,
+    _should_use_short_mha returns False so the result is always length 9,
+    keeping control flow straight-line for CUDA graph capture.
     The trailing q_scale is only consumed by the FP4 dispatch; the FP8
     path ignores it in _forward_dsa_attn.
     """
@@ -83,8 +84,16 @@ def _mla_dsa_proj_fake(
     # Under FP4 q_fp8's trailing dim is head_dim // 2 (two E2M1 codes per
     # byte) and q_scale carries one int32 per (token, head) packing four
     # UE8M0 exponents; under FP8 q_fp8's trailing dim is head_dim and
-    # q_scale carries one float32 per (token, head).
-    if indexer.use_fp4:
+    # q_scale carries one float32 per (token, head). Under BF16 q_fp8 and
+    # k_fp8 are unquantized BF16 and the scales are unit float32 values.
+    if indexer.use_bf16:
+        q_fp8 = hidden_states.new_empty(
+            [num_tokens, indexer.n_heads, indexer.head_dim], dtype=torch.bfloat16
+        )
+        k_fp8 = hidden_states.new_empty([num_tokens, indexer.head_dim], dtype=torch.bfloat16)
+        k_scale = hidden_states.new_empty([num_tokens, 1], dtype=torch.float32)
+        q_scale = hidden_states.new_empty([num_tokens, indexer.n_heads, 1], dtype=torch.float32)
+    elif indexer.use_fp4:
         q_fp8 = hidden_states.new_empty(
             [num_tokens, indexer.n_heads, indexer.head_dim // 2], dtype=torch.int8
         )
@@ -116,10 +125,11 @@ def mla_dsa_attn_inplace(
     """Batch-structure-dependent attention dispatch for DSA MLA.
 
     indexer_intermediates is [q_fp8, k_fp8, k_scale, weights, q_scale] when
-    the indexer ran in Op 1, or [] when short-MHA handled all tokens. The
-    trailing q_scale is only consumed by the FP4 dispatch; the FP8 path
-    ignores it. Runs sparse_attn_indexer then dispatches context/generation
-    attention. This op is excluded from CUDA graph capture.
+    the indexer ran in Op 1, or [k_fp8, k_scale] when short-MHA handled all
+    tokens (only the indexer K cache is written). The trailing q_scale is
+    only consumed by the FP4 dispatch; the FP8 path ignores it. Runs
+    sparse_attn_indexer then dispatches context/generation attention. This
+    op is excluded from CUDA graph capture.
     """
     metadata, mla_layer = _extract_extra_attrs(layer_idx)
     _forward_dsa_attn(
@@ -133,6 +143,8 @@ def mla_dsa_attn_inplace(
         metadata,
         output,
     )
+    if mla_layer.zero_padding_output_rows and output.shape[0] > metadata.num_tokens:
+        output[metadata.num_tokens :].zero_()
 
 
 @mla_dsa_attn_inplace.register_fake

@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -7,8 +21,11 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
     AuxBufferMeta,
     AuxSlot,
+    _decode_draft_history,
+    _encode_draft_history,
     build_aux_transfer_layout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import DataType, KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
 
@@ -185,3 +202,44 @@ def test_aux_transfer_layout_ctx_no_spec_gen_sa():
     np.testing.assert_array_equal(layout.dst_item_sizes, gen.meta.item_sizes[expected_keep])
     np.testing.assert_array_equal(layout.src_base_ptrs, ctx.meta.ptrs[expected_keep])
     np.testing.assert_array_equal(layout.dst_base_ptrs, gen.meta.ptrs[expected_keep])
+
+
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "torch.float8_e4m3fn"])
+def test_draft_history_record_round_trips_the_storage_dtype(dtype):
+    """Prefill and generation servers compare the decoded layout, dtype included."""
+    history = {
+        "valid_length": 89,
+        "position": 89,
+        "layout": {
+            "num_layers": 5,
+            "num_kv_heads": 16,
+            "head_dim": 64,
+            "dtype": dtype,
+            "attention_backend": "VANILLA",
+            "kv_factor": 2,
+            "window_size": None,
+        },
+    }
+
+    assert _decode_draft_history(_encode_draft_history(history)) == history
+
+
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "CUTEDSL"])
+def test_standalone_draft_identity_is_the_storage_format(backend):
+    """CTX and GEN may pick different drafter attention backends over one page format."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.draft_layer_ids = (93,)
+    manager.layer_offsets = {93: 0}
+    manager._draft_total_num_kv_heads = 1
+    manager.num_kv_heads_per_layer = [1]
+    manager.head_dim_per_layer = [576]
+    manager.dtype_per_layer = [DataType.BF16]
+    manager.kv_factor_per_layer = [1]
+    manager.draft_window_size = None
+    manager.draft_attention_backend = backend
+
+    layout = manager.get_draft_transfer_identity()
+
+    assert layout["attention_backend"] == "VANILLA"
+    history = {"valid_length": 1024, "position": 1024, "layout": layout}
+    assert _decode_draft_history(_encode_draft_history(history)) == history

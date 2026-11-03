@@ -267,9 +267,16 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
 
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
-    mGpuPhysMemAllocator
-        = std::make_unique<PooledPhysMemAllocator>(tierAllocationGranularity(CacheTier::GPU_MEM, gpuQuota));
+    size_t const gpuUnit = tierAllocationGranularity(CacheTier::GPU_MEM, gpuQuota);
+    mGpuPhysMemAllocator = std::make_unique<PooledPhysMemAllocator>(gpuUnit, gpuMaxChunkSize(gpuUnit));
     size_t const gpuGranularity = mGpuPhysMemAllocator->physMemSize();
+    if (mGpuPhysMemAllocator->maxChunkSize() > gpuGranularity)
+    {
+        TLLM_LOG_INFO(
+            "KV cache manager v2: GPU pools map physical chunks of up to %zu MiB (%s), sized in %zu MiB units "
+            "(%zu MiB quota)",
+            mGpuPhysMemAllocator->maxChunkSize() >> 20, kGpuChunkSizeEnvVar, gpuGranularity >> 20, gpuQuota >> 20);
+    }
 
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that

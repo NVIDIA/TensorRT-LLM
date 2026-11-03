@@ -431,6 +431,58 @@ def test_queued_routes_by_request_type():
     assert ifb.num_queued_gen_kv_tokens == 1536  # 512 + 1024
 
 
+class _PromptCountingRequest:
+    """Queued request with an O(1) ``num_input_tokens`` whose
+    ``input_token_ids`` must not be read (it copies the whole prompt)."""
+
+    def __init__(self, num_input_tokens, request_type):
+        self.num_input_tokens = num_input_tokens
+        self.request_type = request_type
+
+    @property
+    def input_token_ids(self):
+        raise AssertionError("queued counters must not materialize input_token_ids")
+
+
+def test_queued_counters_use_num_input_tokens():
+    from tensorrt_llm.bindings.executor import RequestType
+
+    items = []
+    for n, request_type in (
+        (150_000, RequestType.REQUEST_TYPE_GENERATION_ONLY),
+        (90_000, RequestType.REQUEST_TYPE_GENERATION_ONLY),
+        (4_096, RequestType.REQUEST_TYPE_CONTEXT_ONLY),
+    ):
+        item = _StubQueueItem(input_token_ids=[])
+        item.request = _PromptCountingRequest(n, request_type)
+        items.append(item)
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), items, num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_queued_gen_requests == 2
+    assert ifb.num_queued_gen_kv_tokens == 240_000
+    assert ifb.num_queued_context_requests == 1
+    assert ifb.num_queued_ctx_tokens == 4_096
+
+
+def test_queued_counters_match_executor_request_prompt_length():
+    from tensorrt_llm.bindings.executor import OutputConfig, Request, RequestType, SamplingConfig
+
+    request = Request(
+        input_token_ids=list(range(3_000)),
+        max_tokens=8,
+        sampling_config=SamplingConfig(),
+        output_config=OutputConfig(),
+        type=RequestType.REQUEST_TYPE_GENERATION_ONLY,
+    )
+    item = _StubQueueItem(input_token_ids=[])
+    item.request = request
+    stats = _invoke_update_iter_stats(_StubScheduledBatch(), [item], num_ctx_tokens=0)
+    ifb = stats.inflight_batching_stats
+    assert request.num_input_tokens == len(request.input_token_ids) == 3_000
+    assert ifb.num_queued_gen_requests == 1
+    assert ifb.num_queued_gen_kv_tokens == 3_000
+
+
 def test_paused_decode_requests():
     paused = [
         _StubRequest(num_tokens=300),

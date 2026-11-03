@@ -1,0 +1,322 @@
+diff --git a/__init__.py b/__init__.py
+index 429c9c88f7a6c9b1186829fb3722536dd02638da..9c5011fa5f269b9da692f6bbeee01e4286cbea60 100644
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -14,28 +15,6 @@
+ 
+ """Experimental task-scheduled attention entry points."""
+ 
+-from .block_sparse import (
+-    BlockSparsePagedTSWrapper,
+-    BlockSparseTSWrapper,
+-    block_sparse_attention,
+-    block_sparse_attention_with_paged_kv_cache,
+-)
+-from .decode import (
+-    BatchDecodePagedTSWrapper,
+-    PrimsTSBatchDecodePlan,
+-    batch_decode_with_paged_kv_cache,
+-    get_prims_ts_batch_decode_workspace_size,
+-    make_q_token_kv_block_sparse_qo_indptr,
+-    prepare_prims_ts_batch_decode_with_kv_cache,
+-    suggest_q_token_kv_block_sparse_group_size,
+-    validate_q_token_kv_block_sparse_group_size,
+-)
+-from .context import (
+-    BatchPrefillPagedTSWrapper,
+-    BatchPrefillTSWrapper,
+-    batch_prefill,
+-    batch_prefill_with_paged_kv_cache,
+-)
+ from .mla_decode import (
+     BatchSparseMLADecodePagedTSWrapper,
+     batch_sparse_mla_decode_with_paged_kv_cache,
+@@ -45,48 +24,11 @@ from .mla_decode import (
+     batch_mla_decode_with_paged_kv_cache,
+     get_prims_ts_batch_mla_decode_workspace_size,
+ )
+-from .q_token_kv_block_sparse_metadata import (
+-    QTokenKvBlockSparsePagedTSWrapper,
+-    get_q_token_kv_block_sparse_workspace_size,
+-    q_token_kv_block_sparse_attention_with_paged_kv_cache,
+-)
+-from .sage import SageAttentionConfig, SageAttentionParams
+-from .vc_attention import (
+-    VCAttentionConfig,
+-    VCAttentionParams,
+-)
+-from .vc_attention.quantization import (
+-    VCAttentionPreprocessor,
+-)
+ 
+ __all__ = [
+     "BatchSparseMLADecodePagedTSWrapper",
+     "batch_sparse_mla_decode_with_paged_kv_cache",
+     "get_prims_ts_sparse_mla_decode_workspace_size",
+-    "BlockSparseTSWrapper",
+-    "SageAttentionConfig",
+-    "SageAttentionParams",
+-    "VCAttentionConfig",
+-    "VCAttentionParams",
+-    "VCAttentionPreprocessor",
+-    "BlockSparsePagedTSWrapper",
+-    "block_sparse_attention",
+-    "block_sparse_attention_with_paged_kv_cache",
+-    "BatchPrefillTSWrapper",
+-    "BatchPrefillPagedTSWrapper",
+-    "batch_prefill",
+-    "batch_prefill_with_paged_kv_cache",
+-    "BatchDecodePagedTSWrapper",
+-    "PrimsTSBatchDecodePlan",
+-    "batch_decode_with_paged_kv_cache",
+-    "get_prims_ts_batch_decode_workspace_size",
+-    "make_q_token_kv_block_sparse_qo_indptr",
+-    "prepare_prims_ts_batch_decode_with_kv_cache",
+-    "suggest_q_token_kv_block_sparse_group_size",
+-    "validate_q_token_kv_block_sparse_group_size",
+-    "QTokenKvBlockSparsePagedTSWrapper",
+-    "get_q_token_kv_block_sparse_workspace_size",
+-    "q_token_kv_block_sparse_attention_with_paged_kv_cache",
+     "BatchMLADecodePagedTSWrapper",
+     "MLAAttentionTuning",
+     "batch_mla_decode_with_paged_kv_cache",
+diff --git a/_compile_cache.py b/_compile_cache.py
+index b374a65311402982d818d80e9145ab40ed9727a1..f014a2acd047c497f421af93bc9827d5d16973a1 100644
+--- a/_compile_cache.py
++++ b/_compile_cache.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -72,6 +73,21 @@ def _kernel_source_files() -> tuple[str, ...]:
+     return tuple(sorted(str(path) for path in root.rglob("*.py")))
+ 
+ 
++@functools.cache
++def _kernel_source_digest() -> str:
++    # TRT-LLM vendor change: the sources' content digest over package-relative
++    # names, carried in every kernel name instead of the module metadata. The
++    # cache is then shared by every tree path with identical sources, and
++    # processes never wipe a module directory that another process (another
++    # tree, another package snapshot) keyed differently.
++    root = Path(__file__).resolve().parent
++    sha = hashlib.sha256()
++    for path in sorted(root.rglob("*.py")):
++        sha.update(path.relative_to(root).as_posix().encode())
++        sha.update(path.read_bytes())
++    return sha.hexdigest()[:16]
++
++
+ def build_and_load_attention_kernel(
+     family: str,
+     kind: str,
+@@ -82,7 +98,7 @@ def build_and_load_attention_kernel(
+     extra: tuple = (),
+ ) -> Any:
+     """Build or load under the caller's selected CUDA device context."""
+-    from ...jit.cute_dsl_core import (
++    from flashinfer.jit.cute_dsl_core import (
+         build_and_load_cute_dsl_kernel,
+         cute_dsl_cache_disabled,
+     )
+@@ -100,8 +116,7 @@ def build_and_load_attention_kernel(
+     # the specialization must also distinguish the physical capability.
+     major, minor = torch.cuda.get_device_capability()
+     return build_and_load_cute_dsl_kernel(
+-        f"prims_ts_{family}",
+-        f"{kind}_sm{major}{minor}_{key}",
++        f"prims_ts_next_{family}",
++        f"{kind}_sm{major}{minor}_{key}_{_kernel_source_digest()}",
+         compile_fn,
+-        extra_key_files=_kernel_source_files(),
+     )
+diff --git a/_flashinfer_compat.py b/_flashinfer_compat.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..af21e7b8b01cf767a49a6e5ee6a683d0a5210bc6
+--- /dev/null
++++ b/_flashinfer_compat.py
+@@ -0,0 +1,30 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""FlashInfer API-logging and trace-template symbols that the pinned FlashInfer wheel predates.
++
++The vendored kernels only use them as decorators and trace metadata; execution never depends on them.
++"""
++
++
++def flashinfer_experimental_api(func=None, *, trace=None, **_):
++    """No-op stand-in for ``flashinfer.api_logging.flashinfer_experimental_api``."""
++    if func is None:
++        return lambda f: f
++    return func
++
++
++def __getattr__(name):
++    """Trace dispatch templates (``flashinfer.trace.templates.attention``) are not used for execution."""
++    return None
+diff --git a/decode.py b/decode.py
+index cd2472da75685f073a78177c6f0e6ee8728f7274..f45390a222d4859528fb7f7a4c4d6a72857da42f 100644
+--- a/decode.py
++++ b/decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -26,14 +27,14 @@ import torch
+ 
+ from ._compile_cache import build_and_load_attention_kernel
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
++from tensorrt_llm._torch.attention.backends.prims_ts_next._flashinfer_compat import flashinfer_experimental_api
+ from flashinfer.utils import (
+     get_device_sm_count,
+     _check_workspace_buffer_alignment,
+     check_shape_dtype_device,
+ )
+ 
+-from flashinfer.trace.templates.attention import (
++from tensorrt_llm._torch.attention.backends.prims_ts_next._flashinfer_compat import (
+     attention_ts_decode_trace_dispatch,
+     prims_ts_decode_wrapper_trace_dispatch,
+ )
+@@ -770,7 +771,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+     # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
+     # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
+     if capability == (10, 7):
+-        from ...cute_dsl.utils import require_cute_dsl_arch
++        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
+ 
+         require_cute_dsl_arch(device_index)
+ 
+diff --git a/kernels/fmha_decode/fmha_decode_config.py b/kernels/fmha_decode/fmha_decode_config.py
+index e492e92a92e139f827e071f940ad699191240147..4a58f037c2ebb4489a2b41f2376b2553ac9b05c4 100644
+--- a/kernels/fmha_decode/fmha_decode_config.py
++++ b/kernels/fmha_decode/fmha_decode_config.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -1059,10 +1060,10 @@ class FmhaDecodeConfig:
+             softmax_warps = self.softmax0_num_warps + (
+                 self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+             )
+-            quanta = (
++            correction_steps = (
+                 softmax_warps + self.correction_num_warps - 1
+             ) // self.correction_num_warps
+-            return 88 - quanta * 8
++            return 88 - correction_steps * 8
+         return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
+ 
+     @property
+diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a32c5289e 100644
+--- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
++++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -36,7 +37,7 @@ from cutlass.experimental.task_scheduling.resources import (
+     producer_work,
+ )
+ 
+-from ......cute_dsl.availability import is_rubin_cute_dsl_available
++from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+ from ..fmha_decode_config import FmhaDecodeConfig
+ from .helpers_common import (
+     _TASK_CACHE_TMEM_BASE_OFFSET,
+diff --git a/mla_decode.py b/mla_decode.py
+index a42843f6ab47c0b1cefa0a0b51e27b355e0a4974..9c5413bd28ea4b3e5563c5befad7971b502a994e 100644
+--- a/mla_decode.py
++++ b/mla_decode.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -33,9 +34,9 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
+     validate_nvfp4_kv_formats,
+ )
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
++from tensorrt_llm._torch.attention.backends.prims_ts_next._flashinfer_compat import flashinfer_experimental_api
+ from flashinfer.utils import get_device_sm_count
+-from flashinfer.trace.templates.attention import (
++from tensorrt_llm._torch.attention.backends.prims_ts_next._flashinfer_compat import (
+     prims_ts_decode_mla_one_shot_trace_dispatch,
+     prims_ts_decode_mla_wrapper_trace_dispatch,
+ )
+@@ -2368,17 +2369,17 @@ def _resolve_sparse_mla_plan(
+ ):
+     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
+     import cutlass
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
++    from tensorrt_llm._torch.attention.backends.prims_ts_next.kernels.mla_decode.throughput_latency_1cta.config import (
+         MlaProfile,
+         compute_workspace_size,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
++    from tensorrt_llm._torch.attention.backends.prims_ts_next.kernels.mla_decode.throughput_latency_1cta.kernel import (
+         ThroughputLatencyMlaDecodeTs,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
++    from tensorrt_llm._torch.attention.backends.prims_ts_next.kernels.mla_decode.throughput_2cta.config import (
+         compute_workspace_size as workspace_2cta,
+     )
+-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
++    from tensorrt_llm._torch.attention.backends.prims_ts_next.kernels.mla_decode.throughput_2cta.kernel import (
+         MlaDecodeTs,
+     )
+ 
+diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
+index 146921278514aa664590b95362a9533a287b145d..4b3f6c41c19dfb0f47dc3fe4169d246b0e0bed7f 100644
+--- a/q_token_kv_block_sparse_metadata.py
++++ b/q_token_kv_block_sparse_metadata.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -41,9 +42,9 @@ from dataclasses import dataclass, replace
+ from typing import Any, Literal, Optional
+ 
+ import torch
+-from flashinfer.api_logging import flashinfer_experimental_api
++from tensorrt_llm._torch.attention.backends.prims_ts_next._flashinfer_compat import flashinfer_experimental_api
+ 
+-from ...utils import device_support_pdl
++from flashinfer.utils import device_support_pdl
+ from ._block_sparse.common import _num_sparse_pattern_heads
+ 
+ _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
+@@ -63,7 +64,7 @@ _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
+ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
+     """Build and cache the CUDA C++ QToken-KvBlock-Sparse-Attention metadata implementation."""
+ 
+-    from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
++    from flashinfer.jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
+ 
+     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
+ 

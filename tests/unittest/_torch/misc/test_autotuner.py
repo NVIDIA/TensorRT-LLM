@@ -932,22 +932,22 @@ def test_kernel_testing_multiple_contexts():
 
     # First, do tuning to populate cache
     with autotune():
-        runner, _ = tuner.choose_one("test_multi_context",
+        runner, _ = tuner.choose_one("test_multi_context_0",
                                      runners,
                                      tuning_config, [x, w],
                                      gemm_idx=0)
-        runner, _ = tuner.choose_one("test_multi_context",
+        runner, _ = tuner.choose_one("test_multi_context_1",
                                      runners,
                                      tuning_config, [x, w],
                                      gemm_idx=1)
 
     # Capture execution context (captures both choose_one calls)
     with tuner.capture() as all_tactics:
-        runner_0, tactic_0 = tuner.choose_one("test_multi_context",
+        runner_0, tactic_0 = tuner.choose_one("test_multi_context_0",
                                               runners,
                                               tuning_config, [x, w],
                                               gemm_idx=0)
-        runner_1, tactic_1 = tuner.choose_one("test_multi_context",
+        runner_1, tactic_1 = tuner.choose_one("test_multi_context_1",
                                               runners,
                                               tuning_config, [x, w],
                                               gemm_idx=1)
@@ -963,11 +963,11 @@ def test_kernel_testing_multiple_contexts():
 
         with tuner.replay(tactic):
             # Make the same calls in the same order
-            runner_0, tactic_0 = tuner.choose_one("test_multi_context",
+            runner_0, tactic_0 = tuner.choose_one("test_multi_context_0",
                                                   runners,
                                                   tuning_config, [x, w],
                                                   gemm_idx=0)
-            runner_1, tactic_1 = tuner.choose_one("test_multi_context",
+            runner_1, tactic_1 = tuner.choose_one("test_multi_context_1",
                                                   runners,
                                                   tuning_config, [x, w],
                                                   gemm_idx=1)
@@ -986,6 +986,43 @@ def test_kernel_testing_multiple_contexts():
         0].get_valid_tactics([x, w], OptimizationProfile(), gemm_idx=gemm_idx))
     assert len(tested_tactics) == num_tactics_for_gemm_idx(0) * num_tactics_for_gemm_idx(1), \
         f"Expected 6 tactic combinations (2*3), got {len(tested_tactics)}"
+
+
+def test_kernel_testing_shared_cache_key_contexts():
+    """Capture replay should follow runtime autotuner cache-key coupling."""
+    x, w = torch.randn(16, 64), torch.randn(64, 128)
+    runners = [MultiContextRunner()]
+    tuning_config = TuningConfig()
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    with tuner.capture() as all_tactics:
+        _ = tuner.choose_one("test_shared_cache_key_contexts",
+                             runners,
+                             tuning_config, [x, w],
+                             gemm_idx=0)
+        _ = tuner.choose_one("test_shared_cache_key_contexts",
+                             runners,
+                             tuning_config, [x, w],
+                             gemm_idx=1)
+
+    tested_tactics = []
+    for tactic in all_tactics:
+        assert len(tactic) == 2, f"Expected 2 contexts, got {len(tactic)}"
+        with tuner.replay(tactic):
+            _, tactic_0 = tuner.choose_one("test_shared_cache_key_contexts",
+                                           runners,
+                                           tuning_config, [x, w],
+                                           gemm_idx=0)
+            _, tactic_1 = tuner.choose_one("test_shared_cache_key_contexts",
+                                           runners,
+                                           tuning_config, [x, w],
+                                           gemm_idx=1)
+            assert tactic_0 == tactic_1
+            tested_tactics.append((tactic_0, tactic_1))
+
+    assert tested_tactics == [(0, 0), (1, 1)]
 
 
 def test_kernel_testing_mismatched_ops():

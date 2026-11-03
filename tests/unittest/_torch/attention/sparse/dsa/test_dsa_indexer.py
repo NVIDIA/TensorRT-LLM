@@ -56,7 +56,9 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa import backend as dsa_backend
 from tensorrt_llm._torch.attention.backends.sparse.dsa import indexer as dsa_indexer
 from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
+    _get_indexer_k_cache_bytes_per_token,
     _resolve_fp8_ds_mla_head_dim,
+    get_indexer_k_data_bytes_per_token,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
@@ -239,6 +241,15 @@ def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, 
         (7, (1, 2, 3), 1, 65536, (7, 1, 1)),  # B=1: too few waves for the split to pay
         (7, (1, 2, 3), 32, 4096, (1, 3, 3)),  # 24 atom-1 waves: split
         (7, (1, 2, 3, 4), 0, 0, (1, 4, 2)),  # workload unknown: fewer KV passes
+        (8, (1, 2, 3), 1, 150000, (4, 2, 1)),  # FP4 default, 8-row window: 4 atoms of 2
+        (
+            8,
+            (1, 2, 3, 4),
+            1,
+            150000,
+            (2, 4, 1),
+        ),  # kernel atoms 1,2,3,4: 2 atoms of 4
+        (8, (1, 2, 3, 4), 16, 150000, (2, 4, 1)),
     ],
 )
 def test_pick_dsl_split(next_n, kernel_atoms, batch_size, max_ctx, expected):
@@ -277,6 +288,7 @@ def test_cute_dsl_paged_mqa_logits_default_is_aligned():
     [
         (dict(), True),
         (dict(sm_version=103, index_topk=2048, compress_ratio=4), True),
+        (dict(sm_version=107), True),
         (dict(enable_heuristic_topk=False), False),
         (dict(use_self_sampling_topk=False), False),
         (dict(is_cute_dsl_available=False), False),
@@ -689,6 +701,54 @@ def test_indexer_post_load_weights_caches_fused_weight():
     assert torch.equal(indexer._fused_wk_wp_weight[:2], indexer.wk.weight.data)
     assert torch.equal(indexer._fused_wk_wp_weight[2:], indexer.weights_proj.weight.data)
     assert not hasattr(indexer, "_weights_transformed")
+
+
+def test_index_rope_dim_comes_from_pretrained_config():
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128, index_n_heads=32, index_topk=2048
+    )
+    assert sparse_config.to_sparse_params().index_rope_dim is None
+    nope_config = SimpleNamespace(index_rope_dim=0)
+    assert sparse_config.to_sparse_params(pretrained_config=nope_config).index_rope_dim == 0
+
+
+@skip_pre_hopper
+def test_index_k_norm_eps_comes_from_pretrained_config():
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128, index_n_heads=32, index_topk=2048
+    )
+    # DeepSeek-V3.2 checkpoints carry no key-norm epsilon: the indexer keeps 1e-6.
+    assert sparse_config.to_sparse_params().index_k_norm_eps is None
+    assert create_indexer(sparse_config).k_norm.variance_epsilon == 1e-6
+    kimi_config = SimpleNamespace(index_k_norm_eps=1e-5)
+    assert create_indexer(sparse_config, pretrained_config=kimi_config).k_norm.variance_epsilon == (
+        1e-5
+    )
+
+
+@skip_pre_hopper
+def test_position_free_indexer_skips_rope():
+    """index_rope_dim=0 (Kimi K3.1): no RoPE module, and Q/K pass through unrotated."""
+    sparse_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=128, index_n_heads=32, index_topk=2048
+    )
+    indexer = create_indexer(sparse_config, pretrained_config=SimpleNamespace(index_rope_dim=0))
+    assert indexer.rope_dim == 0
+    assert indexer.rotary_emb is None
+
+    indexer.wq_b.create_weights()
+    indexer.wq_b.weight.data.normal_()
+    indexer.k_norm = indexer.k_norm.cuda()
+    indexer.wq_b = indexer.wq_b.cuda()
+    qr = torch.randn(5, indexer.q_lora_rank, dtype=torch.bfloat16, device="cuda")
+    indexer_k = torch.randn(5, indexer.head_dim, dtype=torch.bfloat16, device="cuda")
+
+    q_pe, q_nope, k_pe, k_nope = indexer._qk_projection_and_rope(qr, indexer_k, None)
+
+    q = indexer.wq_b(qr).view(-1, indexer.n_heads, indexer.head_dim)
+    torch.testing.assert_close(torch.cat([q_pe, q_nope], dim=-1), q)
+    torch.testing.assert_close(torch.cat([k_pe, k_nope], dim=-1), indexer.k_norm(indexer_k))
+    assert q_pe.shape[-1] > 0 and k_pe.shape[-1] > 0
 
 
 @skip_pre_hopper
@@ -2801,6 +2861,191 @@ def test_indexer_decode_with_paged_kv_cache(
     assert diff < 1e-3, f"Accuracy check failed: {diff=}"
     print(f"✅ Test passed! Accuracy: {diff:.6f} < 1e-3")
     print(f"   Total cache tokens: {final_lens.sum().item()}, Avg: {final_lens.float().mean():.1f}")
+
+
+def test_bf16_indexer_k_cache_bytes_per_token():
+    """BF16 keys take two bytes per value and keep the 4-byte scale slot."""
+    assert get_indexer_k_data_bytes_per_token(128, "fp8") == 128
+    assert get_indexer_k_data_bytes_per_token(128, "fp4") == 64
+    assert get_indexer_k_data_bytes_per_token(128, "bf16") == 256
+    assert _get_indexer_k_cache_bytes_per_token(128, 128, "fp8") == 132
+    assert _get_indexer_k_cache_bytes_per_token(128, 128, "fp4") == 68
+    assert _get_indexer_k_cache_bytes_per_token(128, 128, "bf16") == 260
+
+
+def test_bf16_indexer_rejects_v1_cache_manager():
+    with pytest.raises(ValueError, match="requires the V2 KV cache manager"):
+        create_dsa_cache_manager(
+            batch_size=1,
+            head_dim=128,
+            tokens_per_block=64,
+            max_seq_len=256,
+            indexer_k_dtype="bf16",
+            use_kv_cache_manager_v2=False,
+        )
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_bf16_mqa_logits_matches_reference(num_heads):
+    """Prefill BF16 index scores equal the FP32 reference on the same inputs."""
+    torch.manual_seed(7)
+    num_q, num_k, head_dim = 333, 1500, 128
+    sparse_attn_config = DeepSeekSparseAttentionConfig(
+        index_head_dim=head_dim,
+        index_n_heads=num_heads,
+        index_topk=2048,
+        indexer_k_dtype="bf16",
+    )
+    indexer = create_indexer(sparse_attn_config)
+    assert indexer.use_bf16 and not indexer.use_cute_dsl_paged_mqa_logits
+    q = torch.randn((num_q, num_heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((num_k, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((num_q, num_heads), device="cuda", dtype=torch.float32)
+    cu_seqlen_ke = torch.randint(0, num_k + 1, (num_q,), device="cuda", dtype=torch.int32)
+    window = torch.randint(0, 700, (num_q,), device="cuda", dtype=torch.int32)
+    cu_seqlen_ks = (cu_seqlen_ke - window).clamp(min=0)
+    k_scale = torch.ones((num_k, 1), device="cuda", dtype=torch.float32)
+
+    logits = indexer._call_mqa_logits(q, k, k_scale, weights, cu_seqlen_ks, cu_seqlen_ke, None)
+    ref = _ref_fp8_mqa_logits(q, k, weights, cu_seqlen_ks, cu_seqlen_ke)
+
+    assert logits.shape == (num_q, num_k)
+    in_window = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(logits), in_window)
+    torch.testing.assert_close(logits[in_window], ref[in_window], rtol=1e-5, atol=1e-3)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 3), (3, 4)])
+def test_indexer_decode_with_paged_kv_cache_bf16(batch_size, next_n, dsa_cache_manager):
+    """BF16 keys through the V2 cache: scatter, gather back, paged decode scores.
+
+    The keys are stored unquantized, so the decode scores match the FP32
+    reference on the same BF16 inputs up to summation order.
+    """
+    torch.manual_seed(321)
+    heads, head_dim, block_size, max_model_len = 32, 128, 64, 4096
+    context_lens = torch.randint(700, 2900, (batch_size,), dtype=torch.int32)
+    final_lens = context_lens + next_n
+    total_context_tokens = context_lens.sum().item()
+
+    cache_manager, sparse_attn_config = dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=final_lens.max().item(),
+        num_layers=1,
+        indexer_k_dtype="bf16",
+    )
+    indexer = create_indexer(sparse_attn_config)
+    assert indexer.use_bf16
+    request_ids = list(range(batch_size))
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
+    )
+
+    q = torch.randn((batch_size, next_n, heads, head_dim), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, heads), device="cuda", dtype=torch.float32)
+    k_context = torch.randn((total_context_tokens, head_dim), device="cuda", dtype=torch.bfloat16)
+    k_gen = torch.randn((batch_size * next_n, head_dim), device="cuda", dtype=torch.bfloat16)
+
+    metadata_context = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=batch_size,
+        num_generations=0,
+        seq_lens=context_lens.clone(),
+        kv_lens=context_lens.clone(),
+        num_cached_tokens=[0] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=total_context_tokens,
+        num_tokens=total_context_tokens,
+        max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=False,
+        indexer_head_dim=head_dim,
+    )
+    Indexer.prepare(metadata_context)
+    _, k_context_scale = indexer._prep_q_or_k(k_context[:, :64], k_context[:, 64:])
+    indexer._update_k_cache(k_context, k_context_scale, metadata_context)
+
+    # The chunked-prefill gather reads the same rows back as BF16.
+    k_cache = cache_manager.get_indexer_k_cache_buffers(0)
+    gathered, _ = torch.ops.trtllm.indexer_k_cache_gather_op(
+        k_cache,
+        metadata_context.slot_mapping_fp8,
+        metadata_context.slot_mapping_scale,
+        0,
+        total_context_tokens,
+        indexer.k_data_bytes_per_token,
+    )
+    assert torch.equal(gathered.view(torch.bfloat16), k_context)
+
+    metadata_gen = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.full((batch_size,), next_n, dtype=torch.int32),
+        kv_lens=final_lens.clone(),
+        num_cached_tokens=context_lens.tolist(),
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=batch_size * next_n,
+        max_draft_tokens=next_n - 1,
+        use_cute_dsl_paged_mqa_logits=False,
+        indexer_head_dim=head_dim,
+    )
+    Indexer.prepare(metadata_gen)
+    indexer._update_k_cache(k_gen, torch.ones_like(k_gen[:, :1], dtype=torch.float32), metadata_gen)
+
+    if not metadata_gen.use_expanded_buffers_for_mtp:
+        q_decode = q
+        context_lens_2d = metadata_gen.kv_lens_cuda_2d[:batch_size, :next_n].contiguous()
+        block_table = metadata_gen.indexer_k_cache_block_offsets[:batch_size]
+    else:
+        q_decode = q.view(-1, 1, heads, head_dim)
+        num_tokens = batch_size * next_n
+        context_lens_2d = metadata_gen.kv_lens_expanded_cuda[:num_tokens].view(-1, 1)
+        block_table = metadata_gen.block_table_expanded[:num_tokens]
+    logits = indexer._call_paged_mqa_logits(
+        q_decode, k_cache, weights, context_lens_2d, block_table, None, max_model_len, None
+    )
+
+    # Reference over a plain BF16 copy of every request's keys.
+    kv_cache_bf16 = torch.zeros(
+        (k_cache.shape[0], block_size, 1, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    block_offsets = metadata_gen.indexer_k_cache_block_offsets
+    context_offset = 0
+    for seq_idx in range(batch_size):
+        seq_context_len = context_lens[seq_idx].item()
+        seq_keys = torch.cat(
+            [
+                k_context[context_offset : context_offset + seq_context_len],
+                k_gen[seq_idx * next_n : (seq_idx + 1) * next_n],
+            ]
+        )
+        positions = torch.arange(seq_keys.shape[0], device="cuda")
+        blocks = block_offsets[seq_idx, positions // block_size].long()
+        kv_cache_bf16[blocks, positions % block_size, 0] = seq_keys
+        context_offset += seq_context_len
+    final_lens_cuda = final_lens.cuda()
+    # FP32 operands: a BF16 matmul would round every dot product to BF16.
+    ref = _ref_fp8_paged_mqa_logits(
+        q.float(),
+        kv_cache_bf16.float(),
+        weights,
+        final_lens_cuda,
+        final_lens_cuda,
+        block_offsets,
+        max_model_len,
+    )
+
+    assert logits.shape == (batch_size * next_n, max_model_len)
+    visible = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(logits), visible)
+    torch.testing.assert_close(logits[visible], ref[visible], rtol=1e-5, atol=1e-3)
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")

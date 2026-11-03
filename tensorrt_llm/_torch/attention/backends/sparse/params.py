@@ -80,7 +80,8 @@ def use_self_sampling_gvr(
         enable_heuristic_topk
         and use_self_sampling_topk
         and is_cute_dsl_available
-        and sm_version in (100, 103)
+        # datacenter Blackwell and Rubin
+        and sm_version in (100, 103, 107)
         and index_topk in (512, 1024, 2048)
         and compress_ratio in (1, 4)
     )

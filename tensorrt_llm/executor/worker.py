@@ -229,6 +229,38 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 
 @print_traceback_on_error
+class ProfileAckSender:
+    """Worker side of the synchronous profile-control ack channel.
+
+    Each proxy that issues ``StartProfileRequest`` / ``StopProfileRequest``
+    binds its own ack queue and passes its address on the request; with
+    ``num_serve_frontends > 1`` the attached frontends and the launcher each
+    have a different address. One client socket is connected per address, on
+    first use, so every ack reaches the proxy that sent the request.
+    """
+
+    def __init__(self):
+        self._queues = {}
+
+    def send(self, kind: str, err: Optional[str], req) -> None:
+        addr = getattr(req, "ack_addr", None)
+        if addr is None:
+            return
+        key = tuple(addr) if isinstance(addr, (list, tuple)) else addr
+        queue = self._queues.get(key)
+        if queue is None:
+            queue = IpcQueue(addr,
+                             is_server=False,
+                             name="worker_profile_ack_queue")
+            self._queues[key] = queue
+        queue.put((kind, err))
+
+    def close(self) -> None:
+        for queue in self._queues.values():
+            queue.close()
+        self._queues.clear()
+
+
 def worker_main(
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
@@ -332,18 +364,9 @@ def worker_main(
         # than at startup: the proxy only binds its end when profiling is
         # actually requested, and it passes the address on the request,
         # so a deployment that never profiles never creates this socket.
-        profile_ack_queue = None
-
-        def send_profile_ack(kind: str, err, req) -> None:
-            nonlocal profile_ack_queue
-            addr = getattr(req, "ack_addr", None)
-            if addr is None:
-                return
-            if profile_ack_queue is None:
-                profile_ack_queue = IpcQueue(addr,
-                                             is_server=False,
-                                             name="worker_profile_ack_queue")
-            profile_ack_queue.put((kind, err))
+        # One socket per requesting proxy (multi-frontend serving).
+        profile_ack_sender = ProfileAckSender()
+        send_profile_ack = profile_ack_sender.send
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel

@@ -76,6 +76,9 @@ from .mqa_logits_util import (
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
 
+# 64-bit L2 cache-policy descriptor of an evict-first TMA load (CUTLASS CacheHintSm90::EVICT_FIRST).
+_L2_EVICT_FIRST = 0x12F0000000000000
+
 
 # Reduction identities for emit_block_meta; must match the GVR kernel's
 # FLT_MAX/NEG_FLT_MAX sentinels (gvr_topk_decode.py).
@@ -386,6 +389,33 @@ def unpack_bf16x2(
     return r0, r1
 
 
+@dsl_user_op
+def cvt_relu_bf16x2(
+    lo: cutlass.Float32,
+    hi: cutlass.Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Packed {bf16(relu(lo)), bf16(relu(hi))} with ``lo`` in the low half, in one cvt.rn.relu.bf16x2.f32 (the PTX op
+    packs its first source into the upper half). Same instruction and operand order as DeepGEMM's
+    ``ptx::cvt_relu_bf16x2_f32``."""
+    i32_ty = Int32.mlir_type
+    return Int32(
+        llvm.inline_asm(
+            i32_ty,
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.relu.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _pk(dt, a, b):
     return pack_f16x2(a, b) if dt is Float16 else pack_bf16x2(a, b)
 
@@ -541,6 +571,10 @@ class FP4MQALogitsKernel:
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
         use_relu_trick: bool = True,
+        kv_evict_first: bool = False,
+        fused_relu_cvt: bool = False,
+        seq_col_offset: bool = False,
+        epi_ld_prefetch: bool = False,
     ):
         # The epilogue FMA works on head groups of 4. The N tile itself only
         # needs the tcgen05 rule (8 <= N <= N_max, N % 8 == 0); the SF layouts
@@ -591,6 +625,33 @@ class FP4MQALogitsKernel:
         )
         self.num_heads = num_heads
         self.head_dim = head_dim
+        # Opt-in L2 evict-first policy on the KV + SF_KV TMA loads: every key byte is read once per call, so the hint
+        # leaves L2 to the logits a Top-K reads next. Only the cache policy changes; the logits are bit-identical.
+        self.kv_evict_first = bool(kv_evict_first)
+        # Opt-in BF16-epilogue ReLU as one cvt.rn.relu.bf16x2.f32 per head pair (DeepGEMM's BF16-reduce instruction)
+        # instead of two converts, a pack and max.bf16x2. Same values for finite accumulators.
+        assert not fused_relu_cvt or epi_dtype == cutlass.BFloat16, (
+            "fused_relu_cvt requires epi_dtype=bf16"
+        )
+        self.fused_relu_cvt = bool(fused_relu_cvt)
+        # Opt-in per-sequence logits column offset (``col_offset`` [batch] int32, a multiple of 256): sequence q's
+        # scores for its block-table keys [0, ctx) land in columns col_offset[q] + [0, ctx). Lets several sequences
+        # share one key matrix from different starting keys; needs the flat logits view and no emission.
+        self.seq_col_offset = bool(seq_col_offset)
+        # Opt-in epilogue TMEM-load prefetch: token t+1's LDTM is issued into a second register fragment before
+        # token t's ReLU+FMA, so its latency hides behind that compute (same arithmetic, same results). Even split,
+        # one epilogue sub-tile.
+        self.epi_ld_prefetch = bool(epi_ld_prefetch)
+        if self.epi_ld_prefetch:
+            assert num_epi_subtiles == 1 and not self.uneven, (
+                "epi_ld_prefetch: one sub-tile, even split"
+            )
+        if self.seq_col_offset:
+            assert num_next_n_atoms == 1 and not emit_block_meta, (
+                "seq_col_offset: one atom, no emission"
+            )
+            assert use_flat_logits_view in (None, True), "seq_col_offset needs the flat logits view"
+            use_flat_logits_view = True
         self.next_n = next_n  # logical next-token count (drives output row layout)
         self.num_next_n_atoms = num_next_n_atoms
         self.next_n_atom = _next_n_atom
@@ -750,6 +811,10 @@ class FP4MQALogitsKernel:
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
 
+    def _kv_cache_policy(self):
+        """L2 cache hint of the KV + SF_KV TMA loads (None = the default policy)."""
+        return cutlass.Int64(_L2_EVICT_FIRST) if self.kv_evict_first else None
+
     def _atom_seq(self, qa):
         """Native sequence (block_table / context_lens row) of a q_atom_idx.
         num_next_n_atoms == 1 => identity."""
@@ -812,6 +877,7 @@ class FP4MQALogitsKernel:
         mLogits_2d,
         q_idx,
         packed_zero,
+        tTR_rAcc_b=None,
     ):
         """Epilogue for one KV tile of one math warp group: token slots
         0..n_valid-1 (LDTM -> ReLU+FMA -> reduce, see _epi_t_body), then the
@@ -822,7 +888,7 @@ class FP4MQALogitsKernel:
                 n_valid,
                 tTR,
                 tiled_copy_ref,
-                tTR_rAcc,
+                tTR_rAcc if tTR_rAcc_b is None or t % 2 == 0 else tTR_rAcc_b,
                 w_cache,
                 sW,
                 q_stage_local,
@@ -837,6 +903,7 @@ class FP4MQALogitsKernel:
                 mLogits_2d,
                 q_idx,
                 packed_zero,
+                None if tTR_rAcc_b is None else (tTR_rAcc_b if t % 2 == 0 else tTR_rAcc),
             )
         if cutlass.const_expr(self.use_batched_store):
             # Batched STG: all result_arr[t] -> mLogits in one pass.
@@ -869,6 +936,7 @@ class FP4MQALogitsKernel:
         mLogits_2d,
         q_idx,
         packed_zero,
+        tTR_rAcc_next=None,
     ):
         """One epilogue token-slot `t`. Every operand is an explicit argument
         (no closure: the rem>0 dispatch calls this from inside a staged runtime
@@ -889,9 +957,14 @@ class FP4MQALogitsKernel:
             s1x = cutlass.Float32(0.0)
             s1y = cutlass.Float32(0.0)
         for i in range(num_epi_subtiles):
-            # LDTM for sub-tiles 1..N-1
-            # (sub-tile 0 handled above)
-            if t > 0 or i > 0:
+            if cutlass.const_expr(self.epi_ld_prefetch):
+                # tTR_rAcc holds token t (issued during token t-1, or by the caller for t = 0): wait for it, then
+                # issue token t+1 into the other fragment before computing t.
+                if t > 0:
+                    cute.arch.fence_view_async_tmem_load()
+            elif t > 0 or i > 0:
+                # LDTM for sub-tiles 1..N-1
+                # (sub-tile 0 handled above)
                 cute.copy(
                     tiled_copy_ref,
                     tTR[
@@ -915,6 +988,9 @@ class FP4MQALogitsKernel:
                 # method left the phase constant -> deadlock). The caller
                 # advances right after _epi_tokens; the release stays here.
             acc_vec = tTR_rAcc.load()
+            if cutlass.const_expr(self.epi_ld_prefetch):
+                if t + 1 < n_valid:
+                    cute.copy(tiled_copy_ref, tTR[(None, None, None, 0, t + 1)], tTR_rAcc_next)
             sw_col = sW[(None, q_stage_local)]
             # Reg-path: weights from registers
             reg_h_end = min(subtile_n, max(0, NUM_W_IN_REG - i * subtile_n))
@@ -923,8 +999,12 @@ class FP4MQALogitsKernel:
                 h_g = i * subtile_n + h
                 # packed path catches fp16 & bf16
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
-                    pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
-                    pa23 = _mx(edt, _pk(edt, edt(acc_vec[n0 + 2]), edt(acc_vec[n0 + 3])), pz)
+                    if cutlass.const_expr(self.fused_relu_cvt):
+                        pa01 = cvt_relu_bf16x2(acc_vec[n0], acc_vec[n0 + 1])
+                        pa23 = cvt_relu_bf16x2(acc_vec[n0 + 2], acc_vec[n0 + 3])
+                    else:
+                        pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
+                        pa23 = _mx(edt, _pk(edt, edt(acc_vec[n0 + 2]), edt(acc_vec[n0 + 3])), pz)
                     r0 = t * NUM_W_IN_REG + h_g
                     ps01 = _fm(edt, pa01, _pk(edt, w_cache[r0], w_cache[r0 + 1]), ps01)
                     ps23 = _fm(edt, pa23, _pk(edt, w_cache[r0 + 2], w_cache[r0 + 3]), ps23)
@@ -963,8 +1043,12 @@ class FP4MQALogitsKernel:
                 n0 = h
                 h_g = i * subtile_n + h
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
-                    pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
-                    pa23 = _mx(edt, _pk(edt, edt(acc_vec[n0 + 2]), edt(acc_vec[n0 + 3])), pz)
+                    if cutlass.const_expr(self.fused_relu_cvt):
+                        pa01 = cvt_relu_bf16x2(acc_vec[n0], acc_vec[n0 + 1])
+                        pa23 = cvt_relu_bf16x2(acc_vec[n0 + 2], acc_vec[n0 + 3])
+                    else:
+                        pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
+                        pa23 = _mx(edt, _pk(edt, edt(acc_vec[n0 + 2]), edt(acc_vec[n0 + 3])), pz)
                     w_i = t * num_heads + h_g
                     ps01 = _fm(edt, pa01, _pk(edt, sw_col[w_i], sw_col[w_i + 1]), ps01)
                     ps23 = _fm(edt, pa23, _pk(edt, sw_col[w_i + 2], sw_col[w_i + 3]), ps23)
@@ -1366,6 +1450,7 @@ class FP4MQALogitsKernel:
         cand_ctl: cute.Tensor = None,  # [num_rows, 2] int32 {claimed, void}, zeroed
         cand_idx_t: cute.Tensor = None,  # bucketed: [num_rows, 2*segA+capC] int32 SoA
         cand_cur: cute.Tensor = None,  # bucketed: [num_rows, 4] int32 cursors, zeroed
+        col_offset: cute.Tensor = None,  # [batch] int32 logits column offsets (seq_col_offset)
     ):
         # Derive KV data and SF views from the fused uint8 buffer.
         # Fused layout per phys block: [data half_head_dim*phys_block_kv bytes]
@@ -1604,6 +1689,7 @@ class FP4MQALogitsKernel:
             cand_ctl,
             cand_idx_t,
             cand_cur,
+            col_offset,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1657,6 +1743,7 @@ class FP4MQALogitsKernel:
         mCandCtl: cute.Tensor,  # [num_rows, 2] int32 {claimed, void} (or None)
         mCandIdx: cute.Tensor,  # bucketed: [num_rows, 2*segA+capC] int32 SoA (or None)
         mCandCur: cute.Tensor,  # bucketed: [num_rows, 4] int32 cursors (or None)
+        mColOffset: cute.Tensor,  # [batch] int32 logits column offsets (or None)
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -2235,12 +2322,14 @@ class FP4MQALogitsKernel:
                         tAsA_0[(None, i, stage)],
                         tma_bar_ptr=bar,
                         mcast_mask=a_mcast_mask,
+                        cache_policy=self._kv_cache_policy(),
                     )
                     cute.copy(
                         tma_atom_sf_kv,
                         tSgSF_KV_0[(None, 0, phys_blks[i])],
                         tSsSF_KV_0[(None, i, stage)],
                         tma_bar_ptr=bar,
+                        cache_policy=self._kv_cache_policy(),
                     )
                 kv_prod_state_0.advance()
 
@@ -2314,12 +2403,14 @@ class FP4MQALogitsKernel:
                         tAsA_1[(None, i, stage)],
                         tma_bar_ptr=bar,
                         mcast_mask=a_mcast_mask,
+                        cache_policy=self._kv_cache_policy(),
                     )
                     cute.copy(
                         tma_atom_sf_kv,
                         tSgSF_KV_1[(None, 0, phys_blks[i])],
                         tSsSF_KV_1[(None, i, stage)],
                         tma_bar_ptr=bar,
+                        cache_policy=self._kv_cache_policy(),
                     )
                 kv_prod_state_1.advance()
 
@@ -2711,6 +2802,10 @@ class FP4MQALogitsKernel:
                 m_coord = tTR_cC[0][0]
 
                 tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                if cutlass.const_expr(self.epi_ld_prefetch):
+                    tTR_rAcc_b = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                else:
+                    tTR_rAcc_b = None
 
                 # Register weight cache: the first NUM_W_IN_REG heads per
                 # next_n slot (budget rationale: see _max_num_w_in_reg).
@@ -2819,6 +2914,8 @@ class FP4MQALogitsKernel:
                             out_row_off = (
                                 cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
                             )
+                            if cutlass.const_expr(self.seq_col_offset):
+                                out_row_off = out_row_off + cutlass.Int64(mColOffset[q_idx])
                         # Preload first NUM_W_IN_REG weights per slot. When the
                         # relu trick is on, pre-halve here (once per q-stage,
                         # off the hot path): the register-path's packed
@@ -2995,6 +3092,7 @@ class FP4MQALogitsKernel:
                             mLogits_2d,
                             q_idx,
                             packed_zero,
+                            tTR_rAcc_b,
                         )
                         if cutlass.const_expr(not self.uneven):
                             self._epi_tokens(next_n, *ops)
@@ -3515,6 +3613,10 @@ class FP4MQALogitsKernel:
                 m_coord = tTR_cC[0][0]
 
                 tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                if cutlass.const_expr(self.epi_ld_prefetch):
+                    tTR_rAcc_b = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                else:
+                    tTR_rAcc_b = None
 
                 # Register weight cache, same budget as WG 0 (_max_num_w_in_reg).
                 # Emission keeps meta accumulators live across the tile loop;
@@ -3622,6 +3724,8 @@ class FP4MQALogitsKernel:
                             out_row_off = (
                                 cutlass.Int64(self._atom_out_row_base(q_idx)) * logits_stride0
                             )
+                            if cutlass.const_expr(self.seq_col_offset):
+                                out_row_off = out_row_off + cutlass.Int64(mColOffset[q_idx])
                         # Preload first NUM_W_IN_REG weights per slot. When the
                         # relu trick is on, pre-halve here (once per q-stage,
                         # off the hot path): the register-path's packed
@@ -3790,6 +3894,7 @@ class FP4MQALogitsKernel:
                             mLogits_2d,
                             q_idx,
                             packed_zero,
+                            tTR_rAcc_b,
                         )
                         if cutlass.const_expr(not self.uneven):
                             self._epi_tokens(next_n, *ops)
