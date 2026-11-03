@@ -415,6 +415,20 @@ def _indexer_splitk_kernel(
                         (coord_k, coord_n),
                         full_mbar.subview(stage),
                     )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so
+        # the last `PIPE_STAGES` commit-arrives (multicast to the K-split peers when
+        # SPLITK_B_MCAST) are awaited here. Nothing orders them against the `acc_mbar`
+        # commit the CTA does wait for, and an arrive still in flight at exit lands in the
+        # shared memory of the next CTA on the SM.
+        for t in cutlass.range_constexpr(PIPE_STAGES):
+            last = num_split_k_tiles - cutlass.Int64(PIPE_STAGES - t)
+            if last >= cutlass.Int64(0):
+                while not prims.mbarrier_try_wait_parity(
+                    empty_mbar.subview(last % cutlass.Int64(PIPE_STAGES)),
+                    ((last // cutlass.Int64(PIPE_STAGES)) & cutlass.Int64(1)).to(cutlass.Int32),
+                    time_limit=10_000_000,
+                ):
+                    pass
 
     if warp_idx == 1:
         scale_d = cutlass.Boolean(False)

@@ -433,6 +433,16 @@ def kernel(
                 if stage == cutlass.Int32(stages):
                     stage = cutlass.Int32(0)
                     phase = phase ^ cutlass.Int32(1)
+        # Producer tail: a stage's empty barrier is waited on only to refill it (never when
+        # `stage_steps <= stages`), so the MMA warp's last `stages` commit-arrives are
+        # awaited here. Nothing orders them against the `acc_mbar` commit the CTA does wait
+        # for, and an arrive still in flight at exit lands in the shared memory of the next
+        # CTA on this SM.
+        for j in cutlass.range_constexpr(max(0, stage_steps - stages), stage_steps):
+            while not prims.mbarrier_try_wait_parity(
+                empty_bar.subview(j % stages), (j // stages) % 2, time_limit=10_000_000
+            ):
+                pass
 
     # ---- MMA warp -------------------------------------------------------------
     if warp_idx == MMA_WARP:

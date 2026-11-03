@@ -1665,6 +1665,26 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     work_iteration,
                 )
                 work_iteration += cutlass.Int32(1)
+        # Producer tail: Q's empty barrier is waited on only to refill a slot, so the QK
+        # warp's last releases (a commit, or a plain arrive for an empty row) are awaited
+        # here. Nothing orders them against what the CTA does wait for, and an arrive still
+        # in flight at exit lands in the shared memory of the next CTA on this SM.
+        if cutlass.const_expr(dense_causal):
+            last = work_iteration - cutlass.Int32(1)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    q_empty.data_ptr(), last % cutlass.Int32(2)
+                ):
+                    pass
+        else:
+            for t in cutlass.range_constexpr(CLC_STAGES):
+                last = work_iteration - cutlass.Int32(CLC_STAGES - t)
+                if last >= cutlass.Int32(0):
+                    while not prims.mbarrier_try_wait_parity(
+                        q_empty.data_ptr() + last % cutlass.Int32(CLC_STAGES),
+                        (last // cutlass.Int32(CLC_STAGES)) % cutlass.Int32(2),
+                    ):
+                        pass
 
     # =====================================================================
     # W12-W15 - four independent direct sparse gather4 producers. Each warp
@@ -1862,6 +1882,20 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 work_iteration,
             )
             work_iteration += cutlass.Int32(1)
+        # Producer tail: a K/V panel's empty barrier is waited on only to refill the slot,
+        # so the last `st_kv` panels' releases (the QK and PV commits, the RoPE panel's
+        # commit and arrive) are awaited here. Nothing orders them against what the CTA does
+        # wait for, and an arrive still in flight at exit lands in the shared memory of the
+        # next CTA on this SM.
+        panels = tile_iteration * cutlass.Int32(K_HDIM_STAGES)
+        for t in cutlass.range_constexpr(st_kv):
+            last = panels - cutlass.Int32(st_kv - t)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    kv_empty.data_ptr() + last % cutlass.Int32(st_kv),
+                    (last // cutlass.Int32(st_kv)) & cutlass.Int32(1),
+                ):
+                    pass
 
     # =====================================================================
     # W8 — independent CTA1 QK consumer
@@ -2667,6 +2701,18 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     work_iteration,
                 )
                 work_iteration += cutlass.Int32(1)
+        # Producer tail: P's empty barrier is waited on only to rewrite a stage, so the PV
+        # warp's last `ST_P` commit-arrives are awaited here. Nothing orders them against
+        # what the CTA does wait for, and an arrive still in flight at exit lands in the
+        # shared memory of the next CTA on this SM.
+        for t in cutlass.range_constexpr(ST_P):
+            last = tile_iteration - cutlass.Int32(ST_P - t)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    p_empty.data_ptr() + last % cutlass.Int32(ST_P),
+                    (last // cutlass.Int32(ST_P)) % cutlass.Int32(2),
+                ):
+                    pass
 
     # =====================================================================
     # W4-7 — correction / rescale / epilogue
@@ -3120,11 +3166,14 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 tile_iteration += num_kt
 
     # The scheduler and all role warps consume the final invalid response
-    # before reconverging for the single persistent TMEM deallocation.
+    # before reconverging for the single persistent TMEM deallocation. The fence pair
+    # orders every warp's tcgen05 accesses before the barrier ahead of the dealloc.
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     prims.barrier_cta_sync(0)
     if tidx == 0:
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
     if warp_idx == W_MMA_PV:
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group="cta_1")
 
 

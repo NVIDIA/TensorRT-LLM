@@ -1174,6 +1174,22 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
                 local_major_divisor,
                 tile_sched_params.raster_along_m,
             )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so the
+        # MMA warp's last `num_ab_stage` commit-arrives are awaited here (as cutlass's
+        # PipelineTmaUmma.producer_tail). Nothing orders them against the accumulator commits
+        # the epilogue waits for, and an arrive still in flight at exit lands in the shared
+        # memory of the next CTA on this SM.
+        for _ in cutlass.range_constexpr(num_ab_stage):
+            while not prims.mbarrier_try_wait_parity(
+                ab_empty_mbar_ptr.subview(ab_stage_idx),
+                ab_mbar_empty_phase_bit,
+                time_limit=10_000_000,
+            ):
+                pass
+            ab_stage_idx = ab_stage_idx + 1
+            if ab_stage_idx == num_ab_stage:
+                ab_stage_idx = 0
+                ab_mbar_empty_phase_bit = ab_mbar_empty_phase_bit ^ 1
 
     # =========================================================================
     # MMA warp (warp 8): TMEM alloc, S2T copy, block-scaled tcgen05.mma compute
@@ -1556,6 +1572,12 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             tile_sched_params.raster_along_m,
         )
         acc_stage_idx = 0
+        # The C staging stage alternates across tiles, not only within one. A per-tile
+        # reset put every tile's first store in stage 1, and with one output subtile per
+        # tile (tile_n 128) the next tile then rewrote that stage while the wait below
+        # (`epi_stages - 1` groups left in flight) still let the previous tile's TMA store
+        # read it: that store published the next tile's values.
+        epi_stage_idx = 0
         while work_tile.is_valid_tile:
             cur_tile_coord = work_tile.tile_idx
             tile_coord_m = cur_tile_coord[0]
@@ -1592,7 +1614,6 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             else:
                 base_col_id = tmem_base_col + acc_stage_idx * cols_per_acc_stage
 
-            epi_stage_idx = 0
             # Invalid rows skip arithmetic but still publish every scale entry.
             # Initialize the entire tile: N256 owns eight entries, not four.
             sfc_local.store(cutlass.vector.full((num_sfc_per_tile,), 0.0, cutlass.Float32))
@@ -1809,6 +1830,11 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
                 local_major_divisor,
                 tile_sched_params.raster_along_m,
             )
+
+        # The last TMA stores must have read C staging before this CTA exits: its shared
+        # memory then goes to whatever CTA the SM runs next.
+        if warp_idx == epilog_warp_id[0]:
+            prims.cp_async_bulk_wait_group(0, read=True)
 
         # Deallocate TMEM after persistent loop — epilogue warps sync
         prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
