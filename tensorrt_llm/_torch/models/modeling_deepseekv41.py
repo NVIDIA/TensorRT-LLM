@@ -413,8 +413,8 @@ class _ExchangedEngramLookup:
 
 
 def _engram_table_share_key(checkpoint_dir: Optional[str], layer_id: int) -> Optional[str]:
-    """Identify a layer's Engram table by the checkpoint file that holds it: path, size and mtime;
-    None if the checkpoint index does not name that file."""
+    """Identify a layer's Engram table by the checkpoint file that holds it: path, device, inode, size
+    and mtime; None if the checkpoint index does not name that file."""
     if not checkpoint_dir:
         return None
     root = Path(checkpoint_dir)
@@ -429,7 +429,8 @@ def _engram_table_share_key(checkpoint_dir: Optional[str], layer_id: int) -> Opt
     except (OSError, ValueError) as error:
         logger.debug(f"Engram layer {layer_id} keeps a private table: {error}")
         return None
-    return f"{path}:{stat.st_size}:{stat.st_mtime_ns}:layer{layer_id}"
+    # Device and inode tell apart different files mounted at one path.
+    return f"{path}:{stat.st_dev}:{stat.st_ino}:{stat.st_size}:{stat.st_mtime_ns}:layer{layer_id}"
 
 
 class DeepseekV41Engram(Engram):
@@ -1376,12 +1377,12 @@ class DeepseekV41Model(DeepseekV4Model):
             model_config
         )
         self.encoder_replay_enabled = encoder_replay_enabled(
-            max_num_tokens=model_config.max_num_tokens, replay_window=self.decoder_replay_window
+            max_num_tokens=model_config.max_num_tokens,
+            replay_window=self.decoder_replay_window,
+            supported=self.decoder_replay_split is not None and self.ced_kv_precompute,
         )
-        if self.encoder_replay_enabled and (
-            self.decoder_replay_split is None or not self.ced_kv_precompute
-        ):
-            raise ValueError("Encoder recovery requires a supported decoder replay topology")
+        # The CSA2 cache manager and its estimator follow this decision.
+        model_config.extra_attrs["csa2_encoder_replay"] = self.encoder_replay_enabled
         mapping = model_config.mapping
         # GB300 measurements cover TP4 head-sharded host tables at T=1.
         self._engram_projection_schedule = (

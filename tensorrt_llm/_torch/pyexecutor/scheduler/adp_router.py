@@ -1193,9 +1193,11 @@ class ConversationAwareADPRouter(ADPRouter):
 
     With ``least_prefill`` placement, or while long-prefill demotion is on
     (``TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS``), every routed request gets
-    ``py_uncached_prefill_tokens``: a conversation's prompt grows by appending, so a
-    later turn adds ``prompt_len`` minus the previous turn's prompt, which its rank
-    caches; a first turn or a prompt that shrank adds its whole prompt.
+    ``py_uncached_prefill_tokens`` once placed: a conversation's prompt grows by
+    appending, so a later turn on the rank that served its previous turn there adds
+    ``prompt_len`` minus that turn's prompt, which the rank caches; a first turn, a
+    turn on another rank or a prompt that shrank adds its whole prompt. A turn that
+    overflows off its conversation's rank leaves that rank's record unchanged.
     ``least_prefill`` places by these pending-prefill tokens instead of the prompt
     lengths of ``least_tokens``, which multi-turn traffic with long cached histories
     dominates.
@@ -1222,11 +1224,11 @@ class ConversationAwareADPRouter(ADPRouter):
         self._new_conv_placement = (
             new_conv_placement if new_conv_placement in _NEW_CONV_PLACEMENTS else "round_robin"
         )
-        # Last prompt length per conversation, under the same LRU cap; kept only while
-        # least_prefill placement or the V2 scheduler's long-prefill demotion consumes
-        # the estimate (set_publish_uncached_estimate).
+        # (prompt length, rank) of each conversation's last turn on its rank, under the same
+        # LRU cap; kept only while least_prefill placement or the V2 scheduler's long-prefill
+        # demotion consumes the estimate (set_publish_uncached_estimate).
         self._publish_uncached_estimate_enabled = self._new_conv_placement == "least_prefill"
-        self._conv_last_prompt_len: "OrderedDict[str, int]" = OrderedDict()
+        self._conv_last_prompt: "OrderedDict[str, Tuple[int, int]]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
         self._round_robin_cursor = 0
@@ -1287,10 +1289,13 @@ class ConversationAwareADPRouter(ADPRouter):
             enabled or self._new_conv_placement == "least_prefill"
         )
 
-    def _publish_uncached_prefill_estimate(self, req_item: RequestQueueItem) -> None:
-        """Set ``py_uncached_prefill_tokens`` on the request (see the class docstring)."""
+    def _publish_uncached_prefill_estimate(
+        self, req_item: RequestQueueItem, rank: int, home_rank: Optional[int]
+    ) -> None:
+        """Set ``py_uncached_prefill_tokens`` for a request placed on ``rank`` (see the class
+        docstring); ``home_rank`` is its routing key's rank before this placement, None if new."""
         request = req_item.request
-        if request is None:
+        if not self._publish_uncached_estimate_enabled or request is None:
             return
         prompt_len = _item_num_input_tokens(req_item)
         # A sub-agent shares its parent's routing key but has its own prompt history.
@@ -1300,13 +1305,14 @@ class ConversationAwareADPRouter(ADPRouter):
             conv_id = self._conversation_id(req_item)
         estimate = prompt_len
         if conv_id is not None:
-            previous = self._conv_last_prompt_len.get(conv_id)
-            if previous is not None and previous <= prompt_len:
-                estimate = prompt_len - previous
-            self._conv_last_prompt_len[conv_id] = prompt_len
-            self._conv_last_prompt_len.move_to_end(conv_id)
-            while len(self._conv_last_prompt_len) > self._max_sessions:
-                self._conv_last_prompt_len.popitem(last=False)
+            previous = self._conv_last_prompt.get(conv_id)
+            if previous is not None and previous[1] == rank and previous[0] <= prompt_len:
+                estimate = prompt_len - previous[0]
+            if home_rank is None or rank == home_rank:
+                self._conv_last_prompt[conv_id] = (prompt_len, rank)
+                self._conv_last_prompt.move_to_end(conv_id)
+                while len(self._conv_last_prompt) > self._max_sessions:
+                    self._conv_last_prompt.popitem(last=False)
         request.py_uncached_prefill_tokens = estimate
 
     def _assign_new_conversation_explicit_dp_ranks(
@@ -1338,6 +1344,7 @@ class ConversationAwareADPRouter(ADPRouter):
                 and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
             ):
                 all_ranks_num_active_requests[target_dp_rank] += 1
+                self._publish_uncached_prefill_estimate(req_item, target_dp_rank, None)
                 all_ranks_new_requests[target_dp_rank].append(req_item)
                 if conv_id is not None:
                     self._record_target_rank(conv_id, target_dp_rank)
@@ -1366,9 +1373,6 @@ class ConversationAwareADPRouter(ADPRouter):
             return scheduling_params.attention_dp_relax
 
         sorted_requests = sorted(new_requests, key=get_relax_value)
-        if self._publish_uncached_estimate_enabled:
-            for req_item in sorted_requests:
-                self._publish_uncached_prefill_estimate(req_item)
 
         # 0) Admission reserved a slot on its conversation's rank for each
         #    strict-affinity turn: place those before anything can take it.
@@ -1378,6 +1382,7 @@ class ConversationAwareADPRouter(ADPRouter):
             if rank is None or all_ranks_num_active_requests[rank] >= max_num_active_requests:
                 unreserved.append(req_item)
                 continue
+            self._publish_uncached_prefill_estimate(req_item, rank, rank)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             self._record_target_rank(self._conversation_id(req_item), rank)
@@ -1453,6 +1458,7 @@ class ConversationAwareADPRouter(ADPRouter):
         for req_item in remaining_unscheduled:
             conv_id = self._conversation_id(req_item)
             rank = None
+            home_rank = None if conv_id is None else self._conv_to_rank.get(conv_id)
 
             if conv_id is not None and conv_id in self._conv_to_rank:
                 target_rank = self._conv_to_rank[conv_id]
@@ -1481,6 +1487,7 @@ class ConversationAwareADPRouter(ADPRouter):
                     # Bind this new conversation to its first-turn rank.
                     self._record_target_rank(conv_id, rank)
 
+            self._publish_uncached_prefill_estimate(req_item, rank, home_rank)
             all_ranks_new_requests[rank].append(req_item)
             all_ranks_num_active_requests[rank] += 1
             if by_tokens:

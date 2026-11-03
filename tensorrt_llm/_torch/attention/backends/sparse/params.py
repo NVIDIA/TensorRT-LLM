@@ -88,9 +88,8 @@ def use_self_sampling_gvr(
         and index_topk in (512, 1024, 2048)
         and compress_ratio in (1, 4)
     )
-    # SM107 self-sampling decode regresses measured synthetic-KV GEN throughput
-    # (TP8 C1: -1.27%, C256: -5.95%, C8192: -6.69%). Keep decode disabled
-    # independently of the engine's hardware support.
+    # On SM107 the self-sampling decode is slower than the exact decode Top-K, so only prefill
+    # callers get it there.
     return supported and (is_prefill or sm_version != 107)
 
 

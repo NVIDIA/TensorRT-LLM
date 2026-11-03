@@ -73,6 +73,9 @@ class TopK(nn.Module):
         gvr_self_sampling: bool = True,
         gvr_deterministic: bool = False,
         gvr_sorting: str | None = None,
+        wide_fp32_rows: bool = False,
+        wide_cta_rows: bool = False,
+        split_long_rows: bool = False,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -93,6 +96,12 @@ class TopK(nn.Module):
         self._gvr_det_kwargs = (
             {"deterministic": True, "sorting": gvr_sorting} if gvr_deterministic else {}
         )
+        # Caller opt-ins for the CuTe DSL decode kernels, forwarded only when enabled: the radix op's
+        # wide FP32-row configuration and split of short rows off the cluster launch, and the
+        # self-sampling GVR engine's _WIDE_CTA_ROWS.
+        self.wide_fp32_rows = wide_fp32_rows
+        self.wide_cta_rows = wide_cta_rows
+        self.split_long_rows = split_long_rows
         # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
         # owns the closed-loop emission state; only reachable on the temporal
         # (gvr_self_sampling=False) V1 path.
@@ -390,6 +399,8 @@ class TopK(nn.Module):
                 output_indices,
                 self.top_k,
                 next_n,
+                **({"wide_fp32_rows": True} if self.wide_fp32_rows else {}),
+                **({"split_long_rows": True} if self.split_long_rows else {}),
             )
             return output_indices
 
@@ -490,6 +501,7 @@ class TopK(nn.Module):
                     compress_ratio=self.compress_ratio,
                     max_seq_len=kv_max_seq_len,
                     **({"deterministic": True} if self.gvr_deterministic else {}),
+                    **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
                 ):
                     # the engine never JIT-compiles under capture; a launcher
                     # missed by warmup takes the exact radix path in the graph
@@ -522,6 +534,7 @@ class TopK(nn.Module):
                         compress_ratio=self.compress_ratio,
                         max_seq_len=kv_max_seq_len,
                         **self._gvr_det_kwargs,
+                        **({"wide_cta_rows": True} if self.wide_cta_rows else {}),
                     )
                     return output_indices
             else:

@@ -38,6 +38,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
     DataRole,
+    GpuCacheTierConfig,
     LayerId,
     PageIndexMode,
     ReusePolicy,
@@ -279,6 +280,8 @@ class CSA2CacheManager(KVCacheManagerV2):
 
     # A list while a deferring context prepare runs: block-offset copies are recorded for it.
     _deferred_block_offsets: list | None = None
+    # GPU tier quota of the pools, set while the base configuration is built.
+    _gpu_tier_quota: int | None = None
 
     def __init__(
         self,
@@ -293,6 +296,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         layout: CSA2Layout | None = None,
         context_swa_layer_limit: int | None = None,
         bounded_replay_on_generation: bool = False,
+        encoder_replay: bool | None = None,
         num_kv_heads: int = 1,
         head_dim: int = 512,
         **kwargs,
@@ -338,6 +342,12 @@ class CSA2CacheManager(KVCacheManagerV2):
             raise ValueError("CSA2 cache requires SELFKONLY with one 512-dimensional KV head")
         if mapping.pp_size != 1 or mapping.cp_size != 1:
             raise ValueError("CSA2 shared cache owners currently require PP=CP=1")
+        if kv_cache_config.enable_kv_pool_rebalance:
+            raise ValueError(
+                "CSA2 binds its packed pool views and the fused decode's captured TMA "
+                "descriptors to the pool sizes at construction, and a rebalance can grow the "
+                "pools past them: set kv_cache_config.enable_kv_pool_rebalance=False."
+            )
         self.layout = replace(
             layout,
             compress_ratios=layout.compress_ratios[:num_layers],
@@ -356,9 +366,14 @@ class CSA2CacheManager(KVCacheManagerV2):
             self.layout, num_layers, mapping, kv_cache_config, pretrained_config, spec_config
         )
         self._decoder_replay_window = bounded_replay_tokens(capture_window) if capture_window else 0
-        self._encoder_replay_enabled = encoder_replay_enabled(
-            max_num_tokens=kwargs.get("max_num_tokens", 8192),
-            replay_window=max(self.layout.window_size, self._decoder_replay_window),
+        # ``encoder_replay`` is the model's decision (``csa2_encoder_replay`` in its extra_attrs).
+        self._encoder_replay_enabled = bool(self._decoder_replay_window) and (
+            encoder_replay
+            if encoder_replay is not None
+            else encoder_replay_enabled(
+                max_num_tokens=kwargs.get("max_num_tokens", 8192),
+                replay_window=max(self.layout.window_size, self._decoder_replay_window),
+            )
         )
         self._encoder_reuse_policy = (
             ReusePolicy.OPTIONAL if self._encoder_replay_enabled else ReusePolicy.REQUIRED
@@ -651,9 +666,19 @@ class CSA2CacheManager(KVCacheManagerV2):
     def _get_runtime_cache_size_scratch_group_keys(self) -> list[int]:
         return self._runtime_cache_size_layer_components()[2]
 
+    def _build_base_config(self, kv_cache_config, *, tokens_per_block, cache_tiers):
+        self._gpu_tier_quota = next(
+            (tier.quota for tier in cache_tiers if isinstance(tier, GpuCacheTierConfig)), None
+        )
+        return super()._build_base_config(
+            kv_cache_config, tokens_per_block=tokens_per_block, cache_tiers=cache_tiers
+        )
+
     def _get_typical_seq_len(self, kv_cache_config):
         typical = kv_cache_config.avg_seq_len or self.max_seq_len
-        quota = kv_cache_config.max_gpu_total_bytes
+        # Split the quota the pools receive (max_tokens-capped and synced across ranks), not the
+        # rank-local budget it was derived from.
+        quota = kv_cache_config.max_gpu_total_bytes and self._gpu_tier_quota
         if not quota:
             return typical
         layer_sizes, windows, scratch_keys = self._runtime_cache_size_layer_components()
@@ -1617,9 +1642,15 @@ class CSA2CacheManager(KVCacheManagerV2):
             spec_config,
         )
         replay_window = bounded_replay_tokens(capture_window) if capture_window else 0
-        encoder_replay = encoder_replay_enabled(
-            max_num_tokens=max_num_tokens or getattr(model_config, "max_num_tokens", None),
-            replay_window=max(layout.window_size, replay_window),
+        # The model publishes its Encoder replay decision; the cache manager follows the same one.
+        decision = getattr(model_config, "extra_attrs", {}).get("csa2_encoder_replay")
+        encoder_replay = bool(replay_window) and (
+            decision
+            if decision is not None
+            else encoder_replay_enabled(
+                max_num_tokens=max_num_tokens or getattr(model_config, "max_num_tokens", None),
+                replay_window=max(layout.window_size, replay_window),
+            )
         )
         sizes, windows, scratch_groups = _cache_size_layer_components(
             layout,

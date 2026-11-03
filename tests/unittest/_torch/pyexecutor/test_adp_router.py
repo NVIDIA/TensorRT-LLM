@@ -1860,7 +1860,8 @@ class TestConversationAwareADPRouter:
             assert self._route(router, states, [turn])[turn.id] == 2
 
     def test_uncached_prefill_estimate_published_while_demotion_is_on(self):
-        """Opener: the whole prompt; a later turn: its growth since the previous turn."""
+        """Opener: the whole prompt; a later turn on its rank: its growth since the previous turn
+        there; a turn that overflows to another rank: its whole prompt."""
         router = self._router(tp_size=2)
         router.set_publish_uncached_estimate(True)
         opener = _make_conv_request_item(0, "A", num_tokens=5000)
@@ -1869,6 +1870,16 @@ class TestConversationAwareADPRouter:
         turn2 = _make_conv_request_item(1, "A", num_tokens=5300)
         self._route(router, self._states(2), [turn2])
         assert turn2.request.py_uncached_prefill_tokens == 300
+        home = router._conv_to_rank["A"]
+        full = self._states(2)
+        full[home] = RankState(rank=home, num_active_requests=5, num_active_tokens=50)
+        overflow = _make_conv_request_item(3, "A", num_tokens=5600)
+        assert self._route(router, full, [overflow], cap=5)[3] != home
+        assert overflow.request.py_uncached_prefill_tokens == 5600
+        # Back on its rank, a turn is measured against the last prompt that rank served.
+        turn4 = _make_conv_request_item(4, "A", num_tokens=5900)
+        assert self._route(router, self._states(2), [turn4])[4] == home
+        assert turn4.request.py_uncached_prefill_tokens == 600
         off = _make_conv_request_item(2, "B", num_tokens=5000)
         self._route(self._router(tp_size=2), self._states(2), [off])
         assert not isinstance(off.request.py_uncached_prefill_tokens, int)

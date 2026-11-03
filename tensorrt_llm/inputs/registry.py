@@ -224,6 +224,10 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `prompt_token_cache_config` in `__init__`.
     supports_prompt_token_cache: ClassVar[bool] = False
 
+    # Whether the processor never needs a GPU, so attached serving frontends
+    # (num_serve_frontends > 1) start with no visible GPU.
+    runs_without_gpu: ClassVar[bool] = False
+
     # Set by `_init_tokenization_cache`; None (no cache) for a processor that
     # never calls it.
     _prefix_token_cache: Optional[PrefixTokenCache] = None
@@ -1213,6 +1217,13 @@ def register_input_processor(
     return wrapper
 
 
+def _warn_prompt_token_cache_ignored(processor_name: str) -> None:
+    logger.warning_once(
+        f"prompt_token_cache_config is ignored: {processor_name} does not "
+        "support the shared prompt token cache.",
+        key="prompt_token_cache_unsupported_processor")
+
+
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
@@ -1269,6 +1280,9 @@ def create_input_processor(
             MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        if prompt_token_cache_config is not None:
+            _warn_prompt_token_cache_ignored(
+                MistralNativeInputProcessor.__name__)
         return MistralNativeInputProcessor(model_path_or_dir,
                                            config,
                                            tokenizer,
@@ -1310,6 +1324,8 @@ def create_input_processor(
                         "prompt_token_cache_config takes precedence over "
                         f"enable_tokenization_cache for {input_processor_cls.__name__}."
                     )
+            elif prompt_token_cache_config is not None:
+                _warn_prompt_token_cache_ignored(input_processor_cls.__name__)
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
@@ -1323,6 +1339,8 @@ def create_input_processor(
                                            trust_remote_code=trust_remote_code,
                                            **kwargs)
 
+    if prompt_token_cache_config is not None:
+        _warn_prompt_token_cache_ignored(DefaultInputProcessor.__name__)
     return DefaultInputProcessor(
         None,
         None,

@@ -194,11 +194,13 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         # One-round push dispatch (``_OneRoundRouter``) for buckets of at most 256 tokens per rank at EP16 and
         # wider replaces the size broadcast, the metadata push and the token-in pull with one push round. FC1 reads
         # the same bytes. At EP8 the pushes cost more than the round trips they save. Its router does not carry
-        # per-token activation scales.
+        # per-token activation scales. It is measured on the DeepSeek-V4 MoE only, the one that applies the top-k
+        # weights at FC1.
         self.one_round_dispatch = (
             _ONE_ROUND_MIN_WORLD_SIZE <= self.world_size <= _OneRoundRouter.max_world_size
             and self.max_tokens_per_rank <= _ONE_ROUND_MAX_TOKENS_PER_RANK
             and not self.fc1_activation_per_token_scale
+            and self.apply_topk_at_fc1
         )
         # The sorter waits on one counter per (source rank, source CTA), one thread each (512 per CTA).
         self.one_round_cta_count = max(1, min(32, 512 // max(self.world_size, 1)))

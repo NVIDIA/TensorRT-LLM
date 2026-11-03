@@ -772,10 +772,14 @@ class PyExecutorProfileManager:
                 executor._latest_host_step_time_ms = host_step_time
                 executor._latest_prev_device_step_time_ms = prev_device_step_time
 
+                # Sampled iteration statistics thin the log to the same iterations.
                 if (
                     executor.print_log
                     and (log_all_ranks or executor.dist.rank in log_ranks)
-                    and executor.iter_counter % executor.iter_perf_stats_interval == 0
+                    and (
+                        not executor.enable_iter_perf_stats
+                        or executor.iter_counter % executor.iter_perf_stats_interval == 0
+                    )
                 ):
                     if prev_device_step_time is None:
                         prev_device_step_time_str = "N/A"  # first iteration

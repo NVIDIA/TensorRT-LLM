@@ -512,8 +512,8 @@ def _check_wide(logits, lengths, out):
 @pytest.mark.parametrize("rows", [296])
 @pytest.mark.parametrize("kind", ["spiky", "ties"])
 def test_selfsampling_topk_varlen_wide_cta(monkeypatch, rows, kind):
-    """149..296 varlen rows run gvr_main as one 1,024-thread CTA per row and select the exact
-    Top-K, as the 512-thread plan does (eager and CUDA-graph replay)."""
+    """With wide_cta_rows, 149..296 varlen rows run gvr_main as one 1,024-thread CTA per row and
+    select the exact Top-K, as the default 512-thread plan does (eager and CUDA-graph replay)."""
     from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as ss_dev
 
     logits, lengths = _wide_batch(rows, kind, seed=rows)
@@ -525,23 +525,33 @@ def test_selfsampling_topk_varlen_wide_cta(monkeypatch, rows, kind):
         return compiled(tpl, *args, **kwargs)
 
     monkeypatch.setattr(ss_dev, "get_compiled", spy)
-    wide = ss_host._WIDE_CTA_ROWS
-    for plan in ((0, 0), wide):
-        monkeypatch.setattr(ss_host, "_WIDE_CTA_ROWS", plan)
+    for wide_cta_rows in (False, True):
         ss_host._VARLEN_CACHE.clear()
         blocks.clear()
         out = torch.full((rows, _WIDE_K), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(
-            logits, lengths, out, next_n=1, compress_ratio=1, max_seq_len=_WIDE_WIDTH
+            logits,
+            lengths,
+            out,
+            next_n=1,
+            compress_ratio=1,
+            max_seq_len=_WIDE_WIDTH,
+            wide_cta_rows=wide_cta_rows,
         )
         torch.cuda.synchronize()
-        assert blocks == ([1024] if plan == wide else [512]), (plan, blocks)
+        assert blocks == ([1024] if wide_cta_rows else [512]), (wide_cta_rows, blocks)
         _check_wide(logits, lengths, out)
     graph = torch.cuda.CUDAGraph()
     out = torch.empty((rows, _WIDE_K), dtype=torch.int32, device=_DEV)
     with torch.cuda.graph(graph):
         ss_host.run_varlen(
-            logits, lengths, out, next_n=1, compress_ratio=1, max_seq_len=_WIDE_WIDTH
+            logits,
+            lengths,
+            out,
+            next_n=1,
+            compress_ratio=1,
+            max_seq_len=_WIDE_WIDTH,
+            wide_cta_rows=True,
         )
     fresh, _ = _wide_batch(rows, kind, seed=rows + 1)
     logits.copy_(fresh)

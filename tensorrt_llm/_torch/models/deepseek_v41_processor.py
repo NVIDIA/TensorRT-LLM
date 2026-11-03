@@ -195,6 +195,7 @@ class DeepseekV41InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     supports_token_id_mm_expansion = True
     supports_prompt_token_cache = True
+    runs_without_gpu = True
 
     def __init__(
         self,

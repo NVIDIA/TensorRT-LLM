@@ -231,6 +231,12 @@ class CUDAGraphRunnerConfig:
     # process-wide one, so no other engine writes its metadata buffers (an
     # engine that skips unchanged uploads into them relies on that).
     private_metadata_buffers: bool = False
+    # Capture decode graphs on a high-priority stream for a small engine
+    # (RuntimeHooks.prioritize_decode_graphs).
+    prioritize_decode_graphs: bool = False
+    # Write a replay's input ids and positions in one launch
+    # (RuntimeHooks.stage_decode_inputs).
+    stage_decode_inputs: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
     static_input_ids: Optional[torch.Tensor] = None
@@ -844,8 +850,10 @@ class CUDAGraphRunner:
         return self.memory_pool
 
     def _priority_capture_stream(self) -> Optional[torch.cuda.Stream]:
-        """The stream decode graphs are captured on: a high-priority one for a small engine, else
-        PyTorch's capture stream (None)."""
+        """The stream decode graphs are captured on: a high-priority one for a small engine whose
+        model opted in, else PyTorch's capture stream (None)."""
+        if not self.config.prioritize_decode_graphs:
+            return None
         priority = decode_stream_priority(self.config.max_num_tokens)
         if priority == 0:
             return None
@@ -1025,8 +1033,8 @@ class CUDAGraphRunner:
             hook_positions = self._pre_replay_position_ids[..., :seqlen]
         # One launch copies the ids and positions and writes the hooks' positions,
         # unless an open step-input pack still defers copies into its sources.
-        staged = (copy_input_ids and not self.config.use_mrope
-                  and not step_inputs.is_open()
+        staged = (self.config.stage_decode_inputs and copy_input_ids
+                  and not self.config.use_mrope and not step_inputs.is_open()
                   and tuple(position_ids.shape) == (1, seqlen)
                   and stage_replay_inputs(
                       static_input_ids, input_ids,

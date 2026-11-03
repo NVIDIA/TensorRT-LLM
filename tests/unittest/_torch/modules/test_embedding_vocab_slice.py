@@ -49,3 +49,21 @@ def test_vocab_slice_lookup_sums_to_full_embedding(tp_size, tokens, hidden):
     expected_total = F.embedding(ids.clamp(min=0), table).float()
     expected_total[0] = 0
     assert torch.equal(total, expected_total)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@torch.inference_mode()
+def test_lookup_of_table_past_int32_offsets():
+    """Rows of a table with more than 2^31 elements are looked up exactly."""
+    hidden = 8192
+    vocab = (1 << 31) // hidden + 64
+    if torch.cuda.mem_get_info()[0] < vocab * hidden * 2 + (1 << 30):
+        pytest.skip("needs about 5 GiB of free GPU memory")
+    table = torch.empty(vocab, hidden, dtype=torch.bfloat16, device="cuda")
+    ids = torch.tensor([0, vocab // 2, vocab - 65, vocab - 2, vocab - 1, -1], device="cuda")
+    rows = ids[ids >= 0]
+    table[rows] = torch.randn(rows.numel(), hidden, dtype=torch.bfloat16, device="cuda")
+    out = pre_comm_embedding_ops(ids, table, 1, 0, None, 0, vocab, False, 0)
+    expected = table[ids.clamp(min=0)]
+    expected[ids < 0] = 0
+    assert torch.equal(out, expected)

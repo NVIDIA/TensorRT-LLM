@@ -19,8 +19,15 @@ helper on other hardware; there is no CSA2 FMHA registration or controller.
 | --- | --- | --- |
 | SM100 family | `CSA2TrtllmAttention.forward` | Native trtllm-gen dynamic sparse MLA |
 | SM100 family, generation tiles with 64 query heads | `CSA2TrtllmAttention.forward_fused_decode` | Fused sparse decode kernel |
-| SM120/121 | `CSA2FlashInfer` | FlashInfer BF16 FA2 |
-| SM90 | `CSA2FlashMLA` | FlashMLA sparse BF16 |
+| SM103, E4M3-staged generation tiles of ratio-2 layers with 64 query heads and at least 1024 rows per rank | `CSA2TrtllmAttention._forward_gen_fmha` | `gen_fmha` sparse MLA core |
+| SM120/121, checkpoints without candidate consumers | `CSA2FlashInfer` | FlashInfer BF16 FA2 |
+| SM90, checkpoints without candidate consumers | `CSA2FlashMLA` | FlashMLA sparse BF16 |
+
+A checkpoint with a `candidate_source_layer_id` (the released one has candidate
+consumers at layers 24/28/32/36) needs an SM100-family GPU, a DeepGEMM build with
+the sparse MQA-logits kernels, 32 index heads of 128 dimensions and a
+`candidate_block_size` that is a multiple of 8; model construction rejects any
+other combination with an error naming the missing requirement.
 
 FP8 context tiles that stage the shared E4M3 bank with 64 query heads per rank
 run `torch.ops.trtllm.csa2_sparse_context` (`cpp/tensorrt_llm/kernels/csa2SparseContext`)
@@ -36,12 +43,13 @@ CuTe DSL launch decodes the SWA and main rows exactly into BF16 shared memory
 and attends them with the BF16 query and the sink, so neither the FP8 staging
 nor the native FMHA runs. The backend decides per tile in
 `direct_decode_applies` (generation-only forwards without context tokens,
-SM100/SM103, a geometry that fits one CTA's shared memory); every layer of such
-a forward takes it, and larger batches keep the staging path unless the fused
-decode below takes them.
+SM100/SM103/SM107, a geometry that fits one CTA's shared memory); every layer
+of such a forward takes it, and larger batches keep the staging path unless the
+fused decode below takes them.
 
-Other generation tiles with 64 query heads per rank do not stage either:
-`forward_fused_decode` runs `torch.ops.trtllm.csa2_sparse_decode`
+Other generation tiles with 64 query heads per rank, except the `gen_fmha` tiles
+below, do not stage either: `forward_fused_decode` runs
+`torch.ops.trtllm.csa2_sparse_decode`
 (`cpp/tensorrt_llm/kernels/csa2SparseDecode`), which gathers each query's
 selected SWA and main rows from the packed pools, maps logical main positions
 through the owner's page table, dequantizes the rows exactly to BF16 and
@@ -51,6 +59,21 @@ generation forward of more than 16 rows whose o_a block scales are powers of
 two, its epilogue writes the grouped MXFP8 o_a projection's input instead of
 BF16 (inverse RoPE and MXFP8 quantization as
 `projection.inverse_rope_mxfp8` does them).
+
+On SM103, a generation tile of a compression-ratio-2 layer with at least 1024
+query rows per rank (`_GEN_FMHA_MIN_ROWS`), 64 query heads, E4M3 staging and at
+most 640 staged rows per query (128 SWA rows plus up to 512 main rows) is staged
+instead and attended by the `gen_fmha` core (`gen_fmha.py`, the CuTe DSL kernel
+in `attention/kernels/blackwell/sparse_mla/`). Its independent-query staging
+allocates both pools as one bank (`CSA2TrtllmMetadata.gen_fmha_bank`) and
+publishes each query's indices as rows of that bank; the core, launched with PDL
+after the staging, reads the same FP8 query, BMM scales, sink and staged E4M3
+rows as the native generation kernel but uses its own softmax (lazy rescale,
+E4M3 P). With eight local o_a groups it writes the grouped MXFP8 o_a input
+instead of BF16, as the fused decode does. The module asks `gen_fmha_serves`
+before projecting and the backend decides per tile in `gen_fmha_applies`, from
+what a captured graph fixes; ratio-1 and SWA-only layers and smaller tiles keep
+the paths above.
 
 Decode work of the indexer that does not depend on the layer's own projections runs on
 CSA2 side streams: a Full layer of a forward without context tokens projects its index
@@ -72,7 +95,8 @@ pools. `kv_cache_config.dtype` selects only this staging dtype; the persistent
 cache formats never change with it. Staging is BF16 unless FP8 is asked for:
 with `fp8` or `fp8_ds_mla` (or an FP8 KV-cache algorithm in a directly
 constructed backend's quantization config under `auto`), native trtllm-gen
-consumes E4M3 staging. `CSA2Params.use_fp8_staging` overrides that choice --
+(or, for its tiles, the `gen_fmha` core) consumes E4M3 staging.
+`CSA2Params.use_fp8_staging` overrides that choice --
 left unset it follows the native path's own support, `False` pins BF16, and
 `True` demands E4M3 and rejects a configuration that cannot serve it rather
 than falling back. The E4M3 per-tensor KV scale is range-aware: every forward
@@ -109,7 +133,8 @@ requests' visible SWA/GLOBAL rows, that phase decodes each logical row once
 into a shared row bank and attention indexes the bank directly instead of
 expanding rows per query. Fixed-shape context graphs, and generation tiles
 that neither the direct nor the fused decode takes, use independent-query
-staging with fused compaction/dequantization kernels.
+staging with fused compaction/dequantization kernels (one bank for the
+`gen_fmha` tiles).
 
 `CSA2SparseAttentionConfig(algorithm="csa2")` selects the cache manager through
 the existing sparse registry. Geometry comes from the checkpoint text
@@ -156,7 +181,7 @@ over the paged logits. Candidate consumers score only their published candidate
 blocks with DeepGEMM sparse MQA logits: straight from the index pages for decode
 with the exact radix TopK, which selects over the kernel's BF16 logits as they
 are, and over each context request's gathered prefix for prefill; they require
-SM100 and 32 index heads of 128D rows. Reuse layers
+SM100 and 32 index heads of 128D rows (see the hardware note above). Reuse layers
 consume logical selections from their index source and resolve current physical
 pages without recomputing indexer logits.
 
@@ -173,7 +198,13 @@ lands on a masked column is dropped before the GVR kernel seeds its threshold.
 
 TopK is exact by default: eligible prefill of at least 8192 score columns uses
 the single-pass self-sampling engine, narrower prefill and decode the radix
-TopK. Short sequences whose keys all fit can
+TopK. `use_self_sampling_topk` alone selects that prefill engine, independently
+of `enable_heuristic_topk`, which selects GVR decode. `use_cute_dsl_topk`
+selects the CuTe DSL radix kernels over the CUDA radix TopK on SM100-family
+GPUs: the exact TopK, the candidate source's cluster block TopK for up to 64
+rows, and the fused decode selection of up to 16 rows (`decode_select.py`),
+which also stands in for the self-sampling GVR decode and breaks ties at the
+k-th logit by the lowest column. Short sequences whose keys all fit can
 enumerate visible positions without logits or TopK. Internal `CSA2Params` also
 exposes eligible CuTe DSL exact TopK, self-sampling/temporal GVR decode, and CuTe
 paged MQA/emission options. Temporal
@@ -189,6 +220,11 @@ an incompatible selection domain.
 commit, prefix reuse, copy-on-write, scratch, release and tier storage. Every
 attention layer has private SWA storage; only KV-source layers own global
 main/index storage, and only ratio-two owners allocate FP32 compressor state.
+Packed pool views and the fused decode's captured TMA descriptors keep the pool
+sizes of construction, so the manager rejects
+`kv_cache_config.enable_kv_pool_rebalance`. Without a `pool_ratio`, the
+SWA/GLOBAL split is sized for the GPU quota the pools receive (after the
+`max_tokens` cap and the cross-rank minimum).
 
 Each global position owns a 288-byte main record and a 68-byte index record,
 stored as two buffers of one GLOBAL page group. Main uses NVFP4 E2M1 values
@@ -264,10 +300,12 @@ The CED prepass applies the boundary layer's collapse, normalization and
 GLOBAL/index projections to the complete encoder states before narrowing
 decoder queries. The query pass preserves those cache entries and still
 executes its attention and FFN. Replay is enabled by default with a shared
-Encoder/Decoder range of 140 tokens, controlled by
-`TRTLLM_V41_BOUNDED_REPLAY_TOKENS`. This must exceed the required SWA window
-(including the embedded DSpark capture window), without a physical-ring or
-page-alignment constraint. The released checkpoint's SWA window remains 128.
+Encoder/Decoder range of 140 tokens (`DEFAULT_BOUNDED_REPLAY_TOKENS`), or one
+token more than the required SWA window (including the embedded DSpark capture
+window) when that window is wider, without a physical-ring or page-alignment
+constraint. `TRTLLM_V41_BOUNDED_REPLAY_TOKENS` overrides the range; a value that
+does not exceed the required window is an error. The released checkpoint's SWA
+window remains 128.
 This policy is approximate across stacked
 SWA layers and requires accuracy validation. Set
 `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` for full decoder prefill. Model defaults
@@ -312,8 +350,8 @@ The target publishes per-context valid capture lengths after replay exit.
 DSpark skips unwritten captures and advances its rolling window's valid length
 only by captured rows; absolute prompt positions still advance normally.
 All generation verification rows retain their original batch offsets.
-A wider embedded draft window requires setting `TRTLLM_V41_BOUNDED_REPLAY_TOKENS`
-above that window for both Decoder replay and Encoder recovery.
+A wider embedded draft window widens the default range for both Decoder replay
+and Encoder recovery.
 Decoder KV carries progress between chunks through normal cache suspension
 and resume; no HC residual/pre-mix tail is retained across forwards. Only the
 final context chunk's logits are used for sampling. Requests asking for context logits
@@ -350,11 +388,16 @@ the replay rows are selected before model execution. Its existing ADP role
 requirements and restriction against speculative decoding still apply.
 
 Encoder bounded replay is enabled by default when Decoder bounded replay is
-enabled. Prefix reuse uses independently evictable OPTIONAL Encoder groups;
-`TRTLLM_V41_ENCODER_REPLAY=0` requires cached Encoder state instead.
+enabled and the model resolved a replay split with CED precompute. Prefix reuse
+uses independently evictable OPTIONAL Encoder groups;
+`TRTLLM_V41_ENCODER_REPLAY=0` requires cached Encoder state instead. A topology
+without that split keeps required Encoder checkpoints, and an explicit
+`TRTLLM_V41_ENCODER_REPLAY=1` for it is an error at model construction.
 When `max_num_tokens` is no larger than the recovery window (including an
 embedded DSpark capture window), Encoder replay falls back to required Encoder
-checkpoints. The model, cache pools and memory sizing use this same decision;
+checkpoints. The model publishes its decision as `csa2_encoder_replay` in
+`ModelConfig.extra_attrs`; the cache pools and memory sizing follow it, and a
+cache manager without a Decoder replay window never enables Encoder replay.
 Decoder bounded replay remains enabled.
 
 Encoder groups keep REQUIRED/OPTIONAL policy even when prefix reuse is disabled;

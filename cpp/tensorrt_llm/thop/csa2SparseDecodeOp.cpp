@@ -196,7 +196,7 @@ void csa2SparseDecode(at::Tensor const& q, at::Tensor const& swaPool, at::Tensor
     }
 
     auto const schedule = csa2::makeSchedule(
-        params.numTokens, params.swaTopk, params.mainTopk, tensorrt_llm::common::getMultiProcessorCount());
+        params.numTokens, params.swaTopk, params.mainTopk, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
     TORCH_CHECK(workspace.is_cuda() && workspace.device() == q.device() && workspace.is_contiguous()
             && static_cast<size_t>(workspace.nbytes()) >= csa2::getWorkspaceSize(schedule),
         "csa2_sparse_decode: workspace must be a contiguous CUDA tensor of at least ", csa2::getWorkspaceSize(schedule),
@@ -211,7 +211,7 @@ void csa2SparseDecode(at::Tensor const& q, at::Tensor const& swaPool, at::Tensor
 //! Workspace bytes that cover every csa2_sparse_decode call on the current device.
 int64_t csa2SparseDecodeWorkspaceSize()
 {
-    return static_cast<int64_t>(csa2::getMaxWorkspaceSize(tensorrt_llm::common::getMultiProcessorCount()));
+    return static_cast<int64_t>(csa2::getMaxWorkspaceSize(at::cuda::getCurrentDeviceProperties()->multiProcessorCount));
 }
 
 //! Whether csa2_sparse_decode can run on the current device.

@@ -3504,3 +3504,27 @@ def test_grouped_output_mxfp8_matches_reference(rows, groups, heads, rank):
         atol=0,
         rtol=0,
     )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_inverse_rope_mxfp8_rows_past_int32_offsets():
+    """Rows whose element offsets pass 2**31 at 64 heads per rank quantize as they do alone."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import inverse_rope_mxfp8
+
+    groups, depth, rows = 8, 4096, 65537
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    output = torch.zeros(rows, groups * depth, device="cuda", dtype=torch.bfloat16)
+    output[-2:] = torch.randn(2, groups * depth, device="cuda", generator=gen).bfloat16()
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    quantized, scales = inverse_rope_mxfp8(output, positions, cos_sin, groups)
+    tail, tail_scales = inverse_rope_mxfp8(output[-2:], positions[-2:], cos_sin, groups)
+    assert torch.equal(quantized[:, -2:].view(torch.uint8), tail.view(torch.uint8))
+    unswizzle = torch.ops.trtllm.block_scale_interleave_reverse
+    sf_rows = (rows + 127) // 128 * 128
+    for group in range(groups):
+        full = unswizzle(scales.view(groups, sf_rows, depth // 32)[group])[rows - 2 : rows]
+        alone = unswizzle(tail_scales.view(groups, 128, depth // 32)[group])[:2]
+        assert torch.equal(full, alone)

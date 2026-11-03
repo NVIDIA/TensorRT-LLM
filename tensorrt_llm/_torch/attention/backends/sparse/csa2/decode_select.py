@@ -52,12 +52,20 @@ _PREFETCH = 4
 
 def plan(cols: int) -> tuple[int, int] | None:
     """(CTAs per row, columns per thread, a multiple of 4) for ``cols`` logits columns, or None
-    when a row does not fit in a 16-CTA cluster's registers."""
+    when a row does not fit in the registers of the largest cluster this device co-schedules."""
     for cluster in (8, 16):
         per_thread = pad_up(ceil_div(cols, cluster * _THREADS), 4)
         if per_thread <= _MAX_PER_THREAD:
-            return cluster, per_thread
+            return (cluster, per_thread) if cluster <= _max_cluster_size() else None
     return None
+
+
+def _max_cluster_size() -> int:
+    from tensorrt_llm._torch.kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
+        _query_max_cluster_size,
+    )
+
+    return _query_max_cluster_size()
 
 
 def fused_decode_select_supported(logits: torch.Tensor, top_k: int) -> bool:

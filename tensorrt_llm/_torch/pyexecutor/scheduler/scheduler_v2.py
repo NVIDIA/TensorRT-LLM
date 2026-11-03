@@ -428,9 +428,11 @@ class KVCacheV2Scheduler(RequestScheduler):
     def plan_context_pass(
         self, active_requests: RequestList, inflight_ids, window: int
     ) -> ctx_decoder_batch.ContextPassPlan:
-        """This rank's context phase as ``schedule_request`` will run it, without allocating
-        anything: same order (long-prefill demotion included), token budget, request cap and chunk
-        unit; requests not started yet count their uncached-prefill estimate. Holdable rows count
+        """An estimate of this rank's context phase, without allocating anything: arrival order
+        with long-prefill demotion, token budget, request cap and chunk unit; requests not started
+        yet count their uncached-prefill estimate. The shortest-uncached-first and starvation
+        orders, SWA scratch pre-growth and the pass's per-request skips are not modeled; a wrong
+        estimate costs at most a deferred pass, since a request is held once. Holdable rows count
         only while the queue can refill the held tokens, youngest first, the order the scheduler
         reaches them."""
         candidates = [

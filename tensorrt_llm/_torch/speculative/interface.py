@@ -630,6 +630,12 @@ class OneModelSamplingParams:
                 and self.top_k == torch.iinfo(torch.int32).max
                 and self.top_p >= 1.0 and self.min_p <= 0.0)
 
+    @property
+    def is_shard_sampleable(self) -> bool:
+        """Temperature-only and unseeded: a row the vocabulary-sharded samplers may draw. A seeded
+        row stays on the stock sampler, so its tokens do not depend on the rest of the batch."""
+        return self.is_temperature_only and self.seed is None
+
     @classmethod
     def of_request(cls, request: "LlmRequest") -> "OneModelSamplingParams":
         params = request.py_spec_sampling_params
@@ -667,12 +673,13 @@ class OneModelSamplingParams:
 
 def one_model_sampling_mode(requests) -> int:
     """A batch's sampling mode as attention-DP ranks exchange it: bit 0 when every request is greedy, bit 1
-    when every request is greedy or temperature-only (the two flags of ``_scan_one_model_sampling``)."""
+    when every request is greedy or unseeded temperature-only (the two flags of
+    ``_scan_one_model_sampling``)."""
     greedy = temperature_only = True
     for request in requests:
         params = OneModelSamplingParams.of_request(request)
         greedy &= params.is_greedy
-        temperature_only &= params.is_greedy or params.is_temperature_only
+        temperature_only &= params.is_greedy or params.is_shard_sampleable
     return int(greedy) | int(temperature_only) << 1
 
 
@@ -813,7 +820,7 @@ class SpecMetadata:
     # rank's LM-head columns; temperature-only steps are a CUDA graph variant of their own.
     samples_from_vocab_shards: bool = False
     # Part of the CUDA graph key: the batch is not all greedy, every sampled row sets
-    # only a temperature, and the worker samples such rows from vocabulary shards.
+    # only a temperature and no seed, and the worker samples such rows from vocabulary shards.
     is_all_temperature_only: bool = False
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
@@ -1594,9 +1601,9 @@ class SpecMetadata:
                 num_tokens = 1
 
             has_non_greedy_requests |= not params.is_greedy
-            all_temperature_only &= params.is_greedy or params.is_temperature_only
-            if (temperature_graphs and not params.is_greedy and
-                (not params.is_temperature_only or params.seed is not None)):
+            all_temperature_only &= params.is_greedy or params.is_shard_sampleable
+            if (temperature_graphs and not params.is_greedy
+                    and not params.is_shard_sampleable):
                 temperature_capable = False
 
             per_request_normalized.append(

@@ -41,6 +41,7 @@ from ...impl_contract import (
 from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
+from ...routing import DeepSeekV4MoeRoutingMethod
 from ..identity import grouped_gemm_identity
 from ..kernel_inputs import (
     NvFp4WeightView,
@@ -381,6 +382,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
             prime_inner_tactics=use_locality_domain,
+            # The spread tuning profile is measured on DeepSeek-V4 only.
+            spread_tuning_tokens=isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod),
         )
 
         if use_direct_expert_metadata:
@@ -485,9 +488,11 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ) = sort_outputs
 
         # With the expert all-to-all, FC1's scheduler warp zeroes the FC2 finalize output while FC1
-        # runs instead of a memset, which could only start once FC1's persistent CTAs drain.
+        # runs instead of a memset, which could only start once FC1's persistent CTAs drain. It
+        # zeroes the whole output, so it is kept to the DeepSeek-V4 MoE it was measured on.
         fc1_zero = (
-            self.use_fused_finalize
+            isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod)
+            and self.use_fused_finalize
             and enable_alltoall
             and not use_rubin
             and not use_count_native_expert_metadata

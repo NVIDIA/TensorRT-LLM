@@ -481,15 +481,15 @@ class DecoderInputPreparer:
         # Overlap-scheduled speculative steps stage their inputs in one launch;
         # MRoPE, helix, ragged verification and a model's own step fold keep the
         # per-buffer copies.
-        self._spec_overlap_staging = (
-            host_uploader is not None
-            and config.is_spec_decode
-            and not config.disable_overlap_scheduler
-            and not config.use_mrope
-            and not self._dspark_trims_submitted_tokens
-            and not mapping.has_cp_helix()
-            and self.runtime_hooks.spec_step_fold is None
-        )
+        if self.runtime_hooks.spec_step_fold is None:
+            self._spec_overlap_staging = (
+                host_uploader is not None
+                and config.is_spec_decode
+                and not config.disable_overlap_scheduler
+                and not config.use_mrope
+                and not self._dspark_trims_submitted_tokens
+                and not mapping.has_cp_helix()
+            )
 
     def _new_extra_inputs(self) -> ExtraInputsCollector:
         """Return the collector of this pass's model inputs beyond the decoder's own."""

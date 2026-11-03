@@ -240,6 +240,28 @@ def _fp8_block_scale_small_m_tuned(input: torch.Tensor, weight: torch.Tensor,
     return hit
 
 
+def _uses_fp8_small_m_gemm(module: Linear) -> bool:
+    """Whether the model opted ``module`` into the small-M kernel race (``use_fp8_small_m_gemm``
+    set before the weight transforms)."""
+    return getattr(module, "use_fp8_small_m_gemm",
+                   False) and lowm_fp8_supported()
+
+
+def _set_weight_scale_block128(module: Linear,
+                               weight_scale: torch.Tensor) -> None:
+    """Hold the small-M kernel's FP32 128x128 scales, refreshed in place on reload: captured
+    CUDA graphs keep reading the first buffer."""
+    current = getattr(module, "weight_scale_block128", None)
+    if (current is not None and current.shape == weight_scale.shape
+            and current.dtype == weight_scale.dtype
+            and current.device == weight_scale.device):
+        current.copy_(weight_scale)
+    else:
+        module.register_buffer("weight_scale_block128",
+                               weight_scale,
+                               persistent=False)
+
+
 def _uses_marlin_nvfp4_backend(module) -> bool:
     """Whether a regular NVFP4 linear explicitly selects Marlin."""
     allowed_backends = getattr(module, "nvfp4_allowed_backends", ())
@@ -1461,6 +1483,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                   swiglu_limit: Optional[float]) -> bool:
         """Whether SwiGLU of ``gate_up`` should feed ``apply`` BF16 rows (the small-M kernel)
         rather than its fused FP8 quantization (DeepGEMM)."""
+        block_scale = getattr(module, "weight_scale_block128", None)
+        if block_scale is None:
+            return False
         use_cute_dsl_rubin = _fp8_block_scales_uses_cute_dsl_sm107(module)
         return (is_sm_100f() and not is_torch_compiling() and
                 (use_cute_dsl_rubin or not (module.use_cute_dsl_blockscaling_mm
@@ -1469,7 +1494,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                     gate_up,
                     module.weight,
                     module.weight_scale,
-                    getattr(module, "weight_scale_block128", None),
+                    block_scale,
                     swiglu_limit,
                     use_cute_dsl_rubin=use_cute_dsl_rubin))
 
@@ -1560,7 +1585,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                 if _fp8_block_scales_uses_cute_dsl_sm107(module):
                     # transform_weights() re-laid weight_scale out as UE8M0
                     # K32 R128c4; quantize the activation to match.
-                    if is_torch_compiling():
+                    if block_scale is None or is_torch_compiling():
                         act_input_fp8, act_input_sf = (
                             torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
                                 input))
@@ -1593,8 +1618,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                 key="cute_dsl_fp8_blockscale_unsupported_sm")
                         output = torch.ops.trtllm.fp8_block_scaling_gemm(
                             act_input_fp8, weight, act_input_sf, weight_scale)
-            elif not is_torch_compiling() and _fp8_block_scale_small_m_tuned(
-                    input, weight, weight_scale, block_scale):
+            elif (block_scale is not None and not is_torch_compiling()
+                  and _fp8_block_scale_small_m_tuned(
+                      input, weight, weight_scale, block_scale)):
                 output = fp8_block_scale_gemm_autotuned(input, weight,
                                                         weight_scale,
                                                         block_scale)
@@ -1756,10 +1782,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if _fp8_block_scales_uses_cute_dsl_sm107(module):
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
-            if lowm_fp8_supported():
-                module.register_buffer("weight_scale_block128",
-                                       weight_scale,
-                                       persistent=False)
+            if _uses_fp8_small_m_gemm(module):
+                _set_weight_scale_block128(module, weight_scale)
             transformed_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(
                 weight_scale, mn=weight.shape[0], k=weight.shape[1])
             replace_parameter_and_save_metadata(
@@ -1781,11 +1805,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout or round_to_ue8m0:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
-            if use_deep_gemm_layout and lowm_fp8_supported():
+            if use_deep_gemm_layout and _uses_fp8_small_m_gemm(module):
                 # The small-M kernel reads the power-of-two 128x128 scales as FP32.
-                module.register_buffer("weight_scale_block128",
-                                       weight_scale,
-                                       persistent=False)
+                _set_weight_scale_block128(module, weight_scale)
 
             if use_indexer_q_cutedsl_layout:
                 # Native SM100 MXF8 MMA consumes one scale per 32 K values.

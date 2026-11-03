@@ -181,12 +181,15 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         single_pass_multi_cta: bool = False,
         max_row_len: int = 0,
         min_row_len: int = 0,
+        wide_fp32_rows: bool = False,
     ):
-        # Single-CTA fp32 rows wide enough to keep a least-coarse-key byte per vector (16 KB key
-        # cap) for the filter pass to list its vectors in the second candidate buffer; their
-        # large-occupancy launch is 1024 threads x 2 CTAs/SM with a larger candidate buffer.
+        # With wide_fp32_rows (caller opt-in), single-CTA fp32 rows wide enough to keep a
+        # least-coarse-key byte per vector (16 KB key cap) for the filter pass to list its vectors in
+        # the second candidate buffer; their large-occupancy launch is 1024 threads x 2 CTAs/SM with
+        # a larger candidate buffer.
         wide = (
-            dtype == cutlass.Float32
+            wide_fp32_rows
+            and dtype == cutlass.Float32
             and max_num_cols >= 32768
             and overflow_policy != "REREAD_ALWAYS"
             and not (enable_multi_cta or merge_blocks or single_pass_multi_cta)

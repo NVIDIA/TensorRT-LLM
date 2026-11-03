@@ -258,14 +258,26 @@ def _sentinel_unsupported_reason(
     return None
 
 
+# The moe_a2a kernels' own timeout (kDefaultTimeoutCycles), used while no budget is set.
+_NATIVE_A2A_TIMEOUT_SEC = 300
+
+
 class _NVLinkOneSidedTimeoutProxy:
     """Applies MoE communication timeouts to the process-wide completion-flag budget."""
 
     name = "NVLinkOneSided"
 
+    def __init__(self) -> None:
+        # The current budget, for the pull combine's handshake; None is the native default.
+        self.seconds: int | None = None
+
     def set_timeout_seconds(self, seconds: int | None) -> None:
         # The op restores its native default for 0.
         torch.ops.trtllm.moe_a2a_set_timeout(0 if seconds is None else seconds)
+        self.seconds = seconds
+
+    def handshake_timeout_seconds(self) -> int:
+        return self.seconds or _NATIVE_A2A_TIMEOUT_SEC
 
 
 _TIMEOUT_PROXY = _NVLinkOneSidedTimeoutProxy()
@@ -695,19 +707,16 @@ class NVLinkOneSided(Communication):
         )
         self._workspace_registered = True
 
-        # Two ranks pull each other's BF16 partials straight from the workspace (pull_combine.py).
+        # Two ranks may pull each other's BF16 partials straight from the workspace (pull_combine.py)
+        # once enable_pull_combine attaches the handshake. The watchdog watches only native kernels.
         self._pull_sync: Optional[PullCombineSync] = None
-        if (
+        self._pull_combine_supported = (
             self.ep_size == 2
             and dtype == torch.bfloat16
             and not self.use_low_precision_combine
             and not self._rank_mask_enabled
-        ):
-            pull_sync = workspace_state.get("pull_sync")
-            if pull_sync is None:
-                pull_sync = PullCombineSync(mapping, self.ep_rank)
-                workspace_state["pull_sync"] = pull_sync
-            self._pull_sync = pull_sync
+            and alltoall_watchdog_timeout_s is None
+        )
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -1351,6 +1360,19 @@ class NVLinkOneSided(Communication):
 
         return output
 
+    def enable_pull_combine(self) -> None:
+        """Let this communicator's combines pull the partials where ``pull_combine_applies``.
+
+        Collective on the first call for a workspace: every rank calls it at the same construction step.
+        """
+        if self._pull_sync is not None or not self._pull_combine_supported:
+            return
+        pull_sync = self._workspace_state.get("pull_sync")
+        if pull_sync is None:
+            pull_sync = PullCombineSync(self.mapping, self.ep_rank)
+            self._workspace_state["pull_sync"] = pull_sync
+        self._pull_sync = pull_sync
+
     def pull_combine_applies(self, runtime_max_tokens_per_rank: int) -> bool:
         """Whether a combine with this busiest-rank token count may pull the partials (it does
         when the expert output is also in the workspace); never for a step the sentinel transport
@@ -1390,7 +1412,8 @@ class NVLinkOneSided(Communication):
         # The native prepare-combine's round step, which keeps later native rounds in parity.
         offset = int(self.moe_a2a_metainfo[self.FLAG_VAL_OFFSET_INDEX])
         self.workspace[self.ep_rank, offset : offset + 4].view(torch.int32).add_(1)
-        self._pull_sync.signal_wait()
+        # A launch keeps the timeout of its capture, as the native kernels' launch arguments do.
+        self._pull_sync.signal_wait(_TIMEOUT_PROXY.handshake_timeout_seconds())
         peer_payload = (
             self.workspace[
                 1 - self.ep_rank, combine_payload_offset : combine_payload_offset + nbytes

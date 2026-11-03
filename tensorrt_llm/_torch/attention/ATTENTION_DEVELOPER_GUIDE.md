@@ -222,7 +222,8 @@ registration alone.
 CSA2 implements DeepSeek-V4.1 compressed sparse MLA. Its module adapter owns
 compression and shared KV/index sources; per-phase query tiles feed selected
 rows to attention. See the [CSA2 implementation guide](backends/sparse/csa2/README.md)
-for SM90, SM100-family and SM120/121 routing, persistent cache formats, and replay.
+for SM90, SM100-family and SM120/121 routing (candidate-consumer layers need
+SM100-family GPUs), persistent cache formats, and replay.
 
 Block-sparse FMHA is a kernel-library contract rather than a sparse algorithm.
 Algorithms lower their live routing state to an algorithm-neutral

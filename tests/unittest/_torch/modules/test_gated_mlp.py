@@ -300,6 +300,7 @@ def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
     mlp.gate_up_proj.load_weights([gate, up])
     mlp.down_proj.load_weights([down])
     for linear in (mlp.gate_up_proj, mlp.down_proj):
+        linear.use_fp8_small_m_gemm = True
         linear.post_load_weights()
     x = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
     reference = (F.silu(x.double() @ gate_ref.t()) * (x.double() @ up_ref.t())) @ down_ref.t()
