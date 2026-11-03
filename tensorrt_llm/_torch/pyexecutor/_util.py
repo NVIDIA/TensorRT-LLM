@@ -3736,7 +3736,7 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            # Mixed-precision KV tells the drafter layers apart by the model's layer count.
+            # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
@@ -3797,7 +3797,7 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
-            # Mixed-precision KV tells the drafter layers apart by the model's layer count.
+            # The manager tells its draft layers apart by the model's layer count.
             mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))

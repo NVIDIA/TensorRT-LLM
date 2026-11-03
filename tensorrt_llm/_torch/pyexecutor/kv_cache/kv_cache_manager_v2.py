@@ -1919,11 +1919,14 @@ class KVCacheManagerV2(BaseResourceManager):
         }
         # MTP layers use mixed-precision KV like the model's own layers; the layers that another
         # drafter (Eagle3, ...) adds to this manager keep a plain cache.
-        self._plain_draft_layers = (
-            set()
-            if is_draft or spec_config is None or spec_config.spec_dec_mode.is_mtp_one_model()
-            else self._legacy_draft_layer_ids
-        )
+        self._plain_draft_layers = set()
+        if (
+            self.mixed_precision_low_dtype is not None
+            and spec_config is not None
+            and not is_draft
+            and not spec_config.spec_dec_mode.is_mtp_one_model()
+        ):
+            self._plain_draft_layers = self._legacy_draft_layer_ids
         if self.layer_specs is not None:
             if is_draft and any(
                 layer.owner is not KVCacheLayerOwner.DRAFT for layer in self.layer_specs

@@ -236,7 +236,7 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
 
 
 def test_mixed_precision_rejects_custom_managers():
-    """Hybrid and sparse managers own extra pools; mixed precision refuses them up front."""
+    """A manager subclass must opt in to mixed-precision KV; others are refused up front."""
 
     class _CustomManager(KVCacheManagerV2):
         pass
@@ -260,14 +260,14 @@ def test_mixed_precision_rejects_custom_managers():
     assert object.__new__(_Wrapper)._supports_mixed_precision_kv
 
     # A manager whose pool already holds the mixed-precision low (NVFP4) history accepts any pool dtype.
-    class _Native(_OptedIn):
+    class _OwnPoolIsMixedPrecisionLow(_OptedIn):
         _own_pool_is_mixed_precision_low = True
 
-    native = object.__new__(_Native)
-    native._init_mixed_precision(
+    own_pool_low = object.__new__(_OwnPoolIsMixedPrecisionLow)
+    own_pool_low._init_mixed_precision(
         KvCacheConfig(dtype="mixed_nvfp4_bfloat16"), None, 1024, DataType.FP8
     )
-    assert native.mixed_precision_high_dtype == DataType.BF16
+    assert own_pool_low.mixed_precision_high_dtype == DataType.BF16
 
 
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):

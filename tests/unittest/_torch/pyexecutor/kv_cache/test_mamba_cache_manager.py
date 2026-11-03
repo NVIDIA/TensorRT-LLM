@@ -946,7 +946,7 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
 
     if manager_cls is MambaHybridCacheManagerV2:
         assert captured["vocab_size"] == 131072
-        # Mixed-precision KV tells the drafter layers apart by the model's layer count.
+        # The manager tells its draft layers apart by the model's layer count.
         assert captured["pretrained_config"] is config
     else:
         assert "vocab_size" not in captured
