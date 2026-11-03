@@ -627,8 +627,20 @@ class KDAKernelDispatch:
         if mxfp8_output:
             if not kwargs.pop("fuse_output_norm", True):
                 raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            kwargs.pop("use_pdl", None)
             return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+
+    def mtp_verify_fused_fb(self, **kwargs) -> torch.Tensor:
+        """Fused KDA multi-token verify that computes its forget gate from ``f_a``.
+
+        Thin passthrough to ``trtllm::kda_mtp_decode_fused_fb`` (packed rows, fused gated
+        RMSNorm, BF16 output; see ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py``).
+        """
+        if self.verify_kernel_path != "optimized":
+            raise RuntimeError("mtp_verify_fused_fb needs the optimized verify path")
+        _load_mtp_module()
+        return torch.ops.trtllm.kda_mtp_decode_fused_fb(**kwargs)
 
     def can_use_indexed_prefill(
         self,
