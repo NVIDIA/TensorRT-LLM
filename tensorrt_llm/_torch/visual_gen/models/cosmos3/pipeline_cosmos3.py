@@ -424,6 +424,7 @@ class _PreparedLatents:
         "nvidia/Cosmos3-Super-Text2Image",
         "nvidia/Cosmos3-Super-Text2Image-4Step",
         "nvidia/Cosmos3-Edge",
+        "nvidia/Cosmos3-Edge-FP8",
         "nvidia/Cosmos3-Edge-Policy-DROID",
     ],
     doc="Cosmos3 Omnimodal world models.",

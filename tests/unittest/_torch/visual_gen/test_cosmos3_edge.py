@@ -843,6 +843,7 @@ class TestEdgeDefaults:
     def test_hf_id_registered(self):
         hf_ids = PIPELINE_REGISTRY["Cosmos3OmniMoTPipeline"].hf_ids
         assert "nvidia/Cosmos3-Edge" in hf_ids
+        assert "nvidia/Cosmos3-Edge-FP8" in hf_ids
         assert "nvidia/Cosmos3-Edge-Policy-DROID" in hf_ids
 
     def test_policy_manifest_overrides_policy_sampling_only(self):
