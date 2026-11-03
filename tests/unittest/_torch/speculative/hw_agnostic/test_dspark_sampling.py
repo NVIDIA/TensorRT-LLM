@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from _torch.speculative.hw_agnostic.test_block_verification import chi_square
 
 from tensorrt_llm._torch.models.modeling_dspark import _DSparkHeadMixin
 from tensorrt_llm._torch.models.modeling_speculative import (
@@ -518,9 +519,9 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
     assert torch.equal(graph_tokens, eager_tokens)
 
     if method == "block":
-        # The decisions and the emitted token are block_verify's on the counter
-        # uniforms of the acceptance slot (checked on CPU: the same inputs give
-        # the same verdicts on both devices).
+        # The decisions are block_verify's on the counter uniforms of the
+        # acceptance slot; the emitted token comes from the seeded sampler and
+        # must carry residual mass.
         target_probs = SpecWorkerBase._compute_probs_from_logits(
             AdvancedSamplingMode.FULL,
             logits,
@@ -531,11 +532,66 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
         ).view(num_gens, K + 1, vocab)
         seed = meta.request_seeds
         offset = meta.request_offsets + meta.rng_accept_slot * _RNG_SLOT_SPAN
-        uniforms = counter_uniforms(seed, offset, K + 1)
+        drawn = {}
+
+        def record(weights: torch.Tensor) -> torch.Tensor:
+            drawn["weights"] = weights
+            return eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1]
+
         expected_tokens, expected_accepted = block_verify(
-            *(t.cpu() for t in (draft_tokens, draft_probs, target_probs)),
-            uniforms[:, :K].cpu(),
-            uniforms[:, K].cpu(),
+            draft_tokens,
+            draft_probs,
+            target_probs,
+            counter_uniforms(seed, offset, K),
+            sample_emitted=record,
         )
-        assert torch.equal(eager_accepted.cpu(), expected_accepted)
-        assert torch.equal(eager_tokens.cpu(), expected_tokens)
+        assert torch.equal(eager_accepted, expected_accepted)
+        assert torch.equal(eager_tokens, expected_tokens)
+        emitted = eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1].long()
+        assert (drawn["weights"].gather(1, emitted[:, None]) > 0).all()
+
+
+@_needs_cuda
+@pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
+def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
+    """The seeded sampler draws the emitted token from the normalized residual.
+
+    Each case pins the accepted length regardless of the uniforms, so thousands
+    of rows that differ only in their RNG offset sample one known distribution:
+    all drafts impossible under the target -> L = 0 and max(p_0 - q_0, 0);
+    draft == target -> L = K and the bonus row p_K.
+    """
+    generator = torch.Generator().manual_seed(51)
+    vocab, rows = 64, 20_000
+    worker = _worker()
+    meta = _metadata(rows, vocab=vocab, mode=AdvancedSamplingMode.FULL, device="cuda")
+    target = torch.softmax(torch.randn(1, K + 1, vocab, generator=generator), -1)
+    if case == "all_rejected":
+        target[:, :, 0] = 0.0
+        target = target / target.sum(-1, keepdim=True)
+        draft = torch.softmax(torch.randn(1, K, vocab, generator=generator), -1)
+        draft[:, :, 0] = 0.5
+        draft = draft / draft.sum(-1, keepdim=True)
+        tokens = torch.zeros(1, K, dtype=torch.int32)
+        expected = (target[0, 0] - draft[0, 0]).clamp_min(0)
+        position = 0
+    else:
+        draft = target[:, :K].clone()
+        tokens = torch.multinomial(draft[0], 1).view(1, K).int()
+        expected = target[0, K]
+        position = K
+    expected = expected / expected.sum()
+    seed = meta.request_seeds
+    offset = meta.request_offsets + 7
+    out, accepted = worker._block_verify(
+        meta,
+        tokens.cuda().expand(rows, -1),
+        draft.cuda().expand(rows, -1, -1),
+        target.cuda().expand(rows, -1, -1),
+        seed,
+        offset,
+    )
+    assert (accepted == position + 1).all()
+    histogram = torch.bincount(out[:, position].long().cpu(), minlength=vocab).double()
+    stat, critical = chi_square(histogram, expected.double())
+    assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"

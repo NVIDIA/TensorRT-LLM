@@ -38,7 +38,7 @@ Everything here is tensor arithmetic on static shapes with no host
 synchronization, so it can run inside a captured CUDA graph.
 """
 
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -150,7 +150,8 @@ def block_verify(
     draft_probs: torch.Tensor,
     target_probs: torch.Tensor,
     uniforms: torch.Tensor,
-    resample_uniforms: torch.Tensor,
+    resample_uniforms: Optional[torch.Tensor] = None,
+    sample_emitted: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Verify a batch of drafted blocks with block verification.
 
@@ -162,6 +163,9 @@ def block_verify(
         uniforms: ``[B, K]`` acceptance uniforms in (0, 1).
         resample_uniforms: ``[B]`` uniforms in (0, 1) for the emitted token,
             drawn by inverse CDF (:func:`sample_from_weights`).
+        sample_emitted: alternatively, ``([B, V] nonnegative weights) -> [B]``
+            ids: draws the emitted token from the normalized weights (e.g. a
+            seeded sampler kernel). Exactly one of the two must be given.
     Returns:
         ``accepted_tokens`` ``[B, K + 1]`` int32 -- the ``L`` accepted drafts,
         the emitted token, then ``-1`` -- and ``num_accepted_tokens`` ``[B]``
@@ -192,7 +196,13 @@ def block_verify(
     # target row so rounding can never leave nothing to draw from.
     has_mass = residual.sum(-1, keepdim=True) > 0
     residual = torch.where(has_mass, residual, p_row)
-    emitted = sample_from_weights(residual, resample_uniforms)
+    if sample_emitted is not None:
+        emitted = sample_emitted(residual).long().clamp(0, vocab_size - 1)
+    else:
+        assert resample_uniforms is not None, (
+            "block_verify needs resample_uniforms or sample_emitted"
+        )
+        emitted = sample_from_weights(residual, resample_uniforms)
 
     slots = torch.arange(num_drafts + 1, dtype=torch.int64, device=draft_tokens.device)
     drafts = torch.cat([draft_tokens.long(), torch.zeros_like(draft_tokens[:, :1]).long()], dim=1)

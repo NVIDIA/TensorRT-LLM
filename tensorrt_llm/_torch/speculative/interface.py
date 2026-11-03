@@ -2982,13 +2982,9 @@ class SpecWorkerBase(nn.Module, ABC):
                     "token-level rejection sampling.",
                     key="block_verification_ragged_fallback")
             if use_block and not is_ragged:
-                # The K acceptance uniforms and the emitted token's uniform
-                # are a counter hash of the request's acceptance-slot RNG
-                # state, identical on every rank.
-                uniforms = counter_uniforms(seed, offset, runtime_draft_len + 1)
-                gen_accepted, gen_num_accepted = block_verify(
-                    full_draft_tokens, full_draft_probs, target_probs,
-                    uniforms[:, :runtime_draft_len], uniforms[:, -1])
+                gen_accepted, gen_num_accepted = self._block_verify(
+                    spec_metadata, full_draft_tokens, full_draft_probs,
+                    target_probs, seed, offset)
             else:
                 gen_accepted, gen_num_accepted = rejection_sampling_one_model(
                     draft_probs=full_draft_probs,
@@ -3024,6 +3020,44 @@ class SpecWorkerBase(nn.Module, ABC):
                 num_accepted_tokens[num_contexts:],
                 spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
+
+    def _block_verify(
+            self, spec_metadata: SpecMetadata, draft_tokens: torch.Tensor,
+            draft_probs: torch.Tensor, target_probs: torch.Tensor,
+            seed: torch.Tensor,
+            offset: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Block verification of the gen subset (``rejection_sampling_one_model`` contract).
+
+        The acceptance uniforms (``counter_uniforms``) and the emitted token
+        (seeded sampler on the residual) are both keyed by the request's
+        acceptance-slot RNG state, identical on every rank.
+        """
+        num_drafts = draft_tokens.shape[1]
+        uniforms = counter_uniforms(seed, offset, num_drafts)
+
+        def sample_emitted(weights: torch.Tensor) -> torch.Tensor:
+            # Device-side fills: CUDA graph capture rejects host-scalar copies.
+            ones = torch.ones(weights.shape[0],
+                              dtype=torch.float32,
+                              device=weights.device)
+            no_top_k = torch.full_like(ones,
+                                       torch.iinfo(torch.int32).max,
+                                       dtype=torch.int32)
+            return self._sample_from_logits(
+                spec_metadata.advanced_sampling_mode,
+                weights.log(),
+                ones,
+                no_top_k,
+                ones,
+                torch.zeros_like(ones),
+                seed=seed,
+                offset=offset)
+
+        return block_verify(draft_tokens,
+                            draft_probs,
+                            target_probs,
+                            uniforms,
+                            sample_emitted=sample_emitted)
 
     def _rng_state_per_request(
         self,
