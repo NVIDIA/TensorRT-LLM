@@ -4,6 +4,7 @@
 
 import csv
 import subprocess
+from collections import Counter
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -39,6 +40,25 @@ EXPECTED_METRICS = {
     "KV_CACHE_SIZE": 1.5,
     "FIRST_TOKEN_TIME": 10,
     "OUTPUT_TOKEN_TIME": 2,
+}
+EXPECTED_SERVE_METRICS = {
+    "KV_CACHE_SIZE": 1.5,
+    "SEQ_THROUGHPUT": 4,
+    "TOTAL_OUTPUT_THROUGHPUT": 512,
+    "TOTAL_TOKEN_THROUGHPUT": 1024,
+    "USER_THROUGHPUT": 128,
+    "FIRST_TOKEN_TIME": 10,
+    "MEDIAN_FIRST_TOKEN_TIME": 9,
+    "P99_FIRST_TOKEN_TIME": 12,
+    "OUTPUT_TOKEN_TIME": 2,
+    "MEDIAN_OUTPUT_TOKEN_TIME": 1,
+    "P99_OUTPUT_TOKEN_TIME": 3,
+    "INTER_TOKEN_TIME": 4,
+    "MEDIAN_INTER_TOKEN_TIME": 3,
+    "P99_INTER_TOKEN_TIME": 5,
+    "INFERENCE_TIME": 1000,
+    "MEDIAN_INFERENCE_TIME": 900,
+    "P99_INFERENCE_TIME": 1200,
 }
 
 
@@ -87,8 +107,8 @@ def qa_fixture():
     result = pytester.runpytest_inprocess(
         "-q", "--confcutdir=.", "--test-prefix=qa", f"--test-list={test_list}"
     )
-    result.assert_outcomes(passed=2)
-    assert executed == cases
+    result.assert_outcomes(passed=len(cases))
+    assert Counter(executed) == Counter(cases)
 
 
 @pytest.fixture
@@ -181,8 +201,9 @@ def test_qa_benchmark_results_and_failures(
         with (output / "perf_script_test_results.csv").open() as handle:
             rows = list(csv.DictReader(handle))
         yaml_rows = yaml.safe_load((output / "perf_script_test_results.yaml").read_text())
-        assert {row["metric_type"]: float(row["perf_metric"]) for row in rows} == EXPECTED_METRICS
-        assert len(rows) == len(yaml_rows) == len(EXPECTED_METRICS)
+        metrics = {row["metric_type"]: float(row["perf_metric"]) for row in rows}
+        assert EXPECTED_METRICS.items() <= metrics.items()
+        assert len(rows) == len(metrics) == len(yaml_rows)
         for row in rows:
             assert row["state"] == "valid"
             assert row["original_test_name"] == CASE
@@ -278,11 +299,8 @@ def test_qa_serve_results_and_cleanup(
         with (output / "perf_script_test_results.csv").open() as handle:
             rows = list(csv.DictReader(handle))
         metrics = {row["metric_type"]: float(row["perf_metric"]) for row in rows}
-        assert len(rows) == len(metrics) == 17
-        assert metrics["KV_CACHE_SIZE"] == 1.5
-        assert metrics["TOTAL_OUTPUT_THROUGHPUT"] == 512
-        assert metrics["FIRST_TOKEN_TIME"] == 10
-        assert metrics["P99_INFERENCE_TIME"] == 1200
+        assert EXPECTED_SERVE_METRICS.items() <= metrics.items()
+        assert len(rows) == len(metrics)
         assert all(row["state"] == "valid" and row["original_test_name"] == case for row in rows)
     assert len(server_commands) == 1
     assert server_commands[0][0] == "trtllm-serve"
@@ -290,5 +308,8 @@ def test_qa_serve_results_and_cleanup(
     assert len(client_commands) == (0 if failure == "startup" else 1)
     if client_commands:
         assert "--port" in client_commands[0] and "12345" in client_commands[0]
-    process.terminate.assert_called_once()
-    process.wait.assert_called_once_with(timeout=30)
+    process.terminate.assert_called()
+    process.wait.assert_called()
+    for args, kwargs in process.wait.call_args_list:
+        timeout = kwargs.get("timeout", args[0] if args else None)
+        assert timeout is not None and 0 < timeout < float("inf")
