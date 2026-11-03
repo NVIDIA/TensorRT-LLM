@@ -5780,12 +5780,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # local reuse does. Cap the reservation at the same claim limit, so
         # the recomputed tail stays local by construction; a full-re-prefill
         # tail (-1) caps to zero and releases the reservation below.
-        limit = _spec_recompute_claim_limit(
-            req,
-            tail=self._spec_recompute_tail,
-            tokens_per_block=self.tokens_per_block,
-            is_draft=self.is_draft,
-        )
+        limit = self.context_reuse_claim_limit(req)
         if limit is not None:
             end = min(end, limit)
         if end <= local_end:

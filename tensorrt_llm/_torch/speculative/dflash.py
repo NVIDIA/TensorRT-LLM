@@ -1997,51 +1997,35 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    # A drafter whose positions depend on the token drawn
-                    # before them draws the block itself when drafts are
-                    # sampled.
-                    if self._samples_block_ancestrally(draft_model, spec_metadata):
-                        gen_draft_tokens, vocab_size = self._sample_block_ancestrally(
+                    gen_logits = self._refine_block_logits(
+                        draft_model, gen_logits, inputs, spec_metadata
+                    )
+
+                    # DFlash 2: replace the independent per-position picks with
+                    # one coherent path through the block (absent for plain
+                    # DFlash).
+                    if getattr(draft_model, "lilicorr", None) is not None:
+                        gen_logits = self._apply_lilicorr(
                             draft_model,
                             gen_logits,
-                            inputs,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["lilicorr_anchor"],
                             spec_metadata,
-                            num_contexts,
-                            batch_size,
                         )
-                    else:
-                        gen_logits = self._refine_block_logits(
-                            draft_model, gen_logits, inputs, spec_metadata
-                        )
-
-                        # DFlash 2: replace the independent per-position picks
-                        # with one coherent path through the block (absent for
-                        # plain DFlash).
-                        if getattr(draft_model, "lilicorr", None) is not None:
-                            gen_logits = self._apply_lilicorr(
-                                draft_model,
-                                gen_logits,
-                                gen_hidden_states.reshape(num_gens, K, -1),
-                                inputs["lilicorr_anchor"],
-                                spec_metadata,
-                            )
-                            vocab_size = gen_logits.shape[-1]
-                        elif getattr(draft_model, "has_candidate_selector", False):
-                            gen_logits = self._apply_dflash2_selector(
-                                draft_model,
-                                gen_logits,
-                                gen_hidden_states.reshape(num_gens, K, -1),
-                                inputs["first_prev_tokens"],
-                                spec_metadata,
-                            )
-                            vocab_size = gen_logits.shape[-1]
-
-                        gen_draft_tokens = self.sample_draft_tokens(
+                        vocab_size = gen_logits.shape[-1]
+                    elif getattr(draft_model, "has_candidate_selector", False):
+                        gen_logits = self._apply_dflash2_selector(
+                            draft_model,
                             gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["first_prev_tokens"],
                             spec_metadata,
-                            batch_size,
-                            num_contexts=num_contexts,
                         )
+                        vocab_size = gen_logits.shape[-1]
+
+                    gen_draft_tokens, vocab_size = self._sample_block_draft_tokens(
+                        draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2149,15 +2133,26 @@ class DFlashWorker(SpecWorkerBase):
         """
         return gen_logits
 
-    def _samples_block_ancestrally(
-        self, draft_model: nn.Module, spec_metadata: SpecMetadata
-    ) -> bool:
-        """Whether the drafter family draws its block itself (``_sample_block_ancestrally``).
+    def _sample_block_draft_tokens(
+        self,
+        draft_model: nn.Module,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Draw the ``[num_gens, K]`` int32 draft tokens from the refined block logits.
 
-        Plain DFlash positions are independent given the block forward; families
-        whose positions condition on the previous draft override this.
+        Also returns the vocab width of the logits the stored proposals use.
+        Plain DFlash positions are independent given the block forward, so the
+        shared block sampler draws them; a family whose positions condition on
+        the previous draft overrides this (``DSparkWorker``).
         """
-        return False
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]
 
     def _apply_dflash2_selector(
         self,

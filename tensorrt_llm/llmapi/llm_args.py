@@ -3948,17 +3948,6 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
-    @model_validator(mode="after")
-    def default_embedded_recompute_tail(self) -> "DSparkDecodingConfig":
-        """Resolve ``context_recompute_tail: None`` to 0 without a drafter checkpoint.
-
-        The embedded draft has no recompute; resolving here keeps a config that
-        skips ``TorchLlmArgs`` validation from handing the managers a None.
-        """
-        if self.context_recompute_tail is None and self.speculative_model is None:
-            self.context_recompute_tail = 0
-        return self
-
     @property
     def tokens_per_gen_step(self) -> int:
         """DSpark needs K+1 tokens per gen request (K drafts + 1 bonus).
@@ -7639,8 +7628,8 @@ class TorchLlmArgs(BaseLlmArgs):
         tree, and relaxed thinking-phase acceptance bypasses block verification.
         """
         spec_cfg = self.speculative_config
-        method = getattr(spec_cfg, "rejection_sample_method", "standard")
-        temperature_only = getattr(spec_cfg, "draft_temperature_only", False)
+        method = spec_cfg.rejection_sample_method
+        temperature_only = spec_cfg.draft_temperature_only
         if not spec_cfg.use_rejection_sampling:
             options = []
             if method != "standard":

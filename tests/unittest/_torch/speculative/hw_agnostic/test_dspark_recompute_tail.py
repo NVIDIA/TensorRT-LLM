@@ -296,15 +296,6 @@ class TestDSparkTailResolution:
         spec.resolve_context_recompute_tail()
         assert spec.context_recompute_tail == 0
 
-    def test_a_config_without_a_drafter_checkpoint_resolves_to_no_recompute(self) -> None:
-        # The embedded drafter's shape (speculative_model unset): resolved at
-        # construction, so KV cache managers built from an unvalidated config
-        # never read None (= a full re-prefill on every hit).
-        spec = DSparkDecodingConfig(max_draft_len=5, context_recompute_tail=None)
-        assert spec.context_recompute_tail == 0
-        spec = DSparkDecodingConfig(max_draft_len=5, context_recompute_tail=-1)
-        assert spec.context_recompute_tail == -1
-
     @pytest.mark.parametrize("requested, expected", [(None, 4096), (0, 0), (1024, 1024)])
     def test_llm_args_validation_resolves_the_tail(
         self, tmp_path: Path, requested: Optional[int], expected: int

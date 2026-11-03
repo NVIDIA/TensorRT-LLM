@@ -180,47 +180,6 @@ def test_block_verify_matches_vllm_given_identical_uniforms(num_drafts: int) -> 
         assert len(lengths) > 2, "the case generator should exercise several accept lengths"
 
 
-@pytest.mark.cpu_only
-def test_residual_matches_vllm_through_the_hook_and_the_inverse_cdf() -> None:
-    """The emitted token's distribution is vLLM's residual, both as handed to a
-    caller-supplied sampler and as drawn by the default inverse-CDF sampler."""
-    generator = torch.Generator().manual_seed(8)
-    batch, num_drafts, vocab, draws = 32, 4, 16, 4096
-    target_logits, draft_logits, draft_probs, draft_tokens, target_probs = _random_case(
-        generator, batch, num_drafts, vocab
-    )
-    uniforms = torch.rand(batch, num_drafts, generator=generator, dtype=torch.float64)
-    seen = {}
-
-    def sampler(weights: torch.Tensor) -> torch.Tensor:
-        seen["weights"] = weights
-        return weights.argmax(-1)
-
-    tokens, num_accepted = block_verify(
-        draft_tokens, draft_probs, target_probs, uniforms, sample_emitted=sampler
-    )
-    weights = seen["weights"].double()
-    # Every request repeated over an even grid of resample uniforms.
-    grid = (torch.arange(draws, dtype=torch.float64) + 0.5) / draws
-    inputs = (draft_tokens, draft_probs, target_probs, uniforms)
-    grid_tokens, _ = block_verify(
-        *(t.repeat_interleave(draws, 0) for t in inputs), grid.repeat(batch)
-    )
-    grid_tokens = grid_tokens.view(batch, draws, -1)
-    for b in range(batch):
-        ref_length, ref_thresholds, ref_resample = _vllm_block_reference(
-            target_logits[b], draft_logits[b], 1.0, draft_tokens[b], uniforms[b]
-        )
-        if (uniforms[b] - ref_thresholds).abs().min() < 1e-4:
-            continue
-        assert int(num_accepted[b]) == ref_length + 1
-        torch.testing.assert_close(weights[b] / weights[b].sum(), ref_resample, atol=1e-5, rtol=0)
-        assert int(tokens[b, ref_length]) == int(weights[b].argmax())
-        emitted = grid_tokens[b, :, ref_length].long()
-        histogram = torch.bincount(emitted, minlength=vocab).double() / draws
-        torch.testing.assert_close(histogram, ref_resample, atol=2.0 / draws, rtol=0)
-
-
 # One draft: block verification is token-level verification
 
 

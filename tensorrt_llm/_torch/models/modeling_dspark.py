@@ -83,7 +83,7 @@ import math
 import os
 import re
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -127,7 +127,6 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    dspark_markov_step_bias,
 )
 from .modeling_utils import (
     DecoderModel,
@@ -2692,34 +2691,6 @@ class _DSparkHeadMixin:
         return markov_chain_logits(
             base_logits, first_prev_tokens, self.markov_w1, self.markov_w2, tp_exchange
         )
-
-    def sample_markov_chain(
-        self,
-        base_logits: torch.Tensor,
-        first_prev_tokens: torch.Tensor,
-        sample_step: Callable[[int, torch.Tensor], torch.Tensor],
-    ) -> torch.Tensor:
-        """Draw a block ancestrally through the vanilla-Markov head.
-
-        Position k is drawn by ``sample_step(k, base_logits[:, k] + bias(prev))``,
-        ``prev`` being the token drawn at k - 1 (the anchor for k = 0); the
-        distribution ``sample_step`` draws from is that position's proposal. The
-        greedy chain (``apply_markov_chain_logits``) is the same chain only for
-        argmax draws. ``base_logits`` must span the full vocab. Returns ``[B, K]``
-        long token ids.
-        """
-        drawn = []
-        prev = first_prev_tokens.long()
-        for k in range(base_logits.shape[1]):
-            step_logits = base_logits[:, k]
-            if self.has_markov_head:
-                bias = dspark_markov_step_bias(prev, self.markov_w1, self.markov_w2)
-                step_logits = step_logits + bias.to(base_logits.dtype)
-            prev = sample_step(k, step_logits).long()
-            drawn.append(prev)
-        if not drawn:
-            return base_logits.new_empty((base_logits.shape[0], 0), dtype=torch.long)
-        return torch.stack(drawn, dim=1)
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
         """Pull the head tensors out of ``weights`` and load them onto self.

@@ -256,12 +256,9 @@ def test_forward_verifies_the_previous_block_with_the_configured_rule(method: st
     _, standard = rejection_sampling_one_model(
         draft_probs, draft_tokens, target_probs, seed, offset
     )
+    uniforms = counter_uniforms(seed, offset, K + 1)
     _, block = block_verify(
-        draft_tokens,
-        draft_probs,
-        target_probs,
-        counter_uniforms(seed, offset, K),
-        sample_emitted=lambda weights: weights.argmax(-1),
+        draft_tokens, draft_probs, target_probs, uniforms[:, :K], uniforms[:, K]
     )
     # The batch tells the two rules apart.
     assert not torch.equal(standard, block)

@@ -1280,16 +1280,15 @@ class DSparkWorker(DFlashWorker):
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
-    def _samples_block_ancestrally(
-        self, draft_model: torch.nn.Module, spec_metadata: SpecMetadata
-    ) -> bool:
-        """Sampled drafts walk the Markov head ancestrally; argmax drafts keep the greedy chain."""
+    @staticmethod
+    def _drafts_ancestrally(draft_model: torch.nn.Module, spec_metadata: SpecMetadata) -> bool:
+        """Sampled drafts of a drafter with a Markov head walk the head ancestrally."""
         return bool(
             getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
         )
 
-    def _sample_block_ancestrally(
+    def _sample_block_draft_tokens(
         self,
         draft_model: torch.nn.Module,
         gen_logits: torch.Tensor,
@@ -1298,13 +1297,22 @@ class DSparkWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Draw the block ancestrally and store each position's proposal in ``draft_probs``.
+        """Draw sampled drafts ancestrally through the Markov head; argmax drafts keep the chain.
 
         Position k is drawn by the seeded draft sampler from
-        ``softmax((base_k + bias(d_{k-1})) / T)``. ``gen_logits`` are the
-        ``[num_gens, K, vocab]`` unbiased block logits. Returns the
-        ``[num_gens, K]`` int32 draft tokens and the stored vocab width.
+        ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{k-1}`` being the token
+        drawn before it (the anchor for k = 0), and that distribution is stored
+        as the position's proposal in ``draft_probs``. ``gen_logits`` are the
+        ``[num_gens, K, vocab]`` unbiased block logits (``_refine_block_logits``
+        leaves them so). Returns the ``[num_gens, K]`` int32 draft tokens and
+        the stored vocab width.
         """
+        if not self._drafts_ancestrally(draft_model, spec_metadata):
+            return super()._sample_block_draft_tokens(
+                draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+            )
+        from ..models.modeling_speculative import dspark_markov_step_bias
+
         num_gens, num_drafts, _ = gen_logits.shape
         # The chain indexes the full Markov table, and verification reads
         # full-vocab proposals.
@@ -1325,7 +1333,11 @@ class DSparkWorker(DFlashWorker):
             None if draft_probs is None else spec_metadata.batch_slot_ids[num_contexts:batch_size]
         )
 
-        def sample_step(step: int, step_logits: torch.Tensor) -> torch.Tensor:
+        prev = inputs["first_prev_tokens"].long()
+        drawn = []
+        for step in range(num_drafts):
+            bias = dspark_markov_step_bias(prev, draft_model.markov_w1, draft_model.markov_w2)
+            step_logits = gen_logits[:, step] + bias.to(gen_logits.dtype)
             seed, offset = self._rng_state_per_request(
                 spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
             )
@@ -1338,14 +1350,11 @@ class DSparkWorker(DFlashWorker):
             )
             if slots is not None:
                 draft_probs[slots, step, :vocab] = probs
-            return tokens
-
-        tokens = draft_model.sample_markov_chain(
-            gen_logits, inputs["first_prev_tokens"], sample_step
-        )
+            prev = tokens.long()
+            drawn.append(prev)
         if draft_probs is not None:
             spec_metadata.draft_probs_last_dim = vocab
-        return tokens.to(torch.int32), vocab
+        return torch.stack(drawn, dim=1).to(torch.int32), vocab
 
     def _refine_block_logits(
         self,
@@ -1356,11 +1365,14 @@ class DSparkWorker(DFlashWorker):
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 
-        Argmax drafting only (see :meth:`_sample_block_ancestrally`). A DSpark drafter checkpoint
-        may omit the Markov head (``markov_rank`` 0), which loads as a drafter
-        without one; that case falls through to the unmodified backbone logits.
+        Argmax drafting only: sampled drafts apply the bias per drawn token in
+        :meth:`_sample_block_draft_tokens`. A DSpark drafter checkpoint may omit
+        the Markov head (``markov_rank`` 0), which loads as a drafter without
+        one; that case falls through to the unmodified backbone logits.
         """
-        if not getattr(draft_model, "has_markov_head", False):
+        if not getattr(draft_model, "has_markov_head", False) or self._drafts_ancestrally(
+            draft_model, spec_metadata
+        ):
             return gen_logits
         return self._apply_dspark_markov_bias(draft_model, gen_logits, inputs["first_prev_tokens"])
 

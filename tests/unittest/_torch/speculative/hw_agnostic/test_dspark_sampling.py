@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_step_bias,
 )
 from tensorrt_llm._torch.speculative.block_verification import block_verify, counter_uniforms
+from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DSparkDecodingConfig, TorchLlmArgs
@@ -157,7 +158,7 @@ def _sample_with(
 ) -> tuple[torch.Tensor, int]:
     inputs = {"first_prev_tokens": anchors}
     with patch.object(SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(sampler)):
-        return worker._sample_block_ancestrally(
+        return worker._sample_block_draft_tokens(
             drafter, base, inputs, meta, num_contexts, num_contexts + base.shape[0]
         )
 
@@ -249,59 +250,58 @@ def test_rejection_options_are_rejected_where_they_would_not_apply(mode: str, op
 
 
 @pytest.mark.cpu_only
-def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
-    generator = torch.Generator().manual_seed(1)
-    drafter = _drafter(generator)
-    base = torch.randn(B, K, V, generator=generator)
-    anchors = torch.randint(V, (B,), generator=generator)
-    rows = []
-
-    def argmin_step(
-        step: int, step_logits: torch.Tensor
-    ) -> torch.Tensor:  # deliberately not the argmax walk
-        rows.append((step, step_logits))
-        return step_logits.argmin(-1)
-
-    tokens = drafter.sample_markov_chain(base, anchors, argmin_step)
-    prev = anchors
-    for step in range(K):
-        assert rows[step][0] == step
-        bias = dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
-        torch.testing.assert_close(rows[step][1], base[:, step] + bias)
-        prev = tokens[:, step]
-    assert tokens.dtype == torch.long and tokens.shape == (B, K)
-
-
-@pytest.mark.cpu_only
 def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
     generator = torch.Generator().manual_seed(2)
+    worker = _worker()
     drafter = _drafter(generator)
     base = torch.randn(B, K, V, generator=generator)
     anchors = torch.randint(V, (B,), generator=generator)
+
+    def argmax_sampler(
+        mode: Optional[AdvancedSamplingMode], logits: torch.Tensor, *params: Any, **rng: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return logits.argmax(-1).to(torch.int32), torch.softmax(logits, -1)
 
     def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
         return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
 
-    tokens = drafter.sample_markov_chain(base, anchors, lambda step, logits: logits.argmax(-1))
+    tokens, _ = _sample_with(argmax_sampler, worker, drafter, base, anchors, _metadata(B))
     greedy, _ = dspark_markov_chain(base, anchors, step_bias, cast_bias_to_logits=True)
-    assert torch.equal(tokens, greedy)
+    assert torch.equal(tokens.long(), greedy)
 
 
 # The worker's sampled path
 
 
 @pytest.mark.cpu_only
-def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_head() -> None:
+def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> None:
+    """Argmax drafts and drafters without a head keep the DFlash block sampler and the greedy chain."""
     generator = torch.Generator().manual_seed(3)
     worker = _worker()
     drafter = _drafter(generator)
-    meta = _metadata(B)
-    assert worker._samples_block_ancestrally(drafter, meta)
-    meta.wants_advanced_draft_sampling = False
-    assert not worker._samples_block_ancestrally(drafter, meta)
-    meta.wants_advanced_draft_sampling = True
+    base = torch.randn(B, K, V, generator=generator)
+    inputs = {"first_prev_tokens": torch.randint(V, (B,), generator=generator)}
+    sampled, greedy = _metadata(B), _metadata(B)
+    greedy.wants_advanced_draft_sampling = False
     no_head = types.SimpleNamespace(has_markov_head=False)
-    assert not worker._samples_block_ancestrally(no_head, meta)
+    with patch.object(
+        DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
+    ) as base_hook:
+        assert worker._sample_block_draft_tokens(drafter, base, inputs, greedy, 0, B) == (
+            "dflash",
+            V,
+        )
+        assert worker._sample_block_draft_tokens(no_head, base, inputs, sampled, 0, B) == (
+            "dflash",
+            V,
+        )
+        assert base_hook.call_count == 2
+        tokens, _ = _sample_with(
+            _cpu_sampler(generator), worker, drafter, base, inputs["first_prev_tokens"], sampled
+        )
+        assert base_hook.call_count == 2 and tokens.shape == (B, K)
+    # Sampled drafts leave the logits unbiased: the chain bias is applied per drawn token.
+    assert torch.equal(worker._refine_block_logits(drafter, base, inputs, sampled), base)
 
 
 @pytest.mark.parametrize("num_contexts", [0, 2])
@@ -488,7 +488,7 @@ def test_sampled_block_captures_in_a_cuda_graph(temperature_only: bool) -> None:
     inputs = {"first_prev_tokens": anchors}
 
     graph, (tokens, _) = _capture(
-        lambda: worker._sample_block_ancestrally(drafter, base, inputs, meta, 0, num_gens)
+        lambda: worker._sample_block_draft_tokens(drafter, base, inputs, meta, 0, num_gens)
     )
     meta.draft_probs.fill_(7.0)
     graph.replay()
@@ -552,7 +552,18 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
     assert torch.equal(graph_tokens, eager_tokens)
     assert ((eager_accepted >= 1) & (eager_accepted <= K + 1)).all()
 
+    # Replays redraw from the new RNG offsets and verify the new drafts.
+    draft_tokens.copy_(torch.multinomial(draft_probs.view(-1, vocab), 1).view(num_gens, K).int())
+    meta.request_offsets += 1 << 20
+    graph.replay()
+    eager_tokens, eager_accepted = accept()
+    assert torch.equal(graph_accepted, eager_accepted)
+    assert torch.equal(graph_tokens, eager_tokens)
+
     if method == "block":
+        # The decisions and the emitted token are block_verify's on the counter
+        # uniforms of the acceptance slot (checked on CPU: the same inputs give
+        # the same verdicts on both devices).
         target_probs = SpecWorkerBase._compute_probs_from_logits(
             AdvancedSamplingMode.FULL,
             logits,
@@ -563,69 +574,11 @@ def test_rejection_acceptance_routes_and_captures(method: str) -> None:
         ).view(num_gens, K + 1, vocab)
         seed = meta.request_seeds
         offset = meta.request_offsets + meta.rng_accept_slot * _RNG_SLOT_SPAN
-        drawn = {}
-
-        def record(weights: torch.Tensor) -> torch.Tensor:
-            drawn["weights"] = weights
-            return eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1]
-
-        # The acceptance decisions are block_verify's on the counter uniforms of the
-        # acceptance slot; the emitted token comes from the seeded sampler and must
-        # carry residual mass.
+        uniforms = counter_uniforms(seed, offset, K + 1)
         expected_tokens, expected_accepted = block_verify(
-            draft_tokens,
-            draft_probs,
-            target_probs,
-            counter_uniforms(seed, offset, K),
-            sample_emitted=record,
+            *(t.cpu() for t in (draft_tokens, draft_probs, target_probs)),
+            uniforms[:, :K].cpu(),
+            uniforms[:, K].cpu(),
         )
-        assert torch.equal(eager_accepted, expected_accepted)
-        assert torch.equal(eager_tokens, expected_tokens)
-        emitted = eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1].long()
-        assert (drawn["weights"].gather(1, emitted[:, None]) > 0).all()
-
-
-@_needs_cuda
-@pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
-def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
-    """The seeded sampler draws the emitted token from the normalized residual.
-
-    Each case pins the accepted length regardless of the uniforms, so thousands
-    of rows that differ only in their RNG offset sample one known distribution:
-    all drafts impossible under the target -> L = 0 and max(p_0 - q_0, 0);
-    draft == target -> L = K and the bonus row p_K.
-    """
-    generator = torch.Generator().manual_seed(51)
-    vocab, rows = 64, 20_000
-    worker = _worker()
-    meta = _metadata(rows, vocab=vocab, mode=AdvancedSamplingMode.FULL, device="cuda")
-    target = torch.softmax(torch.randn(1, K + 1, vocab, generator=generator), -1)
-    if case == "all_rejected":
-        target[:, :, 0] = 0.0
-        target = target / target.sum(-1, keepdim=True)
-        draft = torch.softmax(torch.randn(1, K, vocab, generator=generator), -1)
-        draft[:, :, 0] = 0.5
-        draft = draft / draft.sum(-1, keepdim=True)
-        tokens = torch.zeros(1, K, dtype=torch.int32)
-        expected = (target[0, 0] - draft[0, 0]).clamp_min(0)
-        position = 0
-    else:
-        draft = target[:, :K].clone()
-        tokens = torch.multinomial(draft[0], 1).view(1, K).int()
-        expected = target[0, K]
-        position = K
-    expected = expected / expected.sum()
-    seed = meta.request_seeds
-    offset = meta.request_offsets + 7
-    out, accepted = worker._block_verify(
-        meta,
-        tokens.cuda().expand(rows, -1),
-        draft.cuda().expand(rows, -1, -1),
-        target.cuda().expand(rows, -1, -1),
-        seed,
-        offset,
-    )
-    assert (accepted == position + 1).all()
-    histogram = torch.bincount(out[:, position].long().cpu(), minlength=vocab).double()
-    stat, critical = chi_square(histogram, expected.double())
-    assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
+        assert torch.equal(eager_accepted.cpu(), expected_accepted)
+        assert torch.equal(eager_tokens.cpu(), expected_tokens)
