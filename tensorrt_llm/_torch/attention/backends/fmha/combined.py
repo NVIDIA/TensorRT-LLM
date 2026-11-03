@@ -62,20 +62,24 @@ class CombinedFmha(PhasedFmha):
 
     The context implementation is either a phased library or a whole-batch library that
     honours a context-only call on the mixed tensors (``Fmha.serves_context_only_input``,
-    the thop op): it then serves the context requests through that call, and the phased
-    generation library serves the generation rows. A batch whose generation rows are not
-    uniform goes to the whole-batch library alone, exactly as without the combination.
+    the thop op). With ``whole_batch_context``, the context implementation supports the whole
+    mixed batch and serves it alone unless the generation library takes this step's
+    generation rows: they must be uniform and
+    ``PhasedFmha.serves_mixed_generation_rows`` must accept them.
     """
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
         self._context_impl: Optional[Fmha] = None
         self._generation_impl: Optional[PhasedFmha] = None
+        self._whole_batch_context = False
 
     def set_fmha_impls(
         self,
         context_impl: Fmha,
         generation_impl: PhasedFmha,
+        *,
+        whole_batch_context: bool = False,
     ) -> None:
         if not isinstance(context_impl, PhasedFmha) and not context_impl.serves_context_only_input:
             raise TypeError(
@@ -84,6 +88,7 @@ class CombinedFmha(PhasedFmha):
             )
         self._context_impl = context_impl
         self._generation_impl = generation_impl
+        self._whole_batch_context = whole_batch_context
         self.supports_workspace_reclamation = (
             context_impl.supports_workspace_reclamation
             and generation_impl.supports_workspace_reclamation
@@ -108,10 +113,7 @@ class CombinedFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         context_impl = self._get_context_impl()
-        if isinstance(context_impl, PhasedFmha):
-            self._forward_phases(q, k, v, metadata, forward_args)
-            return
-        if not (
+        if (self._whole_batch_context or not isinstance(context_impl, PhasedFmha)) and not (
             forward_args.attention_input_type == AttentionInputType.mixed
             and metadata.num_contexts > 0
             and metadata.num_generations > 0
@@ -119,6 +121,9 @@ class CombinedFmha(PhasedFmha):
             and self._get_generation_impl().serves_mixed_generation_rows(metadata)
         ):
             context_impl.forward(q, k, v, metadata, forward_args)
+            return
+        if isinstance(context_impl, PhasedFmha):
+            self._forward_phases(q, k, v, metadata, forward_args)
             return
         # The whole-batch library serves the context requests on the mixed tensors and
         # leaves the generation rows, which the phased library serves next.
