@@ -3216,6 +3216,8 @@ class _MLABlockFixup(NamedTuple):
     # Helix: [B * block, 1] whether this rank holds each block position; the
     # pages, offsets and lengths above are then rank-local.
     owned: Optional[torch.Tensor] = None
+    # Per-request split-KV counts of the CuTe DSL decode, or None (uniform).
+    split_kvs: Optional[torch.Tensor] = None
 
 
 @lru_cache(maxsize=1)
@@ -3673,6 +3675,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     _low_m_gemm: Optional[LowMGemmDispatcher] = None
     # The target's helix mapping whose CP group the drafter's heads span.
     _helix_mapping: Optional[Mapping] = None
+    # The per-request split-KV plan buffer of the CuTe DSL block decode.
+    _mla_split_plan: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -3949,6 +3953,42 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         self._cute_dsl_checked_shape = key
 
+    def _mla_split_kv_plan(self, seq_lens: torch.Tensor, num_heads: int, block_size: int):
+        """Per-request split-KV counts of the block decode, planned once per step.
+
+        The planner the target's CuTe DSL MLA decode uses, from this step's
+        lengths and the block decode's geometry. None (the kernel's uniform
+        split) when its buffer cannot be allocated, inside a graph capture.
+        """
+        from ..attention.backends.fmha.cute_dsl_mla import (
+            _SPLIT_PLAN_MAX_REQUESTS,
+            launch_mla_split_kv_plan,
+            mla_split_kv_plan_geometry,
+        )
+
+        batch = seq_lens.numel()
+        if (
+            not 0 < batch <= _SPLIT_PLAN_MAX_REQUESTS
+            or seq_lens.dtype != torch.int32
+            or not seq_lens.is_contiguous()
+        ):
+            return None
+        if self._mla_split_plan is None or self._mla_split_plan.device != seq_lens.device:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._mla_split_plan = torch.empty(
+                _SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device=seq_lens.device
+            )
+        rows_per_request, wave_clusters = mla_split_kv_plan_geometry(num_heads, block_size)
+        launch_mla_split_kv_plan(
+            seq_lens,
+            self._mla_split_plan,
+            num_requests=batch,
+            rows_per_request=rows_per_request,
+            wave_clusters=wave_clusters,
+        )
+        return self._mla_split_plan[:batch]
+
     def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
         """One cute-dsl MLA decode over context AND block, no fixup.
 
@@ -4029,6 +4069,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             stats,
             # Every block token sees the whole block, not just its causal prefix.
             fixup.kv_bounds_i32,
+            fixup.split_kvs,
         )
         return out if stats is None else (out, stats)
 
@@ -4311,6 +4352,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 num_ctx_per_req[:batch], page_tables.long(), block_size, page_size, shard
             )
         attn_heads = num_heads if shard is None else num_heads * shard.cp_size
+        if variant == "cute_dsl":
+            fixup = fixup._replace(
+                split_kvs=self._mla_split_kv_plan(fixup.seq_lens_i32, attn_heads, block_size)
+            )
         logger.info_once(
             "MLA DSpark block decode: "
             + {

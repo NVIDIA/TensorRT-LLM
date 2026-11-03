@@ -2111,6 +2111,54 @@ def test_fp8_block_decode_follows_bf16_at_k3_shapes(block_size):
     assert cosine.item() > 0.993 and rel_l2(out_fp8, out_bf16) < 0.12
 
 
+@needs_absorbed_mla
+@pytest.mark.parametrize("block_size", [5, 7])
+def test_block_decode_split_plan_follows_the_planner_and_the_uniform_split(block_size):
+    """The block decode plans its per-request split-KV counts with the target's
+    planner (host mirror plan_mla_split_kv) from the step's lengths; another
+    split changes only the reduction order."""
+    import types
+
+    from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import (
+        mla_split_kv_plan_geometry,
+        plan_mla_split_kv,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _build_mla_block_fixup,
+    )
+
+    heads, page, latent_dim = 64, 64, 576
+    stub = _k3_block_decoder()
+    stub._mla_split_plan = None
+    stub._mla_split_kv_plan = types.MethodType(MLADSparkForCausalLM._mla_split_kv_plan, stub)
+    gen = torch.Generator(device="cuda").manual_seed(block_size)
+    ctx = torch.tensor([300, 1700, 6400, 13700, 90], device="cuda")
+    pages = (ctx + block_size + page - 1) // page
+    table = torch.zeros(len(ctx), int(pages.max()), dtype=torch.long, device="cuda")
+    start = 0
+    for b, n in enumerate(pages.tolist()):
+        table[b, :n] = torch.arange(start, start + n, device="cuda")
+        start += n
+    pool = torch.randn(start, 1, 1, page, latent_dim, device="cuda", generator=gen).bfloat16()
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+    fixup = _build_mla_block_fixup(ctx, table, block_size, page)
+
+    plan = stub._mla_split_kv_plan(fixup.seq_lens_i32, heads, block_size)
+
+    rows, waves = mla_split_kv_plan_geometry(heads, block_size)
+    expected = plan_mla_split_kv(
+        fixup.seq_lens_i32.tolist(), rows_per_request=rows, wave_clusters=waves
+    )
+    assert plan.tolist() == expected
+    planned = stub._cute_dsl_block_decode(query, pool, fixup._replace(split_kvs=plan), block_size)
+    uniform = stub._cute_dsl_block_decode(query, pool, fixup, block_size)
+    rel_l2 = ((planned.float() - uniform.float()).norm() / uniform.float().norm()).item()
+    assert rel_l2 < 5e-3
+
+
 # ---------------------------------------------------------------------------
 # Drafter context KV sharded over helix CP.
 # ---------------------------------------------------------------------------

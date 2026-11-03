@@ -180,6 +180,16 @@ def launch_mla_split_kv_plan(
     )
 
 
+def mla_split_kv_plan_geometry(num_heads: int, seq_len_q: int) -> tuple[int, int]:
+    """``(rows_per_request, wave_clusters)`` of the CuTe DSL MLA decode for the planner."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    runner = CuteDSLNVMlaDecodeBlackwellRunner
+    rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
+    wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+    return rows_per_request, wave_clusters
+
+
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
 
@@ -841,10 +851,6 @@ class CuteDslMlaFmha(PhasedFmha):
         reuse it (``_invalidate_mla_scheduler_buffers`` resets the key when the
         lengths change). None (uniform split) when it cannot be planned here.
         """
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            CuteDSLNVMlaDecodeBlackwellRunner,
-        )
-
         if not 0 < batch_size <= _SPLIT_PLAN_MAX_REQUESTS:
             return None
         plan = getattr(meta, "_cute_dsl_mla_split_plan", None)
@@ -854,9 +860,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 return None
             plan = torch.empty(capacity, dtype=torch.int32, device=cache_seqs.device)
             meta._cute_dsl_mla_split_plan = plan
-        runner = CuteDSLNVMlaDecodeBlackwellRunner
-        rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
-        wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+        rows_per_request, wave_clusters = mla_split_kv_plan_geometry(num_heads, seq_len_q)
         key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
         if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
             launch_mla_split_kv_plan(
