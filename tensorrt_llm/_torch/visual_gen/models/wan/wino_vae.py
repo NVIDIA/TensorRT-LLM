@@ -57,8 +57,8 @@ from .wan_vae import (
     _channels_last_2d_if_needed,
     _channels_last_3d_if_needed,
     _decode_chunk_slices,
+    _to_channels_last,
     _to_device_if_needed,
-    patchify,
     unpatchify,
 )
 from .wino_vae_kernels import (
@@ -268,6 +268,26 @@ def _add_bias_and_residual(s: DeferredSum, pad_h: int, pad_w: int) -> torch.Tens
         pad_w=pad_w,
         products_geometry=geometry,
     )
+
+
+def _patchify_channels_last(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """:func:`patchify` written straight into the channels-last layout (one copy instead of a
+    copy to the default layout and a second one to channels-last)."""
+    if patch_size == 1:
+        return x
+    if x.dim() != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    b, c, t, h, w = x.shape
+    if h % patch_size or w % patch_size:
+        raise ValueError(
+            f"Height ({h}) and width ({w}) must be divisible by patch_size ({patch_size})"
+        )
+    p = patch_size
+    hp, wp = h // p, w // p
+    # patchify's channel index is (c, pw, ph) with ph fastest; channels-last bytes run
+    # (b, t, h', w', channel).
+    y = x.reshape(b, c, t, hp, p, wp, p).permute(0, 2, 3, 5, 1, 6, 4).contiguous()
+    return y.view(b, t, hp, wp, c * p * p).permute(0, 4, 1, 2, 3)
 
 
 def materialize(x: "torch.Tensor | DeferredSum") -> torch.Tensor:
@@ -1039,9 +1059,11 @@ class WinoVaeResample(WanResample):
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
         super().__init__(dim, mode, upsample_out_dim)
         self._packed: tuple[tuple, torch.Tensor, torch.Tensor | None] | None = None
-        # Downsample conv bias left out of the conv: the time conv absorbs it (downsample3d)
-        # or the owning block's shortcut-add kernel adds it (downsample2d). Only a block that
-        # takes ``pending_bias`` may enable the deferral.
+        # Downsample conv biases left out of the convs; the owning block's shortcut-add kernel
+        # adds ``pending_bias``: the space conv's (downsample2d, and the first chunk of
+        # downsample3d), or the time conv's with the space conv's folded through its taps
+        # (later downsample3d chunks). Only a block that takes ``pending_bias`` may enable the
+        # deferral.
         self.defer_bias_to_consumer = False
         self.pending_bias: torch.Tensor | None = None
         self._time_bias: tuple[tuple, torch.Tensor] | None = None
@@ -1216,13 +1238,19 @@ class WinoVaeResample(WanResample):
             and kernels_available()
             and batch_size == 1
         )
-        self.pending_bias = conv.bias if defer else None
+        self._set_pending_bias(conv.bias if defer else None)
         if defer:
             return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding)
         return conv(x_4d)
 
+    def _set_pending_bias(self, bias: torch.Tensor | None) -> None:
+        # A plain attribute: nn.Module would register an assigned Parameter (the conv's bias)
+        # as a parameter of this module.
+        object.__setattr__(self, "pending_bias", bias)
+
     def take_pending_bias(self) -> torch.Tensor | None:
-        bias, self.pending_bias = self.pending_bias, None
+        bias = self.pending_bias
+        self._set_pending_bias(None)
         return bias
 
     def _time_conv_bias(self, bias: torch.Tensor) -> torch.Tensor:
@@ -1251,7 +1279,8 @@ class WinoVaeResample(WanResample):
         """The space step's frames ``[B*T, C, H, W]`` back as video ``[B, C, T, H, W]``, then
         the downsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one):
         the first chunk is cached as is, later chunks run the stride-2 time conv against the
-        cached last frame, with the space conv's deferred bias folded into the time conv's."""
+        cached last frame. With a deferred space-conv bias, the time conv runs without bias
+        and its own bias, with the space conv's folded in, is left in ``pending_bias``."""
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
         x = _channels_last_3d_if_needed(x_5d)
 
@@ -1266,7 +1295,8 @@ class WinoVaeResample(WanResample):
                 bias = self.take_pending_bias()
                 if bias is not None:
                     tc = self.time_conv
-                    x = F.conv3d(x_in, tc.weight, self._time_conv_bias(bias), tc.stride)
+                    x = F.conv3d(x_in, tc.weight, None, tc.stride)
+                    self._set_pending_bias(self._time_conv_bias(bias))
                 else:
                     x = self.time_conv(x_in)
                 feat_cache[idx] = cache_x
@@ -1657,8 +1687,7 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
         else:
             x = materialize(x)
         x = _channels_last_3d_if_needed(x)
-        # The downsample conv's bias, when it ran without one (downsample2d; the time conv
-        # absorbs it in downsample3d).
+        # The downsample convs' bias, when they ran without it.
         bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
         dup = self.avg_shortcut
         if kernels_available() and x.shape[0] == 1:
@@ -2011,6 +2040,9 @@ class WinoVae(WanVAE):
         ).to(device=a.device, dtype=conv_out.weight.dtype)
         folded.weight.copy_(w)
         folded.bias.copy_(b)
+        # The model's conv weights are channels-last (WanVAE builds them so); a default-layout
+        # weight would be converted by every conv call.
+        _to_channels_last(folded)
         folded.weight.requires_grad_(False)
         folded.bias.requires_grad_(False)
         folded.max_in_frames = conv_out.max_in_frames
@@ -2041,7 +2073,7 @@ class WinoVae(WanVAE):
 
         self.clear_cache()
         if self.config.patch_size is not None:
-            x = patchify(x, patch_size=self.config.patch_size)
+            x = _patchify_channels_last(x, self.config.patch_size)
         x = _channels_last_3d_if_needed(x)
 
         self.encoder.conv_out_override = self._folded_tail_conv(self.z_dim if mode_only else None)

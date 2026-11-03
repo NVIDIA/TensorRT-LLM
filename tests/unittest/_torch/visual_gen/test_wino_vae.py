@@ -302,3 +302,32 @@ def test_frame_buffer_follows_the_device() -> None:
     assert on_gpu.device.type == "cuda"
     on_cpu = buf.window(1, DTYPE, torch.device("cpu"), (4, 6))
     assert on_cpu.device.type == "cpu"
+
+
+@pytest.mark.parametrize("patch", [1, 2, 4])
+def test_patchify_channels_last_matches_patchify(patch: int) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import patchify
+
+    x = torch.randn(1, 3, 5, 8 * patch, 12 * patch, dtype=torch.bfloat16)
+    got = wino_vae_module._patchify_channels_last(x, patch)
+    assert torch.equal(got, patchify(x, patch))
+    if patch > 1:
+        assert got.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+def test_folded_tail_conv_weight_is_channels_last() -> None:
+    _, model = _pair()
+    for rows in (None, model.z_dim):
+        folded = model._folded_tail_conv(rows)
+        assert folded.weight.is_contiguous(memory_format=torch.channels_last_3d)
+
+
+def test_forward_registers_no_parameters() -> None:
+    """The deferred downsample bias is held as a plain attribute, never registered as a
+    parameter of the resample module during a call."""
+    _, model = _pair()
+    pixels, _ = _inputs(9)
+    slots = {name: set(m._parameters) for name, m in model.named_modules()}
+    with torch.inference_mode():
+        model.encode(pixels, return_dict=False)
+    assert {name: set(m._parameters) for name, m in model.named_modules()} == slots
