@@ -154,7 +154,7 @@ EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-
 What they change relative to the model card's recipe, and why:
 
 - **CUDA graphs on** (to batch 128 on B200, 160 on B300). The card ships `cuda_graph_config: null`; on one B200, enabling graphs alone raised single-user decode speed about 10x in our runs.
-- **MTP with 3 draft tokens and `use_rejection_sampling: true`** instead of the DFlash drafter. At high concurrency MTP gave about 60% more total throughput than DFlash at 32 users on B200 (same stack, only the speculation method changed). Rejection sampling is lossless and keeps more drafts for sampled (temperature > 0) requests.
+- **MTP with 3 draft tokens and `use_rejection_sampling: true`** instead of the DFlash drafter. At high concurrency MTP gave clearly higher total throughput than DFlash at 32 users on B200 in our runs (same stack, only the speculation method changed; that comparison was not run with unique prompts, so benchmark it on your traffic). Rejection sampling is lossless and keeps more drafts for sampled (temperature > 0) requests.
 - **`max_num_tokens: 65536`** prefill chunks: fewer mixed prefill/decode steps under load (a 1-2% gain at 160 users on B300).
 - **`moe_config.backend: CUTEDSL`**, as in the card.
 - **Block reuse with Mamba snapshots `[1, 576]` tokens from the prompt end**, so multi-turn chat reuses the previous turn. For traffic without shared prefixes (for example random-prompt benchmarks), `enable_block_reuse: false` is faster: the snapshot offsets split each prompt's prefill into extra chunks, which cost about 8-9% output throughput at 160 users on B300.
