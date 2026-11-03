@@ -76,7 +76,6 @@ set_target_properties(tllm_common_environment
 
 add_library(
   common_src OBJECT
-  attentionOp.cpp
   cublasMMWrapper.cpp
   cudaArchitectures.cpp
   cudaFp8Utils.cu

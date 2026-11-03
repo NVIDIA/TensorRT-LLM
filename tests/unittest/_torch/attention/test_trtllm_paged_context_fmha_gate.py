@@ -173,6 +173,7 @@ def _make_dispatch_inputs(num_contexts):
         sparse_runtime_params=SimpleNamespace(block_sparse_inputs=None),
         attention_mask=PredefinedAttentionMask.CAUSAL,
         update_kv_cache=True,
+        kv_append=None,
     )
     q = torch.zeros(num_contexts * 4 + metadata.num_generations, 8, dtype=torch.float16)
     return q, metadata, forward_args

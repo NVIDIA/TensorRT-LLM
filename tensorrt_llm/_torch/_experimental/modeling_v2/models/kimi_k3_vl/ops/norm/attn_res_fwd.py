@@ -19,7 +19,7 @@ class AttnResFwd(OpWrapper):
     per-candidate rsqrt(mean square + eps), softmax probabilities and logits, all newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

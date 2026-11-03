@@ -28,6 +28,7 @@ from ..modules.rms_norm import RMSNorm
 from .attention import Attention
 from .backends.interface import PositionalEmbeddingParams
 from .kernels.fused_qk_norm_rope_gate import (fused_qkv_gemma_rmsnorm_rope_gate,
+                                              fused_qkv_rope_gate_fp8_append,
                                               fused_sigmoid_mul_inplace)
 
 
@@ -167,6 +168,8 @@ class QKNormRoPEAttention(Attention):
         rope_fusion: Optional[bool] = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
+        use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -205,6 +208,8 @@ class QKNormRoPEAttention(Attention):
             reduce_output=reduce_output,
             mapping_with_cp=mapping_with_cp,
             head_dim=head_dim,
+            use_gqa_decode_fmha=use_gqa_decode_fmha,
+            cache_context_plan=cache_context_plan,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
@@ -267,28 +272,76 @@ class QKNormRoPEAttention(Attention):
         return (rotary_dim == rope.dim and rotary_dim > 0
                 and rotary_dim <= self.head_dim and rotary_dim % 2 == 0)
 
-    def preprocess_qkv(self, qkv, position_ids):
+    def preprocess_qkv(self, qkv, position_ids, attn_metadata=None):
         """Fuse gate split + gemma QK norm + RoPE into a single Triton kernel
-        when supported; otherwise fall back to the generic unfused path."""
+        when supported; otherwise fall back to the generic unfused path.
+
+        With attn_metadata (a GQA decode layer) and a generation-only step the
+        GQA decode library takes, the kernel also writes the FP8 query and
+        appends FP8 K / V, or the library's split-KV decode kernel runs it.
+        """
         if not self._can_use_fused_qk_norm_rope_gate(qkv, position_ids):
-            return super().preprocess_qkv(qkv, position_ids)
+            return super().preprocess_qkv(qkv, position_ids, attn_metadata)
         use_mrope = position_ids.dim() == 3
-        positions = position_ids.reshape(
-            3, -1) if use_mrope else position_ids.reshape(-1)
+        positions = (position_ids.reshape(3, -1)
+                     if use_mrope else position_ids.reshape(-1)).contiguous()
+        mrope_section = (tuple(self.pos_embd_params.mrope_section)
+                         if use_mrope else None)
+        gqa_decode = (self.attn.gqa_decode_fmha
+                      if attn_metadata is not None else None)
+        if gqa_decode is not None and qkv.dtype == torch.bfloat16:
+            plan = gqa_decode.kv_append_plan(attn_metadata, qkv.shape[0])
+            # The split-KV decode kernel runs the prologue itself when it takes
+            # the call; it always applies the gate, so the gate is offered.
+            if (plan is not None and self.attn_output_gate
+                    and self.sparse_attn_hooks is None):
+                plan.fold = gqa_decode.fold_inputs(
+                    plan, qkv, self.q_norm.weight, self.k_norm.weight,
+                    self.rotary_emb.rotary_cos_sin,
+                    positions, self.q_norm.variance_epsilon,
+                    self._get_qk_norm_rotary_dim(), mrope_section)
+            if plan is not None and plan.fold is not None:
+                num_tokens = qkv.shape[0]
+                packed = (self.num_heads +
+                          2 * self.num_key_value_heads) * self.head_dim
+                # The prologue is deferred: q is the raw projection, which the
+                # FMHA manager hands only to libraries declaring
+                # supports_deferred_prologue. The gate is the raw gate columns,
+                # as the prologue would copy them.
+                gate = qkv[:, :2 * self.q_size].view(
+                    num_tokens, self.num_heads,
+                    2 * self.head_dim)[:, :, self.head_dim:]
+                return qkv[:, :packed], None, None, gate, plan
+            if plan is not None:
+                qkv, gate, plan.q_fp8, plan.scales = fused_qkv_rope_gate_fp8_append(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.rotary_cos_sin,
+                    positions,
+                    self.q_norm.variance_epsilon,
+                    self.num_heads,
+                    self.num_key_value_heads,
+                    self.head_dim,
+                    self._get_qk_norm_rotary_dim(),
+                    mrope_section,
+                    plan,
+                )
+                return qkv, None, None, gate, plan
         qkv, gate = fused_qkv_gemma_rmsnorm_rope_gate(
             qkv,
             self.q_norm.weight,
             self.k_norm.weight,
             self.rotary_emb.rotary_cos_sin,
-            positions.contiguous(),
+            positions,
             self.q_norm.variance_epsilon,
             self.num_heads,
             self.num_key_value_heads,
             self.head_dim,
             self._get_qk_norm_rotary_dim(),
-            tuple(self.pos_embd_params.mrope_section) if use_mrope else None,
+            mrope_section,
         )
-        return qkv, None, None, gate
+        return qkv, None, None, gate, None
 
     def apply_output_gate(self, attention_output, gate):
         if (self._fuse_qk_norm_rope_gate and torch.version.hip is None
