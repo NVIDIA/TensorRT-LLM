@@ -525,11 +525,11 @@ def _split_ssm_layers():
     ]
 
 
-def _bounded_config(quota=16 << 20, **kwargs):
+def _bounded_config(quota=16 << 20, layers=None, **kwargs):
     return kv.KVCacheManagerConfig(
         tokens_per_block=4,
         cache_tiers=[kv.GpuCacheTierConfig(quota=quota)],
-        layers=_split_ssm_layers(),
+        layers=_split_ssm_layers() if layers is None else layers,
         commit_min_snapshot=True,
         enable_partial_commit=False,
         **kwargs,
@@ -595,6 +595,88 @@ def test_max_live_kv_caches_reserves_private_ssm_pool():
         assert caches[-1].resume(stream.cuda_stream)
     finally:
         for cache in caches:
+            cache.close()
+        manager.shutdown()
+
+
+def test_sink_required_only_beside_fixed_private_ssm_replay():
+    """SINK_REQUIRED_ONLY reuse beside PRIVATE SSM replay buffers with a fixed capacity.
+
+    The sinks are claimed and the window selected as without SSM layers, while the replay group is
+    never claimed and takes one fresh slot per living cache.
+    """
+    sink_layer = kv.AttentionLayerConfig(
+        layer_id=3,
+        buffers=[kv.BufferConfig(role="key", size=4096)],
+        sliding_window_size=4,
+        num_sink_tokens=4,
+        reuse_policy=kv.ReusePolicy.SINK_REQUIRED_ONLY,
+    )
+    config = _bounded_config(
+        layers=[*_split_ssm_layers(), sink_layer], max_util_for_resume=0.8, max_live_kv_caches=2
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(16))
+    try:
+        required = manager.get_buffer_group_id(1, "state")
+        sink = manager.get_layer_group_id(3)
+        private = manager.get_buffer_group_id(1, "old_x")
+        # Layer 3's lifecycle precedes the one only the old_x overrides create.
+        assert (manager.get_layer_group_id(0), required, sink, private) == (0, 1, 2, 3)
+        pools = manager.get_life_cycle_pool_group_indices(0)
+        assert pools[sink] != pools[private]
+
+        def private_stats():
+            stats = manager.get_storage_statistics(0)[pools[private]]
+            return stats.total, stats.free
+
+        # ceil(2 / 0.8) fixed slots.
+        assert private_stats() == (3, 3)
+
+        source = manager.create_kv_cache(input_tokens=[])
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(16)
+        source.commit(tokens, is_end=True)
+        old = source.get_base_page_indices(sink).copy()
+        caches.remove(source)
+        source.close()
+        assert private_stats() == (3, 3)
+
+        warm = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(warm)
+        assert warm.num_committed_tokens == 16
+        assert warm.reuse_status[required].complete
+        assert not warm.reuse_status[private].complete
+        status = warm.reuse_status[sink]
+        assert status.policy == kv.ReusePolicy.SINK_REQUIRED_ONLY and status.complete
+        assert list(status.coverage) == [(0, 4), (12, 16)]
+        assert warm.resume(stream.cuda_stream, optional_reuse_groups=[sink])
+        assert warm.get_base_page_indices(sink)[0] == old[0]
+        assert warm.get_base_page_indices(sink)[3] == old[3]
+        assert private_stats() == (3, 2)
+
+        # Without the window: the sinks are still claimed and the window gets fresh pages.
+        cold = manager.create_kv_cache(input_tokens=tokens)
+        caches.append(cold)
+        assert cold.num_committed_tokens == 16
+        assert cold.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert cold.get_base_page_indices(sink)[0] == old[0]
+        assert cold.get_base_page_indices(sink)[3] != old[3]
+        assert private_stats() == (3, 1)
+        replay = [cache.get_ssm_block_base_index(private) for cache in (warm, cold)]
+        assert min(replay) >= 0 and replay[0] != replay[1]
+
+        with pytest.raises(kv.LogicError, match="max_live_kv_caches=2"):
+            manager.create_kv_cache(input_tokens=tokens)
+        cold.suspend()
+        assert cold.resume(stream.cuda_stream)
+        assert cold.get_ssm_block_base_index(private) == replay[1]
+        assert cold.get_base_page_indices(sink)[0] == old[0]
+    finally:
+        for cache in reversed(caches):
             cache.close()
         manager.shutdown()
 
