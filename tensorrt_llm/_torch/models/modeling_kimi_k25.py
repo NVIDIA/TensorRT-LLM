@@ -801,9 +801,12 @@ class KimiK25VisionModel(nn.Module):
         self.model_config.attn_backend = model_config.get_encoder_attention_backend(
             "vision", model_config.attn_backend
         )
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
-        )
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if self.model_config.attn_backend != model_config.attn_backend:
+            # The encoder keeps no KV cache, and FlashInfer rejects FP8
+            # KV-cache quantization without one.
+            kv_cache_quant_algo = None
+        self.model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this

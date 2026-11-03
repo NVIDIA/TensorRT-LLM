@@ -48,7 +48,7 @@ llm = LLM(
 )
 ```
 
-Omitted entries preserve the model's existing encoder defaults, including inheritance from `attn_backend` where applicable. An encoder override leaves the language model's backend unchanged. Backend availability and supported tensor shapes still depend on the installed kernels and hardware; floating-point differences between backends are expected.
+Omitted entries preserve the model's existing encoder defaults, including inheritance from `attn_backend` where applicable. An encoder override leaves the language model's backend unchanged. Backend availability and supported tensor shapes still depend on the installed kernels and hardware; floating-point differences between backends are expected. `VANILLA` does not support `multimodal_config.encoder_cuda_graph`, so selecting it for an encoder with CUDA graphs enabled fails during configuration.
 
 The table covers every registered multimodal model implementation; model aliases share the same declaration. Image/video share `vision`, and `audio` names a separate encoder. "Not supported" means this option cannot change that encoder's attention backend; it does not mean the model or modality is unsupported. Gemma 4 Unified uses encoder-free projections, and Mllama's vision input is not implemented. The CPU registry test checks this table against each model's explicit `supported_encoder_attention_backends` declaration.
 

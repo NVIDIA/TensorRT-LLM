@@ -6,11 +6,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from pydantic import ValidationError
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    _validate_encoder_attention_backend_enabled,
+    _validate_encoder_attention_backend_support,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 pytestmark = pytest.mark.cpu_only
 
@@ -266,20 +272,237 @@ def test_hf_encoders_reject_backend_overrides(module: str, model: str, encoder: 
 def test_loader_rejects_absent_or_disabled_encoder(disabled: bool) -> None:
     config = SimpleNamespace(vision_config=object() if disabled else None)
     with pytest.raises(ValueError, match="vision.*not enabled"):
-        _validate_encoder_attention_backend_support(
-            _EncoderModel,
+        _validate_encoder_attention_backend_enabled(
             MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
-            pretrained_config=config,
+            config,
             disable_mm_encoder=disabled,
         )
 
 
 def test_loader_accepts_enabled_encoder() -> None:
-    _validate_encoder_attention_backend_support(
-        _EncoderModel,
+    _validate_encoder_attention_backend_enabled(
         MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
-        pretrained_config=SimpleNamespace(vision_config=object()),
+        SimpleNamespace(vision_config=object()),
     )
+
+
+def test_loader_checks_encoder_after_model_kwargs() -> None:
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    def load_config(**kwargs):
+        # The checkpoint has a vision encoder; model_kwargs removes it.
+        pretrained_config = SimpleNamespace(vision_config=object())
+        for name, value in kwargs["model_kwargs"].items():
+            setattr(pretrained_config, name, value)
+        return SimpleNamespace(pretrained_config=pretrained_config)
+
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        model_kwargs={"vision_config": None},
+        multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+    )
+    loader = ModelLoader(
+        llm_args=llm_args,
+        mapping=MagicMock(),
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=128,
+        max_seq_len=128,
+    )
+    with pytest.raises(ValueError, match="vision.*not enabled"):
+        loader._load_and_validate_config(
+            "/tmp/dummy_model", SimpleNamespace(load_config=load_config)
+        )
+
+
+def test_loader_validates_registered_model_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.pyexecutor import model_loader
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    monkeypatch.setattr(
+        model_loader.AutoModelForCausalLM, "_resolve_class", staticmethod(lambda config: None)
+    )
+    checkpoint_loader = SimpleNamespace(
+        load_config=lambda *args, **kwargs: SimpleNamespace(
+            pretrained_config=SimpleNamespace(architectures=["Phi4MMForCausalLM"])
+        )
+    )
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+    )
+    with pytest.raises(ValueError, match="vision.*cannot be changed for Phi4MMForCausalLM"):
+        model_loader.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", llm_args, checkpoint_loader
+        )
+
+
+@pytest.mark.parametrize("graph_key", ["vision", "image"])
+def test_vanilla_encoder_rejects_encoder_cuda_graph(graph_key: str) -> None:
+    with pytest.raises(ValidationError, match=r"VANILLA for \['vision'\].*encoder_cuda_graph"):
+        MultimodalConfig(
+            encoder_attention_backend={"vision": "VANILLA"},
+            encoder_cuda_graph={graph_key: {"max_batch_size": 1}},
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "graph_key"),
+    [("TRTLLM", "vision"), ("FLASHINFER", "vision"), ("VANILLA", "audio")],
+)
+def test_encoder_cuda_graph_accepts_graph_safe_backends(backend: str, graph_key: str) -> None:
+    config = MultimodalConfig(
+        encoder_attention_backend={"vision": backend},
+        encoder_cuda_graph={graph_key: {"max_batch_size": 1}},
+    )
+    assert config.encoder_attention_backend == {"vision": backend}
+
+
+def _recorder(built: dict, role: str) -> type:
+    """Stand in for a tower and record the config it receives."""
+
+    class Recorder(torch.nn.Module):
+        def __init__(self, model_config: ModelConfig, *args, **kwargs) -> None:
+            super().__init__()
+            built[role] = (model_config, kwargs)
+            self.config = model_config.pretrained_config
+
+    return Recorder
+
+
+def _multimodal_config(override: str | None) -> MultimodalConfig:
+    return MultimodalConfig(encoder_attention_backend={"vision": override} if override else None)
+
+
+@pytest.mark.parametrize("override", [None, "VANILLA"])
+def test_pixtral_encoder_backend_keeps_decoder(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from transformers import Mistral3Config
+
+    from tensorrt_llm._torch.models import modeling_mistral
+
+    built = {}
+    monkeypatch.delenv("TLLM_MULTIMODAL_DISAGGREGATED", raising=False)
+    monkeypatch.setattr(modeling_mistral, "MistralForCausalLM", _recorder(built, "decoder"))
+    monkeypatch.setattr(
+        modeling_mistral.modeling_pixtral, "PixtralVisionModel", _recorder(built, "vision")
+    )
+    monkeypatch.setattr(
+        modeling_mistral, "Mistral3MultiModalProjector", _recorder(built, "projector")
+    )
+    config = ModelConfig(
+        pretrained_config=Mistral3Config(architectures=["Mistral3ForConditionalGeneration"]),
+        attn_backend="FLASHINFER",
+        multimodal_config=_multimodal_config(override),
+    )
+
+    modeling_mistral.Mistral3VLM(config)
+
+    assert built["vision"][0].attn_backend == (override or "TRTLLM")
+    assert built["decoder"][0].attn_backend == "FLASHINFER"
+    assert config.attn_backend == "FLASHINFER"
+
+
+@pytest.mark.parametrize("override", [None, "VANILLA"])
+def test_radio_encoder_backend_keeps_decoder(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.models import modeling_nemotron_h_multimodal
+
+    built = {}
+    monkeypatch.setattr(
+        modeling_nemotron_h_multimodal, "RADIOVisionModel", _recorder(built, "vision")
+    )
+    pretrained_config = PretrainedConfig(
+        force_image_size=32,
+        patch_size=16,
+        downsample_ratio=0.5,
+        ps_version="v2",
+        vit_hidden_size=4,
+        projector_hidden_size=8,
+        llm_config=PretrainedConfig(hidden_size=8, rms_norm_eps=1e-6),
+        vision_config=PretrainedConfig(),
+    )
+    pretrained_config.torch_dtype = torch.float32
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        attn_backend="TRTLLM",
+        multimodal_config=_multimodal_config(override),
+    )
+
+    modeling_nemotron_h_multimodal.NemotronHVisionEncoder(config)
+
+    assert built["vision"][1]["vision_attn_backend"] == (override or "FLASHINFER")
+    assert config.attn_backend == "TRTLLM"
+
+
+@pytest.mark.parametrize(
+    ("decoder_backend", "override"), [("FLASHINFER", None), ("TRTLLM", "VANILLA")]
+)
+def test_step3_encoder_backend_keeps_decoder(
+    decoder_backend: str, override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.models import modeling_step3p7vl
+
+    built = {}
+    monkeypatch.setattr(modeling_step3p7vl, "Step3p7VisionEncoder", _recorder(built, "vision"))
+    pretrained_config = PretrainedConfig(
+        vision_config=PretrainedConfig(width=4), text_config=PretrainedConfig(hidden_size=8)
+    )
+    pretrained_config.torch_dtype = torch.float32
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        attn_backend=decoder_backend,
+        multimodal_config=_multimodal_config(override),
+    )
+
+    modeling_step3p7vl.Step3p7VisionTower(config)
+
+    assert built["vision"][0].attn_backend == (override or decoder_backend)
+    assert config.attn_backend == decoder_backend
+
+
+@pytest.mark.parametrize("override", [None, "FLASHINFER"])
+def test_kimi_k25_encoder_override_drops_decoder_kv_cache_quant(override: str | None) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.models.modeling_kimi_k25 import KimiK25VisionModel
+
+    pretrained_config = PretrainedConfig(
+        vision_config={
+            "vt_hidden_size": 16,
+            "vt_num_hidden_layers": 1,
+            "vt_num_attention_heads": 2,
+            "vt_intermediate_size": 32,
+            "text_hidden_size": 16,
+            "init_pos_emb_height": 4,
+            "init_pos_emb_width": 4,
+        }
+    )
+    pretrained_config.torch_dtype = torch.float32
+    # VANILLA keeps construction on CPU; the vision default follows the decoder.
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        attn_backend="VANILLA",
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        multimodal_config=_multimodal_config(override),
+    )
+
+    vision = KimiK25VisionModel(config).model_config
+
+    assert vision.attn_backend == (override or "VANILLA")
+    # The default keeps today's config. An override drops the decoder's FP8
+    # KV-cache setting, which FlashInfer rejects without a KV cache.
+    assert vision.quant_config.kv_cache_quant_algo == (None if override else QuantAlgo.FP8)
+    assert config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
 
 
 def test_model_config_rejects_invalid_backend_even_without_pydantic_validation() -> None:
