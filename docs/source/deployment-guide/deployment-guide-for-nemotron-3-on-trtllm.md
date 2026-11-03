@@ -223,7 +223,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
       additional_snapshot_offsets_from_end: [1, 576]
   ```
 
-  Exact end offsets need `MambaHybridCacheManagerV2` (the default for hybrid Mamba models) and `max_beam_width: 1`. Set `avg_seq_len` (or `pool_ratio`) so V2 sizes the attention KV and Mamba state pools for your workload; without it, V2 warns and assumes half of `max_seq_len`.
+  Exact end offsets need `MambaHybridCacheManagerV2` (the default for hybrid Mamba models) and `max_beam_width: 1`. Set `avg_seq_len` (or `pool_ratio`) so V2 sizes the attention KV and Mamba state pools for your workload; without it, V2 warns and assumes half of `max_seq_len`. The pools grow with both `avg_seq_len` and `max_batch_size`, so at high batch sizes check that the server still fits in memory at startup: on one B300 at `max_batch_size: 160`, `avg_seq_len: 9216` already sized the pools past device memory. Lower `avg_seq_len` or the batch size if startup runs out of memory.
 
   On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 (one DGX Spark), `[1]` alone made follow-up turns reuse the cached prompt instead of re-reading it, and `[1, 576]` cut time to first token on a 100K-token prompt with a cached prefix from 31-33 s to 18.6 s. Check the per-request `num_reused_blocks` metric to confirm reuse on your workload.
 
