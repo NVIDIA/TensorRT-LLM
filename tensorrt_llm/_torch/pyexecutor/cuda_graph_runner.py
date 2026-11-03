@@ -1041,7 +1041,7 @@ class CUDAGraphRunner:
                 encoder_hidden_states)
             static_encoder_hidden_states[actual_num_encoder_tokens:].zero_()
 
-        # Issue the step's deferred copies (no-op without an open pack) before
+        # Issue the step's merged copies (no-op without an open pack) before
         # anything below reads the static inputs on the device.
         device_copy.flush()
         if self._pre_replay_hooks:

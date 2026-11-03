@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""A step's copies routed by a copy plan: deferred into one upload and one scatter launch, or skipped when unchanged."""
+"""A step's copies routed by a copy plan: merged into one upload and one scatter launch per barrier, or skipped when
+unchanged."""
 
 import threading
 
@@ -41,7 +42,7 @@ _SLEEP_CYCLES = 1_000_000_000
 class _Site(CopySiteEnum):
     H2D = ("test.h2d", Direction.H2D)
     D2D = ("test.d2d", Direction.D2D)
-    # Deferred and skipped when unchanged.
+    # Merged and skipped when unchanged.
     SKIP = ("test.skip", Direction.H2D)
     TAIL = ("test.tail", Direction.FILL)
     # In neither set of the plan.
@@ -51,7 +52,7 @@ class _Site(CopySiteEnum):
 
 
 _PLAN = CopyPlan(
-    defer={_Site.H2D, _Site.D2D, _Site.SKIP},
+    merge={_Site.H2D, _Site.D2D, _Site.SKIP},
     skip_unchanged={_Site.SKIP, _Site.TAIL, _Site.SKIP_ONLY},
 )
 
@@ -75,7 +76,7 @@ def copier():
 
 
 def _copy(dst, src) -> bool:
-    """A copy through the deferred site of ``src``'s direction."""
+    """A copy through the merged site of ``src``'s direction."""
     return device_copy.copy(_Site.H2D if src.device.type == "cpu" else _Site.D2D, dst, src)
 
 
@@ -97,14 +98,14 @@ def _zeros(*shape, dtype=torch.int32):
 
 
 def test_the_plan_routes_each_site():
-    plan = CopyPlan(defer={_Site.H2D}, skip_unchanged={_Site.SKIP_ONLY})
-    deferred, skipped, plain = (_zeros(2) for _ in range(3))
+    plan = CopyPlan(merge={_Site.H2D}, skip_unchanged={_Site.SKIP_ONLY})
+    merged, skipped, plain = (_zeros(2) for _ in range(3))
     values = _host([4, 5])
 
     with device_copy.active(_new_copier(plan)):
         device_copy.begin()
-        assert device_copy.copy(_Site.H2D, deferred, values) is True
-        # Skipped sites are not deferred unless the plan says so; the repeat is skipped.
+        assert device_copy.copy(_Site.H2D, merged, values) is True
+        # Skipped sites are not merged unless the plan says so; the repeat is skipped.
         assert [device_copy.copy(_Site.SKIP_ONLY, skipped, values) for _ in range(2)] == [
             True,
             False,
@@ -112,19 +113,19 @@ def test_the_plan_routes_each_site():
         # A site in neither set is a plain copy, every time.
         assert [device_copy.copy(_Site.PLAIN, plain, values) for _ in range(2)] == [True, True]
         torch.cuda.synchronize()
-        assert (deferred.tolist(), skipped.tolist(), plain.tolist()) == ([0, 0], [4, 5], [4, 5])
+        assert (merged.tolist(), skipped.tolist(), plain.tolist()) == ([0, 0], [4, 5], [4, 5])
         with pytest.raises(ValueError, match=r"_Site\.H2D is declared h2d"):
-            device_copy.copy(_Site.H2D, deferred, torch.ones(2, dtype=torch.int32, device="cuda"))
+            device_copy.copy(_Site.H2D, merged, torch.ones(2, dtype=torch.int32, device="cuda"))
         device_copy.flush()
     torch.cuda.synchronize()
-    assert deferred.tolist() == [4, 5]
+    assert merged.tolist() == [4, 5]
 
-    with pytest.raises(ValueError, match="cannot be deferred"):
-        CopyPlan(defer={_Site.TAIL})
+    with pytest.raises(ValueError, match="cannot be merged"):
+        CopyPlan(merge={_Site.TAIL})
     with pytest.raises(ValueError, match="cannot be skipped"):
         CopyPlan(skip_unchanged={CopySite.GRAPH_INPUT_IDS})
     with pytest.raises(TypeError, match="CopySiteEnum"):
-        CopyPlan(defer={"attn.kv_lens"})
+        CopyPlan(merge={"attn.kv_lens"})
     model = torch.nn.Module()
     assert copy_plan_of(model) == CopyPlan() and not copy_plan_of(model)
     model.copy_plan = plan
@@ -135,10 +136,10 @@ def test_the_plan_routes_each_site():
 
 
 @pytest.mark.parametrize(
-    "broken", ["deferred_dst_written", "d2d_src_changed", "skipped_dst_written", "tail_written"]
+    "broken", ["merged_dst_written", "d2d_src_changed", "skipped_dst_written", "tail_written"]
 )
 def test_check_mode_names_the_site_whose_assertion_broke(monkeypatch, broken):
-    monkeypatch.setenv(CHECK_ENV, "1")
+    monkeypatch.setattr(device_copy, "CHECK_MODE", True)
     checked = _new_copier()
     dst = _zeros(4)
     src = torch.arange(4, dtype=torch.int32, device="cuda")
@@ -153,7 +154,7 @@ def test_check_mode_names_the_site_whose_assertion_broke(monkeypatch, broken):
         torch.cuda.synchronize()
         assert static.tolist() == [1, 2, 3, 4]
 
-        if broken == "deferred_dst_written":
+        if broken == "merged_dst_written":
             device_copy.begin()
             _copy(dst, _host([1, 1, 1, 1]))
             dst[0] = 7
@@ -220,11 +221,11 @@ def test_an_inactive_copier_is_not_used():
 
 
 # ---------------------------------------------------------------------------
-# Deferral and ordering
+# Merging and ordering
 # ---------------------------------------------------------------------------
 
 
-def test_deferred_host_copy_lands_only_at_flush(copier):
+def test_merged_host_copy_lands_only_at_flush(copier):
     dst = _zeros(4)
     src = _host([1, 2, 3, 4])
 
@@ -243,7 +244,7 @@ def test_deferred_host_copy_lands_only_at_flush(copier):
     assert dst.tolist() == [1, 2, 3, 4]
 
 
-def test_deferred_host_copy_into_a_row_strided_2d_slice(copier):
+def test_merged_host_copy_into_a_row_strided_2d_slice(copier):
     table = torch.full((4, 6), -1, dtype=torch.int32, device="cuda")
     dst = table[1:3, 2:5]
     assert not dst.is_contiguous() and dst.stride(1) == 1
@@ -260,7 +261,7 @@ def test_deferred_host_copy_into_a_row_strided_2d_slice(copier):
     assert torch.equal(table, expected)
 
 
-def test_deferred_host_copy_converts_dtype_on_the_host(copier):
+def test_merged_host_copy_converts_dtype_on_the_host(copier):
     dst = _zeros(3)
 
     device_copy.begin()
@@ -271,7 +272,7 @@ def test_deferred_host_copy_converts_dtype_on_the_host(copier):
     assert dst.tolist() == [7, -8, 9]
 
 
-def test_deferred_device_copy_lands_only_at_flush(copier):
+def test_merged_device_copy_lands_only_at_flush(copier):
     dst = _zeros(5)
     src = torch.arange(5, dtype=torch.int32, device="cuda")
 
@@ -427,7 +428,7 @@ def test_an_unpackable_copy_flushes_first_and_keeps_order(copier):
     assert buf.tolist() == [2, 1, 2, 1, 2, 1, 2, 1]
     assert other.tolist() == [3, 3, 3, 3]
 
-    # The pack reopened: later copies are deferred again.
+    # The pack stays open: later copies are merged again.
     _copy(later, _host([5, 6]))
     torch.cuda.synchronize()
     assert later.tolist() == [0, 0]
@@ -436,7 +437,7 @@ def test_an_unpackable_copy_flushes_first_and_keeps_order(copier):
     assert later.tolist() == [5, 6]
 
 
-def test_a_device_copy_with_a_dtype_change_is_not_deferred(copier):
+def test_a_device_copy_with_a_dtype_change_is_not_merged(copier):
     dst = _zeros(3, dtype=torch.int64)
     src = torch.tensor([4, 5, 6], dtype=torch.int32, device="cuda")
 
@@ -567,7 +568,7 @@ def test_reusing_a_pinned_staging_buffer_waits_for_its_upload(copier):
         assert dst.tolist() == values[i], f"pack {i} uploaded the wrong bytes"
 
 
-def test_a_copy_while_capturing_is_not_deferred(copier):
+def test_a_copy_while_capturing_is_not_merged(copier):
     dst = _zeros(3)
     src = torch.tensor([1, 2, 3], dtype=torch.int32, device="cuda")
 
@@ -1005,3 +1006,208 @@ def test_a_gather_site_outside_the_plan_is_never_skipped(copier):
     for _ in range(2):
         assert device_copy.inputs_unchanged(_Site.PLAIN, dst, (0,), host) is False
         device_copy.record_inputs(_Site.PLAIN, dst, (0,), host)
+
+
+# ---------------------------------------------------------------------------
+# Barriers (flush_after)
+# ---------------------------------------------------------------------------
+
+# _Site.SKIP is merged, skipped when unchanged and a barrier; the fill and the gather site are barriers too.
+_BARRIER_PLAN = CopyPlan(
+    merge={_Site.H2D, _Site.D2D, _Site.SKIP},
+    flush_after={_Site.SKIP, _Site.TAIL, _Site.SKIP_ONLY},
+    skip_unchanged={_Site.SKIP, _Site.TAIL, _Site.SKIP_ONLY},
+)
+
+
+@pytest.fixture
+def barrier_copier():
+    active = _new_copier(_BARRIER_PLAN)
+    with device_copy.active(active):
+        yield active
+        device_copy.flush()
+    torch.cuda.synchronize()
+
+
+def test_flush_after_is_validated():
+    with pytest.raises(ValueError, match="merges none"):
+        CopyPlan(flush_after={_Site.SKIP}, skip_unchanged={_Site.SKIP})
+    with pytest.raises(TypeError, match="CopySiteEnum"):
+        CopyPlan(merge={_Site.H2D}, flush_after={"test.skip"})
+    # Any site may be a barrier, merged or not.
+    plan = CopyPlan(merge={_Site.H2D}, flush_after={_Site.PLAIN, _Site.TAIL})
+    assert plan.flush_after == frozenset({_Site.PLAIN, _Site.TAIL}) and plan
+
+
+def test_a_barrier_lands_what_was_merged_before_it(barrier_copier):
+    before, anchor, after = _zeros(2), _zeros(2), _zeros(2)
+    pack = barrier_copier._pack
+
+    device_copy.begin()
+    slot = pack.slot
+    _copy(before, _host([1, 2]))
+    assert _skip_copy(anchor, _host([3, 4])) is True
+    torch.cuda.synchronize()
+    # The barrier issued everything merged up to and including the anchor; the pack stays open.
+    assert (before.tolist(), anchor.tolist()) == ([1, 2], [3, 4])
+    assert device_copy.is_open() and pack.seg > 0
+    _copy(after, _host([5, 6]))
+    torch.cuda.synchronize()
+    assert after.tolist() == [0, 0]
+    device_copy.flush()
+    torch.cuda.synchronize()
+    assert after.tolist() == [5, 6]
+    assert pack.slot == slot
+
+
+def test_a_skipped_anchor_still_flushes(barrier_copier):
+    anchor, merged = _zeros(2), _zeros(2)
+
+    device_copy.begin()
+    _skip_copy(anchor, _host([3, 4]))
+    device_copy.flush()
+
+    device_copy.begin()
+    _copy(merged, _host([7, 8]))
+    assert _skip_copy(anchor, _host([3, 4])) is False
+    torch.cuda.synchronize()
+    assert merged.tolist() == [7, 8]
+    device_copy.flush()
+
+
+def test_a_repeated_anchor_flushes_on_every_call(barrier_copier):
+    dsts = [_zeros(1) for _ in range(3)]
+    anchor = _zeros(1)
+    pack = barrier_copier._pack
+
+    device_copy.begin()
+    slot, segments = pack.slot, []
+    for i, dst in enumerate(dsts):
+        _copy(dst, _host([i + 1]))
+        _skip_copy(anchor, _host([10 + i]))
+        segments.append(pack.seg)
+        torch.cuda.synchronize()
+        assert [d.item() for d in dsts[: i + 1]] == list(range(1, i + 2))
+        assert anchor.item() == 10 + i
+    device_copy.flush()
+    # Three segments, appended one after another in the same ring slot.
+    assert segments == sorted(set(segments)) and pack.slot == slot
+
+
+def test_segments_of_one_step_do_not_wait_on_the_device(barrier_copier):
+    """Barriers append segments in the step's slot: no host wait on the queued uploads."""
+    dsts = [_zeros(2) for _ in range(3)]
+    anchor = _zeros(1)
+    done = torch.cuda.Event()
+
+    device_copy.begin()
+    torch.cuda._sleep(_SLEEP_CYCLES)
+    done.record()
+    for i, dst in enumerate(dsts):
+        _copy(dst, _host([i, i]))
+        _skip_copy(anchor, _host([i]))
+    device_copy.flush()
+    assert not done.query(), (
+        "a barrier waited for the device (or the queued kernel finished too early)"
+    )
+    torch.cuda.synchronize()
+    assert [d.tolist() for d in dsts] == [[0, 0], [1, 1], [2, 2]]
+
+
+def test_a_fill_or_gather_anchor_flushes(barrier_copier):
+    first, second, tail = _zeros(2), _zeros(2), _zeros(4)
+
+    device_copy.begin()
+    _copy(first, _host([1, 1]))
+    device_copy.fill_tail(_Site.TAIL, tail, 2, -1)
+    torch.cuda.synchronize()
+    assert first.tolist() == [1, 1]
+    _copy(second, _host([2, 2]))
+    assert _gather(_zeros(2), (0,), _host([5, 5])) is True
+    torch.cuda.synchronize()
+    assert second.tolist() == [2, 2]
+    device_copy.flush()
+
+
+def test_capacity_runs_out_across_segments_and_falls_back_in_order(barrier_copier):
+    # Each chunk is a quarter of the staging buffer: two segments hold one each, the third does not fit.
+    chunk = _Pack.CAPACITY // 16
+    dsts = [_zeros(chunk) for _ in range(3)]
+    values = [torch.full((chunk,), i + 1, dtype=torch.int32).pin_memory() for i in range(3)]
+    anchor = _zeros(1)
+
+    device_copy.begin()
+    for i in range(2):
+        _copy(dsts[i], values[i])
+        _skip_copy(anchor, _host([i]))
+    # A small merged write into the last chunk, then the whole chunk, which no longer fits: the small write is issued
+    # first and the eager copy of the chunk wins.
+    _copy(dsts[2][:4], _host([-1, -1, -1, -1]))
+    _copy(dsts[2], values[2])
+    assert device_copy.is_open()
+    device_copy.flush()
+    torch.cuda.synchronize()
+    for i, dst in enumerate(dsts):
+        assert torch.equal(dst.cpu(), values[i]), f"chunk {i}"
+
+
+def test_host_and_device_copies_keep_their_order_across_segments(barrier_copier):
+    dst = _zeros(2)
+    mirror = _zeros(2)
+    src = torch.tensor([7, 7], dtype=torch.int32, device="cuda")
+    anchor = _zeros(1)
+
+    device_copy.begin()
+    # Segment 1: a device copy into dst. Segment 2: a host copy into dst, then a device copy reading it.
+    _copy(dst, src)
+    _skip_copy(anchor, _host([1]))
+    _copy(dst, _host([3, 4]))
+    _copy(mirror, dst)
+    device_copy.flush()
+    torch.cuda.synchronize()
+    assert dst.tolist() == [3, 4] and mirror.tolist() == [3, 4]
+
+
+# ---------------------------------------------------------------------------
+# Check mode constant and expect_landed
+# ---------------------------------------------------------------------------
+
+
+def test_a_copier_takes_check_mode_from_the_module_constant(monkeypatch):
+    monkeypatch.setattr(device_copy, "CHECK_MODE", True)
+    assert _new_copier().check and _new_copier()._pack.check
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
+    assert not _new_copier().check
+
+
+def test_expect_landed_raises_outside_check_mode(monkeypatch):
+    monkeypatch.setattr(device_copy, "CHECK_MODE", False)
+    with pytest.raises(RuntimeError, match=r"_Site\.SKIP.*CHECK_MODE"):
+        device_copy.expect_landed(_Site.SKIP, _zeros(1))
+
+
+def test_expect_landed_passes_behind_its_barrier(monkeypatch):
+    monkeypatch.setattr(device_copy, "CHECK_MODE", True)
+    table = _zeros(4)
+    with device_copy.active(_new_copier(_BARRIER_PLAN)):
+        device_copy.begin()
+        _skip_copy(table, _host([1, 2, 3, 4]))
+        if device_copy.CHECK_MODE:
+            device_copy.expect_landed(_Site.SKIP, table)
+        assert table.sum().item() == 10
+        device_copy.flush()
+    # Without an active copier nothing is staged.
+    device_copy.expect_landed(_Site.SKIP, table)
+
+
+def test_expect_landed_names_its_anchor_when_the_barrier_is_missing(monkeypatch):
+    monkeypatch.setattr(device_copy, "CHECK_MODE", True)
+    table = _zeros(4)
+    with device_copy.active(_new_copier(CopyPlan(merge={_Site.H2D, _Site.SKIP}))):
+        device_copy.begin()
+        _copy(table, _host([1, 2, 3, 4]))
+        with pytest.raises(RuntimeError, match=rf"{CHECK_ENV}: .*_Site\.SKIP.*_Site\.H2D"):
+            device_copy.expect_landed(_Site.SKIP, table[1:3])
+        # Unrelated bytes are fine.
+        device_copy.expect_landed(_Site.SKIP, _zeros(4))
+        device_copy.discard()

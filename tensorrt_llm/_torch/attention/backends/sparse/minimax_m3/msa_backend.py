@@ -1365,6 +1365,10 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             and self.msa_subpage_block_table is not None
             and block_table_changed
         ):
+            if device_copy.CHECK_MODE:
+                device_copy.expect_landed(
+                    MsaCopySite.BLOCK_TABLE, self.msa_block_table[:batch_size]
+                )
             write_subpage_block_table(
                 self.msa_block_table[:batch_size],
                 self._msa_subpages_per_slot,

@@ -150,7 +150,7 @@ class DecoderRunner(ScheduledModelRunner):
 
     # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
     runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
-    # The copy sites the model defers to the graph replay or skips when unchanged (device_copy); empty by default.
+    # The copy sites the model merges up to a barrier or skips when unchanged (device_copy); empty by default.
     copy_plan: CopyPlan = CopyPlan()
     # This engine's copier (None: an empty plan), active only during its own forward.
     _copier: DeviceCopier | None = None
@@ -383,7 +383,7 @@ class DecoderRunner(ScheduledModelRunner):
             try:
                 return self._forward_decoder(inputs, resource_manager, is_dummy=is_dummy)
             except BaseException:
-                # A failed step issues none of its deferred copies, so forget the shadows recorded for them too.
+                # A failed step may not have issued its merged copies, so forget the shadows recorded for them too.
                 device_copy.discard()
                 raise
 
@@ -732,12 +732,12 @@ class DecoderRunner(ScheduledModelRunner):
                     execution_requests.generation_requests,
                 )
 
-            # Defer the plan's copies to one upload and one scatter at the graph
-            # replay. Only a replay of an already captured graph, which always
-            # reaches the flush, may open a pack.
+            # Merge the plan's copies into one upload and one scatter per barrier,
+            # the last at the graph replay. Only a replay of an already captured
+            # graph, which always reaches that flush, may open a pack.
             if (
                 self._copier is not None
-                and self._copier.defers
+                and self._copier.merges
                 and can_run_graph
                 and not self.cuda_graph_runner.is_warmup_only
                 and not self.cuda_graph_runner.needs_capture(key)

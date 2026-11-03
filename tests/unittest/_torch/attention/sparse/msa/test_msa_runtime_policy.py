@@ -45,7 +45,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA r
 
 
 def _skipping(*sites):
-    """A copier that skips ``sites`` when unchanged (it defers nothing, so it needs no device)."""
+    """A copier that skips ``sites`` when unchanged (it merges nothing, so it needs no device)."""
     return DeviceCopier(CopyPlan(skip_unchanged=set(sites)), torch.device("cuda"))
 
 

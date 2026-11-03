@@ -19,9 +19,9 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-# A host-to-device site the plan both defers and skips.
+# A host-to-device site the plan both merges and skips.
 _SITE = CopySite.ATTN_PROMPT_LENS
-_PLAN = CopyPlan(defer={_SITE}, skip_unchanged={_SITE})
+_PLAN = CopyPlan(merge={_SITE}, skip_unchanged={_SITE})
 
 
 class _ModelWithoutWeights(torch.nn.Module):

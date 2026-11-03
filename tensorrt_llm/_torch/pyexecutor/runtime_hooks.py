@@ -142,7 +142,7 @@ class MsaRuntimePolicy:
     kv_update: Optional[MsaKvUpdate] = None
     # Build the decode step's slot table, page table and query/KV prefix sums on the host and stage them as copies,
     # instead of filling them with device gathers, zero fills and scans between the decode graphs. The copies are
-    # MSA copy sites (MsaCopySite), deferred or skipped as the model's CopyPlan says.
+    # MSA copy sites (MsaCopySite), merged or skipped as the model's CopyPlan says.
     stage_tables_on_host: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
@@ -180,7 +180,7 @@ class ExecutorEvents(Protocol):
 class RuntimeHooks:
     """The step-loop hooks a model opts into. All off by default.
 
-    Which per-step copies are deferred to the graph replay or skipped is the model's ``CopyPlan``
+    Which per-step copies are merged up to a barrier or skipped is the model's ``CopyPlan``
     (``device_copy``), not a hook.
     """
 

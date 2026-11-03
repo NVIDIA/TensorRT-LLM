@@ -45,10 +45,11 @@ class MsaCopySite(CopySiteEnum):
     # Flattened page table (fmha_sm100 only), 2-D page table, per-request attended lengths.
     KV_INDICES = ("msa.kv_indices", Direction.H2D)
     # Read on the device before the replay by write_subpage_block_table when the pool has sub-pages
-    # (uniform_subpages_per_slot > 0): a plan for such a pool must not defer it.
+    # (uniform_subpages_per_slot > 0): a plan for such a pool that merges it must also list it in flush_after, so the
+    # pack is flushed right after this copy and before that reader (which asserts it with expect_landed).
     BLOCK_TABLE = ("msa.block_table", Direction.H2D)
     # Read on the device before the replay by the KV prefix-sum scan unless
-    # MsaRuntimePolicy.stage_tables_on_host: a plan without host staging must not defer it.
+    # MsaRuntimePolicy.stage_tables_on_host: a plan without host staging must not merge it.
     SEQ_LENS = ("msa.seq_lens", Direction.H2D)
     # Host-staged query lengths and query / KV prefix sums (MsaRuntimePolicy.stage_tables_on_host).
     QO_LENS = ("msa.qo_lens", Direction.H2D)
