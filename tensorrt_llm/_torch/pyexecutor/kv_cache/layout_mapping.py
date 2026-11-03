@@ -30,13 +30,18 @@ destination takes them from one rank of its fan. Of several such ranks, the one 
 so that destinations of several data-parallel groups spread over the sources. A destination
 holding an index no paired source rank holds, as an uneven head split or a cyclic split between
 different rank counts can make, is refused rather than left without it.
+
+Token positions: a transfer moves each page by ``page_runs``, given the page's position among the
+request's pages and the token position the transfer reaches, so that runs may depend on the
+positions a page has written (``BufferRuns.by_position``); runs that do not are computed once per
+peer and only add each page's address.
 """
 
 from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Hashable, Sequence
 
 import numpy as np
 
@@ -59,6 +64,7 @@ __all__ = [
     "layer_group_of",
     "map_buffers",
     "merge_runs",
+    "page_runs",
     "sent_bytes",
 ]
 
@@ -88,6 +94,30 @@ class BufferRuns:
     src_offsets: np.ndarray
     dst_offsets: np.ndarray
     sizes: np.ndarray
+
+    @property
+    def by_position(self) -> Hashable | None:
+        """How the runs it moves of a page depend on the token positions the page has written
+        (``page_runs``): None when they do not, and equal for buffers whose runs depend on them
+        alike."""
+        return None
+
+    @property
+    def fixed(self) -> bool:
+        """Whether it moves the same runs of every page, which ``page_runs`` then returns."""
+        return self.by_position is None
+
+    @property
+    def page_bytes(self) -> int:
+        """The most bytes it moves of one page."""
+        return int(self.sizes.sum())
+
+
+def page_runs(runs: BufferRuns, page: int, end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The runs that move page ``page`` (its position among a request's pages, from 0) of a request
+    whose transfer reaches token position ``end`` (exclusive): ``runs``' own, the same for every
+    page."""
+    return runs.src_offsets, runs.dst_offsets, runs.sizes
 
 
 def _dims(topology: RankTopology) -> dict[str, tuple[int, int]]:
@@ -486,9 +516,10 @@ def _held_model_layers(layout: PageLayout, groups: dict[tuple[int, int], int]) -
 
 
 def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:
-    """Bytes the rank of ``src`` sends the rank of ``dst`` into one page of each of the
+    """The most bytes the rank of ``src`` sends the rank of ``dst`` into one page of each of the
     destination's layer groups, a state group's slot counting as its page: ``map_buffers``' runs,
-    summed by the index of the destination's layer group. Groups it sends nothing of are left out.
+    summed by the index of the destination's layer group (``BufferRuns.page_bytes``). Groups it
+    sends nothing of are left out.
 
     Raises:
         ValueError: As ``map_buffers`` and ``layer_group_of`` do.
@@ -497,5 +528,5 @@ def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> d
     out: dict[int, int] = {}
     for runs in map_buffers(src, dst, key=key):
         group = group_of[runs.dst.pool_group, runs.dst.layer]
-        out[group] = out.get(group, 0) + int(runs.sizes.sum())
+        out[group] = out.get(group, 0) + runs.page_bytes
     return out

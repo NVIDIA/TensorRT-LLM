@@ -17,13 +17,36 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc
 
 pytestmark = pytest.mark.cpu_only
+
+_BUFFER = BufferDesc(0, "k", 0, 0, 0, 64)
+
+
+def _runs(src, dst, sizes) -> BufferRuns:
+    return BufferRuns(
+        _BUFFER,
+        _BUFFER,
+        np.array(src, dtype=np.int64),
+        np.array(dst, dtype=np.int64),
+        np.array(sizes, dtype=np.int64),
+    )
+
+
+def _fragments(mapper, *args, **kwargs):
+    """(src pointer, dst pointer, size) of every fragment the mapper gives, sorted."""
+    return sorted(
+        (int(s), int(d), size)
+        for src, dst, size in mapper.map(*args, **kwargs)
+        for s, d in zip(src, dst)
+    )
 
 
 def test_runs_mapper_whole_slot_copy():
     """One run over the whole slot is a pass-through copy of each slot."""
-    mapper = RunsMapper(np.array([0]), np.array([0]), np.array([32]))
+    mapper = RunsMapper([_runs([0], [0], [32])])
     ((src, dst, size),) = mapper.map(np.array([100, 200]), np.array([300, 400]))
     np.testing.assert_array_equal(src, [100, 200])
     np.testing.assert_array_equal(dst, [300, 400])
@@ -36,8 +59,15 @@ def test_runs_mapper_shifts_each_side_by_its_own_offset():
     The run lies at different offsets of the two slots, so applying one side's offset to the
     other would fail here.
     """
-    mapper = RunsMapper(np.array([16]), np.array([32]), np.array([32]))
+    mapper = RunsMapper([_runs([16], [32], [32])])
     ((src, dst, size),) = mapper.map(np.array([10, 20]), np.array([30, 40]))
     np.testing.assert_array_equal(src, [26, 36])
     np.testing.assert_array_equal(dst, [62, 72])
     assert size == 32
+
+
+def test_runs_mapper_moves_runs_alike_on_every_page_whatever_their_positions():
+    """Runs alike on every page ignore the pages and end position a transfer passes."""
+    mapper = RunsMapper([_runs([0], [8], [16])])
+    bases = (np.array([100, 200]), np.array([300, 400]))
+    assert _fragments(mapper, *bases) == _fragments(mapper, *bases, pages=np.array([0, 5]), end=3)

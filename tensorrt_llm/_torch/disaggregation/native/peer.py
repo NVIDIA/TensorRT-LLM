@@ -17,8 +17,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -29,7 +27,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     fan,
     layer_group_of,
     map_buffers,
-    merge_runs,
     sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
@@ -220,13 +217,7 @@ class PeerRegistrar:
         for pair, buffer_runs in runs.items():
             parts = [r for r in buffer_runs if (r.src.layer, r.src.role) not in excluded]
             if parts:
-                maps[pair] = RunsMapper(
-                    *merge_runs(
-                        np.concatenate([r.src_offsets for r in parts]),
-                        np.concatenate([r.dst_offsets for r in parts]),
-                        np.concatenate([r.sizes for r in parts]),
-                    )
-                )
+                maps[pair] = RunsMapper(parts)
         self._kv_map_cache[cache_key] = maps
         return maps
 

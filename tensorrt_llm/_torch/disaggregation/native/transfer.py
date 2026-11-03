@@ -1316,6 +1316,16 @@ class Sender(SenderBase):
         fall out of the same intersection without any per-case arithmetic.
         Ordinals below ``dst_start_block`` are excluded as well.
         """
+        idx = Sender._paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
+        return src_block_ids[idx], dst_block_ids[idx]
+
+    @staticmethod
+    def _paired_ordinals(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        dst_start_block: int = 0,
+    ) -> np.ndarray:
+        """Table positions where both sides hold a block (see ``_pair_ordinals``)."""
         if src_block_ids.size != dst_block_ids.size:
             raise ValueError(
                 f"positional block tables differ in length: src={src_block_ids.size} "
@@ -1324,8 +1334,7 @@ class Sender(SenderBase):
         mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
         if dst_start_block > 0:
             mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
+        return np.flatnonzero(mask)
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1374,6 +1383,7 @@ class Sender(SenderBase):
             dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
             # Slot base pointers: one slot per request for state, one per block for attention.
+            pages = None
             if self_table.page_layout.layer_groups[self_lg].kind == "state":
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
@@ -1382,7 +1392,8 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                helix = peer_ri.cp_size > 1 and self_ri.cp_size == 1
+                if helix:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1396,16 +1407,20 @@ class Sender(SenderBase):
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
                 # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
+                paired = Sender._paired_ordinals(
                     src_block_ids, dst_block_ids, dst_start_block=dst_start_block
                 )
-                if src_block_ids.size == 0:
+                if paired.size == 0:
                     continue
-                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids)
-                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids)
+                # Each pair's page among the request's pages, for runs that move by position.
+                pages = paired * peer_ri.cp_size + peer_ri.cp_rank if helix else paired
+                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids[paired])
+                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids[paired])
 
             # Map and collect fragments (same for all layer types)
-            for src_ptrs, dst_ptrs, size in mapper.map(src_bases, dst_bases):
+            for src_ptrs, dst_ptrs, size in mapper.map(
+                src_bases, dst_bases, pages=pages, end=int(token_range.end)
+            ):
                 src_frag_parts.append(src_ptrs)
                 dst_frag_parts.append(dst_ptrs)
                 size_specs.append((src_ptrs.size, size))

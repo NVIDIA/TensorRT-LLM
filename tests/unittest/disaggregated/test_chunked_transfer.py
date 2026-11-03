@@ -158,7 +158,7 @@ def _make_projection_sender() -> Sender:
     peer_ri.page_table = page_table
 
     mapper = MagicMock()
-    mapper.map.side_effect = lambda src_bases, dst_bases: [(src_bases, dst_bases, 1)]
+    mapper.map.side_effect = lambda src_bases, dst_bases, **_: [(src_bases, dst_bases, 1)]
 
     registrar = MagicMock()
     registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0, page_table=page_table)

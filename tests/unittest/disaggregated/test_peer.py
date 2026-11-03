@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     BufferDesc,
     LayerGroupDesc,
@@ -818,12 +819,19 @@ def test_peer_registrar_rejects_pages_of_other_token_counts(attention, peer_toke
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
-def test_runs_mapper_groups_fragments_by_size():
-    mapper = RunsMapper(
-        src_offsets=np.array([0, 192, 320]),
-        dst_offsets=np.array([0, 128, 256]),
-        sizes=np.array([128, 64, 128]),
+def _runs_of_one_buffer(src_offsets, dst_offsets, sizes) -> BufferRuns:
+    buffer = BufferDesc(0, "k", 0, 0, 0, 512)
+    return BufferRuns(
+        buffer,
+        buffer,
+        np.array(src_offsets, dtype=np.int64),
+        np.array(dst_offsets, dtype=np.int64),
+        np.array(sizes, dtype=np.int64),
     )
+
+
+def test_runs_mapper_groups_fragments_by_size():
+    mapper = RunsMapper([_runs_of_one_buffer([0, 192, 320], [0, 128, 256], [128, 64, 128])])
     assert mapper.bytes_per_slot == 320
 
     (small, large) = mapper.map(np.array([1000, 5000]), np.array([2000, 6000]))
@@ -838,17 +846,17 @@ def test_runs_mapper_groups_fragments_by_size():
 
 
 def test_runs_mapper_without_runs_moves_nothing():
-    mapper = RunsMapper(*(np.zeros(0, dtype=np.int64),) * 3)
+    mapper = RunsMapper([])
     assert mapper.bytes_per_slot == mapper.runs_per_slot == 0
 
 
 def test_runs_mapper_rejects_unequal_run_arrays():
     with pytest.raises(ValueError, match="as many offsets as sizes"):
-        RunsMapper(np.array([0, 8]), np.array([0]), np.array([8, 8]))
+        RunsMapper([_runs_of_one_buffer([0, 8], [0], [8, 8])])
 
 
 def test_runs_mapper_rejects_unequal_region_counts():
-    mapper = RunsMapper(np.array([0]), np.array([0]), np.array([8]))
+    mapper = RunsMapper([_runs_of_one_buffer([0], [0], [8])])
     with pytest.raises(ValueError, match="must match"):
         mapper.map(np.array([1000, 2000]), np.array([3000]))
 
