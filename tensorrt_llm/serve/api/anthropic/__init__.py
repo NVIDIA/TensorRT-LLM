@@ -12,4 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Anthropic Messages wire dialect: protocol, adapter and batches. Import submodules directly."""
+"""Anthropic Messages wire dialect: protocol, adapter, batches, serving classes and router.
+
+Import submodules directly.
+"""

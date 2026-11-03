@@ -54,6 +54,9 @@ class ServerCapabilities:
 
     role: Optional[ServerRole]
     role_group: RoleGroup
+    # A harmony (gpt-oss) model serves chat through the harmony path, which
+    # the Anthropic Messages routes do not support; LLM role only.
+    harmony_model: bool = False
 
     @classmethod
     def for_role(cls, role: Optional[ServerRole]) -> ServerCapabilities:
@@ -62,6 +65,10 @@ class ServerCapabilities:
 
 def _always(caps: ServerCapabilities) -> bool:
     return True
+
+
+def _anthropic_routes_enabled(caps: ServerCapabilities) -> bool:
+    return not caps.harmony_model
 
 
 @dataclass(frozen=True)
@@ -77,6 +84,11 @@ class RouterSpec:
 # order: a router that registers GET /metrics must come before the Prometheus mount.
 ROUTERS: tuple[RouterSpec, ...] = (
     RouterSpec("tensorrt_llm.serve.api.ops.system.api_router", roles=ALL_ROLE_GROUPS),
+    RouterSpec(
+        "tensorrt_llm.serve.api.anthropic.api_router",
+        roles=frozenset({RoleGroup.LLM}),
+        when=_anthropic_routes_enabled,
+    ),
 )
 
 

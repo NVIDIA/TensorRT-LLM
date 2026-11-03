@@ -19,17 +19,22 @@ composition root injects; no class here reads a server attribute.
 """
 
 import asyncio
+import json
 import traceback
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from fastapi import Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.chat_backend import ChatBackend
+from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
+from tensorrt_llm.serve._base.request_context import RequestContext
 from tensorrt_llm.serve.api.anthropic.adapter import (
-    AnthropicRequestError, anthropic_error_response,
-    convert_anthropic_count_tokens_request)
+    AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
+    convert_anthropic_count_tokens_request, convert_anthropic_request,
+    convert_chat_response, reframe_openai_stream)
 from tensorrt_llm.serve.api.anthropic.batches import (AnthropicBatchStore,
                                                       BatchItemRunner,
                                                       BatchStoreFullError,
@@ -37,10 +42,114 @@ from tensorrt_llm.serve.api.anthropic.batches import (AnthropicBatchStore,
 from tensorrt_llm.serve.api.anthropic.protocol import (
     AnthropicBatchDeleteResponse, AnthropicBatchList,
     AnthropicCountTokensRequest, AnthropicCountTokensResponse,
-    AnthropicCreateBatchRequest)
+    AnthropicCreateBatchRequest, AnthropicMessagesRequest)
+from tensorrt_llm.serve.openai_protocol import ChatCompletionResponse
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError, render_chat,
                                        render_chat_for_length)
+
+
+def _error_type(status: int) -> str:
+    """The Anthropic error type both servers derive from an HTTP status."""
+    return "invalid_request_error" if 400 <= status < 500 else "api_error"
+
+
+class AnthropicMessagesServing:
+    """The Anthropic Messages orchestration, for any ChatBackend.
+
+    One class serves the aggregated server (over its typed chat core), the
+    disaggregated frontend (over its prepare, run and finish steps) and the
+    aggregated Message Batches. What differs between the servers, the model a
+    stream without chunks announces and how an error's message is extracted,
+    comes from the backend.
+    """
+
+    def __init__(self, backend: ChatBackend) -> None:
+        self._backend = backend
+
+    async def create_message(self, request: AnthropicMessagesRequest,
+                             ctx: RequestContext) -> Response:
+        """Serve the Anthropic Messages API on top of the chat pipeline.
+
+        The Anthropic request is translated into a ChatCompletionRequest,
+        handed to the chat backend unchanged (chat template, tool parser and
+        post-processing are reused verbatim), and the typed result is
+        translated back: JSON body for non-streaming, SSE reframing for
+        streaming.
+        """
+        try:
+            chat_request = convert_anthropic_request(request)
+        except (AnthropicRequestError, ValidationError) as e:
+            return anthropic_error_response(str(e), "invalid_request_error",
+                                            400)
+        try:
+            result = await self._backend.create_chat_completion(
+                chat_request, ctx)
+        except EngineFatalError:
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        except ServingError as e:
+            return anthropic_error_response(self._backend.error_message(e),
+                                            _error_type(e.status), e.status)
+        if not isinstance(result, ChatCompletionResponse):
+            return StreamingResponse(
+                content=reframe_openai_stream(
+                    result, model=self._backend.stream_model(chat_request)),
+                media_type="text/event-stream",
+            )
+        try:
+            anthropic_response = convert_chat_response(result)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error("Invalid response from OpenAI chat pipeline:\n"
+                         f"{traceback.format_exc()}")
+            return anthropic_error_response("Internal server error",
+                                            "api_error", 500)
+        return JSONResponse(content=anthropic_response.model_dump(
+            exclude_none=True))
+
+    async def run_batched_message(
+            self,
+            request: AnthropicMessagesRequest) -> Tuple[str, Dict[str, Any]]:
+        """Run one batched Messages request through the chat backend."""
+        # Streaming makes no sense for a batch: the result is collected, not
+        # watched. Forcing it off here means a client that sets stream=true in
+        # params gets a usable message instead of an SSE body in its .jsonl.
+        request = request.model_copy(update={"stream": False})
+        try:
+            chat_request = convert_anthropic_request(request)
+        except (AnthropicRequestError, ValidationError) as e:
+            return "errored", {
+                "type": "invalid_request_error",
+                "message": str(e)
+            }
+        # A batched request has no client connection behind it: the context
+        # carries the seeded state and the converted request as its raw JSON.
+        ctx = RequestContext.internal(
+            chat_request.model_dump(exclude_none=True))
+        try:
+            result = await self._backend.create_chat_completion(
+                chat_request, ctx)
+        except EngineFatalError:
+            return "errored", {
+                "type": "api_error",
+                "message": "Internal server error"
+            }
+        except ServingError as e:
+            return "errored", {
+                "type": _error_type(e.status),
+                "message": self._backend.error_message(e)
+            }
+        try:
+            anthropic_response = convert_chat_response(result)
+        except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
+            logger.error(
+                "Invalid response from OpenAI chat pipeline in batch:\n"
+                f"{traceback.format_exc()}")
+            return "errored", {
+                "type": "api_error",
+                "message": "Internal server error"
+            }
+        return "succeeded", anthropic_response.model_dump(exclude_none=True)
 
 
 class AnthropicCountTokensServing:

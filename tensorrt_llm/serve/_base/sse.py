@@ -13,13 +13,12 @@ from tensorrt_llm.logger import logger
 
 async def chat_stream_generator(promise: RequestOutput,
                                 postproc_params: PostprocParams, *, server,
-                                raw_request) -> AsyncGenerator[str, None]:
+                                ctx) -> AsyncGenerator[str, None]:
     try:
         if not server.postproc_worker_enabled:
             post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
         first_response = await anext(promise)
-        raw_request.state.server_first_token_time = server._adjusted_steady_clock.now(
-        )
+        ctx.state.server_first_token_time = server._adjusted_steady_clock.now()
         pp_results = first_response.outputs[
             0]._postprocess_result if server.postproc_worker_enabled else post_processor(
                 first_response, args)
@@ -34,7 +33,7 @@ async def chat_stream_generator(promise: RequestOutput,
             for pp_res in pp_results:
                 yield pp_res
         yield "data: [DONE]\n\n"
-        await server._extract_metrics(res, raw_request)
+        await server._extract_metrics(res, ctx)
         nvtx_mark("generation ends")
     except Exception:
         # Only failures are logged: a consumer that stops reading closes

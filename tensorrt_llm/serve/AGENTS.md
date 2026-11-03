@@ -20,6 +20,10 @@ Name files and symbols here, never line numbers.
   `make_router(prefix=...)` instead. The composition root sets each serving object on
   `app.state.<bucket>_serving_<endpoint>` before attaching; routers read it from
   `request.app.state`, never from a closure.
+- Anthropic Messages: `serve/api/anthropic/`. One `AnthropicMessagesServing` serves both
+  servers through a `ChatBackend`; the aggregated routes are in `api_router.py`, the
+  disaggregated frontend keeps its own `/v1/messages` route and calls the same class.
+  Check: `tests/unittest/serve/api/anthropic/test_messages_behavior.py`.
 - Model-specific behavior: a hook on `ServingExtension` (`serve/serving_extensions.py`,
   `serve/extensions/`). Do not branch on a model name in a handler.
 - Prompt rendering: `serve/render/` only. Handlers do not call `apply_chat_template`.
