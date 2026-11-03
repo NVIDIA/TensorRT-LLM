@@ -757,7 +757,10 @@ def _drain_adp_stats(llm: LLM) -> list[dict]:
         batch = llm.get_stats(timeout=0.5)
         if not batch:
             break
-        stats.extend(batch)
+        for stat in batch:
+            if "rank" not in stat:
+                stat = {**stat, "rank": stat["attentionDpRank"]}
+            stats.append(stat)
     return stats
 
 
