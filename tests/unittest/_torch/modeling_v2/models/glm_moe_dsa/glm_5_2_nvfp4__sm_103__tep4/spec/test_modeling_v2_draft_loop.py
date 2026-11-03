@@ -51,6 +51,7 @@ class _Worker:
     _ensure_force_accept_rng_state = SpecWorkerBase._ensure_force_accept_rng_state
     _apply_force_accepted_tokens = SpecWorkerBase._apply_force_accepted_tokens
     _sample_and_accept_draft_tokens_base = SpecWorkerBase._sample_and_accept_draft_tokens_base
+    _fused_force_params = SpecWorkerBase._fused_force_params
     _prepare_next_new_tokens = SpecWorkerBase._prepare_next_new_tokens
 
     def __init__(self, target: torch.Tensor, force: float) -> None:

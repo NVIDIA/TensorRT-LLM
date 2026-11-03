@@ -5710,10 +5710,14 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
     def _forward_linear_draft_loop(
         self, inputs, attn_metadata, spec_metadata, draft_model, draft_kv_cache_manager,
         num_contexts, batch_size, num_accepted_tokens, original_all_rank_num_tokens,
+        accepted_tokens=None, pre_draft_seq_lens=None,
     ):  # fmt: skip
         """The built-in MTP-Eagle draft loop restricted to the fused domain (no context rows,
         no guided decoding, SA enhancer or LM-head TP: `draft_loop.ineligibility`), with the
-        metadata updates on `DraftLoop.step` and the stack on `DraftLoop.finalize`."""
+        metadata updates on `DraftLoop.step` and the stack on `DraftLoop.finalize`.
+
+        Returns `(next_draft_tokens, next_new_tokens)` like the built-in loop; the fused path
+        returns None for the second, and `_prepare_next_new_tokens` hands out the loop's."""
         from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
         from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
             DSAtrtllmAttentionMetadata,
@@ -5724,6 +5728,7 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
             return super()._forward_linear_draft_loop(
                 inputs, attn_metadata, spec_metadata, draft_model, draft_kv_cache_manager,
                 num_contexts, batch_size, num_accepted_tokens, original_all_rank_num_tokens,
+                accepted_tokens, pre_draft_seq_lens,
             )  # fmt: skip
         draft_len = spec_metadata.runtime_draft_len
         uses_index_share = isinstance(attn_metadata, MTPIndexShareMetadata)
@@ -5766,7 +5771,7 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
                         "spec_metadata": spec_metadata,
                     }
         stacked = loop.finalize(tokens)
-        return stacked if stacked is not None else torch.stack(tokens, dim=1)
+        return (stacked if stacked is not None else torch.stack(tokens, dim=1)), None
 
     def _glm_draft_step(self, loop, md, mode, position_ids, num_accepted_tokens):
         """One metadata update of the draft loop, fused or built-in; the next positions."""
