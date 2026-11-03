@@ -78,7 +78,7 @@ class PeerRegistrar:
         ]
         buffers = fragments = 0
         for pair, mapper in maps.items():
-            if own.layer_groups[pair[0][0]].kind == "attention":
+            if not own.layer_groups[pair[0][0]].kind.per_request:
                 buffers += len(runs[pair])
                 fragments += mapper.runs_per_slot
         if fragments > buffers:

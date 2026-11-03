@@ -83,6 +83,7 @@ INTERNALS = {
     "_page_buffer_tensors",
     "_page_head_split",
     "_page_state_split",
+    "_page_group_kind",
     "_page_untransferred_roles",
     "_page_derived_roles",
     "_page_layer_ids",

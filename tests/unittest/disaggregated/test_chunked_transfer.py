@@ -37,6 +37,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Paged, RankTopology
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -151,7 +152,8 @@ def _make_projection_sender() -> Sender:
     page_table = SimpleNamespace(
         page_layout=SimpleNamespace(
             tokens_per_page=_PROJECTION_TPB,
-            layer_groups=[SimpleNamespace(kind="attention", pool_group=g) for g in range(2)],
+            topology=RankTopology(),
+            layer_groups=[SimpleNamespace(kind=Paged(), pool_group=g) for g in range(2)],
         ),
         device_pools={g: (DevicePool(g, 0, 0, 1, 1 << 20),) for g in range(2)},
     )
@@ -954,9 +956,7 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         get_block_ordinals=lambda _req, _idx: source_block_ids,
     )
     transceiver._page_table = SimpleNamespace(
-        page_layout=SimpleNamespace(
-            layer_groups=[SimpleNamespace(kind="attention", kept_window=None)]
-        )
+        page_layout=SimpleNamespace(layer_groups=[SimpleNamespace(kind=Paged(), kept_window=None)])
     )
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
     transceiver._dp_rank = 0
@@ -1055,7 +1055,7 @@ def _build_prefill_chunk_tokens_for(
     transceiver._describe_local = MagicMock(return_value=whole)
     transceiver._page_table = SimpleNamespace(
         page_layout=SimpleNamespace(
-            layer_groups=[SimpleNamespace(kind="attention", kept_window=sliding_window_size)]
+            layer_groups=[SimpleNamespace(kind=Paged(), kept_window=sliding_window_size)]
         )
     )
     transceiver._send_reqs = {}

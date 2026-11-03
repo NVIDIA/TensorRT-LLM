@@ -26,7 +26,15 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
-from ..page_layout import BufferDesc, PageLayout, axis_to_dict, replicated
+from ..page_layout import (
+    BufferDesc,
+    LayerGroupDesc,
+    Paged,
+    PageLayout,
+    Tensor,
+    axis_to_dict,
+    replicated,
+)
 from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
 
 if TYPE_CHECKING:
@@ -84,20 +92,42 @@ def canonical_order(layers: Sequence[Sequence[int]]) -> list[int]:
     return canonical
 
 
+def _set_fields(value: object, hashed: Mapping[str, str]) -> dict:
+    """The fields of the dataclass ``value`` not at their defaults, under their names in the
+    document: ``hashed`` renames those it lists, and fields with no default are left to the
+    caller. A field a layout type gains is so hashed where a layout sets it, and leaves the
+    document of every other layout unchanged."""
+    out = {}
+    for f in dataclasses.fields(value):
+        if f.name in _UNHASHED.get(type(value), ()) or f.default is dataclasses.MISSING:
+            continue
+        item = getattr(value, f.name)
+        if item != f.default:
+            out[hashed.get(f.name, f.name)] = list(item) if isinstance(item, tuple) else item
+    return out
+
+
+# Fields layout_id leaves out by design (see layout_document), or hashes in their own way.
+_UNHASHED: dict[type, frozenset[str]] = {
+    Tensor: frozenset({"dtype"}),
+    BufferDesc: frozenset({"tensors"}),
+    LayerGroupDesc: frozenset(
+        {"kept_window", "num_sink_blocks", "pool_group", "shard", "read_window", "model_layers"}
+    ),
+}
+
+
 def _tensors_document(buffer: BufferDesc) -> list[dict] | None:
     """The buffer's tensors, or None for the whole buffer alike on every rank."""
     if buffer.tensors == replicated(buffer.size):
         return None
-    out = []
-    for tensor in buffer.tensors:
-        # Every field of every axis, so a field ``Axis`` gains is hashed without a change here.
-        doc = {"axes": [axis_to_dict(axis, sparse=True) for axis in tensor.axes]}
-        if tensor.name:
-            doc["name"] = tensor.name
-        if tensor.offset:
-            doc["offset"] = int(tensor.offset)
-        out.append(doc)
-    return out
+    return [
+        {
+            "axes": [axis_to_dict(axis, sparse=True) for axis in tensor.axes],
+            **_set_fields(tensor, {}),
+        }
+        for tensor in buffer.tensors
+    ]
 
 
 def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
@@ -113,14 +143,11 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
         "role": b.role,
         "offset": sum(widths[: b.pool_index]) + int(b.slot_offset),
         "size": int(b.size),
+        **_set_fields(b, {"transferred": "transfer"}),
     }
     tensors = _tensors_document(b)
     if tensors is not None:
         doc["tensors"] = tensors
-    if not b.transferred:
-        doc["transfer"] = False
-    if int(b.expansion) != 1:
-        doc["expansion"] = int(b.expansion)
     return doc
 
 
@@ -129,7 +156,7 @@ def layout_document(layout: PageLayout) -> dict:
     global layers) when any differs from its global layer, slot widths, kinds and each buffer's
     tensors, but no addresses, windows, sinks, shards, topology, total head counts, dtypes or
     local region numbering. Two pipeline stages naming their layers alike but holding other model
-    layers differ."""
+    layers differ. A field a layout type gains is hashed where it is set (``_set_fields``)."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])
     groups = [None] * len(layout.layer_groups)
     for local, desc in enumerate(layout.layer_groups):
@@ -143,11 +170,12 @@ def layout_document(layout: PageLayout) -> dict:
         entry = {
             "layers": [int(layer) for layer, _ in named],
             "slot_bytes": [int(w) for w in widths],
+            **_set_fields(desc, {}),
         }
         if any(layer != model for layer, model in named):
             entry["model_layers"] = [int(model) for _, model in named]
-        if desc.kind != "attention":
-            entry["kind"] = desc.kind
+        if desc.kind != Paged():
+            entry["kind"] = desc.kind.to_dict()
         groups[canonical[local]] = entry
     buffers = sorted(
         (_buffer_document(layout, b) for b in layout.buffers),

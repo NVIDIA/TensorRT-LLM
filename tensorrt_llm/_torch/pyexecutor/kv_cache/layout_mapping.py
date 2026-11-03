@@ -32,13 +32,16 @@ holding an index no paired source rank holds, as an uneven head split or a cycli
 different rank counts can make, is refused rather than left without it.
 
 Token positions: a transfer moves each page by ``page_runs``, given the page's position among the
-request's pages and the token position the transfer reaches, so that runs may depend on the
-positions a page has written (``BufferRuns.by_position``); runs that do not are computed once per
-peer and only add each page's address.
+request's pages and the request's transfer window (``TransferWindow``), so that runs may depend on
+the positions a page has written (``BufferRuns.by_position``); runs that do not are computed once
+per peer and only add each page's address. Which slots of a request pair in one transfer is
+``pair_pages``: each layer-group kind registers its pairing (``pair_slots``), so a new kind in
+``page_layout`` registers its own here and leaves every function above unchanged.
 """
 
 from __future__ import annotations
 
+import functools
 import itertools
 from dataclasses import dataclass
 from typing import Hashable, Sequence
@@ -49,7 +52,10 @@ from .page_layout import (
     GRID_DIMENSIONS,
     Axis,
     BufferDesc,
+    GroupKind,
+    Paged,
     PageLayout,
+    PerRequest,
     Progression,
     RankTopology,
     Tensor,
@@ -59,12 +65,17 @@ from .page_layout import (
 
 __all__ = [
     "BufferRuns",
+    "PagePairs",
+    "TransferWindow",
     "check_compatible",
     "fan",
     "layer_group_of",
     "map_buffers",
     "merge_runs",
     "page_runs",
+    "pair_pages",
+    "pair_slots",
+    "paired_ordinals",
     "sent_bytes",
 ]
 
@@ -73,6 +84,22 @@ def fan(src_size: int, dst_size: int, dst_rank: int) -> range:
     """The source ranks, of ``src_size`` along one parallel dimension, whose equal share of it
     overlaps the share of destination rank ``dst_rank`` of ``dst_size``."""
     return range(dst_rank * src_size // dst_size, -(-(dst_rank + 1) * src_size // dst_size))
+
+
+@dataclass(frozen=True)
+class TransferWindow:
+    """What one transfer of a request covers, as the request's token positions.
+
+    Attributes:
+        start: First token position the transfer moves.
+        end: Token position the transfer reaches, exclusive.
+        reused: Token positions from the request's start that the destination already holds, as
+            a prefix it reuses; their pages are not paired.
+    """
+
+    start: int
+    end: int
+    reused: int = 0
 
 
 @dataclass(frozen=True, eq=False)
@@ -113,10 +140,11 @@ class BufferRuns:
         return int(self.sizes.sum())
 
 
-def page_runs(runs: BufferRuns, page: int, end: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """The runs that move page ``page`` (its position among a request's pages, from 0) of a request
-    whose transfer reaches token position ``end`` (exclusive): ``runs``' own, the same for every
-    page."""
+def page_runs(
+    runs: BufferRuns, page: int, window: TransferWindow
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The runs that move page ``page`` (its position among a request's pages, from 0) in a
+    transfer over ``window``: ``runs``' own, the same for every page."""
     return runs.src_offsets, runs.dst_offsets, runs.sizes
 
 
@@ -373,6 +401,116 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
     return out
 
 
+@dataclass(frozen=True, eq=False)
+class PagePairs:
+    """The slots one transfer of a request pairs in a layer group: source slot ``src_slots[i]``
+    sends into destination slot ``dst_slots[i]``.
+
+    Attributes:
+        src_slots: int64 slot indices on the source.
+        dst_slots: int64 slot indices on the destination.
+        pages: int64 position of each pair's page among the request's pages, from 0, for runs
+            that move by token position; None for a group holding one slot per request.
+    """
+
+    src_slots: np.ndarray
+    dst_slots: np.ndarray
+    pages: np.ndarray | None = None
+
+
+def paired_ordinals(src_ids: np.ndarray, dst_ids: np.ndarray, start: int = 0) -> np.ndarray:
+    """The indices of two block tables, both indexed by page and -1 where a side holds no block,
+    at which both hold one, from index ``start`` on.
+
+    A block moves only where both sides hold it, so a sender that has not evicted yet, a receiver
+    that already reused a prefix, a receiver with a wider speculative window, or a sender chunk
+    that blanks everything outside its range all fall out of the same intersection.
+
+    Raises:
+        ValueError: If the tables differ in length.
+    """
+    if src_ids.size != dst_ids.size:
+        raise ValueError(
+            f"positional block tables differ in length: src={src_ids.size} dst={dst_ids.size}; "
+            "both sides must span the same prompt"
+        )
+    mask = (src_ids >= 0) & (dst_ids >= 0)
+    if start > 0:
+        mask[:start] = False
+    return np.flatnonzero(mask)
+
+
+@functools.singledispatch
+def pair_slots(
+    kind: GroupKind,
+    src: PageLayout,
+    src_ids: np.ndarray,
+    dst: PageLayout,
+    dst_ids: np.ndarray,
+    window: TransferWindow,
+) -> PagePairs:
+    """The slots of a layer group of kind ``kind`` that one transfer over ``window`` pairs, from
+    the source's slot ids ``src_ids`` and the destination's ``dst_ids`` for the request. A
+    layer-group kind registers its own.
+
+    Raises:
+        ValueError: If ``kind`` registers no pairing.
+    """
+    raise ValueError(f"layer-group kind {kind.name!r} registers no pair_slots")
+
+
+_NO_SLOTS = np.zeros(0, dtype=np.int64)
+
+
+@pair_slots.register(Paged)
+def _pair_paged(kind, src, src_ids, dst, dst_ids, window):
+    src_ids = np.asarray(src_ids, dtype=np.int64)
+    dst_ids = np.asarray(dst_ids, dtype=np.int64)
+    # Helix: the destination's CP rank r of n holds pages r, r + n, ... of the source's, which
+    # holds them all; reuse is refused under Helix.
+    cp_size, cp_rank = dst.topology.cp_size, dst.topology.cp_rank
+    helix = cp_size > 1 and src.topology.cp_size == 1
+    if helix:
+        src_ids = src_ids[cp_rank::cp_size]
+    paired = paired_ordinals(src_ids, dst_ids, window.reused // src.tokens_per_page)
+    pages = paired * cp_size + cp_rank if helix else paired
+    return PagePairs(src_ids[paired], dst_ids[paired], pages)
+
+
+@pair_slots.register(PerRequest)
+def _pair_per_request(kind, src, src_ids, dst, dst_ids, window):
+    if len(src_ids) == 0 or len(dst_ids) == 0:
+        return PagePairs(_NO_SLOTS, _NO_SLOTS)
+    return PagePairs(
+        np.asarray(src_ids[:1], dtype=np.int64), np.asarray(dst_ids[:1], dtype=np.int64)
+    )
+
+
+def pair_pages(
+    src: PageLayout,
+    src_group: int,
+    src_ids: np.ndarray,
+    dst: PageLayout,
+    dst_group: int,
+    dst_ids: np.ndarray,
+    window: TransferWindow,
+) -> PagePairs:
+    """The slots one transfer over ``window`` pairs between layer group ``src_group`` of ``src``,
+    holding the request in slots ``src_ids``, and ``dst_group`` of ``dst``, holding it in
+    ``dst_ids``: as the source group's kind registers (``pair_slots``).
+
+    Raises:
+        ValueError: If the groups differ in kind, or as the kind's pairing does.
+    """
+    kind = src.layer_groups[src_group].kind
+    if dst.layer_groups[dst_group].kind != kind:
+        raise ValueError(
+            f"layer group {src_group} of {kind} against {dst_group} of "
+            f"{dst.layer_groups[dst_group].kind}"
+        )
+    return pair_slots(kind, src, src_ids, dst, dst_ids, window)
+
+
 def layer_group_of(layout: PageLayout) -> dict[tuple[int, int], int]:
     """(pool group, global layer) -> index of the layer group holding that layer's buffers there.
 
@@ -407,8 +545,8 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     such a rebuilt role, as the same tensors: the same names, axes and extents over all ranks,
     however each splits them, and elements of the same type where the tensors state one, in pages
     of as many sub-pages, in layer groups of the same kind. The KV data is of one element type and
-    quantization. Pages pair one to one, so where both transfer attention buffers their pages hold
-    as many tokens.
+    quantization. Pages pair one to one, so where both transfer buffers of paged groups (not
+    ``GroupKind.per_request``) their pages hold as many tokens.
 
     How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
     backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
@@ -455,7 +593,7 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
             problems.append(f"buffer {key} lies in no layer group of one rank")
             continue
         ga, gb = a.layer_groups[index_a], b.layer_groups[index_b]
-        paged |= ga.kind == "attention" and gb.kind == "attention"
+        paged |= not ga.kind.per_request and not gb.kind.per_request
         if ga.kind != gb.kind:
             problems.append(f"buffer {key}: a layer group of {ga.kind} against one of {gb.kind}")
         model_a = ga.model_layers[ga.layers.index(x.layer)]
@@ -517,9 +655,9 @@ def _held_model_layers(layout: PageLayout, groups: dict[tuple[int, int], int]) -
 
 def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:
     """The most bytes the rank of ``src`` sends the rank of ``dst`` into one page of each of the
-    destination's layer groups, a state group's slot counting as its page: ``map_buffers``' runs,
-    summed by the index of the destination's layer group (``BufferRuns.page_bytes``). Groups it
-    sends nothing of are left out.
+    destination's layer groups, a per-request group's slot counting as its page: ``map_buffers``'
+    runs, summed by the index of the destination's layer group (``BufferRuns.page_bytes``). Groups
+    it sends nothing of are left out.
 
     Raises:
         ValueError: As ``map_buffers`` and ``layer_group_of`` do.

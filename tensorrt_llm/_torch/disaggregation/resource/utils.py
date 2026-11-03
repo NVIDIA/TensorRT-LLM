@@ -29,9 +29,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, Manag
 
 def get_cache_kinds(page_table: ManagerLayout) -> List[CacheKind]:
     """Per layer group, how its slots are addressed: one per block (attention) or one per request
-    (recurrent state)."""
+    (recurrent state), as its kind says (``GroupKind.per_request``)."""
     return [
-        CacheKind.STATE if group.kind == "state" else CacheKind.PAGED
+        CacheKind.STATE if group.kind.per_request else CacheKind.PAGED
         for group in page_table.page_layout.layer_groups
     ]
 

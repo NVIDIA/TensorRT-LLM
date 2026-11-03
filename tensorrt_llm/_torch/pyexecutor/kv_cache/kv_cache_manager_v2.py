@@ -136,8 +136,11 @@ from ..scheduler import ScheduledRequests
 from . import _lender_hooks
 from .page_layout import (
     BufferDesc,
+    GroupKind,
     LayerGroupDesc,
+    Paged,
     PageLayout,
+    PerRequest,
     Tensor,
     content_shard,
     grid_place,
@@ -3701,7 +3704,7 @@ class KVCacheManagerV2(BaseResourceManager):
             named = sorted((global_of[lid], model_of[lid]) for lid in group)
             layer_groups.append(
                 LayerGroupDesc(
-                    kind="state" if is_state else "attention",
+                    kind=self._page_group_kind(lg, is_state),
                     kept_window=window,
                     num_sink_blocks=-(-sink_tokens // tokens_per_block),
                     pool_group=g,
@@ -3739,7 +3742,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_group_of=tuple(pg_of_lg),
             windows=tuple(desc.kept_window for desc in layer_groups),
             sink_blocks=tuple(desc.num_sink_blocks for desc in layer_groups),
-            recurrent=tuple(desc.kind == "state" for desc in layer_groups),
+            recurrent=tuple(desc.kind.per_request for desc in layer_groups),
             sparse=tuple(has_sparse_buffers(layer_cfg[group[0]]) for group in grouping),
             layers=tuple(desc.layers for desc in layer_groups),
             shards=tuple((desc.shard.count, desc.shard.index) for desc in layer_groups),
@@ -3891,6 +3894,13 @@ class KVCacheManagerV2(BaseResourceManager):
         if self._has_cp_helix and not getattr(self.mapping, "enable_attention_dp", False):
             return ("tp", "cp")
         return ("tp",)
+
+    def _page_group_kind(self, layer_group: int, state: bool) -> GroupKind:
+        """How layer group ``layer_group`` addresses a request's pages, which says which of its
+        slots one transfer pairs (``layout_mapping.pair_slots``): one slot per request for
+        recurrent state (``state``), else one per page of its tokens. A manager whose group
+        addresses them otherwise returns a kind of its own (``page_layout.GroupKind``)."""
+        return PerRequest() if state else Paged()
 
     def _page_untransferred_roles(self) -> frozenset[str]:
         """Roles whose buffers hold no state a peer needs, such as storage-only buffers that

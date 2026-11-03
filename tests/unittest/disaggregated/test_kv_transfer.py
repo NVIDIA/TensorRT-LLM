@@ -62,6 +62,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, T
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Paged
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
@@ -393,7 +394,7 @@ def test_build_prefill_chunk_defers_partial_swa_chunk(source_block_ids):
     prompt_blocks = 16
     window_blocks = 4
 
-    layer_group = SimpleNamespace(kind="attention", kept_window=window_blocks * tokens_per_block)
+    layer_group = SimpleNamespace(kind=Paged(), kept_window=window_blocks * tokens_per_block)
 
     def _unexpected_get_block_ids(req, idx):
         raise AssertionError("context-side transfer must use get_block_ordinals, not get_block_ids")

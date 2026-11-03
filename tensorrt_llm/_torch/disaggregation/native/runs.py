@@ -20,7 +20,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns, merge_runs, page_runs
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+    BufferRuns,
+    TransferWindow,
+    merge_runs,
+    page_runs,
+)
 from tensorrt_llm._utils import nvtx_range
 
 
@@ -101,7 +106,7 @@ class RunsMapper:
         src_bases: np.ndarray,
         dst_bases: np.ndarray,
         pages: Optional[np.ndarray] = None,
-        end: Optional[int] = None,
+        window: Optional[TransferWindow] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray, int]]:
         """The fragments that copy the runs from each source slot starting at ``src_bases[i]`` to
         the destination slot starting at ``dst_bases[i]``: per run size, the source and
@@ -111,11 +116,11 @@ class RunsMapper:
             src_bases: Base address of each source slot.
             dst_bases: Base address of the destination slot paired with each.
             pages: Position of each slot pair's page among the request's pages, from 0.
-            end: Token position (exclusive) the transfer reaches.
+            window: What the transfer covers of the request.
 
         Raises:
             ValueError: If the two sides list different numbers of slots, or runs moving by page
-                lack ``pages`` for every slot or ``end``.
+                lack ``pages`` for every slot or ``window``.
         """
         src_bases = np.asarray(src_bases, dtype=np.int64)
         dst_bases = np.asarray(dst_bases, dtype=np.int64)
@@ -129,15 +134,15 @@ class RunsMapper:
         ]
         if not self._by_page:
             return out
-        if pages is None or end is None or np.asarray(pages).size != src_bases.size:
+        if pages is None or window is None or np.asarray(pages).size != src_bases.size:
             raise ValueError(
                 "runs moving by token position need the page of every slot pair and the "
-                "transfer's end position"
+                "transfer's window"
             )
         parts: Dict[int, Tuple[list, list]] = {}
         for src_base, dst_base, page in zip(src_bases, dst_bases, np.asarray(pages)):
             for template, src_starts, dst_starts in self._by_page:
-                src, dst, sizes = page_runs(template, int(page), int(end))
+                src, dst, sizes = page_runs(template, int(page), window)
                 for size in np.unique(sizes):
                     pick = sizes == size
                     group = parts.setdefault(int(size), ([], []))

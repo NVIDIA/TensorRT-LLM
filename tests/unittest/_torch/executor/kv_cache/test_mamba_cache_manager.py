@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PerRequest
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
     LlmRequest,
@@ -1181,7 +1182,7 @@ def test_v2_disagg_slice_reads_state_index_without_refreshing_batch_mask():
         side_effect=AssertionError("state-index lookup must not refresh the dummy mask")
     )
     # Provide a mamba layer group so _create_chunk places the slot ID
-    mamba_lg = SimpleNamespace(kind="state")
+    mamba_lg = SimpleNamespace(kind=PerRequest())
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = manager
     transceiver._reuse_adapter = SimpleNamespace(tokens_per_block=32)
@@ -3680,7 +3681,7 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         page_table = mgr.get_page_table()
         mamba_group = page_table.page_layout.layer_groups[0]
 
-        assert mamba_group.kind == "state"
+        assert mamba_group.kind.per_request
         d_conv_m1 = mgr.conv_state_shape[1]
         conv_elem_size = mgr.all_conv_states[0].element_size()
         conv = next(
@@ -4841,14 +4842,14 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         dst_table = gen.get_page_table()
         check_compatible(src_table.page_layout, dst_table.page_layout)
         for table in (src_table, dst_table):
-            group = next(g for g in table.page_layout.layer_groups if g.kind == "state")
+            group = next(g for g in table.page_layout.layer_groups if g.kind.per_request)
             assert {
                 b.role
                 for b in table.page_layout.buffers
                 if b.transferred and b.layer in group.layers
             } == {str(MambaRole.CONV_STATE), str(MambaRole.SSM_STATE)}
         state_group = next(
-            i for i, g in enumerate(dst_table.page_layout.layer_groups) if g.kind == "state"
+            i for i, g in enumerate(dst_table.page_layout.layer_groups) if g.kind.per_request
         )
         assert sent_bytes(src_table.page_layout, dst_table.page_layout)[state_group] == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2

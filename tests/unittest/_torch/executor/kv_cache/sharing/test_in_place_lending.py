@@ -2780,7 +2780,7 @@ def test_a_state_group_s_regions_are_the_pools_native_names_and_its_row_the_stat
         lg = state_group(mgr)
         page_table = mgr.get_page_table()
         native = page_table.page_layout.layer_groups[lg]
-        assert native.kind == "state"
+        assert native.kind.per_request
         pools = sorted(page_table.device_pools[native.pool_group], key=lambda p: int(p.base))
         source = computed_to(mgr, kit.make_request(SOURCE, PROMPT), len(PROMPT))
         lease = lender.lend_read(source, 0, len(PROMPT), **kit.DEVICE_ALL)

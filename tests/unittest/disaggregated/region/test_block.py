@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import BufferRuns, TransferWindow
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import BufferDesc
 
 pytestmark = pytest.mark.cpu_only
@@ -67,7 +67,9 @@ def test_runs_mapper_shifts_each_side_by_its_own_offset():
 
 
 def test_runs_mapper_moves_runs_alike_on_every_page_whatever_their_positions():
-    """Runs alike on every page ignore the pages and end position a transfer passes."""
+    """Runs alike on every page ignore the pages and window a transfer passes."""
     mapper = RunsMapper([_runs([0], [8], [16])])
     bases = (np.array([100, 200]), np.array([300, 400]))
-    assert _fragments(mapper, *bases) == _fragments(mapper, *bases, pages=np.array([0, 5]), end=3)
+    assert _fragments(mapper, *bases) == _fragments(
+        mapper, *bases, pages=np.array([0, 5]), window=TransferWindow(0, 3)
+    )

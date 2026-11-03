@@ -579,7 +579,7 @@ def decode_result_tail(message):
 
 
 def state_groups(page_table: ManagerLayout) -> frozenset[int]:
-    """The layer groups of ``page_table`` holding recurrent state."""
+    """The layer groups of ``page_table`` holding one slot per request, as recurrent state."""
     return frozenset(
-        g for g, desc in enumerate(page_table.page_layout.layer_groups) if desc.kind == "state"
+        g for g, desc in enumerate(page_table.page_layout.layer_groups) if desc.kind.per_request
     )

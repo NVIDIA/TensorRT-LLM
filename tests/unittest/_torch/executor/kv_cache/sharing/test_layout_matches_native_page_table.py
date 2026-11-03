@@ -372,7 +372,7 @@ def project(layout, desc, pools):
     pool, offset, size, spread), the roles per (pool, spread), the state geometry per (pool,
     spread), the heads attention buffers split by head and those replicated buffers count, and the
     indices of the buffers it holds."""
-    state = desc.kind == "state"
+    state = desc.kind.per_request
     rows, roles, geometries, heads, whole, claimed = (
         [],
         defaultdict(list),
@@ -415,7 +415,7 @@ def native_groups(page_table):
             (int(p.base), int(p.slot_bytes), int(p.num_slots))
             for p in page_table.device_pools[desc.pool_group]
         ]
-        state = desc.kind == "state"
+        state = desc.kind.per_request
         rows, roles, geometry, _, _ = project(layout, desc, pools)
         out.append(
             {
@@ -441,7 +441,7 @@ def public_groups(layout, regions):
         for p in range(len(layout.pool_slot_bytes.get(g, ()))):
             region = regions[layout.device_region_index[(g, p)]]
             pools.append((region.address, region.slot_bytes, region.slot_count))
-        state = desc.kind == "state"
+        state = desc.kind.per_request
         rows, roles, geometry, heads, held = project(layout, desc, pools)
         claimed |= held
         out.append(
@@ -566,7 +566,7 @@ def test_the_public_layout_matches_what_native_builds(
             expected = {
                 int(layer): spec.total_heads
                 for group in page_table.page_layout.layer_groups
-                if group.kind != "state"
+                if not group.kind.per_request
                 for layer in group.layers
             }
             assert dict(layout.total_kv_heads_by_layer) == expected

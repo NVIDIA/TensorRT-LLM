@@ -181,7 +181,7 @@ def _create_kda_managers(
 
 def _state_group(page_table) -> int:
     """The index of the page table's one recurrent-state layer group."""
-    groups = [i for i, g in enumerate(page_table.page_layout.layer_groups) if g.kind == "state"]
+    groups = [i for i, g in enumerate(page_table.page_layout.layer_groups) if g.kind.per_request]
     assert len(groups) == 1, f"expected exactly one state layer group, got {len(groups)}"
     return groups[0]
 

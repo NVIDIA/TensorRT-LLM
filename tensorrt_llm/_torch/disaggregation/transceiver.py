@@ -616,9 +616,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 and b.layer in desc.layers
                 and (b.layer, b.role) not in chunk.excluded_buffers
             )
-            # STATE: one slot per request, moved once whatever the block count; attention: n
-            # blocks.
-            total += page_bytes if desc.kind == "state" else n * page_bytes
+            # One slot per request (recurrent state) moves once whatever the block count; a paged
+            # group moves n blocks.
+            total += page_bytes if desc.kind.per_request else n * page_bytes
         return total
 
     @staticmethod

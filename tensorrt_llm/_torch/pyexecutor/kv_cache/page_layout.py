@@ -20,7 +20,8 @@ over all ranks together; each axis says how its indices spread over the parallel
 (``Axis.split``: whole on every rank, a contiguous run per rank, or every n-th index per rank) and
 the byte stride of its local index. Which global indices a rank holds is therefore a progression
 per axis (``held``), and how two ranks' pages correspond follows from intersecting them
-(``layout_mapping``)."""
+(``layout_mapping``). How a layer group addresses a request's pages is the group's kind
+(``GroupKind``); a new kind adds a class here and its pairing in ``layout_mapping``."""
 
 from __future__ import annotations
 
@@ -31,14 +32,17 @@ import numbers
 import types
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Mapping
+from typing import ClassVar, Literal, Mapping
 
 __all__ = [
     "GRID_DIMENSIONS",
     "Axis",
     "BufferDesc",
+    "GroupKind",
     "LayerGroupDesc",
     "PageLayout",
+    "Paged",
+    "PerRequest",
     "Progression",
     "RankTopology",
     "ShardDesc",
@@ -46,6 +50,7 @@ __all__ = [
     "axis_to_dict",
     "content_shard",
     "grid_place",
+    "group_kind",
     "head_major",
     "held",
     "held_bytes",
@@ -423,6 +428,98 @@ class ShardDesc:
         return shard
 
 
+def _register(registry: dict, cls: type, what: str) -> None:
+    """Enter ``cls`` in ``registry`` by its name; a class defined again in its own place (a module
+    reloaded, a test run again) replaces itself, while another class of the same name is refused."""
+    if not cls.name:
+        return
+    known = registry.get(cls.name)
+    if known is not None and (known.__module__, known.__qualname__) != (
+        cls.__module__,
+        cls.__qualname__,
+    ):
+        raise ValueError(f"{what} {cls.name!r} is registered twice")
+    registry[cls.name] = cls
+
+
+def _sparse(kind: object) -> dict:
+    """The fields of a kind not at their defaults, as plain values (a tuple as a list, which the
+    kind's constructor converts back)."""
+    doc = {}
+    for f in dataclasses.fields(kind):
+        value = getattr(kind, f.name)
+        if f.default is not dataclasses.MISSING and value == f.default:
+            continue
+        doc[f.name] = list(value) if isinstance(value, tuple) else value
+    return doc
+
+
+_GROUP_KINDS: dict[str, type[GroupKind]] = {}
+
+
+@dataclass(frozen=True)
+class GroupKind:
+    """How a layer group addresses a request's pages, and so which of its slots one transfer pairs.
+
+    A subclass is one such way. It states its data here; which slots pair is registered in
+    ``layout_mapping`` (``pair_slots``), so a new way adds a subclass and edits no existing
+    function. Each subclass names itself (``name``) for peers and for ``layout_id``; the kinds a
+    layer group is built with may be given by name.
+
+    Attributes:
+        name: The kind's name, unique among layer-group kinds.
+        per_request: Whether the group holds one slot per request, as recurrent state does, rather
+            than one per page of its tokens; this also gives its kind in the backend contract.
+    """
+
+    name: ClassVar[str] = ""
+    per_request: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        _register(_GROUP_KINDS, cls, "layer-group kind")
+
+    def __str__(self) -> str:
+        return self.name
+
+    def to_dict(self) -> str | dict:
+        """The kind as plain values for a peer and for ``layout_id``: its name, or with fields not
+        at their defaults, its name and those fields; ``group_kind`` reads it back."""
+        fields = _sparse(self)
+        return {"name": self.name, **fields} if fields else self.name
+
+
+def group_kind(value: GroupKind | str | Mapping) -> GroupKind:
+    """The layer-group kind ``value`` names: a kind itself, its name, or ``GroupKind.to_dict``'s
+    plain values.
+
+    Raises:
+        ValueError: If ``value`` names no registered kind.
+    """
+    if isinstance(value, GroupKind):
+        return value
+    fields = {"name": value} if isinstance(value, str) else dict(value)
+    name = fields.pop("name", None)
+    if name not in _GROUP_KINDS:
+        raise ValueError(f"unknown layer-group kind {name!r}; known: {sorted(_GROUP_KINDS)}")
+    return _GROUP_KINDS[name](**fields)
+
+
+@dataclass(frozen=True)
+class Paged(GroupKind):
+    """A slot per page of the request's tokens, as attention KV is held."""
+
+    name: ClassVar[str] = "attention"
+
+
+@dataclass(frozen=True)
+class PerRequest(GroupKind):
+    """One slot per request, overwritten in place, as recurrent state is held."""
+
+    name: ClassVar[str] = "state"
+    per_request: ClassVar[bool] = True
+
+
 @dataclass(frozen=True)
 class LayerGroupDesc:
     """One local layer group's windows, pools, global layers and content shard.
@@ -435,7 +532,9 @@ class LayerGroupDesc:
     hold (``content_shard``), so ranks with equal shares hold equal bytes.
 
     Attributes:
-        kind: "attention" for attention KV data, or "state" for recurrent state.
+        kind: How the group addresses a request's pages: ``Paged`` for attention KV data,
+            ``PerRequest`` for recurrent state, or another ``GroupKind``; given by name, as
+            "attention" or "state", it is normalized to the kind.
         kept_window: Positive number of tokens whose blocks the manager retains; None means full
             attention.
         num_sink_blocks: Non-negative number of sink blocks retained by the manager.
@@ -449,12 +548,12 @@ class LayerGroupDesc:
             model layer apart, such as one per attention type, all name that model layer.
 
     Raises:
-        ValueError: If an index, layer id or model layer is not a non-negative integer, a window is
-            not a positive integer, any such value is a boolean, read_window exceeds kept_window or
-            is given when kept_window is None, or model_layers does not name one model layer per
-            layer."""
+        ValueError: If kind names no layer-group kind, an index, layer id or model layer is not a
+            non-negative integer, a window is not a positive integer, any such value is a boolean,
+            read_window exceeds kept_window or is given when kept_window is None, or model_layers
+            does not name one model layer per layer."""
 
-    kind: Literal["attention", "state"]
+    kind: GroupKind
     kept_window: int | None
     num_sink_blocks: int
     pool_group: int
@@ -464,6 +563,7 @@ class LayerGroupDesc:
     model_layers: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", group_kind(self.kind))
         if self.kept_window is not None:
             object.__setattr__(self, "kept_window", _integer(self.kept_window, "kept_window", 1))
         object.__setattr__(
@@ -496,7 +596,7 @@ class LayerGroupDesc:
     @classmethod
     def unchecked(
         cls,
-        kind: Literal["attention", "state"],
+        kind: GroupKind,
         kept_window: int | None,
         num_sink_blocks: int,
         pool_group: int,
@@ -959,7 +1059,7 @@ def replica_ranks(
     layout = ranks[rank]
     desc = layout.layer_groups[group]
     topology = layout.topology
-    paged_by_context = desc.kind == "attention"
+    paged_by_context = not desc.kind.per_request
     held_indices = None if replicated else _held_indices(layout, desc)
     out = []
     for other_rank in range(len(ranks)):
@@ -1004,7 +1104,7 @@ def layout_to_dict(layout: PageLayout) -> dict:
         "pool_slot_bytes": {int(g): list(w) for g, w in layout.pool_slot_bytes.items()},
         "layer_groups": [
             {
-                "kind": d.kind,
+                "kind": d.kind.to_dict(),
                 "kept_window": d.kept_window,
                 "num_sink_blocks": d.num_sink_blocks,
                 "pool_group": d.pool_group,

@@ -31,7 +31,7 @@ def manager_layout(layout, pool_bases, kv_heads=0, num_slots=128):
         pool_group_of=tuple(g.pool_group for g in groups),
         windows=tuple(g.kept_window for g in groups),
         sink_blocks=tuple(g.num_sink_blocks for g in groups),
-        recurrent=tuple(g.kind == "state" for g in groups),
+        recurrent=tuple(g.kind.per_request for g in groups),
         sparse=tuple(False for _ in groups),
         layers=tuple(g.layers for g in groups),
         shards=tuple((g.shard.count, g.shard.index) for g in groups),
@@ -45,5 +45,5 @@ def manager_layout(layout, pool_bases, kv_heads=0, num_slots=128):
         },
         named_groups=tuple(True for _ in groups),
         local_layers=tuple(tuple(enumerate(g.layers)) for g in groups),
-        kv_heads=tuple(kv_heads if g.kind == "attention" else 0 for g in groups),
+        kv_heads=tuple(kv_heads if not g.kind.per_request else 0 for g in groups),
     )

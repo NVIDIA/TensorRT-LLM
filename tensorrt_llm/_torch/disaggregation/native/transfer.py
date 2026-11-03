@@ -87,6 +87,11 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     slot_pointers,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+    TransferWindow,
+    pair_pages,
+    paired_ordinals,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -1306,35 +1311,10 @@ class Sender(SenderBase):
         dst_block_ids: np.ndarray,
         dst_start_block: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Pair src/dst positional block tables ordinal by ordinal.
-
-        Both tables are indexed by block ordinal (see Chunk); an entry is -1
-        where that side has nothing to offer/accept. A block moves only where
-        both sides hold it, so a sender that has not evicted yet, a receiver
-        that already reused a prefix, a receiver with a wider speculative
-        window, or a sender chunk that blanks everything outside its range all
-        fall out of the same intersection without any per-case arithmetic.
-        Ordinals below ``dst_start_block`` are excluded as well.
-        """
-        idx = Sender._paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
+        """Pair src/dst positional block tables ordinal by ordinal, from ordinal
+        ``dst_start_block`` on (``layout_mapping.paired_ordinals``)."""
+        idx = paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
         return src_block_ids[idx], dst_block_ids[idx]
-
-    @staticmethod
-    def _paired_ordinals(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
-        dst_start_block: int = 0,
-    ) -> np.ndarray:
-        """Table positions where both sides hold a block (see ``_pair_ordinals``)."""
-        if src_block_ids.size != dst_block_ids.size:
-            raise ValueError(
-                f"positional block tables differ in length: src={src_block_ids.size} "
-                f"dst={dst_block_ids.size}; both sides must span the same prompt"
-            )
-        mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
-        if dst_start_block > 0:
-            mask[:dst_start_block] = False
-        return np.flatnonzero(mask)
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1377,49 +1357,33 @@ class Sender(SenderBase):
         # Aggregate fragments from all pool pairs using numpy concatenation.
         # The mapper of a pool pair holds the runs this rank is elected to send
         # (layout_mapping); pairs another rank sends are absent.
+        window = TransferWindow(
+            int(token_range.start),
+            int(token_range.end),
+            int(req_info.dst_start_token or 0),
+        )
         kv_maps = self._registrar.get_kv_maps(peer_ri, excluded=task._chunk.excluded_buffers)
         for ((self_lg, self_pi), (peer_lg, peer_pi)), mapper in kv_maps.items():
-            src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
-            # Slot base pointers: one slot per request for state, one per block for attention.
-            pages = None
-            if self_table.page_layout.layer_groups[self_lg].kind == "state":
-                if src_block_ids.size == 0 or dst_block_ids.size == 0:
-                    continue
-                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids[:1])
-                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids[:1])
-            else:
-                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
-                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                helix = peer_ri.cp_size > 1 and self_ri.cp_size == 1
-                if helix:
-                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix), so its
-                    # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                tpb = self_table.page_layout.tokens_per_page
-                dst_start_block = (
-                    req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
-                )
-                # Both tables are positional (index == block ordinal, -1 == not
-                # held), so pairing is a plain intersection: SWA eviction, prefix
-                # reuse, and pipelined chunk bounds are all already encoded as
-                # holes by whichever side owns that state.
-                paired = Sender._paired_ordinals(
-                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
-                )
-                if paired.size == 0:
-                    continue
-                # Each pair's page among the request's pages, for runs that move by position.
-                pages = paired * peer_ri.cp_size + peer_ri.cp_rank if helix else paired
-                src_bases = slot_pointers(self_table, self_lg, self_pi, src_block_ids[paired])
-                dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, dst_block_ids[paired])
+            # Which slots pair is the layer group kind's (layout_mapping.pair_pages): both block
+            # tables are positional (index == page, -1 == not held), so SWA eviction, prefix reuse
+            # and pipelined chunk bounds are already holes in them.
+            pairs = pair_pages(
+                self_table.page_layout,
+                self_lg,
+                src_block_ids_per_groups[self_lg],
+                peer_table.page_layout,
+                peer_lg,
+                dst_block_ids_per_groups[peer_lg],
+                window,
+            )
+            if pairs.src_slots.size == 0:
+                continue
+            src_bases = slot_pointers(self_table, self_lg, self_pi, pairs.src_slots)
+            dst_bases = slot_pointers(peer_table, peer_lg, peer_pi, pairs.dst_slots)
 
             # Map and collect fragments (same for all layer types)
             for src_ptrs, dst_ptrs, size in mapper.map(
-                src_bases, dst_bases, pages=pages, end=int(token_range.end)
+                src_bases, dst_bases, pages=pairs.pages, window=window
             ):
                 src_frag_parts.append(src_ptrs)
                 dst_frag_parts.append(dst_ptrs)

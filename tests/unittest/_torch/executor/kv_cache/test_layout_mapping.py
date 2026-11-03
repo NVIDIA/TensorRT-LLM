@@ -31,10 +31,12 @@ from utils.page_layout_oracle import assert_layouts_reshard
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     BufferRuns,
+    TransferWindow,
     check_compatible,
     fan,
     map_buffers,
     merge_runs,
+    pair_pages,
     sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
@@ -624,3 +626,39 @@ def test_sent_bytes_count_what_one_source_sends_into_each_layer_group():
         {0: 4 * HEAD, 1: 4 * HEAD + 24},
         {0: 4 * HEAD, 1: 4 * HEAD},
     ]
+
+
+def test_pages_pair_where_both_tables_hold_a_block_past_the_reused_prefix():
+    page = layout(RankTopology(), (0,), [("key", kv(4), "attention")])
+    src = np.array([10, 11, -1, 13, 14], dtype=np.int64)
+    dst = np.array([20, 21, 22, -1, 24], dtype=np.int64)
+    window = TransferWindow(0, 5 * TOKENS, reused=TOKENS)
+    pairs = pair_pages(page, 0, src, page, 0, dst, window)
+    assert pairs.src_slots.tolist() == [11, 14]
+    assert pairs.dst_slots.tolist() == [21, 24]
+    assert pairs.pages.tolist() == [1, 4]
+
+
+def test_helix_pairs_every_nth_page_of_the_source_with_its_context_rank():
+    """A Helix destination at CP rank r of n holds pages r, r + n, ... of a source holding all."""
+    specs = [("key", kv(4), "attention")]
+    src = layout(RankTopology(), (0,), specs)
+    dst = layout(RankTopology(cp_size=2, cp_rank=1), (0,), specs)
+    window = TransferWindow(0, 6 * TOKENS)
+    pairs = pair_pages(src, 0, np.arange(6), dst, 0, np.array([30, 31, 32]), window)
+    assert pairs.src_slots.tolist() == [1, 3, 5]
+    assert pairs.dst_slots.tolist() == [30, 31, 32]
+    assert pairs.pages.tolist() == [1, 3, 5]
+
+
+def test_a_per_request_group_pairs_its_one_slot_and_paged_groups_pair_with_their_own_kind():
+    state = layout(RankTopology(), (0,), [("ssm", whole(HEAD), "state")])
+    window = TransferWindow(0, TOKENS)
+    pairs = pair_pages(state, 0, np.array([7]), state, 0, np.array([9]), window)
+    assert pairs.src_slots.tolist() == [7] and pairs.dst_slots.tolist() == [9]
+    assert pairs.pages is None
+    empty = pair_pages(state, 0, np.array([7]), state, 0, np.zeros(0, dtype=np.int64), window)
+    assert empty.src_slots.size == 0 and empty.dst_slots.size == 0
+    paged = layout(RankTopology(), (0,), [("key", kv(4), "attention")])
+    with pytest.raises(ValueError, match="layer group 0 of attention against 0 of state"):
+        pair_pages(paged, 0, np.array([7]), state, 0, np.array([9]), window)

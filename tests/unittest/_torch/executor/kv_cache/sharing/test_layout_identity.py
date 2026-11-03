@@ -39,8 +39,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
     BufferDesc,
+    GroupKind,
     LayerGroupDesc,
+    Paged,
     PageLayout,
+    PerRequest,
     RankTopology,
     ShardDesc,
     Tensor,
@@ -423,6 +426,7 @@ class Manager:
     get_page_table = KVCacheManagerV2.get_page_table
     _page_head_split = KVCacheManagerV2._page_head_split
     _page_state_split = KVCacheManagerV2._page_state_split
+    _page_group_kind = KVCacheManagerV2._page_group_kind
     _page_derived_roles = KVCacheManagerV2._page_derived_roles
     _page_request_rebuilt_roles = KVCacheManagerV2._page_request_rebuilt_roles
     rebuild_disagg_imported_cache = KVCacheManagerV2.rebuild_disagg_imported_cache
@@ -937,7 +941,7 @@ def test_recurrent_state_is_described_and_sharded_by_rank():
     geometry = derive_layout(recurrent_state())
     layout = geometry.page_layout
     (group,) = layout.layer_groups
-    assert group.kind == "state" and group.shard == ShardDesc(2, 1)
+    assert group.kind.per_request and group.shard == ShardDesc(2, 1)
     assert geometry.recurrent == (True,) and geometry.windows == (None,)
     by_role = {b.role: b for b in layout.buffers}
     assert by_role["conv_state"].tensors == sectioned((32, 32, 32), 2, ("tp",))
@@ -960,7 +964,7 @@ def test_recurrent_state_splits_as_its_pools_are_sized(attention_dp, cp_size, sp
     manager = attention_and_state(2, 1, attention_dp, 4, cp_size, cp_size - 1)
     assert manager._page_state_split() == split
     state = derive_layout(manager).page_layout.layer_groups[1]
-    assert state.kind == "state" and state.shard == shard
+    assert state.kind.per_request and state.shard == shard
 
 
 @pytest.mark.cpu_only
@@ -1590,8 +1594,8 @@ def test_layer_groups_publish_each_layer_s_model_layer():
     )
     layout = derive_layout(manager).page_layout
     assert [(g.kind, g.layers, g.model_layers) for g in layout.layer_groups] == [
-        ("attention", (6, 7), (6, 7)),
-        ("state", (8, 9), (8, 9)),
+        (Paged(), (6, 7), (6, 7)),
+        (PerRequest(), (8, 9), (8, 9)),
     ]
 
 
@@ -1847,7 +1851,7 @@ def test_a_full_attention_cache_is_one_layer_group_over_one_pool_group(real_mana
 
         assert layout.tokens_per_page == geometry.tokens_per_block == REAL_TPB
         (group,) = layout.layer_groups
-        assert group.kind == "attention"
+        assert not group.kind.per_request
         assert group.kept_window is None
         assert group.layers == (0, 1)
         g = int(mgr.impl.get_life_cycle_pool_group_indices()[0])
@@ -2793,6 +2797,8 @@ LAYOUT_TYPES = (
 )
 # Each layout type's public names beyond its fields and ``unchecked``.
 LAYOUT_TYPE_EXTRAS = {BufferDesc: {"split"}, Tensor: {"split"}}
+# The kinds page_layout defines, and their fields.
+LAYOUT_KINDS = {Paged: "", PerRequest: ""}
 
 
 def pinned_fields(cls):
@@ -2809,11 +2815,14 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     assert sorted(page_layout.__all__) == sorted(
         [
             *(t.__name__ for t in LAYOUT_TYPES),
+            *(t.__name__ for t in LAYOUT_KINDS),
+            "GroupKind",
             "GRID_DIMENSIONS",
             "Progression",
             "axis_to_dict",
             "content_shard",
             "grid_place",
+            "group_kind",
             "head_major",
             "held",
             "held_bytes",
@@ -2845,6 +2854,10 @@ def test_the_layout_types_keep_their_module_fields_and_members():
     )
     assert pinned_fields(Tensor) == "axes offset=0 name='' dtype=None"
     assert pinned_fields(Axis) == "name extent stride split=() held=None cyclic=False"
+    for kind, fields in LAYOUT_KINDS.items():
+        assert pinned_fields(kind) == fields, kind
+        assert kind.__dataclass_params__.frozen, kind
+    assert [k.name for k in LAYOUT_KINDS] == ["attention", "state"]
     assert pinned_fields(RankTopology) == (
         "tp_size=1 tp_rank=0 pp_size=1 pp_rank=0 cp_size=1 cp_rank=0 dp_size=1 dp_rank=0 "
         "attention_dp=False"
@@ -3095,7 +3108,10 @@ def every_field_set():
 
 
 def rebuilt(value):
-    """``value`` rebuilt through the unchecked constructors from plain values."""
+    """``value`` rebuilt through the unchecked constructors from plain values; kinds are values
+    of their own, kept as they are."""
+    if isinstance(value, GroupKind):
+        return value
     if dataclasses.is_dataclass(value):
         parts = {f.name: rebuilt(getattr(value, f.name)) for f in dataclasses.fields(value)}
         return type(value).unchecked(**parts)

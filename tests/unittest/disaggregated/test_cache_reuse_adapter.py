@@ -26,6 +26,7 @@ from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     _CacheReuseAdapterV2,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Paged, PerRequest
 
 pytestmark = pytest.mark.cpu_only
 
@@ -127,7 +128,7 @@ def _build_transceiver_for_kv_slice(
     modeled by prepending the manager-reported SWA holes, as V2 reports
     them via valid_only=False.
     """
-    layer_group = SimpleNamespace(kind="attention", kept_window=sliding_window_size)
+    layer_group = SimpleNamespace(kind=Paged(), kept_window=sliding_window_size)
     total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
     if block_ids is None:
         block_ids = np.arange(total_blocks, dtype=np.int64)
@@ -194,9 +195,9 @@ def test_v2_receive_uses_each_resumed_group(encoder_hit):
     # Native lifecycle IDs, not physical pool IDs, index reuse_status. Two
     # distinct window groups can share a physical pool without sharing reuse.
     groups = [
-        SimpleNamespace(kind="attention", kept_window=None),
-        SimpleNamespace(kind="attention", kept_window=128),
-        SimpleNamespace(kind="attention", kept_window=128),
+        SimpleNamespace(kind=Paged(), kept_window=None),
+        SimpleNamespace(kind=Paged(), kept_window=128),
+        SimpleNamespace(kind=Paged(), kept_window=128),
     ]
     pages = [[10, 11, 12], [-1, 21, 22], [-1, 31, 32]]
     cache = SimpleNamespace(
@@ -702,7 +703,9 @@ def test_a_state_layer_group_carries_its_slot_or_the_transfer_is_refused():
     """
     transceiver, req = _build_transceiver_for_kv_slice(0, 64, tokens_per_block=32)
     transceiver._page_table = SimpleNamespace(
-        page_layout=SimpleNamespace(layer_groups=[SimpleNamespace(kind="state", kept_window=None)])
+        page_layout=SimpleNamespace(
+            layer_groups=[SimpleNamespace(kind=PerRequest(), kept_window=None)]
+        )
     )
     transceiver._kv_cache_manager.disagg_state_slot = lambda req, layer_group: 5 + layer_group
     assert transceiver._create_chunk(req).block_ids_per_layer_groups[0].tolist() == [5]
