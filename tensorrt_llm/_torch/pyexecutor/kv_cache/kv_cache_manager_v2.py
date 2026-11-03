@@ -103,6 +103,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskOOMError as KVCacheDiskOOMError
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.sampling_params import SamplingParams
@@ -415,12 +416,32 @@ class _ConversationState:
     planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
 
 
+def committed_drop_plan_is_always_empty(
+    layers: Sequence[Union[AttentionLayerConfig, SsmLayerConfig]],
+) -> bool:
+    """Whether ``plan_committed_block_drop()`` never returns a plan: it needs committed pages of
+    every dense windowed attention group, and a PRIVATE windowed group is never committed."""
+    for layer in layers:
+        if (
+            isinstance(layer, AttentionLayerConfig)
+            and layer.reuse_policy == ReusePolicy.PRIVATE
+            and layer.sliding_window_size is not None
+            and not any(buffer.is_sparse for buffer in layer.buffers)
+        ):
+            return True
+    return False
+
+
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self, max_num_turns: int) -> None:
+    def __init__(self, max_num_turns: int, skip_empty_drop_plans: bool = False) -> None:
         self._max_num_turns = max_num_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
+        # Every plan would be empty: skip the native planner (a full re-match of the prefix per
+        # completed context) and warn once instead of once per request.
+        self._skip_empty_drop_plans = skip_empty_drop_plans
+        self._warned_empty_drop_plans = False
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
         """Save a completed context's drop plan and apply the preceding plan on success."""
@@ -431,6 +452,16 @@ class ConversationManager:
 
         state = self._conversation_states[conversation_id]
         if state.current_request_id != request_id:
+            return
+
+        if self._skip_empty_drop_plans:
+            if not self._warned_empty_drop_plans:
+                self._warned_empty_drop_plans = True
+                logger.warning(
+                    "Committed blocks of completed contexts cannot be planned for dropping: the KV "
+                    "cache has a PRIVATE sliding-window group (logged once)."
+                )
+            self.finish_request(request)
             return
 
         drop_handle = kv_cache.plan_committed_block_drop()
@@ -613,6 +644,106 @@ def _sync_kv_cache_manager_init_status(
     return local_status
 
 
+def _check_disk_tier_space(path: str, quota: int, mapping: Mapping) -> None:
+    """Fail on every rank together when the disk tier cannot be preallocated.
+
+    Each rank preallocates its whole quota at construction, and the co-located
+    ranks share ``path``. Readings precede the collective and allocations follow
+    it, so no reading includes a peer's preallocation.
+    """
+    local_ranks = max(1, Distributed.get(mapping).local_world_size) if mapping.world_size > 1 else 1
+    problem = None
+    try:
+        stat = os.statvfs(path)
+        free = stat.f_bavail * stat.f_frsize
+        if free < quota * local_ranks:
+            problem = (
+                f"KV cache disk tier: {path} has {free / (1 << 30):.1f}GiB free, but "
+                f"{local_ranks} co-located rank(s) each preallocate "
+                f"{quota / (1 << 30):.1f}GiB there at startup. Free space on that filesystem, "
+                "move kv_cache_config.disk_cache_path, or lower kv_cache_config.disk_cache_size."
+            )
+    except OSError as error:
+        problem = f"KV cache disk tier: cannot use {path}: {error}"
+    failed = int(problem is not None)
+    if mapping.world_size > 1:
+        failed = Distributed.get(mapping).allreduce(failed, op=ReduceOp.MAX)
+    if problem is not None:
+        raise RuntimeError(problem)
+    if failed:
+        raise RuntimeError("KV cache disk tier: another rank cannot preallocate its quota")
+
+
+def _numa_node_available_bytes(node: int) -> int:
+    """Memory node ``node`` can hand out: free plus reclaimable file pages (tmpfs excluded)."""
+    fields = {}
+    with open(f"/sys/devices/system/node/node{node}/meminfo") as meminfo:
+        for line in meminfo:
+            # "Node 0 MemFree:  326415936 kB"
+            parts = line.split()
+            fields[parts[2].rstrip(":")] = int(parts[3]) * 1024
+    return fields["MemFree"] + fields["FilePages"] - fields["Shmem"]
+
+
+def _host_tier_numa_node(quota: int, mapping: Mapping) -> int:
+    """The GPU's host NUMA node, once every rank knows it can hold all host tiers bound to it.
+
+    Readings precede the collective and allocations follow it, so no reading
+    includes a peer's tier.
+    """
+    import socket
+
+    from cuda.bindings import driver as cuda
+
+    attribute = cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID
+    result, node = cuda.cuDeviceGetAttribute(attribute, torch.cuda.current_device())
+    problem = None
+    if result != cuda.CUresult.CUDA_SUCCESS or node < 0:
+        problem = (
+            "kv_cache_config.host_cache_bind_to_gpu_numa_node: the GPU reports no host NUMA "
+            "node; turn the field off."
+        )
+    placement = (socket.gethostname(), int(node) if problem is None else -1)
+    placements = (
+        Distributed.get(mapping).allgather(placement) if mapping.world_size > 1 else [placement]
+    )
+    if problem is None:
+        ranks_on_node = placements.count(placement)
+        available = _numa_node_available_bytes(node)
+        if available < quota * ranks_on_node:
+            problem = (
+                f"kv_cache_config.host_cache_bind_to_gpu_numa_node: NUMA node {node} of "
+                f"{placement[0]} has {available} bytes available, but {ranks_on_node} rank(s) "
+                f"bind {quota}-byte host cache tiers to it ({quota * ranks_on_node} bytes). "
+                "Lower kv_cache_config.host_cache_size or turn the field off."
+            )
+    failed = int(problem is not None)
+    if mapping.world_size > 1:
+        failed = Distributed.get(mapping).allreduce(failed, op=ReduceOp.MAX)
+    if problem is not None:
+        raise RuntimeError(problem)
+    if failed:
+        raise RuntimeError(
+            "kv_cache_config.host_cache_bind_to_gpu_numa_node: another rank cannot bind its "
+            "host cache tier"
+        )
+    return node
+
+
+def _disk_tier_init_error(cache_tiers: Sequence[object], error: Exception) -> RuntimeError:
+    """Name the disk tier a ``DiskOOMError`` from manager construction came from."""
+    where = ", ".join(
+        f"{tier.quota / (1 << 30):.1f}GiB at {tier.path}"
+        for tier in cache_tiers
+        if isinstance(tier, DiskCacheTierConfig)
+    )
+    return RuntimeError(
+        f"KV cache disk tier ({where}) could not be preallocated: {error}. Other processes "
+        "on the node may share that filesystem; free space there or lower "
+        "kv_cache_config.disk_cache_size."
+    )
+
+
 def _estimate_swa_cache_size(
     layer_sizes: Sequence[int],
     attention_windows: Sequence[Optional[int]],
@@ -620,6 +751,7 @@ def _estimate_swa_cache_size(
     *,
     context: bool,
     scratch: bool,
+    scratch_group_keys: Sequence[int] | None = None,
     generation_capacity_headroom: int = BASE_GENERATION_TOKEN_COUNT,
     layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
 ) -> tuple[int, int]:
@@ -643,11 +775,14 @@ def _estimate_swa_cache_size(
             elif not scratch:
                 size_per_token += layer_size
             else:
+                # Groups with different reuse policies own separate scratch slots.
+                group_key = scratch_group_keys[layer_idx] if scratch_group_keys is not None else 0
                 scratch_key = (
                     int(window_size),
                     layer_size,
                     sink_blocks,
                     layer.reuse_policy if layer else None,
+                    group_key,
                 )
                 if scratch_key in scratch_keys:
                     size_per_request += window_tokens * layer_size
@@ -727,6 +862,7 @@ def _estimate_cache_size_components(
     scratch: bool,
     generation_capacity_headroom: int,
     layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+    scratch_group_keys: Sequence[int] | None = None,
 ) -> tuple[int, int, int]:
     """Return context/generation bytes per token and generation bytes per request.
 
@@ -742,6 +878,7 @@ def _estimate_cache_size_components(
         context=True,
         scratch=scratch,
         layer_specs=layer_specs,
+        scratch_group_keys=scratch_group_keys,
     )
     generation_swa_size, generation_swa_per_request = _estimate_swa_cache_size(
         layer_sizes,
@@ -1439,7 +1576,7 @@ def _copy_swa_block_offsets_with_scratch_compiled(
         slot_id * scales[:, :, None, None]
         + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
     )
-    scratch_mask = scratch_mask_by_pool[pool_ids]
+    scratch_mask = scratch_mask_by_pool[pool_ids] & (base == BAD_PAGE_INDEX)
     converted = torch.where(scratch_mask, scratch_index, converted)
 
     output.copy_(converted.permute(0, 2, 1, 3))
@@ -1471,6 +1608,9 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     # holds, and ``history_length`` cannot be lowered to agree.
     reuse = max(reuse, req.py_served_prefix_end)
     _rewind_context_cursor(req, reuse)
+    # The native setter aligns the existing chunk against the new prefix.
+    # Seed the full suffix so a zero or shortened chunk cannot round below reuse.
+    req.context_chunk_size = req.prompt_len - reuse
     req.set_prepopulated_prompt_len(reuse, tokens_per_block)
     req.context_chunk_size = req.context_remaining_length
 
@@ -2481,14 +2621,23 @@ class KVCacheManagerV2(BaseResourceManager):
             # _sync_host_tier_quota for why divergence wedges collectives.
             host_quota = _sync_host_tier_quota(host_quota, mapping)
         if host_quota > 0:
-            cache_tiers.append(HostCacheTierConfig(quota=int(host_quota)))
             logger.info(
                 f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
+            )
+            host_tier_numa_node = None
+            if kv_cache_config.host_cache_bind_to_gpu_numa_node:
+                host_tier_numa_node = _host_tier_numa_node(int(host_quota), mapping)
+                logger.info(
+                    f"KV cache manager v2 host tier bound to NUMA node {host_tier_numa_node}"
+                )
+            cache_tiers.append(
+                HostCacheTierConfig(quota=int(host_quota), numa_node=host_tier_numa_node)
             )
         disk_cache_size = kv_cache_config.disk_cache_size
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
             assert disk_cache_path is not None
+            _check_disk_tier_space(disk_cache_path, int(disk_cache_size), mapping)
             cache_tiers.append(
                 DiskCacheTierConfig(quota=int(disk_cache_size), path=disk_cache_path)
             )
@@ -2540,12 +2689,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # waiting in the first collective.
         sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
         if not sync_init_status:
-            candidate = self._allocate_cache_pools(
-                config,
-                event_manager=event_sink,
-                cold_page_codec=create_cold_page_codec(config),
-                max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
-            )
+            try:
+                candidate = self._allocate_cache_pools(
+                    config,
+                    event_manager=event_sink,
+                    cold_page_codec=create_cold_page_codec(config),
+                    max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
+                )
+            except KVCacheDiskOOMError as error:
+                raise _disk_tier_init_error(config.cache_tiers, error) from error
         else:
             init_error: Optional[Exception] = None
             local_init_status = _KVCacheManagerInitStatus.OK
@@ -2557,7 +2709,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     max_gpu_total_bytes=kv_cache_config.max_gpu_total_bytes,
                 )
             except Exception as error:
-                init_error = error.with_traceback(None)
+                if isinstance(error, KVCacheDiskOOMError):
+                    init_error = _disk_tier_init_error(config.cache_tiers, error)
+                else:
+                    init_error = error.with_traceback(None)
                 local_init_status = _KVCacheManagerInitStatus.ABORT
 
             init_status = _sync_kv_cache_manager_init_status(local_init_status, mapping)
@@ -2677,7 +2832,10 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
         )
         self.conversation_manager = (
-            ConversationManager(block_reuse_config.max_num_turns)
+            ConversationManager(
+                block_reuse_config.max_num_turns,
+                skip_empty_drop_plans=committed_drop_plan_is_always_empty(config.layers),
+            )
             if enable_conversation_manager
             else None
         )
@@ -3394,6 +3552,10 @@ class KVCacheManagerV2(BaseResourceManager):
             attention_windows.append(self.max_attention_window_vec[local_layer_idx])
         return layer_sizes, attention_windows
 
+    def _get_runtime_cache_size_scratch_group_keys(self) -> Sequence[int] | None:
+        """Optional per-layer keys separating otherwise identical scratch groups."""
+        return None
+
     def _get_generation_request_capacity(self) -> int:
         """Return the resident generation requests used for SWA sizing."""
         return self.max_batch_size
@@ -3422,6 +3584,7 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
             layer_specs=self.layer_specs,
+            scratch_group_keys=self._get_runtime_cache_size_scratch_group_keys(),
         )
         size_per_batch = self._get_generation_request_capacity() * generation_swa_size_per_request
         if quota < size_per_batch:
@@ -3459,6 +3622,7 @@ class KVCacheManagerV2(BaseResourceManager):
             scratch=self.enable_swa_scratch_reuse,
             generation_capacity_headroom=self._generation_kv_capacity_headroom,
             layer_specs=self.layer_specs,
+            scratch_group_keys=self._get_runtime_cache_size_scratch_group_keys(),
         )
         context_tokens = min(max_tokens, self.max_num_tokens)
         generation_tokens = max_tokens - context_tokens
@@ -5062,7 +5226,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
-        not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
+        not shrunk; the caller drops any draft pool.
         """
         if self._connector_reservations_enabled():
             if self.kv_connector_manager.get_prefix_reservation(req) is not None:
@@ -5093,6 +5257,33 @@ class KVCacheManagerV2(BaseResourceManager):
         if pre_cap > 0:
             kv_cache.suspend()
         return True
+
+    def revert_unexecuted_context_chunk(self, req: LlmRequest) -> None:
+        """Give back the capacity of a scheduled chunk whose forward pass did not run.
+
+        History and the request's cursor are unchanged, so the request is
+        scheduled normally next iteration; with SWA scratch, a later resize then
+        still finds capacity equal to history.
+        """
+        if self.is_draft:
+            pre_cap = req.py_draft_ctx_pre_resize_cap
+            req.py_draft_ctx_pre_resize_cap = None
+        else:
+            pre_cap = req.py_ctx_pre_resize_cap
+            req.py_ctx_pre_resize_cap = None
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if pre_cap is None or kv_cache is None or not kv_cache.is_active:
+            return
+        history = kv_cache.history_length
+        capacity = max(pre_cap, history)
+        if capacity >= kv_cache.capacity:
+            return
+        if not kv_cache.resize(capacity, history):
+            raise RuntimeError(
+                f"Failed to revert KV cache capacity for context request "
+                f"{req.py_request_id} from {kv_cache.capacity} to {capacity}"
+            )
+        self._after_shrink(req.py_request_id, kv_cache)
 
     def _set_page_index_bufs(self, request_id: int, kv_cache: _KVCache) -> None:
         assert kv_cache.beam_width <= self.max_beam_width
@@ -5540,7 +5731,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         target = req.context_current_position + num_tokens + self._kv_alloc_extra_tokens
-        return kv_cache.resize(max(kv_cache.capacity, target))
+        pre_cap = kv_cache.capacity
+        if not kv_cache.resize(max(pre_cap, target)):
+            return False
+        req.py_draft_ctx_pre_resize_cap = pre_cap if target > pre_cap else None
+        return True
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
@@ -5849,15 +6044,22 @@ class KVCacheManagerV2(BaseResourceManager):
             by_group.append(indices)
         return by_group
 
-    @nvtx_range("prepare_resources_kv_cache_manager_v2")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.impl.refresh_retention()
-        for request in scheduled_batch.context_requests:
+    def disagg_receive_ready_done(self, request: LlmRequest) -> bool:
+        """Whether the admission work on a gen-init request's pages is done (no wait)."""
+        ready = self._disagg_receive_ready.get(request.py_request_id)
+        return ready is None or ready.query()
+
+    def wait_disagg_receive_ready(self, requests: Iterable[LlmRequest]) -> None:
+        """Block until the admission work on these gen-init requests' pages is done."""
+        for request in requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:
                 ready.synchronize()
                 del self._disagg_receive_ready[request.py_request_id]
 
+    @nvtx_range("prepare_resources_kv_cache_manager_v2")
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        self.impl.refresh_retention()
         if self.is_draft:
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
@@ -7431,9 +7633,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             self.impl.clear_stats_excluded(request_id)
             return
-        kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
+        # close() discards the pending stats itself.
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
         if request_id in self._early_freed_index_requests:

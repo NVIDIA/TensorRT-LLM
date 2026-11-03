@@ -31,6 +31,7 @@ from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
     MoEEplbBinding,
+    MoEFusedRouteQuant,
     MoEProblem,
     MoERunContext,
     MoESortTables,
@@ -284,14 +285,25 @@ class MoEImplBase(
     @abc.abstractmethod
     def run_moe(self, ctx: MoERunContext) -> torch.Tensor: ...
 
+    #: Cleared to make the scheduler route without ``try_fused_route_quant``: e.g. a benchmark that
+    #: replaces ``routing_method.apply``, which the fused launch would bypass.
+    fused_route_quant_enabled = True
+
+    def try_fused_route(
+        self, x: "Fp4QuantizedTensor", router_logits: "torch.Tensor"
+    ) -> "MoEFusedRouteQuant | None":
+        """Offer to route an input that arrives already quantized in one launch, returning what
+        ``routing_method.apply`` would plus the input's own data and scales, and optionally this
+        backend's routing tables. Declining is the default."""
+        return None
+
     def try_fused_route_quant(
         self, x: "torch.Tensor", router_logits: "torch.Tensor"
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None":
+    ) -> "MoEFusedRouteQuant | None":
         """Offer to fuse routing and input quantization into one launch.
 
-        Accepting returns what the scheduler otherwise assembles from two calls,
-        in that order: ``routing_method.apply``'s selected experts and scales,
-        then ``quantize_input``'s quantized activations and scaling factors.
+        Accepting returns what ``routing_method.apply`` and ``quantize_input``
+        would, plus optionally this backend's routing tables for ``run_moe``.
 
         Declining is the default and the common case: the one implementation
         that accepts is shape-, SM-, and quant-specialized and checks all of
@@ -353,6 +365,11 @@ class MoEImplBase(
         return self.routing_method.apply_with_sort(
             router_logits, self.slot_start, self.expert_size_per_partition
         )
+
+    def takes_router_logit_partials(self) -> bool:
+        """Whether ``try_fused_route_quant`` accepts the router logits as ``RouterLogitPartials``,
+        which only it sums, and then never declines. Declining is the default."""
+        return False
 
     # ---- impl-owned resources: produced here, never passed in -------------
     def get_workspaces(self, *args: object, **kwargs: object) -> "list[dict] | None":

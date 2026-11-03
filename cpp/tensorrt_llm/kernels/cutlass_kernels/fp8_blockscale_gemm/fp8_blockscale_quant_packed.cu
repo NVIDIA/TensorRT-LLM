@@ -280,10 +280,11 @@ __global__ void silu_and_mul_fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3
         }
 
         int const valid = kInRange ? min(kElemsPerLane, k - kBase) : 0;
-        __nv_bfloat16 maxElem = __nv_bfloat16(0.0F);
+        float swiglu[kElemsPerLane];
 #pragma unroll
         for (int i = 0; i < kElemsPerLane; ++i)
         {
+            swiglu[i] = 0.0F;
             if (i < valid)
             {
                 float gateValue = static_cast<float>(gate.values[i]);
@@ -294,16 +295,21 @@ __global__ void silu_and_mul_fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3
                     upValue = fminf(fmaxf(upValue, -swiglu_limit), swiglu_limit);
                 }
                 float const silu = gateValue / (1.0F + __expf(-gateValue));
-                gate.values[i] = __nv_bfloat16(silu * upValue);
-                maxElem = __hmax(maxElem, __habs(gate.values[i]));
-            }
-            else
-            {
-                gate.values[i] = __nv_bfloat16(0.0F);
+                swiglu[i] = silu * upValue;
             }
         }
 
-        float amax = static_cast<float>(maxElem);
+        // BF16 rounding, |max| and the E4M3 conversion run on element pairs: same bits, fewer conversions.
+        __nv_bfloat162 bf16Pairs[kElemsPerLane / 2];
+        __nv_bfloat162 maxPair = __float2bfloat162_rn(0.0F);
+#pragma unroll
+        for (int pair = 0; pair < kElemsPerLane / 2; ++pair)
+        {
+            bf16Pairs[pair] = __floats2bfloat162_rn(swiglu[2 * pair], swiglu[2 * pair + 1]);
+            maxPair = __hmax2(maxPair, __habs2(bf16Pairs[pair]));
+        }
+
+        float amax = fmaxf(static_cast<float>(__low2bfloat16(maxPair)), static_cast<float>(__high2bfloat16(maxPair)));
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 4, 8));
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 2, 8));
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFU, amax, 1, 8));
@@ -326,10 +332,14 @@ __global__ void silu_and_mul_fp8_quantize_1x128_packed_kernel_impl(__nv_fp8_e4m3
 
         Fp8Pack output;
         output.pack = float4{};
+        auto* outputPairs = reinterpret_cast<__nv_fp8x2_e4m3*>(output.values);
 #pragma unroll
-        for (int i = 0; i < kElemsPerLane; ++i)
+        for (int pair = 0; pair < kElemsPerLane / 2; ++pair)
         {
-            output.values[i] = __nv_fp8_e4m3(static_cast<float>(gate.values[i]) * quantScale);
+            float2 scaled = __bfloat1622float2(bf16Pairs[pair]);
+            scaled.x *= quantScale;
+            scaled.y *= quantScale;
+            outputPairs[pair] = __nv_fp8x2_e4m3(scaled);
         }
 
         if (kInRange)

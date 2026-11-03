@@ -394,6 +394,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml",
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml",
+        "deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_gen_init_cap.yaml",
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap_cuda_graph.yaml",
         "deepseek_v3_lite_fp8_overlap_cuda_graph":
@@ -1115,9 +1117,10 @@ def run_disaggregated_test(example_dir,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
-    after the client tests, at least one worker of each specified role must log its substring
-    (used to prove an intended code path actually engaged instead of silently falling back).
+    If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
+    worker logs are captured and, after the client tests, at least one worker of each specified
+    role must log each substring (used to prove an intended code path actually engaged instead of
+    silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1185,11 +1188,11 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        for role, workers, marker in (
+        for role, workers, markers in (
             ("context", ctx_workers, assert_ctx_log_contains),
             ("generation", gen_workers, assert_gen_log_contains),
         ):
-            if marker is None:
+            if markers is None:
                 continue
             # Fail loudly if the marker is absent: the code path the test means to
             # exercise never ran and something else silently took its place.
@@ -1198,10 +1201,12 @@ def run_disaggregated_test(example_dir,
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(marker in log for log in logs), (
-                f"expected marker {marker!r} in a {role}-worker log, "
-                f"but none of {len(logs)} log(s) contained it "
-                f"(the intended code path did not engage)")
+            for marker in ((markers, )
+                           if isinstance(markers, str) else markers):
+                assert any(marker in log for log in logs), (
+                    f"expected marker {marker!r} in a {role}-worker log, "
+                    f"but none of {len(logs)} log(s) contained it "
+                    f"(the intended code path did not engage)")
         success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -2163,6 +2168,53 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory(),
                            server_start_timeout=1200)
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        deepseek_v3_model_root):
+    """Run the scheduling fields of the delivered disaggregated servers.
+
+    The generation server admits at most one generation-init request per
+    pass, does client I/O during the GPU wait and receives only the prompt
+    tail of a long generation-only request; the context server places new
+    conversations by pending prefill.
+    """
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    def long_prompt(server_url):
+        import requests
+
+        with open(
+                f"{disaggregated_example_root}/clients/long_prompts.json") as f:
+            prompt = json.load(f)[0]
+        response = requests.post(f"{server_url}/v1/completions",
+                                 json={
+                                     "model": "DeepSeek-V3-Lite/fp8",
+                                     "prompt": prompt,
+                                     "max_tokens": 4
+                                 },
+                                 timeout=600)
+        assert response.status_code == 200 and response.json()["choices"], (
+            response.text)
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp8_attention_dp_overlap_gen_init_cap",
+        num_iters=1,
+        env=llm_venv._new_env,
+        gen_env={"TLLM_LOG_LEVEL": "INFO"},
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200,
+        post_client_test=long_prompt,
+        assert_gen_log_contains=(
+            "max_gen_init_admissions_per_pass=1",
+            "prompt tail trimming: first trimmed request sends 256"))
 
 
 @skip_no_hopper

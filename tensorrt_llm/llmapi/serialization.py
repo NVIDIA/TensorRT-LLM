@@ -101,7 +101,7 @@ BASE_EXAMPLE_CLASSES = {
         "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
         "CheckpointIOPolicy", "KvCacheConfig", "SchedulerConfig", "LoadFormat",
         "DynamicBatchConfig", "MoeLoadBalancerConfig",
-        "MoePerLayerDynamicLoadBalancerConfig"
+        "MoePerLayerDynamicLoadBalancerConfig", "MoeWarmupPlacementConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],

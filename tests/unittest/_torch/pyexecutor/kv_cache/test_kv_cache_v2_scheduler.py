@@ -104,7 +104,6 @@ def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.impl = Mock()
     order = Mock()
-    manager._disagg_receive_ready = {}
     manager.is_draft = is_draft
     manager._stream = Mock(cuda_stream=123)
     manager.sparse_metadata_batch = Mock()
@@ -5174,10 +5173,10 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
 
 
 @pytest.mark.parametrize("remote_mode", [None, "source", "destination"])
-def test_replay_only_batch_clears_deferred_generation_overlap_state(
+def test_remote_tail_source_defers_generation_and_destination_mixes(
     remote_mode: str | None,
 ) -> None:
-    """A resumed decode must not compensate for a token already harvested on CPU."""
+    """Only a source-only batch must clear the deferred decode's overlap state."""
     manager = make_kv_cache_manager()
     scheduler = make_scheduler(manager, max_num_tokens=256)
     decoding = make_gen_request(0)
@@ -5187,7 +5186,7 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
 
     first = scheduler.schedule_request([decoding, replay], set())
     assert ids(first.context_requests) == [1]
-    if remote_mode is None:
+    if remote_mode != "source":
         assert ids(first.generation_requests) == [0]
         assert decoding.py_batch_idx == 7
     else:
@@ -5196,10 +5195,11 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
         manager.try_allocate_generation.assert_not_called()
         manager.suspend_request.assert_not_called()
 
-    # After replay finishes, the deferred request resumes without losing KV.
-    resumed = scheduler.schedule_request([decoding], set())
-    assert ids(resumed.generation_requests) == [0]
-    manager.try_allocate_generation.assert_called_with(decoding)
+    if remote_mode == "source":
+        # The deferred request resumes from its host token count.
+        resumed = scheduler.schedule_request([decoding], set())
+        assert ids(resumed.generation_requests) == [0]
+        manager.try_allocate_generation.assert_called_with(decoding)
 
 
 @pytest.mark.parametrize("prompt_len", [0, 8])
@@ -5455,6 +5455,20 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+def test_remote_tail_destination_mixes_with_local_prefill_and_decode() -> None:
+    manager = make_kv_cache_manager()
+    scheduler = make_scheduler(manager, max_num_tokens=256)
+    remote = make_ctx_request(1, context_remaining_length=128)
+    remote.py_csa2_remote_tail_mode = "destination"
+    local = make_ctx_request(2, context_remaining_length=64)
+    decoding = make_gen_request(3)
+
+    batch = scheduler.schedule_request([local, decoding, remote], set())
+
+    assert ids(batch.context_requests) == [2, 1]
+    assert ids(batch.generation_requests) == [3]
 
 
 # ===========================================================================

@@ -155,6 +155,7 @@ l0_b200:
   # trtllm-gen non-causal windowed DSpark block attention; skips off SM100/SM103.
   - unittest/_torch/speculative/hw_agnostic/test_dspark_noncausal_window.py
   - unittest/disaggregated/test_csa2_kv_transfer.py
+  - unittest/_torch/modeling/test_deepseek_v41_ced.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)

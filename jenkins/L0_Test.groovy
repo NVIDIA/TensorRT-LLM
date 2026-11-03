@@ -1864,6 +1864,12 @@ def getPytestBaseCommandLine(
     }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // TRTLLMINF-435 TEMPORARY: DS v4.1 perf-sanity stages compare pre-merge numbers
+    // against the feature branch's own post-merge history; main has no
+    // DeepSeek-V4.1 records. Remove before merging feat/ds-v4.1-bringup into main.
+    if (stageName.contains("PerfSanity-DS-V4-1")) {
+        extraInternalEnv += " PERF_BASELINE_BRANCH=feat/ds-v4.1-bringup"
+    }
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
     extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
@@ -7036,6 +7042,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
+        // TRTLLMINF-435 TEMPORARY: Remove this one-test list before main/release merge.
+        "DGX_B200-DS-V4-1": ["auto:dgx-b200-flex", "l0_b200_ds_v4_1", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
         "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 9, 1, 1, true],
@@ -7056,6 +7064,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
         "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 8, 1, true],
+        // TRTLLMINF-435 TEMPORARY: Remove this one-test list before main/release merge.
+        "DGX_B200-8_GPUs-DS-V4-1": ["auto:dgx-b200-flex", "l0_dgx_b200_ds_v4_1", 1, 1, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
@@ -7130,6 +7140,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
+        // TRTLLMINF-435 TEMPORARY: Remove this one-test list before main/release merge.
+        "GB300-4_GPUs-DS-V4-1": ["auto:gb300-x4", "l0_gb300_ds_v4_1", 1, 1, 4, 1, true, false],
+        // TRTLLMINF-435 TEMPORARY: DS v4.1 perf sanity (the cases also sit in the
+        // post-merge l0_gb300_multi_gpus_perf_sanity list). Remove before main/release merge.
+        "GB300-4_GPUs-PyTorch-PerfSanity-DS-V4-1": ["auto:gb300-x4", "l0_gb300_ds_v4_1_perf_sanity", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
@@ -7159,6 +7174,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // stage <-> test by list name with a line-based parser, so a shared list or a helper's
         // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
         "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
+        // TRTLLMINF-435 TEMPORARY: Remove this one-test list before main/release merge.
+        "GB300-8_GPUs-2_Nodes-DS-V4-SingleNvlinkDomain-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_ds_v4_1", 1, 1, 8, 2],
         "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
@@ -7778,6 +7795,20 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs
+    }
+
+    // TRTLLMINF-435 TEMPORARY: Keep non-nightly feature-branch CI focused on the five DS v4.1
+    // stages plus the package sanity checks needed for release validation.
+    // Remove this override before merging the feature branch into main or a release branch.
+    def dsV41BringupStages = [
+        "DGX_B200-DS-V4-1",
+        "DGX_B200-8_GPUs-DS-V4-1",
+        "GB300-4_GPUs-DS-V4-1",
+        "GB300-4_GPUs-PyTorch-PerfSanity-DS-V4-1",
+        "GB300-8_GPUs-2_Nodes-DS-V4-SingleNvlinkDomain-1",
+    ] as Set
+    if (globalVars[RUN_MODE] != "nightly_release") {
+        parallelJobsFiltered = parallelJobs.findAll { it.key in dsV41BringupStages } + sanityCheckJobs
     }
 
     echo "Check the passed GitLab bot testFilter parameters."

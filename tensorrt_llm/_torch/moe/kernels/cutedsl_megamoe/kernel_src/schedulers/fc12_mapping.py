@@ -35,6 +35,9 @@ class BlockPhase(IntEnum):
     None_ = 0
     Linear1 = 1
     Linear2 = 2
+    # The fused FP8 shared expert's gate/up and down projections.
+    SharedLinear1 = 3
+    SharedLinear2 = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -889,11 +892,6 @@ class _PhaseFc12CursorState:
             self.token_block_cumulative,
         )
 
-    @cute.jit
-    def clone(self) -> "_PhaseFc12CursorState":
-        """Fork this cursor while sharing its immutable initial SSA values."""
-        return type(self)(*self._runtime_fields(), blocks_per_token_block=self.blocks_per_token_block)
-
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
         for field in self._runtime_fields():
@@ -931,6 +929,7 @@ class PhaseInterleavedFc12MappingState:
         fc2_cursor: _PhaseFc12CursorState,
         num_fc1_intermediate_blocks: int,
         num_fc2_hidden_blocks: int,
+        stream_token_blocks: Int32,
         dfc1_m_group: int = 1,
     ) -> None:
         if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
@@ -948,6 +947,7 @@ class PhaseInterleavedFc12MappingState:
         self.fc2_cursor = fc2_cursor
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
+        self.stream_token_blocks = stream_token_blocks
         self.fc2_claims_per_token_block = num_fc2_hidden_blocks
         if fc2_cursor.blocks_per_token_block != self.fc2_claims_per_token_block:
             raise ValueError(
@@ -959,11 +959,15 @@ class PhaseInterleavedFc12MappingState:
     def mapping_cluster_tile_m(self) -> int:
         return self.mapping_cta_tile_shape_mnk[0] * self.mapping_cluster_shape_mn[0]
 
+    def stream_tiles(self, phase_blocks: int) -> Int32:
+        """Tiles of one phase stream over all local experts (needs a resolved stream extent)."""
+        return self.stream_token_blocks * Int32(phase_blocks)
+
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
         token_counts = self.expert_token_sizes if self.expert_token_sizes is not None else self.expert_token_prefix_sum
         values.extend(extract_mlir_values(token_counts))
-        for field in (self.fc1_cursor, self.fc2_cursor):
+        for field in (self.fc1_cursor, self.fc2_cursor, self.stream_token_blocks):
             values.extend(extract_mlir_values(field))
         return values
 
@@ -996,6 +1000,7 @@ class PhaseInterleavedFc12MappingState:
             fc2_cursor=rebuild(self.fc2_cursor),
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=self.num_fc2_hidden_blocks,
+            stream_token_blocks=rebuild(self.stream_token_blocks),
             dfc1_m_group=self.dfc1_m_group,
         )
         if value_index != len(values):
@@ -1053,8 +1058,21 @@ def create_phase_interleaved_fc12_mapping_state(
         fc2_cursor=_make_phase_cursor(fc2_claims_per_token_block),
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+        stream_token_blocks=Int32(-1),
         dfc1_m_group=dfc1_m_group,
     )
+
+
+@cute.jit
+def resolve_phase_interleaved_stream_extent(
+    mapping_state: PhaseInterleavedFc12MappingState,
+) -> PhaseInterleavedFc12MappingState:
+    """Count the token blocks of all local experts in one warp pass, once the sizes are ready."""
+    _, _, token_blocks = _sum_expert_range(
+        mapping_state, Int32(0), Int32(mapping_state.expert_count)
+    )
+    mapping_state.stream_token_blocks = token_blocks
+    return mapping_state
 
 
 @cute.jit
@@ -1110,12 +1128,11 @@ def resolve_phase_interleaved_fc1_claim_target(
     minimum_claim_count: Int32, mapping_state: PhaseInterleavedFc12MappingState
 ) -> Tuple[Int32, Boolean]:
     """Resolve the static FC1 watermark or the smaller runtime stream extent."""
-    target_work_id = minimum_claim_count - Int32(1)
-    probe_cursor = _seek_phase_cursor(target_work_id, mapping_state.fc1_cursor.clone(), mapping_state)
-    stream_ends_before_target = target_work_id >= probe_cursor.expert_tile_end
+    fc1_stream_tiles = mapping_state.stream_tiles(mapping_state.num_fc1_intermediate_blocks)
+    stream_ends_before_target = minimum_claim_count > fc1_stream_tiles
     claim_target = minimum_claim_count
     if stream_ends_before_target:
-        claim_target = probe_cursor.expert_tile_end
+        claim_target = fc1_stream_tiles
     return claim_target, stream_ends_before_target
 
 
@@ -1208,15 +1225,15 @@ def map_phase_interleaved_fc12_work_id(
     fc2_cursor = mapping_state.fc2_cursor
 
     if phase == Int32(BlockPhase.Linear1):
-        fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
-        if linear_work_id < fc1_cursor.expert_tile_end:
+        if linear_work_id < mapping_state.stream_tiles(mapping_state.num_fc1_intermediate_blocks):
+            fc1_cursor = _seek_phase_cursor(linear_work_id, fc1_cursor, mapping_state)
             work_tile = _decode_phase_work_id(
                 linear_work_id, phase, cta_id_in_mapping_cluster, fc1_cursor, mapping_state
             )
             stream_has_work = Boolean(True)
     else:
-        fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
-        if linear_work_id < fc2_cursor.expert_tile_end:
+        if linear_work_id < mapping_state.stream_tiles(mapping_state.fc2_claims_per_token_block):
+            fc2_cursor = _seek_phase_cursor(linear_work_id, fc2_cursor, mapping_state)
             work_tile = _decode_phase_work_id(
                 linear_work_id, phase, cta_id_in_mapping_cluster, fc2_cursor, mapping_state
             )
@@ -1243,5 +1260,6 @@ __all__ = [
     "map_phase_interleaved_fc12_work_id",
     "peek_ready_bit",
     "resolve_phase_interleaved_fc1_claim_target",
+    "resolve_phase_interleaved_stream_extent",
     "rewind_fc12_mapping_cursor",
 ]

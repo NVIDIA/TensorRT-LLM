@@ -38,6 +38,7 @@ class PythonRequestInputs:
     conversation_params: ConversationParams | None = None
     uncached_prefill_tokens: int | None = None
     kv_hints: KvHintsSnapshot | None = None
+    prompt_trimmed_prefix: int = 0
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -62,6 +63,7 @@ class PythonRequestInputs:
             conversation_params=getattr(request, "py_conversation_params", None),
             uncached_prefill_tokens=getattr(request, "py_uncached_prefill_tokens", None),
             kv_hints=getattr(request, "py_kv_hints", None),
+            prompt_trimmed_prefix=getattr(request, "py_prompt_trimmed_prefix", 0),
         )
 
 
@@ -118,3 +120,7 @@ class ExecutorRequest:
     @py_uncached_prefill_tokens.setter
     def py_uncached_prefill_tokens(self, value: int | None) -> None:
         self.inputs.uncached_prefill_tokens = value
+
+    @property
+    def py_prompt_trimmed_prefix(self) -> int:
+        return self.inputs.prompt_trimmed_prefix

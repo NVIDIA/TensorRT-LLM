@@ -41,7 +41,7 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
-from .impl_contract import PreroutedRouting
+from .impl_contract import MoERoutingTables, PreroutedRouting
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -174,10 +174,13 @@ class MoEOpBackend:
         use_dp: bool = False,
         prerouted: Optional[PreroutedRouting] = None,
         decode_tuning: bool = False,
+        routing_tables: Optional[MoERoutingTables] = None,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
-        tunes for the model's decode steps (``FP4BlockScaleMoERunner``)."""
+        tunes for the model's decode steps (``FP4BlockScaleMoERunner``).
+        ``routing_tables`` replace the kernel's routing pass for tactics of their tiles.
+        """
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -346,6 +349,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         use_dp=False,
         prerouted=None,
         decode_tuning=False,
+        routing_tables=None,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -461,6 +465,8 @@ class TRTLLMOpBackend(MoEOpBackend):
                     prerouted_weights=None if prerouted is None else prerouted.topk_weights,
                     prerouted_tactic=None if prerouted is None else prerouted.tactic,
                     decode_tuning=decode_tuning,
+                    routing_tables=None if routing_tables is None else routing_tables.tables,
+                    routing_tiles=None if routing_tables is None else list(routing_tables.tiles),
                 )
                 if not do_finalize:
                     if prerouted is not None:
@@ -811,10 +817,13 @@ class FlashinferOpBackend(MoEOpBackend):
         use_dp=False,
         prerouted=None,
         decode_tuning=False,
+        routing_tables=None,
     ):
         del decode_tuning  # FlashInfer tunes its own way.
         if prerouted is not None:
             raise ValueError("prerouted routing needs the native TRT-LLM op backend")
+        # Only the native provider builds routing tables.
+        assert routing_tables is None
         # The framework hands the scales over token-major 2-D as
         # ``quantize_input`` produced them, which is exactly what the
         # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.

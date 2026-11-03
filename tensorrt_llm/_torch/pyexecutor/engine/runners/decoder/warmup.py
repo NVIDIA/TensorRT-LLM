@@ -203,6 +203,28 @@ class WarmupAgreement:
             f"--kv_cache_free_gpu_mem_fraction."
         )
 
+    def agree_capture_batch(
+        self, batch: ScheduledRequests | None, label: str, batch_size: int, draft_len: int
+    ) -> bool:
+        """Whether every rank of the forward group captures this generation graph: free KV
+        differs per rank under attention DP, so a graph any rank cannot fit is skipped on all."""
+        allgather = self.allgather()
+        flags = [int(batch is not None)]
+        if allgather is not None:
+            flags = list(allgather(flags[0]))
+        if all(flags):
+            return True
+        # During KV cache estimation a skip makes the profiling peak unrepresentative (the
+        # final executor still captures this graph), so it is never silent.
+        where = ""
+        if len(flags) > 1:
+            where = f" on rank(s) {[rank for rank, flag in enumerate(flags) if not flag]}"
+        logger.warning(
+            f"Skipping CUDA graph warmup ({label}) for batch size={batch_size}, "
+            f"draft_len={draft_len}: not enough KV cache space{where}."
+        )
+        return False
+
     def assert_all_tp_ranks_have_warmup_batch(self, batch, num_tokens: int) -> None:
         """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
 
@@ -1077,15 +1099,18 @@ class DecoderWarmup:
             )
         )
         if use_mxfp8_flashinfer_graph_default:
-            # CuTeDSL is the alternative backend; PP has no graph-pass handoff.
-            tune_with_cute_dsl = (
-                IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE and not self.mapping.has_pp()
-            )
             for quant_method in mxfp8_methods:
                 quant_method.enable_flashinfer_auto()
-                quant_method.tune_decode_graph_backends = (
-                    tune_with_cute_dsl and quant_method.uses_flashinfer
-                )
+        # PP has no handoff for the per-operator cache in the FlashInfer pass.
+        tune_mxfp8_backends = (
+            not compile_all_batches
+            and not self.mapping.has_pp()
+            and IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE
+        )
+        for quant_method in mxfp8_methods:
+            quant_method.tune_mxfp8_backends = (
+                tune_mxfp8_backends and quant_method.backend == "auto"
+            )
         # An explicit auto setting stays intact, but compiled auto dispatch
         # uses native GEMM. Do not run or mark an unused FlashInfer tuning pass.
         flashinfer_mxfp8_methods = [
@@ -1285,6 +1310,13 @@ class DecoderWarmup:
                     "Native MXFP8 autotuning had no runnable warmup batch; "
                     "using the default native GEMM tactic."
                 )
+
+        if (
+            cache_path
+            and ran_flashinfer_forward
+            and any(method.tune_mxfp8_backends for method in flashinfer_mxfp8_methods)
+        ):
+            AutoTuner.get().profiling_cache.save_cache(cache_path, self.mapping.rank)
 
         logger.info(
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
@@ -1543,14 +1575,18 @@ class DecoderWarmup:
             return
 
         from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+            CSA2Indexer,
+            prewarm_prefill_topk,
             prewarm_sparse_candidate_kernels,
         )
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode, CSA2Params
 
         config = self.model.model_config.pretrained_config
+        layout = kv_cache_manager.layout
         with torch.inference_mode():
             try:
                 compiled = prewarm_sparse_candidate_kernels(
-                    kv_cache_manager.layout,
+                    layout,
                     config.index_n_heads,
                     config.index_head_dim,
                     torch.device("cuda"),
@@ -1558,6 +1594,32 @@ class DecoderWarmup:
             except RuntimeError as e:
                 logger.warning(f"CSA2 sparse indexer prewarm skipped. {type(e).__name__}: {e}")
                 compiled = False
+            # The backends build their indexers at their first forward: build the same Top-K
+            # configuration to compile every prefill engine a context pass can request.
+            options = next(
+                (
+                    module.backend.sparse_params
+                    for module in self.model.modules()
+                    if isinstance(
+                        getattr(getattr(module, "backend", None), "sparse_params", None),
+                        CSA2Params,
+                    )
+                ),
+                None,
+            )
+            try:
+                widths = prewarm_prefill_topk(
+                    CSA2Indexer(
+                        layout, index, config.index_n_heads, config.index_head_dim, options=options
+                    ).top_k
+                    for index in range(len(layout.compress_ratios))
+                    if layout.layer(index).mode in (CSA2Mode.FULL, CSA2Mode.REINDEX)
+                )
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(f"CSA2 prefill Top-K prewarm skipped. {type(e).__name__}: {e}")
+                widths = []
+            if widths:
+                logger.info(f"CSA2 prefill Top-K prewarm compiled widths {widths}")
         torch.cuda.synchronize()
         if self.mapping.tp_size > 1 and self.dist is not None:
             self.dist.tp_allgather(1)

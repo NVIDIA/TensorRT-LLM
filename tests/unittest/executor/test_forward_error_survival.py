@@ -130,7 +130,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.resource_manager = MagicMock()
 
     batches = iter([(_scheduled_batch(), None), (None, None)])
-    executor._prepare_and_schedule_batch = lambda: next(batches)
+    executor._prepare_and_schedule_batch = lambda defer_gen_receives=False: next(batches)
     executor._can_queue = Mock(return_value=(True, True))
     executor._kv_connector_start_batch = Mock(return_value=(True, True))
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
@@ -158,7 +158,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
         "_maybe_prefetch_next_iter_mm_encoders",
         "_submit_encoder_step",
         "_run_encoder_step",
-        "_revert_gen_alloc",
+        "_revert_unexecuted_alloc",
     ):
         setattr(executor, name, Mock())
     return executor

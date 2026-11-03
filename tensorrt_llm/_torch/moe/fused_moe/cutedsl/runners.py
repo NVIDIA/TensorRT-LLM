@@ -101,12 +101,28 @@ class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
     def infer_shape_num_tokens(self, input_shapes: list[torch.Size]) -> int:
         return input_shapes[0][0]
 
+    def spread_num_tokens_per_expert(self, num_tokens: int) -> list[int]:
+        """Per-expert rows with the balanced total, spread linearly from 0 to twice the mean.
+
+        Equal counts give every expert the same padding remainder, which near a tile
+        boundary misjudges the routing tile; real routing pads half a tile on average.
+        """
+        total = sum(self.generate_num_tokens_per_expert(num_tokens, approx_max_load=True))
+        num_experts = self.num_local_experts
+        counts = [
+            min(num_tokens, total * (2 * e + 1) // num_experts**2) for e in range(num_experts)
+        ]
+        for e in range(num_experts - 1, -1, -1):
+            extra = min(total - sum(counts), num_tokens - counts[e])
+            if extra <= 0:
+                break
+            counts[e] += extra
+        return counts
+
     def inputs_pre_hook(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
         x, token_selected_experts, *others = inputs
         num_tokens = token_selected_experts.size(0)
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(
-            num_tokens, approx_max_load=True
-        )
+        num_tokens_per_expert = self.spread_num_tokens_per_expert(num_tokens)
 
         new_token_selected_experts = []
         for i, curr_num_tokens in enumerate(num_tokens_per_expert, start=self.local_expert_offset):

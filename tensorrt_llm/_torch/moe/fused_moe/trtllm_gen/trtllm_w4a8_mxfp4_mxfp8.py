@@ -21,9 +21,9 @@ import torch
 from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm._utils import is_sm_100f
 
-from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
+from ..impl_contract import MoEDeployment, MoEEligibility, MoEFusedRouteQuant, MoEProblem
 from ..impl_identity import register_moe_impl
-from ..routing import DeepSeekV3MoeRoutingMethod
+from ..routing import DeepSeekV3MoeRoutingMethod, DeepSeekV4MoeRoutingMethod
 from .eligibility import check_trtllm_gen_leaf
 from .fp4_block_scale import TRTLLMGenW4a8Mxfp4Mxfp8Base
 from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
@@ -51,7 +51,66 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         self,
         x: torch.Tensor | MxFp8QuantizedTensor,
         router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    ) -> MoEFusedRouteQuant | None:
+        """Fuse the routing and the MXFP8 input quantization: the DSpark draft bank's or Kimi K3's."""
+        # Checked first: a pre-quantized input declines before any routing or SM probe.
+        if isinstance(x, MxFp8QuantizedTensor):
+            return None
+        if isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod):
+            return self._try_dsv4_draft_route_quant(x, router_logits)
+        return self._try_kimi_k3_route_quant(x, router_logits)
+
+    def _try_dsv4_draft_route_quant(
+        self,
+        x: torch.Tensor | MxFp8QuantizedTensor,
+        router_logits: torch.Tensor,
+    ) -> MoEFusedRouteQuant | None:
+        """The DeepSeek-V4 DSpark draft bank's routing (top-3 of 128, bias-selected) and the MXFP8
+        quantization of its input in one launch: the ids and weights of
+        ``DeepSeekV4MoeRoutingMethod.apply`` in the expert kernels' dtype and the bytes of
+        ``quantize_input``. Declines for any other bank, a hashed gate, a routing method whose
+        ``apply`` was replaced on the instance, or an input that needs padding.
+        """
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+        routing = self.routing_method
+        if (
+            not IS_CUTLASS_DSL_AVAILABLE
+            or routing.is_hashed
+            or "apply" in vars(routing)
+            or routing.top_k != 3
+            or not isinstance(x, torch.Tensor)
+            or x.dtype != torch.bfloat16
+            or x.dim() != 2
+            or not x.is_contiguous()
+            or x.shape[1] != self.hidden_size
+            or x.shape[1] % self.quant_method.input_hidden_alignment
+            or router_logits.shape != (x.shape[0], 128)
+            or router_logits.dtype != torch.float32
+            or not router_logits.is_contiguous()
+        ):
+            return None
+        bias = routing.callable_e_score_correction_bias()
+        if bias is None or bias.dtype != torch.float32 or not bias.is_contiguous():
+            return None
+        from ....attention.kernels.blackwell.dspark.draft_routing import dspark_draft_route_mxfp8
+
+        return MoEFusedRouteQuant(
+            *dspark_draft_route_mxfp8(
+                router_logits,
+                bias,
+                x,
+                routing.top_k,
+                routing.routed_scaling_factor,
+                self.input_requirement.routing_scales_dtype or torch.float32,
+            )
+        )
+
+    def _try_kimi_k3_route_quant(
+        self,
+        x: torch.Tensor | MxFp8QuantizedTensor,
+        router_logits: torch.Tensor,
+    ) -> MoEFusedRouteQuant | None:
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
         The op is MXFP8-activation and native-cubin only, which is exactly this
@@ -62,9 +121,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         below mirror its ``TORCH_CHECK``s so a miss declines quietly instead of
         raising, which keeps every other model and shape on the unfused path.
         """
-        if os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1" or isinstance(
-            x, MxFp8QuantizedTensor
-        ):
+        if os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1":
             return None
 
         # Direct construction reaches here without a resolution query, so the
@@ -93,6 +150,8 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         ):
             return None
 
-        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
-            router_logits, bias, x, routing.routed_scaling_factor
+        return MoEFusedRouteQuant(
+            *torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+                router_logits, bias, x, routing.routed_scaling_factor
+            )
         )

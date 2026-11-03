@@ -222,7 +222,7 @@ def test_engram_decode_row_maps_are_immutable_and_stream_local(providers):
 @pytest.mark.parametrize(
     "case",
     [
-        "packed",
+        "empty_request",
         "missing_positions",
         "missing_ids",
         "missing_lengths",
@@ -241,7 +241,7 @@ def test_engram_decode_row_maps_are_immutable_and_stream_local(providers):
 def test_engram_decode_hash_rejects_unsupported_geometry(providers, case):
     provider, _ = providers()
     kwargs = _arguments([10, 20], [0, 0], [1, 2])
-    if case == "packed":
+    if case == "empty_request":
         kwargs["seq_lens_host"] = torch.tensor([2, 0], dtype=torch.int32)
     elif case == "missing_positions":
         kwargs["position_ids"] = None
@@ -294,16 +294,19 @@ def test_engram_decode_hash_preserves_validation(providers, case):
         provider.compute_hashes(**kwargs)
 
 
-def test_engram_decode_hash_keeps_packed_prefill_path(providers, monkeypatch):
+@pytest.mark.parametrize("masked", [False, True])
+def test_engram_decode_hash_fuses_multi_token_requests(providers, monkeypatch, masked):
     candidate, reference = providers()
-    kwargs = _arguments([10, 11, 20, 21], [0, 1, 0, 1], [1, 2], padded=8)
-    kwargs["seq_lens_host"] = torch.tensor([2, 2], dtype=torch.int32)
-    original = candidate._lookback_from_history
-    spy = Mock(wraps=original)
-    monkeypatch.setattr(candidate, "_lookback_from_history", spy)
-    _assert_hashes(candidate.compute_hashes(**kwargs), reference.compute_hashes(**kwargs))
-    assert spy.call_count == 1
-    assert candidate._decode_row_map is None
+    monkeypatch.setattr(candidate, "_lookback_from_history", Mock(side_effect=AssertionError))
+    mask = [True, True, False, True] if masked else None
+    # Speculative steps carry several tokens per request, each reading the ones before it.
+    for step in range(2):
+        ids = [10 + 8 * step, 20 + 8 * step, 22 + 8 * step, 24 + 8 * step]
+        positions = [step, 3 * step, 3 * step + 1, 3 * step + 2]
+        kwargs = _arguments(ids, positions, [1, 2], padded=8, mask=mask)
+        kwargs["seq_lens_host"] = torch.tensor([1, 3], dtype=torch.int32)
+        _assert_hashes(candidate.compute_hashes(**kwargs), reference.compute_hashes(**kwargs))
+    torch.testing.assert_close(candidate._history, reference._history, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("position", [-64, -1, 0, 1, 63])
@@ -453,8 +456,8 @@ def test_engram_decode_alias_hashes_read_resolved_scatter(providers, monkeypatch
     positions = positions[:16]
     tokens = list(range(70, 70 + real_requests)) + [11 + 17 * index for index in range(aliases)]
     masks = [index % 3 != 1 for index in range(16)]
-    launch = Mock(wraps=engram_module._decode_hash_kernel.run)
-    monkeypatch.setattr(engram_module._decode_hash_kernel, "run", launch)
+    launch = Mock(wraps=engram_module.compile_engram_decode_hash)
+    monkeypatch.setattr(engram_module, "compile_engram_decode_hash", launch)
     actual = provider.compute_hashes(
         **_arguments(tokens, positions, request_ids, padded=32, mask=masks)
     )
@@ -462,10 +465,8 @@ def test_engram_decode_alias_hashes_read_resolved_scatter(providers, monkeypatch
     for layer, hashes in actual.items():
         torch.testing.assert_close(hashes.cpu(), expected[layer], atol=0, rtol=0)
     assert len(launch.call_args_list) == len(provider.config.layer_ids)
-    assert all(
-        call.kwargs["READ_CURRENT_HISTORY"] and not call.kwargs["WRITE_HISTORY"]
-        for call in launch.call_args_list
-    )
+    # Arguments 3 and 4 are write_history and read_current_history.
+    assert all(call.args[4] and not call.args[3] for call in launch.call_args_list)
 
 
 def test_engram_decode_aliases_refresh_all_dummy_capture(providers, monkeypatch):

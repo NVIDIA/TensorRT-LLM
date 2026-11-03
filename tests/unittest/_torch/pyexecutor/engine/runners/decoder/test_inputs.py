@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -18,10 +19,12 @@ from _torch.pyexecutor.engine_test_utils import (
     _create_request,
     _create_request_with_tokens,
     _make_request_stub,
+    create_model_engine_and_kvcache,
 )
 from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
 from utils.util import skip_pre_blackwell_unittest, skip_ray
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
@@ -53,7 +56,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -600,6 +603,228 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         num_tokens = len(requests) * tokens_per_step
         expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
         self.assertEqual(kernel_path[0][:num_tokens].tolist(), expected_input_ids.tolist())
+
+    def test_staged_speculative_overlap_inputs_match_per_buffer_copies(self) -> None:
+        """One slab upload and one staging launch write the same inputs as the
+        per-buffer copies: a context row, a request without a previous step,
+        requests verifying in-flight drafts in permuted slots, and a dummy."""
+        model_engine, kv_cache_manager = self.enterContext(
+            create_model_engine_and_kvcache(spec_config=SADecodingConfig(max_draft_len=3))
+        )
+        preparer = model_engine._runner._inputs
+        buffers = preparer._buffers
+        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+        tokens_per_step = 4
+        slots = 6
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(
+                0,
+                1000,
+                (tokens_per_step, slots, 1),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+            new_tokens_lens=torch.randint(
+                1,
+                tokens_per_step + 1,
+                (slots,),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+            next_draft_tokens=torch.randint(
+                0,
+                1000,
+                (slots, tokens_per_step - 1),
+                dtype=torch.int32,
+                device="cuda",
+                generator=generator,
+            ),
+        )
+
+        def batch() -> ScheduledRequests:
+            context = _create_request_with_tokens(list(range(100, 107)), 1)
+            context.py_seq_slot = 0
+            fresh = _create_request_with_tokens([50, 51, 52, 53, 54], 2)
+            fresh.py_seq_slot = 1
+            fresh.py_draft_tokens = [7, 8, 9]
+            verifying = []
+            for request_id, (seq_slot, previous_slot) in enumerate(((2, 4), (3, 2)), start=3):
+                request = _create_request_with_tokens(list(range(20 + request_id)), request_id)
+                request.py_seq_slot = seq_slot
+                request.py_batch_idx = previous_slot
+                verifying.append(request)
+            dummy = _create_request_with_tokens([1, 1, 1], 6)
+            dummy.py_seq_slot = 5
+            dummy.py_draft_tokens = [1, 1, 1]
+            dummy.is_cuda_graph_dummy = True
+            scheduled = ScheduledRequests()
+            scheduled.context_requests_last_chunk = [context]
+            scheduled.generation_requests = [fresh, *verifying, dummy]
+            return scheduled
+
+        # The gather ids take their cached upload on both paths.
+        written = (
+            "input_ids_cuda",
+            "draft_tokens_cuda",
+            "previous_batch_indices_cuda",
+            "position_ids_cuda",
+            "previous_pos_id_offsets_cuda",
+            "previous_kv_lens_offsets_cuda",
+        )
+        self.assertTrue(preparer._spec_overlap_staging)
+        results = []
+        for staging in (True, False):
+            preparer._spec_overlap_staging = staging
+            preparer._staged_previous_batch_indices = None
+            preparer._staged_previous_pos_indices = None
+            for name in written:
+                getattr(buffers, name).fill_(-7)
+            attn_metadata = AttentionMetadata(
+                max_num_requests=8, max_num_tokens=64, kv_cache_manager=kv_cache_manager
+            )
+            attn_metadata.is_cuda_graph = False
+            inputs = preparer.prepare_inputs(
+                scheduled_requests=batch(),
+                kv_cache_manager=kv_cache_manager,
+                attn_metadata=attn_metadata,
+                new_tensors_device=previous,
+                resource_manager=resource_manager,
+                enable_spec_decode=True,
+                runtime_draft_len=tokens_per_step - 1,
+                is_dummy=False,
+            ).kwargs
+            torch.cuda.synchronize()
+            results.append(
+                {
+                    "input_ids": inputs["input_ids"].cpu(),
+                    "position_ids": inputs["position_ids"].cpu(),
+                    "gather_ids": preparer._gather_ids_buffer.tensor.cpu(),
+                    "draft_tokens": buffers.draft_tokens_cuda[:9].cpu(),
+                    "previous_slots": buffers.previous_batch_indices_cuda[:2].cpu(),
+                    "position_offsets": buffers.previous_pos_id_offsets_cuda.cpu(),
+                    "kv_lens_offsets": buffers.previous_kv_lens_offsets_cuda.cpu(),
+                }
+            )
+        staged, plain = results
+        for name, expected in plain.items():
+            self.assertTrue(torch.equal(staged[name], expected), name)
+        # The verifying rows take the previous step's tokens and corrections.
+        lens = previous.new_tokens_lens.cpu()
+        self.assertEqual(staged["previous_slots"].tolist(), [4, 2])
+        self.assertEqual(staged["input_ids"][11:15].tolist(), previous.new_tokens[:, 4, 0].tolist())
+        self.assertEqual(
+            staged["kv_lens_offsets"][:4].tolist(),
+            [0, lens[4].item() - tokens_per_step, lens[2].item() - tokens_per_step, 0],
+        )
+
+    def test_breakable_mixed_eligibility_preserves_compaction_fallback(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
+        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+        from tensorrt_llm._torch.utils import (
+            get_per_request_prefill_cuda_graph_flag,
+            set_per_request_prefill_cuda_graph_flag,
+        )
+
+        self.addCleanup(
+            set_per_request_prefill_cuda_graph_flag, get_per_request_prefill_cuda_graph_flag()
+        )
+        for case in ("mixed", "remote_tail_dspark", "compaction"):
+            with self.subTest(case=case):
+                engine, kv_cache_manager = self.enterContext(create_model_engine_and_kvcache())
+                preparer = engine._runner._inputs
+                speculative = case == "remote_tail_dspark"
+                draft_len = 5 if speculative else 0
+                spec_config = (
+                    SimpleNamespace(
+                        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+                        is_linear_tree=True,
+                        max_draft_len=draft_len,
+                    )
+                    if speculative
+                    else None
+                )
+                preparer._config = replace(
+                    preparer._config,
+                    enable_attention_dp=speculative,
+                    disable_overlap_scheduler=True,
+                    is_spec_decode=speculative,
+                    spec_config=spec_config,
+                    prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+                    prefill_cuda_graph_num_tokens=[8, 16],
+                )
+                graphs = Mock(is_capturing=False, is_warming_up=False)
+                graphs.has_graph.return_value = True
+                graphs.captured_num_tokens = [8, 16]
+                preparer.breakable_cuda_graph_runner = graphs
+                preparer.dist = Mock()
+
+                def gather(values: list[int]) -> torch.Tensor:
+                    return torch.tensor([values])
+
+                preparer.dist.tp_allgather_int64.side_effect = gather
+                preparer.dist.tp_cp_allgather_int64.side_effect = gather
+                preparer.get_runtime_tokens_per_gen_step = lambda length: length + 1
+                context = _create_request_with_tokens([11, 22, 33, 44], 1)
+                context.context_chunk_size = 4
+                context.py_seq_slot = 0
+                generation = _create_request_with_tokens([50, 51], 2)
+                generation.py_seq_slot = 1
+                generation.py_draft_tokens = [60] * draft_len
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = [context]
+                batch.generation_requests = [generation]
+                metadata = AttentionMetadata(
+                    max_num_requests=4, max_num_tokens=32, kv_cache_manager=kv_cache_manager
+                )
+                metadata.is_cuda_graph = False
+                metadata.decoder_replay_plan = None
+                if case == "compaction":
+                    metadata.decoder_replay_plan = SimpleNamespace(replays_local_tokens=True)
+                spec_metadata = None
+                if speculative:
+                    engine.model.model = SimpleNamespace(
+                        disagg_remote_tail_replay=True, disagg_context_only=False
+                    )
+                    context.py_csa2_remote_tail_mode = "destination"
+                    context.py_csa2_remote_tail_start = 0
+                    batch.attention_dp_phase = RemoteTailPhase.MIXED
+                    spec_metadata = Mock(
+                        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+                        context_prompt_lookahead_tokens=None,
+                        dp_num_tokens=Mock(return_value=10),
+                    )
+                    gather_ids = torch.empty(16, dtype=torch.int32, device="cuda")
+                    preparer._buffers = replace(
+                        preparer._buffers,
+                        draft_tokens_cuda=torch.empty(5, dtype=torch.int32, device="cuda"),
+                        gather_ids_cuda=gather_ids,
+                    )
+                    preparer._gather_ids_buffer = DeviceCopyBuffer(gather_ids)
+                resources = ResourceManager(
+                    {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
+                )
+
+                inputs = preparer.prepare_inputs(
+                    batch,
+                    kv_cache_manager,
+                    metadata,
+                    spec_metadata=spec_metadata,
+                    resource_manager=resources,
+                    enable_spec_decode=speculative,
+                    runtime_draft_len=draft_len,
+                    is_dummy=False,
+                ).kwargs
+
+                eligible = case != "compaction"
+                bucket = 16 if speculative else 8
+                self.assertEqual(get_per_request_prefill_cuda_graph_flag(), eligible)
+                self.assertEqual(inputs["input_ids"].numel(), bucket if eligible else 5)
+                self.assertEqual(metadata.padded_num_tokens, bucket if eligible else None)
+                if speculative:
+                    self.assertEqual(spec_metadata.all_rank_num_gens, [1])
 
     @skip_ray
     def test_prepare_inputs_with_helix_parallelism(self) -> None:

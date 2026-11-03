@@ -1141,13 +1141,16 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params (Optional[AllReduceParams]): Parameters for fused operations.
 
         Returns:
-            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s). Output tensors
-            preserve the input's N-D shape (NVFP4 quant output has its last dim halved; the
-            NVFP4 scale-factor output is 1-D).
+            Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s), or None for an
+            unsupported fusion op, input dtype or size. Output tensors preserve the input's N-D shape
+            (NVFP4 quant output has its last dim halved; the NVFP4 scale-factor output is 1-D).
         """
 
         if isinstance(all_reduce_params, MoEAllReduceParams):
             return self._moe_fold_call(input, all_reduce_params)
+        if input.dtype != self.dtype:
+            # The workspace is sized and laid out for self.dtype.
+            return None
         fusion_op = all_reduce_params.fusion_op
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
@@ -1158,13 +1161,9 @@ class MNNVLAllReduce(nn.Module):
         workspace_size_bytes = self.get_required_workspace_size(
             num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
 
-        # We use uint32_t to store workspace size related info. Safeguard against overflow.
+        # The kernels keep workspace sizes in uint32; a larger input falls back to the next strategy.
         if workspace_size_bytes >= 2**32 - 1:
-            # Raise an error so we can fallback to other allreduce strategies
-            raise ValueError(
-                f"[MNNVL AllReduce] Required workspace {workspace_size_bytes} bytes exceeds uint32 limits "
-                f"for shard ({num_tokens}, {hidden_dim}), TP {self.mapping.tp_size}."
-            )
+            return None
 
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping,
@@ -1449,6 +1448,18 @@ class AllReduce(nn.Module):
                         "MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
                     )
                     self.mnnvl_allreduce = None
+                tp_nodes = {
+                    self.mapping.get_node_rank(rank)
+                    for rank in self.mapping.tp_group
+                }
+                if self.mnnvl_allreduce is None and len(tp_nodes) > 1:
+                    # Without MNNVL the C++ op falls back to NCCL across nodes.
+                    reason = ("no dtype was given"
+                              if dtype is None else "MNNVL is unavailable")
+                    logger.warning_once(
+                        "AllReduce over a TP group spanning nodes falls back "
+                        f"to NCCL: {reason}.",
+                        key=("allreduce_multi_node_nccl", reason))
 
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
         """Whether ``forward`` takes MoEAllReduceParams for ``num_tokens`` tokens: the routed MoE output

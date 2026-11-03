@@ -110,7 +110,7 @@ public:
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
 
-    GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
+    GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
         std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
@@ -134,7 +134,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, bool trackUniqueTokens = true)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -168,6 +168,7 @@ public:
         , mReturnPerfMetrics(returnPerfMetrics)
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
+        , mTrackUniqueTokens(trackUniqueTokens)
     {
         TLLM_CHECK_WITH_INFO(!encoderInputLength.has_value() || encoderInputLength.value() >= 0,
             "Encoder input length must be nonnegative.");
@@ -179,7 +180,15 @@ public:
         }
 
         adoptContextPhaseDraftTokens();
-        initialize(*inputTokens, arrivalTime);
+        // A prompt nothing else holds becomes the tokens of the first beam without a copy.
+        if (inputTokens.use_count() == 1)
+        {
+            initialize(std::move(*inputTokens), arrivalTime);
+        }
+        else
+        {
+            initialize(*inputTokens, arrivalTime);
+        }
     }
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
@@ -466,6 +475,7 @@ public:
     /// @return A vector of UniqueTokens for this beam index, includes the prompt
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens(SizeType32 beam) const
     {
+        TLLM_CHECK_WITH_INFO(mTrackUniqueTokens, "Request %lu was created without unique tokens.", mRequestId);
         return mUniqueTokens.at(beam);
     }
 
@@ -473,7 +483,14 @@ public:
     /// @return A vector of vector of UniqueTokens.
     [[nodiscard]] BeamUniqueTokens const& getUniqueTokens() const
     {
+        TLLM_CHECK_WITH_INFO(mTrackUniqueTokens, "Request %lu was created without unique tokens.", mRequestId);
         return mUniqueTokens;
+    }
+
+    /// @brief Whether the request keeps the (token, extra id) sequence that block reuse keys on.
+    [[nodiscard]] bool tracksUniqueTokens() const noexcept
+    {
+        return mTrackUniqueTokens;
     }
 
     /// @brief Get all extra input token ids
@@ -591,8 +608,11 @@ public:
     {
         mLastTokens[beam] = token;
         mTokens.at(beam).push_back(token);
-        // New token's extra id is 0
-        mUniqueTokens.at(beam).push_back({token, 0});
+        if (mTrackUniqueTokens)
+        {
+            // New token's extra id is 0
+            mUniqueTokens.at(beam).push_back({token, 0});
+        }
         return getNumTokens(beam);
     }
 
@@ -607,8 +627,11 @@ public:
         {
             auto const outputId = beamTokens[beam];
             mTokens.at(beam).push_back(outputId);
-            // New token's extra id is 0
-            mUniqueTokens.at(beam).push_back({outputId, 0});
+            if (mTrackUniqueTokens)
+            {
+                // New token's extra id is 0
+                mUniqueTokens.at(beam).push_back({outputId, 0});
+            }
         }
     }
 
@@ -634,6 +657,10 @@ public:
             auto& beamTokens = mTokens[beamId];
             beamTokens.resize(mPromptLen);
             beamTokens.insert(beamTokens.end(), generatedBeamTokens[beamId].begin(), generatedBeamTokens[beamId].end());
+            if (!mTrackUniqueTokens)
+            {
+                continue;
+            }
             auto& beamUniqueTokens = mUniqueTokens[beamId];
             beamUniqueTokens.resize(mPromptLen);
             for (auto const token : generatedBeamTokens[beamId])
@@ -692,8 +719,10 @@ public:
             {
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(mPromptLen);
-                auto& beamUniqueTokens = mUniqueTokens.at(beam);
-                beamUniqueTokens.resize(mPromptLen);
+                if (mTrackUniqueTokens)
+                {
+                    mUniqueTokens.at(beam).resize(mPromptLen);
+                }
             }
         }
         else
@@ -703,8 +732,10 @@ public:
             {
                 auto& beamTokens = mTokens.at(beam);
                 beamTokens.resize(newPromptLen);
-                auto& beamUniqueTokens = mUniqueTokens.at(beam);
-                beamUniqueTokens.resize(newPromptLen);
+                if (mTrackUniqueTokens)
+                {
+                    mUniqueTokens.at(beam).resize(newPromptLen);
+                }
             }
             mMaxNewTokens -= (newPromptLen - mPromptLen);
             mPromptLen = newPromptLen;
@@ -1444,6 +1475,13 @@ public:
         return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
     }
 
+    //! Capacity of a beam's token vector: room for the generated tokens, up to what the first one would allocate
+    //! anyway, keeps that token from copying the prompt.
+    [[nodiscard]] static std::size_t promptTokensCapacity(std::size_t promptLen, SizeType32 maxNewTokens)
+    {
+        return promptLen + std::min(promptLen, static_cast<std::size_t>(std::max<SizeType32>(maxNewTokens, 0)));
+    }
+
     [[nodiscard]] std::optional<std::vector<std::tuple<std::string, int>>> const& getAgentHierarchy() const
     {
         return mAgentHierarchy;
@@ -1574,36 +1612,12 @@ protected:
 
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
 
+    // Without block reuse nothing reads mUniqueTokens, so a request can skip building it.
+    bool mTrackUniqueTokens{true};
+
 private:
-    void adoptContextPhaseDraftTokens()
+    void initializeUniqueTokens(VecTokens const& inputTokens)
     {
-        if (hasDraftTokens() || !mContextPhaseParams.has_value())
-        {
-            return;
-        }
-
-        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
-        if (draftTokens.has_value() && !draftTokens->empty())
-        {
-            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
-        }
-    }
-
-    void initialize(VecTokens const& inputTokens, std::optional<TimePoint> arrivalTime = std::nullopt)
-    {
-        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
-        {
-            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
-        }
-
-        // Scatter the input tokens to other beam
-        mTokens = BeamTokens(mSamplingConfig.getBeamWidth(), inputTokens);
-        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
-        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
-        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.getBeamWidth())
-                                          : VecTokens(mSamplingConfig.getBeamWidth(), inputTokens.back());
-
-        // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};
         if (mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value())
         {
@@ -1627,6 +1641,70 @@ private:
                 });
         }
         mUniqueTokens = BeamUniqueTokens(mSamplingConfig.getBeamWidth(), uniqueTokens);
+    }
+
+    void adoptContextPhaseDraftTokens()
+    {
+        if (hasDraftTokens() || !mContextPhaseParams.has_value())
+        {
+            return;
+        }
+
+        auto const& draftTokens = mContextPhaseParams.value().getDraftTokens();
+        if (draftTokens.has_value() && !draftTokens->empty())
+        {
+            mDraftTokens = std::make_shared<VecTokens>(*draftTokens);
+        }
+    }
+
+    void initialize(VecTokens const& inputTokens, std::optional<TimePoint> arrivalTime = std::nullopt)
+    {
+        // Scatter the input tokens to other beam.
+        mTokens = BeamTokens(mSamplingConfig.getBeamWidth());
+        for (auto& beamTokens : mTokens)
+        {
+            beamTokens.reserve(promptTokensCapacity(inputTokens.size(), mMaxNewTokens));
+            beamTokens.assign(inputTokens.cbegin(), inputTokens.cend());
+        }
+        initializeFromTokens(arrivalTime);
+    }
+
+    //! A single beam takes the input tokens over; with more beams each gets a copy.
+    void initialize(VecTokens&& inputTokens, std::optional<TimePoint> arrivalTime = std::nullopt)
+    {
+        if (mSamplingConfig.getBeamWidth() != 1)
+        {
+            initialize(std::as_const(inputTokens), arrivalTime);
+            return;
+        }
+        mTokens = BeamTokens(1);
+        mTokens.front() = std::move(inputTokens);
+        mTokens.front().reserve(promptTokensCapacity(mTokens.front().size(), mMaxNewTokens));
+        initializeFromTokens(arrivalTime);
+    }
+
+    //! The rest of initialize, once every beam holds the input tokens.
+    void initializeFromTokens(std::optional<TimePoint> arrivalTime)
+    {
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+            mState = LlmRequestState::kDISAGG_GENERATION_INIT;
+        }
+
+        auto const& inputTokens = mTokens.front();
+        // A request may legitimately have no input tokens on this rank (e.g. an "empty" Helix CP rank that owns zero KV
+        // blocks for the sequence). Guard against calling .back() on an empty vector (undefined behavior).
+        mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.getBeamWidth())
+                                          : VecTokens(mSamplingConfig.getBeamWidth(), inputTokens.back());
+
+        if (mTrackUniqueTokens)
+        {
+            initializeUniqueTokens(inputTokens);
+        }
+        else
+        {
+            mUniqueTokens = BeamUniqueTokens(mSamplingConfig.getBeamWidth());
+        }
 
         // Init mEncoderUniqueTokens
         // TODO: use real extra id instead of default zero value
@@ -1707,7 +1785,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt, bool trackUniqueTokens = true)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming,
             multimodalHashes.has_value()
@@ -1741,7 +1819,7 @@ public:
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(cacheSalt))
+            std::move(cacheSalt), trackUniqueTokens)
     {
     }
 

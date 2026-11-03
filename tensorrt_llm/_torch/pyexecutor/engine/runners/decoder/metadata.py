@@ -38,6 +38,8 @@ if TYPE_CHECKING:
         AttentionRuntimeFeatures,
     )
     from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.host_staging import HostUploader
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -65,6 +67,7 @@ class DecoderMetadata:
         model: torch.nn.Module,
         buffers: DecoderInputBuffers,
         attention_runtime_features: AttentionRuntimeFeatures,
+        host_uploader: HostUploader | None = None,
     ) -> None:
         self._config = config
         self.mapping = mapping
@@ -72,6 +75,8 @@ class DecoderMetadata:
         self.runtime_hooks = runtime_hooks_of(model)
         self._buffers = buffers
         self._attention_runtime_features = attention_runtime_features
+        # Uploads the per-step metadata between decode replays.
+        self._host_uploader = host_uploader
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
         # 1) The attention metadata depends on the KV cache manager.
@@ -116,6 +121,8 @@ class DecoderMetadata:
                 config, "chunk_size", self.attn_metadata.mamba_chunk_size
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
+        if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
+            self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
 
         return self.attn_metadata
@@ -323,7 +330,7 @@ def create_spec_metadata(
     mapping: Mapping | None = None,
 ) -> SpecMetadata | None:
     """Create speculative metadata sized by the runner capacities."""
-    return get_spec_metadata(
+    metadata = get_spec_metadata(
         config.spec_config,
         pretrained_config,
         config.max_batch_size,
@@ -336,6 +343,9 @@ def create_spec_metadata(
         and config.spec_decode_fast_paths
         and supports_sharded_target_sampling(config.spec_config, mapping),
     )
+    if metadata is not None:
+        metadata.samples_from_vocab_shards = config.samples_from_vocab_shards
+    return metadata
 
 
 def update_spec_metadata(
@@ -384,10 +394,21 @@ def update_spec_metadata(
     )
 
 
+def samples_from_adp_head_shards(spec_metadata: SpecMetadata | None, mapping: Mapping) -> bool:
+    """Whether attention-DP ranks sample target rows from shards of a shared LM head."""
+    return (
+        mapping.enable_attention_dp
+        and spec_metadata is not None
+        and spec_metadata.samples_from_vocab_shards
+    )
+
+
 def sync_group_all_greedy_sample(
     spec_metadata: SpecMetadata,
     mapping: Mapping,
     dist: Distributed | None,
+    cuda_graph_runner: CUDAGraphRunner,
+    batch: ScheduledRequests,
     *,
     confidence_enabled: bool = False,
 ) -> None:
@@ -403,25 +424,47 @@ def sync_group_all_greedy_sample(
     subgroup. A dedicated host all-gather rather than a piggyback on the
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
+
+    Ranks that sample target rows from shards of a shared head also agree on
+    the temperature-only variant, whose kernels exchange data across the
+    group. Their flags ride the padding exchange of ``batch``'s forward
+    (``one_model_sampling_mode``), which every rank runs before the key;
+    only without one (CUDA graphs off) do they take the exchange here.
     """
-    # Confidence needs the same group-uniform rejection decision even without
-    # LM-head TP. Feature-off execution retains the existing gate.
+    shard_sampling = samples_from_adp_head_shards(spec_metadata, mapping)
+    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
+    # Mapping.__init__), so ADP needs no separate check here. Confidence needs the
+    # same group-uniform rejection decision even without LM-head TP.
     if not (
-        spec_metadata.use_rejection_sampling
-        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+        (
+            spec_metadata.use_rejection_sampling
+            and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+        )
+        or shard_sampling
     ):
         return
-    local_flag = bool(spec_metadata.is_all_greedy_sample)
-    if mapping.tp_size > 1:
-        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
-    else:
-        spec_metadata.group_all_greedy_sample = local_flag
+    local = (
+        int(spec_metadata.is_all_greedy_sample) | int(spec_metadata.local_all_temperature_only) << 1
+    )
+    modes = cuda_graph_runner.take_sampling_modes(batch) if shard_sampling else None
+    if modes is None:
+        modes = dist.tp_allgather_int64([local])[:, 0].tolist() if mapping.tp_size > 1 else [local]
+    elif modes[mapping.tp_rank] != local:
+        raise RuntimeError(
+            f"rank {mapping.tp_rank} sent sampling mode {modes[mapping.tp_rank]} "
+            f"for a batch whose scan gives {local}"
+        )
+    spec_metadata.group_all_greedy_sample = all(mode & 1 for mode in modes)
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+    if shard_sampling:
+        spec_metadata.group_all_temperature_only = all(mode & 2 for mode in modes)
+        spec_metadata.is_all_temperature_only = (
+            spec_metadata.group_all_temperature_only and not spec_metadata.is_all_greedy_sample
+        )
 
 
 def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:

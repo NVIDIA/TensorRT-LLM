@@ -48,14 +48,17 @@ from tensorrt_llm._torch.pyexecutor.adp_iter_stats import (
     _ITERATION_STATS_OPTIONAL_FIELDS,
     _ITERATION_STATS_SCALAR_FIELDS,
     ADPIterStatsBuffer,
+    _snapshot_kv_cache_stats,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import (
     InflightBatchingStats,
     IterationStats,
     KvCacheStats,
+    RequestStats,
     SpecDecodingStats,
 )
+from tensorrt_llm.executor.base_worker import BaseWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -760,12 +763,25 @@ def _make_adp_iteration_stats(
     return stats
 
 
+class _KvWindowIterStats:
+    """KV-cache iteration stats of one window; each counter reads as its name's length."""
+
+    def __getattr__(self, name):
+        return len(name)
+
+
+def _make_request_stats(request_id):
+    req_stats = RequestStats()
+    req_stats.id = request_id
+    return req_stats
+
+
 def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
     buffer = ADPIterStatsBuffer()
     buffer.queue(
         pending_stats,
-        ["req-stats"] if is_rank0 else None,
-        kv_iter_stats={0: "pending-kv"} if is_rank0 else None,
+        [_make_request_stats(42)] if is_rank0 else None,
+        kv_iter_stats={16: _KvWindowIterStats()} if is_rank0 else None,
         is_rank0=is_rank0,
         host_step_time_ms=11.0 if is_rank0 else None,
         prev_device_step_time_ms=9.0 if is_rank0 else None,
@@ -825,16 +841,16 @@ def test_attention_dp_fanout_preserves_rank_local_kv_snapshots(
         state = RankState(rank=rank, iter_stats=payload)
         states.append(RankState.deserialize(state.serialize(include_kv_cache_load)))
 
-    records = buffers[0].finalize(states, is_rank0=True)
+    rows = buffers[0].finalize(states, is_rank0=True)
 
-    assert len(records) == 2
-    for rank, record in enumerate(records):
-        exported = json.loads(record.stats.to_json_str())
-        assert record.attention_dp_rank == rank
-        assert record.stats.inflight_batching_stats.num_gen_requests == rank + 1
+    assert len(rows) == 2
+    for rank, row in enumerate(rows):
+        exported = json.loads(row)
+        assert exported["attentionDpRank"] == rank
+        assert exported["inflightBatchingStats"]["numGenRequests"] == rank + 1
         assert exported["kvCacheStats"] == expected[rank]["kvCacheStats"]
-        # IterationStats JSON omits the cross-cache object; check its native fields.
-        cross = record.stats.cross_kv_cache_stats
+        # IterationStats JSON omits the cross-cache object; check the transported snapshot.
+        cross = states[rank].iter_stats.cross_kv_cache_stats
         expected_cross = _make_kv_cache_snapshot(rank * 10 + 30)
         assert cross.max_num_blocks == expected_cross.max_num_blocks
         assert cross.free_num_blocks == expected_cross.free_num_blocks
@@ -884,60 +900,124 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
         ),
     )
 
-    records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
+    rows = buffer.finalize([rank1_state, rank0_state], is_rank0=True, scheduler_mode="overlap")
 
-    assert len(records) == 2
+    assert len(rows) == 2
 
-    rank0_record = records[0]
-    rank0_row = rank0_record.stats
-    rank0_ifb = rank0_row.inflight_batching_stats
-    assert rank0_record.attention_dp_rank == 0
-    assert rank0_row.iter_latency_ms == 12.5
-    assert rank0_ifb.num_context_requests == 1
-    assert rank0_ifb.num_ctx_tokens == 100
-    assert rank0_ifb.num_ctx_kv_tokens == 10
-    assert rank0_ifb.num_gen_requests == 2
-    assert rank0_ifb.num_gen_kv_tokens == 20
-    assert rank0_ifb.num_paused_requests == 1
-    assert rank0_ifb.num_paused_kv_tokens == 5
-    assert rank0_ifb.num_scheduled_requests == 3
-    assert rank0_ifb.num_queued_context_requests == 7
-    assert rank0_ifb.num_queued_ctx_tokens == 700
-    assert rank0_ifb.num_queued_gen_requests == 8
-    assert rank0_ifb.num_queued_gen_kv_tokens == 800
-    assert rank0_record.req_stats == ["req-stats"]
-    assert rank0_record.kv_iter_stats == {0: "pending-kv"}
-    assert rank0_record.host_step_time_ms == 11.0
-    assert rank0_record.prev_device_step_time_ms == 9.0
-    assert rank0_record.gpu_forward_time_ms == 7.0
+    rank0_row = json.loads(rows[0])
+    rank0_ifb = rank0_row["inflightBatchingStats"]
+    assert rank0_row["attentionDpRank"] == 0
+    assert rank0_row["iterLatencyMS"] == 12.5
+    assert rank0_ifb["numContextRequests"] == 1
+    assert rank0_ifb["numCtxTokens"] == 100
+    assert rank0_ifb["numCtxKvTokens"] == 10
+    assert rank0_ifb["numGenRequests"] == 2
+    assert rank0_ifb["numGenKvTokens"] == 20
+    assert rank0_ifb["numPausedRequests"] == 1
+    assert rank0_ifb["numPausedKvTokens"] == 5
+    assert rank0_ifb["numScheduledRequests"] == 3
+    assert rank0_ifb["numQueuedContextRequests"] == 7
+    assert rank0_ifb["numQueuedCtxTokens"] == 700
+    assert rank0_ifb["numQueuedGenRequests"] == 8
+    assert rank0_ifb["numQueuedGenKvTokens"] == 800
+    assert [req["id"] for req in rank0_row["requestStats"]] == [42]
+    assert list(rank0_row["kvCacheIterationStats"]) == ["16"]
+    assert rank0_row["hostStepTimeMS"] == 11.0
+    assert rank0_row["prevDeviceStepTimeMS"] == 9.0
+    assert rank0_row["gpuForwardTimeMS"] == 7.0
+    assert rank0_row["schedulerMode"] == "overlap"
 
-    rank1_record = records[1]
-    rank1_row = rank1_record.stats
-    rank1_ifb = rank1_row.inflight_batching_stats
-    assert rank1_record.attention_dp_rank == 1
-    assert rank1_row.iter_latency_ms == 12.5
-    assert rank1_ifb.num_context_requests == 3
-    assert rank1_ifb.num_ctx_tokens == 300
-    assert rank1_ifb.num_ctx_kv_tokens == 30
-    assert rank1_ifb.num_gen_requests == 4
-    assert rank1_ifb.num_gen_kv_tokens == 40
-    assert rank1_ifb.num_paused_requests == 2
-    assert rank1_ifb.num_paused_kv_tokens == 25
-    assert rank1_ifb.num_scheduled_requests == 7
-    # Expected to be zero/None because queued/request/KV iteration deltas are reported
-    # only on rank 0.
-    assert rank1_ifb.num_queued_context_requests == 0
-    assert rank1_ifb.num_queued_ctx_tokens == 0
-    assert rank1_ifb.num_queued_gen_requests == 0
-    assert rank1_ifb.num_queued_gen_kv_tokens == 0
-    assert rank1_record.req_stats is None
-    assert rank1_record.kv_iter_stats is None
-    assert rank1_record.host_step_time_ms == 11.0
-    assert rank1_record.prev_device_step_time_ms == 9.0
-    assert rank1_record.gpu_forward_time_ms == 7.0
+    rank1_row = json.loads(rows[1])
+    rank1_ifb = rank1_row["inflightBatchingStats"]
+    assert rank1_row["attentionDpRank"] == 1
+    assert rank1_row["iterLatencyMS"] == 12.5
+    assert rank1_ifb["numContextRequests"] == 3
+    assert rank1_ifb["numCtxTokens"] == 300
+    assert rank1_ifb["numCtxKvTokens"] == 30
+    assert rank1_ifb["numGenRequests"] == 4
+    assert rank1_ifb["numGenKvTokens"] == 40
+    assert rank1_ifb["numPausedRequests"] == 2
+    assert rank1_ifb["numPausedKvTokens"] == 25
+    assert rank1_ifb["numScheduledRequests"] == 7
+    # Queued, request and KV iteration stats are reported on rank 0 only.
+    assert rank1_ifb["numQueuedContextRequests"] == 0
+    assert rank1_ifb["numQueuedCtxTokens"] == 0
+    assert rank1_ifb["numQueuedGenRequests"] == 0
+    assert rank1_ifb["numQueuedGenKvTokens"] == 0
+    assert "requestStats" not in rank1_row
+    assert "kvCacheIterationStats" not in rank1_row
+    assert rank1_row["hostStepTimeMS"] == 11.0
+    assert rank1_row["prevDeviceStepTimeMS"] == 9.0
+    assert rank1_row["gpuForwardTimeMS"] == 7.0
+    assert rank1_row["schedulerMode"] == "overlap"
 
     assert buffer._payloads == {}
     assert buffer.next_payload() is None
+
+
+def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
+    """Fanout rows equal serializing each rank's own IterationStats at scrape time."""
+    rank0_stats = _make_adp_iteration_stats(
+        iter_id=9,
+        num_gen_requests=25,
+        num_gen_kv_tokens=4_600_000,
+        num_queued_gen_requests=4,
+        num_queued_gen_kv_tokens=700_000,
+    )
+    rank0_stats.timestamp = "10-25-2026 17:30:00"
+    rank0_stats.iter_latency_ms = 19.123456789
+    rank0_stats.num_active_requests = 25
+    rank0_stats.num_queued_requests = 4
+    rank0_stats.num_completed_requests = 2
+    rank0_stats.gpu_mem_usage = 250 << 30
+    rank0_stats.inflight_batching_stats.micro_batch_id = 1
+    rank0_stats.inflight_batching_stats.avg_num_decoded_tokens_per_iter = 3.51
+    kv_cache_stats = KvCacheStats()
+    kv_cache_stats.max_num_blocks = 80_000
+    kv_cache_stats.used_num_blocks = 60_000
+    rank0_stats.kv_cache_stats = kv_cache_stats
+    specdec_stats = SpecDecodingStats()
+    specdec_stats.num_draft_tokens = 125
+    specdec_stats.acceptance_length = 3.52
+    rank0_stats.specdec_stats = specdec_stats
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    states = [RankState(rank=0, iter_stats=buffer.next_payload())]
+    for rank in range(1, 6):
+        payload = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=rank % 2,
+            num_ctx_tokens=1000 * rank,
+            num_ctx_kv_tokens=100 * rank,
+            num_gen_requests=23 + rank,
+            num_gen_kv_tokens=4_400_000 + rank,
+            num_paused_requests=rank // 3,
+            num_paused_kv_tokens=7 * rank,
+            kv_cache_stats=(
+                None if rank == 3 else _snapshot_kv_cache_stats(_make_kv_cache_snapshot(rank))
+            ),
+        )
+        states.append(RankState(rank=rank, iter_stats=payload))
+    expected = [
+        BaseWorker._stats_serializer(
+            (
+                ADPIterStatsBuffer._make_rank_iter_stats(rank0_stats, state),
+                [_make_request_stats(42)] if state.rank == 0 else None,
+                {16: _KvWindowIterStats()} if state.rank == 0 else None,
+                state.rank,
+                11.0,
+                9.0,
+                "non_overlap",
+                7.0,
+            )
+        )
+        for state in states
+    ]
+
+    rows = buffer.finalize(states[::-1], is_rank0=True, scheduler_mode="non_overlap")
+
+    assert rows == expected
+    assert [BaseWorker._stats_serializer(row) for row in rows] == expected
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
@@ -1046,16 +1126,16 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
             RankState(rank=1, iter_stats=next_payload),
         )
     ]
-    records = rank0_buffer.finalize(states, is_rank0=True)
-    assert len(records) == 2
-    assert records[0].stats.kv_cache_stats.used_num_blocks == 20
-    assert records[0].stats.cross_kv_cache_stats.used_num_blocks == 50
-    assert records[0].stats.inflight_batching_stats.num_context_requests == 1
-    idle_row = records[1].stats
-    assert idle_row.kv_cache_stats is None
-    assert idle_row.cross_kv_cache_stats is None
-    assert idle_row.inflight_batching_stats.num_context_requests == 0
-    assert idle_row.inflight_batching_stats.num_scheduled_requests == 0
+    rows = [json.loads(row) for row in rank0_buffer.finalize(states, is_rank0=True)]
+    assert len(rows) == 2
+    assert rows[0]["kvCacheStats"]["usedNumBlocks"] == 20
+    assert states[0].iter_stats.cross_kv_cache_stats.used_num_blocks == 50
+    assert rows[0]["inflightBatchingStats"]["numContextRequests"] == 1
+    idle_row = rows[1]
+    assert idle_row["kvCacheStats"] is None
+    assert states[1].iter_stats.cross_kv_cache_stats is None
+    assert idle_row["inflightBatchingStats"]["numContextRequests"] == 0
+    assert idle_row["inflightBatchingStats"]["numScheduledRequests"] == 0
     assert buffer._payloads[10].kv_cache_stats.max_num_blocks == 120
 
     # A measured payload replaces the synthetic placeholder for the same iter.

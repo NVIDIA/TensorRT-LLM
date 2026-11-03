@@ -38,11 +38,12 @@ def make_operand(rows, cols, layout, device):
     "num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
 # 256 experts: DeepSeek-V3/V4, GLM-5 (scalar FFMA kernel, all three hidden sizes).
 # 288 experts: GLM-5.3-Flash (scalar FFMA kernel, hidden 4096).
+# 384 experts: DeepSeek-V4.1 (scalar FFMA kernel, hidden 5120).
 # 896 experts: Kimi K3 (tensor-core kernel for hidden 7168; cuBLAS fallback otherwise).
 @pytest.mark.parametrize("num_experts,hidden_size", [(256, 7168), (256, 6144),
                                                      (256, 4096), (288, 4096),
-                                                     (896, 7168), (896, 6144),
-                                                     (896, 4096)])
+                                                     (384, 5120), (896, 7168),
+                                                     (896, 6144), (896, 4096)])
 @pytest.mark.parametrize("layout", ["packed", "unaligned", "padded"])
 def test_router_gemm_run(num_tokens, num_experts, hidden_size, layout):
     torch.manual_seed(24)
@@ -126,3 +127,39 @@ def test_router_latent_gemm_matches_separate_ops(num_tokens: int) -> None:
         assert mismatches == 0, (
             f"{mismatches}/{actual.numel()} projection values exceed one BF16 "
             f"step + {accumulation_atol} or are nonfinite; max_abs={max_abs}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability() not in ((10, 0),
+                                                                  (10, 3),
+                                                                  (10, 7)),
+                    reason="The small-M kernel runs on SM100/SM103/SM107")
+@pytest.mark.parametrize("m", [1, 6, 12, 64])
+@pytest.mark.parametrize("num_experts,hidden_size", [(384, 5120), (128, 5120),
+                                                     (256, 4096)])
+def test_router_gemm_small_m_matches_reference(m, num_experts, hidden_size):
+    """The small-M tactic equals the exact product; the race may pick either kernel."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+        RouterGemmRunner, router_gemm_autotuned)
+
+    torch.manual_seed(0)
+    x = torch.randn((m, hidden_size), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((num_experts, hidden_size),
+                         dtype=torch.bfloat16,
+                         device="cuda")
+    reference = (x.double() @ weight.double().t()).float()
+
+    runner = RouterGemmRunner()
+    assert runner.small_m_applies([x, weight])
+    torch.testing.assert_close(runner([x, weight], tactic=0),
+                               reference,
+                               rtol=1e-3,
+                               atol=1e-2)
+
+    AutoTuner.get().clear_cache()
+    with autotune():
+        tuned = router_gemm_autotuned(x, weight)
+    served = router_gemm_autotuned(x, weight)
+    torch.testing.assert_close(served, tuned, rtol=0, atol=0)
+    torch.testing.assert_close(served, reference, rtol=1e-3, atol=1e-2)

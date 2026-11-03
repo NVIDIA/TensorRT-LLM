@@ -195,3 +195,11 @@ def _install_sm_reserve() -> None:
 
 
 _install_sm_reserve()
+
+
+def graph_safe_from_dlpack(tensor, assumed_align: int = 16):
+    """``cutlass.cute.runtime.from_dlpack`` of ``tensor`` without the DLPack export's stream
+    synchronization, so it can run during CUDA-graph capture."""
+    from cutlass.cute.runtime import from_dlpack
+
+    return from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)

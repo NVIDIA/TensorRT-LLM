@@ -1,0 +1,21 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# TRTLLMINF-435 TEMPORARY: Remove this feature-branch-only list before main/release merge.
+
+version: 0.0.1
+l0_gb300_multi_nodes_ds_v4_1:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*gb300*'
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # DSpark GSM8K accuracy and acceptance length across two nodes: TP8/EP8 and DP8/EP8.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp8] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp8] TIMEOUT (120)
