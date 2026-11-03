@@ -3279,6 +3279,82 @@ def _all_reduce_add_norm(
     )
 
 
+@lru_cache(maxsize=1)
+def _bf16_push_gemm_available() -> bool:
+    """Whether the BF16 split-K GEMM with the all-reduce push epilogue imports here."""
+    try:
+        from ..kernels.blackwell import bf16_splitk_push_gemm  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _pushed_linear_add_norm(
+    linear: Linear, x: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """``norm(all_reduce(linear(x)) + residual)`` and the new residual, the row-parallel GEMM
+    pushing its partial straight into the MNNVL all-reduce (``AllReduce.push_target`` with the
+    ``RESIDUAL_RMS_NORM`` fusion); None where that does not apply."""
+    from ..flashinfer_utils import get_env_enable_pdl
+    from ..kernels.blackwell.bf16_splitk_push_gemm import MAX_M, default_push_tactic, run_gemm_push
+
+    m, k = x.shape
+    weight = linear.weight
+    if (
+        not 0 < m <= MAX_M
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or linear.bias is not None
+        or linear.has_any_quant
+        or not x.is_contiguous()
+        or x.data_ptr() % 32
+        or weight.data_ptr() % 32
+    ):
+        return None
+    n = weight.shape[0]
+    tactic = default_push_tactic(m, n, k)
+    if tactic is None:
+        return None
+    all_reduce = linear.all_reduce
+    target = all_reduce.push_target(
+        m,
+        n,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm.weight,
+            eps=norm.variance_epsilon,
+        ),
+    )
+    if target is None:
+        return None
+    run_gemm_push(
+        x.detach(), weight.detach(), target.view, target.one_shot, tactic, pdl=get_env_enable_pdl()
+    )
+    return all_reduce.finish_push(target)
+
+
+def _mlp_activation(mlp: GatedMLP, x: torch.Tensor) -> Optional[torch.Tensor]:
+    """``GatedMLP.forward`` up to its down projection for a BF16 MLP, or None (a quantized
+    activation path)."""
+    if mlp.split_gate_up:
+        return mlp._split_gate_up_forward(x)
+    if mlp._can_fuse_gate_up_swiglu_fp4out() or mlp._can_fuse_gate_up_swiglu():
+        return None
+    if mlp._can_fuse_gate_up_swiglu_bf16(x):
+        return mlp._fused_gate_up_swiglu_bf16(x)
+    if mlp._can_fuse_swiglu_fp8_quant():
+        return None
+    return mlp._apply_activation(mlp.gate_up_proj(x))
+
+
+class _PendingDown(NamedTuple):
+    """A drafter MLP whose down projection runs at the all-reduce site that consumes it."""
+
+    mlp: GatedMLP
+    h2: torch.Tensor
+
+
 def _block_upper_triangle(block_size: int, device) -> torch.Tensor:
     """``[1, block, 1, block]``: query i sees block key j > i (the fixup's part)."""
     idx = torch.arange(block_size, device=device)
@@ -3680,6 +3756,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
     # The low-M BF16 GEMM race of the drafter's projections (set in __init__).
     _low_m_gemm: Optional[LowMGemmDispatcher] = None
+    # o_proj and down_proj push their partials into the MNNVL all-reduce that sums them
+    # (residual + RMSNorm fused into its finish) when the TP fusions run on SM100f.
+    _ar_push: bool = False
     # The target's helix mapping whose CP group the drafter's heads span.
     _helix_mapping: Optional[Mapping] = None
     # The per-request split-KV plan buffer of the CuTe DSL block decode.
@@ -3801,6 +3880,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # rows per request: they race the low-M BF16 kernels against cuBLAS.
         self._low_m_gemm = prepare_low_m_gemm(
             self.model, force=True, per_rank_tuning=draft_config.mapping.enable_attention_dp
+        )
+        self._ar_push = (
+            self._tp_split
+            and not context_kv_only
+            and IS_CUTLASS_DSL_AVAILABLE
+            and is_sm_100f()
+            and _bf16_push_gemm_available()
         )
 
     def _keep_context_kv_modules(self) -> None:
@@ -4133,6 +4219,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             fixup.split_kvs,
         )
         return out if stats is None else (out, stats)
+
+    @staticmethod
+    def _reduce_partial(all_reduce, partial, residual, norm):
+        """``norm(all_reduce(partial) + residual)`` and the new residual, where ``partial`` is
+        a down projection's output or a ``_PendingDown`` that a pushed site projects and
+        reduces itself."""
+        if isinstance(partial, _PendingDown):
+            down = partial.mlp.down_proj
+            site = _pushed_linear_add_norm(down, partial.h2, residual, norm)
+            if site is not None:
+                return site
+            partial = down(
+                partial.h2,
+                all_reduce_params=AllReduceParams(enable_allreduce=False),
+                layer_idx=partial.mlp.layer_idx,
+            )
+        return _all_reduce_add_norm(all_reduce, partial, residual, norm)
 
     def _fused_block_rope(
         self, q, query, blk_latent, attn, layer_idx, ctx_kv_cache, fixup, positions, freqs_real
@@ -4541,12 +4644,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         partial, partial_all_reduce = None, None
         for layer_idx, layer in enumerate(self.model.layers):
             attn = layer.self_attn
-            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
             if residual is None:
                 residual = hidden_states.clone()
-                hs_normed = layer.input_layernorm(hs_flat)
+                hs_normed = layer.input_layernorm(
+                    hidden_states.reshape(-1, hidden_states.shape[-1])
+                )
             elif partial is not None:
-                hs_normed, res_flat = _all_reduce_add_norm(
+                hs_normed, res_flat = self._reduce_partial(
                     partial_all_reduce,
                     partial,
                     residual.reshape(-1, residual.shape[-1]),
@@ -4555,6 +4659,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 residual = res_flat.reshape(batch, block_size, -1)
             else:
                 res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
 
@@ -4748,16 +4853,26 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             # With the TP fusions, o_proj and down_proj reduce their outputs;
             # fuse each all-reduce with the residual add and the RMSNorm after it.
             if self._tp_split:
-                hidden_out = attn.o_proj(
-                    attn_out.reshape(batch * block_size, -1),
-                    all_reduce_params=AllReduceParams(enable_allreduce=False),
-                )
-                hidden_out, res_flat = _all_reduce_add_norm(
-                    attn.o_proj.all_reduce, hidden_out, res_flat, layer.post_attention_layernorm
-                )
-                partial = layer.mlp(
-                    hidden_out, final_all_reduce_params=AllReduceParams(enable_allreduce=False)
-                )
+                no_reduce = AllReduceParams(enable_allreduce=False)
+                attn_rows = attn_out.reshape(batch * block_size, -1)
+                site = None
+                if self._ar_push:
+                    site = _pushed_linear_add_norm(
+                        attn.o_proj, attn_rows, res_flat, layer.post_attention_layernorm
+                    )
+                if site is not None:
+                    hidden_out, res_flat = site
+                else:
+                    hidden_out = attn.o_proj(attn_rows, all_reduce_params=no_reduce)
+                    hidden_out, res_flat = _all_reduce_add_norm(
+                        attn.o_proj.all_reduce, hidden_out, res_flat, layer.post_attention_layernorm
+                    )
+                h2 = _mlp_activation(layer.mlp, hidden_out) if self._ar_push else None
+                if h2 is not None:
+                    # The down projection runs at the site that reduces it.
+                    partial = _PendingDown(layer.mlp, h2)
+                else:
+                    partial = layer.mlp(hidden_out, final_all_reduce_params=no_reduce)
                 partial_all_reduce = layer.mlp.down_proj.all_reduce
                 hidden_states = partial
             else:
@@ -4769,7 +4884,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
         res_flat = residual.reshape(-1, residual.shape[-1])
         if partial is not None:
-            hidden_states_out, _ = _all_reduce_add_norm(
+            hidden_states_out, _ = self._reduce_partial(
                 partial_all_reduce, partial, res_flat, self.model.norm
             )
             return hidden_states_out
