@@ -9801,11 +9801,17 @@ def ordered_v30_six_yield_kernel(
             )
         _ds_wait(bars.subview(25), ctm.Int32(0))
         denom = rs_own + sDenom[row]
+        # Split mode exported the FP32 partial + row stats for EVERY used plan slot, including requests the plan kept
+        # whole (count == 1, `direct`): their normalized output is written below and the reducer never reads their
+        # slot, so the export was 128 KB + 1 KB of dead HBM writes per CTA (118 MB per B128/q4 launch). Skip it.
+        export_slot_row = slot_row_base
+        if direct:
+            export_slot_row = ctm.Int32(-1)
         if cutlass.const_expr(split_mode):
             # Milestone 2: export the unnormalized FP32 O slice, the row anchor (raw score units; the reducer applies
             # softmax_scale_log2 / (q_scale * kv_scale)) and the denominator; fp4_mla_packed_reduce.reduce_packed_splits
             # merges the request's tasks with output_scale = 1 / kv_global_scale (== pscale / FP4_MLA_P_GLOBAL_SCALE).
-            if slot_row_base >= ctm.Int32(0):
+            if export_slot_row >= ctm.Int32(0):
                 srow = slot_row_base + row
                 part = ctm.make_array_view(mPartial)
                 poff = srow * ctm.Int32(512) + pair_id * ctm.Int32(256) + half * ctm.Int32(128)
