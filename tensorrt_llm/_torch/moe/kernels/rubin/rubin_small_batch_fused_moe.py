@@ -1812,15 +1812,21 @@ class RubinSmallBatchFusedMoeKernel:
                         cute.arch.mbarrier_arrive(acc_empty + acc_stage)
                     for i in cutlass.range_constexpr(cute.size(rAcc)):
                         row, col = tTR_cAcc[i]
-                        _sts_f32(sacc_base + col * col_bytes + row * 4, rAcc[i])
+                        # W1 rows 32 q + i (gate) and 32 q + 16 + i (up) of the block go to
+                        # staging rows 64 + 16 (q ^ 1) + i and 16 q + i: a warp's stores hit 32
+                        # distinct banks and the reads below are two-way instead of four-way.
+                        g = ((row >> 4) & 1) ^ 1
+                        srow = (((row >> 5) ^ g) << 4) + (row & 15) + (g << 6)
+                        _sts_f32(sacc_base + col * col_bytes + srow * 4, rAcc[i])
                     self._wg_barrier(Int32(0))
                     if r < n_valid:
-                        # W1 rows 32 q .. 32 q + 15 of the block are gate rows, the next 16 the
-                        # matching up rows: outputs 16 q .. 16 q + 15 of the block
-                        src = sacc_base + tok * col_bytes + q * 128
+                        # outputs 16 q .. 16 q + 15 of the block
+                        src = sacc_base + tok * col_bytes
+                        src_up = src + q * 64
+                        src_gate = src + 256 + (q ^ 1) * 64
                         for vv in cutlass.range_constexpr(4):
-                            g0, g1, g2, g3 = _lds_v4_f32(src + vv * 16)
-                            u0, u1, u2, u3 = _lds_v4_f32(src + 64 + vv * 16)
+                            g0, g1, g2, g3 = _lds_v4_f32(src_gate + vv * 16)
+                            u0, u1, u2, u3 = _lds_v4_f32(src_up + vv * 16)
                             up[4 * vv] = u0
                             up[4 * vv + 1] = u1
                             up[4 * vv + 2] = u2
