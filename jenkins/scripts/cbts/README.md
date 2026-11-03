@@ -358,7 +358,7 @@ combined via `_combine_scopes`.
 
 CBTS defers to the existing filter chain when:
 
-- PostMerge job / `alternativeTRT` set
+- PostMerge job
 - `changed_files` is empty
 - `cbts.command main` throws or stdout is unparsable
 - Python returns `scope: null`
