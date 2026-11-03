@@ -792,7 +792,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
         first_chunk_contributors: dict = {}
         context_init_ids = (
-            {r.py_request_id for r in requests_list if r.state_value == self._context_init_state_value}
+            {
+                r.py_request_id
+                for r in requests_list
+                if r.state_value == self._context_init_state_value
+            }
             if contributed_blocks is not None and self._prev_first_chunk_contributors
             else frozenset()
         )
