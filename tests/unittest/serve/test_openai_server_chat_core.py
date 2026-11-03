@@ -206,7 +206,7 @@ def test_http_wrapper_keeps_every_answer(serve_env, engine_failure_recorder):
     assert response.text == "data: a\n\ndata: b\n\ndata: [DONE]\n\n", f"streaming success: {KEEP}"
 
 
-def test_unencodable_response_is_still_a_400(serve_env):
+def test_unencodable_response_is_still_a_400(serve_env, error_records):
     server = _build(serve_env)
     server._create_chat_response = AsyncMock(
         return_value=_chat_response(avg_decoded_tokens_per_iter=float("nan"))
@@ -216,6 +216,9 @@ def test_unencodable_response_is_still_a_400(serve_env):
     assert response.json()["message"].startswith(
         "Out of range float values are not JSON compliant"
     ), f"unencodable response: {KEEP}"
+    # The wrapper answers this from its own ValueError branch, without the
+    # traceback the generic handler would log.
+    assert error_records == [], f"unencodable response: {KEEP}"
 
 
 def test_health_generate_still_fails_with_500_on_engine_failure(serve_env, engine_failure_recorder):
