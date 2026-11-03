@@ -81,6 +81,7 @@ def complete_and_count(
 
 def chi_square(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, float]:
     """Pearson statistic over cells with expected count >= 5 (the rest pooled) vs its 1e-4 critical value."""
+    assert counts[probs == 0].sum() == 0, "observations in zero-probability cells"
     total = counts.sum().item()
     expected = probs * total
     big = expected >= 5
