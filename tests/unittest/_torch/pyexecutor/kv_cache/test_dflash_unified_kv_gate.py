@@ -78,7 +78,10 @@ def _creator(*, is_disagg, target, draft, tp_size=1, draft_windows=None):
     creator._get_draft_max_attention_window = lambda max_seq_len, kv_cache_config: draft_windows
     creator._llm_args = SimpleNamespace(attn_backend="TRTLLM", kv_cache_compression_config=None)
     creator._model_engine = SimpleNamespace(
-        model=SimpleNamespace(model_config=target), dtype=torch.bfloat16
+        model=SimpleNamespace(
+            model_config=target, config=SimpleNamespace(torch_dtype=torch.bfloat16)
+        ),
+        dtype=torch.bfloat16,
     )
     creator._kv_cache_manager_cls = KVCacheManagerV2
     creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
