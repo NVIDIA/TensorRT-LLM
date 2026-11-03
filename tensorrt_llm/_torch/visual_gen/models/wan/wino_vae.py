@@ -872,13 +872,6 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
             return 4
         return 1
 
-    def winograd_inputs_geometry(self, h: int, w: int, order: int) -> FrameGeometry | None:
-        """The Winograd-input layout for a logical ``h x w`` frame under sharding: halo lines, with the
-        physical extent rounded up to :meth:`winograd_inputs_align`. None without sharding."""
-        if self.shard is None:
-            return None
-        return self.shard.geometry(h, w, self.winograd_inputs_align(h, w, order))
-
     def winograd_inputs(
         self, h: int, w: int, order: int, frames: int
     ) -> tuple[FrameGeometry | None, torch.Tensor | None, DirectFrames | None]:

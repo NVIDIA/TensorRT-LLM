@@ -55,9 +55,9 @@ NPASS = 2
 VROWS = BOXH * WT  # 160 V rows per coordinate
 MT = RC * WT  # 128 tiles per CTA (MMA M per CTA)
 NCO = 256  # Cout per MMA (N) = all output channels
-RAW_BYTES = BOXH * BOXW * KC * 2  # 22400
-VCOORD_BYTES = VROWS * KC * 2  # 10240
-VSTAGE_BYTES = NACC * VCOORD_BYTES  # 20480
+RAW_BYTES = BOXH * BOXW * KC * 2
+VCOORD_BYTES = VROWS * KC * 2
+VSTAGE_BYTES = NACC * VCOORD_BYTES
 SLOT_CTAS = 4  # CTAs per slot: one 4-CTA cluster or two 2-CTA clusters
 
 NUM_U_STAGE = 6

@@ -139,7 +139,6 @@ class _Conv:
         self.plan_count = self.graph.get_execution_plan_count()
         self.plan: int | None = None
         self.workspace: torch.Tensor | None = None
-        self.out_shape = None
 
     @staticmethod
     def _bias_stride(dim: list[int]) -> list[int]:

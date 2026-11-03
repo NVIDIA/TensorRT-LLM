@@ -1115,7 +1115,6 @@ class WanUpsample(nn.Upsample):
 
 
 class WanResample(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _conv_cls = WanCausalConv3d
 
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
@@ -1213,7 +1212,6 @@ class WanResample(nn.Module):
 
 
 class WanResidualBlock(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _norm_cls = WanRMSNorm
     _conv_cls = WanCausalConv3d
 
@@ -1314,7 +1312,6 @@ class WanAttentionBlock(nn.Module):
 
 
 class WanMidBlock(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _resblock_cls = WanResidualBlock
     _attention_cls = WanAttentionBlock
 
@@ -1345,7 +1342,6 @@ class WanMidBlock(nn.Module):
 
 
 class WanResidualDownBlock(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _resblock_cls = WanResidualBlock
     _resample_cls = WanResample
 
@@ -1390,7 +1386,6 @@ class WanResidualDownBlock(nn.Module):
 
 
 class WanEncoder3d(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _conv_cls = WanCausalConv3d
     _down_block_cls = WanResidualDownBlock
     _resblock_cls = WanResidualBlock
@@ -1483,7 +1478,6 @@ class WanEncoder3d(nn.Module):
 
 
 class WanResidualUpBlock(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _resblock_cls = WanResidualBlock
     _resample_cls = WanResample
 
@@ -1535,7 +1529,6 @@ class WanResidualUpBlock(nn.Module):
 
 
 class WanUpBlock(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _resblock_cls = WanResidualBlock
     _resample_cls = WanResample
 
@@ -1576,7 +1569,6 @@ class WanUpBlock(nn.Module):
 
 
 class WanDecoder3d(nn.Module):
-    # Child module classes; a subclass swaps in its own.
     _conv_cls = WanCausalConv3d
     _mid_block_cls = WanMidBlock
     _res_up_block_cls = WanResidualUpBlock
@@ -1710,9 +1702,11 @@ def unpatchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
 
 
 class WanVAE(nn.Module):
-    """Wan VAE implementation compatible with diffusers AutoencoderKLWan."""
+    """Wan VAE implementation compatible with diffusers AutoencoderKLWan.
 
-    # Child module classes; a subclass swaps in its own.
+    Every module class in this file names its child module classes in ``_*_cls`` attributes;
+    a subclass (WinoVae) swaps in its own and keeps the module tree and state dict."""
+
     _encoder_cls = WanEncoder3d
     _decoder_cls = WanDecoder3d
     _conv_cls = WanCausalConv3d
