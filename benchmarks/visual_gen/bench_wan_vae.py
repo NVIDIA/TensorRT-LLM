@@ -261,15 +261,33 @@ TOP_KERNELS = 15  # kernels kept in each timing record, largest first
 def _time_cupti(
     run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: bool
 ) -> dict[str, Any]:
-    """Time ``iters`` replays of ``run_fn`` with CUPTI.
+    """Time ``iters`` replays of ``run_fn`` with CUPTI, then ``iters`` more without it.
 
     Replays run as a CUDA graph when ``run_fn`` captures, with L2 flushed before each; the
-    record holds the per-iteration kernel span, busy time and wall time.
+    record holds the per-iteration kernel span, busy time and wall time under CUPTI, and the
+    wall time of the untraced replays. CUPTI activity tracing adds host time to every launch,
+    so an eager run's traced wall time and span overstate it; ``wall_untraced`` is the eager
+    number to compare with a graph replay.
     """
     graph, replay = _warm_up(run_fn, warmup, use_graph)
     launches, kernels, windows = _record_iterations(replay, iters)
     per_iter = _kernels_per_iteration(launches, kernels, windows)
-    return _timing_summary(per_iter, windows, iters, graph is not None)
+    summary = _timing_summary(per_iter, windows, iters, graph is not None)
+    summary["wall_untraced"] = _stats(_untraced_walls(replay, iters))
+    return summary
+
+
+def _untraced_walls(replay: Callable[[], Any], iters: int) -> list[float]:
+    """Wall time (us) of each of ``iters`` replays with no tracing, L2 flushed before each."""
+    walls = []
+    with torch.inference_mode():
+        for _ in range(iters):
+            _flush_l2()
+            t0 = time.perf_counter()
+            replay()
+            torch.cuda.synchronize()
+            walls.append((time.perf_counter() - t0) * 1e6)
+    return walls
 
 
 def _warm_up(run_fn: Callable[[], Any], warmup: int, use_graph: bool):
@@ -795,6 +813,7 @@ def _print_row(backend: str, row: dict[str, Any]) -> None:
         f"span med {t['span']['median_us'] / 1e3:9.2f} ms "
         f"p90 {t['span']['p90_us'] / 1e3:9.2f} ms  "
         f"wall med {t['wall']['median_us'] / 1e3:9.2f} ms  "
+        f"untraced wall med {t['wall_untraced']['median_us'] / 1e3:9.2f} ms  "
         f"kernels/iter {t['kernels_per_iter']:.0f}  "
         + (f"rel_l2 {acc['rel_l2']:.3e} max_abs {acc['max_abs']:.3e}" if acc else ""),
         flush=True,
