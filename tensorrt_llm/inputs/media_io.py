@@ -1079,10 +1079,10 @@ def _normalize_file_uri(uri: str) -> str:
 # A server request may name a `file://` URI or a bare path (a chat media part,
 # or a VisualGen reference with format='path'); such a reference is read from
 # the server's own filesystem, so it is accepted only when
-# TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path lies
+# TRTLLM_MEDIA_ALLOWED_INPUT_DIR names a directory and the resolved path lies
 # inside it. Unset (the default) refuses every local reference. The offline
 # Python API does not go through this check.
-_ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
 
 # Flags for the single open of a request-supplied local file. Each is left
 # out on a platform that lacks it; the fstat checks on the open descriptor
@@ -1108,7 +1108,7 @@ _DESCRIPTOR_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir
 def open_allowed_local_media(url: str) -> int:
     """Open a request-supplied local media reference; return its read-only descriptor.
 
-    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
+    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` names a
     directory, the reference resolves (symlinks and ``..`` included) to a path
     inside it, and that path is a regular file within the media size limit. A
     reference refused for its location gets the same message whether or not it
@@ -1124,10 +1124,10 @@ def open_allowed_local_media(url: str) -> int:
     refused = ValueError(
         "Local media paths are not accepted by this server. Send the media as "
         "an http(s) or base64 data URL, or start the server with "
-        f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV}=<directory> to allow files under "
+        f"{_MEDIA_ALLOWED_INPUT_DIR_ENV}=<directory> to allow files under "
         "that directory."
     )
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         raise refused
     parsed = urlparse(url)
@@ -1138,7 +1138,7 @@ def open_allowed_local_media(url: str) -> int:
         # Operator configuration: report it in the server log, not to the client.
         logger.warning(
             "%s=%r is not a directory; refusing the local media reference.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
         raise refused
@@ -1206,24 +1206,24 @@ def read_allowed_local_media(url: str) -> bytes:
 def log_allowed_local_media_path() -> None:
     """Log the local media policy once, at server start.
 
-    Unset ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is the default and is not
+    Unset ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is the default and is not
     logged. A value that is not a directory is reported here, since every
     request naming a local file would otherwise fail with a generic error
     while the operator sees nothing at startup.
     """
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         return
     if os.path.isdir(os.path.realpath(allowed_root)):
         logger.info(
             "Request media may name local files under %r (%s).",
             allowed_root,
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
         )
     else:
         logger.warning(
             "%s=%r is not a directory; every request naming a local media file will be refused.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
 
@@ -1416,7 +1416,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             # No path policy here: this branch serves the offline API, which
             # reads the caller's own files. A URL taken from a server request
             # must go through `async_load_allowed_local_file` instead, which
-            # confines it to TRTLLM_MEDIA_ALLOWED_LOCAL_PATH and never looks
+            # confines it to TRTLLM_MEDIA_ALLOWED_INPUT_DIR and never looks
             # the request's path up again.
             return await self._run_in_executor(self.load_file, url)
         else:

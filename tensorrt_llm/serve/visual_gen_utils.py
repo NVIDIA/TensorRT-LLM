@@ -109,24 +109,50 @@ def _merge_extra_params(
         params.extra_params = None
 
 
-def local_media_path_is_disallowed() -> bool:
+_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
+# The switch's former name. A server started with it set refuses to start
+# (`check_path_response_policy`) rather than reading it as an alias or
+# ignoring it: a deployment that relied on it to keep path responses off
+# must not come back up with them on.
+_FORMER_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
+
+
+def path_response_is_disabled() -> bool:
     """Whether ``response_format='path'`` is refused at the HTTP boundary.
 
     A ``path`` response discloses where the server wrote a file: what a
     co-located client wants and what a remote one has no business seeing. The
     code cannot tell the two deployments apart, so it is allowed by default
-    and turned off with ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``. A ``path``
+    and turned off with ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``. A ``path``
     *reference*, which has the server read a file, follows
-    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` instead (`_reference_transport`).
+    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` instead (`_reference_transport`).
     """
-    raw = os.environ.get("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "0")
+    raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "0")
     if raw not in ("0", "1"):
         logger.warning(
-            "Unrecognized value for TRTLLM_DISALLOW_LOCAL_MEDIA_PATH: "
-            f"{raw!r}. Expected '0' or '1'. Treating as '0' "
-            "(path responses allowed)."
+            f"Unrecognized value for {_PATH_RESPONSE_DISABLED_ENV}: {raw!r}. "
+            "Expected '0' or '1'. Treating as '0' (path responses allowed)."
         )
     return raw == "1"
+
+
+def check_path_response_policy() -> None:
+    """Refuse the switch's former name at server start; log the switch when set.
+
+    ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` has shipped, so a deployment may still
+    set it to keep path responses off. Treating it as an alias would keep an
+    outdated name alive, and ignoring it would silently turn path responses
+    back on; failing to start names the variable to set instead. Reading the
+    switch here also surfaces an unrecognized value at startup rather than at
+    the first request that asks for a path response.
+    """
+    if _FORMER_PATH_RESPONSE_DISABLED_ENV in os.environ:
+        raise ValueError(
+            f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} has been renamed; unset it and "
+            f"set {_PATH_RESPONSE_DISABLED_ENV} instead."
+        )
+    if path_response_is_disabled():
+        logger.info("response_format='path' is disabled (%s=1).", _PATH_RESPONSE_DISABLED_ENV)
 
 
 def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
@@ -138,7 +164,7 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     rather than declared by the client. A ``path`` reference names a file on
     the server, so it is read to ``bytes`` here as well, under the request
     local media policy (`read_allowed_local_media`): only a regular file inside
-    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is read. ``url`` and ``base64`` pass
+    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is read. ``url`` and ``base64`` pass
     through for the engine to resolve.
     """
     if hasattr(ref, "file"):  # multipart UploadFile

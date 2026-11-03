@@ -659,9 +659,9 @@ def _mock_video_encoding():
     ],
 )
 def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endpoint, payload):
-    """With ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1``, ``response_format='path'``
+    """With ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``, ``response_format='path'``
     is rejected with 400 on the image and video (sync + async) endpoints."""
-    monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    monkeypatch.setenv("TRTLLM_MEDIA_DISABLE_PATH_RESPONSE", "1")
     monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
     gen = MockVisualGen(
         image_output=_make_dummy_image_tensor(),
@@ -1295,11 +1295,11 @@ class TestImageEdit:
         assert os.path.exists(item["path"])
 
     def test_image_edit_response_format_path_rejected_when_disabled(self, tmp_path, monkeypatch):
-        """``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` gates the edit route too,
+        """``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1`` gates the edit route too,
         so the path transport cannot leak server-side paths on shared
         deployments."""
         client, _ = self._client(tmp_path, monkeypatch)
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+        monkeypatch.setenv("TRTLLM_MEDIA_DISABLE_PATH_RESPONSE", "1")
 
         resp = client.post(
             "/v1/images/edits",

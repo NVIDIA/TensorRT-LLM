@@ -900,7 +900,7 @@ class TestChatCompletionRequestSchemaValidation:
 class TestRequestLocalMediaPaths:
     """Local media references in a request are read only from the allowed directory."""
 
-    _ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+    _ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
 
     @pytest.fixture
     def media_dirs(self, tmp_path):

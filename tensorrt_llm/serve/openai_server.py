@@ -148,8 +148,9 @@ from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
+                                                 parse_visual_gen_params,
+                                                 path_response_is_disabled)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -700,6 +701,7 @@ class OpenAIServer(_VideoRoutesMixin):
         )
         BaseMediaIO.set_executor(self._media_load_executor)
         log_allowed_local_media_path()
+        check_path_response_policy()
         # /metrics reads iteration stats with a blocking call that waits up to
         # 2 s. A dedicated thread keeps those waits off the default executor,
         # which request handling also uses; get_iteration_stats runs at most
@@ -4043,14 +4045,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        See :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
+        See :func:`path_response_is_disabled`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if path_response_is_disabled():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "(TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
