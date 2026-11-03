@@ -104,6 +104,19 @@ class TestAttentionConfigQuantValidation:
                     ),
                 )
 
+    @pytest.mark.parametrize("sm_ver", [103, 107])
+    def test_int8_sage_rejected_without_int8_tensor_cores(self, sm_ver):
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            with pytest.raises(
+                ValidationError, match=f"INT8 SageAttention is unsupported on SM{sm_ver}"
+            ):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="int8", q_block_size=1, k_block_size=4, v_block_size=1
+                    ),
+                )
+
     def test_vsa_and_quantization_compose_only_on_trtllm(self):
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
             sage = QuantAttentionConfig(
@@ -156,6 +169,9 @@ class TestAttentionConfigQuantValidation:
             (103, "fp8", 1, 1, 1),
             (103, "fp8", 1, 4, 1),
             (103, "fp8", 1, 16, 1),
+            (107, "fp8", 1, 1, 1),
+            (107, "fp8", 1, 4, 1),
+            (107, "fp8", 1, 16, 1),
             (100, "bf16", 0, 0, 0),
             (100, "fp8", 0, 0, 0),
             (103, "bf16", 0, 0, 0),
@@ -321,7 +337,12 @@ class TestAttentionConfigQuantValidation:
 
     @pytest.mark.parametrize(
         ("sm_ver", "qk_dtype", "q_block_size", "accepted"),
-        [(90, "int8", 2, False), (100, "int8", 1, True), (103, "fp8", 1, True)],
+        [
+            (90, "int8", 2, False),
+            (100, "int8", 1, True),
+            (103, "fp8", 1, True),
+            (107, "fp8", 1, False),
+        ],
     )
     def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
         def build():

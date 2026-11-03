@@ -188,6 +188,11 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
                 ("fp8", "fp8", (1, 16, 1)),
             },
+            107: {
+                ("fp8", "fp8", (1, 1, 1)),
+                ("fp8", "fp8", (1, 4, 1)),
+                ("fp8", "fp8", (1, 16, 1)),
+            },
         }
         # PrimTS serves the per-tensor FP8 recipes on Blackwell (TLLM_FMHA_LIBS=+prims_ts).
         PRIMSTS_RECIPES = {
@@ -241,6 +246,11 @@ class AttentionConfig(StrictBaseModel):
         recipe = (q_config.qk_dtype, q_config.v_dtype, block_sizes)
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
+            if sm_version in (103, 107) and q_config.qk_dtype == "int8":
+                raise ValueError(
+                    f"INT8 SageAttention is unsupported on SM{sm_version}; "
+                    "use qk_dtype='fp8' with a supported SageAttention block-size recipe."
+                )
             if q_config.vc_attention:
                 # The recipe fixes its scaling granularity. QK16 keeps bf16 Q/K with one V
                 # scale per channel, QK8 scales Q and K per 128-token block. The block size
