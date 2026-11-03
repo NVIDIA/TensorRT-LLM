@@ -65,8 +65,10 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
-from tensorrt_llm.serve._base.errors import (EngineFatalError, ServingError,
-                                             error_body, serving_error)
+from tensorrt_llm.serve._base.errors import (CHAT_LADDER, EngineFatalError,
+                                             ServingError, error_body,
+                                             serving_error,
+                                             serving_error_boundary)
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._base.sse import chat_stream_generator
@@ -96,6 +98,9 @@ from tensorrt_llm.serve.disagg_auth import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
+from tensorrt_llm.serve.exception_handling.register import (
+    ANTHROPIC, OPENAI, VISUAL_GEN, default_error_renderers,
+    install_exception_handlers, route_dialect)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
@@ -544,6 +549,12 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
+# Characters of a validation error's text kept in the OpenAI-shaped 400 body:
+# pydantic echoes each failing input verbatim, which can be megabytes of
+# base64; the error locations are what matters.
+_VALIDATION_ERROR_DETAIL_LIMIT = 4096
+
+
 class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
@@ -850,35 +861,22 @@ class OpenAIServer(_VideoRoutesMixin):
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
 
-        async def validation_exception_handler(request, exc):
-            if request.url.path.startswith("/v1/messages"):
-                # Anthropic clients expect a 400 with the Anthropic error
-                # envelope, not FastAPI's 422 shape.
-                if self.metrics_collector:
-                    self.metrics_collector.log_request_error(http_code=400)
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            if self.server_role is ServerRole.VISUAL_GEN:
-                return self._create_visual_gen_validation_error_response(exc)
-            # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
-            # response shape that integration tests (e.g.
-            # ``test_malformed_json_request``) and existing clients
-            # expect.
-            if self.metrics_collector:
-                self.metrics_collector.log_request_error(http_code=400)
-            # pydantic echoes each failing input verbatim, which can be
-            # megabytes of base64; the error locations are what matters.
-            detail = str(exc)
-            if len(detail) > 4096:
-                detail = detail[:4096] + " ... [truncated %d bytes]" % (
-                    len(detail) - 4096)
-            return JSONResponse(status_code=400, content={"error": detail})
-
+        # Validation errors are rendered per wire dialect: the dialect of the
+        # endpoint that matched, else the dialect of the server's role. The
+        # OpenAI-shaped 400 body keeps the shape integration tests (e.g.
+        # ``test_malformed_json_request``) and existing clients expect.
+        self._error_renderers = default_error_renderers(
+            openai_validation_detail_limit=_VALIDATION_ERROR_DETAIL_LIMIT)
+        default_dialect = (VISUAL_GEN if self.server_role
+                           is ServerRole.VISUAL_GEN else OPENAI)
         self.app = build_http_app(
             lifespan=lifespan,
             route_class=_MsgspecRoute,
-            dialect_error_renderers=lambda app: app.add_exception_handler(
-                RequestValidationError, validation_exception_handler),
+            dialect_error_renderers=functools.partial(
+                install_exception_handlers,
+                renderers=self._error_renderers,
+                default_dialect=default_dialect,
+                on_validation_error=self._observe_validation_error),
             routers=(self._attach_role_routes, ),
             middleware=lambda app: register_middlewares(
                 app,
@@ -889,6 +887,21 @@ class OpenAIServer(_VideoRoutesMixin):
         )
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
                                                   "0") == "1"
+        if (self.server_role is ServerRole.VISUAL_GEN
+                and not self._error_renderers.has(VISUAL_GEN,
+                                                  RequestValidationError)):
+            raise RuntimeError(
+                "VisualGen role started without its validation-error "
+                "renderer; the VisualGen route registration must register "
+                "it for the visual_gen dialect")
+
+    def _observe_validation_error(self, request: Request,
+                                  exc: RequestValidationError,
+                                  dialect: str) -> None:
+        # A rejected request counts as a 400 whichever dialect answers it;
+        # the VisualGen role has no metrics collector and counts nothing.
+        if dialect != VISUAL_GEN and self.metrics_collector:
+            self.metrics_collector.log_request_error(http_code=400)
 
     def _attach_role_routes(self, app: FastAPI) -> None:
         # The register_* methods below add their routes through self.app.
@@ -906,6 +919,12 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
+            # VisualGen answers a validation error with its own 422 envelope;
+            # the renderer is registered with the VisualGen routes, so only
+            # the VisualGen role carries it.
+            self._error_renderers.register(
+                VISUAL_GEN, RequestValidationError, lambda request, exc: self.
+                _create_visual_gen_validation_error_response(exc))
             self.register_visual_gen_routes()
         elif self.server_role is ServerRole.MM_ENCODER:
             assert isinstance(
@@ -2009,29 +2028,22 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
+    # The boundary renders the core's ServingError with its own status, answers
+    # an EngineFatalError as HTTP 200 with body null (FastAPI's rendering of
+    # None), which the in-process callers map to their own errors, and maps the
+    # rest with CHAT_LADDER: a response that cannot be encoded (JSONResponse
+    # encodes in its constructor, allow_nan=False) raises ValueError and is
+    # answered 400 without a log; any other failure is answered 400 with its
+    # traceback logged.
+    @serving_error_boundary(OPENAI,
+                            ladder=CHAT_LADDER,
+                            on_engine_fatal=lambda: None)
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
-        try:
-            result = await self.create_chat_completion(request, raw_request)
-            if isinstance(result, ChatCompletionResponse):
-                return JSONResponse(content=result.model_dump())
-            return StreamingResponse(content=result,
-                                     media_type="text/event-stream")
-        except ServingError as e:
-            return JSONResponse(content=e.body.model_dump(),
-                                status_code=e.status)
-        except EngineFatalError:
-            # Answered as HTTP 200 with body null (FastAPI's rendering of
-            # None); the in-process callers map that to their own errors.
-            # Answering 5xx would be a behavior change of its own.
-            return None
-        except ValueError as e:
-            # JSONResponse encodes in its constructor (allow_nan=False), so a
-            # response that cannot be encoded fails here and keeps its 400.
-            return self.create_error_response(str(e))
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+        result = await self.create_chat_completion(request, raw_request)
+        if isinstance(result, ChatCompletionResponse):
+            return JSONResponse(content=result.model_dump())
+        return StreamingResponse(content=result, media_type="text/event-stream")
 
     async def create_chat_completion(
         self, request: ChatCompletionRequest, raw_request: Request
@@ -2490,6 +2502,7 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(traceback.format_exc())
             raise serving_error(str(e)) from e
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve the Anthropic Messages API on top of the openai_chat path.
@@ -2543,6 +2556,7 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
         """Report how many input tokens a Messages request would consume.
@@ -2695,6 +2709,7 @@ class OpenAIServer(_VideoRoutesMixin):
             }
         return "succeeded", anthropic_response.model_dump(exclude_none=True)
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_create_batch(
             self, request: AnthropicCreateBatchRequest) -> Response:
         try:
@@ -2708,6 +2723,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                             400)
         return JSONResponse(content=batch.model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_list_batches(
             self,
             # Validated here rather than clamped in the store: clamping turned
@@ -2740,18 +2756,21 @@ class OpenAIServer(_VideoRoutesMixin):
         )
         return JSONResponse(content=listing.model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_get_batch(self, batch_id: str) -> Response:
         batch = self._batch_store().get(batch_id)
         if batch is None:
             return self._no_such_batch(batch_id)
         return JSONResponse(content=batch.model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_cancel_batch(self, batch_id: str) -> Response:
         batch = self._batch_store().cancel(batch_id)
         if batch is None:
             return self._no_such_batch(batch_id)
         return JSONResponse(content=batch.model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_delete_batch(self, batch_id: str) -> Response:
         try:
             deleted = self._batch_store().delete(batch_id)
@@ -2763,6 +2782,7 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=AnthropicBatchDeleteResponse(
             id=batch_id).model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_batch_results(self, batch_id: str) -> Response:
         store = self._batch_store()
         results = store.results(batch_id)

@@ -28,6 +28,11 @@ from fastapi.testclient import TestClient
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 from tensorrt_llm.serve._base import sse as sse_module
+from tensorrt_llm.serve.exception_handling.register import (
+    OPENAI,
+    default_error_renderers,
+    install_exception_handlers,
+)
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -125,7 +130,7 @@ def _make_route_client(server_kind, openai_response):
     # Body validation fails before the route function runs, so without the
     # server's own handler these tests would see FastAPI's 422 instead of the
     # 400 + Anthropic envelope a client actually gets.
-    _anthropic_validation_handler(app)
+    install_exception_handlers(app, renderers=default_error_renderers(), default_dialect=OPENAI)
     if server_kind == "standard":
         server = object.__new__(OpenAIServer)
         server.model = MODEL
@@ -530,7 +535,7 @@ def _batch_client(runner=None):
         return "succeeded", {"type": "message", "role": "assistant", "content": []}
 
     app = FastAPI()
-    _anthropic_validation_handler(app)
+    install_exception_handlers(app, renderers=default_error_renderers(), default_dialect=OPENAI)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server._anthropic_batch_store = AnthropicBatchStore(runner=runner or ok)
@@ -841,28 +846,9 @@ class _FakeTokenizer:
         return text.split()
 
 
-def _anthropic_validation_handler(app):
-    """Mirror the server's handler so boundary rejections keep the envelope.
-
-    Model-level validation fails before the route function runs, so without
-    this a bare test app answers with FastAPI's 422 shape while the real
-    server answers 400 with the Anthropic envelope -- the test would pin the
-    fixture's behaviour instead of the product's.
-    """
-    from fastapi.exceptions import RequestValidationError
-
-    from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
-
-    @app.exception_handler(RequestValidationError)
-    async def _handler(request, exc):  # noqa: ANN001
-        if request.url.path.startswith("/v1/messages"):
-            return anthropic_error_response(str(exc), "invalid_request_error", 400)
-        raise exc
-
-
 def _count_tokens_client():
     app = FastAPI()
-    _anthropic_validation_handler(app)
+    install_exception_handlers(app, renderers=default_error_renderers(), default_dialect=OPENAI)
     server = object.__new__(OpenAIServer)
     server.model = MODEL
     server.tokenizer = _FakeTokenizer()

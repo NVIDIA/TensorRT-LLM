@@ -15,6 +15,7 @@
 
 # yapf: disable
 import asyncio
+import functools
 import json
 import os
 import signal
@@ -56,6 +57,9 @@ from tensorrt_llm.serve.conversation_id import (extract_subagent_parent_id,
                                                 resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
+from tensorrt_llm.serve.exception_handling.register import (
+    ANTHROPIC, OPENAI, default_error_renderers, install_exception_handlers,
+    route_dialect)
 from tensorrt_llm.serve.kv_hints import KvHintsRoute
 from tensorrt_llm.serve.middleware.register import register_middlewares
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
@@ -289,32 +293,12 @@ class OpenAIDisaggServer:
             await self._service.teardown()
             await self._perf_metrics_writer.close()
 
-        # Log request-body validation failures so a client/server schema mismatch
-        # shows up server-side. Throttled (first, then every 1000th) to avoid
-        # flooding the event loop when every request fails identically.
+        # Validation errors are rendered per wire dialect (the marked Anthropic
+        # routes answer with the Anthropic envelope, every other route with the
+        # OpenAI shape) after _observe_validation_error has counted and logged
+        # them.
         self._val_err_n = 0
-        async def validation_exception_handler(request: Request, exc):
-            self._perf_metrics_collector.validation_exceptions.inc()
-            # Anthropic clients parse the error envelope, so every /v1/messages
-            # route must fail in that shape rather than the generic one below.
-            if request.url.path.startswith("/v1/messages"):
-                return anthropic_error_response(str(exc),
-                                                "invalid_request_error", 400)
-            self._val_err_n += 1
-            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
-                try:
-                    errs = exc.errors()
-                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
-                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
-                              "msg": e.get("msg")} for e in errs][:8]
-                except Exception:  # noqa: BLE001
-                    brief = str(exc)[:500]
-                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
-                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
-                logger.warning(
-                    f"[validation] {method} {path} 400 "
-                    f"(n={self._val_err_n}): {brief}")
-            return JSONResponse(status_code=400, content={"error": str(exc)})
+        self._error_renderers = default_error_renderers()
 
         # KvHintsRoute: the frontend's public port strips kv_hints from request
         # bodies unless this process trusts its ingress (TRTLLM_TRUST_KV_HINTS=1);
@@ -322,8 +306,11 @@ class OpenAIDisaggServer:
         self.app = build_http_app(
             lifespan=lifespan,
             route_class=KvHintsRoute,
-            dialect_error_renderers=lambda app: app.add_exception_handler(
-                RequestValidationError, validation_exception_handler),
+            dialect_error_renderers=functools.partial(
+                install_exception_handlers,
+                renderers=self._error_renderers,
+                default_dialect=OPENAI,
+                on_validation_error=self._observe_validation_error),
             routers=(self._attach_routes,),
             middleware=lambda app: register_middlewares(
                 app,
@@ -337,6 +324,32 @@ class OpenAIDisaggServer:
         # register_routes adds its routes through self.app.
         self.app = app
         self.register_routes()
+
+    def _observe_validation_error(self, request: Request,
+                                  exc: RequestValidationError,
+                                  dialect: str) -> None:
+        self._perf_metrics_collector.validation_exceptions.inc()
+        # Anthropic clients parse the error envelope; only the OpenAI-shaped
+        # rejections are logged.
+        if dialect == ANTHROPIC:
+            return
+        # Log request-body validation failures so a client/server schema mismatch
+        # shows up server-side. Throttled (first, then every 1000th) to avoid
+        # flooding the event loop when every request fails identically.
+        self._val_err_n += 1
+        if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+            try:
+                errs = exc.errors()
+                # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+                brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                          "msg": e.get("msg")} for e in errs][:8]
+            except Exception:  # noqa: BLE001
+                brief = str(exc)[:500]
+            method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+            path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
+            logger.warning(
+                f"[validation] {method} {path} 400 "
+                f"(n={self._val_err_n}): {brief}")
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
         async def disagg_id_generator():
@@ -470,6 +483,7 @@ class OpenAIDisaggServer:
                 return self._handle_exception(e)
         return wrapper
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
@@ -540,6 +554,7 @@ class OpenAIDisaggServer:
                 code=status,
             ).model_dump())
 
+    @route_dialect(ANTHROPIC)
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:
         """Count Anthropic input tokens on a context worker."""

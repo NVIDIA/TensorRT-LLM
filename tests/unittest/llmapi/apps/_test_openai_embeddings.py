@@ -132,7 +132,8 @@ def test_dimensions_must_be_positive(server: RemoteEmbeddingServer):
     # `dimensions` is a Pydantic PositiveInt, so a non-positive value fails
     # request-model validation. The server's RequestValidationError handler
     # renders that as a 400 (consistent `{"error": ...}` envelope) rather than
-    # FastAPI's default 422 — see openai_server.validation_exception_handler.
+    # FastAPI's default 422 — see the OpenAI validation renderer in
+    # tensorrt_llm/serve/exception_handling/register.py.
     resp = requests.post(
         server.url_for("v1", "embeddings"),
         json={"model": BERT_MODEL, "input": "x", "dimensions": 0},

@@ -34,9 +34,17 @@ import pytest
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from test_common.serve.app_factory import AggConfig, DisaggConfig
+from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.exception_handling.register import (
+    ANTHROPIC,
+    OPENAI,
+    VISUAL_GEN,
+    ErrorRenderers,
+    dialect_of,
+)
 
 # threadleak is off: TestClients are created in the test body and closed by the serve_env
 # fixture's teardown, which runs after the leak check.
@@ -276,3 +284,51 @@ def test_disagg_bodies_counter_and_throttled_log(
         "[validation] P\\x01ST /v1/chat/completions\\x7f 400 (n=1): "
         in _validation_warnings(warning_records)[-1]
     ), warning_records
+
+
+# ---------------------------------------------------------------------------
+# Dialect resolution on the real apps
+# ---------------------------------------------------------------------------
+
+
+def test_visual_gen_role_requires_its_renderer(serve_env, monkeypatch):
+    """A VisualGen app whose renderer registration was lost fails at startup, not per request."""
+    register = ErrorRenderers.register
+
+    def dropping_visual_gen(self, dialect, exc_type, renderer):
+        if dialect != VISUAL_GEN:
+            register(self, dialect, exc_type, renderer)
+
+    monkeypatch.setattr(ErrorRenderers, "register", dropping_visual_gen)
+    with pytest.raises(
+        RuntimeError, match="VisualGen role started without its validation-error renderer"
+    ):
+        serve_env.build_openai_server(AggConfig(role=ServerRole.VISUAL_GEN))
+
+
+@pytest.mark.parametrize("kind", ["agg_llm", "disagg"])
+def test_every_messages_route_resolves_to_anthropic(serve_env, kind):
+    """Every ``/v1/messages`` route is marked Anthropic; every other route takes the app default."""
+    if kind == "agg_llm":
+        app = serve_env.build_openai_server(AggConfig()).app
+    else:
+        app = serve_env.build_disagg_server(DisaggConfig()).app
+    default = OPENAI
+    checked = 0
+    for path, route in effective_routes(app):
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is None:  # a Mount
+            continue
+        expected = ANTHROPIC if path.startswith("/v1/messages") else default
+        methods = ",".join(sorted(getattr(route, "methods", None) or ()))
+        for scope in ({"endpoint": endpoint}, {"route": route}):
+            dialect = dialect_of(Request({"type": "http", "headers": [], **scope}), default)
+            assert dialect == expected, (
+                f"route {methods} {path} resolves to {dialect}; Anthropic endpoints must be marked "
+                "with @route_dialect(ANTHROPIC) (tensorrt_llm/serve/exception_handling/register.py)"
+            )
+        checked += 1
+    anthropic_routes = [
+        path for path, _ in effective_routes(app) if path.startswith("/v1/messages")
+    ]
+    assert checked > len(anthropic_routes) > 0, (checked, anthropic_routes)
