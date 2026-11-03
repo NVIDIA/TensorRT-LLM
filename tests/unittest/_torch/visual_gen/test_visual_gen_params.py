@@ -174,6 +174,17 @@ class TestMediaRefValidation:
                 image_reference=[MediaRef(content="a.png", format="path"), "b.png"],
             )
 
+    def test_bytes_content_is_shown_by_size_in_repr(self):
+        """The serve routes log the whole params object, so a payload must not be in it."""
+        from tensorrt_llm.visual_gen import MediaRef, VisualGenParams
+
+        params = VisualGenParams(image_reference=MediaRef(content=b"\x89PNG" * 64, format="bytes"))
+
+        shown = f"{params}"
+        assert "<256 bytes>" in shown
+        assert "PNG" not in shown
+        assert "a.png" in repr(MediaRef(content="a.png", format="path"))
+
     def test_format_is_required(self):
         from pydantic import ValidationError
 

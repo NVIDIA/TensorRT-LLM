@@ -84,6 +84,14 @@ class MediaRef(StrictBaseModel):
             )
         return self
 
+    def __repr_args__(self):
+        # A ``bytes`` payload is shown by size only, so a log line that prints a
+        # whole ``VisualGenParams`` does not carry the media itself.
+        for name, value in super().__repr_args__():
+            if name == "content" and isinstance(value, bytes):
+                value = f"<{len(value)} bytes>"
+            yield name, value
+
 
 def _reject_bare_refs(value: Any) -> Any:
     """Reject the bare path/bytes shorthand with an actionable message.
