@@ -298,17 +298,19 @@ def test_rejection_sampling_still_gated_on_context_parallel():
     with pytest.raises(ValueError, match="context parallelism"):
         TorchLlmArgs(model=llama_model_path,
                      context_parallel_size=2,
+                     cp_config=CpConfig(cp_type="HELIX"),
                      speculative_config=spec_cfg)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "cp_config",
-    [CpConfig(),
+    [None,
+     CpConfig(),
      CpConfig(cp_type="ULYSSES"),
      CpConfig(cp_type="RING")],
-    ids=["default", "ulysses", "ring"])
-def test_context_parallelism_rejects_cp_type_other_than_helix(cp_config):
+    ids=["no_cp_config", "default", "ulysses", "ring"])
+def test_context_parallelism_rejects_cp_config_other_than_helix(cp_config):
     with pytest.raises(ValueError,
                        match="supports context parallelism only with cp_type "
                        "HELIX"):
@@ -319,11 +321,10 @@ def test_context_parallelism_rejects_cp_type_other_than_helix(cp_config):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "context_parallel_size,cp_config", [(1, CpConfig()),
-                                        (1, CpConfig(cp_type="RING")),
-                                        (2, CpConfig(cp_type="HELIX")),
-                                        (2, None)],
-    ids=["one_rank_default", "one_rank_ring", "helix", "no_cp_config"])
+    "context_parallel_size,cp_config",
+    [(1, CpConfig()), (1, CpConfig(cp_type="RING")), (1, None),
+     (2, CpConfig(cp_type="HELIX"))],
+    ids=["one_rank_default", "one_rank_ring", "one_rank_no_cp_config", "helix"])
 def test_context_parallelism_accepts_supported_cp_config(
         context_parallel_size, cp_config):
     args = TorchLlmArgs(model="/tmp/dummy_model",
@@ -5198,6 +5199,7 @@ class TestTransceiverRuntimeAutoResolution:
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
             context_parallel_size=2,
+            cp_config=CpConfig(cp_type="HELIX"),
             cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
         )
         _resolve_transceiver_runtime_auto(args)

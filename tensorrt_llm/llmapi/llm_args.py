@@ -7978,20 +7978,24 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode='after')
     def validate_cp_type_with_context_parallelism(self) -> 'TorchLlmArgs':
-        """Reject a cp_type other than HELIX when context parallelism is on.
+        """Require a HELIX cp_config when context parallelism is on.
 
         The PyTorch executor implements context parallelism only with HELIX:
-        with context_parallel_size > 1, the request path raises for any other
-        cp_type.
+        with context_parallel_size > 1, the attention modules and the request
+        path reject any other cp_type, and a missing cp_config.
         """
-        if (self.context_parallel_size > 1 and self.cp_config is not None
-                and self.cp_config.cp_type != CpType.HELIX):
-            raise ValueError(
-                f"cp_config.cp_type {self.cp_config.cp_type.name} is not "
-                f"supported with context_parallel_size "
-                f"{self.context_parallel_size}: the PyTorch backend supports "
-                "context parallelism only with cp_type HELIX.")
-        return self
+        if self.context_parallel_size <= 1:
+            return self
+        if self.cp_config is None:
+            got = "no cp_config"
+        elif self.cp_config.cp_type != CpType.HELIX:
+            got = f"cp_config.cp_type {self.cp_config.cp_type.name}"
+        else:
+            return self
+        raise ValueError(
+            f"context_parallel_size {self.context_parallel_size} requires "
+            f"cp_config.cp_type HELIX, got {got}: the PyTorch backend "
+            "supports context parallelism only with cp_type HELIX.")
 
     def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
         """Warn on unstable feature usage."""
