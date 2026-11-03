@@ -334,3 +334,112 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     assert not mixer.takes_prequantized_input(16, metadata(1, 16, 4))
     # CUDA-graph padding: more rows than the batch's tokens, so the mixer would not use it.
     assert not mixer.takes_prequantized_input(16, metadata(0, 12, 3))
+
+
+def _schedule_layer(layer_idx: int, is_moe: bool, is_kda: bool, token_sliced: bool = False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        layer_idx=layer_idx,
+        is_moe=is_moe,
+        is_kda=is_kda,
+        token_sliced=token_sliced,
+        linear_attn=SimpleNamespace(qkvg_takes_prequantized=lambda num_rows: num_rows <= 32),
+    )
+
+
+def _variants(layers, max_tokens=64, helix_first=None, verify=True):
+    return mkl._decode_attn_res_variants(
+        layers,
+        2,
+        HIDDEN,
+        max_tokens,
+        torch.cuda.current_device(),
+        len(layers) if helix_first is None else helix_first,
+        verify,
+    )
+
+
+def test_prewarm_variants_follow_the_layer_schedule(monkeypatch):
+    """The prewarmed decode-kernel variants are those the decoder layers launch: snapshot counts,
+    add modes (plain, attention add, folded MoE residual), the MXFP8 output only for KDA layers
+    after a MoE layer in verify batches, and cluster sizes over the token range."""
+    V = mkl._AttnResVariant
+    none, prefix, moe = 0, 1, 2
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=True, is_kda=True),
+        _schedule_layer(2, is_moe=True, is_kda=False),
+        _schedule_layer(3, is_moe=True, is_kda=True),
+        _schedule_layer(4, is_moe=True, is_kda=True),
+    ]
+    plain = {
+        V(2, none, 4, False, False),
+        V(2, prefix, 4, False, False),
+        V(2, moe, 4, False, False),
+        V(3, none, 4, False, False),
+        V(3, moe, 4, False, False),
+        V(3, prefix, 4, False, False),
+        # Five candidates' output mix: eight CTAs per token up to 16 tokens.
+        V(4, none, 8, False, False),
+        V(4, none, 4, False, False),
+    }
+    assert _variants(layers, verify=False) == plain
+    assert _variants(layers) == plain | {V(3, moe, 4, True, False)}
+    # Up to 16 tokens only the eight-CTA cluster serves four or more candidates.
+    assert _variants(layers, max_tokens=16, verify=False) == plain - {V(4, none, 4, False, False)}
+    # A token ceiling of 1 behaves like a budget of one token.
+    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
+    assert _variants(layers, verify=False) == plain - {V(4, none, 4, False, False)}
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    assert _variants(layers) == set()
+
+
+def test_prewarm_variants_helix_a2a(monkeypatch):
+    """helix_a2a: the first token-sliced layer's pre-attention mix reads the bank after the PDL
+    wait, and sliced KDA layers get no MXFP8 hand-off."""
+    V = mkl._AttnResVariant
+    none, prefix, moe = 0, 1, 2
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=False, is_kda=True),
+        _schedule_layer(2, is_moe=True, is_kda=True, token_sliced=True),
+        _schedule_layer(3, is_moe=True, is_kda=True, token_sliced=True),
+    ]
+    assert _variants(layers, helix_first=2) == {
+        V(2, none, 4, False, False),
+        V(2, prefix, 4, False, False),
+        V(2, none, 4, False, True),
+        V(3, none, 4, False, False),
+        V(3, moe, 4, False, False),
+        V(3, prefix, 4, False, False),
+    }
+
+
+@torch.no_grad()
+def test_prewarm_compiles_what_the_mixes_launch(monkeypatch):
+    """After ``prewarm_decode_kernels`` the model's mixes launch without compiling."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res
+
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    model = mkl.KimiLinearModel.__new__(mkl.KimiLinearModel)
+    nn.Module.__init__(model)
+    model.layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=False, is_kda=True),
+    ]
+    model._text_cfg = SimpleNamespace(attn_res_block_size=2, hidden_size=HIDDEN)
+    model.helix_a2a_first_layer = len(model.layers)
+    assert model.prewarm_decode_kernels(8, verify_batches=False) == 2
+    misses = kimi_k3_attn_res._compiled.cache_info().misses
+    proj, norm, out_norm = _modules(0)
+    for m in (1, 8):
+        prefix, addend, block = _rows(m, HIDDEN), _rows(m, HIDDEN), _rows(1, m, HIDDEN)
+        mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
+        mkl._apply_attn_res_add_and_rmsnorm(prefix, addend, block, proj, norm, out_norm)
+    torch.cuda.synchronize()
+    assert kimi_k3_attn_res._compiled.cache_info().misses == misses
