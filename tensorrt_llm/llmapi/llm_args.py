@@ -2344,6 +2344,30 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    rejection_sample_method: Literal["standard", "block"] = Field(
+        default="standard",
+        status="prototype",
+        description=
+        "Verification rule of rejection sampling (use_rejection_sampling=True). "
+        "'standard': token-level rejection sampling (Leviathan et al., 2023): "
+        "each draft is accepted with probability min(1, p/q) in order, and the "
+        "first rejection resamples from max(p - q, 0). 'block': block "
+        "verification (Sun et al., 2024, arXiv:2403.10444), which judges the "
+        "drafted block jointly; it is lossless, equals 'standard' for one "
+        "draft, and accepts at least as many tokens in expectation. Linear-chain "
+        "one-model paths only (not the dynamic tree); ragged (confidence-"
+        "scheduled) verification steps fall back to 'standard'.")
+
+    draft_temperature_only: bool = Field(
+        default=False,
+        status="prototype",
+        description="If true, rejection-sampled draft tokens are drawn from the "
+        "temperature-scaled draft distribution without the request's top-k / "
+        "top-p / min-p filters, and that distribution is what verification "
+        "divides by (vLLM's 'probabilistic' drafting). Outputs stay lossless "
+        "either way; the setting changes the acceptance rate. Requires "
+        "use_rejection_sampling=True.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -3419,6 +3443,84 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
     return translated
 
 
+def dflash_context_attention_window(
+        draft_config: Dict[str, Any]) -> Optional[int]:
+    """Widest context-attention window over a DFlash/DSpark drafter's layers.
+
+    Mirrors how the drafter resolves each layer's window at runtime
+    (``DFlashForCausalLM._resolve_block_attention``): ``dflash_config.use_swa``
+    with ``swa_window_size`` first (on every layer, or only on the
+    'sliding_attention' layers when ``layer_types`` names any), then the HF
+    fields ``sliding_window`` / ``layer_types`` / ``use_sliding_window`` /
+    ``max_window_layers`` (``get_layer_attention_window``). Returns None when
+    any layer attends to its whole context (or no layers are declared).
+    """
+    dflash_cfg = draft_config.get("dflash_config") or {}
+    num_layers = int(draft_config.get("num_hidden_layers") or 0)
+    layer_types = draft_config.get("layer_types") or []
+
+    def is_sliding(layer_type: Any) -> bool:
+        return "sliding" in str(getattr(layer_type, "name", layer_type)).lower()
+
+    def positive_int(value: Any) -> bool:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and value > 0)
+
+    swa_window = dflash_cfg.get("swa_window_size")
+    use_swa = bool(dflash_cfg.get("use_swa")) and positive_int(swa_window)
+    any_sliding = any(is_sliding(t) for t in layer_types)
+    hf_window = draft_config.get("sliding_window")
+    hf_windowed = (draft_config.get("use_sliding_window") is not False
+                   and positive_int(hf_window))
+    max_window_layers = draft_config.get("max_window_layers")
+    windows = []
+    for layer_idx in range(num_layers):
+        window = None
+        if use_swa and not (any_sliding and layer_idx < len(layer_types)
+                            and not is_sliding(layer_types[layer_idx])):
+            window = swa_window
+        if window is None and hf_windowed:
+            if layer_types:
+                if is_sliding(layer_types[layer_idx % len(layer_types)]):
+                    window = hf_window
+            elif not (positive_int(max_window_layers)
+                      and layer_idx < max_window_layers):
+                window = hf_window
+        if window is None:
+            return None
+        windows.append(window)
+    return max(windows) if windows else None
+
+
+def dspark_context_attention_window(
+        config_dict: Dict[str, Any]) -> Optional[int]:
+    """Widest context-attention window of a standalone DSpark drafter.
+
+    ``dflash_context_attention_window`` of the drafter's ``config.json``, read
+    the way the drafter is built from it. A speculators-format checkpoint goes through
+    ``translate_speculators_dspark_config``, which drops its window. A
+    MiniMax-M3 drafter (``DSparkMiniMaxDraftModel``) ships a VL-shaped config
+    that ``build_minimax_dspark_draft_config`` flattens: ``text_config`` wins
+    over the top level, and ``layer_types`` + ``sliding_window`` stand for the
+    DFlash ``use_swa`` / ``swa_window_size`` spelling.
+    """
+    config = translate_speculators_dspark_config(config_dict)
+    architectures = config.get("architectures") or []
+    if architectures and architectures[0] == "DSparkMiniMaxDraftModel":
+        config = {**config, **(config.get("text_config") or {})}
+        dflash_cfg = dict(config.get("dflash_config") or {})
+        layer_types = (dflash_cfg.get("layer_types")
+                       or config.get("layer_types") or [])
+        sliding_window = (dflash_cfg.get("sliding_window")
+                          or config.get("sliding_window"))
+        if ("use_swa" not in dflash_cfg and sliding_window
+                and "sliding_attention" in layer_types):
+            dflash_cfg["use_swa"] = True
+            dflash_cfg["swa_window_size"] = int(sliding_window)
+        config["dflash_config"] = dflash_cfg
+    return dflash_context_attention_window(config)
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -3622,6 +3724,24 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    context_recompute_tail: Optional[int] = Field(
+        default=None,
+        description=
+        "Prompt-tail tokens to recompute through the target forward when a "
+        "request takes a KV-cache prefix hit. A standalone DSpark drafter "
+        "builds its context K/V from target hidden states, which reused "
+        "tokens never produce, and its draft KV pool is not shared with the "
+        "target's prefix cache, so without a recompute a cache-hit request "
+        "drafts from only the uncached tail of its prompt. None (the default) "
+        "resolves from the draft model config: the drafter's attention window "
+        "when every layer's context attention is windowed (recomputing the "
+        "window reproduces the no-reuse drafter inputs exactly; 4096 for "
+        "MiniMax-M3.1), else 0. 0 disables the recompute; -1 forces a full "
+        "re-prefill on a hit. A smaller tail trades acceptance length for "
+        "TTFT. The embedded (DeepSeek-V4) drafter resolves to 0. Requires "
+        "chunked prefill and the all_reusable block-reuse policy; the KV "
+        "cache managers disable it with a warning otherwise.")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
@@ -3642,6 +3762,21 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
+    @model_validator(mode="after")
+    def default_embedded_recompute_tail(self):
+        """Resolve the tail of a config that names no drafter checkpoint to 0.
+
+        Without one the draft is the target's own mtp.* namespace (the embedded
+        DeepSeek-V4 flavour; ``TorchLlmArgs`` points ``speculative_model`` at
+        the target for it), whose tail is 0. Resolving it here keeps a config
+        that never goes through ``TorchLlmArgs`` validation from handing the KV
+        cache managers an unresolved None, which they treat as a full
+        re-prefill on every hit.
+        """
+        if self.context_recompute_tail is None and self.speculative_model is None:
+            self.context_recompute_tail = 0
+        return self
+
     @property
     def tokens_per_gen_step(self) -> int:
         """DSpark needs K+1 tokens per gen request (K drafts + 1 bonus).
@@ -3653,6 +3788,53 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def resolve_context_recompute_tail(self) -> None:
+        """Resolve ``context_recompute_tail: None`` from the drafter's window.
+
+        A windowed drafter never attends to prompt context older than its
+        attention window, and its context K/V are per-token projections of
+        target hidden states (the receptive field does not grow with drafter
+        depth), so recomputing that many prompt tokens gives a cache-hit
+        request exactly the drafter inputs it would have had without reuse.
+        An unwindowed drafter would need the whole prompt, i.e. no reuse at
+        all; that stays an explicit -1, so None resolves to 0 there. Leaves
+        None while a standalone drafter's ``config.json`` is not readable yet
+        (a hub repo id before download; ``resolve_from_checkpoint`` retries).
+        """
+        if self.context_recompute_tail is not None:
+            return
+        if self.speculative_model is None or self.draft_is_embedded_in_target:
+            # DSv4DSparkWorker keeps its own rolling captured-context window;
+            # the recompute is not wired up for it.
+            self.context_recompute_tail = 0
+            return
+        draft_config_path = os.path.join(str(self.speculative_model),
+                                         "config.json")
+        if not os.path.exists(draft_config_path):
+            return
+        with open(draft_config_path) as f:
+            window = dspark_context_attention_window(json.load(f))
+        self.context_recompute_tail = int(window) if window else 0
+        logger.info(
+            f"DSpark context_recompute_tail resolved to "
+            f"{self.context_recompute_tail} " +
+            (f"(the drafter's {window}-token attention window)"
+             if window else "(the drafter has an unwindowed layer; set -1 to "
+             "re-prefill whole prompts on prefix-cache hits)"))
+
+    def resolve_from_checkpoint(self) -> None:
+        """Resolve checkpoint-derived fields once a hub repo id is downloaded.
+
+        Called by ``CachedModelLoader``. Only ``context_recompute_tail`` is
+        resolved here; the other checkpoint fields resolve during validation.
+        """
+        self.resolve_context_recompute_tail()
+        if self.context_recompute_tail is None:
+            logger.warning(
+                f"DSpark drafter {self.speculative_model} has no readable "
+                "config.json; context_recompute_tail falls back to 0.")
+            self.context_recompute_tail = 0
 
     @functools.cached_property
     def draft_is_embedded_in_target(self) -> bool:
@@ -6965,6 +7147,30 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         return True
 
+    def _validate_rejection_sampling_options(self) -> None:
+        """Reject rejection-sampling options that would have no effect.
+
+        ``rejection_sample_method`` and ``draft_temperature_only`` only change
+        the rejection path, so setting them while it is off is a configuration
+        mistake. Block verification is also not wired into the dynamic tree.
+        """
+        spec_cfg = self.speculative_config
+        method = getattr(spec_cfg, "rejection_sample_method", "standard")
+        temperature_only = getattr(spec_cfg, "draft_temperature_only", False)
+        if not spec_cfg.use_rejection_sampling:
+            options = []
+            if method != "standard":
+                options.append(f"rejection_sample_method={method!r}")
+            if temperature_only:
+                options.append("draft_temperature_only=True")
+            if options:
+                raise ValueError(f"{' and '.join(options)} require(s) "
+                                 "use_rejection_sampling=True.")
+        if method == "block" and getattr(spec_cfg, "use_dynamic_tree", False):
+            raise ValueError(
+                "rejection_sample_method='block' is not supported with "
+                "use_dynamic_tree=True.")
+
     def _validate_dflash_ctx_budget(self,
                                     memory_budget_bytes: Optional[int] = None
                                     ) -> None:
@@ -7218,6 +7424,8 @@ class TorchLlmArgs(BaseLlmArgs):
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
 
+            self._validate_rejection_sampling_options()
+
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
@@ -7359,6 +7567,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                # Before the KV cache managers read it: an unresolved None
+                # means a full re-prefill there. A hub repo id resolves after
+                # download (resolve_from_checkpoint).
+                spec_cfg.resolve_context_recompute_tail()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

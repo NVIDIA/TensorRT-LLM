@@ -114,7 +114,7 @@ The checkpoint ships MXFP8 base layers with NVFP4 routed experts in the compress
 
 ### KV cache reuse
 
-KV cache block reuse is supported on the sparse-attention path for text and multimodal requests, with or without speculative decoding. Enable it with `kv_cache_config.enable_block_reuse: true`; the MSA backend matches reused prefixes at token granularity on its 128-token pages, and a reuse hit or a chunk boundary inside an image or video placeholder span is handled. With the DSpark drafter enabled, the target's cache is reused as usual while the drafter keeps its own per-request context, so after a partial-prefix hit the drafter can run without context for the rest of its current 64-token page; this lowers the acceptance length for a few steps and does not change outputs.
+KV cache block reuse is supported on the sparse-attention path for text and multimodal requests, with or without speculative decoding. Enable it with `kv_cache_config.enable_block_reuse: true`; the MSA backend matches reused prefixes at token granularity on its 128-token pages, and a reuse hit or a chunk boundary inside an image or video placeholder span is handled. With the DSpark drafter enabled, the target's cache is reused as usual while the drafter keeps its own per-request context. On a prefix hit the target recomputes the last `speculative_config.context_recompute_tail` prompt tokens so the drafter has the context its attention window needs; the default resolves to the drafter's window (4096 tokens for MiniMax-M3.1-Flash), so prompts shorter than that are re-prefilled in full on a hit and longer prompts recompute their last 4096 tokens, and reuse claims end on the drafter's page boundaries. A warm prompt then keeps the acceptance length of a cold one. Set `context_recompute_tail: 0` to trade that for the lowest time to first token on short repeated prompts. The tail applies to the default `block_reuse_config.policy: all_reusable`; under `per_conversation` the manager resumes the previous turn's cache instead of making a fresh claim, so it disables the tail and logs a warning at startup.
 
 ### NVFP4 KV cache on SM107
 
@@ -155,7 +155,135 @@ speculative_config:
 
 `max_draft_len` is the number of draft tokens per step, up to the drafter's native block of 7; smaller values trade acceptance length for cheaper drafting at high concurrency. `block_size` defaults to the drafter's value and must equal `max_draft_len`, so to draft 3 tokens set both `max_draft_len: 3` and `block_size: 3`. Launch the server with the same command as in [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server), pointing `$MODEL` at `/models/MiniMax-M3.1-Flash` and `--extra_llm_api_options` at this file, and adding `--served_model_name MiniMax-M3.1-Flash` so requests can name the model as in the examples below; a single-node deployment uses `-N 1 --ntasks 4 --ntasks-per-node 4 --gres=gpu:4`. The startup log reports the drafter's cache as `Separate draft KV cache of the standalone drafter is funded for ...`.
 
+For sampled requests (`temperature` above 0), enable rejection sampling with block verification so the drafter proposes tokens the way the published MiniMax-M3.1-Flash acceptance numbers were measured:
+
+```yaml
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  block_size: 7
+  speculative_model: /models/MiniMax-M3.1-Flash/dspark
+  use_rejection_sampling: true
+  rejection_sample_method: block
+  draft_temperature_only: true
+```
+
+Drafts are then drawn ancestrally from the drafter's Markov head with the request's temperature only, and each block is verified as a whole (block verification, Sun et al., 2024); sampling stays lossless and greedy requests are unaffected. On GB300 with `max_draft_len: 7` this accepts about 4.1 tokens per step on coding prompts at `temperature: 1.0`, `top_p: 0.95`, against about 3.6 with the default greedy drafting and exact-match verification.
+
 In disaggregated serving the drafter's cache is not transferred with the prompt, so a generation worker starts drafting without prompt context and draft acceptance is reduced until its attention window fills; compare against generation workers without speculative decoding before enabling it there.
+
+### Performance recipes
+
+The two aggregated configurations below were measured on this branch on GB300 with the AgentX agentic benchmark (SemiAnalysis InferenceX `cc-traces` dataset, multi-turn chat completions with KV offload to host memory, natural acceptance, 900 s profiles) and are starting points for agentic serving; `max_batch_size`, the CUDA-graph batch list and `host_cache_size` set the throughput/interactivity trade-off, and `max_seq_len` can be lowered to the longest prompt plus output you serve. Throughput counts prompt tokens (served from the cache or computed) plus output tokens per second per GPU; interactivity is 1000 / p90 inter-token latency.
+
+| Recipe | GPUs | Concurrency | tok/s/GPU | Interactivity (tok/s/user) | TTFT p50 / p90 | Acceptance length |
+|---|---|---|---|---|---|---|
+| Aggregated TP2 | 2 | 32 | 83,400 | 75 | 1.0 s / 2.3 s | 3.9 |
+| Aggregated TP4 | 4 | 30 | 48,100 | 103 | 0.8 s / 1.5 s | 4.0 |
+
+Aggregated TP2 (2 ranks):
+
+```yaml
+tensor_parallel_size: 2
+moe_expert_parallel_size: 1
+enable_attention_dp: false
+trust_remote_code: true
+attn_backend: TRTLLM
+max_batch_size: 64
+max_num_tokens: 16384
+max_seq_len: 1048576
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+prefill_cuda_graph_backend: breakable
+prefill_capture_num_tokens: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304, 2560, 2816, 3072]
+allreduce_strategy: AUTO
+moe_config:
+  backend: TRTLLM
+  use_low_precision_moe_combine: true
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  sparse_disable_index_value: true
+  fuse_qkv_index_projection: true
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  free_gpu_memory_fraction: 0.9
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_conversation
+  host_cache_size: 103079215104  # bytes of host KV tier per rank; size to the node's memory
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 40, 48, 56, 64]
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  block_size: 7
+  use_rejection_sampling: true
+  rejection_sample_method: block
+  draft_temperature_only: true
+  attention_backend: TRTLLM
+  speculative_model: /models/MiniMax-M3.1-Flash/dspark
+enable_autotuner: true
+enable_tokenization_cache: true
+stream_interval: 20
+```
+
+Aggregated TP4 (one 4-GPU node):
+
+```yaml
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+enable_attention_dp: false
+trust_remote_code: true
+attn_backend: TRTLLM
+max_batch_size: 32
+max_num_tokens: 16384
+max_seq_len: 1048576
+enable_chunked_prefill: true
+disable_overlap_scheduler: false
+moe_config:
+  backend: TRTLLM
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  sparse_disable_index_value: true
+  fuse_qkv_index_projection: true
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  free_gpu_memory_fraction: 0.9
+  enable_block_reuse: true
+  block_reuse_config:
+    policy: per_conversation
+  host_cache_size: 103079215104  # bytes of host KV tier per rank; size to the node's memory
+  event_buffer_max_size: 0
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+scheduler_config:
+  capacity_scheduler_policy: MAX_UTILIZATION
+speculative_config:
+  decoding_type: DSpark
+  max_draft_len: 7
+  block_size: 7
+  use_rejection_sampling: true
+  rejection_sample_method: block
+  draft_temperature_only: true
+  attention_backend: TRTLLM
+  speculative_model: /models/MiniMax-M3.1-Flash/dspark
+enable_autotuner: true
+enable_tokenization_cache: true
+num_postprocess_workers: 8
+stream_interval: 20
+```
+
+Both recipes use `block_reuse_config.policy: per_conversation`, so the recompute tail described under [KV cache reuse](#kv-cache-reuse) is off and the server logs that at startup; the acceptance lengths in the table were measured that way. Leave `advanced_sampling_mode` at its default with these recipes: on this branch `advanced_sampling_mode: no_topk` combined with rejection sampling is slower and can stall the executor under the agentic workload.
 
 ### Thinking mode and reasoning parsing
 

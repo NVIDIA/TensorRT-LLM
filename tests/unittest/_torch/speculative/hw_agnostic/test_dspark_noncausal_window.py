@@ -7,8 +7,10 @@ every key within ``W - 1`` positions on both sides: context keys from
 ``C + j - W + 1`` and every block key. The TRTLLM backend serves that mask as
 the causal windowed decode plus the block keys after each query, merged by
 log-sum-exp. These tests check the mask resolution (CPU), the merge against a
-dense oracle (CPU), and the full trtllm-gen path against a dense fp32 oracle
-over a paged cache (SM100/SM103 only).
+dense oracle (CPU), the compiled in-place merge against the eager one (CUDA),
+and the full trtllm-gen path against a dense fp32 oracle over a paged cache,
+up to a batch whose softmax stats outgrow the plain workspace (SM100/SM103
+only).
 """
 
 import math
@@ -20,6 +22,9 @@ import torch
 from tensorrt_llm._torch.models.modeling_dflash import (
     DFlashForCausalLM,
     dflash_merge_future_block_attention,
+    dflash_merge_future_block_attention_,
+    dflash_merges_future_block_keys,
+    dflash_trtllm_gen_workspace_size,
     dflash_trtllm_windowed_block_attention,
 )
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
@@ -226,17 +231,17 @@ class _PagedCase:
         self.block_key = torch.stack([k[-block_size:] for k in self.keys])
         self.block_value = torch.stack([v[-block_size:] for v in self.values])
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=dev)
+        # Sized as the drafter sizes it for a layer that merges later block keys.
         self.workspace = torch.empty(
-            ops.get_workspace_size(
-                dtype=torch.bfloat16,
-                num_tokens=B * block_size,
-                num_gen_tokens=B * block_size,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_size=head_dim,
-                max_num_requests=B,
-                rotary_embedding_dim=0,
-                fp8_context_fmha=False,
+            dflash_trtllm_gen_workspace_size(
+                ops,
+                torch.bfloat16,
+                B,
+                block_size,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                return_lse=True,
             ),
             dtype=torch.uint8,
             device=dev,
@@ -316,7 +321,7 @@ def _ctx_lens_around(window, block_size, page_size):
 
 @pytest.mark.parametrize("page_size", [32, 64])
 @pytest.mark.parametrize("block_size", [1, 2, 4, 7])
-@pytest.mark.parametrize("heads", [(16, 1), (16, 2)])
+@pytest.mark.parametrize("heads", [(16, 1), (16, 2), (64, 4)])
 @pytest.mark.parametrize("window", [64, 4096])
 def test_trtllm_windowed_non_causal_matches_the_oracle(page_size, block_size, heads, window):
     """Mixed context lengths in one batch, straddling the window and page
@@ -386,3 +391,62 @@ def test_trtllm_windowed_non_causal_replays_under_cuda_graph():
     graph.replay()
     expected, _ = _oracle(case.query, case.keys, case.values, new_ctx, 4095, 4095, causal=False)
     torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_only_blocks_with_later_keys_take_the_merge():
+    assert dflash_merges_future_block_keys(False, (4095, 4095), 7)
+    assert dflash_merges_future_block_keys(False, (4095, -1), 2)
+    # One block token, or no right window: nothing follows a query.
+    assert not dflash_merges_future_block_keys(False, (4095, 4095), 1)
+    assert not dflash_merges_future_block_keys(False, (4095, 0), 7)
+    # Causal layers, and unwindowed non-causal ones (context kernel).
+    assert not dflash_merges_future_block_keys(True, (4095, 0), 7)
+    assert not dflash_merges_future_block_keys(False, (-1, -1), 7)
+
+
+@pytest.mark.parametrize("block_size", [2, 3, 7])
+@pytest.mark.parametrize("heads", [(16, 1), (64, 4)])
+def test_compiled_in_place_merge_matches_the_eager_merge(block_size, heads):
+    """The layer runs the merge compiled, in place, on the decode's base-2
+    log-sum-exp; at every batch size it equals the eager merge."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    # Earlier tests may have used up the recompile budget, after which the
+    # function would run eagerly; start from a clean compile cache.
+    torch._dynamo.reset()
+    torch.manual_seed(block_size)
+    num_heads, num_kv_heads = heads
+    for batch in (1, 5, 64):
+        query = torch.randn(batch, block_size, num_heads, 128, device="cuda").bfloat16()
+        block_key = torch.randn(batch, block_size, num_kv_heads, 128, device="cuda").bfloat16()
+        block_value = torch.randn_like(block_key)
+        out = torch.randn(batch * block_size, num_heads, 128, device="cuda").bfloat16()
+        lse_log2 = 4 * torch.randn(batch * block_size, num_heads, device="cuda")
+        expected = dflash_merge_future_block_attention(
+            out, lse_log2 * math.log(2.0), query, block_key, block_value, 128**-0.5, 4095
+        )
+        dflash_merge_future_block_attention_(
+            out, lse_log2, query, block_key, block_value, 128**-0.5, 4095
+        )
+        torch.testing.assert_close(out, expected)
+
+
+def test_workspace_holds_the_lse_stats_at_large_batch():
+    """With its log-sum-exp the decode takes 8 B x heads x requests x 256 + 1 MiB
+    of softmax stats off the front of the workspace. At 64 heads, 512 requests
+    and 3 block tokens that alone outgrows the trtllm-gen workspace (flashinfer
+    refuses the launch); the drafter's size includes the stats."""
+    ops = _trtllm_gen_ops_or_skip()
+    torch.manual_seed(5)
+    batch, block_size, num_heads, num_kv_heads = 512, 3, 64, 4
+    trtllm_gen_bytes = dflash_trtllm_gen_workspace_size(
+        ops, torch.bfloat16, batch, block_size, num_heads, num_kv_heads, 128, return_lse=False
+    )
+    assert trtllm_gen_bytes < 8 * num_heads * batch * 256 + (1 << 20)
+    ctx_lens = [1 + (97 * b) % 300 for b in range(batch)]
+    case = _PagedCase(ops, ctx_lens, block_size, num_heads, num_kv_heads, 128, 64)
+    case.append_block()
+    expected, _ = _oracle(case.query, case.keys, case.values, ctx_lens, 4095, 4095, causal=False)
+    torch.testing.assert_close(
+        case.run(False, (4095, 4095)).float(), expected, atol=2e-2, rtol=2e-2
+    )

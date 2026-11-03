@@ -274,6 +274,56 @@ def dspark_markov_chain(
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
 
 
+def dspark_markov_chain_ancestral(
+    base_logits: torch.Tensor,
+    first_prev_tokens: torch.Tensor,
+    step_bias_fn,
+    sample_step,
+    *,
+    hidden_states: Optional[torch.Tensor] = None,
+    cast_bias_to_logits: bool = False,
+) -> torch.Tensor:
+    """Sample the intra-block Markov chain ancestrally.
+
+    Position k is drawn from ``base_logits[:, k] + bias(prev_k)`` where
+    ``prev_k`` is the token *drawn* at position k-1 (the anchor for k = 0) --
+    the chain the head is trained on, and the one vLLM's and SGLang's
+    probabilistic DSpark drafting samples. :func:`dspark_markov_chain` walks the
+    argmax instead, which is the same chain only for greedy drafting.
+
+    Args:
+        base_logits: [B, K, vocab] shared-lm_head logits over the FULL draft
+            vocab (the draws index the full Markov embedding table).
+        first_prev_tokens: [B] long, anchor token ids.
+        step_bias_fn: ``(prev_tokens [B], step_hidden or None) -> bias``, as in
+            :func:`dspark_markov_chain`.
+        sample_step: ``(k, step_logits [B, vocab]) -> [B] token ids``: draws
+            position k. The distribution it draws from is the position's
+            proposal, so a rejection-sampling caller records it here.
+        hidden_states: [B, K, d] fed to ``step_bias_fn``; None for the
+            memoryless heads.
+        cast_bias_to_logits: see :func:`dspark_markov_chain`.
+    Returns:
+        [B, K] long, the drawn tokens.
+    """
+    batch_size, block_size = base_logits.shape[:2]
+    if block_size == 0:
+        return torch.empty(batch_size,
+                           0,
+                           dtype=torch.long,
+                           device=base_logits.device)
+    drawn = []
+    prev = first_prev_tokens.long()
+    for k in range(block_size):
+        step_hidden = None if hidden_states is None else hidden_states[:, k]
+        bias = step_bias_fn(prev, step_hidden)
+        if cast_bias_to_logits:
+            bias = bias.to(base_logits.dtype)
+        prev = sample_step(k, base_logits[:, k] + bias).long()
+        drawn.append(prev)
+    return torch.stack(drawn, dim=1)
+
+
 def dspark_markov_chain_logits(base_logits: torch.Tensor,
                                first_prev_tokens: torch.Tensor,
                                markov_w1: torch.Tensor,

@@ -28,6 +28,7 @@ from ..speculative.dflash_attention import (
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
+from ..utils import maybe_compile
 from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
 
 
@@ -82,6 +83,10 @@ def dflash_merge_future_block_attention(
     backend serves a non-causal sliding-window layer, which the trtllm-gen
     context kernel rejects while its causal decode kernel windows natively.
 
+    The softmax over the later keys, their output and the merge are unrolled
+    over the (few) block keys, so that under torch.compile they fuse into one
+    pointwise kernel (see :func:`dflash_merge_future_block_attention_`).
+
     Args:
         out_causal: [B * blk, Hq, D] causal attention output.
         lse_causal: [B * blk, Hq] float32 log-sum-exp of the scaled causal logits.
@@ -95,28 +100,106 @@ def dflash_merge_future_block_attention(
     B, blk, num_heads, head_dim = query.shape
     num_kv_heads = block_key.shape[2]
     group = num_heads // num_kv_heads
-    q = query.float().reshape(B, blk, num_kv_heads, group, head_dim)
-    logits = torch.einsum("bjhgd,bkhd->bhgjk", q, block_key.float()) * scale
+    q = query.float().reshape(B, blk, num_kv_heads, group, 1, head_dim)
+    keys = block_key.float().permute(0, 2, 1, 3)[:, None, :, None]  # [B, 1, Hkv, 1, blk, D]
+    logits = (q * keys).sum(-1) * scale  # [B, query j, Hkv, g, key k]
     offsets = torch.arange(blk, device=query.device)
     distance = offsets.view(1, -1) - offsets.view(-1, 1)  # [j, k] = k - j
     future = distance > 0
     if window_right >= 0:
         future &= distance <= window_right
-    logits = logits.masked_fill(~future, float("-inf"))
-    lse_future = torch.logsumexp(logits, dim=-1)  # [B, Hkv, g, blk], -inf for no future keys
-    lse_future_finite = torch.where(
-        torch.isfinite(lse_future), lse_future, torch.zeros_like(lse_future)
-    )
-    probs = torch.exp(logits - lse_future_finite.unsqueeze(-1))
-    out_future = torch.einsum("bhgjk,bkhd->bjhgd", probs, block_value.float())
-    out_future = out_future.reshape(B * blk, num_heads, head_dim)
-    lse_future = lse_future.permute(0, 3, 1, 2).reshape(B * blk, num_heads)
+    future_logits = [
+        logits[..., k].masked_fill(~future[:, k].view(1, blk, 1, 1), float("-inf"))
+        for k in range(blk)
+    ]
+    max_future = future_logits[0]
+    for logit in future_logits[1:]:
+        max_future = torch.maximum(max_future, logit)
+    # A query without later keys has only -inf logits; its weight is 0 below.
+    max_future = torch.where(torch.isfinite(max_future), max_future, 0.0)
+    exp_future = [torch.exp(logit - max_future) for logit in future_logits]
+    sum_future = exp_future[0]
+    for exp_logit in exp_future[1:]:
+        sum_future = sum_future + exp_logit
+    has_future = sum_future > 0
+    sum_future = torch.where(has_future, sum_future, 1.0)
+    lse_future = max_future + torch.log(sum_future)
+    lse_causal = lse_causal.float().reshape(B, blk, num_kv_heads, group)
+    # exp(lse_future) / (exp(lse_causal) + exp(lse_future))
+    weight_future = torch.where(has_future, torch.sigmoid(lse_future - lse_causal), 0.0)
+    out = out_causal.float().reshape(B, blk, num_kv_heads, group, head_dim)
+    merged = out * (1.0 - weight_future).unsqueeze(-1)
+    value = block_value.float()
+    prob_scale = weight_future / sum_future
+    for k in range(blk):
+        merged = merged + (prob_scale * exp_future[k]).unsqueeze(-1) * value[:, k, None, :, None]
+    return merged.reshape(B * blk, num_heads, head_dim).to(out_causal.dtype)
 
-    lse_total = torch.logaddexp(lse_causal, lse_future)
-    weight_causal = torch.exp(lse_causal - lse_total).unsqueeze(-1)
-    weight_future = torch.exp(lse_future - lse_total).unsqueeze(-1)
-    merged = weight_causal * out_causal.float() + weight_future * out_future
-    return merged.to(out_causal.dtype)
+
+@maybe_compile
+def dflash_merge_future_block_attention_(
+    out: torch.Tensor,
+    lse_log2: torch.Tensor,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    scale: float,
+    window_right: int,
+) -> None:
+    """In-place :func:`dflash_merge_future_block_attention` on a base-2 log-sum-exp.
+
+    Compiled, so that the merge runs as a few fused kernels per layer instead of
+    dozens of small eager ones.
+    """
+    out.copy_(
+        dflash_merge_future_block_attention(
+            out, lse_log2 * math.log(2.0), query, block_key, block_value, scale, window_right
+        )
+    )
+
+
+def dflash_merges_future_block_keys(
+    causal: bool, window_size: tuple[int, int], block_size: int
+) -> bool:
+    """Whether the TRTLLM block decode adds later block keys to its causal result.
+
+    True for a non-causal windowed layer whose block has a key after some query
+    within the right window; such a layer requests the decode's log-sum-exp.
+    """
+    window_left, window_right = window_size
+    return not causal and window_left >= 0 and block_size > 1 and window_right != 0
+
+
+def dflash_trtllm_gen_workspace_size(
+    trtllm_gen_ops,
+    dtype: torch.dtype,
+    max_batch_size: int,
+    block_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    return_lse: bool,
+) -> int:
+    """Bytes of trtllm-gen workspace for DFlash's block attention.
+
+    With ``return_lse``, flashinfer takes the decode's softmax stats
+    (``round_up(block_size, 256)`` float2 per query head and request) and a
+    1 MiB guard off the front of the workspace; the kernel scratch gets the rest.
+    """
+    workspace_bytes = trtllm_gen_ops.get_workspace_size(
+        dtype=dtype,
+        num_tokens=max_batch_size * block_size,
+        num_gen_tokens=max_batch_size * block_size,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_dim,
+        max_num_requests=max_batch_size,
+        rotary_embedding_dim=0,
+        fp8_context_fmha=False,
+    )
+    if return_lse:
+        workspace_bytes += 8 * num_heads * max_batch_size * 256 * -(-block_size // 256) + (1 << 20)
+    return workspace_bytes
 
 
 def dflash_trtllm_windowed_block_attention(
@@ -140,7 +223,8 @@ def dflash_trtllm_windowed_block_attention(
     non-causal unwindowed layer takes the context kernel instead. trtllm-gen
     windows only causal attention, so the non-causal windowed case runs the
     causal decode with its log-sum-exp and then adds the block keys after each
-    query (:func:`dflash_merge_future_block_attention`).
+    query (:func:`dflash_merge_future_block_attention_`). With no such keys (a
+    single-token block, or no right window) the causal decode is the result.
 
     Args:
         query: [B, blk, Hq, D] block queries.
@@ -152,7 +236,7 @@ def dflash_trtllm_windowed_block_attention(
     """
     B, block_size, num_heads, head_dim = query.shape
     window_left, window_right = window_size
-    merge_future = not causal and window_left >= 0
+    merge_future = dflash_merges_future_block_keys(causal, window_size, block_size)
     decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
         query=query.reshape(-1, num_heads, head_dim),
         kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
@@ -179,11 +263,8 @@ def dflash_trtllm_windowed_block_attention(
     )
     if merge_future:
         # trtllm-gen reports the log-sum-exp in base 2.
-        lse = decoded[1] * math.log(2.0)
-        out.copy_(
-            dflash_merge_future_block_attention(
-                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
-            )
+        dflash_merge_future_block_attention_(
+            out, decoded[1], query, block_key, block_value, head_dim**-0.5, window_right
         )
 
 
@@ -1490,18 +1571,18 @@ class DFlashForCausalLM(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        return_lse: bool = False,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
-        workspace_bytes = trtllm_gen_ops.get_workspace_size(
-            dtype=dtype,
-            num_tokens=max_batch_size * block_size,
-            num_gen_tokens=max_batch_size * block_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_dim,
-            max_num_requests=max_batch_size,
-            rotary_embedding_dim=0,
-            fp8_context_fmha=False,
+        workspace_bytes = dflash_trtllm_gen_workspace_size(
+            trtllm_gen_ops,
+            dtype,
+            max_batch_size,
+            block_size,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            return_lse,
         )
         device = torch.device(device)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -1687,6 +1768,12 @@ class DFlashForCausalLM(nn.Module):
                     num_heads_per_rank,
                     num_kv_heads_per_rank,
                     head_dim,
+                    return_lse=any(
+                        dflash_merges_future_block_keys(
+                            *self._resolve_block_attention(layer_idx), block_size
+                        )
+                        for layer_idx in range(len(self.model.layers))
+                    ),
                 )
             else:  # FA4 needs no workspace or counter buffers.
                 self._prepare_dflash_index_buffers(hidden_states.device, max_batch_size, block_size)

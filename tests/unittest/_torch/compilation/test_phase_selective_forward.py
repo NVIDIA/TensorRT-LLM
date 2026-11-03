@@ -264,7 +264,10 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     monkeypatch.setattr(runner_module, "log_mem_snapshot", Mock())
     monkeypatch.setattr(runner_module.AutoTuner, "get", Mock())
     monkeypatch.setattr(
-        runner_module, "moe_a2a_steady_state_budget_for_capture", contextlib.nullcontext
+        runner_module,
+        "moe_a2a_steady_state_budget_for_capture",
+        contextlib.nullcontext,
+        raising=False,
     )
     monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
     monkeypatch.setattr(runner_module, "gc", SimpleNamespace(collect=Mock()))

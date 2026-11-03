@@ -2433,7 +2433,9 @@ def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):
         max_draft_len=max_draft_len,
         max_total_draft_tokens=tokens_per_gen_step - 1,
         tokens_per_gen_step=tokens_per_gen_step,
-        spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
+        spec_dec_mode=SimpleNamespace(
+            use_one_engine=lambda: False, is_external_drafter=lambda: False
+        ),
     )
 
 

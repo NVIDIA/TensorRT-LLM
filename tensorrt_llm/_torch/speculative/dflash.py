@@ -38,6 +38,42 @@ from .dflash_attention import (
 )
 from .interface import SpecMetadata, SpecWorkerBase
 
+# Read the drafter's per-row block counts back from the device instead of
+# deriving them on the host (debug A/B switch; read at import).
+_SYNC_CTX_ALLOC = os.environ.get("TRTLLM_DFLASH_SYNC_CTX_ALLOC", "0") == "1"
+
+
+def host_counted_block_width(attn_metadata) -> Optional[int]:
+    """Per-row block count the drafter's refresh computes this step, when the host can tell; else None.
+
+    ``_refresh_ctx_block_tables`` counts the entries ``>= 0`` in each row of
+    ``draft_kv_cache_block_offsets``. KVCacheManagerV2's shared-page-table copy
+    (``copy_batch_block_offsets_to_device``) rewrites every column of each row
+    it copies, mapping a missing page to 0 and every other page to a
+    non-negative offset, and it always copies on a step with context requests.
+    With source and destination rows of equal width, each row then holds no
+    negative entry, so its count is that width. Returns None for any other
+    writer (V1, the per-layer page-table path, a subclass's own copy), where
+    only the device knows the count.
+    """
+    from ..pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    offsets = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+    manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
+    if offsets is None or manager is None or not isinstance(manager, KVCacheManagerV2):
+        return None
+    if type(manager).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets:
+        return None
+    if getattr(manager, "_use_per_layer_page_tables", True):
+        return None
+    host = getattr(manager, "host_kv_cache_block_offsets", None)
+    if host is None or host.dim() != 4 or offsets.dim() != 4:
+        return None
+    if host.size(-1) != offsets.size(-1):
+        return None
+    return int(offsets.size(-1))
+
+
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
 _PAGED_ATTENTION_BACKENDS = ("TRTLLM", "FA4")
@@ -1310,6 +1346,7 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        self._configure_prefix_reuse(getattr(attn_metadata, "kv_cache_manager", None))
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
@@ -1334,6 +1371,62 @@ class DFlashWorker(SpecWorkerBase):
             table = self._ctx_page_table
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
+
+    def _configure_prefix_reuse(self, target_cache_manager) -> None:
+        """Set the target KV cache manager up for this drafter's prefix-cache
+        hits, and report how they are served.
+
+        Bound to an unpaired draft pool, the drafter stores the uncached tail of
+        a hit at its target positions and hides the pages below it from its
+        reads (``_ctx_base_for_store``), in whole pages only: a hit ending
+        inside a page would leave that page's stored tail tokens -- up to
+        ``page_size - 1`` of the newest prompt tokens -- unread. The target
+        therefore ends its reuse claims on draft page boundaries
+        (``KVCacheManagerV2.align_reuse_claims_to_draft_pages``). The reused
+        prefix itself has no drafter K/V at all on any unaddressable cache;
+        ``context_recompute_tail`` makes the target recompute the part the
+        drafter attends to.
+        """
+        bound_unpaired = self._ctx_block_tables is not None and not self._ctx_reuse_addressable
+        align = getattr(target_cache_manager, "align_reuse_claims_to_draft_pages", None)
+        if align is not None:
+            align(self._ctx_page_size if bound_unpaired else 0)
+        if self._ctx_reuse_addressable or not getattr(
+            target_cache_manager, "enable_block_reuse", False
+        ):
+            return
+        tail = getattr(target_cache_manager, "_spec_recompute_tail", 0)
+        aligned = bound_unpaired and align is not None
+        logger.info(
+            f"DFlash: prefix-cache hits recompute a {tail}-token prompt tail for the "
+            f"drafter (context_recompute_tail; -1 = whole prompt, 0 = none); reuse "
+            + (
+                f"claims end on {self._ctx_page_size}-token draft page boundaries."
+                if aligned
+                else "claims are not aligned to draft pages."
+            )
+        )
+        if not tail:
+            # The target skips the reused prefix, so _store_prefill_context only
+            # ever sees the uncached tail; nothing else reports the loss.
+            requested = getattr(self.spec_config, "context_recompute_tail", 0)
+            if requested:
+                why = (
+                    f"the KV cache manager disabled context_recompute_tail={requested} "
+                    "(it requires block_reuse_config.policy 'all_reusable' and chunked "
+                    "prefill)"
+                )
+            else:
+                why = (
+                    "context_recompute_tail is 0 (set it to the drafter's attention "
+                    "window -- null resolves it -- or -1 to recompute on hits)"
+                )
+            logger.warning(
+                "DFlash: KV-cache block reuse is on, but the drafter's context K/V are "
+                f"not kept where a prefix-cache hit can hand them back, and {why}: a "
+                "cache-hit request drafts from only the uncached tail of its prompt, so "
+                "acceptance drops on every hit."
+            )
 
     def _ctx_store_start(self, cur: int, first_pos: int) -> int:
         """Position at which a context chunk's drafter K/V is stored.
@@ -1543,6 +1636,18 @@ class DFlashWorker(SpecWorkerBase):
         if self._saved_ctx_base is not None:
             self._ctx_base_pages.copy_(self._saved_ctx_base)
 
+    def _ctx_alloc_tokens(self, attn_metadata, num_contexts: int) -> List[int]:
+        """Tokens addressable through each context row of the block table.
+
+        That is ``_ctx_block_counts[:num_contexts] * page_size``. When the host can
+        tell what the refresh counted, the list is built on the host; otherwise it
+        is read back from the device, which waits for the GPU to finish the step.
+        """
+        width = None if _SYNC_CTX_ALLOC else host_counted_block_width(attn_metadata)
+        if width is not None:
+            return [width * self._ctx_page_size] * num_contexts
+        return (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+
     def _store_prefill_context(
         self,
         draft_model,
@@ -1587,10 +1692,10 @@ class DFlashWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
-        # One tolist() for the whole loop: the lengths themselves come from
-        # _ctx_len_host, so the loop body below stays sync-free.
+        # Built once for the whole loop, on the host where possible; the lengths
+        # themselves come from _ctx_len_host, so the loop body stays sync-free.
         ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+            self._ctx_alloc_tokens(attn_metadata, num_contexts)
             if self._ctx_block_tables is not None
             else None
         )
@@ -1873,37 +1978,49 @@ class DFlashWorker(SpecWorkerBase):
                 vocab_size = gen_logits.shape[-1]
                 gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                gen_logits = self._refine_block_logits(
-                    draft_model, gen_logits, inputs, spec_metadata
-                )
-
-                # DFlash 2: replace the independent per-position picks with one
-                # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "lilicorr", None) is not None:
-                    gen_logits = self._apply_lilicorr(
+                # A drafter whose positions depend on the token drawn before
+                # them draws the block itself when drafts are sampled.
+                if self._samples_block_ancestrally(draft_model, spec_metadata):
+                    gen_draft_tokens, vocab_size = self._sample_block_ancestrally(
                         draft_model,
                         gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["lilicorr_anchor"],
+                        inputs,
                         spec_metadata,
+                        num_contexts,
+                        batch_size,
                     )
-                    vocab_size = gen_logits.shape[-1]
-                elif getattr(draft_model, "has_candidate_selector", False):
-                    gen_logits = self._apply_dflash2_selector(
-                        draft_model,
-                        gen_logits,
-                        gen_hidden_states.reshape(num_gens, K, -1),
-                        inputs["first_prev_tokens"],
-                        spec_metadata,
+                else:
+                    gen_logits = self._refine_block_logits(
+                        draft_model, gen_logits, inputs, spec_metadata
                     )
-                    vocab_size = gen_logits.shape[-1]
 
-                gen_draft_tokens = self.sample_draft_tokens(
-                    gen_logits,
-                    spec_metadata,
-                    batch_size,
-                    num_contexts=num_contexts,
-                )
+                    # DFlash 2: replace the independent per-position picks with one
+                    # coherent path through the block (absent for plain DFlash).
+                    if getattr(draft_model, "lilicorr", None) is not None:
+                        gen_logits = self._apply_lilicorr(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["lilicorr_anchor"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+                    elif getattr(draft_model, "has_candidate_selector", False):
+                        gen_logits = self._apply_dflash2_selector(
+                            draft_model,
+                            gen_logits,
+                            gen_hidden_states.reshape(num_gens, K, -1),
+                            inputs["first_prev_tokens"],
+                            spec_metadata,
+                        )
+                        vocab_size = gen_logits.shape[-1]
+
+                    gen_draft_tokens = self.sample_draft_tokens(
+                        gen_logits,
+                        spec_metadata,
+                        batch_size,
+                        num_contexts=num_contexts,
+                    )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2008,6 +2125,30 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+        """Whether this step's drafts come from :meth:`_sample_block_ancestrally`.
+
+        Plain DFlash positions are independent given the block forward, so
+        sampling every logits row on its own is exact. Drafter families whose
+        positions condition on the previous draft override this.
+        """
+        return False
+
+    def _sample_block_ancestrally(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        inputs: dict,
+        spec_metadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> Tuple[torch.Tensor, int]:
+        """Draw the block position by position; returns int32 tokens and the vocab width.
+
+        Only called when :meth:`_samples_block_ancestrally` holds.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not sample blocks ancestrally")
 
     def _apply_dflash2_selector(
         self,
