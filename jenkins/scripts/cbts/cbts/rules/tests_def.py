@@ -57,6 +57,11 @@ BLAST_RADIUS_FRACTION = 0.8
 ACCURACY_REFS_PREFIX = "tests/integration/defs/accuracy/references/"
 ACCURACY_DIR = "tests/integration/defs/accuracy"
 DEFS_GIT_PREFIX = "tests/integration/defs/"
+QA_PERF_HARNESS_SOURCES = {
+    f"{DEFS_GIT_PREFIX}perf/test_perf.py",
+    f"{DEFS_GIT_PREFIX}perf/utils.py",
+}
+QA_PERF_FUNCTIONAL_TEST = "unittest/others/test_perf_qa_functional.py"
 
 _CLASS_RE = re.compile(r"class\s+(\w+)")
 # `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
@@ -485,7 +490,15 @@ class TestsDefRule(Rule):
 
         for git_path in candidates:
             yaml_path = self.yaml_index.git_path_to_yaml_key(git_path)
-            if yaml_path is None:
+            qa_perf = git_path in QA_PERF_HARNESS_SOURCES
+            if qa_perf:
+                qa_blocks, _ = lookup_paths_into_block_filters(
+                    self.yaml_index, [QA_PERF_FUNCTIONAL_TEST]
+                )
+                if not qa_blocks:
+                    # Without the CPU harness test, narrowing cannot protect QA execution.
+                    return None
+            if yaml_path is None and not qa_perf:
                 base = git_path.rsplit("/", 1)[-1]
                 if base.startswith("test_") and base.endswith(".py"):
                     # Standalone test_*.py not referenced by any L0 YAML —
@@ -501,7 +514,13 @@ class TestsDefRule(Rule):
                 out_of_namespace.add(git_path)
                 continue
             handled.add(git_path)
-            anchors = self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
+            anchors = (
+                self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
+                if yaml_path is not None
+                else []
+            )
+            if qa_perf:
+                anchors.append(QA_PERF_FUNCTIONAL_TEST)
             file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
             if not file_bf:
                 # In-namespace but no YAML entry covers this path → no

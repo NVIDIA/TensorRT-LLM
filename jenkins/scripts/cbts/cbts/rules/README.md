@@ -81,6 +81,11 @@ Outcomes:
 
 ## TestsDefRule
 
+Changes to `tests/integration/defs/perf/test_perf.py` or its shared `utils.py`
+also select `unittest/others/test_perf_qa_functional.py` in the CPU test list.
+This protects the QA harness without scheduling a GPU benchmark. Existing
+PerfSanity matches are retained; missing CPU coverage forces fallback.
+
 For each file under `tests/` in the diff:
 
 1. `git_path_to_yaml_key` translates the repo path to a YAML namespace

@@ -10,8 +10,16 @@ for metric collection and regression checks, and the
 ## QA benchmarks
 
 `test_perf.py` provides the dynamically generated benchmark cases used by QA
-test lists under `tests/integration/test_lists/qa/`. Run these cases with `--perf`;
-`--perf-log-formats csv` and `--perf-log-formats yaml` select the result formats.
+test lists under `tests/integration/test_lists/qa/`. Run these cases with both
+`--perf` and `--test-list=<rendered-test-list.txt>`; see the
+[runnable example](../../README.md#run-perf-tests).
+`--perf-log-formats csv` and `--perf-log-formats yaml` select the result formats
+and require `--output-dir=<results-directory>`.
+
+The [CPU harness tests](../../../unittest/others/test_perf_qa_functional.py)
+exercise dynamic test generation, bench/serve commands, metric output, and
+failure handling with simulated GPU processes. They run through the
+`unittest/others` entry in `l0_cpu.yml`; real GPU execution remains QA coverage.
 
 ## Warmup pass
 
