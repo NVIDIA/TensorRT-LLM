@@ -396,6 +396,7 @@ class WinoVaeRMSNorm(WanRMSNorm):
                     in_bias=x.bias,
                     out=out,
                     out_geometry=out_geometry,
+                    return_sum=return_sum,
                 )
                 return (s, y) if return_sum else y
             if src is not None and x.residual is None and not return_sum:
@@ -423,11 +424,14 @@ class WinoVaeRMSNorm(WanRMSNorm):
         frames: int,
         inputs_geometry: FrameGeometry | None = None,
         inputs: torch.Tensor | None = None,
+        *,
+        return_sum: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor, WinogradInputs]:
         """Norm + SiLU that writes the Winograd inputs for the conv that follows.
 
         ``cache`` holds the last 0..2 normalized frames of the previous chunk as
-        ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], inputs)``.
+        ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], inputs)``; the
+        sum (the pre-norm input, when it was formed by the kernel) only with ``return_sum``.
         ``inputs_geometry``: write the Winograd inputs into frames with halo lines (sharded decode);
         ``inputs``: a preallocated destination for them."""
         x = x if isinstance(x, DeferredSum) else DeferredSum(x)
@@ -445,6 +449,7 @@ class WinoVaeRMSNorm(WanRMSNorm):
             bias=bias,
             scale=self.scale,
             frames=frames,
+            return_sum=return_sum,
             order=temporal_order_for(frames),
             fp16_inputs=_WINOGRAD_DTYPE == torch.float16,
             products_geometry=products.geometry if products is not None else None,
@@ -1432,14 +1437,16 @@ class WinoVaeResidualBlock(WanResidualBlock):
         h, w = x.shape[-2:]
         order = temporal_order_for(frames)
         # norm1 -> inputs for conv1; the sum it writes is the block input (residual source).
-        s, inputs = self._norm_winograd(self.norm1, self.conv1, x, feat_cache, feat_idx, order)
+        s, inputs = self._norm_winograd(
+            self.norm1, self.conv1, x, feat_cache, feat_idx, order, return_sum=True
+        )
         if isinstance(x, DeferredSum):
             x = s if s is not None else materialize(x)
         residual, out_bias = self._shortcut(x, True)
         m1, geo_m1 = self.conv1.forward_winograd(inputs)
         products = DeferredSum(WinogradProducts(m1, geo_m1), bias=self.conv1.bias)
         _, inputs2 = self._norm_winograd(
-            self.norm2, self.conv2, products, feat_cache, feat_idx, order
+            self.norm2, self.conv2, products, feat_cache, feat_idx, order, return_sum=False
         )
         m2, geo_m2 = self.conv2.forward_winograd(inputs2)
         return DeferredSum(WinogradProducts(m2, geo_m2), residual=residual, bias=out_bias), x
@@ -1452,15 +1459,18 @@ class WinoVaeResidualBlock(WanResidualBlock):
         feat_cache: list[CacheEntry],
         feat_idx: list[int],
         order: int,
+        *,
+        return_sum: bool,
     ) -> tuple[torch.Tensor | None, WinogradInputs]:
         """``norm`` writes the Winograd inputs of ``conv`` (halo lines completed) and the next
-        cache entry; returns the sum it formed (None for a plain tensor input) and the inputs."""
+        cache entry; returns the sum it formed (with ``return_sum``; None for a plain tensor
+        input) and the inputs."""
         h, w = x.shape[-2:]
         frames = x.shape[2]
         idx = feat_idx[0]
         geo, into, direct = conv.winograd_inputs(h, w, order, frames)
         s, cache, inputs = norm.norm_silu_winograd(
-            x, _history_frames(feat_cache[idx]), frames, geo, inputs=into
+            x, _history_frames(feat_cache[idx]), frames, geo, inputs=into, return_sum=return_sum
         )
         feat_cache[idx] = cache
         feat_idx[0] += 1

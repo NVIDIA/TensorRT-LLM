@@ -297,6 +297,7 @@ def wino_norm_silu(
     scale: float,
     frames: int,
     *,
+    return_sum: bool,
     order: int = 2,
     fp16_inputs: bool = False,
     reference_rounding: bool = False,
@@ -316,8 +317,9 @@ def wino_norm_silu(
     the previous chunk's last normalized frames (none: zero history). ``gamma`` / ``bias``
     ``[C]``: the norm's scale and shift.
 
-    Returns ``(sum, y_tail, D)``: ``sum`` ``[T, P, C]``, the pre-norm frames, when there is a
-    residual, an input bias or product input (else None); ``y_tail`` ``[2, P, C]``, the last
+    Returns ``(sum, y_tail, D)``: ``sum`` ``[T, P, C]``, the pre-norm frames, when
+    ``return_sum`` is set and there is a residual, an input bias or product input (else None:
+    the kernel does not store it); ``y_tail`` ``[2, P, C]``, the last
     two normalized frames (the next chunk's cache); ``D`` ``[order + 2, T/order, input
     positions, C]``, the Winograd inputs.
 
@@ -336,7 +338,7 @@ def wino_norm_silu(
     channels = src.shape[-1]
     device = src.device.index
     opts = dict(device=src.device, dtype=torch.bfloat16)
-    want_sum = residual is not None or in_bias is not None or x is None
+    want_sum = return_sum and (residual is not None or in_bias is not None or x is None)
     out_sum = torch.empty((frames, positions, channels), **opts) if want_sum else None
     y_tail = torch.empty((2, positions, channels), **opts)
     input_positions = inputs_geometry.frame if inputs_geometry is not None else positions
@@ -490,10 +492,12 @@ def rms_norm_silu_rows(
     silu: bool = True,
     frames: int = 1,
     out_geometry: FrameGeometry | None = None,
+    return_sum: bool,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """RMSNorm (+ SiLU, + residual, + deferred bias) on rows ``[N, C]`` bf16: returns
-    ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when a residual
-    is given; ``out`` is an optional destination for ``y``.
+    ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when
+    ``return_sum`` is set and a residual is given; ``out`` is an optional destination for
+    ``y``.
 
     With ``out_geometry`` the rows are ``frames`` frames of ``height * width`` positions and
     ``out`` holds frames with halo rows / columns (``[frames * rows * cols, C]``); only the
@@ -525,7 +529,8 @@ def rms_norm_silu_rows(
     device = x.device.index
     opts = dict(device=x.device, dtype=torch.bfloat16)
     y = out if out is not None else torch.empty((rows, channels), **opts)
-    out_sum = torch.empty((rows, channels), **opts) if residual is not None else None
+    want_sum = return_sum and residual is not None
+    out_sum = torch.empty((rows, channels), **opts) if want_sum else None
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         fp16_winograd=False,

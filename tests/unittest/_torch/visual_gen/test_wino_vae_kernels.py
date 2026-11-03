@@ -290,8 +290,14 @@ def test_cuda_residual_variant(C: int, reference: bool) -> None:
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
     s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale)
-    s, a = add_rms_norm_silu(x, r, gamma, None, scale, reference_rounding=reference)
+    s, a = add_rms_norm_silu(
+        x, r, gamma, None, scale, reference_rounding=reference, return_sum=True
+    )
     assert torch.equal(s, s_ref), "the returned sum must be bit-identical to the eager bf16 add"
+    no_sum, a_only = add_rms_norm_silu(
+        x, r, gamma, None, scale, reference_rounding=reference, return_sum=False
+    )
+    assert no_sum is None and torch.equal(a_only, a), "skipping the sum must not change y"
     assert a.is_contiguous(memory_format=torch.channels_last_3d)
     ulp = a_ref.float().abs().clamp_min(1e-3) * 2**-7
     mismatched = ((a.float() - a_ref.float()).abs() > ulp).float().mean().item()
@@ -326,7 +332,7 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
     if with_residual:
         s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale, in_bias=in_bias)
         s, a = add_rms_norm_silu(
-            x, r, gamma, None, scale, reference_rounding=reference, in_bias=in_bias
+            x, r, gamma, None, scale, reference_rounding=reference, in_bias=in_bias, return_sum=True
         )
         assert torch.equal(s, s_ref)
     else:
@@ -338,7 +344,9 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
     # The in-bias path must equal the standalone kernel applied to the eagerly biased input.
     xb = (x + in_bias.view(1, -1, 1, 1, 1)).contiguous(memory_format=torch.channels_last_3d)
     if with_residual:
-        _, a2 = add_rms_norm_silu(xb, r, gamma, None, scale, reference_rounding=reference)
+        _, a2 = add_rms_norm_silu(
+            xb, r, gamma, None, scale, reference_rounding=reference, return_sum=False
+        )
     else:
         a2 = rms_norm_silu(xb, gamma, None, scale, reference_rounding=reference)
     assert torch.equal(a, a2)
@@ -511,10 +519,30 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
         reference_rounding=True,
         order=order,
         fp16_inputs=dtype_name == "fp16",
+        return_sum=True,
     )
     assert d.dtype == winograd_dtype and d.shape[0] == order + 2
     if residual is not None:
         assert torch.equal(s, s_ref), "sum must be bit-identical to the eager adds"
+    # Without the sum the kernel skips only its store: the cache and the inputs are bitwise
+    # unchanged.
+    cache_in = cache.clone() if cache is not None else None
+    no_sum, tail2, d2 = wino_norm_silu(
+        x,
+        [mk.clone() for mk in m] if m is not None else None,
+        residual,
+        in_bias,
+        cache_in,
+        gamma,
+        None,
+        scale,
+        T,
+        reference_rounding=True,
+        order=order,
+        fp16_inputs=dtype_name == "fp16",
+        return_sum=False,
+    )
+    assert no_sum is None and torch.equal(tail2, tail) and torch.equal(d2, d)
     # The normalized frames (cache) and the Winograd inputs match eager up to the fp32 reduction
     # order of the sum of squares: at most 1 bf16 ulp on a tiny fraction of elements.
     for name, a, b in [
@@ -552,6 +580,7 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
         T,
         order=order,
         fp16_inputs=order == 4,
+        return_sum=False,
     )
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
@@ -576,7 +605,18 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
     weight = (0.1 * torch.randn(Co, C, 3, 3, 3, generator=gen, device="cuda")).to(torch.bfloat16)
     _, _, d = wino_norm_silu(
-        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=order == 4
+        x,
+        None,
+        None,
+        None,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        fp16_inputs=order == 4,
+        return_sum=False,
     )
     g = winograd_weights(weight, order, torch.float32)
     comps = order + 2
@@ -1338,7 +1378,18 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
 
     # Producer with a Winograd-input geometry.
     s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        x, None, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=True
+        x,
+        None,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        fp16_inputs=True,
+        return_sum=True,
     )
     d_phys = torch.full(
         (order + 2, T // order, geo.frame, C), 7.0, dtype=torch.float16, device="cuda"
@@ -1356,6 +1407,7 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         order=order,
         fp16_inputs=True,
         inputs_geometry=geo,
+        return_sum=True,
     )
     assert d.shape == d_phys.shape
     assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref)
@@ -1364,7 +1416,18 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
     # Consumer with a products geometry (halo positions hold a sentinel).
     m_ref = [rnd(T // order, P, C).to(torch.float16) for _ in range(order + 2)]
     s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        None, m_ref, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=True
+        None,
+        m_ref,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        fp16_inputs=True,
+        return_sum=True,
     )
     m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
     s, tail, d = jit_norm.wino_norm_silu(
@@ -1380,6 +1443,7 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         order=order,
         fp16_inputs=True,
         products_geometry=geo,
+        return_sum=True,
     )
     assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref) and torch.equal(d, d_ref)
 
@@ -1398,6 +1462,7 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         fp16_inputs=True,
         products_geometry=geo,
         inputs_geometry=geo,
+        return_sum=True,
     )
     assert torch.equal(s, s_ref) and torch.equal(_interior(d, geo), d_ref)
 
@@ -1420,10 +1485,20 @@ def test_rows_and_add_bias_and_residual_geometry_match_plain(C: int, axis: str) 
     # Row norm into halo frames.
     x = rnd(T * P, C)
     residual = rnd(T * P, C)
-    s_ref, y_ref = jit_norm.rms_norm_silu_rows(x, gamma, bias, C**0.5, residual=residual)
+    s_ref, y_ref = jit_norm.rms_norm_silu_rows(
+        x, gamma, bias, C**0.5, residual=residual, return_sum=True
+    )
     out = torch.full((T * geo.frame, C), 7.0, dtype=bf, device="cuda")
     s, y = jit_norm.rms_norm_silu_rows(
-        x, gamma, bias, C**0.5, residual=residual, out=out, frames=T, out_geometry=geo
+        x,
+        gamma,
+        bias,
+        C**0.5,
+        residual=residual,
+        out=out,
+        frames=T,
+        out_geometry=geo,
+        return_sum=True,
     )
     assert torch.equal(s, s_ref)
     assert torch.equal(_interior(y.view(T, geo.frame, C), geo), y_ref.view(T, P, C))
@@ -1519,6 +1594,7 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
         order=order,
         fp16_inputs=True,
         inputs_geometry=replace(geo, push=push),
+        return_sum=False,
     )
     phys = d.view(comps, groups, geo.rows, geo.cols, C)
     if axis == "h":
@@ -1550,6 +1626,7 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
         out=out,
         frames=T,
         out_geometry=replace(geo, push=push),
+        return_sum=False,
     )
     phys = out.view(1, T, geo.rows, geo.cols, C)
     if axis == "h":

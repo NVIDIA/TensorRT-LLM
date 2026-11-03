@@ -88,6 +88,7 @@ def rms_norm_silu(
         silu=silu,
         frames=_frame_count(x),
         out_geometry=out_geometry,
+        return_sum=False,
     )
     return out if out is not None else _rows_to_like(out_rows, x)
 
@@ -117,8 +118,10 @@ def add_rms_norm_silu(
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     out_geometry: FrameGeometry | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``.
+    return_sum: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor]:
+    """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns
+    ``(s, act)``, with ``s`` None (not stored) unless ``return_sum``.
     ``out``: optional channels-last destination for the activation (with ``out_geometry``:
     frames with halo lines, logical positions written)."""
     rows = _channel_rows(x)
@@ -139,8 +142,10 @@ def add_rms_norm_silu(
         out=dst,
         frames=_frame_count(x),
         out_geometry=out_geometry,
+        return_sum=return_sum,
     )
-    return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
+    s = _rows_to_like(s_rows, x) if s_rows is not None else None
+    return s, (out if out is not None else _rows_to_like(a_rows, x))
 
 
 def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
@@ -381,6 +386,7 @@ def wino_norm_silu(
     scale: float,
     frames: int,
     *,
+    return_sum: bool,
     reference_rounding: bool = False,
     order: int = 2,
     fp16_inputs: bool = False,
@@ -400,6 +406,7 @@ def wino_norm_silu(
         bias=bias.reshape(-1) if bias is not None else None,
         scale=float(scale),
         frames=frames,
+        return_sum=return_sum,
         order=order,
         fp16_inputs=fp16_inputs,
         reference_rounding=reference_rounding,
