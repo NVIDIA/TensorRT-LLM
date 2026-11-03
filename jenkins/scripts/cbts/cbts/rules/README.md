@@ -15,7 +15,7 @@ for the overall CBTS architecture.
 | `waives.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
+| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/serve/api/visual_gen/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
 | `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
@@ -217,7 +217,8 @@ Outcomes:
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
 `scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
-`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
+`tensorrt_llm/media/`, `tensorrt_llm/serve/api/visual_gen/`, and
+`tensorrt_llm/visual_gen/` (excluding documentation,
 which `DocsRule` handles). It also claims the exact generated schema
 `tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json`.
 Fused-DiT paths stay unclaimed:
@@ -258,11 +259,23 @@ pre-merge multi-GPU stages cannot satisfy this requirement. Missing or filtered
 required validation keeps `scope=None`. Public changes therefore get a wider
 test set than internal VG changes without requiring all unrelated GPU tests.
 
+Internal serving package: `tensorrt_llm/serve/api/visual_gen/`, the VisualGen
+HTTP serving package, is internal rather than shared. No module outside it
+imports it except the trtllm-serve composition root for the VISUAL_GEN role,
+the routing table's module-path string, the lazy re-export in
+`tensorrt_llm.serve.openai_protocol` and the VisualGen benchmark client, so a
+change under it narrows like the other internal paths.
+`tests/unittest/llmapi/apps/visual_gen/test_serve_visual_gen_isolation.py`
+asserts this (the static import graph, a runtime check per serving role and
+CLI entry point, and the placement of VisualGen tests under `visual_gen/`
+paths); if it fails, the prefix can no longer be treated as internal.
+
 Outcomes:
 
 - No VG source files in the diff → rule returns `None`.
 - VG source touched, all internal (`examples/visual_gen/**`,
-  `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
+  `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, or
+  `tensorrt_llm/serve/api/visual_gen/**`)
   → `scope=visualgenonly`;
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
   a matched block lives in `l0_perf` or `*perf_sanity*`.

@@ -41,14 +41,15 @@ filter chain.
 
 ## Rules
 
-Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
+Eleven rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
+| `PythonFormattingRule` | `noop` | Python files whose patch is a verified pure reformat: identical complete ASTs (docstrings and type comments included) and unchanged comments |
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `VisualGenRule` | `visualgenonly` | VG source and the exact VG serve schema; public VG/media changes also keep full CPU and shared serving tests, package sanity, and performance sanity; missing required validation forces fallback |
+| `VisualGenRule` | `visualgenonly` | VG source (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/serve/api/visual_gen/**`, `tensorrt_llm/visual_gen/**`; excl. docs) and the exact VG serve schema; public VG/media changes also keep full CPU and shared serving tests, package sanity, and performance sanity; missing required validation forces fallback |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
 | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
@@ -65,7 +66,7 @@ See `cbts/rules/README.md` for per-rule logic.
 | `waiveonly` | `WaivesRule` fired solo: PR only edits `waives.txt`. |
 | `testdefonly` | `TestsDefRule` fired solo: PR only edits files under `tests/**/*`. |
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
-| `visualgenonly` | `VisualGenRule` fired solo. Internal VG changes select VG test entries; schema changes also retain schema validation. Public VG/media changes additionally retain the complete CPU suite, shared serving integration tests, package sanity, and performance sanity. Missing required validation forces `null` fallback. |
+| `visualgenonly` | `VisualGenRule` fired solo. Internal VG changes (`examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/serve/api/visual_gen/**`) select VG test entries; schema changes also retain schema validation. Public VG/media changes additionally retain the complete CPU suite, shared serving integration tests, package sanity, and performance sanity. Missing required validation forces `null` fallback. The serving package counts as internal because nothing outside it imports it (`tests/unittest/llmapi/apps/visual_gen/test_serve_visual_gen_isolation.py`). |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
 | `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A change under `models/` selects its model node's unit tests and target accuracy gates, plus whole-tree checks; shared code or an unreadable routing tree selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
