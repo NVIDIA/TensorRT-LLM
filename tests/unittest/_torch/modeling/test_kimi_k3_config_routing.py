@@ -282,8 +282,6 @@ def test_kimi_k3_forward_with_attached_embeddings():
                 input_ids=media_ids,
                 return_context_logits=True,
                 multimodal_params=[params],
-                mm_token_indices=torch.tensor([1], device="cuda"),
-                text_token_indices=torch.tensor([0, 2, 3], device="cuda"),
             )
 
         for logits in (expected, changed, actual):
