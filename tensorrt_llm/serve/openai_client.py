@@ -39,7 +39,7 @@ import aiohttp
 import msgspec
 from pydantic import BaseModel
 
-from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm._utils import AdjustedSteadyClock, get_steady_clock_now_in_seconds
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
@@ -68,7 +68,6 @@ from tensorrt_llm.serve.perf_metrics import (
     adjusted_clock_from_headers,
     build_metrics_record_from_headers,
 )
-from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.router import Router
 
 # yapf: enable
