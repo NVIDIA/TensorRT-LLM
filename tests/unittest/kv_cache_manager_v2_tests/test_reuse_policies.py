@@ -156,8 +156,11 @@ def test_snapshot_selection_excludes_delayed_and_rebuilt_private_state():
     groups[-1].initially_active = False
     groups[-1].suspend_policy = kv.SuspendPolicy.RELEASE
     config.allocation_groups = groups
-    manager = kv.KVCacheManager(config)
+    config.constraints = [
+        kv.BatchDesc([kv.KVCacheDesc(12, 0, active_allocation_groups=[40]) for _ in range(2)])
+    ]
     stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
     caches = []
     try:
         private = manager.get_buffer_group_id(0, "private")
