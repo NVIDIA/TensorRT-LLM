@@ -43,7 +43,7 @@ pytestmark = pytest.mark.skipif(
 NUM_EXPERTS = 896
 TOP_K = 16
 TILE = 128
-MS = [1, 4, 5, 7, 13, 16, 17, 28, 32, 33, 56, 64, 65, 112, 128, 224, 256]
+MS = [1, 4, 5, 7, 13, 16, 17, 28, 32, 33, 56, 64, 65, 112, 128, 129, 138, 224, 256]
 # (local_expert_offset, local_num_experts): EP16 ranks, EP8, TP4xEP4 ranks, TP8xEP2, no EP.
 LAYOUTS = [
     (0, 56),
@@ -208,7 +208,7 @@ def test_route_sort_routed_scaling_factor(m, scale):
 
 
 @pytest.mark.parametrize("num_experts", [128, 256, 384, 512, 1024])
-@pytest.mark.parametrize("m", [1, 32, 33, 64, 65, 256])  # each of the three launch configs
+@pytest.mark.parametrize("m", [1, 32, 33, 64, 65, 128, 129, 256])  # each launch config
 @pytest.mark.parametrize("mode", ["rand", "ties"])
 def test_route_sort_other_expert_counts(num_experts, m, mode):
     """Expert counts other than Kimi-K3's 896: every multiple of 128 up to 1024 is served."""

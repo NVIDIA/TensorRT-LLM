@@ -964,12 +964,14 @@ def serves(
 def _config(m: int) -> tuple[int, int]:
     """``(warps_per_token, num_warps)`` for ``m`` tokens on the eight CTAs (at most 32 tokens per
     CTA): 8-warp CTAs with two-warp teams up to 32 tokens, one-warp teams up to 64; 16-warp CTAs
-    above."""
+    up to 16 tokens per CTA, 32-warp CTAs above (each CTA routes its tokens in one round)."""
     if m <= 32:
         return 2, 8
     if m <= 64:
         return 1, 8
-    return 1, 16
+    if m <= 16 * CLUSTER_SIZE:
+        return 1, 16
+    return 1, 32
 
 
 @functools.cache
