@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the encode dynamic batcher (tensorrt_llm/serve/encode_batcher.py).
+"""Unit tests for the encode dynamic batcher (tensorrt_llm/serve/api/openai/embeddings/batcher.py).
 
 These tests exercise the pure-async coalescing logic with an injected, synchronous
 `encode_fn`. They do not require a GPU or any TensorRT-LLM runtime.

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Optional, Sequence, Union
 
+import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -203,6 +204,9 @@ class ScriptedOutput:
     raise_after_steps: Optional[BaseException] = None  # raised once the steps are replayed
     hold_after_steps: bool = False  # wait until release(), abort() or cancellation
     prompt_token_ids: Optional[tuple] = None  # default: derived from the inputs
+    # What the result's ``disaggregated_params`` carries, for example the
+    # multimodal embedding handles the multimodal-encoder role answers with.
+    disaggregated_params: Any = None
 
 
 @dataclass
@@ -264,6 +268,7 @@ class ScriptedRequestOutput(GenerationResultBase):
         )
         self._script = script
         self._fake_tokenizer = tokenizer
+        self._disaggregated_params = script.disaggregated_params
         if script.prompt_token_ids is not None:
             self.prompt_token_ids = list(script.prompt_token_ids)
             try:
@@ -470,17 +475,26 @@ class FakeEncodeOnlyLLM(FakeLLM):
 
     A production encode-only LLM has no generation executor: ``_build_model``
     returns before creating one and ``_check_health`` reads only
-    ``_encoder_executor`` in encode-only mode.
+    ``_encoder_executor`` in encode-only mode. ``encode_limits`` is the real
+    ``LLM`` property, read over ``FakeEncoderExecutor.model_engine``.
+
+    ``encode`` records every batch in ``encode_calls`` and answers each input
+    with the fixed two-value embedding ``[len(token_ids), first token id]``,
+    so a test can tell the inputs apart in the response.
     """
 
     def __init__(self, *, args: FakeLlmArgs) -> None:
         self._setup_fake(args=args, executor=None, encode_only=True)
         self._encoder_executor = FakeEncoderExecutor()
+        self.encode_calls: list = []
 
     def encode(self, token_ids_batch: Any) -> Any:
-        raise NotImplementedError(
-            "FakeEncodeOnlyLLM does not encode; script it when a test needs it."
-        )
+        batch = [list(token_ids) for token_ids in token_ids_batch]
+        self.encode_calls.append(batch)
+        return [
+            SimpleNamespace(logits=torch.tensor([float(len(ids)), float(ids[0]) if ids else 0.0]))
+            for ids in batch
+        ]
 
 
 class UserProbeMiddleware:

@@ -106,6 +106,8 @@ class AggConfig:
     model_name: str = "fake-model"  # OpenAIServer(model=...): the /v1/models id
     tool_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
+    chat_template: Optional[str] = None  # server-side template, a literal Jinja string
+    allow_request_chat_template: bool = False  # OpenAIServer(allow_request_chat_template=...)
     num_postprocess_workers: int = 0  # > 0 takes the postprocess-worker path
     # Attached frontend of a multi-frontend server: registers the launcher
     # forwarding routes ahead of the local handlers, which they shadow.
@@ -240,6 +242,8 @@ class ServeTestEnv:
             tool_parser=config.tool_parser,
             server_role=config.role,
             metadata_server_cfg=None,
+            chat_template=config.chat_template,
+            allow_request_chat_template=config.allow_request_chat_template,
             enable_rl_control_endpoints=config.rl_control,
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,

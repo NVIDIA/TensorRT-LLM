@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The HTTP server reads the engine through public LLM members only.
 
-Each test calls a production ``OpenAIServer`` method on a stand-in object (not
-``object.__new__(OpenAIServer)``) whose generator double defines exactly the
-public members the method reads, so a server method reaching for a private
-engine member again fails loudly here.
+Each test calls a production ``OpenAIServer`` or serving-class method on a
+stand-in object (not ``object.__new__(OpenAIServer)``) whose generator double
+defines exactly the public members the method reads, so a server method
+reaching for a private engine member again fails loudly here.
 """
 
 from types import SimpleNamespace
@@ -15,7 +15,9 @@ from fastapi import FastAPI
 
 from tensorrt_llm.llmapi.llm import EncodeLimits
 from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve._base import serving as base_serving
 from tensorrt_llm.serve._base.serving import _record_generator_termination
+from tensorrt_llm.serve.api.openai.embeddings.serving import EmbeddingServing
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
@@ -42,21 +44,20 @@ def _generator(**kwargs):
 
 
 # ---------------------------------------------------------------------------
-# _init_embedding_batcher reads generator.encode_limits
+# EmbeddingServing builds its batcher from generator.encode_limits
 # ---------------------------------------------------------------------------
 def test_embedding_batcher_takes_the_limits_encode_checks():
-    stub = _ServerStub(
+    serving = EmbeddingServing(
+        model="fake-model",
         generator=_generator(
             encode_limits=EncodeLimits(max_batch_size=4, max_num_tokens=512, max_seq_len=128),
             encode=lambda batch: batch,
         ),
-        _embedding_max_queue_delay=0.01,
-        _embedding_max_queue_size=8,
+        embedding_max_queue_delay=0.01,
+        embedding_max_queue_size=8,
     )
 
-    OpenAIServer._init_embedding_batcher(stub)
-
-    batcher = stub.embedding_batcher
+    batcher = serving.embedding_batcher
     assert batcher._max_batch_size == 4
     assert batcher._max_num_tokens == 512
     assert batcher._max_seq_len == 128
@@ -152,7 +153,8 @@ def test_init_llm_loads_processor_and_config_from_the_public_model_dir(monkeypat
 # ---------------------------------------------------------------------------
 def _recorded_outcome(monkeypatch, generator):
     outcomes = []
-    monkeypatch.setattr(openai_server, "record_termination_observation", outcomes.append)
+    # Patched where the helper looks the name up: it lives in serve/_base/serving.py.
+    monkeypatch.setattr(base_serving, "record_termination_observation", outcomes.append)
     _record_generator_termination(generator)
     assert len(outcomes) == 1
     return outcomes[0]

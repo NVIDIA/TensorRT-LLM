@@ -46,10 +46,12 @@ def test_importing_the_package_does_not_load_the_servers() -> None:
         print(json.dumps({
             "openai_server": "tensorrt_llm.serve.openai_server" in sys.modules,
             "openai_disagg_server": "tensorrt_llm.serve.openai_disagg_server" in sys.modules,
+            # The endpoint packages load per role, from the composition root.
+            "api": any(m.startswith("tensorrt_llm.serve.api.") for m in sys.modules),
         }))
         """
     )
-    assert out == {"openai_server": False, "openai_disagg_server": False}
+    assert out == {"openai_server": False, "openai_disagg_server": False, "api": False}
 
 
 def test_servers_load_on_first_access_and_are_the_real_classes() -> None:

@@ -25,6 +25,7 @@ from prometheus_client import REGISTRY
 from test_common.serve.app_factory import AggConfig, isolated_serve_env
 from test_common.serve.cpu_tests import select_entries
 from test_common.serve.fakes import (
+    FakeEncodeOnlyLLM,
     FakeLLM,
     FakeLlmArgs,
     ScriptedOutput,
@@ -402,3 +403,31 @@ def test_hold_after_steps_release_and_cancellation():
             await hanging
 
     asyncio.run(scenario())
+
+
+def test_scripted_disaggregated_params_reach_the_result():
+    llm = FakeLLM(args=FakeLlmArgs(model="unused"))
+    default = llm.generate_async({"prompt_token_ids": [1]}, SamplingParams())
+    assert default.disaggregated_params is None
+    llm.script(ScriptedOutput(disaggregated_params="scripted params"))
+    scripted = llm.generate_async({"prompt_token_ids": [1]}, SamplingParams())
+    assert scripted.disaggregated_params == "scripted params"
+
+
+def test_encode_only_fake_answers_fixed_embeddings_and_records_batches():
+    llm = FakeEncodeOnlyLLM(args=FakeLlmArgs(model="unused", encode_only=True))
+    outputs = llm.encode([[5], [6, 7]])
+    assert [output.logits.flatten().tolist() for output in outputs] == [[1.0, 5.0], [2.0, 6.0]]
+    assert llm.encode_calls == [[[5], [6, 7]]]
+    # The real LLM.encode_limits property, over the fake encoder executor.
+    limits = llm.encode_limits
+    assert (limits.max_batch_size, limits.max_num_tokens, limits.max_seq_len) == (8, 8192, 2048)
+
+
+def test_agg_config_passes_the_chat_template_knobs(serve_env):
+    template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    server = serve_env.build_openai_server(
+        AggConfig(chat_template=template, allow_request_chat_template=True)
+    )
+    assert server.chat_template == template
+    assert server.allow_request_chat_template is True
