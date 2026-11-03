@@ -128,59 +128,79 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
 
     float cm[HC_MULT];
 
-    // ---- Phase 1a prologue: split-K reduce for runtime split counts ----
-    // NUM_SPLITS == 0 serves the large split counts (up to the MMA ladder's 112). Each of the token's HC_MULT3 + 1
-    // values (24 mixes, then the sqr-sum) is owned by one lane of every warp; each warp sums a strided subset of the
-    // splits with coalesced loads, warp 0 adds the per-warp partials in warp order, and lanes 0..3 gather the six
-    // mixes and the sqr-sum they need. The order is fixed for a given split count and block size, so the result is
-    // independent of how the producer's split CTAs ran.
+    // ---- Phase 1a prologue: split-K reduce for large split counts ----
+    // Each of the token's HC_MULT3 + 1 values (24 mixes, then the sqr-sum) is owned by one lane, which sums it over
+    // the splits with coalesced loads; lanes 0..3 of warp 0 then gather the six mixes and the sqr-sum they need.
+    // NUM_SPLITS == 0 serves the runtime split counts (up to the MMA ladder's 112): every warp sums a strided subset
+    // of the splits and warp 0 adds the per-warp partials in warp order. NUM_SPLITS == 16 is summed by warp 0 alone
+    // in split order. Either order is fixed, so the result is independent of how the producer's split CTAs ran.
+    // Smaller compile-time split counts are summed per lane in Phase 1a.
+    constexpr bool kLaneSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 16;
     float r_split = 0.0f;
     float y_pre_split = 0.0f;
     float y_post_split = 0.0f;
     float cm_split[HC_MULT] = {};
-    if constexpr (NUM_SPLITS == 0)
+    if constexpr (kLaneSplitSum)
     {
-        constexpr int kNumWarps = BLOCK_SIZE / WARP_SIZE;
-        // Splits per warp that are loaded with independent loads before they are added; split counts above
-        // kMaxUnrolledSplits add their remaining splits one by one.
-        constexpr int kMaxUnrolledSplits = 112;
-        constexpr int kSplitsPerWarp = (kMaxUnrolledSplits + kNumWarps - 1) / kNumWarps;
-        __shared__ float s_split_part[kNumWarps][HC_MULT3 + 1];
-        if (lane <= HC_MULT3)
+        float split_sum = 0.0f;
+        if constexpr (NUM_SPLITS == 0)
         {
-            float vals[kSplitsPerWarp];
-#pragma unroll
-            for (int i = 0; i < kSplitsPerWarp; i++)
-            {
-                int const s = warp_id + i * kNumWarps;
-                long long const row = static_cast<long long>(s) * M + token;
-                vals[i]
-                    = (s < num_splits_runtime) ? ((lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row]) : 0.0f;
-            }
-            float part = 0.0f;
-#pragma unroll
-            for (int i = 0; i < kSplitsPerWarp; i++)
-            {
-                if (warp_id + i * kNumWarps < num_splits_runtime)
-                    part += vals[i];
-            }
-            for (int s = warp_id + kSplitsPerWarp * kNumWarps; s < num_splits_runtime; s += kNumWarps)
-            {
-                long long const row = static_cast<long long>(s) * M + token;
-                part += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
-            }
-            s_split_part[warp_id][lane] = part;
-        }
-        __syncthreads();
-        if (warp_id == 0)
-        {
-            float split_sum = 0.0f;
+            constexpr int kNumWarps = BLOCK_SIZE / WARP_SIZE;
+            // Splits per warp that are loaded with independent loads before they are added; split counts above
+            // kMaxUnrolledSplits add their remaining splits one by one.
+            constexpr int kMaxUnrolledSplits = 112;
+            constexpr int kSplitsPerWarp = (kMaxUnrolledSplits + kNumWarps - 1) / kNumWarps;
+            __shared__ float s_split_part[kNumWarps][HC_MULT3 + 1];
             if (lane <= HC_MULT3)
+            {
+                // Lanes 0..HC_MULT3-1 read the mixes from y_acc [splits, M, HC_MULT3], lane HC_MULT3 the sqr-sum from
+                // r_acc [splits, M]; one pointer and a fixed offset step per warp keep the address math to one
+                // register.
+                bool const is_mix = lane < HC_MULT3;
+                float const* const src = is_mix ? y_acc + lane : r_acc;
+                int const split_step = is_mix ? M * HC_MULT3 : M;
+                int const warp_step = kNumWarps * split_step;
+                int off = (is_mix ? token * HC_MULT3 : token) + warp_id * split_step;
+                float vals[kSplitsPerWarp];
+#pragma unroll
+                for (int i = 0; i < kSplitsPerWarp; i++)
+                {
+                    vals[i] = (warp_id + i * kNumWarps < num_splits_runtime) ? src[off] : 0.0f;
+                    off += warp_step;
+                }
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < kSplitsPerWarp; i++)
+                {
+                    if (warp_id + i * kNumWarps < num_splits_runtime)
+                        part += vals[i];
+                }
+                for (int s = warp_id + kSplitsPerWarp * kNumWarps; s < num_splits_runtime; s += kNumWarps)
+                {
+                    part += src[off];
+                    off += warp_step;
+                }
+                s_split_part[warp_id][lane] = part;
+            }
+            __syncthreads();
+            if (warp_id == 0 && lane <= HC_MULT3)
             {
 #pragma unroll
                 for (int w = 0; w < kNumWarps; w++)
                     split_sum += s_split_part[w][lane];
             }
+        }
+        else if (warp_id == 0 && lane <= HC_MULT3)
+        {
+#pragma unroll
+            for (int s = 0; s < NUM_SPLITS; s++)
+            {
+                long long const row = static_cast<long long>(s) * M + token;
+                split_sum += (lane < HC_MULT3) ? y_acc[row * HC_MULT3 + lane] : r_acc[row];
+            }
+        }
+        if (warp_id == 0)
+        {
             unsigned constexpr kFullMask = 0xffffffffu;
             int const row_lane = lane & (HC_MULT - 1);
             r_split = __shfl_sync(kFullMask, split_sum, HC_MULT3);
@@ -215,7 +235,7 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
             for (int k = 0; k < HC_MULT; k++)
                 cm[k] = y_row[2 * HC_MULT + lane * HC_MULT + k];
         }
-        else if constexpr (NUM_SPLITS == 0)
+        else if constexpr (kLaneSplitSum)
         {
             r_val = r_split;
             y_pre = y_pre_split;
