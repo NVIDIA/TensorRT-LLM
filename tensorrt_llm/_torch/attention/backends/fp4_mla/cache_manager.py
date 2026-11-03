@@ -510,13 +510,13 @@ class Fp4MlaV2CacheLayoutPolicy:
         self._draft_manager_layer_ids = [
             LayerId(local_layer) for local_layer in sorted(self._appended_draft_layer_specs)
         ]
-        draft_lifecycle_window = (
-            self.max_seq_len
-            + self._generation_kv_capacity_headroom
-            + self._kv_reserve_draft_tokens
-            + 2
-        )
         for layer_id in self._draft_manager_layer_ids:
+            draft_lifecycle_window = (
+                self.max_seq_len
+                + self._generation_kv_capacity_headroom
+                + self._kv_reserve_draft_tokens
+                + 2
+            )
             draft_layer = cache_layers[int(layer_id)]
             cache_layers[int(layer_id)] = AttentionLayerConfig(
                 layer_id=layer_id,
