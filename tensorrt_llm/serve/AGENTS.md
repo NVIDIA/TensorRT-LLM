@@ -35,6 +35,9 @@ Name files and symbols here, never line numbers.
   outermost. Do not reorder. Check: `tests/unittest/serve/test_middleware_order.py`.
 - Import directions between layers are tests; a PR that creates a package adds its contract.
   Check: `tests/unittest/serve/test_layering.py`.
+- VisualGen serving: `serve/api/visual_gen/` (`ImageServing` and `VideoServing` on
+  `VisualGenBaseServing`; routes in `api_router.py`, one `RouterSpec`). The composition root
+  loads the package only for the VISUAL_GEN role; nothing else imports it.
 - VisualGen serve tests live under a path that contains `visual_gen/`
   (`tests/unittest/serve/api/visual_gen/`), or CI selection misses them.
 
