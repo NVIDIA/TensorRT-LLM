@@ -3,6 +3,7 @@
 
 #include "kvCacheManagerV2TestUtils.h"
 #include "kv_cache_manager_v2/batch.h"
+#include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/storageManager.h"
@@ -302,16 +303,17 @@ TEST_F(AllocationLifetimeTest, EveryBeamReallocatesReleasedFixedState)
 TEST_F(AllocationLifetimeTest, SizingCountsOnlySelectedFixedGroups)
 {
     auto manager = std::make_shared<KvCacheManager>(makeLifetimeConfig());
-    auto const counts = manager->storage().computeSlotsForBatch(
+    auto const counts = KvCacheIntrospection::computeSlotsForBatch(*manager,
         BatchDesc{{KVCacheDesc{.capacity = 64},
             KVCacheDesc{.capacity = 128,
                 .beamWidth = 3,
                 .activeAllocationGroups = std::vector<AllocationGroupId>{AllocationGroupId{30}}}}},
         4, std::nullopt);
-    EXPECT_EQ(counts[group(*manager, 1)], 4);
-    EXPECT_EQ(counts[group(*manager, 2)], 4);
-    EXPECT_EQ(counts[group(*manager, 3)], 3);
-    EXPECT_EQ(counts[group(*manager, 4)], 0);
+    auto const& storage = manager->storage();
+    EXPECT_EQ(counts[storage.getPoolGroupIndex(group(*manager, 1))], 4);
+    EXPECT_EQ(counts[storage.getPoolGroupIndex(group(*manager, 2))], 4);
+    EXPECT_EQ(counts[storage.getPoolGroupIndex(group(*manager, 3))], 3);
+    EXPECT_EQ(counts[storage.getPoolGroupIndex(group(*manager, 4))], 0);
     manager->shutdown();
 }
 
