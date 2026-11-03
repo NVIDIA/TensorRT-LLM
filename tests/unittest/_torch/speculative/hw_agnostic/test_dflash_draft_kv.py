@@ -322,26 +322,32 @@ def test_dflash_write_ctx_len_zero_length_reset_wins_over_a_pending_base() -> No
 
 
 @pytest.mark.parametrize(
-    ("bound_to_pool", "page_aligned", "reuse_addressable", "position", "expected"),
+    ("bound_to_pool", "unified", "page_aligned", "reuse_addressable", "position", "expected"),
     [
         # A disaggregated generation row: the slot starts empty at the first
         # position of the page holding its position and reads from there,
         # paired with reuse or not (the mirror of such a request never looked
         # a prefix up).
-        (True, True, False, 8200, (8192, 128)),
-        (True, True, True, 8200, (8192, 128)),
-        (True, True, False, 8192, (8192, 128)),
+        (True, False, True, False, 8200, (8192, 128)),
+        (True, False, True, True, 8200, (8192, 128)),
+        (True, False, True, False, 8192, (8192, 128)),
         # Clamped to the drafter's context ceiling, base included.
-        (True, True, False, 1 << 20, (65536, 1024)),
+        (True, False, True, False, 1 << 20, (65536, 1024)),
         # A pool window shorter than a page may already have released that
         # page: the slot starts at the position, reading from the next page.
-        (True, False, False, 8200, (8200, 129)),
+        (True, False, False, False, 8200, (8200, 129)),
+        # A unified manager holds the drafter K/V below the position (the
+        # draft layers travel with the target's prompt KV): the slot starts at
+        # the position and reads from base 0, clamped like any other.
+        (True, True, True, True, 8200, (8200, 0)),
+        (True, True, True, True, 1 << 20, (65536, 0)),
         # The private arena is slot-addressed and starts at 0.
-        (False, True, False, 8200, (0, None)),
+        (False, False, True, False, 8200, (0, None)),
     ],
 )
 def test_dflash_generation_slot_seed_is_absolute_with_a_base(
     bound_to_pool: bool,
+    unified: bool,
     page_aligned: bool,
     reuse_addressable: bool,
     position: int,
@@ -351,11 +357,13 @@ def test_dflash_generation_slot_seed_is_absolute_with_a_base(
     worker's first step, or a request whose slot was evicted) starts in the
     coordinates of its draft mirror, at a page boundary no further than a page
     below its absolute position, with every page below the base hidden from
-    the block decode."""
+    the block decode -- or, on a unified manager, at the position itself with
+    nothing hidden."""
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     worker = object.__new__(DFlashWorker)
     worker._ctx_block_tables = object() if bound_to_pool else None
+    worker._ctx_unified_cache = unified
     worker._ctx_reuse_addressable = reuse_addressable
     worker._ctx_seed_page_aligned = page_aligned
     worker._ctx_page_size = 64
