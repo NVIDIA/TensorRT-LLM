@@ -4327,6 +4327,26 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return frozenset()
 
+    def get_disagg_pool_view_partition(
+        self, layer_id: LayerId, role: DataRole
+    ) -> tuple[str, int] | None:
+        """Keep different owners and KV-head counts in separate transfer views.
+
+        Layers may share a physical pool when their buffers have equal byte
+        sizes, even if their head counts differ within the same model.
+        """
+        layer_specs = getattr(self, "layer_specs", None)
+        if layer_specs is None:
+            # Virtual storage IDs may not index the model-layer head list.
+            local_layer_id = int(layer_id)
+            if hasattr(self, "_layer_attn_to_layer_id") or not (
+                0 <= local_layer_id < len(self.num_kv_heads_per_layer)
+            ):
+                return None
+            return KVCacheLayerOwner.TARGET.value, self.num_kv_heads_per_layer[local_layer_id]
+        layer = layer_specs[int(layer_id)]
+        return layer.owner.value, layer.num_kv_heads
+
     def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
         """Return an explicitly supplied rank-local layer specification."""
         if self.layer_specs is None:

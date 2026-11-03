@@ -48,6 +48,7 @@ from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
 from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
+from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
 
@@ -3127,7 +3128,10 @@ class SpecWorkerBase(nn.Module, ABC):
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return torch.argmax(logits, dim=-1).type(torch.int32)
+        return greedy_argmax(logits,
+                             torch.int32,
+                             small_rows=spec_metadata is not None
+                             and spec_metadata.is_cuda_graph)
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
                                     spec_metadata: "SpecMetadata",
@@ -3550,6 +3554,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 vocab_offset=self.mapping.tp_rank * logits.shape[-1],
                 channel=1)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
 
         return sampled_tokens

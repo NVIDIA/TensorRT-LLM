@@ -716,15 +716,15 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "4.2.6"
+version = "4.2.7"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version == \"3.12\""
 files = [
-    {file = "filelock-4.2.6-py3-none-any.whl", hash = "sha256:fd7d4fca497bf3e3d0945a13261f8e684f2aef12ce7cf76aef26e13bf7388b88"},
-    {file = "filelock-4.2.6.tar.gz", hash = "sha256:ee7af8ede36dcaf12e1016d9f7c3a63ecd5497d46f85dab21b8c779b8f944e97"},
+    {file = "filelock-4.2.7-py3-none-any.whl", hash = "sha256:d08972bbca2b8767ee552aff877b091dd111ffb1d22de7de885766ea7d719d5e"},
+    {file = "filelock-4.2.7.tar.gz", hash = "sha256:31f6f7e3a8b6f0bd89114d30c5d5218ea1cfb63e5c4aa695b7559314a209bc7f"},
 ]
 
 [[package]]
@@ -895,14 +895,14 @@ tracing = ["opentelemetry-instrumentation-grpc (>=0.65b0,<1.0.0)"]
 
 [[package]]
 name = "google-auth"
-version = "2.62.0"
+version = "2.62.1"
 description = "Google Authentication Library"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_auth-2.62.0-py3-none-any.whl", hash = "sha256:4ff4319aeb4ad128409759d397a9fcafad126d0031d241cc0dd6b9a00b43e3f3"},
-    {file = "google_auth-2.62.0.tar.gz", hash = "sha256:0bef0ce54bdf9ce226c5d66e4264413bd918141c31bbe49fb52eac882f513d69"},
+    {file = "google_auth-2.62.1-py3-none-any.whl", hash = "sha256:015399a5abde39033c69404cc1c079e6d4c2de2993e164c9f4eac6e5376ad72b"},
+    {file = "google_auth-2.62.1.tar.gz", hash = "sha256:3c8e1ce2553784ae17fd220e6f88df3281d86ab98019278f436d06dffab17a9e"},
 ]
 
 [package.dependencies]
@@ -1869,20 +1869,21 @@ files = [
 
 [[package]]
 name = "py-spy"
-version = "0.4.2"
+version = "0.4.3"
 description = ""
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "py_spy-0.4.2-py2.py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl", hash = "sha256:1ccf688393105111684435f035bc14ec3f22117dd2b85b2414612cf27a22755a"},
-    {file = "py_spy-0.4.2-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:a0e6f6810ccf0fc5e64e85e0182a5b626c4496eec01b14fb8755154b363a4831"},
-    {file = "py_spy-0.4.2-py2.py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:142887e984a4e541071c99a4401ff8c3770f255d329dbd0f64e8c1dd51882cce"},
-    {file = "py_spy-0.4.2-py2.py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:7f1c6d9b0e2379ead5bf792df43f4cf36153aa79e6dda4fb8ac7740cf8017110"},
-    {file = "py_spy-0.4.2-py2.py3-none-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:24720573f95230653b457671a1dcc3c5a381fcf4e92677761e328a430ad251b2"},
-    {file = "py_spy-0.4.2-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl", hash = "sha256:aeb0323409199c785f730645e9f4bb7a7b9ca2c481f2c331a55642b5d13fa52f"},
-    {file = "py_spy-0.4.2-py2.py3-none-win_amd64.whl", hash = "sha256:8b06a353c177677e4e1701b288d8c58e2f8d4208ee81a8048d9f72ba800918f8"},
-    {file = "py_spy-0.4.2.tar.gz", hash = "sha256:90e600b27bb6bb40479637baca5a5b4bc2ba3395c93d889e672315d93042c4ae"},
+    {file = "py_spy-0.4.3-py2.py3-none-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl", hash = "sha256:b4e22d1fbc22bffa7d8e43c8b13daf47f56f14dbdbc813590093df81f0a971c6"},
+    {file = "py_spy-0.4.3-py2.py3-none-macosx_11_0_arm64.whl", hash = "sha256:89ccab893c89b65f8f45bd51f8173294eaeebefbfc4252345681de8048420437"},
+    {file = "py_spy-0.4.3-py2.py3-none-manylinux1_i686.manylinux_2_5_i686.whl", hash = "sha256:a21b6958bf1200ff225c4f360834a77f7e12556ac11dcd863e26c9345b468783"},
+    {file = "py_spy-0.4.3-py2.py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:8a4277225f470d394a85cca0cdd944bef87f0097b6f20150a6dd3ac2e92806b8"},
+    {file = "py_spy-0.4.3-py2.py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:bbcec46930d464b3bfc142d6d02ade4dd8ad5627823263b3eff0280e80c7c132"},
+    {file = "py_spy-0.4.3-py2.py3-none-manylinux2014_armv7l.manylinux_2_17_armv7l.whl", hash = "sha256:885d61020f763792e99cb3ad0788ae424b73cef45d5420ec9683f30e270b5d75"},
+    {file = "py_spy-0.4.3-py2.py3-none-win_amd64.whl", hash = "sha256:b14e00fddd4bfb12628e5c04b7d22c6754ae4c31bdfad0728adbe091ed26445f"},
+    {file = "py_spy-0.4.3-py2.py3-none-win_arm64.whl", hash = "sha256:7de40c2903602a7cca888c26cc5d37aed004a7fd07b5258d1a14356c00540974"},
+    {file = "py_spy-0.4.3.tar.gz", hash = "sha256:65ac4319f8c20dcd1e2ea219935c6b4fd98179b0b7faf59181eae2680a85fad4"},
 ]
 
 [package.extras]
@@ -2119,14 +2120,14 @@ typing-extensions = ">=4.16.0"
 
 [[package]]
 name = "python-discovery"
-version = "1.9.0"
+version = "1.9.1"
 description = "Python interpreter discovery"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.9.0-py3-none-any.whl", hash = "sha256:fb65edfff3541b7ceb3a39be334a0f69f4cb5148287a053e1874748742fda93b"},
-    {file = "python_discovery-1.9.0.tar.gz", hash = "sha256:88beb57e51b919c30f303b053ec41359298ca349192035b0a802c76347ae96d7"},
+    {file = "python_discovery-1.9.1-py3-none-any.whl", hash = "sha256:a78322b3b70c5d61dddc2f37ca1beffa9a5ce01cedf3526444e01bfc94f50b35"},
+    {file = "python_discovery-1.9.1.tar.gz", hash = "sha256:83e3c0024b93e256809dc9cd053537a37df6d3badc3b68aa03006a224336b21f"},
 ]
 
 [package.dependencies]

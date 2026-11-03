@@ -49,6 +49,7 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    context_first_ownership: bool = False
     # Layers a unified KV cache manager owns for the drafter (layer specs with
     # a DRAFT owner). They ride the target's pages, so both peers must agree.
     num_draft_layers: int = 0
@@ -61,6 +62,9 @@ class RankInfo:
 
     def to_bytes(self) -> bytes:
         data = asdict(self)
+        if not self.context_first_ownership:
+            # Preserve the legacy wire shape for endpoints outside this profile.
+            data.pop("context_first_ownership")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None

@@ -1148,12 +1148,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
-    @property
-    def _vocab_size(self) -> Optional[int]:
-        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
-            return self.tokenizer.tokenizer.vocab_size
-        return None
-
     @staticmethod
     def create_error_response(
             message: str,
@@ -3408,10 +3402,11 @@ class OpenAIServer(_VideoRoutesMixin):
                              "storage, which is disabled on this server."),
                 )
 
-            # Same reasoning for the web_search server tool. Dropping it lets
-            # the model answer from memory while the client believes a live
-            # search was folded in - a wrong answer it cannot detect. A 400
-            # is recoverable: drop the tool and retry.
+            # A web_search server tool this server cannot honour gets a 400
+            # only under TRTLLM_WEB_SEARCH_UNAVAILABLE=reject, for clients that
+            # drop the tool and retry rather than take an answer that may look
+            # searched. By default the request is served without the tool (see
+            # web_search_rejection_reason).
             web_search_error = web_search_rejection_reason(request.tools)
             if web_search_error is not None:
                 return self.create_error_response(
