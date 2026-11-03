@@ -155,6 +155,9 @@ class KimiK3MLAAttention(MLA):
     # forward starts (beside q_a / q_b) and joined before the tail, and whether it is still to join.
     _helix_tail_gate: Optional[torch.Tensor] = None
     _helix_tail_gate_pending: bool = False
+    # Set for one such forward that takes the fused decode query, which forks the gate behind
+    # its KV half on the aux stream instead (_forward_generation_fused_query).
+    _helix_tail_gate_behind_kv: bool = False
     # Whether o_proj takes a prequantized input (PrequantizedInputProjection); set in
     # cache_derived_state. The tail then hands it the MXFP8 form of the gated rows, set for one
     # forward in _helix_tail_operand.
@@ -490,6 +493,13 @@ class KimiK3MLAAttention(MLA):
             self.mqa.fp4_mla_kv_append_generation(latent_cache, md, heads)
             if kv_stream is not None:
                 kv_ready.record()
+            if self._helix_tail_gate_behind_kv:
+                # The fused Helix tail's gate, beside the fused query; the decode joins only the
+                # KV half, the tail joins the gate.
+                self._helix_tail_gate = self._gate(hidden_states)
+                if kv_stream is not None:
+                    self._gate_ready.record()
+                    self._helix_tail_gate_pending = True
         norm = None
         if self._fused_decode_query_norm and k3_mla_q_fused.input_supported(q):
             norm = (self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
@@ -525,6 +535,7 @@ class KimiK3MLAAttention(MLA):
             None,
             md,
             helix_v_up=True,
+            helix_output=output[:num_tokens],
             attention_input_type=AttentionInputType.generation_only,
             out_scale=self.out_scale,
             latent_cache=latent_cache,
@@ -620,7 +631,9 @@ class KimiK3MLAAttention(MLA):
         ):
             # A fused-tail batch: the decode can hold every SM, so the gate GEMM runs beside the
             # q_a / q_b GEMMs rather than after the decode.
-            if self._gate_on_aux_stream():
+            if self._takes_fused_decode_query(hidden_states, attn_metadata, latent_cache_gen):
+                self._helix_tail_gate_behind_kv = True
+            elif self._gate_on_aux_stream():
                 self._tail_gate_fork.record()
                 self._helix_tail_gate = self._fork_gate(hidden_states, self._tail_gate_fork)
                 self._helix_tail_gate_pending = True
@@ -638,6 +651,7 @@ class KimiK3MLAAttention(MLA):
         finally:
             self._helix_tail_gate = None
             self._helix_tail_gate_pending = False
+            self._helix_tail_gate_behind_kv = False
             self._helix_tail_operand = None
 
     def _join_tail_gate(self) -> None:
