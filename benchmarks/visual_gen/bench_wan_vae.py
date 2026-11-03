@@ -547,7 +547,8 @@ def _parse_args() -> argparse.Namespace:
         "--alloc-stats",
         action="store_true",
         help="after timing, run the op once more eagerly and record the caching allocator's "
-        "allocation count, allocated bytes and peak memory for that steady-state run",
+        "request count, requested bytes, new device segments and peak memory for that "
+        "steady-state run",
     )
     parser.add_argument(
         "--span-diffs",
@@ -697,8 +698,9 @@ def _run_backend(
 def _allocation_pass(run_fn: Callable[[], Any]) -> dict[str, Any]:
     """One steady-state eager run, measured with the caching allocator's counters.
 
-    Returns the allocation count, the bytes allocated and the peak memory above the memory
-    in use when the run starts.
+    Returns the allocation request count, the bytes requested (GiB), the device segments
+    (``cudaMalloc`` calls) the allocator added, and the peak allocated memory above the
+    memory allocated when the run starts (GiB).
     """
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()
@@ -710,6 +712,7 @@ def _allocation_pass(run_fn: Callable[[], Any]) -> dict[str, Any]:
     del out
     return {
         "allocations": after["allocation.all.allocated"] - before["allocation.all.allocated"],
+        "segments": after["segment.all.allocated"] - before["segment.all.allocated"],
         "allocated_gb": (
             after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]
         )

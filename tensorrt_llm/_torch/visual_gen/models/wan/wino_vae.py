@@ -1558,6 +1558,8 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
             ]
             kv = torch.cat(per_rank, dim=1).unsqueeze(1)
         else:
+            # Rank-major rows [W, T, P, 2C] repacked into per-frame sequences [T, W * P, 2C]:
+            # for T > 1 and W > 1 the reshape is a copy of K and V.
             kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
             kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
         k, v = kv.chunk(2, dim=-1)
