@@ -89,7 +89,7 @@ window.MOE_DASHBOARD_CONFIG = {
   // Curation over the index: what to surface and default selections.
   display: {
     topN: 3,
-    hardwareOrder: ["GB200", "GB300", "B200", "B300", "H100"],
+    hardwareOrder: ["GB200", "GB300", "B200", "B300", "Rubin", "H100"],
     hiddenFiles: [],
     // Backstop, not a curation rule: every real scenario fans out well under this
     // (107 cards is the widest dataset today). It exists to catch a future dataset
