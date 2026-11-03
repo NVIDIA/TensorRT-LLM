@@ -549,7 +549,6 @@ class CuteDslMlaFmha(PhasedFmha):
             and seq_len_q > 1
             and meta.helix_position_offsets is None
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
-            and get_sm_version() in (100, 103, 107)
         )
         if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
             # Perf gate (NOT a correctness limit).
