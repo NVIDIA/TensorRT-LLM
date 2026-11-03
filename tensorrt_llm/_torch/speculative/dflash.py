@@ -638,7 +638,8 @@ class DFlashSpecMetadata(SpecMetadata):
                         assigned[slot] = min(
                             int(self.host_position_ids[token_offset]), worker._max_ctx
                         )
-            worker._write_ctx_len(assigned)
+            if assigned:
+                worker._write_ctx_len(assigned)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context. A
@@ -1275,16 +1276,12 @@ class DFlashWorker(SpecWorkerBase):
         # is taken before the clamp erases the placeholders; it is informative
         # only on the python V2 backend, the cpp one already mapped
         # BAD_PAGE_INDEX to 0.
-        encoded = src[self._ctx_pool_idx, :num_seqs, 0]
-        if self._ctx_block_offset:
-            # Use int64 to avoid underflowing negative placeholders, and keep
-            # the metadata's table unchanged when removing the layer offset.
-            encoded = encoded.to(torch.int64) - self._ctx_block_offset
         decode_draft_block_table(
-            encoded,
+            src[self._ctx_pool_idx, :num_seqs, 0],
             self._ctx_block_divisor,
             self._ctx_block_tables,
             self._ctx_block_counts,
+            block_offset=self._ctx_block_offset,
         )
         return True
 

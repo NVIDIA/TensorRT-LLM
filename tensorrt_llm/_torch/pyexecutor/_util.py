@@ -2326,6 +2326,8 @@ class KvCacheCreator:
         backend = self._unified_drafter_attention_backend()
         if backend != "TRTLLM":
             return f"the drafter attention_backend is {backend}, not TRTLLM"
+        if self._tokens_per_block not in (16, 32, 64):
+            return f"tokens_per_block is {self._tokens_per_block}, not 16, 32, or 64"
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
         if spec_config.draft_len_schedule is not None:
@@ -2341,6 +2343,9 @@ class KvCacheCreator:
         if _has_variable_kv_cache_geometry(
                 self._model_engine.model.model_config):
             return "the target uses different KV cache geometry across layers"
+        if getattr(self._kv_cache_config, "mixed_precision_kv",
+                   None) is not None:
+            return "retained-token mixed-precision KV cache is enabled"
         if self._llm_args.kv_cache_compression_config is not None:
             return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
@@ -2348,7 +2353,8 @@ class KvCacheCreator:
         if self._kv_cache_manager_cls is not KVCacheManagerV2:
             return "the target does not use KVCacheManagerV2"
         target_layout = self._dflash_kv_layout(
-            self._model_engine.model.model_config, self._model_engine.dtype)
+            self._model_engine.model.model_config,
+            self._model_engine.model.config.torch_dtype)
         draft_model_config = self._get_draft_kv_model_config()
         draft_layout = self._dflash_kv_layout(
             draft_model_config,
@@ -2371,6 +2377,10 @@ class KvCacheCreator:
                     int(draft_model_config.pretrained_config.num_hidden_layers))
             ))
         if len(set(draft_windows)) > 1:
+            logger.info_once(
+                f"{self._unified_drafter_name()}: draft layers have different "
+                "effective attention windows; keeping a separate draft KV cache.",
+                key="dflash_mixed_draft_windows_fallback")
             return "the draft layers use different attention windows"
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout, draft_layout):
@@ -2473,7 +2483,7 @@ class KvCacheCreator:
         target_local_ids = list(self._mapping.pp_layers(target_layers))
         target_heads, target_head_dim, target_dtype, target_k_only = (
             self._dflash_kv_layout(target_model_config,
-                                   self._model_engine.dtype))
+                                   self._model_engine.model.config.torch_dtype))
         target_window_config = kv_cache_config.max_attention_window
         if target_window_config is None:
             target_window_config = _derive_v2_layer_type_attention_windows(

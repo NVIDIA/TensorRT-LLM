@@ -2715,6 +2715,21 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
             return ("speculative_config to be DFlash with attention_backend "
                     "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
                     "in both sections")
+        if (spec.get("draft_len_schedule") is not None
+                or spec.get("max_concurrency") is not None):
+            return "draft_len_schedule and max_concurrency to be unset in both sections"
+        if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
+            return "attn_backend TRTLLM in both sections"
+        if (cfg.other_args.get("pipeline_parallel_size", 1) != 1
+                or cfg.other_args.get("context_parallel_size", 1) != 1):
+            return "pipeline_parallel_size and context_parallel_size to be 1 in both sections"
+        if cfg.other_args.get("kv_cache_compression_config") is not None:
+            return "kv_cache_compression_config to be unset in both sections"
+        kv_cache = cfg.other_args.get("kv_cache_config") or {}
+        if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
+            return "a uniform KV cache dtype in both sections"
+        if kv_cache.get("tokens_per_block", 32) not in (16, 32, 64):
+            return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
     return None
 
 

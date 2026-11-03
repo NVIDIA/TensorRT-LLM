@@ -35,12 +35,14 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
-    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
     _get_generation_kv_capacity,
     _get_kv_alloc_extra_tokens,
     _get_static_cache_size_layer_components,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -1254,7 +1256,7 @@ def test_creator_uses_v2_affine_cache_cost():
 
 
 def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
-    windowed = KVCacheLayerSpec(
+    windowed = KVCacheStorageLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
         dtype=DataType.BF16,
@@ -1324,7 +1326,7 @@ def test_v2_dspark_resolved_width_sizes_shared_cache_costs(
 ) -> None:
     """One extra draft position can require a full page in every cost estimate."""
     spec_config = DSparkDecodingConfig(max_draft_len=7, speculative_model="draft")
-    target = KVCacheLayerSpec(
+    target = KVCacheStorageLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
         dtype=DataType.BF16,
@@ -1373,7 +1375,7 @@ def test_v2_resolved_draft_width_does_not_change_target_only_headroom(
     layer_specs = None
     if with_target_layer:
         layer_specs = [
-            KVCacheLayerSpec(
+            KVCacheStorageLayerSpec(
                 global_layer_id=0,
                 owner=KVCacheLayerOwner.TARGET,
                 dtype=DataType.BF16,
@@ -1995,6 +1997,58 @@ def _mixed_schedule_pretrained(layer_types: list[str], **overrides: object) -> S
     return SimpleNamespace(**fields)
 
 
+@pytest.mark.parametrize("publish_model_geometry", [False, True])
+def test_create_kv_cache_manager_preserves_storage_layer_specs(
+    publish_model_geometry: bool,
+) -> None:
+    captured = {}
+
+    class RecordingManager(KVCacheManagerV2):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    target = KVCacheStorageLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    storage_specs = (
+        target,
+        replace(target, global_layer_id=1, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16),
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=_mixed_schedule_pretrained([_FULL]),
+        quant_config=None,
+        kv_cache_layer_specs=(
+            (ModelKVCacheLayerSpec(head_dim=128, num_kv_heads=8, num_q_heads=8),)
+            if publish_model_geometry
+            else None
+        ),
+    )
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=RecordingManager,
+        mapping=Mapping(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=4096,
+        max_batch_size=4,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=1024,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        layer_specs=storage_specs,
+    )
+
+    assert captured["layer_specs"] is storage_specs
+
+
 def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) -> SimpleNamespace:
     """The fields `get_num_spec_layers` and `should_use_separate_draft_kv_cache`
     read from an Eagle3 one-model speculative config."""
@@ -2132,7 +2186,7 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default(
 
 
 def _fp8_target_bf16_draft_specs(*, draft_window):
-    target = KVCacheLayerSpec(
+    target = KVCacheStorageLayerSpec(
         global_layer_id=0,
         owner=KVCacheLayerOwner.TARGET,
         dtype=DataType.FP8,
