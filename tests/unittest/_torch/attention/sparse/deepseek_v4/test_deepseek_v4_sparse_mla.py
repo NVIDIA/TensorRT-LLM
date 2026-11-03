@@ -48,6 +48,12 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCach
 from tensorrt_llm.mapping import Mapping
 
 
+@pytest.fixture(autouse=True)
+def _strict_precompile_workers(monkeypatch):
+    """A PrimTS precompile worker failure is an error here, not a logged fallback."""
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+
+
 @dataclass(kw_only=True, frozen=True)
 class Scenario:
     dtype: torch.dtype = torch.bfloat16

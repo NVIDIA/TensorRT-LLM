@@ -7,11 +7,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.qsa import (
-    QSAMambaHybridCacheManagerV2,
     QSASparseMetadataParams,
     QSASparseParams,
 )
-from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import QSA_SIDE_PLANES
 from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     QSAIndexer,
     _position_coordinates,
@@ -39,6 +37,10 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.module import (
     select_qsa_tokens,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
+    QSA_SIDE_PLANES,
+    Qwen4ExpHybridCacheManager,
+)
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
@@ -1484,7 +1486,8 @@ def test_fused_qsa_prefill_bounds_sparse_attention_to_visible_tokens() -> None:
 
 
 def test_qsa_side_buffers_use_exact_geometry_and_one_position_role() -> None:
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._qsa_enabled = True
     manager.qsa_index_dim = 128
     manager.qsa_index_kv_heads = 1
     manager.qsa_sparse_layer_ids = [7, 11]
@@ -1504,7 +1507,8 @@ def test_qsa_side_buffers_pack_when_a_page_size_matches_the_main_cache() -> None
     """An index page the size of a K/V page would coalesce into the K/V pool,
     so both sparse layers' index pages and the position page become one
     buffer on the first layer, sized past every main-cache page size."""
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+    manager._qsa_enabled = True
     manager.qsa_index_dim = 128
     manager.qsa_index_kv_heads = 1
     manager.qsa_sparse_layer_ids = [7, 11]
@@ -1536,14 +1540,14 @@ def test_qsa_position_buffer_keeps_shared_index_mode_outside_dynamo() -> None:
             del layer_idx, role
             return 0
 
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_position_layer_id = 7
     manager.qsa_side_planes_size = None
     manager.layer_offsets = {7: 2}
     manager.impl = _Impl()
     manager.tokens_per_block = 128
 
-    with pytest.raises(RuntimeError, match="position-cache page stride mismatch"):
+    with pytest.raises(RuntimeError, match="Slot-view page stride mismatch"):
         manager.get_qsa_position_buffer()
 
     assert len(calls) == 1
@@ -1688,9 +1692,9 @@ class _QsaPageImpl:
 
 def _qsa_layout_manager(
     *, sparse_layer_ids, pool_id, scale, num_pools, max_blocks_per_seq
-) -> QSAMambaHybridCacheManagerV2:
+) -> Qwen4ExpHybridCacheManager:
     """A V2 QSA manager reduced to the page layout the metadata reads."""
-    manager = object.__new__(QSAMambaHybridCacheManagerV2)
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
     manager.qsa_sparse_layer_ids = list(sparse_layer_ids)
     manager.layer_offsets = {layer: local for local, layer in enumerate(sparse_layer_ids)}
     manager.qsa_position_layer_id = sparse_layer_ids[0]

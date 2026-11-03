@@ -35,6 +35,7 @@ _SHAPES = [
     (512, 32783, 2048),
     (256, 131087, 2048),
     (512, 131075, 1024),
+    (4, 32771, 2048),  # reg_clus with K=2048
 ]
 _PATTERNS = ["unique", "quantized", "equal", "boundary", "clustered"]
 

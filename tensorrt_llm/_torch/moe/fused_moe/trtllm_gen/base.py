@@ -46,7 +46,6 @@ from ..activation import (
     MoEActivationSupport,
 )
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
-from ..impl_contract import identity_quant_of, require_layer_quant_format
 from ..impl_identity import MOE_IMPL_REGISTRY
 from ..interface import FORCE_SEPARATED_ROUTING, MoEWeightLoadingMode
 from ..moe_op_backend import MoEOpBackend, get_op_backend
@@ -223,6 +222,9 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
         self.max_num_tokens = model_config.max_num_tokens
+        # Declared by the model: the FP4 block-scale op tunes for its decode steps
+        # (FP4BlockScaleMoERunner.get_tuning_config).
+        self.decode_tuning = bool(model_config.extra_attrs.get("moe_decode_tuning", False))
 
         self.op_backend: MoEOpBackend = get_op_backend(self.provider)
 
@@ -372,13 +374,6 @@ class TrtllmGenFusedMoEBase(MoEImplBase):
 
         if self.needs_zero_expert_bias and not self.bias:
             self._allocate_zero_expert_bias()
-
-    def _check_quant_config_is_my_format(self) -> None:
-        """Fail loudly if this layer ended up on a leaf of the wrong format.
-
-        See :func:`..impl_contract.require_layer_quant_format`.
-        """
-        require_layer_quant_format(self, identity_quant_of(type(self)))
 
     def _create_quant_method_weights(self) -> None:
         """Hand the module to its quantization method, and settle the layout.

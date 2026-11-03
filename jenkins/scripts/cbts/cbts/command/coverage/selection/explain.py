@@ -38,7 +38,6 @@ import click
 
 from cbts.coverage.selection.python_change_analysis import (
     analyze_python_changes,
-    closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
@@ -148,7 +147,6 @@ def _run(args: _Args) -> int:
             pre_source=reconstruct_diff_pre_image(src, diffs.get(f, "")),
         )
         import_executed = import_executed_qualnames(src)
-        closures = closure_attributed_qualnames(src, lines)
 
         def record_impact(q: str) -> None:
             if db.tests_touching_func(cf, q):
@@ -165,8 +163,6 @@ def _run(args: _Args) -> int:
             if q in import_executed:
                 for consumer in dependencies.binding_consumers:
                     record_impact(consumer)
-            elif q in closures:
-                impact_files.add(cf)
             else:
                 record_impact(q)
     no_data = res.no_data_funcs

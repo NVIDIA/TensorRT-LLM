@@ -10,9 +10,6 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
-#: The Beam dense block's bias-free projections at its three fresh-context lengths: q and
-#: the attention gate 5120 -> 6144, k and v 5120 -> 1024, o 6144 -> 5120, the feed-forward
-#: gate and up 5120 -> 20480, and down 20480 -> 5120.
 _BEAM_DENSE_BLOCK = tuple(
     Cell(
         why=f"beam dense {name} {k}->{n}, {m} tokens",
@@ -27,7 +24,7 @@ _BEAM_DENSE_BLOCK = tuple(
     )
     for m in (1, 17, 129)
 )
-#: The Beam six-block model's bias-free, untied head: 5120 -> the 151936-entry vocabulary.
+
 _BEAM_HEAD = tuple(
     Cell(
         why=f"beam head 5120->151936, {m} tokens",
@@ -46,64 +43,18 @@ class CublasMm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # Both targets use this for every dense projection, so the cells are the
-    # three argument shapes that differ in kind rather than in size: fused bias
-    # (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
+    # Both targets use this for every dense projection. This entry's test
+    # carries their three argument shapes that differ in kind rather than in size: fused
+    # bias (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
-    # asks for fp32 logits). The Beam dense block's cells are by size: every
-    # projection it makes, at each of its context lengths.
+    # asks for fp32 logits).
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="gpt-oss qkv with fused bias: hidden 2880 -> (64 + 8 + 8) * 64",
-            spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek q_a, no bias: hidden 7168 -> q_lora 1536",
-            spec=dict(m=16, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek router: bf16 in, fp32 logits out, 256 experts",
-            spec=dict(
-                m=16, k=7168, n=256, dtype=torch.bfloat16, bias=False, out_dtype=torch.float32
-            ),
-        ),
         Cell(
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
         *_BEAM_DENSE_BLOCK,
         *_BEAM_HEAD,
-        Cell(
-            why="deepseek default q_b at attention TP4: q_lora 1536 -> 32 heads x 192",
-            spec=dict(m=16, k=1536, n=6144, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek default kv_b at attention TP8: kv_lora 512 -> 16 heads x 256",
-            spec=dict(m=64, k=512, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek default o_proj at attention TP8: 16 heads x 128 -> hidden 7168",
-            spec=dict(m=16, k=2048, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        # The MTP layer's own GEMMs. Its eh_proj is replicated on every rank; its
-        # shared expert is bf16 (the NVFP4 export skips layer 61), so it runs here
-        # rather than in nvfp4_gemm, split over attention TP like the trunk's.
-        Cell(
-            why="deepseek MTP eh_proj: [enorm(e) | hnorm(h)] 2 x 7168 -> hidden 7168",
-            spec=dict(m=16, k=14336, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek MTP shared expert gate_up, whole under attention DP: 7168 -> 2 x 2048",
-            spec=dict(m=16, k=7168, n=4096, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek MTP shared expert gate_up at attention TP8: 7168 -> 2 x 256",
-            spec=dict(m=16, k=7168, n=512, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
-        Cell(
-            why="deepseek MTP shared expert down at attention TP8: 256 -> hidden 7168",
-            spec=dict(m=16, k=256, n=7168, dtype=torch.bfloat16, bias=False, out_dtype=None),
-        ),
     )
 
     note = """

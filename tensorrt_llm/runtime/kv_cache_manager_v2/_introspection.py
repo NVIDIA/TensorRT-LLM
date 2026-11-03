@@ -246,14 +246,307 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
-def grains_for_slots(num_slots: int, slot_size_list: list[int], granularity: int) -> int:
-    """Return the grain count required for a pool group slot count."""
-    return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity))
+def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
+    """Resident unit ordinal per sparse cache entry, laid out [buffer][entry].
+
+    A free entry holds the bad-ordinal sentinel, which is -1, the same value as
+    BAD_PAGE_INDEX. Empty when the life cycle reserves no cache.
+    """
+    return list(_cpp().sparse_cache_resident_ordinals(kv_cache, lc_id))
 
 
-def grains_to_slots(pg_grains: int, slot_size_list: list[int], granularity: int) -> tuple[int, int]:
+def sparse_cache_base_cell(kv_cache: Any, lc_id: int, pool: int = 0) -> int | None:
+    """First cell of this request's lease in one pool's arena region, or None if it holds none.
+
+    Identifies the lease the way the page list used to identify the reservation, now that a
+    lease is one contiguous run of cells rather than scattered slots. Per pool, because the
+    arena mirrors the hot pool group: buffers of different sizes sit in regions of their own.
+    """
+    cell = _cpp().sparse_cache_base_cell(kv_cache, lc_id, pool)
+    return None if cell is None else int(cell)
+
+
+def sparse_flush_counts(kv_cache: Any, lc_id: int) -> list[int]:
+    """Units the last write-back moved for this cache's row, per layer.
+
+    -1 where no write-back has run for that layer, which distinguishes "never flushed"
+    from "flushed and found nothing resident".
+
+    The lists belong to the Batch rather than the request -- one scan covers every row --
+    so this reads the cache's own row out of it, and an unbatched cache has none.
+    """
+    return list(_cpp().sparse_flush_counts(kv_cache, lc_id))
+
+
+def batch_page_table(batch: Any, layer_group_id: int) -> list[int]:
+    """A Batch's published device page table, row-major [max_batch][max_blocks_per_seq].
+
+    Reads the device copy, so it shows what the last publish() put there rather than what
+    the staging rows currently hold. Synchronises.
+    """
+    return list(_cpp().batch_page_table(batch, layer_group_id))
+
+
+def batch_index_table_slot(batch: Any, layer_id: int, role: str) -> tuple[int, int]:
+    """``(table, entry)`` serving one buffer.
+
+    A consumer names a table by the spec it asked for -- :meth:`Batch.index_table_id` --
+    and slices it at the buffer's position in that spec, which it already knows. This is
+    the same answer reached from the buffer, and exists so a test can compare the two.
+    """
+    return tuple(_cpp().batch_index_table_slot(batch, layer_id, role))
+
+
+def batch_index_table_base(batch: Any, layer_id: int, role: str) -> int:
+    """What a converted index for one buffer is added to.
+
+    Buffers sharing a pool share it, their own offsets being already in the entries.
+    """
+    return _cpp().batch_index_table_base(batch, layer_id, role)
+
+
+def batch_index_table(batch: Any, table_id: int) -> list[int]:
+    """A Batch's converted index table, row-major [max_batch][entries][blocks_per_seq].
+
+    Reads the device copy, so it shows what the last publish() converted rather than what
+    the raw staging holds. Synchronises.
+    """
+    return list(_cpp().batch_index_table(batch, table_id))
+
+
+def batch_gpu_coalesced_page_table(batch: Any, layer_group_id: int) -> Any:
+    """One layer group's coalesced page table on the device, as a DLPack array.
+
+    ``int32[max_batch, max_blocks_per_seq]``. A view rather than a copy, so unlike the
+    other hooks here it neither synchronises nor returns a plain list: callers check the
+    device-array contract and that the pointer is stable across resizes. The indices a
+    consumer actually reads come from ``Batch.coalesced_page_table()``, on the host.
+    """
+    return _cpp().batch_gpu_coalesced_page_table(batch, layer_group_id)
+
+
+def batch_sparse_entries_per_row(batch: Any, layer_group_id: int) -> list[int]:
+    """Metadata entries per layer of the lease each row holds.
+
+    Zero where the row holds none, so this is non-zero exactly where a member holds a
+    reservation for that layer group. Synchronises.
+    """
+    return list(_cpp().batch_sparse_entries_per_row(batch, layer_group_id))
+
+
+def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
+    """A Batch's published per-row (history_length, capacity), in tokens.
+
+    Reads the device copy, so it shows what the last publish() put there. Synchronises.
+    """
+    history, capacity = _cpp().batch_watermarks(batch)
+    return list(history), list(capacity)
+
+
+class SparseResolveResult(NamedTuple):
+    """State and outputs of one sparse resolve launch."""
+
+    resident_ordinal: list[int]
+    lru_order: list[int]
+    out_slot: list[int]
+    #: The compacted work list, one run per layer, of which the first ``miss_total[layer]``
+    #: are valid. Entry order is whatever the CTAs raced to, so compare as a set.
+    miss_row: list[int]
+    miss_ordinal: list[int]
+    miss_slot: list[int]
+    miss_total: list[int]
+    miss_count: list[int]
+    in_flight_slot: list[int]
+
+
+def sparse_unit_copy(
+    host_pool: bytes | list[int],
+    host_page_stride: int,
+    page_table: list[int],
+    device_arena: bytes | list[int],
+    base_cell: int,
+    num_blocks: int,
+    cells_per_buffer: int,
+    buffer_bytes: int,
+    num_chunks: int,
+    chunk_bytes: int,
+    chunk_stride: int,
+    unit_stride: int,
+    expansion: int,
+    miss_ordinal: list[int],
+    miss_slot: list[int],
+    miss_count: list[int],
+    selection_width: int,
+    buffer_layer: list[int],
+    write_back: bool = False,
+    grid_ctas: int = 1,
+) -> list[int]:
+    """Move units between a caller-supplied cold pool and cache entries.
+
+    Exercises the copy's address arithmetic against a known byte pattern. Returns the
+    destination pool: the cache pool when fetching, the cold pool when writing back.
+
+    ``page_table`` holds converted indices, [num_buffers][num_blocks]: one entry per
+    buffer, each counting whole buffers rather than coalesced slots, so a buffer's offset
+    within its page is already in the value and ``host_page_stride`` is one buffer.
+
+    ``buffer_layer`` maps each buffer to the work-list row it reads, so buffers of one
+    layer share a list; its length is the number of buffers copied.
+
+    ``grid_ctas`` is how many CTAs walk the compacted list. Only throughput depends on it,
+    so a result must not. Synchronises.
+    """
+    return list(
+        _cpp().sparse_unit_copy(
+            list(host_pool),
+            host_page_stride,
+            page_table,
+            list(device_arena),
+            base_cell,
+            num_blocks,
+            cells_per_buffer,
+            buffer_bytes,
+            num_chunks,
+            chunk_bytes,
+            chunk_stride,
+            unit_stride,
+            expansion,
+            miss_ordinal,
+            miss_slot,
+            miss_count,
+            selection_width,
+            buffer_layer,
+            write_back,
+            grid_ctas,
+        )
+    )
+
+
+class SparseFlushList(NamedTuple):
+    """Entries holding units a watermark move has just passed."""
+
+    #: The compacted list, one run per layer, of which the first ``total[layer]`` are
+    #: valid. Entry order is whatever the CTAs raced to, so compare as a set.
+    row: list[int]
+    ordinal: list[int]
+    slot: list[int]
+    total: list[int]
+    count: list[int]
+
+
+def sparse_flush_list(
+    resident_ordinal: list[int],
+    num_layers: int,
+    entries_per_layer: int,
+    from_units: int,
+    to_units: int,
+    max_flush_units: int,
+) -> SparseFlushList:
+    """Collect the entries whose units fall in ``[from_units, to_units)``.
+
+    These are the units the watermark has just made selectable, so they must reach their
+    host pages before any later fetch can read them. Synchronises.
+    """
+    row, ordinal, slot, total, count = _cpp().sparse_flush_list(
+        resident_ordinal,
+        num_layers,
+        entries_per_layer,
+        from_units,
+        to_units,
+        max_flush_units,
+    )
+    return SparseFlushList(list(row), list(ordinal), list(slot), list(total), list(count))
+
+
+def sparse_resolve(
+    resident_ordinal: list[int],
+    lru_order: list[int],
+    num_layers: int,
+    entries_per_layer: int,
+    selected: list[int],
+    selection_width: int,
+    history_units: int | list[int],
+    capacity_units: int | list[int] = 0,
+    max_in_flight_units: int = 0,
+    inactive_rows: list[int] | None = None,
+) -> SparseResolveResult:
+    """Run the sparse resolve kernel over caller-supplied cache state.
+
+    Issues one launch per layer, as a step does: a layer's selection is not known until
+    the previous layer has run. Cache state is therefore [row][layer][entry], following
+    the view each row owns, while the selection and every output are [layer][row][width]
+    so that each launch sees a contiguous slice of its own.
+
+    A negative selection entry is padding. ``inactive_rows`` get a default view, standing
+    in for a row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
+    flight: they are made resident before the selection takes any victim, are never
+    chosen as victims themselves, and never enter the miss list because their host pages
+    hold nothing to fetch. Synchronises.
+    """
+    # One row unless the caller passes per-row lists; the kernel is batched either way.
+    history = [history_units] if isinstance(history_units, int) else list(history_units)
+    if isinstance(capacity_units, int):
+        capacity = [max(capacity_units, h) for h in history]
+    else:
+        capacity = list(capacity_units)
+
+    (
+        resident,
+        lru,
+        out,
+        miss_row,
+        miss_ord,
+        miss_slot,
+        miss_total,
+        miss_count,
+        in_flight,
+    ) = _cpp().sparse_resolve(
+        resident_ordinal,
+        lru_order,
+        num_layers,
+        entries_per_layer,
+        selected,
+        selection_width,
+        history,
+        capacity,
+        max_in_flight_units,
+        list(inactive_rows or []),
+    )
+    return SparseResolveResult(
+        list(resident),
+        list(lru),
+        list(out),
+        list(miss_row),
+        list(miss_ord),
+        list(miss_slot),
+        list(miss_total),
+        list(miss_count),
+        list(in_flight),
+    )
+
+
+def grains_for_slots(
+    num_slots: int,
+    slot_size_list: list[int],
+    granularity: int,
+    pools: list[int] | None = None,
+) -> int:
+    """Return the grain count required for a pool group slot count.
+
+    ``pools`` names which of ``slot_size_list``'s pools to count, defaulting to all of
+    them -- which is what a caller with a single budget means.
+    """
+    return int(_cpp().grains_for_slots(num_slots, slot_size_list, granularity, pools))
+
+
+def grains_to_slots(
+    pg_grains: int,
+    slot_size_list: list[int],
+    granularity: int,
+    pools: list[int] | None = None,
+) -> tuple[int, int]:
     """Return (slot count, consumed grains) for a pool group grain budget."""
-    slots, used = _cpp().grains_to_slots(pg_grains, slot_size_list, granularity)
+    slots, used = _cpp().grains_to_slots(pg_grains, slot_size_list, granularity, pools)
     return int(slots), int(used)
 
 
@@ -263,10 +556,28 @@ def ratio_to_slot_count_list(
     ratio_list: list[float],
     granularity: int,
     min_slots: list[int],
+    second_quota: int | None = None,
+    second_granularity: int | None = None,
+    second_pools: list[list[int]] | None = None,
 ) -> list[int]:
-    """Return slot counts by pool group for a quota and ratio list."""
+    """Return slot counts by pool group for a quota and ratio list.
+
+    ``slot_size_lists`` holds every pool's size. A second medium's budget is given by
+    ``second_quota`` with its own ``second_granularity`` and ``second_pools``; the quota
+    pays for every pool that budget does not name, so the two cannot overlap or leave a
+    pool unpaid.
+    """
     return list(
-        _cpp().ratio_to_slot_count_list(quota, slot_size_lists, ratio_list, granularity, min_slots)
+        _cpp().ratio_to_slot_count_list(
+            quota,
+            slot_size_lists,
+            ratio_list,
+            granularity,
+            min_slots,
+            second_quota,
+            second_granularity,
+            second_pools,
+        )
     )
 
 
@@ -337,3 +648,8 @@ def compute_slots_for_batch(
 ) -> list[int]:
     """Return the minimum per-pool-group slot counts to support ``batch``."""
     return list(_cpp().compute_slots_for_batch(manager, batch, tokens_per_block, swa_scratch_reuse))
+
+
+def tier_allocation_granularity(tier: Any, quota: int) -> int:
+    """Return the unit a ``tier`` of ``quota`` bytes allocates its pools in."""
+    return _cpp().tier_allocation_granularity(tier, quota)
