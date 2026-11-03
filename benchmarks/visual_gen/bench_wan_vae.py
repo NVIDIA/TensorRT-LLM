@@ -546,9 +546,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--alloc-stats",
         action="store_true",
-        help="after timing, run the op once more eagerly and record the caching allocator's "
-        "request count, requested bytes, new device segments and peak memory for that "
-        "steady-state run",
+        help="after timing, run the op eagerly three more times and record, per call, the "
+        "caching allocator's request count, requested bytes, new device segments and peak "
+        "memory",
     )
     parser.add_argument(
         "--span-diffs",
@@ -695,33 +695,41 @@ def _run_backend(
     return row, out_cpu
 
 
-def _allocation_pass(run_fn: Callable[[], Any]) -> dict[str, Any]:
-    """One steady-state eager run, measured with the caching allocator's counters.
+def _allocation_pass(run_fn: Callable[[], Any], calls: int = 3) -> list[dict[str, Any]]:
+    """Consecutive eager runs after timing, each measured with the caching allocator's counters.
 
-    Returns the allocation request count, the bytes requested (GiB), the device segments
+    One record per call (the first can include a one-time transition, e.g. out of graph
+    capture): the allocation request count, the bytes requested (GiB), the device segments
     (``cudaMalloc`` calls) the allocator added, and the peak allocated memory above the
-    memory allocated when the run starts (GiB).
+    memory allocated when the call starts (GiB). Each call's output is released before the
+    next; the allocator cache is kept.
     """
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_stats()
-    torch.cuda.reset_peak_memory_stats()
-    with torch.inference_mode():
-        out = run_fn()
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    del out
-    return {
-        "allocations": after["allocation.all.allocated"] - before["allocation.all.allocated"],
-        "segments": after["segment.all.allocated"] - before["segment.all.allocated"],
-        "allocated_gb": (
-            after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]
+    records = []
+    for _ in range(calls):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_stats()
+        torch.cuda.reset_peak_memory_stats()
+        with torch.inference_mode():
+            out = run_fn()
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+        del out
+        records.append(
+            {
+                "allocations": after["allocation.all.allocated"]
+                - before["allocation.all.allocated"],
+                "segments": after["segment.all.allocated"] - before["segment.all.allocated"],
+                "allocated_gb": (
+                    after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]
+                )
+                / 2**30,
+                "peak_above_start_gb": (
+                    after["allocated_bytes.all.peak"] - before["allocated_bytes.all.current"]
+                )
+                / 2**30,
+            }
         )
-        / 2**30,
-        "peak_above_start_gb": (
-            after["allocated_bytes.all.peak"] - before["allocated_bytes.all.current"]
-        )
-        / 2**30,
-    }
+    return records
 
 
 def _accuracy_pass(
