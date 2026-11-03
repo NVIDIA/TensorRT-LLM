@@ -102,6 +102,8 @@ keeps track of the sequences, allocates new blocks from a pool, and recycles tho
 The PyTorch executor integrates the cache managers through
 [`KVCacheManager`](source:tensorrt_llm/_torch/pyexecutor/resource_manager.py) and
 [`KVCacheManagerV2`](source:tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py).
+The V1 `KVCacheManager` wraps the C++ block manager under the
+[Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
 See [Selecting the KV Cache Manager](kvcache.md#selecting-the-kv-cache-manager)
 for configuration and compatibility details.
 
