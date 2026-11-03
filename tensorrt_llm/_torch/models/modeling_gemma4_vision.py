@@ -40,7 +40,7 @@ Architecture references (HF transformers 5.5.3 ``modeling_gemma4.py``):
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -759,7 +759,7 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
         pixel_values: torch.Tensor,
         pixel_position_ids: torch.Tensor,
         output_length: Optional[int] = None,
-        image_seq_lens: Optional[List[int]] = None,
+        image_seq_lens: Optional[Union[torch.Tensor, List[int]]] = None,
     ) -> VisionOutput:
         if output_length is None:
             k = self.config.pooling_kernel_size
@@ -789,7 +789,7 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
             assert len(image_seq_lens) == B, (
                 f"image_seq_lens length mismatch: got {len(image_seq_lens)}, expected {B}"
             )
-            seq_lens_cpu = torch.tensor(image_seq_lens, dtype=torch.int, device="cpu")
+            seq_lens_cpu = torch.as_tensor(image_seq_lens, dtype=torch.int, device="cpu")
         else:
             seq_lens_cpu = torch.full((B,), N, dtype=torch.int, device="cpu")
 

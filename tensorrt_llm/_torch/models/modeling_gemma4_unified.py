@@ -50,6 +50,7 @@ the repo's pinned transformers.
 """
 
 import copy
+import itertools
 import json
 import math
 import os
@@ -225,13 +226,60 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
         multimodal_data: dict,
         mm_item_order: list[dict] | None = None,
     ) -> MultimodalItemMetadata | None:
-        """Keep request metadata without the tower-specific encoder costs."""
+        """Describe request items without the tower-specific encoder costs.
+
+        Requests with more than one input type are rejected here, as for the base Gemma4 model.
+        Without a record from the prompt, each item's embedding rows come from its payload: one
+        row per real patch, or per valid audio frame.
+        """
+        modalities = [
+            modality
+            for modality in ("image", "video", "audio")
+            if isinstance(multimodal_data.get(modality), dict)
+        ]
+        if len(modalities) > 1:
+            raise ValueError(
+                "Gemma4 requests containing multiple multimodal input types are not supported."
+            )
         metadata = BaseMultimodalInputProcessor.get_mm_item_metadata(
             self, prompt_token_ids, multimodal_data, mm_item_order
         )
+        if metadata is None and modalities:
+            modality = modalities[0]
+            rows = _unified_item_rows(modality, multimodal_data[modality])
+            item_refs = (
+                [(entry["modality"], entry["index"]) for entry in mm_item_order]
+                if mm_item_order
+                else [(modality, index) for index in range(len(rows))]
+            )
+            metadata = MultimodalItemMetadata(
+                item_refs, output_embedding_lengths=[rows[index] for _, index in item_refs]
+            )
         if metadata is not None:
             metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
         return metadata
+
+
+def _unified_item_rows(modality: str, data: dict) -> list[int]:
+    """Count the embedding rows the encoder-free projections give each item.
+
+    Vision keeps one row per patch that is not padding; a video sums its frames. Audio keeps one
+    row per valid frame.
+    """
+    if modality == "audio":
+        features, mask = data["audio_features"], data.get("audio_features_mask")
+        if mask is None:
+            return [int(features.shape[1])] * int(features.shape[0])
+        return mask.bool().sum(dim=-1).tolist()
+    pixel_values, position_ids = data["pixel_values"], data.get("image_position_ids")
+    frame_rows = (
+        [int(pixel_values.shape[1])] * int(pixel_values.shape[0])
+        if position_ids is None
+        else (~(position_ids == -1).all(dim=-1)).sum(dim=-1).tolist()
+    )
+    frame_counts = data.get("num_frames") or [1] * len(frame_rows)
+    starts = list(itertools.accumulate(frame_counts, initial=0))
+    return [sum(frame_rows[start:end]) for start, end in zip(starts, starts[1:])]
 
 
 @register_auto_model("Gemma4UnifiedForConditionalGeneration")
