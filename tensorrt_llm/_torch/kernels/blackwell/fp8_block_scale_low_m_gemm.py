@@ -123,7 +123,7 @@ from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import mnnvl_pushed_allreduce as pushed_ar
-from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
+from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 if TYPE_CHECKING:
     from ...distributed.ops import LamportWorkspaceView
@@ -3017,56 +3017,81 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
                     )
                 )
 
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         if cutlass.const_expr(self.fold_weight_scale):
             cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, 0)], tCtSFA_s2t)
-        # The staged tiles' MMAs come first and the first of them starts the accumulator.
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, staged > 0)
-        tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, False)
-        # Fully unrolled over the largest K-tile count; the MMA descriptor fields are set outside
-        # the per-tile predicate (a rank with one K tile fewer skips the last tile's work), and
-        # only stages that are refilled are released. The staged tiles are K tiles of every rank.
-        for kt in cutlass.range_constexpr(self.kt_max):
-            a_stage = kt % self.a_stages
-            b_stage = kt % self.b_stages
-            live = kt < kt_count
-            if live:
-                if cutlass.const_expr(kt >= staged):
-                    cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+        if cutlass.const_expr(self.fold_weight_scale or staged > 0):
+            # The staged tiles' MMAs come first and the first of them starts the accumulator.
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, staged > 0)
+            tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, False)
+            # Fully unrolled over the largest K-tile count; the MMA descriptor fields are set
+            # outside the per-tile predicate (a rank with one K tile fewer skips the last tile's
+            # work), and only stages that are refilled are released. The staged tiles are K tiles
+            # of every rank.
+            for kt in cutlass.range_constexpr(self.kt_max):
+                a_stage = kt % self.a_stages
+                b_stage = kt % self.b_stages
+                live = kt < kt_count
+                if live:
+                    if cutlass.const_expr(kt >= staged):
+                        cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
+                    cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
+                    if cutlass.const_expr(not self.fold_weight_scale):
+                        cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
+                    cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
+                for kp in cutlass.range_constexpr(num_kphases):
+                    if cutlass.const_expr(kt < staged):
+                        tiled_mma_ts.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                        tiled_mma_ts.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                        if live:
+                            cute.gemm(
+                                tiled_mma_ts,
+                                tCtAcc,
+                                tCtA_tiles[kt][(None, None, kp)],
+                                tCrB[(None, None, kp, b_stage)],
+                                tCtAcc,
+                            )
+                        tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, True)
+                    else:
+                        tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
+                        tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
+                        if live:
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[(None, None, kp, a_stage)],
+                                tCrB[(None, None, kp, b_stage)],
+                                tCtAcc,
+                            )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                if live:
+                    with cute.arch.elect_one():
+                        if cutlass.const_expr(kt >= staged and kt + self.a_stages < self.kt_max):
+                            tcgen05.commit(a_empty + a_stage)
+                        if cutlass.const_expr(kt + self.b_stages < self.kt_max):
+                            tcgen05.commit(b_empty + b_stage)
+        else:
+            for kt in cutlass.range(kt_count, unroll=1):
+                a_stage = kt % self.a_stages
+                b_stage = kt % self.b_stages
+                cute.arch.mbarrier_wait(a_full + a_stage, (kt // self.a_stages) & 1)
                 cute.arch.mbarrier_wait(b_full + b_stage, (kt // self.b_stages) & 1)
-                if cutlass.const_expr(not self.fold_weight_scale):
-                    cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
+                cute.copy(s2t_sfa, tCsSFA_s2t[(None, None, None, None, kt)], tCtSFA_s2t)
                 cute.copy(s2t_sfb, tCsSFB_s2t[(None, None, None, None, b_stage)], tCtSFB_s2t)
-            for kp in cutlass.range_constexpr(num_kphases):
-                if cutlass.const_expr(kt < staged):
-                    tiled_mma_ts.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
-                    tiled_mma_ts.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                    if live:
-                        cute.gemm(
-                            tiled_mma_ts,
-                            tCtAcc,
-                            tCtA_tiles[kt][(None, None, kp)],
-                            tCrB[(None, None, kp, b_stage)],
-                            tCtAcc,
-                        )
-                    tiled_mma_ts.set(tcgen05.Field.ACCUMULATE, True)
-                else:
+                for kp in cutlass.range_constexpr(num_kphases):
                     tiled_mma.set(tcgen05.Field.SFA, tCtSFA[(None, None, kp)].iterator)
                     tiled_mma.set(tcgen05.Field.SFB, tCtSFB[(None, None, kp)].iterator)
-                    if live:
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc,
-                            tCrA[(None, None, kp, a_stage)],
-                            tCrB[(None, None, kp, b_stage)],
-                            tCtAcc,
-                        )
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[(None, None, kp, a_stage)],
+                        tCrB[(None, None, kp, b_stage)],
+                        tCtAcc,
+                    )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-            if live:
                 with cute.arch.elect_one():
-                    if cutlass.const_expr(kt >= staged and kt + self.a_stages < self.kt_max):
-                        tcgen05.commit(a_empty + a_stage)
-                    if cutlass.const_expr(kt + self.b_stages < self.kt_max):
-                        tcgen05.commit(b_empty + b_stage)
+                    tcgen05.commit(a_empty + a_stage)
+                    tcgen05.commit(b_empty + b_stage)
         with cute.arch.elect_one():
             tcgen05.commit(storage.acc_full)
 
@@ -3302,9 +3327,8 @@ class _ShapeTables:
     #: for buckets without an entry.
     mid_m_tuned: dict
     mid_m_default: dict
-    #: (N, K) -> largest M for which :func:`max_m_for` selects this GEMM (its cross-over with
-    #: the architecture's default FP8 block-scale GEMM); ``default_max_m`` for other shapes
-    #: whose grid fits in one wave, none for the rest.
+    #: (N, K) -> largest M for which :func:`can_run` selects this GEMM; ``default_max_m`` for
+    #: other shapes.
     max_m: dict
     default_max_m: int
     #: (N, K) -> largest M of the low-M kernel (mid-M kernel above); the rule otherwise.
@@ -3317,87 +3341,165 @@ class _ShapeTables:
     nvfp4_out_route: dict = dataclasses.field(default_factory=dict)
 
 
-# SM100 / SM103: the rule's tactics, and the cross-over M with ``fp8_swap_ab_gemm`` of each
-# measured shape.
+# SM100 / SM103, tuned on GB300 for the Kimi-K3 decode projections (CUDA graph, weights not
+# L2-resident). The M limits are the largest M at which this GEMM (with its quantization) beat
+# ``fp8_swap_ab_gemm`` (with its quantization), both standalone and behind a latency-bound
+# kernel with PDL; every measured shape wins up to M = 128.
 _SM100_TABLES = _ShapeTables(
-    low_m_tuned={},
-    mid_m_tuned={},
-    mid_m_default={},
+    low_m_tuned={
+        # KDA fused q/k/v/g (helix16 shard)
+        (3072, 7168, 8): (5, 12, 4, 4, 4),
+        (3072, 7168, 16): (4, 8, 4, 4, 2),
+        (3072, 7168, 32): (5, 8, 4, 8, 4),
+        (3072, 7168, 64): (5, 4, 4, 8, 4),
+        # MoE latent down
+        (3584, 7168, 8): (4, 14, 4, 4, 4),
+        (3584, 7168, 16): (4, 8, 4, 4, 2),
+        (3584, 7168, 32): (4, 8, 4, 8, 2),
+        (3584, 7168, 64): (4, 4, 4, 8, 4),
+        # MoE latent up
+        (7168, 3584, 8): (2, 14, 4, 4, 4),
+        (7168, 3584, 16): (2, 8, 4, 4, 2),
+        (7168, 3584, 32): (2, 8, 4, 8, 2),
+        (7168, 3584, 64): (2, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix16 shard)
+        (7168, 768, 8): (1, 6, 4, 4, 4),
+        (7168, 768, 16): (1, 6, 4, 8, 4),
+        (7168, 768, 32): (1, 6, 4, 8, 4),
+        (7168, 768, 64): (1, 4, 4, 8, 2),
+        # MLA fused q_a / kv_a (2112 rows)
+        (2176, 7168, 8): (6, 10, 4, 4, 4),
+        (2176, 7168, 16): (6, 8, 4, 8, 4),
+        (2176, 7168, 32): (6, 8, 4, 8, 4),
+        (2176, 7168, 64): (6, 4, 4, 8, 4),
+        # MLA q_b
+        (18432, 1536, 8): (1, 12, 4, 4, 4),
+        (18432, 1536, 16): (1, 12, 4, 4, 2),
+        (18432, 1536, 32): (1, 8, 4, 8, 2),
+        (18432, 1536, 64): (1, 4, 4, 8, 2),
+    },
+    mid_m_tuned={
+        (3072, 7168, 224): (4, 4),
+        (3072, 7168, 256): (4, 3),
+        (3584, 7168, 224): (3, 4),
+        (3584, 7168, 256): (3, 3),
+        (7168, 3584, 224): (2, 3),
+        (7168, 3584, 256): (2, 3),
+        (2176, 7168, 128): (6, 4),
+        (2176, 7168, 192): (6, 4),
+        (2176, 7168, 224): (4, 4),
+        (2176, 7168, 256): (6, 3),
+        (12288, 7168, 192): (1, 3),
+        (12288, 7168, 224): (1, 3),
+        (12288, 7168, 256): (1, 3),
+        (7168, 6144, 256): (2, 3),
+    },
+    mid_m_default={
+        (3072, 7168): (4, 4),
+        (3584, 7168): (4, 4),
+        (7168, 3584): (2, 4),
+        (7168, 768): (1, 4),
+        (2176, 7168): (5, 4),
+        (18432, 1536): (1, 4),
+        (12288, 7168): (1, 4),
+        (7168, 6144): (2, 4),
+    },
     max_m={
-        (768, 7168): 224,
-        (1536, 7168): 224,
-        (2176, 7168): 192,
         (3072, 7168): 224,
-        (3584, 7168): 192,
-        (6144, 7168): 192,
+        (3584, 7168): 224,
+        (7168, 3584): 144,
         (7168, 768): 192,
-        (7168, 1536): 160,
-        (7168, 6144): 160,
-        (7168, 12288): 160,
-        (12288, 7168): 160,
+        (2176, 7168): 224,
         (18432, 1536): 224,
+        (12288, 7168): 128,
+        (7168, 6144): 128,
     },
     default_max_m=128,
-    low_m_cutover={},
+    # Large weights on fewer than all SMs, where the in-kernel quantization of a 64-token tile
+    # is exposed: the mid-M kernel is faster above 32 tokens.
+    low_m_cutover={
+        (12288, 7168): 32,
+        (7168, 6144): 32,
+    },
 )
 
-# SM107: measured tactics, low-/mid-M cut-overs and cross-overs with
-# ``fp8_quantize_1x128_cutedsl_ue8m0`` + ``cute_dsl_mxfp8_gemm_rubin``; other shapes are not
-# selected.
+# SM107, tuned on Rubin (212 SMs) for the Kimi-K3 decode projections with cold weights (rotated
+# over 1.5 GiB): each tactic scores the mean CUDA-graph per-call time of back-to-back launches
+# with and without PDL. Low-M kernel, per mma_n bucket timed at M = mma_n: a split_k sweep with
+# the heuristic ring sizes, then quant warps / groups and x / b ring depths around the three
+# best splits; mid-M kernel, per mma_n bucket: split_k x b_stages. With 212 SMs the best split
+# is larger than on GB300 for the small-N weights. The M limits are the largest M up to which
+# this GEMM ran at least 5% faster than ``fp8_quantize_1x128_cutedsl_ue8m0`` + the autotuned
+# ``cute_dsl_mxfp8_gemm_rubin`` at every measured M (and, for the helix weights, not slower on
+# the mean of the times with and without PDL); other shapes stop at 32 tokens.
 _SM107_TABLES = _ShapeTables(
     low_m_tuned={
+        # KDA fused q/k/v/g (dep16)
         (49152, 7168, 8): (1, 8, 4, 4, 4),
         (49152, 7168, 16): (1, 8, 4, 8, 4),
         (49152, 7168, 32): (1, 8, 4, 8, 4),
         (49152, 7168, 64): (1, 4, 4, 8, 4),
+        # KDA / MLA o_proj (dep16)
         (7168, 12288, 8): (3, 8, 4, 4, 4),
         (7168, 12288, 16): (3, 8, 4, 8, 4),
         (7168, 12288, 32): (3, 8, 4, 8, 4),
         (7168, 12288, 64): (3, 4, 4, 8, 4),
+        # MLA output gate / shared-expert gate_up (dep16)
         (12288, 7168, 8): (2, 8, 4, 4, 4),
         (12288, 7168, 16): (2, 8, 4, 8, 4),
         (12288, 7168, 32): (2, 8, 4, 8, 4),
         (12288, 7168, 64): (2, 4, 4, 8, 4),
+        # shared-expert down (dep16)
         (7168, 6144, 8): (6, 8, 4, 4, 4),
         (7168, 6144, 16): (3, 8, 4, 8, 4),
         (7168, 6144, 32): (3, 8, 4, 8, 4),
         (7168, 6144, 64): (3, 4, 4, 8, 4),
+        # MLA q_b
         (18432, 1536, 8): (2, 4, 4, 4, 4),
         (18432, 1536, 16): (2, 4, 4, 8, 4),
         (18432, 1536, 32): (1, 8, 4, 8, 4),
         (18432, 1536, 64): (1, 4, 4, 8, 4),
+        # MoE latent down
         (3584, 7168, 8): (8, 7, 4, 4, 4),
         (3584, 7168, 16): (8, 4, 4, 8, 4),
         (3584, 7168, 32): (5, 8, 4, 8, 4),
         (3584, 7168, 64): (6, 4, 4, 8, 2),
+        # MoE latent up
         (7168, 3584, 8): (7, 4, 4, 4, 4),
         (7168, 3584, 16): (6, 4, 4, 8, 4),
         (7168, 3584, 32): (6, 5, 4, 8, 4),
         (7168, 3584, 64): (3, 4, 4, 8, 4),
+        # KDA fused q/k/v/g (helix16 shard)
         (3072, 7168, 8): (7, 8, 4, 4, 4),
         (3072, 7168, 16): (7, 4, 4, 8, 4),
         (3072, 7168, 32): (6, 8, 4, 8, 4),
         (3072, 7168, 64): (6, 4, 4, 8, 2),
+        # MLA fused q_a / kv_a (2112 rows)
         (2176, 7168, 8): (10, 4, 4, 4, 4),
         (2176, 7168, 16): (7, 8, 4, 8, 4),
         (2176, 7168, 32): (8, 4, 4, 8, 4),
         (2176, 7168, 64): (8, 7, 4, 8, 4),
+        # MLA output gate (helix16 shard)
         (768, 7168, 8): (14, 4, 4, 4, 4),
         (768, 7168, 16): (14, 4, 4, 8, 4),
         (768, 7168, 32): (10, 6, 4, 8, 4),
         (768, 7168, 64): (16, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix16 shard)
         (7168, 768, 8): (3, 2, 2, 4, 4),
         (7168, 768, 16): (3, 2, 2, 8, 4),
         (7168, 768, 32): (1, 6, 4, 8, 4),
         (7168, 768, 64): (2, 3, 3, 8, 4),
+        # KDA fused q/k/v/g (helix8 shard)
         (6144, 7168, 8): (3, 4, 4, 4, 4),
         (6144, 7168, 16): (3, 8, 4, 8, 4),
         (6144, 7168, 32): (3, 8, 4, 8, 4),
         (6144, 7168, 64): (3, 4, 4, 8, 4),
+        # KDA / MLA o_proj (helix8 shard)
         (7168, 1536, 8): (4, 3, 3, 4, 4),
         (7168, 1536, 16): (4, 3, 3, 8, 4),
         (7168, 1536, 32): (2, 6, 4, 8, 4),
         (7168, 1536, 64): (2, 4, 4, 8, 4),
+        # MLA output gate (helix8 shard)
         (1536, 7168, 8): (12, 5, 4, 4, 4),
         (1536, 7168, 16): (7, 8, 4, 8, 4),
         (1536, 7168, 32): (8, 7, 4, 8, 4),
@@ -4007,6 +4109,15 @@ def weights_on_chip(m: int, n: int, k: int) -> bool:
     return tactic.a_stages + tactic.tmem_tiles >= kt_max
 
 
+def precompile_prequantized(n: int, k: int, max_m: int) -> int:
+    """JIT-compile the kernels ``trtllm::fp8_block_scale_low_m_gemm_prequantized`` launches for
+    an ``[N, K]`` weight at ``1..max_m`` rows (one per distinct tactic); returns their count."""
+    tactics = {default_prequantized_tactic(m, n, k) for m in range(1, max_m + 1)}
+    for tactic in tactics:
+        _compiled_mid_kernel(n, k, tactic, TRTLLM_ENABLE_PDL, False, fold_weight_scale=True)
+    return len(tactics)
+
+
 def run_low_m_gemm_prequantized(
     xq: torch.Tensor,
     xs: torch.Tensor,
@@ -4067,7 +4178,7 @@ def run_low_m_gemm(
     w_scale: torch.Tensor,
     out: torch.Tensor,
     *,
-    gate: Optional[torch.Tensor] = None,
+    gate: torch.Tensor | None = None,
     sigmoid: bool = False,
     tactic: LowMTactic | MidMTactic | None = None,
     use_pdl: bool = True,
@@ -4514,6 +4625,7 @@ __all__ = [
     "run_low_m_gemm_nvfp4",
     "run_low_m_gemm_all_reduce_push",
     "run_low_m_gemm_prequantized",
+    "precompile_prequantized",
     "split_tactic",
     "staged_prequantized_tactic",
     "ue8m0_of_amax",

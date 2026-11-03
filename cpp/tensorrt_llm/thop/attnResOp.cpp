@@ -287,6 +287,11 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_persistent_fwd(at::Tenso
     c10::cuda::CUDAGuard device_guard(layer_residual.device());
     TORCH_CHECK(
         is_sm100_family(), "attn_res_add_rmsnorm_persistent_fwd requires an sm_100-family (datacenter Blackwell) GPU");
+    // Same bound as cute_dsl_utils.set_sm_reserve: the grid keeps at least one SM.
+    int const sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    TORCH_CHECK(sm_reserve >= 0 && sm_reserve < sm_count,
+        "attn_res_add_rmsnorm_persistent_fwd: sm_reserve=", sm_reserve, " must be in [0, ", sm_count,
+        ") (the SM count of the device)");
 
     int64_t const T = layer_residual.size(0);
     int64_t const B = layer_residual.size(1);

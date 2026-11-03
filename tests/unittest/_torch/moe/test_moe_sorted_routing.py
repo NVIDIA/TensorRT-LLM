@@ -351,7 +351,7 @@ def test_shared_gemms_lead_routed_experts(monkeypatch, m):
         assert runtime._front_plan(m).shared_first == lead
         quantized_inputs.clear()
         with torch.inference_mode(), with_multi_stream(True):
-            routed, shared = runtime.forward_parts(hidden)
+            routed, shared = runtime(hidden, return_parts=True)
         torch.cuda.synchronize()
         assert quantized_inputs == ([m] if lead else [])
         torch.testing.assert_close(shared, hidden * 0.5 + 1.0, rtol=0, atol=0)
@@ -431,7 +431,7 @@ def test_latent_down_nvfp4_output_feeds_routed_experts(monkeypatch, m):
         plan = runtime._front_plan(m)
         assert plan.latent_down_nvfp4 == epilogue and not plan.shared_first
         with torch.inference_mode(), with_multi_stream(True):
-            routed, _ = runtime.forward_parts(hidden)
+            routed, _ = runtime(hidden, return_parts=True)
         torch.cuda.synchronize()
         outputs.append(routed)
 
@@ -471,7 +471,7 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
     runtime = _runtime(moe, logits)
     hidden = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
     with torch.inference_mode(), with_multi_stream(True):
-        unreserved, _ = runtime.forward_parts(hidden)
+        unreserved, _ = runtime(hidden, return_parts=True)
     torch.cuda.synchronize()
 
     assert moe.backend.reserve_sms_for_concurrent_kernels(shared_sms) == shared_sms
@@ -497,7 +497,7 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
     monkeypatch.setattr(runtime.shared_experts, "forward", recording_shared)
     before = torch._C._get_sm_carveout_experimental()
     with torch.inference_mode(), with_multi_stream(True):
-        routed, shared = runtime.forward_parts(hidden)
+        routed, shared = runtime(hidden, return_parts=True)
     torch.cuda.synchronize()
     total = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     assert carveouts == [total - shared_sms]
@@ -510,5 +510,5 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
     # In order on one stream (no CUDA graph) there is nothing to share SMs with.
     carveouts.clear()
     with torch.inference_mode(), with_multi_stream(False):
-        runtime.forward_parts(hidden)
+        runtime(hidden, return_parts=True)
     assert carveouts == [before]

@@ -123,7 +123,7 @@ def test_router_issued_before_latent_down(num_tokens):
     hidden = torch.randn(num_tokens, HIDDEN, device="cuda")
     main["stream"] = torch.cuda.current_stream()
     with torch.inference_mode(), with_multi_stream(True):
-        routed, shared = runtime.forward_parts(hidden)
+        routed, shared = runtime(hidden, return_parts=True)
     torch.cuda.synchronize()
 
     events = [name for name, _ in log if name != "latent_up"]
@@ -146,12 +146,12 @@ def test_router_first_graph_capture():
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             main["stream"] = side
-            runtime.forward_parts(static)
+            runtime(static, return_parts=True)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             main["stream"] = torch.cuda.current_stream()
-            routed, shared = runtime.forward_parts(static)
+            routed, shared = runtime(static, return_parts=True)
         for seed in range(2):
             torch.manual_seed(seed)
             static.copy_(torch.randn_like(static))

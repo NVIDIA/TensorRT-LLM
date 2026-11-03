@@ -244,11 +244,13 @@ l0_cpu:
   - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_skips_unavailable_api
   - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_does_not_block_model_startup
   - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
+  - unittest/grpc/test_grpc_optional.py::test_smg_rejects_multiple_frontends_before_engine_start
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
+  - unittest/llmapi/test_session_reuse.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py
@@ -257,7 +259,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_context_length_error.py
   - unittest/llmapi/apps/test_harmony_channel_validation.py
-  - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
+  - unittest/llmapi/apps/test_harmony_parsing.py
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
@@ -287,6 +289,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
+  - unittest/llmapi/test_iteration_logging.py
   - unittest/llmapi/test_bench_async.py
   - unittest/llmapi/test_config_overrides.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"

@@ -50,16 +50,22 @@ UE8M0 exponent per 1x32 group in the R128c4 scale layout, the bits the FP8 low-M
 in-kernel quantization makes of the BF16 output, so a projection can consume it instead of
 quantizing (``fp8_block_scale_low_m_gemm``).
 
-PDL contract. Before its wait the kernel reads only the weights and the snapshot rows (with
-``early_poll`` also the prefix sum and the pushed slots). The snapshot rows are written by a copy
-kernel launched without PDL, which therefore completes before any later kernel starts, and that
-copy precedes this launch by at least one complete grid boundary. With ``early_poll`` the
-producer releases this grid only after its own wait, so every earlier grid, the prefix sum's
-writer and the previous call's readers included, has completed by then. The kernel releases
-its dependent grid right after its own ``griddepcontrol.wait``, so the next kernel (the decode
-projection GEMM or the router) can become resident and stream its weights while this one
-finishes; that is safe for every dependent that, as PDL requires, writes
-no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
+PDL contract (with ``TRTLLM_ENABLE_PDL``, the default; without it the kernel is launched and
+runs like any other). Before its wait the kernel reads only the weights and, by default, the
+snapshot rows (with ``early_poll`` also the prefix sum and the pushed slots). That is safe while
+the snapshot rows were not written by the kernel launched immediately before this one: some
+kernel in between must start its dependents only after its predecessors' writes are visible (a
+launch without PDL, or a PDL kernel whose ``launch_dependents`` follows its
+``griddepcontrol.wait``), so that this grid cannot start before the writer's grid has completed.
+Where the immediately preceding kernel writes the snapshot rows (the copy that slices the
+snapshot bank at the first token-sliced layer of ``helix_a2a``), the caller selects
+``snapshots_after_wait``: the kernel then loads the snapshot rows after its wait. With
+``early_poll`` the producer releases this grid only after its own wait, so every earlier grid,
+the prefix sum's writer and the previous call's readers included, has completed by then. The
+kernel releases its dependent grid right after its own ``griddepcontrol.wait``, so the next
+kernel (the decode projection GEMM or the router) can become resident and stream its weights
+while this one finishes; that is safe for every dependent that, as PDL requires, writes no global
+memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
 
 ``entry_trigger`` releases the dependent at kernel entry instead and prefers the largest
 shared-memory carve-out, so that a projection which holds its whole weight slice on chip before
@@ -73,6 +79,7 @@ windows and replay rows of the previous step).
 from __future__ import annotations
 
 import functools
+import itertools
 import struct
 from typing import NamedTuple
 
@@ -87,6 +94,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from . import fp8_block_scale_low_m_gemm as low_m_gemm
 from . import mnnvl_pushed_allreduce as pushed_ar
+from .utils import TRTLLM_ENABLE_PDL, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: Candidate counts (snapshots + the layer row) the kernel is instantiated for.
 MIN_CANDIDATES, MAX_CANDIDATES = 2, 12
@@ -273,14 +281,14 @@ def _mbar_arrive_expect_tx(addr, nbytes: int, *, loc=None, ip=None):
     )
 
 
-_WAIT_LABEL = [0]
+# Unique PTX labels of the spin loops in :func:`_mbar_wait_cluster`.
+_wait_labels = itertools.count(1)
 
 
 @dsl_user_op
 def _mbar_wait_cluster(addr, *, loc=None, ip=None):
     """Wait for phase 0 of a local mbarrier completed by peers' ``st.async`` (cluster acquire)."""
-    _WAIT_LABEL[0] += 1
-    lab = f"K3AR_WAIT{_WAIT_LABEL[0]}"
+    lab = f"K3AR_WAIT{next(_wait_labels)}"
     _asm_se(
         None,
         [_iv(addr, loc=loc, ip=ip)],
@@ -321,16 +329,6 @@ def _cluster_arrive_relaxed(*, loc=None, ip=None):
 @dsl_user_op
 def _cluster_wait(*, loc=None, ip=None):
     _asm_se(None, [], "barrier.cluster.wait.acquire.aligned;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _griddepcontrol_wait(*, loc=None, ip=None):
-    _asm_se(None, [], "griddepcontrol.wait;", "", loc=loc, ip=ip)
-
-
-@dsl_user_op
-def _griddepcontrol_launch_dependents(*, loc=None, ip=None):
-    _asm_se(None, [], "griddepcontrol.launch_dependents;", "", loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -566,6 +564,20 @@ class KimiK3AttnResKernel:
     (one-shot) does so before the grid wait; ``finish_chunk`` / ``finish_sanitize``: the slot
     sums in the order of another C++ transport. ``finish_all_gather`` (``ADD_MOE``): the call
     is an all-gather call, ``routed`` its all-gather row and ``shared`` its slot sum.
+
+    Args:
+        num_candidates: ``N``, the snapshot rows plus the layer row, in
+            ``[MIN_CANDIDATES, MAX_CANDIDATES]``.
+        add_mode: Inputs of the layer row: ``ADD_NONE``, ``ADD_PREFIX`` or ``ADD_MOE``.
+        cluster: CTAs per token, one of ``CLUSTER_SIZES`` (see :func:`cluster_size`).
+        hidden: Hidden size ``H`` (:func:`supports_hidden_size`).
+        mxfp8: Also store the MXFP8 form of the normalized output.
+        entry_trigger: Release the dependent grid at kernel entry (module docstring).
+        snapshots_after_wait: Load the snapshot rows after ``griddepcontrol.wait`` instead of
+            in the prologue, for a snapshot bank written by the immediately preceding kernel
+            (see the module's PDL contract).
+        use_pdl: Launch with programmatic dependent launch (``griddepcontrol`` wait and
+            release); without it the kernel waits for the previous grid like any launch.
     """
 
     def __init__(
@@ -583,6 +595,8 @@ class KimiK3AttnResKernel:
         finish_sanitize: bool = False,
         finish_all_gather: bool = False,
         entry_trigger: bool = False,
+        snapshots_after_wait: bool = False,
+        use_pdl: bool = TRTLLM_ENABLE_PDL,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -611,6 +625,8 @@ class KimiK3AttnResKernel:
         self.finish_sanitize = finish_sanitize
         self.finish_all_gather = finish_all_gather
         self.entry_trigger = entry_trigger
+        self.snapshots_after_wait = snapshots_after_wait
+        self.use_pdl = use_pdl
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -681,7 +697,7 @@ class KimiK3AttnResKernel:
             cluster=(self.c, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
             preferred_smem_carveout=100 if self.entry_trigger else None,
         )
 
@@ -717,8 +733,8 @@ class KimiK3AttnResKernel:
         outsq_smem = storage.outsq.data_ptr().toint()
         mbar_smem = storage.mbar.data_ptr().toint()
 
-        if cutlass.const_expr(self.entry_trigger):
-            _griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.entry_trigger and self.use_pdl):
+            griddepcontrol_launch_dependents()
         token = bidx // c
         rank = bidx - token * c
         if cutlass.const_expr(self.finish_two_shot):
@@ -748,12 +764,24 @@ class KimiK3AttnResKernel:
                 out.append(hi)
             return out
 
+        def wait_and_release():
+            # Wait for the previous grid, then release the dependent grid (entry_trigger: released
+            # at kernel entry).
+            if cutlass.const_expr(self.use_pdl):
+                griddepcontrol_wait()
+                if cutlass.const_expr(not self.entry_trigger):
+                    griddepcontrol_launch_dependents()
+
         # ---- prologue: everything that does not depend on the previous grid ----
         res_w = unpack(load(res_addr + col, True))
         rms_w = unpack(load(rms_addr + col, True))
         out_w = load(out_w_addr + col, True)
+        if cutlass.const_expr(self.snapshots_after_wait):
+            wait_and_release()
         plane = Int64(m) * (hidden * 2)
-        snaps = [load(block_addr + plane * n + row + col, True) for n in range(k)]
+        # Written by the previous grid with ``snapshots_after_wait``: coherent loads then.
+        snap_nc = not self.snapshots_after_wait
+        snaps = [load(block_addr + plane * n + row + col, snap_nc) for n in range(k)]
         q = [_mul_ftz(res_w[e], rms_w[e]) for e in range(8)]
 
         snap_f = [unpack(snaps[n]) for n in range(k)]
@@ -804,11 +832,9 @@ class KimiK3AttnResKernel:
                 premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
         # ---- wait for the previous grid, then release the dependent grid (early_poll: after
-        # the mix, before the first store; entry_trigger: released at kernel entry) ----
-        if cutlass.const_expr(not self.early_poll):
-            _griddepcontrol_wait()
-            if cutlass.const_expr(not self.entry_trigger):
-                _griddepcontrol_launch_dependents()
+        # the mix, before the first store; snapshots_after_wait: in the prologue) ----
+        if cutlass.const_expr(not self.early_poll and not self.snapshots_after_wait):
+            wait_and_release()
 
         state = None
         finished = []
@@ -933,9 +959,8 @@ class KimiK3AttnResKernel:
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
         if cutlass.const_expr(self.early_poll):
             # The output buffers may reuse memory the producer, or a grid before it, still reads.
-            _griddepcontrol_wait()
-            if cutlass.const_expr(not self.entry_trigger):
-                _griddepcontrol_launch_dependents()
+            if cutlass.const_expr(not self.snapshots_after_wait):
+                wait_and_release()
             _stg_v4_if(valid, upd_addr + row + col, upd_words)
         _stg_v4_if(valid, out_addr + row + col, words)
         if cutlass.const_expr(self.mxfp8):
@@ -1007,7 +1032,8 @@ def _compiled(
     cluster: int,
     hidden: int,
     mxfp8: bool,
-    in_place_addend: bool,
+    snapshots_after_wait: bool,
+    in_place_addend: bool = False,
     finish_world: int = 0,
     finish_two_shot: bool = False,
     early_poll: bool = False,
@@ -1030,6 +1056,7 @@ def _compiled(
         finish_sanitize,
         finish_all_gather,
         entry_trigger,
+        snapshots_after_wait,
     )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1071,8 +1098,8 @@ def can_run(
     *weights: torch.Tensor,
 ) -> bool:
     """Whether :func:`run_attn_res` serves ``layer [M, H]``, 0-2 addends ``[M, H]``,
-    ``block [N - 1, M, H]`` and the ``[H]`` weights: BF16, contiguous, :func:`supports`
-    ``(M, H, N)``, on SM100 / SM103 / SM107."""
+    ``block [N - 1, M, H]`` and the ``[H]`` weights: BF16, contiguous, 16-byte aligned,
+    :func:`supports` ``(M, H, N)``, on SM100 / SM103 / SM107."""
     if not layer.is_cuda or not is_supported_device(layer.device.index or 0):
         return False
     if layer.dim() != 2 or block.dim() != 3 or len(addends) > 2:
@@ -1083,9 +1110,24 @@ def can_run(
     for t in (layer, block, *weights, *addends):
         if t.dtype != torch.bfloat16 or not t.is_contiguous() or t.device != layer.device:
             return False
+        if t.data_ptr() % 16:
+            return False
     if any(a.shape != layer.shape for a in addends):
         return False
     return all(w.numel() == hidden for w in weights)
+
+
+def precompile(
+    num_candidates: int,
+    add_mode: int,
+    cluster: int,
+    hidden: int,
+    mxfp8: bool = False,
+    snapshots_after_wait: bool = False,
+) -> None:
+    """JIT-compile the variant :func:`run_attn_res` launches for these parameters (``cluster``
+    as :func:`cluster_size` picks it), so its first launch does not compile."""
+    _compiled(num_candidates, add_mode, cluster, hidden, mxfp8, snapshots_after_wait)
 
 
 def mxfp8_scale_numel(num_tokens: int, hidden: int) -> int:
@@ -1110,8 +1152,10 @@ def run_attn_res(
     in_place_addend: tuple[int, int] | None = None,
     finish: AllReduceFinish | None = None,
     entry_trigger: bool = False,
+    snapshots_after_wait: bool = False,
 ) -> None:
-    """Launch on the current stream with PDL (inputs are not re-validated; see :func:`can_run`).
+    """Launch on the current stream, with PDL unless ``TRTLLM_ENABLE_PDL=0`` (inputs are not
+    re-validated; see :func:`can_run`).
 
     Args:
         layer: ``bf16 [M, H]``: the layer row without addends, else the prefix sum.
@@ -1137,6 +1181,8 @@ def run_attn_res(
             call the mix is the MoE residual update ``bf16(layer + bf16(routed + shared))``
             with the call's all-gather rows as ``routed`` and its slot sum as ``shared``.
         entry_trigger: release the dependent at kernel entry (see the module docstring).
+        snapshots_after_wait: Load ``block`` after the PDL wait: required where the kernel
+            launched immediately before this one writes ``block`` (module docstring).
     """
     if in_place_addend is not None and addends:
         raise ValueError("pass either addends or in_place_addend")
@@ -1154,20 +1200,29 @@ def run_attn_res(
         cluster_size(num_tokens, num_candidates),
         hidden,
         mxfp8_out is not None,
-        in_place_addend is not None,
+        snapshots_after_wait,
+        # Only the pushed all-reduce and entry-trigger variants pass more, so the plain ones share
+        # the cache entries :func:`precompile` fills.
         *(
             (
-                finish.world,
-                finish.two_shot,
-                finish.early_poll,
-                finish.chunk,
-                finish.sanitize,
-                finish.all_gather,
+                in_place_addend is not None,
+                *(
+                    (
+                        finish.world,
+                        finish.two_shot,
+                        finish.early_poll,
+                        finish.chunk,
+                        finish.sanitize,
+                        finish.all_gather,
+                    )
+                    if finish is not None
+                    else (0, False, False, 0, False, False)
+                ),
+                entry_trigger,
             )
-            if finish is not None
+            if in_place_addend is not None or entry_trigger
             else ()
         ),
-        entry_trigger=entry_trigger,
     )
     if in_place_addend is not None:
         add_addr, add2_addr = in_place_addend
@@ -1209,6 +1264,7 @@ __all__ = [
     "cluster_size",
     "is_supported_device",
     "mxfp8_scale_numel",
+    "precompile",
     "run_attn_res",
     "supports",
     "supports_hidden_size",

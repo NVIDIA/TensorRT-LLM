@@ -323,7 +323,7 @@ def test_partial_n_tile_mid_m_tactics(m, mma_n, split_k):
 def test_partial_n_tile_limits_follow_whole_tiles():
     mod = _kernel_module()
     k = 7168
-    assert mod.max_m_for(2112, k) == mod.max_m_for(2176, k) == 192
+    assert mod.max_m_for(2112, k) == mod.max_m_for(2176, k) == (192 if _is_sm107() else 224)
     assert mod.low_m_max_for(2112, k) == mod.low_m_max_for(2176, k)
 
 
@@ -886,7 +886,9 @@ def test_prequantized_mid_m_matches_bf16_gemm(m, n, k):
     assert torch.equal(out, ref)
 
 
-@pytest.mark.parametrize("n, k", [(3072, 7168), (7168, 768), (2112, 7168), (384, 1280)])
+@pytest.mark.parametrize(
+    "n, k", [(3072, 7168), (3584, 7168), (7168, 768), (2112, 7168), (18432, 1536), (384, 1280)]
+)
 @pytest.mark.parametrize("m", [1, 7, 8, 14, 32, 56, 64])
 def test_prequantized_matches_bf16_kernel(m, n, k):
     mod = _kernel_module()
@@ -900,6 +902,21 @@ def test_prequantized_matches_bf16_kernel(m, n, k):
     ref = _run(x, w, packed, mod.default_tactic(m, n, k))
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize(
+    "n, k", [(3072, 7168), (3584, 7168), (7168, 3584), (7168, 768), (2112, 7168), (18432, 1536)]
+)
+def test_prequantized_tactic_follows_selected_low_m_tactic(n, k):
+    """Over the prequantized range of the measured shapes, the prequantized kernel runs the
+    low-M kernel's ``mma_n`` and split-K (the condition for bitwise equality)."""
+    mod = _kernel_module()
+    kernel_max_m = mod.kernel_max_m_for(n, k)
+    assert 32 <= kernel_max_m <= mod.LOW_M_MAX
+    for m in sorted({1, 8, 9, 16, 17, 32, kernel_max_m}):
+        pq = mod.default_prequantized_tactic(m, n, k)
+        low = mod.default_tactic(m, n, k)
+        assert (pq.mma_n, pq.split_k) == (low.mma_n, low.split_k), m
 
 
 @pytest.mark.parametrize("split_k", [1, 2, 3, 4])

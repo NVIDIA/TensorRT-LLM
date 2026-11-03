@@ -93,16 +93,91 @@ def test_dispatch_matches_cpp(m: int, snapshots: int):
     assert torch.equal(upd, ref_upd.view(m, HIDDEN))
 
 
-@pytest.mark.parametrize("raw, persistent", [("per_token", False), ("1", True), ("split", True)])
+@pytest.mark.parametrize(
+    "raw, persistent",
+    [("per_token", False), ("1", True), ("split", True), ("persistent", True)],
+)
 def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
-    """``KIMI_K3_ATTN_RES_TOPOLOGY``: ``split`` stays an alias of ``1``; ``persistent`` and unknown
+    """``KIMI_K3_ATTN_RES_TOPOLOGY``: ``split`` and ``persistent`` are aliases of ``1``; unknown
     values fail loudly instead of silently measuring the default."""
     monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, raw)
     assert mkl._read_persistent_attn_res() is persistent
-    for bad in ("persistent", "on"):
+    for bad in ("on", "per-token"):
         monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, bad)
         with pytest.raises(ValueError):
             mkl._read_persistent_attn_res()
+
+
+def test_fused_max_tokens_env(monkeypatch):
+    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default 64 (the decode
+    kernel's range); anything else fails loudly."""
+    monkeypatch.delenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
+    assert mkl._read_fused_attn_res_max_tokens() == 64 == _max_tokens()
+    monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "1")
+    assert mkl._read_fused_attn_res_max_tokens() == 1
+    for bad in ("0", "-3", "1.5", "all"):
+        monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, bad)
+        with pytest.raises(ValueError):
+            mkl._read_fused_attn_res_max_tokens()
+
+
+def _kernel_for(m: int, num_candidates: int = 5):
+    return mkl._attn_res_kernel(_rows(m, HIDDEN), num_candidates)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_selector_token_ceiling(monkeypatch, persistent: bool):
+    """Up to the ceiling the decode kernel takes the mix; above it the persistent kernel with
+    ``KIMI_K3_ATTN_RES_TOPOLOGY=1``, else unfused. A ceiling of 1 leaves only single-token mixes
+    on the decode kernel, and only they defer a MoE residual update."""
+    K = mkl._AttnResKernel
+    above = K.PERSISTENT if persistent else K.UNFUSED
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
+    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.DECODE, K.DECODE, above]
+    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
+    assert [_kernel_for(m) for m in (1, 2, 64)] == [K.DECODE, above, above]
+    assert mkl._defers_moe_residual(_rows(1, HIDDEN), 5)
+    assert not mkl._defers_moe_residual(_rows(2, HIDDEN), 5)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_selector_falls_back_to_cpp_per_token_ops(monkeypatch, persistent: bool):
+    """Without the decode kernel on the device (no CuTe DSL, or SM107 without the Rubin helpers)
+    the mixes up to the ceiling run on the C++ per-token ops, which have no MoE fold: no MoE
+    layer defers its residual update."""
+    K = mkl._AttnResKernel
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
+    above = K.PERSISTENT if persistent else K.UNFUSED
+    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.PER_TOKEN, K.PER_TOKEN, above]
+    assert _kernel_for(8, num_candidates=12) is K.PER_TOKEN
+    assert not mkl._defers_moe_residual(_rows(8, HIDDEN), 5)
+
+
+@pytest.mark.parametrize("m", [1, 16])
+@torch.no_grad()
+def test_cpp_per_token_fallback_matches_cpp_ops(monkeypatch, m: int):
+    """The fallback runs the C++ ops themselves (bitwise), and a decoder layer pair then returns
+    the materialized residual."""
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    proj, norm, out_norm = _modules(m)
+    prefix, addend, block = _rows(m, HIDDEN), _rows(m, HIDDEN), _rows(4, m, HIDDEN)
+    w = (proj.weight.reshape(-1), norm.weight, out_norm.weight, EPS, EPS)
+    block4 = block.view(4, m, 1, HIDDEN)
+    out = mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
+    ref = torch.ops.trtllm.attn_res_rmsnorm_fwd(prefix.view(m, 1, HIDDEN), block4, *w)
+    assert torch.equal(out, ref.view(m, HIDDEN))
+    upd, add_out = mkl._apply_attn_res_add_and_rmsnorm(prefix, addend, block, proj, norm, out_norm)
+    ref_upd, ref_out = torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        prefix.view(m, 1, HIDDEN), addend.view(m, 1, HIDDEN), block4, *w
+    )
+    assert torch.equal(upd, ref_upd.view(m, HIDDEN))
+    assert torch.equal(add_out, ref_out.view(m, HIDDEN))
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    h, snaps = _rows(m, HIDDEN), 3
+    for layer in layers:
+        h, snaps = layer(h, _rows(8, m, HIDDEN), snaps, None)
+    assert isinstance(h, torch.Tensor)
 
 
 class _PlainKdaMixer:
@@ -123,7 +198,14 @@ _GENERATION = SimpleNamespace(num_contexts=0)
 class _FakeMoE(nn.Module):
     """Stands in for ``KimiK3MoERuntime``: routed/shared outputs derived from the input."""
 
-    def forward_parts(self, hidden_states, all_rank_num_tokens=None, column_parallel_tail=False):
+    def forward(
+        self,
+        hidden_states,
+        all_rank_num_tokens=None,
+        return_parts=False,
+        column_parallel_tail=False,
+    ):
+        assert return_parts
         routed = (hidden_states.float() * 0.5).to(torch.bfloat16)
         shared = (hidden_states.float() * -0.25).to(torch.bfloat16)
         return routed, shared
@@ -259,7 +341,7 @@ def _kda_mixer_taking_mxfp8(max_rows: int):
 def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     """The producer predicate and the verify routing share one batch condition: plain
     single-token decode and context batches get no MXFP8 input, and neither does a mixer whose
-    fused q/k/v/g projection was not declared to take one."""
+    fused q/k/v/g projection was not declared to take one, nor a padded batch."""
     from types import SimpleNamespace
 
     mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
@@ -276,6 +358,117 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
     assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
     assert not mixer.takes_prequantized_input(16, metadata(1, 16, 4))
+    # CUDA-graph padding: more rows than the batch's tokens, so the mixer would not use it.
+    assert not mixer.takes_prequantized_input(16, metadata(0, 12, 3))
+
+
+def _schedule_layer(layer_idx: int, is_moe: bool, is_kda: bool, token_sliced: bool = False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        layer_idx=layer_idx,
+        is_moe=is_moe,
+        is_kda=is_kda,
+        token_sliced=token_sliced,
+        linear_attn=SimpleNamespace(qkvg_takes_prequantized=lambda num_rows: num_rows <= 32),
+    )
+
+
+def _variants(layers, max_tokens=64, helix_first=None, verify=True):
+    return mkl._decode_attn_res_variants(
+        layers,
+        2,
+        HIDDEN,
+        max_tokens,
+        torch.cuda.current_device(),
+        len(layers) if helix_first is None else helix_first,
+        verify,
+    )
+
+
+def test_prewarm_variants_follow_the_layer_schedule(monkeypatch):
+    """The prewarmed decode-kernel variants are those the decoder layers launch: snapshot counts,
+    add modes (plain, attention add, folded MoE residual), the MXFP8 output only for KDA layers
+    after a MoE layer in verify batches, and cluster sizes over the token range."""
+    V = mkl._AttnResVariant
+    none, prefix, moe = 0, 1, 2
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=True, is_kda=True),
+        _schedule_layer(2, is_moe=True, is_kda=False),
+        _schedule_layer(3, is_moe=True, is_kda=True),
+        _schedule_layer(4, is_moe=True, is_kda=True),
+    ]
+    plain = {
+        V(2, none, 4, False, False),
+        V(2, prefix, 4, False, False),
+        V(2, moe, 4, False, False),
+        V(3, none, 4, False, False),
+        V(3, moe, 4, False, False),
+        V(3, prefix, 4, False, False),
+        # Five candidates' output mix: eight CTAs per token up to 16 tokens.
+        V(4, none, 8, False, False),
+        V(4, none, 4, False, False),
+    }
+    assert _variants(layers, verify=False) == plain
+    assert _variants(layers) == plain | {V(3, moe, 4, True, False)}
+    # Up to 16 tokens only the eight-CTA cluster serves four or more candidates.
+    assert _variants(layers, max_tokens=16, verify=False) == plain - {V(4, none, 4, False, False)}
+    # A token ceiling of 1 behaves like a budget of one token.
+    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
+    assert _variants(layers, verify=False) == plain - {V(4, none, 4, False, False)}
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    assert _variants(layers) == set()
+
+
+def test_prewarm_variants_helix_a2a(monkeypatch):
+    """helix_a2a: the first token-sliced layer's pre-attention mix reads the bank after the PDL
+    wait, and sliced KDA layers get no MXFP8 hand-off."""
+    V = mkl._AttnResVariant
+    none, prefix, moe = 0, 1, 2
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=False, is_kda=True),
+        _schedule_layer(2, is_moe=True, is_kda=True, token_sliced=True),
+        _schedule_layer(3, is_moe=True, is_kda=True, token_sliced=True),
+    ]
+    assert _variants(layers, helix_first=2) == {
+        V(2, none, 4, False, False),
+        V(2, prefix, 4, False, False),
+        V(2, none, 4, False, True),
+        V(3, none, 4, False, False),
+        V(3, moe, 4, False, False),
+        V(3, prefix, 4, False, False),
+    }
+
+
+@torch.no_grad()
+def test_prewarm_compiles_what_the_mixes_launch(monkeypatch):
+    """After ``prewarm_decode_kernels`` the model's mixes launch without compiling."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res
+
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", False)
+    model = mkl.KimiLinearModel.__new__(mkl.KimiLinearModel)
+    nn.Module.__init__(model)
+    model.layers = [
+        _schedule_layer(0, is_moe=False, is_kda=True),
+        _schedule_layer(1, is_moe=False, is_kda=True),
+    ]
+    model._text_cfg = SimpleNamespace(attn_res_block_size=2, hidden_size=HIDDEN)
+    model.helix_a2a_first_layer = len(model.layers)
+    assert model.prewarm_decode_kernels(8, verify_batches=False) == 2
+    misses = kimi_k3_attn_res._compiled.cache_info().misses
+    proj, norm, out_norm = _modules(0)
+    for m in (1, 8):
+        prefix, addend, block = _rows(m, HIDDEN), _rows(m, HIDDEN), _rows(1, m, HIDDEN)
+        mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
+        mkl._apply_attn_res_add_and_rmsnorm(prefix, addend, block, proj, norm, out_norm)
+    torch.cuda.synchronize()
+    assert kimi_k3_attn_res._compiled.cache_info().misses == misses
 
 
 def test_kda_mixer_qkvg_stages_weights_only_where_declared():

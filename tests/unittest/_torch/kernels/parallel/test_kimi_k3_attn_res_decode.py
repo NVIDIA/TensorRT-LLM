@@ -348,3 +348,136 @@ def test_graph_replay_pdl_chain(n: int):
         for i, ((u, o), (ru, ro)) in enumerate(zip(outs, refs)):
             assert _mismatches(o, ro) == 0, f"replay {seed} stage {i} output"
             assert _mismatches(u, ru) == 0, f"replay {seed} stage {i} updated prefix"
+
+
+def test_can_run_rejects_misaligned_rows():
+    """The kernel reads 16-byte vectors: a view off a 16-byte boundary is rejected (and the op
+    raises instead of launching)."""
+    k = _kernel()
+    m = 8
+    t = _inputs(m, 4, 1.0)
+    w = (t["proj"], t["norm_w"], t["out_w"])
+    storage = torch.empty(m * HIDDEN + 1, device="cuda", dtype=torch.bfloat16)
+    misaligned = storage[1:].view(m, HIDDEN)
+    misaligned.copy_(t["layer"])
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16
+    assert not k.can_run(misaligned, (), t["block"], *w)
+    with pytest.raises(ValueError, match="unsupported inputs"):
+        torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(misaligned, t["block"], *_weights(t))
+
+
+@pytest.mark.parametrize("m", [1, 16, 64])
+def test_snapshots_after_wait_matches(m: int):
+    """The variant that loads the snapshots after the PDL wait computes the same bits."""
+    t = _inputs(m, 9, 1.0, seed=m)
+    w = _weights(t)
+    ops = torch.ops.trtllm
+    ref = ops.kimi_k3_attn_res_rmsnorm(t["layer"], t["block"], *w)
+    out = ops.kimi_k3_attn_res_rmsnorm(t["layer"], t["block"], *w, True)
+    assert _mismatches(out, ref) == 0
+
+
+@pytest.mark.parametrize("n", [4, 9])
+def test_graph_replay_bank_scattered_right_before_the_mix(n: int):
+    """helix_a2a's first token-sliced layer: the copy that slices this rank's rows out of the
+    snapshot bank is the kernel launched right before the pre-attention mix, inside a CUDA graph
+    (PDL edge). With ``snapshots_after_wait`` the mix reads the rows that copy wrote."""
+    world, rank, m = 4, 2, 16
+    full = _inputs(world * m, n, 1.0, seed=n)
+    w = _weights(full)
+    bank = torch.empty_like(full["block"])
+    rows = torch.empty_like(full["layer"])
+    outs = []
+
+    def body():
+        # KimiK3HelixA2A.scatter_rows: a view of the hidden states, a copy of the bank.
+        layer = rows.narrow(0, rank * m, m).contiguous()
+        block = bank.narrow(1, rank * m, m).contiguous()
+        outs[:] = [torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(layer, block, *w, True)]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        bank.copy_(full["block"])
+        rows.copy_(full["layer"])
+        body()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        body()
+    for seed in range(4):
+        step = _inputs(world * m, n, 1.0, seed=100 + seed)
+        bank.copy_(step["block"])
+        rows.copy_(step["layer"])
+        graph.replay()
+        torch.cuda.synchronize()
+        # The graph's weights are ``full``'s; only the bank and the rows change per replay.
+        local = dict(full)
+        local["block"] = step["block"][:, rank * m : (rank + 1) * m].contiguous()
+        local["layer"] = step["layer"][rank * m : (rank + 1) * m].contiguous()
+        ref = _dsl(local, 0)[1]
+        assert _mismatches(outs[0], ref) == 0, f"replay {seed}"
+        _assert_within_two_ulps(outs[0], _torch_reference(local, 0)[1])
+
+
+def pdl_switch_outputs() -> list:
+    """Outputs of the decode attention-residual ops and of the FP8 low-M GEMMs fed by the MXFP8
+    side output, on fixed inputs (compared with and without ``TRTLLM_ENABLE_PDL``)."""
+    from torch import nn
+
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    m, n = 12, 9
+    t = _inputs(m, n, 1.0, seed=7)
+    w = _weights(t)
+    ops = torch.ops.trtllm
+    results = [ops.kimi_k3_attn_res_rmsnorm(t["layer"], t["block"], *w)]
+    results.append(ops.kimi_k3_attn_res_rmsnorm(t["layer"], t["block"], *w, True))
+    results.extend(ops.kimi_k3_attn_res_add_rmsnorm(t["layer"], t["addend"], t["block"], *w))
+    prefix, out, xq, xs = ops.kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
+        t["layer"], t["addend"], t["shared"], t["block"], *w
+    )
+    # The scale buffer is padded to 128 rows; only this batch's scales are written.
+    results.extend((prefix, out, xq.view(torch.uint8), xs[r128c4_offsets(m, HIDDEN)]))
+    torch.manual_seed(3)
+    dense = nn.Linear(HIDDEN, 3072, bias=False, dtype=torch.bfloat16, device="cuda")
+    proj = _Fp8BlockScaleWeightReadLinear.from_linear(dense)
+    proj.post_load_weights()
+    results.append(proj(out))
+    if proj.takes_prequantized_input(m):
+        results.append(proj.forward_prequantized(xq, xs))
+    torch.cuda.synchronize()
+    return [r.cpu() for r in results]
+
+
+def test_pdl_disabled_matches(tmp_path):
+    """``TRTLLM_ENABLE_PDL=0`` launches the decode kernel and the low-M GEMMs without PDL and
+    yields the same bits."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    result = tmp_path / "no_pdl.pt"
+    script = textwrap.dedent(
+        f"""
+        import sys
+        import torch
+        sys.path.insert(0, {os.path.dirname(os.path.abspath(__file__))!r})
+        from tensorrt_llm._torch.kernels.blackwell import utils
+        assert not utils.TRTLLM_ENABLE_PDL
+        import test_kimi_k3_attn_res_decode as t
+        torch.save(t.pdl_switch_outputs(), {str(result)!r})
+        """
+    )
+    from tensorrt_llm._torch.kernels.blackwell import utils
+
+    if not utils.TRTLLM_ENABLE_PDL:
+        pytest.skip("compares against PDL launches; TRTLLM_ENABLE_PDL=0 is set")
+    env = dict(os.environ, TRTLLM_ENABLE_PDL="0")
+    subprocess.run([sys.executable, "-c", script], env=env, check=True)
+    expected = pdl_switch_outputs()
+    actual = torch.load(result)
+    assert len(actual) == len(expected)
+    for i, (a, e) in enumerate(zip(actual, expected)):
+        assert torch.equal(a, e), i
