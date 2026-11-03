@@ -22,8 +22,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncIterator, Dict, List,
+                    Optional, Tuple, Union)
 
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
@@ -68,6 +68,7 @@ from tensorrt_llm.runtime.kv_cache_hash import \
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve._base.sse import chat_stream_generator
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -154,7 +155,7 @@ from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import (AdjustedSteadyClock,
-                      get_global_steady_clock_now_in_seconds, nvtx_mark,
+                      get_global_steady_clock_now_in_seconds,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
@@ -2022,38 +2023,6 @@ class OpenAIServer(_VideoRoutesMixin):
                 role = request.messages[-1]["role"]
             return role
 
-        async def chat_stream_generator(
-                promise: RequestOutput,
-                postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
-                pp_results = first_response.outputs[
-                    0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        first_response, args)
-                for pp_res in pp_results:
-                    yield pp_res
-                # Making sure we can handle the situation where there is only one response
-                res = first_response
-                async for res in promise:
-                    pp_results = res.outputs[
-                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                            res, args)
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
-
         try:
             # Extension preprocessing, the required-tool check and tool dumping
             # are the first stage of the shared prompt-preparation pipeline.
@@ -2457,7 +2426,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             if request.stream:
                 response_generator = chat_stream_generator(
-                    promise, postproc_params)
+                    promise,
+                    postproc_params,
+                    server=self,
+                    raw_request=raw_request)
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
