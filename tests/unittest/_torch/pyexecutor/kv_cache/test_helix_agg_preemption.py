@@ -21,8 +21,10 @@ preemption and request state, not attention.
 """
 
 from collections import Counter
+from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
 from unittest.mock import Mock, patch
 
 import pytest
@@ -115,49 +117,65 @@ SCENARIOS = {
 }
 
 
-def _make_rank(
-    cp_rank: int, scenario: Scenario, host_cache_size: Optional[int] = 0
-) -> tuple[KVCacheManagerV2, KVCacheV2Scheduler]:
-    """`host_cache_size=None` provisions the automatic host tier."""
-    distributed = Mock()
-    distributed.allreduce.side_effect = lambda value, op: value
-    distributed.local_world_size = 1
-    with patch.object(Distributed, "get", return_value=distributed):
-        manager = KVCacheManagerV2(
-            KvCacheConfig(
-                max_tokens=POOL_TOKENS, host_cache_size=host_cache_size, enable_block_reuse=False
-            ),
-            CacheType.SELF,
-            num_layers=NUM_LAYERS,
-            num_kv_heads=NUM_KV_HEADS,
-            head_dim=HEAD_DIM,
-            tokens_per_block=TOKENS_PER_BLOCK,
-            max_seq_len=max(scenario.prompt_lens.values())
-            + max(map(scenario.new_tokens, scenario.prompt_lens))
-            + TOKENS_PER_BLOCK,
-            max_batch_size=scenario.batch_size(),
-            mapping=Mapping(
-                world_size=CP_SIZE,
-                rank=cp_rank,
-                cp_size=CP_SIZE,
-                cp_config={"cp_type": CpType.HELIX},
-            ),
-            dtype=DataType.HALF,
-            is_disagg=False,
-        )
-    scheduler = KVCacheV2Scheduler(
-        max_batch_size=scenario.batch_size(),
-        max_num_tokens=scenario.max_num_tokens,
-        kv_cache_manager=manager,
-        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-        ctx_chunk_config=(
-            None
-            if scenario.chunk_unit is None
-            else (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, scenario.chunk_unit)
-        ),
-        enable_recompute_pause=True,
-    )
-    return manager, scheduler
+class _RankFactory(Protocol):
+    def __call__(
+        self, cp_rank: int, scenario: Scenario, host_cache_size: Optional[int] = 0
+    ) -> tuple[KVCacheManagerV2, KVCacheV2Scheduler]: ...
+
+
+@pytest.fixture
+def _make_rank() -> Iterator[_RankFactory]:
+    """Create ranks and shut down their managers before reference cycles are collected."""
+    with ExitStack() as cleanup:
+
+        def make_rank(
+            cp_rank: int, scenario: Scenario, host_cache_size: Optional[int] = 0
+        ) -> tuple[KVCacheManagerV2, KVCacheV2Scheduler]:
+            """`host_cache_size=None` provisions the automatic host tier."""
+            distributed = Mock()
+            distributed.allreduce.side_effect = lambda value, op: value
+            distributed.local_world_size = 1
+            with patch.object(Distributed, "get", return_value=distributed):
+                manager = KVCacheManagerV2(
+                    KvCacheConfig(
+                        max_tokens=POOL_TOKENS,
+                        host_cache_size=host_cache_size,
+                        enable_block_reuse=False,
+                    ),
+                    CacheType.SELF,
+                    num_layers=NUM_LAYERS,
+                    num_kv_heads=NUM_KV_HEADS,
+                    head_dim=HEAD_DIM,
+                    tokens_per_block=TOKENS_PER_BLOCK,
+                    max_seq_len=max(scenario.prompt_lens.values())
+                    + max(map(scenario.new_tokens, scenario.prompt_lens))
+                    + TOKENS_PER_BLOCK,
+                    max_batch_size=scenario.batch_size(),
+                    mapping=Mapping(
+                        world_size=CP_SIZE,
+                        rank=cp_rank,
+                        cp_size=CP_SIZE,
+                        cp_config={"cp_type": CpType.HELIX},
+                    ),
+                    dtype=DataType.HALF,
+                    is_disagg=False,
+                )
+            cleanup.callback(manager.shutdown)
+            scheduler = KVCacheV2Scheduler(
+                max_batch_size=scenario.batch_size(),
+                max_num_tokens=scenario.max_num_tokens,
+                kv_cache_manager=manager,
+                scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+                ctx_chunk_config=(
+                    None
+                    if scenario.chunk_unit is None
+                    else (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, scenario.chunk_unit)
+                ),
+                enable_recompute_pause=True,
+            )
+            return manager, scheduler
+
+        yield make_rank
 
 
 def _make_request(request_id: int, scenario: Scenario) -> LlmRequest:
@@ -276,7 +294,9 @@ def _step(
 
 
 @pytest.mark.parametrize("scenario_name", SCENARIOS)
-def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name: str) -> None:
+def test_agg_helix_preempts_identically_and_re_prefills_correctly(
+    _make_rank: _RankFactory, scenario_name: str
+) -> None:
     scenario = SCENARIOS[scenario_name]
     ranks = [_make_rank(cp_rank, scenario) for cp_rank in range(CP_SIZE)]
     context_preemptions = [0] * CP_SIZE
@@ -349,7 +369,9 @@ HOST_TIER_BYTES = 2 << 20
 
 
 @pytest.mark.parametrize("cp_rank", range(CP_SIZE))
-def test_suspended_pages_migrate_to_host_until_the_host_tier_is_full(cp_rank: int) -> None:
+def test_suspended_pages_migrate_to_host_until_the_host_tier_is_full(
+    _make_rank: _RankFactory, cp_rank: int
+) -> None:
     """Suspending a request makes its GPU pages eligible to migrate: the next
     allocation that needs room moves them to the host tier, so a new request
     fits. Once the host tier is full they have nowhere to go and stay on GPU,
@@ -402,7 +424,6 @@ def test_suspended_pages_migrate_to_host_until_the_host_tier_is_full(cp_rank: in
     finally:
         for request in requests.values():
             manager.free_resources(request)
-        manager.shutdown()
 
 
 # Enough host pages that every suspend in decode_pressure finds room.
@@ -412,7 +433,9 @@ ROOMY_HOST_TIER_BYTES = 8 << 20
 @pytest.mark.parametrize(
     "host_cache_size", [ROOMY_HOST_TIER_BYTES, None], ids=["explicit_host_tier", "auto_host_tier"]
 )
-def test_agg_helix_suspends_and_resumes_identically(host_cache_size: Optional[int]) -> None:
+def test_agg_helix_suspends_and_resumes_identically(
+    _make_rank: _RankFactory, host_cache_size: Optional[int]
+) -> None:
     """Under decode pressure with room on the host tier, every rank suspends
     the same requests and resumes them later, and a resumed request decodes
     on from where it stopped with consistent helix fields. The generation
@@ -481,7 +504,9 @@ HOST_TIER_CHUNKED_SCENARIOS = {
 
 
 @pytest.mark.parametrize("scenario_name", HOST_TIER_CHUNKED_SCENARIOS)
-def test_agg_helix_chunked_prefill_with_host_tier(scenario_name: str) -> None:
+def test_agg_helix_chunked_prefill_with_host_tier(
+    _make_rank: _RankFactory, scenario_name: str
+) -> None:
     """Chunked prefill under pressure with a host tier: every rank suspends the
     same requests and lets the same prompts wait, and a request suspended
     mid-prefill resumes chunking from where it stopped."""
@@ -591,7 +616,9 @@ def _fill_pool_with_prefills(
     return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
 
 
-def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
+def test_prefill_only_pressure_recompute_pauses_with_host_tier(
+    _make_rank: _RankFactory,
+) -> None:
     """Two half-prefilled prompts fill the pool and no decode request holds
     pages, so the generation path has nothing to suspend. The context path
     recompute-pauses the newer prompt, every rank picks the same one, and both
@@ -624,7 +651,9 @@ def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
     assert first_recompute_paused == (2,)
 
 
-def test_suspended_prefill_preempts_a_newer_prefill_to_resume() -> None:
+def test_suspended_prefill_preempts_a_newer_prefill_to_resume(
+    _make_rank: _RankFactory,
+) -> None:
     """Request 1 is suspended to the host tier mid-prefill, and the newer
     request 2 takes part of the freed GPU room for its next chunk, so request
     1's pages cannot come back. The context path recompute-pauses request 2
@@ -686,7 +715,9 @@ SUSPENDED_DECODES_BEHIND_PREFILLS = Scenario(
 )
 
 
-def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
+def test_context_fallback_skips_requests_given_up_earlier_in_the_pass(
+    _make_rank: _RankFactory,
+) -> None:
     """Prompts 1 and 2 fill the pool ahead of decodes 3 and 4, both suspended
     to the host tier. Decode 3 cannot resume, so the generation path
     recompute-pauses decode 4; prompt 1 then needs pages, and the context path
@@ -731,7 +762,9 @@ def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
     assert first_recompute_paused == (4, 2)
 
 
-def test_context_fallback_skips_a_request_given_up_earlier_with_no_active_victim() -> None:
+def test_context_fallback_skips_a_request_given_up_earlier_with_no_active_victim(
+    _make_rank: _RankFactory,
+) -> None:
     """As above, but prompt 2 is left out of the active list, so every
     candidate behind prompt 1 is suspended and the context path falls back to
     suspended victims. Decode 3 cannot resume and the generation path
@@ -799,7 +832,9 @@ def _decode_behind_a_partial_prefill(ranks: list) -> list:
     return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
 
 
-def test_full_host_tier_recompute_pauses_a_suspended_request_holding_gpu_pages() -> None:
+def test_full_host_tier_recompute_pauses_a_suspended_request_holding_gpu_pages(
+    _make_rank: _RankFactory,
+) -> None:
     """Request 2 suspends itself, and request 1's chunks move its pages to the
     host tier until that is full. The rest of request 2's pages stay on GPU, so
     request 1 can continue only once the context path recompute-pauses request
