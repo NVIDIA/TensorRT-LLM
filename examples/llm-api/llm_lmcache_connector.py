@@ -30,7 +30,7 @@ automatically via the connector registry.
 
 Prerequisites:
   Install an LMCache release that provides the lmcache.inprocess package:
-  pip install --upgrade lmcache
+  pip install lmcache==0.5.7rc3
 
 How to run:
   PYTHONHASHSEED=0 LMCACHE_CHUNK_SIZE=32 \
@@ -58,7 +58,7 @@ try:
 except ImportError as e:
     raise ImportError(
         "LMCache is not installed or is missing the in-process TensorRT-LLM integration. "
-        "Install a release providing lmcache.inprocess: pip install --upgrade lmcache"
+        "Install a release providing lmcache.inprocess: pip install lmcache==0.5.7rc3"
     ) from e
 
 # A prompt long enough to produce at least one full TRT-LLM KV block.
