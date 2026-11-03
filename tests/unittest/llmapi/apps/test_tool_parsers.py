@@ -16,6 +16,7 @@
 import abc
 import functools
 import json
+import re
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -5337,6 +5338,17 @@ _G4_STREAM_TEXTS = {
     _g4_tc("get_time", ""),
 }
 
+# A call the end of the output cuts off inside its arguments.
+_G4_CUT_OFF_CALL = (f"{BOT_TOKEN}{CALL_PREFIX}get_weather"
+                    f"{{location:{STRING_DELIM}NY")
+
+
+def _g4_prose(text):
+    """The text before, between and after the calls in `text`, in order."""
+    return re.split(f"{re.escape(BOT_TOKEN)}.*?{re.escape(EOT_TOKEN)}",
+                    text,
+                    flags=re.DOTALL)
+
 
 def _g4_stream(chunks, label):
     """(text, [(name, arguments)]) a client assembles from the stream.
@@ -5378,12 +5390,20 @@ class TestGemma4StreamingMatchesWholeParse:
         whole = Gemma4ToolParser().detect_and_parse(text, _G4_TOOLS)
         expected = [(c.name, json.loads(c.parameters)) for c in whole.calls]
         assert expected
+        before, *after = _g4_prose(text)
+        assert before.strip() == whole.normal_text
+        # detect_and_parse keeps only the text before the first call. A stream
+        # also sends the text after a call when a later increment reads it,
+        # and finish drops what is left, so it sends the text before the first
+        # call and then the text after each of the first k calls, for some k.
+        # Without text after a call, that is the text detect_and_parse keeps.
+        sendable = [before + "".join(after[:k]) for k in range(len(after) + 1)]
 
         for label, chunks in _chunkings(text):
             normal, calls = _g4_stream(chunks, label)
             assert [(name, _g4_arguments(arguments, label))
                     for name, arguments in calls] == expected, label
-            assert normal.strip().startswith(whole.normal_text), label
+            assert normal in sendable, label
 
     def test_arguments_go_out_once_the_call_closes(self, sample_tools):
         """In token-sized increments the name goes out first, then the JSON."""
@@ -5424,16 +5444,35 @@ class TestGemma4StreamingMatchesWholeParse:
                     }),
                 ]
 
-    def test_finish_reports_no_call_cut_off_by_the_end(self, sample_tools):
+    @pytest.mark.parametrize(
+        "chunks,steps",
+        [
+            # The increment returns the text before the call, so no increment
+            # reads the call.
+            pytest.param(["Checking. " + _G4_CUT_OFF_CALL],
+                         [("Checking. ", [])],
+                         id="call_never_read"),
+            # The call's own increment sends its name.
+            pytest.param(["Checking. ", _G4_CUT_OFF_CALL],
+                         [("Checking. ", []), ("", [(0, "get_weather", "")])],
+                         id="name_sent"),
+        ],
+    )
+    def test_finish_reports_no_call_cut_off_by_the_end(self, sample_tools,
+                                                       chunks, steps):
         """detect_and_parse reports no call that never closed, nor does finish."""
+        assert Gemma4ToolParser().detect_and_parse("".join(chunks),
+                                                   sample_tools).calls == []
         parser = Gemma4ToolParser()
-        cut_off = (f"Checking. {BOT_TOKEN}{CALL_PREFIX}get_weather"
-                   f"{{location:{STRING_DELIM}NY")
 
-        streamed = parser.parse_streaming_increment(cut_off, sample_tools)
+        streamed = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in chunks
+        ]
         flushed = parser.finish(sample_tools)
 
-        assert (streamed.normal_text, streamed.calls) == ("Checking. ", [])
+        assert [(r.normal_text, [(c.tool_index, c.name, c.parameters)
+                                 for c in r.calls]) for r in streamed] == steps
         assert (flushed.normal_text, flushed.calls) == ("", [])
 
 
