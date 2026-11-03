@@ -37,7 +37,12 @@ Name files and symbols here, never line numbers.
   Check: `tests/unittest/serve/test_layering.py`.
 - VisualGen serving: `serve/api/visual_gen/` (`ImageServing` and `VideoServing` on
   `VisualGenBaseServing`; routes in `api_router.py`, one `RouterSpec`). The composition root
-  loads the package only for the VISUAL_GEN role; nothing else imports it.
+  loads the package only for the VISUAL_GEN role; the only other references from outside it
+  are the routing table's module path, the lazy re-export in `tensorrt_llm.serve.openai_protocol`
+  and the VisualGen benchmark client, which is what lets CI run only VisualGen tests for
+  changes under the package.
+  Check: `tests/unittest/llmapi/apps/visual_gen/test_serve_visual_gen_isolation.py` (import
+  isolation and test location).
 - VisualGen serve tests live under a path that contains `visual_gen/`
   (`tests/unittest/serve/api/visual_gen/`), or CI selection misses them.
 
