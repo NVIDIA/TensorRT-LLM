@@ -75,6 +75,7 @@ from .ops.attention import cute_dsl_mha_prefix_gather as _mha_prefix_op
 from .ops.attention import cute_dsl_mla_rope_append_prefill as _ctx_rope_op
 from .ops.attention import cute_dsl_mla_rope_generation as _mla_rope_op
 from .ops.attention import cute_dsl_sparse_mla_decode as _fmha_dec_op
+from .ops.attention import cute_dsl_sparse_mla_decode_union as _fmha_union_op
 from .ops.attention import cute_dsl_sparse_mla_prefill as _fmha_pre_op
 from .ops.attention.convert_req_index_to_global import convert_req_index_to_global
 from .ops.attention.cute_dsl_fp8_paged_mqa_logits import ATOM_SPLIT as _MQA_ATOM_SPLIT
@@ -83,6 +84,8 @@ from .ops.attention.cute_dsl_indexer_k_cache_update import build as build_ix_k_c
 from .ops.attention.cute_dsl_indexer_k_cache_update import cute_dsl_indexer_k_cache_update
 from .ops.attention.cute_dsl_indexer_q_side_fused import build as build_ix_q_side
 from .ops.attention.cute_dsl_indexer_q_side_fused import cute_dsl_indexer_q_side_fused
+from .ops.attention.cute_dsl_indexer_q_side_k_cache import build as build_ix_qk
+from .ops.attention.cute_dsl_indexer_q_side_k_cache import cute_dsl_indexer_q_side_k_cache
 from .ops.attention.cute_dsl_indexer_topk_decode import build as build_ix_topk_decode
 from .ops.attention.cute_dsl_indexer_topk_decode import cute_dsl_indexer_topk_decode
 from .ops.attention.cute_dsl_indexer_topk_prefill import build as build_ix_topk_prefill
@@ -100,8 +103,8 @@ from .ops.attention.cute_dsl_sparse_mla_decode import (
     INDEX_KIND_BASE_WITH_LAYER_OFFSET,
     INDEX_KIND_GLOBAL,
     cute_dsl_sparse_mla_decode,
-    cute_dsl_sparse_mla_decode_union,
 )
+from .ops.attention.cute_dsl_sparse_mla_decode_union import cute_dsl_sparse_mla_decode_union
 from .ops.attention.cute_dsl_sparse_mla_prefill import cute_dsl_sparse_mla_prefill
 from .ops.attention.fp8_mqa_logits import fp8_mqa_logits
 from .ops.attention.indexer_k_cache_gather_op import indexer_k_cache_gather_op
@@ -134,6 +137,8 @@ from .ops.gemm import cute_dsl_mtp_eh_proj as _mtp_eh
 from .ops.gemm import cute_dsl_projection as _projection_op
 from .ops.gemm import cute_dsl_projection_mxf8 as _mxf8_op
 from .ops.gemm import cute_dsl_projection_mxf8_decode as _dec8_op
+from .ops.gemm import cute_dsl_q_b_ix_wq_b as _qbix_op
+from .ops.gemm import cute_dsl_qkva_ix_fold as _ix_fold_op
 from .ops.gemm import cute_dsl_shared_gate_up_swiglu as _shared_gu_swiglu_op
 from .ops.gemm import cute_dsl_shared_up_swiglu_mxf8 as _shared_up8_op
 from .ops.gemm.bmm_out import bmm_out
@@ -144,6 +149,8 @@ from .ops.gemm.cute_dsl_mtp_eh_proj import cute_dsl_mtp_eh_proj
 from .ops.gemm.cute_dsl_projection import cute_dsl_projection
 from .ops.gemm.cute_dsl_projection_mxf8 import cute_dsl_projection_mxf8
 from .ops.gemm.cute_dsl_projection_mxf8_decode import cute_dsl_projection_mxf8_decode
+from .ops.gemm.cute_dsl_q_b_ix_wq_b import cute_dsl_q_b_ix_wq_b
+from .ops.gemm.cute_dsl_qkva_ix_fold import cute_dsl_qkva_ix_fold
 from .ops.gemm.cute_dsl_shared_gate_up_swiglu import cute_dsl_shared_gate_up_swiglu
 from .ops.gemm.cute_dsl_shared_up_swiglu_mxf8 import cute_dsl_shared_up_swiglu_mxf8
 from .ops.moe import cute_dsl_moe_l2_prefetch as _l2pf_op
@@ -523,6 +530,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # replicas' slots, prefill pair and hot ids (`_build_moe_wide_rep`; needs
         # `ctx_replicas` > 0).
         self.wide_dec_replicas = os.environ.get("TRTLLM_GLM52_WIDE_DEC_EXPERT_REPLICAS", "1") == "1"
+        # The wide decode top-k's schedule (`TRTLLM_GLM52_WIDE_TOPK_CLUSTER16`: "1", the
+        # default, or "0"): the MTP3 / MTP5 decode steps' fused top-k (and its replica
+        # variant) on a 16-CTA cluster, half the token-warps per SM, with the trimmed winner
+        # lookup; "0" keeps the portable 8-CTA kernel as it was. Same ids, weights, counts
+        # and tile layout either way (route `moe_topk_wide_cl16` counts the 16-CTA launches).
+        cl16 = os.environ.get("TRTLLM_GLM52_WIDE_TOPK_CLUSTER16", "1") == "1"
+        self.wide_topk_schedule = (16, True) if cl16 else (8, False)
         self.mtp_enabled = getattr(model_config, "spec_config", None) is not None
         # The routed experts' FC1 weight layout (`TRTLLM_GLM52_MOE_FC1_KBLK`, `moe_fc1_kblock`),
         # read once here: the loader (`weights._fc1_w`), the MTP layer's quantized experts and
@@ -564,10 +578,41 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # nothing in them compiles.
         self._wide_bucket = True
         self._wide_rag: dict[tuple[str, int], object] = {}
+        # Whether the running call is an eager draft step past the first (`DecodeTarget.
+        # mtp_forward` outside a CUDA-graph capture) of an engine drafting more than one token:
+        # one row per sequence of a context or mixed step, any count 1..64. Such a count
+        # without a decode cell of its own runs on the next cell up at its exact rows (the
+        # cells' runtime-M launch, as `_wide_cell` above 64) instead of cuBLAS, whose kernel
+        # for a new shape loads its module inside the step: the load holds the host until the
+        # GPU drains (19-25 ms), and the step loses the host's lead. `_draft_rag` holds the
+        # re-pinned runners, by (call, rows).
+        self._draft_eager = False
+        self._draft_rag: dict[tuple[str, int], object] = {}
         self._ix_pre_split_rag = None
         # The MTP3 / MTP5 decode cells' K-B writing the e4m3 q-base beside the rope kernel
         # (`_attn_gen`), by row count; empty keeps the bf16 K-B and the full rope there.
         self._kb8_mtp: dict = {}
+        # TRTLLM_GLM52_WIDE_IX_FOLD (default 1): on an MTP3 / MTP5 engine an indexer layer's
+        # wide decode step (rows above 64) runs the qkva projection and the indexer's key /
+        # head-weight projection as one GEMM over the two weights stacked in one buffer
+        # (`_qkva_ix_fold`); 0 keeps the two GEMMs. Set up in `post_load_weights`: the
+        # stacked weights by layer and the fold cells by row count; empty keeps the two.
+        self._ix_fold_on = os.environ.get("TRTLLM_GLM52_WIDE_IX_FOLD", "1") == "1"
+        self._ix_fold_w: dict[int, torch.Tensor] = {}
+        self._qkva_ix_mtp: dict = {}
+        # TRTLLM_GLM52_WIDE_QB_IXQB (default 1): likewise q_b and the indexer's wq_b (both read
+        # q_a) as one GEMM over their two weights stacked `[2, 4096, 2048]` (`_qb_ixqb`), where
+        # the step runs the indexer; 0 keeps the two GEMMs. Stacked weights by layer, cells by
+        # row count, both set up in `post_load_weights`.
+        self._qbix_on = os.environ.get("TRTLLM_GLM52_WIDE_QB_IXQB", "1") == "1"
+        self._qbix_w: dict[int, torch.Tensor] = {}
+        self._qbix_mtp: dict = {}
+        # TRTLLM_GLM52_WIDE_IX_QK (default 1): there, too, the indexer's q side (rope + e4m3
+        # pack of its q, the head weights) and this step's K-cache update run as one launch
+        # (`cute_dsl_indexer_q_side_k_cache`: each kernel's CTAs in one grid, the same bytes);
+        # 0 keeps the two launches. Both pool layouts' launchers, built with the K update's.
+        self._ix_qk_on = os.environ.get("TRTLLM_GLM52_WIDE_IX_QK", "1") == "1"
+        self._ix_qk_compiled: dict = {}
 
         self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
 
@@ -601,7 +646,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # MTP3 / MTP5 only: the decode attention's grid for max_draft_len + 1 rows per sequence.
         self._fmha_dec_wide: _fmha_dec_op.CompiledSparseMlaDecode | None = None
         # MTP3 / MTP5 pure decode: the union decode attention's handle (None: per-row only).
-        self._fmha_union: _fmha_dec_op.CompiledSparseMlaDecodeUnion | None = None
+        self._fmha_union: _fmha_union_op.CompiledSparseMlaDecodeUnion | None = None
         # The routed experts' operand slots: two of each buffer, alternating per layer (trunk)
         # or per call (MTP). See `_build_moe`.
         self._moe_slot = 0
@@ -1137,6 +1182,62 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             kn_b=w[f"l{i}_ix_kn_b"],
         )
 
+    def _stack_ix_fold_weights(self, layers) -> dict[int, torch.Tensor]:
+        """For every layer with an indexer: its qkva weight and the indexer's bf16 key /
+        head-weight rows (`ix_fused_bf16`) moved into one `[2848, 6144]` buffer
+        (`_ix_fold_op.stack_weight`: qkva, 64 zero rows, the indexer rows), the two
+        parameters re-pointed at their rows of it -- the same bytes in the same row-major
+        layout, so every other reader is unchanged, and the old storage is freed. Returns the
+        buffers by layer (`_qkva_ix_fold`'s weight)."""
+        stacked = {}
+        for i in layers:
+            if f"l{i}_ix_fused_bf16" not in self.w:
+                continue
+            qkva, ix = self.w[f"l{i}_qkva"], self.w[f"l{i}_ix_fused_bf16"]
+            buf = _ix_fold_op.stack_weight(qkva.detach(), ix.detach())
+            qkva.data = buf[: int(qkva.shape[0])]
+            ix.data = buf[_ix_fold_op.IX_ROW0 :]
+            stacked[i] = buf
+        return stacked
+
+    def _stack_qbix_weights(self, layers) -> dict[int, torch.Tensor]:
+        """For every layer with an indexer: its q_b weight and the indexer's wq_b moved into
+        one `[2, 4096, 2048]` buffer (`_qbix_op.stack_weight`), the two parameters re-pointed
+        at its two halves (the same bytes and row-major layout: every other reader, the MXF8
+        copies included, is unchanged; the old storage is freed). Returns the buffers by
+        layer (`_qb_ixqb`'s weight)."""
+        stacked = {}
+        for i in layers:
+            if f"l{i}_ix_qb" not in self.w:
+                continue
+            qb, ixqb = self.w[f"l{i}_qb"], self.w[f"l{i}_ix_qb"]
+            buf = _qbix_op.stack_weight(qb.detach(), ixqb.detach())
+            qb.data = buf[0]
+            ixqb.data = buf[1]
+            stacked[i] = buf
+        return stacked
+
+    def _build_qbix(self, dev: int) -> dict:
+        """The q_b | wq_b cells (`_qbix_op.build_all`), kept only where they match both
+        projections' MTP cells row for row: then they serve exactly the rows those cells would
+        (`_wide_cell`), with their bytes. Empty (the two GEMMs) otherwise or on a failed
+        build."""
+        cells = _try_build("q_b | wq_b fold", lambda: _qbix_op.build_all(dev))
+        want = set(self._proj_mtp.get("q_b", {}))
+        if not cells or set(cells) != want or set(self._proj_mtp.get("ix_qb", {})) != want:
+            return {}
+        return cells
+
+    def _build_qkva_ix_fold(self, dev: int) -> dict:
+        """The fold cells (`_ix_fold_op.build_all`), kept only where they match the qkva
+        projection's MTP cells row for row: the fold then serves exactly the rows the qkva
+        cells would (`_wide_cell`), with their bytes. Empty (the two GEMMs) otherwise or if
+        the build fails."""
+        cells = _try_build("qkva indexer fold", lambda: _ix_fold_op.build_all(dev))
+        if not cells or set(cells) != set(self._proj_mtp.get("qkva", {})):
+            return {}
+        return cells
+
     def _derive_moe(self, i: int) -> SimpleNamespace:
         """The routed experts' operands, with the per-tensor scalars folded into the kernels'
         alphas over this rank's window.
@@ -1283,6 +1384,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         """
         dev = torch.cuda.current_device()
         layers = range(self.num_layers + (1 if self.mtp_enabled else 0))
+        # Before any view of the two weights is taken: an MTP3 / MTP5 engine's indexer layers
+        # hold their qkva and indexer key / head-weight rows in one buffer (`_qkva_ix_fold`).
+        if self.max_draft_len > 1 and self._ix_fold_on:
+            self._ix_fold_w = self._stack_ix_fold_weights(layers)
+        # The same for q_b and the indexer's wq_b (`_qb_ixqb`).
+        if self.max_draft_len > 1 and self._qbix_on:
+            self._qbix_w = self._stack_qbix_weights(layers)
         self._attn = [self._derive_attention(i) for i in layers]
         self._idx = [self._derive_indexer(i) for i in layers]
         self._mlp = [(self.w[f"l{i}_mlp_gu"].t(), self.w[f"l{i}_mlp_dn"].t()) for i in layers]
@@ -1336,6 +1444,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             for name, w_colmajor in proj_weights.items()
             if wide and _projection_op.MTP_ROWS[name]
         }
+        self._qkva_ix_mtp = self._build_qkva_ix_fold(dev) if self._ix_fold_w else {}
+        self._qbix_mtp = self._build_qbix(dev) if self._qbix_w else {}
         if self.mtp_enabled:
             proj_weights["mtp_eh"] = self._mtp["eh"]
         self._proj_pre = _projection_op.build_prefill_all(
@@ -1532,6 +1642,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 f"modeling_v2 GLM-5.2 row ops built: {built} "
                 f"logits_gather={self._lamport.gather is not None}"
             )
+        if self.max_draft_len > 1:
+            self._warm_draft_rows()
 
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
@@ -1753,7 +1865,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             splits = _moe_router_op.SPLIT_K if k.router_wide is not None else 1
             wide = optional(
                 lambda: {
-                    r: _moe_topk_op.build_wide(r[1], splits, dev, expert_hist=self._pf is not None)
+                    r: _moe_topk_op.build_wide(
+                        r[1],
+                        splits,
+                        dev,
+                        expert_hist=self._pf is not None,
+                        cluster=self.wide_topk_schedule[0],
+                        trim=self.wide_topk_schedule[1],
+                    )
                     for r in _moe_topk_op.WIDE_RANGES
                 }
             )
@@ -1788,6 +1907,57 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     for w in _MOE_DECODE_WIDTHS
                 },
             )
+
+    def _warm_draft_rows(self) -> None:
+        """MTP3 / MTP5, at load: launch once on zeros what an eager draft step runs at a
+        per-row-count module. Those compile at load but launch only on a step of that count,
+        and the first such launch loads its module inside the step: the load holds the host
+        until the GPU drains (19-23 ms on a context step's eager draft step).
+        Decode graphs load the counts they capture; an eager draft step takes any count 1..64.
+        - The MTP layer's routed experts at every count 1..64: the top-k per count; routing,
+          quantize and clear per power of two. Same path, handles and buffers as the step
+          (the FC2 tile counters reset at each launch's end).
+        - The eh_proj K-split instances up to 64 rows (`_mtp_front`).
+        - The shared expert's gate|up at the counts no runtime-M cell serves (33..63 but 48:
+          the 48 / 64 cells are compiled for their own M, and the fused MTP cells take 65
+          rows and up): `_project` itself on the step's operand shape, so cuBLAS loads the
+          kernels it picks for those shapes here.
+        The slot parity, the MTP layer's L2 prefetch counts and the route counters are
+        restored after."""
+        dev = self.w["embed"].device
+        j = self.num_layers
+        hits, misses = dict(self.route_hits), dict(self.route_misses)
+        x = torch.zeros(
+            (_DECODE_MAX_ROWS, self.w["embed"].shape[1]), dtype=torch.bfloat16, device=dev
+        )
+        if self.mtp_enabled:
+            runner = self._mtp["ehproj"]
+            for m in _mtp_eh.SUPPORTED_M_VALUES:
+                if m <= _DECODE_MAX_ROWS:
+                    eh = torch.zeros(
+                        (m, _mtp_eh.LOCAL_INPUT_SIZE), dtype=torch.bfloat16, device=dev
+                    )
+                    runner.forward_rows(eh, m)
+            self._draft_eager = True
+            try:
+                for rows in range(1, _DECODE_MAX_ROWS + 1):
+                    if rows not in self._shared_gu_swiglu:
+                        self._project("shared_gate_up", x[:rows], self._mlp[j][0])
+            finally:
+                self._draft_eager = False
+        if self._mtp_fp4 is not None:
+            slot = self._moe_slot
+            hist = self._pf.hist[j].clone() if self._pf is not None else None
+            for rows in range(1, _DECODE_MAX_ROWS + 1):
+                self._routed(x[:rows], self._mtp_fp4, rows, False, None, False, False, j)
+            self._moe_slot = slot
+            if hist is not None:
+                self._pf.hist[j].copy_(hist)
+        torch.cuda.synchronize()
+        self.route_hits.clear()
+        self.route_hits.update(hits)
+        self.route_misses.clear()
+        self.route_misses.update(misses)
 
     def _select_target(self, attn_metadata) -> "PrefillTarget | DecodeTarget":
         """Which target runs this step.
@@ -1915,6 +2085,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
             for contiguous in (False, True)
         }
+        if self.max_draft_len > 1 and self._ix_qk_on:
+            self._ix_qk_compiled = (
+                _try_build(
+                    "indexer q side + K update",
+                    lambda: {
+                        contiguous: build_ix_qk(
+                            dev, is_neox=self.indexer_is_neox, cache_contiguous=contiguous
+                        )
+                        for contiguous in (False, True)
+                    },
+                )
+                or {}
+            )
         # Every split-K variant the decode attention selects for 1..max_batch_size sequences,
         # both index kinds. `max_num_requests` is the engine's max_batch_size, in every
         # metadata it hands over (a CUDA-graph copy keeps it): no step schedules more
@@ -1939,10 +2122,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # layer and mixed steps keep the per-row handle above.
             if (
                 self._union_on
-                and self.max_draft_len + 1 in _fmha_dec_op.UNION_ROWS_PER_GROUP
+                and self.max_draft_len + 1 in _fmha_union_op.UNION_ROWS_PER_GROUP
                 and int(md.tokens_per_block) == _fmha_dec_op.LAYER_ROW_STRIDE
             ):
-                self._fmha_union = _fmha_dec_op.compile_union(
+                self._fmha_union = _fmha_union_op.compile_union(
                     max_batch_size=int(md.max_num_requests),
                     device_index=dev,
                     max_sq=self.max_draft_len + 1,
@@ -2205,6 +2388,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._count("dec_wide_rows", cell is not None)
         return cell
 
+    def _draft_cell(self, call: str, rows: int, cells: dict, mtp_cells: dict, at_rows):
+        """The cell an eager draft step's `rows` (at most 64, no cell of their own; see
+        `_draft_eager`) run on at their exact rows: the smallest decode cell above `rows` up
+        to 64 that launches at a runtime row count, else the smallest such MTP cell (128 /
+        192). `at_rows(cell, rows)` re-pins as in `_wide_cell`; a None from it (a cell
+        compiled for its own M only) moves to the next cell up. The context-sized cells
+        (1099 rows and up) are never taken: their tiles past the last row would each read
+        the weight again. Each row is bitwise the serving cell's for it. None (the call's
+        fallback runs) when no cell qualifies. Kept per (`call`, rows); builds nothing."""
+        key = (call, rows)
+        if key not in self._draft_rag:
+            cell = None
+            ups = [cells[m] for m in sorted(cells) if rows < m <= _DECODE_MAX_ROWS]
+            ups += [mtp_cells[m] for m in sorted(mtp_cells) if m > rows]
+            for up in ups:
+                cell = at_rows(up, rows)
+                if cell is not None:
+                    break
+            self._draft_rag[key] = cell
+        cell = self._draft_rag[key]
+        self._count("draft_cell", cell is not None)
+        return cell
+
     def _project(
         self,
         name: str,
@@ -2264,6 +2470,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 f"proj:{name}", self._proj_mtp.get(name, {}), rows, _projection_op.at_rows
             )
             self._count("dec_wide", runner is not None)
+        if runner is None and self._draft_eager and rows <= _DECODE_MAX_ROWS:
+            runner = self._draft_cell(
+                f"proj:{name}",
+                rows,
+                self._proj.get(name, {}),
+                self._proj_mtp.get(name, {}),
+                _projection_op.at_rows,
+            )
         prefill = self._proj_pre.get(name)
         if (
             runner is None
@@ -2402,14 +2616,25 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         the K-B then takes its decode fp8 q-base cell, as at MTP1's width 2."""
         return gen_p in self.mtp_widths or (gen_p == 1 and self.max_draft_len > 1)
 
-    def _qkv(self, x, a, q_b: bool = True, x8=None, q8_rows: int = 0, q_store_from: int = 0):
+    def _qkv(
+        self,
+        x,
+        a,
+        q_b: bool = True,
+        x8=None,
+        q8_rows: int = 0,
+        q_store_from: int = 0,
+        qkva=None,
+    ):
         """`(q, q_a, latent, q8)`. The kv norm writes in place, so the latent `[ckv | k_pe]` is
         the fused projection's tail, a strided view. `q_b=False` leaves q to the caller (None).
         `x8` is `x`'s MXF8 operand from the closing all-reduce of the layer before. With
         `q8_rows` the norm also writes the first `q8_rows` q_a rows as the MXF8 operand `q8` of
         the fp8 context attention's q_b, where its q8 kernel takes the call (else `q8` is
-        None); `q_store_from` then skips the bf16 q rows below it (no reader)."""
-        qkva = self._project("qkva", x, a.qkva, w8=a.qkva8, pre=x8)
+        None); `q_store_from` then skips the bf16 q rows below it (no reader). `qkva`: the
+        projection's output the caller already wrote (`_qkva_ix_fold`), else it runs here."""
+        if qkva is None:
+            qkva = self._project("qkva", x, a.qkva, w8=a.qkva8, pre=x8)
         q_a_raw, ckv_raw, _ = torch.split(qkva, [self.q_lora, self.kv_lora, self.rope_dim], -1)
         if (
             q8_rows
@@ -2508,58 +2733,146 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._copy_into(buf[tc:], md.topk_indices_buffer[tc:rows])
         return buf
 
-    def _indexer_project(self, x, q_a, pos, ix, rows: int, need_q: bool):
+    def _qkva_ix_fold(self, x, i: int, rows: int):
+        """`(qkva, key, head_weights)` of indexer layer `i` from one GEMM (the qkva projection
+        with the indexer's key / head-weight rows folded in, `cute_dsl_qkva_ix_fold`), or None
+        where it does not serve and the two GEMMs run: off (`TRTLLM_GLM52_WIDE_IX_FOLD=0`), an
+        MTP1 engine, a step that is not a wide decode step (rows above 64 on an MTP3 / MTP5
+        engine), or rows without a qkva MTP cell. Where it serves, `qkva` is bitwise the qkva
+        MTP cell's (`_project` on these rows) and the indexer columns accumulate as the
+        split-output projection's (its chains and reduction order); `key` / `head_weights` are
+        views of the cell's side buffers, consumed by this layer's indexer before the next
+        layer's call."""
+        w = self._ix_fold_w.get(i)
+        if (
+            w is None
+            or not self._qkva_ix_mtp
+            or not self._wide_decode
+            or rows <= _DECODE_MAX_ROWS
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+        ):
+            return None
+        runner = self._wide_cell("qkva_ix_fold", self._qkva_ix_mtp, rows, _ix_fold_op.at_rows)
+        self._count("ix_fold", runner is not None)
+        if runner is None:
+            return None
+        out = torch.empty([rows, _ix_fold_op.QKVA_N], dtype=x.dtype, device=x.device)
+        return cute_dsl_qkva_ix_fold(x, w, out, runner)
+
+    def _qb_ixqb_runner(self, i: int, rows: int):
+        """The q_b | wq_b cell for indexer layer `i` at `rows` (`_qb_ixqb`), or None where it
+        does not serve and the two GEMMs run: off (`TRTLLM_GLM52_WIDE_QB_IXQB=0`), an MTP1
+        engine, a step that is not a wide decode step (rows above 64 on an MTP3 / MTP5
+        engine), or rows without an MTP cell. Counted as `qb_ixqb`."""
+        if i not in self._qbix_w or not self._qbix_mtp:
+            return None
+        if not self._wide_decode or rows <= _DECODE_MAX_ROWS:
+            return None
+        runner = self._wide_cell("qb_ixqb", self._qbix_mtp, rows, _qbix_op.at_rows)
+        self._count("qb_ixqb", runner is not None)
+        return runner
+
+    def _qb_ixqb(self, q_a, i: int, runner):
+        """`(q, ix_q)` of layer `i` from one GEMM: bitwise the q_b and wq_b MTP cells' outputs
+        (`cute_dsl_q_b_ix_wq_b`); `q` `[rows, 4096]` and `ix_q` contiguous halves of one
+        buffer."""
+        rows = int(q_a.shape[0])
+        out2 = torch.empty([2, rows, _qbix_op.N], dtype=q_a.dtype, device=q_a.device)
+        return cute_dsl_q_b_ix_wq_b(q_a, self._qbix_w[i], out2, runner)
+
+    def _indexer_project(
+        self, x, q_a, pos, ix, rows: int, need_q: bool, kw=None, ixq=None, kc=None
+    ):
         """The indexer's front: `(q_fp8, weights, k_pre)`; `q_fp8` and `weights` are None on a
         step where every phase takes the engine's index. The k side always runs: the keys this
-        step appends are read by later steps."""
+        step appends are read by later steps. `kw`: the pre-norm keys and head weights the
+        caller already projected (`_qkva_ix_fold`), else the split-output projection runs;
+        `ixq`: the indexer's q projection likewise (`_qb_ixqb`). `kc`: `(md, k_pool)`, the
+        layer's K cache: where `_ix_qk_handle` has a launcher the q side and the K-cache
+        update run as one launch here, and `k_pre` is None (the keys are written)."""
         hi, di = self.idx_heads, self.idx_dim
         dev = x.device
-        split = self._ix_pre_split.get(rows)
-        if self._wide_decode and rows > _DECODE_MAX_ROWS:
-            # Rows without a handle of their own take the runtime-M handle (the same kernel).
-            rag = self._ix_pre_split_rag
-            if rag is not None and rows > rag.max_m:
-                rag = None
-            split = self._wide_cell("ix_split", self._ix_pre_split_mtp, rows, lambda h, r: rag)
-            self._count("dec_wide", split is not None)
-        pre = self._ix_pre_split_pre
-        if (
-            split is None
-            and pre is not None
-            and _DECODE_MAX_ROWS < rows <= pre.max_rows
-            and x.is_contiguous()
-        ):
-            split = pre
         qside = self._ix_qside_compiled
-        if split is not None and split is pre and self._ix_nosplit:
-            # fp32 column views of one [rows, 160] output (`TRTLLM_GLM52_CTX_IX_NOSPLIT`).
-            kb, wq = _ix_pre_split_op.project_unsplit(x, ix.fused_bf16, pre)
-            qside = self._ix_qside_compiled_p160
-            self._count("ctx_ix_nosplit", True)
-        elif split is not None:
-            kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
-            wq = torch.empty([rows, hi], dtype=torch.float32, device=dev)
-            cute_dsl_indexer_pre_proj_split(x, ix.fused_bf16, kb, wq, split)
+        if kw is not None:
+            kb, wq = kw
         else:
-            kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
-            # fp32: the only `weights` dtype fp8_mqa_logits takes.
-            fused = self._project("ix_fused", x.float(), ix.fused, torch.float32)
-            k_raw, wq_raw = torch.split(fused, [di, hi], -1)
-            self._copy_into(kb, k_raw)
-            # The scorers check `weights`' stride(1) but not stride(0), then read it densely:
-            # a strided slice scores each row with another row's head weights.
-            wq = wq_raw.contiguous()
+            split = self._ix_pre_split.get(rows)
+            if self._wide_decode and rows > _DECODE_MAX_ROWS:
+                # Rows without a handle of their own take the runtime-M handle (the same kernel).
+                rag = self._ix_pre_split_rag
+                if rag is not None and rows > rag.max_m:
+                    rag = None
+                split = self._wide_cell("ix_split", self._ix_pre_split_mtp, rows, lambda h, r: rag)
+                self._count("dec_wide", split is not None)
+            elif split is None and self._draft_eager and rows <= _DECODE_MAX_ROWS:
+                # An eager draft step's count without a handle: the runtime-M handle (the
+                # same kernel) instead of the fp32 cuBLAS projection.
+                rag = self._ix_pre_split_rag
+                split = rag if rag is not None and rows <= rag.max_m else None
+                self._count("draft_cell", split is not None)
+            pre = self._ix_pre_split_pre
+            if (
+                split is None
+                and pre is not None
+                and _DECODE_MAX_ROWS < rows <= pre.max_rows
+                and x.is_contiguous()
+            ):
+                split = pre
+            if split is not None and split is pre and self._ix_nosplit:
+                # fp32 column views of one [rows, 160] output (`TRTLLM_GLM52_CTX_IX_NOSPLIT`).
+                kb, wq = _ix_pre_split_op.project_unsplit(x, ix.fused_bf16, pre)
+                qside = self._ix_qside_compiled_p160
+                self._count("ctx_ix_nosplit", True)
+            elif split is not None:
+                kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
+                wq = torch.empty([rows, hi], dtype=torch.float32, device=dev)
+                cute_dsl_indexer_pre_proj_split(x, ix.fused_bf16, kb, wq, split)
+            else:
+                kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
+                # fp32: the only `weights` dtype fp8_mqa_logits takes.
+                fused = self._project("ix_fused", x.float(), ix.fused, torch.float32)
+                k_raw, wq_raw = torch.split(fused, [di, hi], -1)
+                self._copy_into(kb, k_raw)
+                # The scorers check `weights`' stride(1) but not stride(0), then read it
+                # densely: a strided slice scores each row with another row's head weights.
+                wq = wq_raw.contiguous()
         k_pre = (kb, ix.kn_w, ix.kn_b, pos)
         if not need_q:
             return None, None, k_pre
-        q = torch.reshape(self._project("ix_qb", q_a, ix.qb), [rows, hi, di])
+        if ixq is None:
+            ixq = self._project("ix_qb", q_a, ix.qb)
+        q = torch.reshape(ixq, [rows, hi, di])
         q_fp8 = torch.empty([rows, hi, di], dtype=torch.float8_e4m3fn, device=dev)
         weights = torch.empty([rows, hi], dtype=torch.float32, device=dev)
+        qk = self._ix_qk_handle(kc, kb, rows)
+        if qk is not None:
+            md, k_pool = kc
+            self._count("ix_qk", True)
+            cute_dsl_indexer_q_side_k_cache(
+                q, pos, self._idx_cos_sin, wq, self.idx_weight_scale, q_fp8, weights, kb,
+                ix.kn_w, ix.kn_b, k_pool, md.slot_mapping_fp8, md.slot_mapping_scale,
+                is_neox=self.indexer_is_neox, compiled=qk,
+            )  # fmt: skip
+            return q_fp8, weights, None
         cute_dsl_indexer_q_side_fused(
             q, pos, self._idx_cos_sin, wq, self.idx_weight_scale, q_fp8, weights,
             is_neox=self.indexer_is_neox, compiled=qside,
         )  # fmt: skip
         return q_fp8, weights, k_pre
+
+    def _ix_qk_handle(self, kc, kb: torch.Tensor, rows: int):
+        """The q side + K-cache update launcher for this call (`TRTLLM_GLM52_WIDE_IX_QK`), or
+        None: only with the layer's cache (`kc`) on an MTP3 / MTP5 wide decode step (rows
+        above 64), once the K update's first eager call has validated the slot mappings
+        (`_indexer_write_k`), with 8-byte aligned contiguous keys (its only key loads)."""
+        if kc is None or not self._ix_qk_compiled or not self._idx_k_checked:
+            return None
+        if not (self._wide_decode and rows > _DECODE_MAX_ROWS):
+            return None
+        if not kb.is_contiguous() or kb.data_ptr() % 8:
+            return None
+        return self._ix_qk_compiled[kc[1].is_contiguous()]
 
     def _indexer_write_k(self, md, k_pool, k_pre, rows: int) -> None:
         """Norm, rope, fp8-pack and append this step's keys in one launch."""
@@ -3032,7 +3345,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             "MoE wide decode replica top-k",
             lambda: {
                 r: _moe_topk_wide_rep_op.build_wide_rep(
-                    r[1], splits, self.ctx_replicas, dev, expert_hist=h.expert_hist
+                    r[1],
+                    splits,
+                    self.ctx_replicas,
+                    dev,
+                    expert_hist=h.expert_hist,
+                    cluster=h.cluster,
+                    trim=h.trim,
                 )
                 for r, h in k.topk_wide.items()
                 if r[1] <= _WIDE_REP_MAX_ROWS
@@ -3108,6 +3427,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 # takes this branch for the same rows and layer.
                 handle, hot = rep
                 self._count("moe_wide_replica", True)
+                if handle.cluster == 16:
+                    self._count("moe_topk_wide_cl16", True)
                 outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.maps}
                 selected = cute_dsl_moe_topk_routing_wide_rep(
                     logits, m.router_bias, hot, self.expert_offset, self.routed_scale, outputs,
@@ -3118,6 +3439,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # One fused launch for the three of the prefill top-k (histogram, prefix,
             # scatter); the maps it writes are FC1's as they stand.
             self._count("moe_topk_wide", True)
+            if wide.cluster == 16:
+                self._count("moe_topk_wide_cl16", True)
             outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.maps}
             return cute_dsl_moe_topk_routing(
                 logits, m.router_bias, self.expert_offset, self.routed_scale, outputs, None, wide,
@@ -3470,6 +3793,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         if not ksplit and self._wide_decode and rows > _DECODE_MAX_ROWS:
             cells = dict.fromkeys(_mtp_eh.WIDE_ROWS, runner)
             runner = self._wide_cell("mtp_eh", cells, rows, _mtp_eh.at_rows)
+            ksplit = runner is not None
+        elif not ksplit and self._draft_eager and rows <= _DECODE_MAX_ROWS:
+            # An eager draft step's count: the next supported instance up at its exact rows
+            # (`at_rows` picks the instance; one runner holds them all).
+            runner = self._draft_cell(
+                "mtp_eh", rows, {_DECODE_MAX_ROWS: runner}, {}, _mtp_eh.at_rows
+            )
             ksplit = runner is not None
         if ksplit and e.is_contiguous() and h.is_contiguous():
             src, nw = (e, mw["enorm"]) if self.tp_rank < 2 else (h, mw["hnorm"])
@@ -4756,12 +5086,26 @@ class DecodeTarget:
     ):
         core = self.core
         a = core._attn[i]
-        q, q_a, latent, _ = core._qkv(x, a)
         ix = core._idx[i]
+        # MTP3 / MTP5 wide rows: the qkva projection and the indexer's key / head-weight
+        # projection in one GEMM (None: the two GEMMs below).
+        fold = core._qkva_ix_fold(x, i, rows) if ix is not None else None
+        # And q_b with the indexer's wq_b in one GEMM where the step runs the indexer.
+        qbix = core._qb_ixqb_runner(i, rows) if ix is not None and not skip_gen else None
+        q, q_a, latent, _ = core._qkv(
+            x, a, q_b=qbix is None, qkva=None if fold is None else fold[0]
+        )
+        ixq = None
+        if qbix is not None:
+            q, ixq = core._qb_ixqb(q_a, i, qbix)
         if ix is not None:
-            q_fp8, weights, k_pre = core._indexer_project(x, q_a, pos, ix, rows, not skip_gen)
             k_pool = md.kv_cache_manager.get_indexer_k_cache_buffers(i)
-            core._indexer_write_k(md, k_pool, k_pre, rows)
+            q_fp8, weights, k_pre = core._indexer_project(
+                x, q_a, pos, ix, rows, not skip_gen, kw=None if fold is None else fold[1:],
+                ixq=ixq, kc=(md, k_pool),
+            )  # fmt: skip
+            if k_pre is not None:  # else written with the q side (`_ix_qk_handle`)
+                core._indexer_write_k(md, k_pool, k_pre, rows)
             if not skip_gen:
                 core._indexer_decode(
                     md, k_pool, q_fp8, weights, topk_buf, 0, rows // gen_p, gen_p, split_memo
@@ -4857,7 +5201,17 @@ class DecodeTarget:
         **kwargs,
     ) -> torch.Tensor:
         """One draft step, decode rows only. Pool rows go through the stock conversion against
-        the draft pool's live mapping."""
+        the draft pool's live mapping. Run eagerly (a context or mixed step's draft loop), its
+        row counts without a decode cell run on the next cell up (`_draft_eager`)."""
+        core = self.core
+        core._draft_eager = core.max_draft_len > 1 and not torch.cuda.is_current_stream_capturing()
+        try:
+            return self._mtp_step(input_ids, hidden_states, attn_metadata, position_ids)
+        finally:
+            core._draft_eager = False
+
+    def _mtp_step(self, input_ids, hidden_states, attn_metadata, position_ids):
+        """`mtp_forward`'s step."""
         core = self.core
         md = attn_metadata
         rows = hidden_states.shape[0]

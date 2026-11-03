@@ -118,15 +118,31 @@ moe_quant_dec: dict = {}
 # 0 and leaves the slot's next user nothing to clear. The cells interleave row
 # counts and kinds, so a slot tail that push left dirty would show in a later
 # cell's outputs. The epoch moves only under the `strict` PDL policy, which no
-# kernel of the workspace uses.
+# kernel of the workspace uses. Wide-decode levers: on a `wide` workspace with self-cleaning slots
+# (`_lamport.wide_ar_levers`) the quant entry's two-shot (above QUANT_TWOSHOT_ABOVE rows) and
+# the fused entry's `fused_wide` (QUANT_TWOSHOT_ABOVE..TWOSHOT_ABOVE rows) record 0 as well.
 _slot = 0
 _counts = [0, 0, 0]
+SELF_CLEAN = False
 
 
-def _launched(rows: int, width: int = HIDDEN, kind: str = "") -> None:
+def _launched(rows: int, width: int = HIDDEN, kind: str = "", direct: bool = False) -> None:
+    """`direct`: the call launched a build itself instead of going through its entry."""
     global _slot
     pushed = kind == "fused" and rows > TWOSHOT_ABOVE
-    _counts[_slot] = 0 if pushed else rows * width // 8
+    clean = (
+        SELF_CLEAN
+        and not direct
+        and (
+            (kind == "quant" and rows > QUANT_TWOSHOT_ABOVE)
+            or (
+                kind == "fused"
+                and QUANT_TWOSHOT_ABOVE < rows <= TWOSHOT_ABOVE
+                and WS.fused_wide is not None
+            )
+        )
+    )
+    _counts[_slot] = 0 if (pushed or clean) else rows * width // 8
     _slot = (_slot + 1) % 3
 
 
@@ -808,7 +824,7 @@ def check_wide_quant_twoshot_matches_one_shot() -> None:
                 )  # fmt: skip
             else:
                 call.launch()
-            _launched(rows, kind="quant")
+            _launched(rows, kind="quant", direct=direct)
             _assert_state(f"two-shot vs one-shot {rows} rows, direct={direct}")
             call.check(f"{'one-shot' if direct else 'two-shot'} build")
             snaps.append(call.snapshot())
@@ -816,6 +832,44 @@ def check_wide_quant_twoshot_matches_one_shot() -> None:
         for key in snaps[0]:
             assert torch.equal(snaps[0][key], snaps[1][key]), (
                 f"{rows} rows: the two-shot build's {key} differs from the one-shot build's"
+            )
+    dist.barrier()
+
+
+def check_wide_fused_matches_the_plain_build() -> None:
+    """Wide-decode levers: a `wide` workspace runs the fused entry at QUANT_TWOSHOT_ABOVE+1 ..
+    TWOSHOT_ABOVE rows on `fused_wide` (the same one-shot with the CTA head and, by default,
+    self-cleaning slots: an MTP3 / MTP5 step's post-MoE, dense-layer and MTP-layer closes).
+    On the same inputs it must write `fused`'s bytes exactly -- norm and residual -- and pass
+    every gate, at the first wide count, MTP3's and MTP5's step and the odd counts around
+    them, 256 and the one-shot ceiling. `fused` is launched directly (the entry would not pick
+    it there); the two interleave on one workspace, a clearing and a self-cleaning build
+    alternating on the same three slots."""
+    if WS.fused_wide is None:
+        return  # every wide-decode lever off: the entry runs `fused` at these rows itself
+    for rows in (65, 127, 128, 129, 191, 192, 256, 512):
+        call = _Call("fused", rows)
+        seed = _seed(f"fused wide vs plain {rows}")
+        snaps = []
+        for direct in (True, False):
+            call.fill(seed)
+            torch.cuda.synchronize()
+            dist.barrier()
+            if direct:
+                WS.fused(
+                    call.partial, call.residual, call.weight, call.out, call.residual,
+                    *lamport_tail(WS, fused=True),
+                )  # fmt: skip
+            else:
+                call.launch()
+            _launched(rows, kind="fused", direct=direct)
+            _assert_state(f"fused wide vs plain {rows} rows, direct={direct}")
+            call.check(f"{'plain' if direct else 'wide'} fused build")
+            snaps.append(call.snapshot())
+            dist.barrier()
+        for key in snaps[0]:
+            assert torch.equal(snaps[0][key], snaps[1][key]), (
+                f"{rows} rows: fused_wide's {key} differs from fused's"
             )
     dist.barrier()
 
@@ -881,6 +935,7 @@ CHECKS = (
     check_cuda_graph_replays_rotate_the_slot_counter,
     check_wide_quant_replays_match_eager,
     check_wide_quant_twoshot_matches_one_shot,
+    check_wide_fused_matches_the_plain_build,
     check_allgather_cells_interleaved_with_the_all_reduces,
     check_allgather_replays_in_a_cuda_graph,
     check_guards_refuse_a_row_count_above_the_budget,
@@ -891,7 +946,7 @@ CHECKS = (
 def _run_one_rank() -> int:
     """Body of one spawned rank: run every check; a failing rank exits nonzero
     and the launcher kills its siblings."""
-    global RANK, WORLD, WS, TWOSHOT_ABOVE, QUANT_TWOSHOT_ABOVE, lamport_tail
+    global RANK, WORLD, WS, TWOSHOT_ABOVE, QUANT_TWOSHOT_ABOVE, lamport_tail, SELF_CLEAN
     global pure, fused, quant, gather
     global fp4_quantize, fp4_quantize_mod, validating, assert_within_ulp, act_quant
     global moe_quant, moe_quant_mod, moe_quant_pre
@@ -942,6 +997,7 @@ def _run_one_rank() -> int:
     WS = _lamport.build_workspace(HIDDEN, EPS, MAX_ROWS, rank, world, wide=True)
     TWOSHOT_ABOVE = _lamport.TWOSHOT_ABOVE
     QUANT_TWOSHOT_ABOVE = _lamport.QUANT_TWOSHOT_ABOVE
+    SELF_CLEAN = _lamport.wide_ar_levers()["self_clean"]
     lamport_tail = _lamport.tail
     pure = cute_dsl_allreduce
     fused = cute_dsl_allreduce_add_rmsnorm

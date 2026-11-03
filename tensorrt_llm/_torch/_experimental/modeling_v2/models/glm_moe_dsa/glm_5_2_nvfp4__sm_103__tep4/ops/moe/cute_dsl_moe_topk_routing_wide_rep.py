@@ -58,15 +58,26 @@ class CompiledTopkRoutingWideRep:
     nrep: int
     launch: Callable[..., None]
     expert_hist: bool = False
+    cluster: int = 8
+    trim: bool = False
 
 
 def build_wide_rep(
-    rows: int, logit_splits: int, nrep: int, device, *, expert_hist: bool = False
+    rows: int,
+    logit_splits: int,
+    nrep: int,
+    device,
+    *,
+    expert_hist: bool = False,
+    cluster: int = 8,
+    trim: bool = False,
 ) -> CompiledTopkRoutingWideRep:
     """Compile the wide replica top-k for the row range holding `rows` (`wide_range`) reading
-    `logit_splits` planes, with `nrep` replica slots. Call at load; nothing is launched. No
-    early FC1 release (as the wide top-k the trunk builds). `expert_hist`: also write the
-    step's per-home-expert token counts into the int32 `[64]` row the call passes."""
+    `logit_splits` planes, with `nrep` replica slots, on a `cluster`-CTA cluster (8, or 16 as
+    the wide top-k's `build_wide`), `trim`: with its trimmed winner lookup. Call at load;
+    nothing is launched. No early FC1 release
+    (as the wide top-k the trunk builds). `expert_hist`: also write the step's per-home-expert
+    token counts into the int32 `[64]` row the call passes."""
     _, hi = wide_range(rows)
     nrep = int(nrep)
     shape = (hi, EXPERTS) if logit_splits == 1 else (hi, int(logit_splits), EXPERTS)
@@ -86,6 +97,8 @@ def build_wide_rep(
             wait_for_router_pdl=_USE_PDL,
             signal_gg1_pdl=False,
             expert_hist=hist,
+            cluster=int(cluster),
+            trim=bool(trim),
         )
 
     def launch(logits, bias, hot_ids, local_expert_offset, routed_scale, outputs, expert_hist=None):
@@ -103,7 +116,9 @@ def build_wide_rep(
             *((as_t(expert_hist, assumed_align=16),) if expert_hist is not None else ()),
         )
 
-    return CompiledTopkRoutingWideRep(hi, int(logit_splits), nrep, launch, bool(expert_hist))
+    return CompiledTopkRoutingWideRep(
+        hi, int(logit_splits), nrep, launch, bool(expert_hist), int(cluster), bool(trim)
+    )
 
 
 class CuteDslMoeTopkRoutingWideRep(OpWrapper):

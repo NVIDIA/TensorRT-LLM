@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.2 decode MoE router: split-K4 FP32 partials ``[T, 4, 256]`` for T = 1..64, latency-first.
+"""GLM-5.2 decode MoE router: split-K4 FP32 partials ``[T, 4, 256]`` for T = 1..256, latency-first.
 
 Drop-in for ``moe_frontend_router_tc.run_router_tc_partials`` (the reused
 TRT-LLM persistent GEMM, ``mma_tiler (64, 32)``, split-K 4, cluster (1, 2)):
@@ -40,6 +40,15 @@ Operands: ``x`` BF16 ``[T, 6144]`` contiguous (16-byte aligned), weight BF16
 ``[256, 6144]`` contiguous, partials FP32 ``[T, 4, 256]`` contiguous
 (32-byte aligned; 256-bit stores). Rows beyond T are TMA zero-fill and never
 stored. One compile serves every T (symbolic).
+
+T above 64 (the MTP3 / MTP5 verify steps and draft step 0 carry 128 / 192 rows):
+the 32-CTA schedule above is repeated for each 64-row M tile along grid y,
+``ceil(T / 64)`` of them. M tile ``m`` loads activation rows ``64 m ..`` and
+stores those rows; every CTA still loads its whole weight slice before the PDL
+wait (from L2 after the first M tile: 3 MiB per tile). The MMAs, their K order
+and the TMEM drain are the same in every M tile, so each tile's partials are the
+64-row partials of its rows, bit for bit. At T <= 64 grid y is 1 and tile 0
+starts at row 0.
 """
 
 from typing import Callable, Dict, Tuple
@@ -67,7 +76,8 @@ _CLUSTER = 8  # the 8 N tiles of one K split share every activation tile
 # cluster needs at once -- an 8-CTA cluster must find 8 free SMs of one GPC behind the pre-MoE all-reduce, which
 # in serving places the router after the shared expert's gate/up.
 _CLUSTERS = (1, 2, 4, 8)
-_MAX_TOKENS = 64
+#: Up to four 64-row M tiles on grid y.
+MAX_TOKENS = 4 * _TILE_M
 
 # 64-K tiles per pipeline stage (divides 24, <= 8) and the activation pipeline depth.
 _KSUB = 4
@@ -116,9 +126,10 @@ def decode_router_partials_kernel(
     acc_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     tmem_location = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
     tid, _, _ = cute.arch.thread_idx()
-    block, _, _ = cute.arch.block_idx()
+    block, m_tile, _ = cute.arch.block_idx()
     warp = cute.arch.warp_idx()
     lane = tid % 32
+    m0 = m_tile * cutlass.Int32(_TILE_M)
     if cutlass.const_expr(use_pdl):
         # Early scheduling signal only: the top-k's griddepcontrol.wait still waits for this grid to complete.
         if tid == 0:
@@ -193,7 +204,7 @@ def decode_router_partials_kernel(
                     prims.cp_async_bulk_tensor_shared_cluster_global(
                         smem_a.subview((stage * ksub + j) * a_tile + crank * (a_rows * _TILE_K)),
                         a_desc.get_ptr(),
-                        (k0 + (st * ksub + j) * _TILE_K, crank * a_rows),
+                        (k0 + (st * ksub + j) * _TILE_K, m0 + crank * a_rows),
                         full.subview(stage),
                         [],
                         multicast_mask=cutlass.Int16(mask),
@@ -256,7 +267,7 @@ def decode_router_partials_kernel(
 
     if warp >= 2:
         # Four TMEM drain warps: M64 accumulator rows are lanes 0..15 of each warp's sub-partition.
-        row = (warp % 4) * (_TILE_M // 4) + lane
+        row = m0 + (warp % 4) * (_TILE_M // 4) + lane
         owns_row = lane < _TILE_M // 4
         global_output = output.iterator.raw_ptr()
         while not prims.mbarrier_try_wait_parity(acc_full.subview(0), 0):
@@ -317,7 +328,7 @@ def launch_decode_router_partials(
         swizzle=cuda_exp.TensorMapSwizzle.s128b,
     )
     decode_router_partials_kernel(a_desc, b_desc, c, tokens, stages, ksub, use_pdl, cluster).launch(
-        grid=(_CTAS, 1, 1),
+        grid=(_CTAS, cute.ceil_div(tokens, _TILE_M), 1),
         block=(192, 1, 1),
         cluster=(cluster, 1, 1),
         stream=stream,
@@ -327,8 +338,8 @@ def launch_decode_router_partials(
 
 def _validate(input_tensor: "torch.Tensor", weight: "torch.Tensor", output: "torch.Tensor") -> int:
     m, k = input_tensor.shape
-    if not 1 <= m <= _MAX_TOKENS:
-        raise ValueError(f"decode router supports T in [1, {_MAX_TOKENS}], got {m}")
+    if not 1 <= m <= MAX_TOKENS:
+        raise ValueError(f"decode router supports T in [1, {MAX_TOKENS}], got {m}")
     if tuple(weight.shape) != (_E, _K) or k != _K:
         raise ValueError(f"decode router requires [T,{_K}] x [{_E},{_K}]")
     if tuple(output.shape) != (m, _SPLIT, _E):
@@ -383,7 +394,7 @@ def compile_router_partials(
             a,
             b,
             c,
-            cutlass.Int32(_MAX_TOKENS),
+            cutlass.Int32(MAX_TOKENS),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             stages=_STAGES,
             ksub=_KSUB,

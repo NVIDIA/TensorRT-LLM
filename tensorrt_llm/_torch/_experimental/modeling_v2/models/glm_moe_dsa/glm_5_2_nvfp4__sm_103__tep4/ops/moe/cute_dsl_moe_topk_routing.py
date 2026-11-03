@@ -56,6 +56,12 @@ PREFILL_OUTPUTS = ("topk_weights", "topk_indices", "partial_counts", "expert_bas
 WIDE_MIN_ROWS = _wide.MIN_TOKENS
 WIDE_MAX_ROWS = _wide.MAX_TOKENS
 WIDE_RANGES = tuple((8 * (w - 8) + 1, 8 * w) for w in _wide.WARP_COUNTS)
+#: The wide kernel's cluster sizes: the portable 8 CTAs, or 16 (half the token-warps per CTA
+#: on twice the SMs; same selection, counts and tile layout).
+WIDE_CLUSTERS = _wide.CLUSTERS
+#: The wide kernel's schedules `(cluster, trim)`: the served 8-CTA one, and the 16-CTA cluster
+#: with the trimmed winner lookup (`TRTLLM_GLM52_WIDE_TOPK_CLUSTER16`). Bitwise the same.
+WIDE_SCHEDULES = ((8, False), (16, True))
 
 
 def wide_range(rows: int) -> tuple[int, int]:
@@ -102,6 +108,8 @@ class CompiledTopkRouting:
     fuse_zero: bool
     launch: Callable[..., None]
     expert_hist: bool = False
+    cluster: int = 8
+    trim: bool = False
 
 
 def _decode_launch(
@@ -218,10 +226,14 @@ def build_wide(
     *,
     signal_gg1: bool = False,
     expert_hist: bool = False,
+    cluster: int = 8,
+    trim: bool = False,
 ) -> CompiledTopkRouting:
     """Compile the wide decode top-k for the row range holding `rows` (65..128, 129..192 or
     193..256, `wide_range`) reading `logit_splits` planes (1: the prefill router's logits; 2,
-    4 or 8 K partials). Call at load. Compiles only; nothing is launched.
+    4 or 8 K partials), on a `cluster`-CTA cluster (`WIDE_CLUSTERS`: 8, or 16 with half the
+    token-warps per CTA), `trim`: with the trimmed winner lookup (one value fetch after the
+    eight rounds). Call at load. Compiles only; nothing is launched.
 
     It waits for the router as its PDL dependent; `signal_gg1` releases the next grouped GEMM
     early (see `note`). `expert_hist`: also write the step's token count per local expert
@@ -248,6 +260,8 @@ def build_wide(
             wait_for_router_pdl=_USE_PDL,
             signal_gg1_pdl=signal,
             expert_hist=hist,
+            cluster=int(cluster),
+            trim=bool(trim),
         )
     return CompiledTopkRouting(
         "wide",
@@ -257,6 +271,8 @@ def build_wide(
         False,
         _wide_launch(compiled, bool(expert_hist)),
         bool(expert_hist),
+        int(cluster),
+        bool(trim),
     )
 
 

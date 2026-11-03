@@ -50,12 +50,17 @@ class RowsRunner:
 
 
 def at_rows(runner: Runner, rows: int) -> RowsRunner | None:
-    """`runner` on `rows` rows (65..191, not an instance's own count) at the next
-    `WIDE_ROWS` instance up: each output row bitwise what that instance writes for it. None
-    outside that range. Builds nothing, so it is safe inside a CUDA-graph capture."""
+    """`runner` on `rows` rows (not an instance's own count) at the next instance up: in
+    65..191 the next `WIDE_ROWS` one, in 1..63 the next `SUPPORTED_M_VALUES` one up to 64
+    (an MTP3 / MTP5 eager draft step's count). Each output row is bitwise what that
+    instance writes for it. None outside those ranges. Builds nothing, so it is safe inside
+    a CUDA-graph capture."""
     rows = int(rows)
-    bucket = min((m for m in WIDE_ROWS if m > rows), default=None)
-    if bucket is None or rows <= 64 or rows in SUPPORTED_M_VALUES + MTP_ROWS:
+    if rows <= 0 or rows in SUPPORTED_M_VALUES + MTP_ROWS:
+        return None
+    pool = WIDE_ROWS if rows > 64 else tuple(m for m in SUPPORTED_M_VALUES if m <= 64)
+    bucket = min((m for m in pool if m > rows), default=None)
+    if bucket is None:
         return None
     return RowsRunner(runner, bucket, rows)
 
@@ -107,7 +112,8 @@ class CuteDslMtpEhProj(OpWrapper):
     token only, so MTP5's draft step 0 keeps MTP3's bf16 numerics; a context step of
     192 rows keeps the MXF8 path. Such a decode step's other row counts in 65..191 (a
     batch of fewer than 32 sequences) it sends through `at_rows`: the next `WIDE_ROWS`
-    instance up on the exact rows.
+    instance up on the exact rows; an eager draft step's count in 1..63 without an
+    instance likewise takes the next instance up to 64.
 
     The kernel also accepts a row stride of 12288 (a quarter-column view of the
     full concat). The target never passes one, and no cell drives it.

@@ -32,14 +32,9 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
-import torch
-from cutlass import testing
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from cutlass.cute.runtime import make_ptr
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..moe.static_persistent_tile_scheduler import (
@@ -48,15 +43,20 @@ from ..moe.static_persistent_tile_scheduler import (
 )
 
 """
-This example provides an experimental implementation of the SM100 batched dense blockscaled GEMM kernel, please note that the APIs and implementation details related to this kernel may change in future releases.
+This example provides an experimental implementation of the SM100 batched dense blockscaled GEMM kernel, please note
+that the APIs and implementation details related to this kernel may change in future releases.
 
 A high-performance persistent batched dense blockscaled GEMM example for the NVIDIA Blackwell SM100 architecture
 using CUTE DSL.
-- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M") for MXF8 input type and can only be row-major("K") for MXF4/NVF4 input type
-- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K") for MXF8 input type and can only be row-major("K") for MXF4/NVF4 input type
+- Matrix A is MxKxL, L is batch dimension, A can be row-major("K") or column-major("M") for MXF8 input type and can
+  only be row-major("K") for MXF4/NVF4 input type
+- Matrix B is NxKxL, L is batch dimension, B can be row-major("N") or column-major("K") for MXF8 input type and can
+  only be row-major("K") for MXF4/NVF4 input type
 - Matrix C is MxNxL, L is batch dimension, C can be row-major("N") or column-major("M")
-- Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk, which has M×ceil_div(K, sf_vec_size)×L elements respectively
-- Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk, which has N×ceil_div(K, sf_vec_size)×L elements respectively
+- Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk, which has M×ceil_div(K,
+  sf_vec_size)×L elements respectively
+- Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk, which has N×ceil_div(K,
+  sf_vec_size)×L elements respectively
 
 This GEMM kernel supports the following features:
     - Utilizes Tensor Memory Access (TMA) for efficient memory operations
@@ -73,7 +73,8 @@ This GEMM works as follows:
 3. EPILOGUE warp:
     - Load completed accumulator from tensor memory (TMEM) to registers (RMEM) using tcgen05.ld.
     - Type convert C matrix to output type.
-    - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA operations,
+    - Optionally store C matrix from registers (RMEM) to shared memory (SMEM) to global memory (GMEM) with TMA
+      operations,
       or directly store C matrix from registers (RMEM) to global memory (GMEM) without TMA operations.
     - Optionally accept an elementwise lambda function epilogue_op to apply to the output tensor:
       e.g., relu can set epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
@@ -468,7 +469,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.smem_alloc_b_dtype = (
             cutlass.Int8 if (self.mxf8f6f4 and self.b_dtype.width < 8) else self.b_dtype
         )
-        m, n, k, l = problem_mnkl
+        m, n, k, l = problem_mnkl  # noqa: E741
         self.a_major_mode, self.b_major_mode, self.c_layout = layouts
 
         # Setup attributes that dependent on gemm inputs
@@ -1282,7 +1283,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] in {64, 192}):
-                    # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
+                    # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words
+                    # (ignores first 64 columns of SFB)
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
@@ -1490,7 +1492,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                     #
-                    # Async arrive accumulator buffer empty ealier when overlapping_accum is enabled
+                    # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
@@ -1570,7 +1572,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tSF: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source) and tensor memory (destination).
+        Make tiledCopy for smem to tmem load for scale factor tensor, then use it to partition smem memory (source)
+        and tensor memory (destination).
 
         :param sSF: The scale factor tensor in smem
         :type sSF: cute.Tensor
@@ -1614,7 +1617,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         use_2cta_instrs: Union[cutlass.Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
+        Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array
+        (destination).
 
         :param tidx: The thread index in epilogue warp groups
         :type tidx: cutlass.Int32
@@ -1672,7 +1676,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sC: cute.Tensor,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
         """
-        Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
+        Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory
+        (destination).
 
         :param tiled_copy_t2r: The tiled copy operation for tmem to register copy(t2r)
         :type tiled_copy_t2r: cute.TiledCopy
@@ -2067,7 +2072,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if cluster_shape_mn[0] % (2 if mma_tiler_mn[0] == 256 else 1) != 0:
             is_valid = False
         # Skip invalid cluster shape
-        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
+        is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0  # noqa: E731
         if (
             cluster_shape_mn[0] * cluster_shape_mn[1] > 16
             or cluster_shape_mn[0] <= 0
@@ -2087,7 +2092,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         m: int,
         n: int,
         k: int,
-        l: int,
+        l: int,  # noqa: E741
         a_dtype: Type[cutlass.Numeric],
         b_dtype: Type[cutlass.Numeric],
         c_dtype: Type[cutlass.Numeric],
@@ -2234,7 +2239,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :rtype: bool
         """
         # Unpack parameters
-        m, n, k, l = mnkl
+        m, n, k, l = mnkl  # noqa: E741
         can_implement = True
         # Skip unsupported types
         if not Sm100BlockScaledPersistentDenseGemmKernel.is_valid_dtypes_and_scale_factor_vec_size(

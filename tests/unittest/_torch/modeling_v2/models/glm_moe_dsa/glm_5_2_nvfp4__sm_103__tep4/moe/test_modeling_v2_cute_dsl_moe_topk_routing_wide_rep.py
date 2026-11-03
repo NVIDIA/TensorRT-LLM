@@ -23,6 +23,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_topk_routing import (  # noqa: E402, E501
     WIDE_RANGES,
+    WIDE_SCHEDULES,
     build_wide,
     cute_dsl_moe_topk_routing,
     wide_range,
@@ -53,6 +54,10 @@ OFFSETS = (0, 64, 128, 192)
 _COMPILED: dict = {}
 
 
+def _sched_id(schedule) -> str:
+    return f"cl{schedule[0]}{'trim' if schedule[1] else ''}"
+
+
 def _wide(rows: int, splits: int, hist: bool = False):
     key = ("wide", wide_range(rows), splits, hist)
     if key not in _COMPILED:
@@ -60,11 +65,17 @@ def _wide(rows: int, splits: int, hist: bool = False):
     return _COMPILED[key]
 
 
-def _wrep(rows: int, splits: int, nrep: int, hist: bool = False):
-    key = ("wrep", wide_range(rows), splits, nrep, hist)
+def _wrep(rows: int, splits: int, nrep: int, hist: bool = False, schedule=(8, False)):
+    key = ("wrep", wide_range(rows), splits, nrep, hist, schedule)
     if key not in _COMPILED:
         _COMPILED[key] = build_wide_rep(
-            rows, splits, nrep, torch.cuda.current_device(), expert_hist=hist
+            rows,
+            splits,
+            nrep,
+            torch.cuda.current_device(),
+            expert_hist=hist,
+            cluster=schedule[0],
+            trim=schedule[1],
         )
     return _COMPILED[key]
 
@@ -92,9 +103,9 @@ def _home(logits, bias, offset, splits):
     return w.clone(), ids.clone(), {k: v.clone() for k, v in maps.items()}
 
 
-def _rep(logits, bias, hot_t, offset, splits, nrep, hist=None, check=True):
+def _rep(logits, bias, hot_t, offset, splits, nrep, hist=None, check=True, schedule=(8, False)):
     out = _slot_outputs(nrep)
-    handle = _wrep(int(logits.shape[0]), splits, nrep, hist is not None)
+    handle = _wrep(int(logits.shape[0]), splits, nrep, hist is not None, schedule)
     if check:
         with validating(op):
             w, ids, maps = op(
@@ -128,14 +139,14 @@ def _check_inverse(maps, ids, offset: int, rows: int) -> torch.Tensor:
     return held
 
 
-def _check_rank(logits, bias, hot_t, offset, splits, nrep, hist=False):
-    """One rank: ids / weights = the wide top-k's bitwise, maps = the slot reference of its
-    own ids, the inverse maps consistent, the counts row the home counts. Returns
+def _check_rank(logits, bias, hot_t, offset, splits, nrep, hist=False, schedule=(8, False)):
+    """One rank: ids / weights = the (8-CTA) wide top-k's bitwise, maps = the slot reference of
+    its own ids, the inverse maps consistent, the counts row the home counts. Returns
     `(ids, held expanded indices, canonical maps)`."""
     rows = int(logits.shape[0])
     w0, ids0, maps0 = _home(logits, bias, offset, splits)
     h = torch.full((64,), -1, dtype=torch.int32, device="cuda") if hist else None
-    w, ids, maps = _rep(logits, bias, hot_t, offset, splits, nrep, h)
+    w, ids, maps = _rep(logits, bias, hot_t, offset, splits, nrep, h, schedule=schedule)
     assert torch.equal(ids, ids0), "ids differ from the wide top-k's"
     assert torch.equal(w, w0), "weights differ from the wide top-k's"
     nslots = 64 + nrep
@@ -221,13 +232,15 @@ def _skewed_logits(rows: int, splits: int, g: torch.Generator):
     return logits.contiguous(), bias
 
 
+@pytest.mark.parametrize("schedule", WIDE_SCHEDULES, ids=_sched_id)
 @pytest.mark.parametrize("splits", (4, 1))
 @pytest.mark.parametrize("rows", ODD_ROWS)
-def test_skewed_router_odd_rows(rows: int, splits: int) -> None:
+def test_skewed_router_odd_rows(rows: int, splits: int, schedule) -> None:
     """On a skewed router: every rank's selection, weights and maps exact, the hot expert
     moved whole off its (busiest) home rank onto one rank's replica slot -- two tiles past
     128 rows -- an inactive hot expert and an unused slot assigned nowhere, and every
-    (token, k) routed on exactly one rank. The draw is checked not to be degenerate."""
+    (token, k) routed on exactly one rank. The draw is checked not to be degenerate. On both
+    wide schedules alike (8-CTA; 16-CTA with the trimmed winner lookup)."""
     g = torch.Generator(device="cuda").manual_seed(rows * 10 + splits)
     logits, bias = _skewed_logits(rows, splits, g)
     _, ids, _ = _home(logits, bias, 0, splits)
@@ -252,7 +265,9 @@ def test_skewed_router_odd_rows(rows: int, splits: int) -> None:
     assert assign[1] == -1 and assign[7] == -1, f"an inactive or unused slot was assigned: {assign}"
     held = []
     for off in OFFSETS:
-        _, h, got = _check_rank(logits, bias, hot_t, off, splits, 8, hist=(off == WIN))
+        _, h, got = _check_rank(
+            logits, bias, hot_t, off, splits, 8, hist=(off == WIN), schedule=schedule
+        )
         held.append(h)
         tiles = got["tile_idx_to_expert_idx"].tolist()
         if off // 64 == assign[0]:
@@ -264,8 +279,9 @@ def test_skewed_router_odd_rows(rows: int, splits: int) -> None:
     _cover(held, rows)
 
 
+@pytest.mark.parametrize("schedule", WIDE_SCHEDULES, ids=_sched_id)
 @pytest.mark.parametrize("rows", (65, 128, 129, 192, 200))
-def test_graph_replay_matches_eager(rows: int) -> None:
+def test_graph_replay_matches_eager(rows: int, schedule) -> None:
     """The launch captured once per EP rank, replayed on fresh logits and hot ids written into
     its static buffers: ids, weights and canonical maps equal the eager call's, and the four
     ranks' replays map every (token, k) exactly once, some through a replica slot."""
@@ -274,7 +290,7 @@ def test_graph_replay_matches_eager(rows: int) -> None:
     logits = torch.zeros(rows, splits, EXPERTS, device="cuda")
     bias = torch.randn(EXPERTS, generator=g, device="cuda") * 0.1
     hot_t = torch.full((nrep,), -1, dtype=torch.int32, device="cuda")
-    handle = _wrep(rows, splits, nrep)
+    handle = _wrep(rows, splits, nrep, schedule=schedule)
     graphs = {}
     for off in OFFSETS:
         out = _slot_outputs(nrep)
@@ -295,7 +311,7 @@ def test_graph_replay_matches_eager(rows: int) -> None:
             graph.replay()
             torch.cuda.synchronize()
             got = canonical_slot_maps(gmaps, rows * TOP_K, 64 + nrep)
-            w, ids, maps = _rep(logits, bias, hot_t, off, splits, nrep)
+            w, ids, maps = _rep(logits, bias, hot_t, off, splits, nrep, schedule=schedule)
             want = canonical_slot_maps(maps, rows * TOP_K, 64 + nrep)
             assert torch.equal(gw, w) and torch.equal(gids, ids), f"replay {rep} rank {off}"
             for k in MAP_KEYS:

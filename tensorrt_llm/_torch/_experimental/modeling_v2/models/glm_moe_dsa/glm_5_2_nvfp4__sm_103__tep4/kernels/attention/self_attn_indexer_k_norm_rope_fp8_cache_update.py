@@ -180,17 +180,85 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
 ) -> None:
     block_row, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
+
+    if cutlass.const_expr(USE_PDL):
+        # Every thread waits before it can issue an indexer-K load. This avoids
+        # paying an additional CTA barrier on the latency-sensitive path.
+        cute.arch.griddepcontrol_wait()
+
+    indexer_k_cache_update_rows(
+        block_row,
+        tidx,
+        indexer_k,
+        norm_weight,
+        norm_bias,
+        position_ids,
+        rotary_cos_sin,
+        k_cache,
+        slot_mapping_fp8,
+        slot_mapping_scale,
+        num_tokens,
+        cache_dim_0,
+        cache_dim_1,
+        cache_dim_2,
+        cache_dim_3,
+        cache_stride_0,
+        cache_stride_1,
+        cache_stride_2,
+        cache_stride_3,
+        USE_UE8M0,
+        IS_NEOX,
+        ROWS_PER_BLOCK,
+        VECTORIZED_LOADS,
+        CACHE_CONTIGUOUS,
+        F32_INPUT,
+    )
+
+    # Do not explicitly launch dependents here. The final cache store is at the
+    # end of the kernel, so there is no useful producer tail to overlap. Kernel
+    # completion provides the required implicit PDL release without paying for
+    # an explicit griddepcontrol signal on this latency-sensitive path.
+
+
+@cute.jit
+def indexer_k_cache_update_rows(
+    block_row: cutlass.Int32,
+    tidx: cutlass.Int32,
+    indexer_k: cute.Tensor,
+    norm_weight: cute.Tensor,
+    norm_bias: cute.Tensor,
+    position_ids: cute.Tensor,
+    rotary_cos_sin: cute.Tensor,
+    k_cache: cute.Tensor,
+    slot_mapping_fp8: cute.Tensor,
+    slot_mapping_scale: cute.Tensor,
+    num_tokens: cutlass.Int32,
+    cache_dim_0: cutlass.Int32,
+    cache_dim_1: cutlass.Int32,
+    cache_dim_2: cutlass.Int32,
+    cache_dim_3: cutlass.Int32,
+    cache_stride_0: cutlass.Int64,
+    cache_stride_1: cutlass.Int64,
+    cache_stride_2: cutlass.Int64,
+    cache_stride_3: cutlass.Int64,
+    USE_UE8M0: cutlass.Constexpr[bool],
+    IS_NEOX: cutlass.Constexpr[bool],
+    ROWS_PER_BLOCK: cutlass.Constexpr[int],
+    VECTORIZED_LOADS: cutlass.Constexpr[bool],
+    CACHE_CONTIGUOUS: cutlass.Constexpr[bool],
+    F32_INPUT: cutlass.Constexpr[bool],
+) -> None:
+    """Thread ``tidx`` of CTA ``block_row``'s share of the update (the kernel's whole body,
+    callable from another kernel at a block offset): 16 lanes per token,
+    ``ROWS_PER_BLOCK`` tokens per CTA. Reads only after the caller's PDL wait.
+    ``F32_INPUT``: the keys are the fp32 pitch-160 columns of the context indexer
+    projection (the kernel's ``f32_input`` launchers), else bf16 ``[T, 128]``."""
     warp_in_block = tidx // _FUSED_CAT_WARP_SIZE
     lane_in_warp = tidx % _FUSED_CAT_WARP_SIZE
     lane_in_row = lane_in_warp % cutlass.Int32(_FUSED_CAT_THREADS_PER_ROW)
     row_in_warp = lane_in_warp // cutlass.Int32(_FUSED_CAT_THREADS_PER_ROW)
     row_in_block = warp_in_block * cutlass.Int32(2) + row_in_warp
     token_idx = block_row * ROWS_PER_BLOCK + row_in_block
-
-    if cutlass.const_expr(USE_PDL):
-        # Every thread waits before it can issue an indexer-K load. This avoids
-        # paying an additional CTA barrier on the latency-sensitive path.
-        cute.arch.griddepcontrol_wait()
 
     if row_in_block < ROWS_PER_BLOCK and token_idx < num_tokens:
         input_ptr = indexer_k.iterator
@@ -569,11 +637,6 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
                     dtype=cutlass.Int32,
                 )
                 dst_scale_word_ptr.store(scale.bitcast(cutlass.Int32))
-
-    # Do not explicitly launch dependents here. The final cache store is at the
-    # end of the kernel, so there is no useful producer tail to overlap. Kernel
-    # completion provides the required implicit PDL release without paying for
-    # an explicit griddepcontrol signal on this latency-sensitive path.
 
 
 @cute.jit

@@ -8,7 +8,7 @@ At MTP3 / MTP5 the 4 / 6 query rows of a sequence are consecutive positions whos
 overlap heavily (all of them are subsets of the same few thousand KV positions), so the same
 576-byte pool rows are gathered up to 6 times, and the gather is what bounds the kernel: per
 SM the TMA gather4 of scattered pool rows delivers ~20 B/clk with every SM pulling, ~34 B/clk
-when consecutive rows of a page are gathered together (B300, MTP35 track M microbenchmarks).
+when consecutive rows of a page are gathered together (B300 microbenchmarks).
 
 Here one CTA serves a group of ``rows_per_group`` (RG) consecutive query rows of one sequence:
 
@@ -25,23 +25,39 @@ Here one CTA serves a group of ``rows_per_group`` (RG) consecutive query rows of
   box; PV reads V from the latent slots as the wide kernel does) and multiplied against all
   NC = 16 RG query columns: S^T = K Q^T with N = NC, O^T += V^T P^T with N = NC.
 * Softmax. The online softmax runs per row on its 16 columns, with entry e of the tile masked
-  (-3e38 before the max, P forced to 0 after the exponential) unless its mask byte has the
-  row's bit. A row's running max therefore covers exactly its own selections, so its output is
-  softmax(s q.k_r) v_r over its selected rows, as the per-row kernels compute, up to fp32
-  summation order (tiles hold union entries in position order, not the row's own order).
-  The softmax warps stage each tile's per-warp partial sums with the new max and correction;
-  correction thread j < NC folds them into column j's running sum, so a tile takes no second
-  softmax barrier.
+  to -inf unless its mask byte has the row's bit (the running max starts at -3e38, so a masked
+  entry's exponential is exactly 0 even before the row has seen a selection). A row's running
+  max therefore covers exactly its own selections, so its output is softmax(s q.k_r) v_r over
+  its selected rows, as the per-row kernels compute, up to fp32 summation order (tiles hold
+  union entries in position order, not the row's own order). Maxima are max.f32 (FMNMX), not
+  the NaN-propagating max (four instructions each); scores are finite, so the values are the
+  same. The softmax warps stage each tile's per-warp partial sums with the new max and
+  correction; correction thread j < NC folds them into column j's running sum, so a tile takes
+  no second softmax barrier.
+* Correction. The correction warps rescale O and normalize the partial in 32-column chunks,
+  reading the factors from SMEM per chunk, so their registers hold 64 + 32 values at most: with
+  every NC column live at once, 4-row groups (NC = 64) spilled. The warp roles' register split
+  (softmax 152, correction 200, gather 80, MMA / load 56) leaves no local memory at 2, 3 or 4
+  rows (cuobjdump of the compiled kernels: 0 LDL / STL; the old split 152 / 176 / 80 /
+  80 spilled 280 B per thread at 4 rows and 16 B at 2 and 3).
 * Split. The ``num_chunks`` CTAs of a cluster hold disjoint union tiles of the same group and
   merge their partials through DSMEM, the base kernel's CGA reducer arithmetic over NC rows.
 
-Costs (B300, per-CTA clock64 phase stamps, median CTA, MTP5 at 32 sequences of ~2900
-positions, 3-row groups on 2-chunk clusters, 128 CTAs; MTP35 track M job u9): bounds 0.9 us,
-building the union 3.5 us, the first tile's gather 1.3 us, the tile loop 18.1 us (~1.5 us per
-tile, bound by the per-row online softmax: one 16-column block per row of the group, where the
-per-row kernels' single block hides behind the gather), the last PV 1.0 us, publishing the
-partial 1.0 us and the cluster merge 2.2 us (mostly waiting for the peer chunk); 29.0 us per
-CTA against 33.8 us per call.
+* Sums (``thread_sums``, per specialization). Each softmax thread keeps its own running sums
+  (times each tile's correction, like O) and the CTA reduces them once after the tile loop,
+  instead of the per-tile warp reduction staged for the correction warps: no per-tile sum
+  shuffles. Same band; another fp32 summation order, so the default keeps the staged sums for
+  the plans served before it.
+
+Costs (B300, per-CTA clock64 phase stamps, median CTA, census lengths ~2900 positions;
+before / after the register split, chunked correction, max.f32 and -inf
+masking): MTP5 at 32 sequences, 3-row groups on 2-chunk clusters, 28.5 -> 24.6 us per CTA
+(tile loop 18.3 -> 15.3 us, ~1.4 us per tile); MTP3 at 32, 4-row groups on 4-chunk clusters,
+27.2 -> 18.9 us (loop 15.1 -> 9.3 us: the old split spilled the correction warps), 17.8 us with
+per-thread sums. What is left of an MTP3 4-row CTA besides the loop: bounds 0.4 us, building
+the union 2.8 us, the first tile's gather 1.3 us, the last PV 1.0 us, publishing the partial
+1.3 us, the cluster merge 2.8 us (mostly waiting for the peer chunks); a call adds ~5 us of
+launch and drain over its slowest CTA.
 
 Validity: the kernel takes row t of a sequence of ``sq`` rows and KV length ``n`` to own the
 first ``clamp(n - sq + t + 1, 0, 2048)`` entries of its top-k row (the per-row kernels'
@@ -102,7 +118,6 @@ from .self_attn_fmha_sparse_mla_h16_qk576_v512_topk2048_fp8_bf16 import (
     L,
     R,
     _fmax,
-    _fragment_max4,
     _fragment_sum4,
     _scale_scores_packed,
     _tma_gather4_cta1,
@@ -126,6 +141,14 @@ SUPPORTED_ROWS_PER_GROUP: tuple[int, ...] = (2, 3, 4)
 MAX_CHUNKS: int = 8
 #: Bar id of the correction warpgroup (BAR_SM0 = 1 is the softmax warpgroup's).
 BAR_CORR: int = 2
+#: Columns the correction warps rescale / normalize per TMEM load (see the module docstring).
+CORR_CHUNK: int = 32
+#: setmaxregister per warp role: softmax W0-W3, correction W4-W7, MMA / load W8-W11, gather
+#: W12-W15. Four warps each, 4 x (152 + 200 + 56 + 80) = 1952 <= 2048 = 512 threads x 128.
+REG_SOFTMAX: int = 152
+REG_CORRECTION: int = 200
+REG_ISSUE: int = 56
+REG_GATHER: int = 80
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 
 
@@ -176,6 +199,26 @@ def _tmem_st_cols(addr, values, nc: cutlass.Constexpr[int]):
 
 
 @cute.jit
+def _fragment_max4_f32(values):
+    """The base kernel's `_fragment_max4` (per-head max over a thread's 4 KV rows) on max.f32."""
+    return cutlass.Vector.from_elements(
+        (
+            _fmax(_fmax(values[0], values[2]), _fmax(values[8], values[10])),
+            _fmax(_fmax(values[1], values[3]), _fmax(values[9], values[11])),
+            _fmax(_fmax(values[4], values[6]), _fmax(values[12], values[14])),
+            _fmax(_fmax(values[5], values[7]), _fmax(values[13], values[15])),
+        ),
+        dtype=ACC_DTYPE,
+    )
+
+
+@cute.jit
+def _max4_f32(a, b):
+    """Elementwise max.f32 of two 4-vectors."""
+    return cutlass.Vector.from_elements(tuple(_fmax(a[i], b[i]) for i in range(4)), dtype=ACC_DTYPE)
+
+
+@cute.jit
 def _block_exclusive_scan(value, tidx, scan_smem):
     """Exclusive prefix sum of one Int32 per thread over the CTA, and the total."""
     lane = tidx % cutlass.Int32(32)
@@ -219,6 +262,7 @@ def _fmha_union_kernel(
     scale_log2: cutlass.Float32,
     rows_per_group: cutlass.Constexpr[int],
     num_chunks: cutlass.Constexpr[int],
+    thread_sums: cutlass.Constexpr[bool],
 ) -> None:
     num_heads: cutlass.Constexpr[int] = NUM_HEADS
     rg: cutlass.Constexpr[int] = rows_per_group
@@ -286,6 +330,8 @@ def _fmha_union_kernel(
     c_empty = cutlass.Array(cutlass.Int64, ST_C, space=cutlass.AddressSpace.smem)
     o_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     o_empty = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+    # thread_sums: the softmax warps' final per-warp sums are in `softmax_sum` stage 0.
+    l_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     tmem_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
     # [q_begin, q_end, kv length, block-table row, union tiles of this CTA, first entry]
     bounds = cutlass.Array(cutlass.Int32, 8, space=cutlass.AddressSpace.smem, alignment=16)
@@ -307,6 +353,8 @@ def _fmha_union_kernel(
                 prims.mbarrier_init(c_empty.data_ptr() + i, 4)
             prims.mbarrier_init(o_full, 1)
             prims.mbarrier_init(o_empty, 4)
+            # Lanes 0..3 of each softmax warp arrive, each after its own stores.
+            prims.mbarrier_init(l_full, 16)
     prims.fence_mbarrier_init()
     prims.barrier_cluster_arrive_relaxed()
 
@@ -531,9 +579,9 @@ def _fmha_union_kernel(
     if (warp_idx >= cutlass.Int32(W_LOAD_GATHER0)) and (
         warp_idx < cutlass.Int32(W_LOAD_GATHER0 + NUM_GATHER_WARPS)
     ):
-        prims.setmaxregister(80, prims.SetMaxRegisterAction.DECREASE)
+        prims.setmaxregister(REG_GATHER, prims.SetMaxRegisterAction.DECREASE)
     if (warp_idx >= cutlass.Int32(8)) and (warp_idx < cutlass.Int32(12)):
-        prims.setmaxregister(80, prims.SetMaxRegisterAction.DECREASE)
+        prims.setmaxregister(REG_ISSUE, prims.SetMaxRegisterAction.DECREASE)
 
     # =====================================================================
     # W12-W15 - gather4 producers over the staged union entries.
@@ -763,7 +811,7 @@ def _fmha_union_kernel(
     # W0-W3 - online softmax, one 16-column H16 block per row of the group.
     # =====================================================================
     if warp_idx < cutlass.Int32(4):
-        prims.setmaxregister(152, prims.SetMaxRegisterAction.INCREASE)
+        prims.setmaxregister(REG_SOFTMAX, prims.SetMaxRegisterAction.INCREASE)
         lane = tidx % cutlass.Int32(32)
         col_group = lane % cutlass.Int32(4)
         row_idx = lane // cutlass.Int32(4)
@@ -775,6 +823,11 @@ def _fmha_union_kernel(
         prev_max = cutlass.Array(ACC_DTYPE, rg * num_scale_groups, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(rg * num_scale_groups):
             prev_max[i] = ACC_DTYPE(-3.0e38)
+        # thread_sums: this thread's running sums per (row, head slot), rescaled by each tile's
+        # correction like O, and reduced over the CTA once after the loop.
+        run_l = cutlass.Array(ACC_DTYPE, rg * num_scale_groups, space=cutlass.AddressSpace.rmem)
+        for i in cutlass.range_constexpr(rg * num_scale_groups):
+            run_l[i] = ACC_DTYPE(0.0)
         stage = cutlass.Int32(0)
         phase = cutlass.Int32(0)
         # The four KV rows of a tile this thread's 16x256b fragments hold (offsets 0/8/16/24).
@@ -820,12 +873,12 @@ def _fmha_union_kernel(
                     if cutlass.const_expr(sel == 3):
                         mb = m3
                     if ((mb >> cutlass.Int32(r)) & cutlass.Int32(1)) == cutlass.Int32(0):
-                        all_scores[r * 16 + i] = ACC_DTYPE(-3.0e38)
+                        all_scores[r * 16 + i] = ACC_DTYPE(float("-inf"))
             for r in cutlass.range_constexpr(rg):
                 scores_r = cutlass.Vector.from_elements(
                     tuple(all_scores[r * 16 + i] for i in range(16)), dtype=ACC_DTYPE
                 )
-                thread_max = _fragment_max4(scores_r)
+                thread_max = _fragment_max4_f32(scores_r)
                 reduced_max = cutlass.Vector.from_elements(
                     tuple(_warpgroup_row_max(thread_max[i]) for i in range(4)), dtype=ACC_DTYPE
                 )
@@ -870,7 +923,7 @@ def _fmha_union_kernel(
                     count=num_scale_groups, alignment=scale_alignment
                 )
                 for max_warp in cutlass.range_constexpr(1, 4):
-                    tm = cute.math.max(
+                    tm = _max4_f32(
                         tm,
                         (
                             softmax_max.data_ptr() + max_stage + max_warp * num_heads + max_group
@@ -900,39 +953,37 @@ def _fmha_union_kernel(
                     tuple(tile_max[r * num_scale_groups + i] for i in range(num_scale_groups)),
                     dtype=ACC_DTYPE,
                 )
-                new_max = cute.math.max(pm, tm)
+                new_max = _max4_f32(pm, tm)
                 corr = cute.math.exp2((pm - new_max) * scale_log2, fastmath=True)
                 scores_r = cutlass.Vector.from_elements(
                     tuple(all_scores[r * 16 + i] for i in range(16)), dtype=ACC_DTYPE
                 )
                 scaled = _scale_scores_packed(scores_r, new_max, scale_log2, num_heads)
-                probs_raw = cute.math.exp2(scaled, fastmath=True)
-                # An unselected entry contributes exactly 0, even while the row's max is
-                # still the -3e38 of "no selection seen yet".
-                probs_arr = cutlass.Array(ACC_DTYPE, 16, space=cutlass.AddressSpace.rmem)
-                for i in cutlass.range_constexpr(16):
-                    pv = probs_raw[i]
-                    if scores_r[i] == ACC_DTYPE(-3.0e38):
-                        pv = ACC_DTYPE(0.0)
-                    probs_arr[i] = pv
-                probs = cutlass.Vector.from_elements(
-                    tuple(probs_arr[i] for i in range(16)), dtype=ACC_DTYPE
-                )
+                # An unselected entry (-inf) contributes exactly 0, even while the row's max is
+                # still the -3e38 of "no selection seen yet": -inf * s + bias is -inf.
+                probs = cute.math.exp2(scaled, fastmath=True)
                 thread_sum = _fragment_sum4(probs)
-                warp_sum = cutlass.Vector.from_elements(
-                    tuple(_warpgroup_row_sum(thread_sum[i]) for i in range(4)), dtype=ACC_DTYPE
-                )
-                # This warp's partial sums of the tile, staged: the correction warps fold the
-                # four warps' partials into each column's running sum, so the softmax needs no
-                # second barrier per tile. Warp 0 publishes the new max and the correction.
-                if lane < cutlass.Int32(4):
-                    (
-                        softmax_sum.data_ptr()
-                        + stage * cutlass.Int32(rg * 4 * num_heads)
-                        + cutlass.Int32(r * 4 * num_heads)
-                        + warp_idx * cutlass.Int32(num_heads)
-                        + lane * cutlass.Int32(num_scale_groups)
-                    ).store(warp_sum, alignment=scale_alignment)
+                if cutlass.const_expr(thread_sums):
+                    for i in cutlass.range_constexpr(num_scale_groups):
+                        run_l[r * num_scale_groups + i] = (
+                            run_l[r * num_scale_groups + i] * corr[i] + thread_sum[i]
+                        )
+                else:
+                    warp_sum = cutlass.Vector.from_elements(
+                        tuple(_warpgroup_row_sum(thread_sum[i]) for i in range(4)), dtype=ACC_DTYPE
+                    )
+                    # This warp's partial sums of the tile, staged: the correction warps fold the
+                    # four warps' partials into each column's running sum, so the softmax needs
+                    # no second barrier per tile.
+                    if lane < cutlass.Int32(4):
+                        (
+                            softmax_sum.data_ptr()
+                            + stage * cutlass.Int32(rg * 4 * num_heads)
+                            + cutlass.Int32(r * 4 * num_heads)
+                            + warp_idx * cutlass.Int32(num_heads)
+                            + lane * cutlass.Int32(num_scale_groups)
+                        ).store(warp_sum, alignment=scale_alignment)
+                # Warp 0 publishes the new max and the correction.
                 if (warp_idx == cutlass.Int32(0)) and (lane < cutlass.Int32(4)):
                     rb = stat_base + cutlass.Int32(r * num_heads * 3)
                     (compact_stats.data_ptr() + rb + cutlass.Int32(num_heads) + head_base).store(
@@ -971,12 +1022,29 @@ def _fmha_union_kernel(
             if stage == cutlass.Int32(ST_S):
                 stage = cutlass.Int32(0)
                 phase ^= cutlass.Int32(1)
+        if cutlass.const_expr(thread_sums):
+            # Each warp's final sums per (row, packed head), [row][warp][16] in the stage-0
+            # partial area (unused per tile under thread_sums), then l_full.
+            for r in cutlass.range_constexpr(rg):
+                warp_l = cutlass.Vector.from_elements(
+                    tuple(_warpgroup_row_sum(run_l[r * num_scale_groups + i]) for i in range(4)),
+                    dtype=ACC_DTYPE,
+                )
+                if lane < cutlass.Int32(4):
+                    (
+                        softmax_sum.data_ptr()
+                        + cutlass.Int32(r * 4 * num_heads)
+                        + warp_idx * cutlass.Int32(num_heads)
+                        + lane * cutlass.Int32(num_scale_groups)
+                    ).store(warp_l, alignment=scale_alignment)
+            if lane < cutlass.Int32(4):
+                prims.mbarrier_arrive(l_full)
 
     # =====================================================================
     # W4-7 - correction / rescale / epilogue over NC columns.
     # =====================================================================
     if (warp_idx >= cutlass.Int32(W_CORR0)) and (warp_idx < cutlass.Int32(W_CORR0 + 4)):
-        prims.setmaxregister(176, prims.SetMaxRegisterAction.INCREASE)
+        prims.setmaxregister(REG_CORRECTION, prims.SetMaxRegisterAction.INCREASE)
         lane = tidx % cutlass.Int32(32)
         corr_warp = warp_idx - cutlass.Int32(W_CORR0)
         out_row = corr_warp * cutlass.Int32(32) + lane
@@ -986,7 +1054,8 @@ def _fmha_union_kernel(
         cph = cutlass.Int32(0)
         cthread = corr_warp * cutlass.Int32(32) + lane
         # Thread j < NC keeps column j's running sum (the softmax warps publish per-warp
-        # partials and the correction); (row, head, packed stats slot) of column j.
+        # partials and the correction; under thread_sums they keep the sums themselves);
+        # (row, head, packed stats slot) of column j.
         jr = cthread // cutlass.Int32(num_heads)
         jh = cthread % cutlass.Int32(num_heads)
         jph = (
@@ -998,40 +1067,47 @@ def _fmha_union_kernel(
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
             while not prims.mbarrier_try_wait_parity(c_full.data_ptr() + cst, cph):
                 pass
-            if cthread < cutlass.Int32(nc):
-                rbj = cst * cutlass.Int32(rg * num_heads * 3) + jr * cutlass.Int32(num_heads * 3)
-                cj = compact_stats[rbj + cutlass.Int32(2 * num_heads) + jph]
-                pb = (cst * cutlass.Int32(rg) + jr) * cutlass.Int32(4 * num_heads) + jph
-                ts = softmax_sum[pb]
-                for w in cutlass.range_constexpr(1, 4):
-                    ts = ts + softmax_sum[pb + cutlass.Int32(w * num_heads)]
-                run_sum = run_sum * cj + ts
-            corr = cutlass.Array(ACC_DTYPE, nc, space=cutlass.AddressSpace.rmem)
-            for r in cutlass.range_constexpr(rg):
-                rb = cst * cutlass.Int32(rg * num_heads * 3) + cutlass.Int32(r * num_heads * 3)
-                packed_corr = (compact_stats.data_ptr() + rb + 2 * num_heads).load(
-                    count=num_heads, alignment=16
-                )
-                for h in cutlass.range_constexpr(num_heads):
-                    ph: cutlass.Constexpr[int] = H16_LOGICAL_TO_PACKED_STATS[h]
-                    corr[r * num_heads + h] = packed_corr[ph]
-            if prims.elect_sync():
-                prims.mbarrier_arrive(c_empty.data_ptr() + cst, relaxed=True)
+            if cutlass.const_expr(not thread_sums):
+                if cthread < cutlass.Int32(nc):
+                    rbj = cst * cutlass.Int32(rg * num_heads * 3) + jr * cutlass.Int32(
+                        num_heads * 3
+                    )
+                    cj = compact_stats[rbj + cutlass.Int32(2 * num_heads) + jph]
+                    pb = (cst * cutlass.Int32(rg) + jr) * cutlass.Int32(4 * num_heads) + jph
+                    ts = softmax_sum[pb]
+                    for w in cutlass.range_constexpr(1, 4):
+                        ts = ts + softmax_sum[pb + cutlass.Int32(w * num_heads)]
+                    run_sum = run_sum * cj + ts
             oph = kt % cutlass.Int32(2)
             if kt > cutlass.Int32(0):
                 while not prims.mbarrier_try_wait_parity(o_full, oph ^ cutlass.Int32(1)):
                     pass
-                corr_v = cutlass.Vector.from_elements(
-                    tuple(corr[j] for j in range(nc)), dtype=ACC_DTYPE
-                )
+                # O *= this tile's correction, CORR_CHUNK columns per TMEM load, the factors
+                # read from the stage's stats per chunk (so the stage is released after).
+                rbs = cst * cutlass.Int32(rg * num_heads * 3)
                 for s in cutlass.range_constexpr(N_V):
-                    tile_v = _tmem_ld_cols(my_addr + tmem_o_off + s * nc, nc)
-                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                    _tmem_st_cols(my_addr + tmem_o_off + s * nc, tile_v * corr_v, nc)
+                    for c0 in cutlass.range_constexpr(0, nc, CORR_CHUNK):
+                        cw: cutlass.Constexpr[int] = min(CORR_CHUNK, nc - c0)
+                        tile_c = _tmem_ld_cols(my_addr + tmem_o_off + s * nc + c0, cw)
+                        factors = []
+                        for r in cutlass.range_constexpr(c0 // num_heads, (c0 + cw) // num_heads):
+                            packed_corr = (
+                                compact_stats.data_ptr()
+                                + rbs
+                                + cutlass.Int32(r * num_heads * 3 + 2 * num_heads)
+                            ).load(count=num_heads, alignment=16)
+                            for h in cutlass.range_constexpr(num_heads):
+                                ph: cutlass.Constexpr[int] = H16_LOGICAL_TO_PACKED_STATS[h]
+                                factors.append(packed_corr[ph])
+                        corr_c = cutlass.Vector.from_elements(tuple(factors), dtype=ACC_DTYPE)
+                        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                        _tmem_st_cols(my_addr + tmem_o_off + s * nc + c0, tile_c * corr_c, cw)
                 prims.tcgen05_wait(prims.Tcgen05Wait.STORE)
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 if prims.elect_sync():
                     prims.mbarrier_arrive(o_empty, relaxed=True)
+            if prims.elect_sync():
+                prims.mbarrier_arrive(c_empty.data_ptr() + cst, relaxed=True)
             cst += cutlass.Int32(1)
             if cst == cutlass.Int32(ST_C):
                 cst = cutlass.Int32(0)
@@ -1062,17 +1138,28 @@ def _fmha_union_kernel(
                     num_heads * 3
                 )
                 fsum = run_sum
+                if cutlass.const_expr(thread_sums):
+                    while not prims.mbarrier_try_wait_parity(l_full, 0):
+                        pass
+                    lb = jr * cutlass.Int32(4 * num_heads) + ph
+                    fsum = softmax_sum[lb]
+                    for w in cutlass.range_constexpr(1, 4):
+                        fsum = fsum + softmax_sum[lb + cutlass.Int32(w * num_heads)]
                 fmax = compact_stats[rb + cutlass.Int32(num_heads) + ph]
                 inv_smem[cthread] = ACC_DTYPE(1.0) / _fmax(fsum, ACC_DTYPE(1.0e-30))
                 _publish_stats(partial_stats, cta, cthread, fmax, fsum, nc, num_chunks)
             prims.barrier_cta_sync(BAR_CORR, thread_count=128)
-            inv = (inv_smem.data_ptr()).load(count=nc, alignment=16)
             for s in cutlass.range_constexpr(N_V):
-                tile_v = _tmem_ld_cols(my_addr + tmem_o_off + s * nc, nc)
-                prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
                 out_col = s * PV_M + out_row
-                for j in cutlass.range_constexpr(nc):
-                    (po16 + cutlass.Int32(j * L) + out_col).store(OUT_DTYPE(tile_v[j] * inv[j]))
+                for c0 in cutlass.range_constexpr(0, nc, CORR_CHUNK):
+                    cw: cutlass.Constexpr[int] = min(CORR_CHUNK, nc - c0)
+                    tile_c = _tmem_ld_cols(my_addr + tmem_o_off + s * nc + c0, cw)
+                    inv_c = (inv_smem.data_ptr() + c0).load(count=cw, alignment=16)
+                    prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                    for j in cutlass.range_constexpr(cw):
+                        (po16 + cutlass.Int32((c0 + j) * L) + out_col).store(
+                            OUT_DTYPE(tile_c[j] * inv_c[j])
+                        )
         else:
             # Empty participant: the neutral partial (O = 0, max = -3e38, sum = 0).
             for s in cutlass.range_constexpr(N_V):
@@ -1254,6 +1341,7 @@ def _launch_fmha_union(
     scale_log2: cutlass.Constexpr[float],
     rows_per_group: cutlass.Constexpr[int],
     num_chunks: cutlass.Constexpr[int],
+    thread_sums: cutlass.Constexpr[bool],
 ) -> None:
     num_heads = NUM_HEADS
 
@@ -1306,6 +1394,7 @@ def _launch_fmha_union(
         cutlass.Float32(scale_log2),
         rows_per_group,
         num_chunks,
+        thread_sums,
     ).launch(
         grid=(num_chunks * num_groups, 1, cu_q_seqlens.shape[0] - 1),
         block=(THREADS, 1, 1),
@@ -1318,15 +1407,24 @@ def _launch_fmha_union(
 
 @dataclass(frozen=True)
 class UnionSpecialization:
+    """`thread_sums`: each softmax thread keeps its own running sums and the CTA reduces them
+    once after the tile loop, instead of a warp reduction staged per tile and folded by the
+    correction warps. Same band, another fp32 summation order (so not bitwise the default)."""
+
     rows_per_group: int
     num_chunks: int
     q_scaling: float = 1.0
+    thread_sums: bool = False
 
     def validate(self) -> None:
         if self.rows_per_group not in SUPPORTED_ROWS_PER_GROUP:
             raise ValueError(f"rows_per_group must be one of {SUPPORTED_ROWS_PER_GROUP}")
         if not 1 <= self.num_chunks <= MAX_CHUNKS:
             raise ValueError(f"num_chunks must be in [1, {MAX_CHUNKS}], got {self.num_chunks}")
+        if self.rows_per_group == 4 and self.num_chunks == 1:
+            # One CTA would stage the whole 4 x 2048-entry union (40 KB of row / mask arrays):
+            # past the SMEM a CTA can launch with next to the K/V ring, Q and P.
+            raise ValueError("4-row groups need at least 2 chunks (SMEM)")
 
     @property
     def scale_log2(self) -> float:
@@ -1377,6 +1475,7 @@ def compile_union(spec: UnionSpecialization, device_index: int) -> object:
         spec.scale_log2,
         spec.rows_per_group,
         spec.num_chunks,
+        spec.thread_sums,
         options=_base._compile_options(),
     )
     _COMPILE_CACHE[key] = compiled
@@ -1413,6 +1512,7 @@ def prepare_union_runner(
     max_sq: int,
     rows_per_group: int,
     num_chunks: int,
+    thread_sums: bool = False,
     refresh_stream: bool = False,
 ) -> PreparedUnionRunner:
     """Validated launcher. `topk_positions` [total_q, 2048] int32 request-local positions,
@@ -1431,7 +1531,11 @@ def prepare_union_runner(
     if req_ids.dtype != torch.int32 or req_ids.numel() < total_q:
         raise ValueError("req_ids must be int32 with one entry per query row")
     groups = (int(max_sq) + rows_per_group - 1) // rows_per_group
-    spec = UnionSpecialization(rows_per_group=int(rows_per_group), num_chunks=int(num_chunks))
+    spec = UnionSpecialization(
+        rows_per_group=int(rows_per_group),
+        num_chunks=int(num_chunks),
+        thread_sums=bool(thread_sums),
+    )
     compiled = compile_union(spec, _base._device_index(quant_q_buffer))
     stream = None if refresh_stream else _base._current_stream(_base._device_index(quant_q_buffer))
     del pool_rows, batch

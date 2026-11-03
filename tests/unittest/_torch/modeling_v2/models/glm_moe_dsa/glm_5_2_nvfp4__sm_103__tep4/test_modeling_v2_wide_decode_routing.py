@@ -102,6 +102,8 @@ def core_for(monkeypatch):
         core.max_draft_len = max_draft_len
         core._wide_decode = False
         core._wide_bucket, core._wide_rag = True, {}
+        # Set by `mtp_forward` around an eager draft step only.
+        core._draft_eager, core._draft_rag = False, {}
         core.route_hits, core.route_misses = {}, {}
         core._decode, core._prefill = "decode", "prefill"
         core.tp_rank, core.eps = 0, 1e-5
@@ -304,6 +306,57 @@ def test_mtp_front_eh_proj(core_for, max_draft_len, decode, rows, bucket) -> Non
     assert calls == want, calls
 
 
+@pytest.mark.parametrize("own_m", [False, True], ids=["runtime_m", "own_m_64"])
+@pytest.mark.parametrize("rows", (1, 17, 33, 63, 64))
+@pytest.mark.parametrize("draft", [True, False], ids=["draft_eager", "not_draft"])
+@pytest.mark.parametrize("max_draft_len", (3, 5))
+def test_draft_eager_rows(core_for, monkeypatch, max_draft_len, draft, rows, own_m) -> None:
+    """An MTP3 / MTP5 eager draft step (`_draft_eager`: `mtp_forward` outside a CUDA-graph
+    capture, inside a context or mixed step) at a row count without a decode cell runs each
+    call on a cell at its exact rows, never cuBLAS: a projection on the smallest decode cell
+    above it, or the MTP cell where that one is compiled for its own M only (`at_rows` gives
+    None: `own_m_64`); the indexer split on the runtime-M handle; eh_proj on the next K-split
+    instance. A count with its own cell, and every count off a draft step, route as before."""
+    core, calls = core_for(max_draft_len)
+    if own_m:
+        monkeypatch.setattr(
+            M._projection_op,
+            "at_rows",
+            lambda r, rows: None if r.tag.endswith("@64") else _runner(f"{r.tag}@{rows}"),
+        )
+    _step(core, decode=False)
+    core._draft_eager = draft
+    eager = draft and rows != 64
+    x = _aligned(rows, 160)
+    w = torch.zeros(4, 160, dtype=BF16).t()
+    for name in ("qkva", "q_b", "o_proj"):
+        calls.clear()
+        core._project(name, x, w)
+        if not eager:
+            want = f"{name}@64" if rows == 64 else "cublas"
+        else:
+            want = f"{name}@128:mtp@{rows}" if own_m else f"{name}@64@{rows}"
+        assert calls == [want], (name, rows, calls)
+
+    calls.clear()
+    ix = SimpleNamespace(fused_bf16=None, fused=None, kn_w=None, kn_b=None)
+    core._indexer_project(x, None, None, ix, rows, need_q=False)
+    want = "ix_split@64" if rows == 64 else "ix_split:rag" if eager else "cublas"
+    assert calls == [want], calls
+
+    calls.clear()
+    e = torch.zeros(rows, 16, dtype=BF16)
+    core._mtp_front(e, e, rows)
+    if rows in (1, 64):
+        want = ["norm_shard", "ksplit"]
+    else:
+        want = ["norm_shard", f"ksplit@{rows}"] if draft else ["cublas"]
+    assert calls == want, calls
+    # One `draft_cell` per eager call: 3 projections, the indexer split, eh_proj (1 row has
+    # its own K-split instance).
+    assert core.route_hits.get("draft_cell", 0) == (0 if not eager else 4 if rows == 1 else 5)
+
+
 @pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])
 @pytest.mark.parametrize("rows", (64, 96, 150, 192, 200))
 @pytest.mark.parametrize("max_draft_len", ENGINES)
@@ -460,3 +513,262 @@ def test_mtp_layer_rope_widths(max_draft_len) -> None:
     taken = {p for p in range(1, 9) if core._mtp_rope_specialised(p)}
     want = set(core.mtp_widths) | ({1} if max_draft_len > 1 else set())
     assert taken == want, (taken, want)
+
+
+@pytest.mark.parametrize("built", [True, False], ids=["fold", "fold_off"])
+@pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])
+@pytest.mark.parametrize("rows", ROWS)
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_qkva_ix_fold(core_for, monkeypatch, max_draft_len, decode, rows, bucket, built) -> None:
+    """The qkva + indexer key / head-weight fold (`_qkva_ix_fold`) serves exactly where the qkva
+    projection would take its bf16 MTP cell -- an MTP3 / MTP5 decode step above 64 rows, at the
+    cell or (buckets on) the next cell up on the exact rows -- on a layer whose weights were
+    stacked, with the fold cells built (`TRTLLM_GLM52_WIDE_IX_FOLD`, on by default); everywhere
+    else it returns None and the two GEMMs run. With the caller's keys and head weights the
+    indexer front runs no projection of its own."""
+    core, calls = core_for(max_draft_len)
+    core._wide_bucket = bucket
+    # `post_load_weights` stacks only on an MTP3 / MTP5 engine; layer 0 has an indexer here.
+    core._ix_fold_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
+    core._qkva_ix_mtp = {m: _runner(f"fold@{m}") for m in MTP_ROWS} if built else {}
+    monkeypatch.setattr(
+        M._ix_fold_op,
+        "at_rows",
+        lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
+    )
+    for m, r in core._qkva_ix_mtp.items():
+        r.rows = m
+    monkeypatch.setattr(
+        M, "cute_dsl_qkva_ix_fold", lambda x, w, out, r: calls.append(r.tag) or (out, None, None)
+    )
+    _step(core, decode)
+    cell = _cell(max_draft_len, decode, rows, bucket)
+    x = _aligned(rows, 16)
+    calls.clear()
+    got = core._qkva_ix_fold(x, 0, rows)
+    serves = built and max_draft_len > 1 and cell is not None
+    if serves:
+        assert calls == [f"fold@{cell}" if cell == rows else f"fold@{cell}@{rows}"], calls
+        assert got is not None and got[0].shape[0] == rows
+    else:
+        assert got is None and calls == [], (got, calls)
+    # A layer without stacked weights (no indexer, or a stack the build skipped): the two GEMMs.
+    calls.clear()
+    assert core._qkva_ix_fold(x, 1, rows) is None and calls == []
+    # Keys and head weights from the caller: no split, no fp32 projection.
+    ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None)
+    kb = torch.zeros(rows, 128, dtype=BF16)
+    q_fp8, weights, k_pre = core._indexer_project(
+        x, None, None, ix, rows, need_q=False, kw=(kb, None)
+    )
+    assert calls == [] and k_pre[0] is kb and q_fp8 is None and weights is None
+
+
+@pytest.mark.parametrize("built", [True, False], ids=["fold", "fold_off"])
+@pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])
+@pytest.mark.parametrize("rows", ROWS)
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_q_b_ix_wq_b(core_for, monkeypatch, max_draft_len, decode, rows, bucket, built) -> None:
+    """The q_b | wq_b fold (`_qb_ixqb_runner`) serves exactly where q_b and ix_qb would take
+    their bf16 MTP cells -- an MTP3 / MTP5 decode step above 64 rows, at the cell or (buckets
+    on) the next cell up -- on a layer whose weights were stacked, with the cells built
+    (`TRTLLM_GLM52_WIDE_QB_IXQB`); elsewhere None and the two GEMMs run. With the caller's
+    indexer q the indexer front runs no wq_b projection."""
+    core, calls = core_for(max_draft_len)
+    core._wide_bucket = bucket
+    core._qbix_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
+    core._qbix_mtp = {m: _runner(f"qbix@{m}", rows=m) for m in MTP_ROWS} if built else {}
+    monkeypatch.setattr(
+        M._qbix_op,
+        "at_rows",
+        lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
+    )
+    _step(core, decode)
+    cell = _cell(max_draft_len, decode, rows, bucket)
+    got = core._qb_ixqb_runner(0, rows)
+    if built and max_draft_len > 1 and cell is not None:
+        assert got is not None and got.tag == (
+            f"qbix@{cell}" if cell == rows else f"qbix@{cell}@{rows}"
+        )
+    else:
+        assert got is None
+    assert core._qb_ixqb_runner(1, rows) is None
+    calls.clear()
+    x = _aligned(rows, 16)
+    ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None, qb=None)
+    monkeypatch.setattr(M, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
+    core._ix_qside_compiled, core._idx_cos_sin, core.idx_weight_scale = None, None, 1.0
+    core.indexer_is_neox = False
+    kb = torch.zeros(rows, 128, dtype=BF16)
+    ixq = torch.zeros(rows, 32 * 128, dtype=BF16)
+    core._indexer_project(x, x, None, ix, rows, need_q=True, kw=(kb, None), ixq=ixq)
+    assert calls == ["q_side"], calls
+
+
+@pytest.mark.parametrize("checked", [True, False], ids=["checked", "unchecked"])
+@pytest.mark.parametrize("built", [True, False], ids=["qk", "qk_off"])
+@pytest.mark.parametrize("rows", ROWS)
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_indexer_q_side_k_cache(
+    core_for, monkeypatch, max_draft_len, decode, rows, built, checked
+) -> None:
+    """The q side + K-cache update in one launch (`_ix_qk_handle`, `TRTLLM_GLM52_WIDE_IX_QK`)
+    serves only an MTP3 / MTP5 decode step above 64 rows, given the layer's cache, with the
+    launchers built and the K update's slots validated once (its first eager call): it takes
+    the launcher of the cache's layout, writes the keys (no pending `k_pre`) and counts
+    `ix_qk`. Everywhere else the q side runs alone and the keys go to `_indexer_write_k`, as
+    with keys the launcher cannot load (not 8-byte aligned)."""
+    core, calls = core_for(max_draft_len)
+    core._ix_qk_compiled = {c: _runner(f"qk:{c}") for c in (False, True)} if built else {}
+    core._idx_k_checked = checked
+    _step(core, decode)
+    monkeypatch.setattr(M, "cute_dsl_indexer_q_side_fused", lambda *a, **k: calls.append("q_side"))
+    monkeypatch.setattr(
+        M, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
+    )
+    core._ix_qside_compiled, core._idx_cos_sin, core.idx_weight_scale = None, None, 1.0
+    core.indexer_is_neox = False
+    x = _aligned(rows, 16)
+    ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None, qb=None)
+    ixq = torch.zeros(rows, 32 * 128, dtype=BF16)
+    md = SimpleNamespace(slot_mapping_fp8=None, slot_mapping_scale=None)
+    dense = torch.zeros(4, 32, 1, 132, dtype=torch.uint8)
+    strided = torch.zeros(4, 2, 32 * 132, dtype=torch.uint8)[:, 0].view(4, 32, 1, 132)
+
+    def project(kb, pool):
+        calls.clear()
+        return core._indexer_project(
+            x, x, None, ix, rows, need_q=True, kw=(kb, None), ixq=ixq, kc=(md, pool)
+        )
+
+    kb = _aligned(rows, 128)
+    fused = built and checked and _wide(max_draft_len, decode, rows)
+    _, _, k_pre = project(kb, dense)
+    if fused:
+        assert calls == ["qk:True"] and k_pre is None and core.route_hits["ix_qk"] == 1
+        _, _, k_pre = project(kb, strided)
+        assert calls == ["qk:False"] and k_pre is None
+    else:
+        assert calls == ["q_side"] and k_pre[0] is kb and "ix_qk" not in core.route_hits
+    misaligned = torch.zeros(rows * 128 + 1, dtype=BF16)[1:].view(rows, 128)
+    _, _, k_pre = project(misaligned, dense)
+    assert calls == ["q_side"] and k_pre[0] is misaligned
+
+
+@pytest.mark.parametrize("nosplit", [True, False], ids=["nosplit", "split"])
+@pytest.mark.parametrize("fold", [True, False], ids=["fold", "fold_off"])
+@pytest.mark.parametrize("rag", [True, False], ids=["rag", "no_rag"])
+@pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])
+@pytest.mark.parametrize("rows", ROWS)
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_indexer_nosplit_beside_wide_decode(
+    core_for, monkeypatch, max_draft_len, decode, rows, bucket, rag, fold, nosplit
+) -> None:
+    """The context indexer projection's no-split read (`TRTLLM_GLM52_CTX_IX_NOSPLIT`, default
+    on: the prefill handle's fp32 `[T, 160]` output read in place by the pitch-160 q side and
+    the K write's fp32-key launchers) beside the MTP3 / MTP5 wide decode indexer front, in the
+    order the targets call it (decode: `_qkva_ix_fold`, then `_indexer_project` with the
+    layer's cache, then `_indexer_write_k` unless the keys were written; context and mixed:
+    `_indexer_project`, then `_indexer_write_k`).
+
+    * It applies wherever the prefill handle serves: every engine's context and mixed steps
+      above 64 rows (an MTP3 / MTP5 mixed step is not a `_wide_decode` step, so its rows
+      take it as MTP1's do).
+    * A wide decode step's keys come from the fold, the MTP split cell or the runtime-M split
+      (buckets on), never from it; the one-launch q side + K update then serves as before.
+    * Where none of those serves (fold off and buckets off or no runtime-M handle) the wide
+      rows fall back to the prefill handle and, with the read on, take it like a context
+      step: pitch-160 q side, fp32 keys to the K write, and not the one-launch q side + K
+      update (it loads contiguous bf16 keys). The bytes equal the split's (the no-split
+      read's own test); only the launch count differs from the split fallback.
+    """
+    core, calls = core_for(max_draft_len)
+    core._wide_bucket = bucket
+    core._ix_nosplit = nosplit
+    if not rag:
+        core._ix_pre_split_rag = None
+    core._ix_fold_w = {0: torch.zeros(1, dtype=BF16)} if max_draft_len > 1 else {}
+    core._qkva_ix_mtp = {m: _runner(f"fold@{m}", rows=m) for m in MTP_ROWS} if fold else {}
+    core._ix_qk_compiled = {c: _runner(f"qk:{c}") for c in (False, True)}
+    core._idx_k_checked = True
+    core._ix_qside_compiled = SimpleNamespace(wq_pitch=32)
+    core._ix_qside_compiled_p160 = SimpleNamespace(wq_pitch=160)
+    core._ix_k_compiled = {False: "k:strided", True: "k:dense"}
+    core._idx_cos_sin, core.rope_dim, core.idx_weight_scale = torch.zeros(4, 64), 64, 1.0
+    core.indexer_is_neox = False
+    x = _aligned(rows, 16)
+    fold_kb, fold_wq = _aligned(rows, 128), torch.zeros(rows, 32)
+
+    def unsplit(x, w, handle):
+        calls.append(f"unsplit:{handle.tag}")
+        full = torch.zeros(int(x.shape[0]), 160)
+        return full[:, :128], full[:, 128:]
+
+    monkeypatch.setattr(M._ix_pre_split_op, "project_unsplit", unsplit)
+    monkeypatch.setattr(
+        M._ix_fold_op,
+        "at_rows",
+        lambda r, rows: None if rows > r.rows else _runner(f"{r.tag}@{rows}", rows=rows),
+    )
+    monkeypatch.setattr(
+        M,
+        "cute_dsl_qkva_ix_fold",
+        lambda x, w, out, r: calls.append(r.tag) or (out, fold_kb, fold_wq),
+    )
+    monkeypatch.setattr(
+        M,
+        "cute_dsl_indexer_q_side_fused",
+        lambda q, pos, cs, wq, c, q8, w, *, is_neox, compiled: calls.append(
+            f"q_side:{compiled.wq_pitch}:wq{wq.stride(0)}"
+        ),
+    )
+    monkeypatch.setattr(
+        M, "cute_dsl_indexer_q_side_k_cache", lambda *a, compiled, **k: calls.append(compiled.tag)
+    )
+    monkeypatch.setattr(
+        M,
+        "cute_dsl_indexer_k_cache_update",
+        lambda kb, *a, compiled, **k: calls.append(f"k_write:{kb.dtype}:{kb.stride(0)}:{compiled}"),
+    )
+    _step(core, decode)
+    ix = SimpleNamespace(fused_bf16=None, kn_w=None, kn_b=None, qb=None)
+    ixq = torch.zeros(rows, 32 * 128, dtype=BF16)
+    md = SimpleNamespace(slot_mapping_fp8=None, slot_mapping_scale=None)
+    pool = torch.zeros(4, 32, 1, 132, dtype=torch.uint8)
+    calls.clear()
+    if decode:
+        got = core._qkva_ix_fold(x, 0, rows)
+        kw = None if got is None else got[1:]
+        _, _, k_pre = core._indexer_project(
+            x, x, None, ix, rows, True, kw=kw, ixq=ixq, kc=(md, pool)
+        )
+    else:
+        _, _, k_pre = core._indexer_project(x, x, None, ix, rows, True, ixq=ixq)
+    if k_pre is not None:
+        core._indexer_write_k(md, pool, k_pre, rows)
+
+    wide = _wide(max_draft_len, decode, rows)
+    cell = _cell(max_draft_len, decode, rows, bucket)
+    if fold and max_draft_len > 1 and cell is not None:
+        front = [f"fold@{cell}" if cell == rows else f"fold@{cell}@{rows}"]
+    elif rows <= 64:
+        front = ["ix_split@64"]
+    elif wide and cell == rows:
+        front = [f"ix_split@{rows}:mtp"]
+    elif wide and bucket and rag:
+        front = ["ix_split:rag"]
+    else:
+        front = ["unsplit:ix_split:prefill" if nosplit else "ix_split:prefill"]
+    in_place = front == ["unsplit:ix_split:prefill"]
+    if wide and not in_place:
+        back = ["qk:True"]
+    elif in_place:
+        back = ["q_side:160:wq160", "k_write:torch.float32:160:k:dense"]
+    else:
+        back = ["q_side:32:wq32", "k_write:torch.bfloat16:128:k:dense"]
+    assert calls == front + back, (calls, front + back)
+    assert core.route_hits.get("ctx_ix_nosplit", 0) == int(in_place)

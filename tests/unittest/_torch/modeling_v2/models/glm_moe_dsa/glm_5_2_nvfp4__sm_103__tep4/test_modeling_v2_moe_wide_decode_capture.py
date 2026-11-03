@@ -67,7 +67,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     cute_dsl_moe_quantize_nvfp4 as _quant_op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = ["../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 HIDDEN, INTER, EXPERTS, LOCAL = 6144, 2048, 256, 64

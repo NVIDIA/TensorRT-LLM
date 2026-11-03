@@ -22,6 +22,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_topk_routing import (  # noqa: E402, E501
     PREFILL_MAX_ROWS,
     WIDE_RANGES,
+    WIDE_SCHEDULES,
     CompiledTopkRouting,
     allocate_decode_outputs,
     allocate_prefill_scratch,
@@ -56,10 +57,16 @@ def _compiled(spec) -> CompiledTopkRouting:
     rows = spec["rows"]
     if spec.get("wide"):
         hist = spec.get("expert_hist", False)
-        key = ("wide", wide_range(rows), spec["splits"], hist)
+        cluster, trim = spec.get("schedule", (8, False))
+        key = ("wide", wide_range(rows), spec["splits"], hist, cluster, trim)
         if key not in _COMPILED:
             _COMPILED[key] = build_wide(
-                rows, spec["splits"], torch.cuda.current_device(), expert_hist=hist
+                rows,
+                spec["splits"],
+                torch.cuda.current_device(),
+                expert_hist=hist,
+                cluster=cluster,
+                trim=trim,
             )
         return _COMPILED[key]
     if rows > 64:
@@ -203,22 +210,25 @@ def _skewed_logits(rows: int, splits: int, g: torch.Generator):
     return logits.contiguous(), summed.contiguous(), bias
 
 
+@pytest.mark.parametrize("schedule", WIDE_SCHEDULES, ids=("cl8", "cl16trim"))
 @pytest.mark.parametrize("splits", (1, 4))
 @pytest.mark.parametrize("rows", WIDE_ROWS)
-def test_wide_matches_the_prefill_top_k_bitwise(rows: int, splits: int) -> None:
+def test_wide_matches_the_prefill_top_k_bitwise(rows: int, splits: int, schedule) -> None:
     """The wide kernel takes the prefill top-k's place on MTP3 / MTP5 decode steps. On the same
     scores (the K partials summed in split order, as the kernel sums them) its ids and weights
     equal the prefill kernel's bit for bit -- both select with the decode arithmetic -- and its
     maps the same tile layout exactly (canonical form: rows within an expert are claimed by
     atomics), which is `reference_maps` of those ids. Its counts are the step's. Over the four
-    EP windows every `(token, k)` is routed on exactly one rank.
+    EP windows every `(token, k)` is routed on exactly one rank. On both schedules alike: the
+    8-CTA cluster, and the 16-CTA one (half the token-warps per CTA, 16 ranks' histograms) with
+    the trimmed winner lookup.
 
     The draw is checked not to be degenerate: the hot expert takes every row (two tiles past
     128), the cold ones none, and some tied pair is split at the selection edge with the
     lower id taken."""
     g = torch.Generator(device="cuda").manual_seed(rows * 10 + splits)
     logits, summed, bias = _skewed_logits(rows, splits, g)
-    wide = _compiled(dict(rows=rows, splits=splits, wide=True, expert_hist=True))
+    wide = _compiled(dict(rows=rows, splits=splits, wide=True, expert_hist=True, schedule=schedule))
     prefill = _compiled(dict(rows=max(rows, 65)))
     seen = torch.zeros(rows * TOP_K, dtype=torch.long, device="cuda")
     for offset in (0, 64, 128, 192):

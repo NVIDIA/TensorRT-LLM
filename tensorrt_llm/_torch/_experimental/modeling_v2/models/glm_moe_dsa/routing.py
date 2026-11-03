@@ -186,27 +186,27 @@ def route(
     # The target carries the checkpoint's own MTP module (layer 78) driven by the
     # one-model MTP-Eagle loop, and no other draft path. A linear chain of 1, 3 or 5
     # draft tokens per step: a generation step carries D + 1 query rows per sequence,
-    # and the decode attention's grid is compiled for that width. Width 2 (MTP1) is
-    # the one the specialised MLA rope kernel and the base-row index kind are built
-    # for; MTP3 / MTP5 take their stock fallbacks there. A dynamic tree is a
-    # different forward. The engine resolves an unset draft length to 1 before this runs.
+    # and the decode attention's grid is compiled for that width. The specialised MLA
+    # rope kernel and the base-row index kind are built for width 2 and, at MTP3 /
+    # MTP5, also for D + 1 (4 / 6). A dynamic tree is a different forward. The engine
+    # resolves an unset draft length to 1 before this runs.
     draft_len = getattr(spec_config, "max_draft_len", None) or 1
     draft_tokens = getattr(spec_config, "max_total_draft_tokens", None) or draft_len
-    mtp1_or_none = spec_config is None or (
+    mtp_linear_or_none = spec_config is None or (
         isinstance(spec_config, MTPDecodingConfig)
         and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and draft_len in (1, 3, 5)
         and draft_tokens == draft_len
     )
-    # GLM-5.2-NVFP4 on 4 B300s (sm103), tep4, MTP-Eagle with one draft token or
-    # no speculation. index_n_heads is checked because a DeepSeek-V3.2-shaped DSA
-    # checkpoint would otherwise match the shape.
+    # GLM-5.2-NVFP4 on 4 B300s (sm103), tep4, MTP-Eagle with 1, 3 or 5 draft
+    # tokens or no speculation. index_n_heads is checked because a
+    # DeepSeek-V3.2-shaped DSA checkpoint would otherwise match the shape.
     if (
         compute_capability == (10, 3)
         and shape == _SHAPE
         and index_n_heads == 32
         and tep4
-        and mtp1_or_none
+        and mtp_linear_or_none
         and kv_cache_quant_algo == QuantAlgo.FP8
     ):
         # fmt: off

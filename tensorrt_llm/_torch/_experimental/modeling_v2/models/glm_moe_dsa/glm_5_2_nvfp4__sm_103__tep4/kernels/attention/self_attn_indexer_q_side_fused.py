@@ -207,6 +207,51 @@ def indexer_q_side_fused_kernel(
     """
     block, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
+
+    if cutlass.const_expr(USE_PDL):
+        # Nothing above touches global memory; every thread waits before its first
+        # load of the predecessor GEMM's output (no CTA barrier on this path).
+        cute.arch.griddepcontrol_wait()
+
+    indexer_q_side_rows(
+        block,
+        tidx,
+        q,
+        position_ids,
+        cos_sin,
+        wq,
+        q_fp8,
+        weights,
+        rows,
+        weight_scale_factor,
+        IS_NEOX,
+        USE_UE8M0,
+        ROWS_PER_BLOCK,
+        WQ_PITCH,
+    )
+
+
+@cute.jit
+def indexer_q_side_rows(
+    block: cutlass.Int32,
+    tidx: cutlass.Int32,
+    q: cute.Tensor,
+    position_ids: cute.Tensor,
+    cos_sin: cute.Tensor,
+    wq: cute.Tensor,
+    q_fp8: cute.Tensor,
+    weights: cute.Tensor,
+    rows: cutlass.Int32,
+    weight_scale_factor: cutlass.Float32,
+    IS_NEOX: cutlass.Constexpr[bool],
+    USE_UE8M0: cutlass.Constexpr[bool],
+    ROWS_PER_BLOCK: cutlass.Constexpr[int],
+    WQ_PITCH: cutlass.Constexpr[int],
+) -> None:
+    """Thread ``tidx`` of CTA ``block``'s share of the kernel (its whole body, callable from
+    another kernel at a block offset): eight lanes per (token, head) row, ``ROWS_PER_BLOCK``
+    rows per CTA. Reads only after the caller's PDL wait. ``WQ_PITCH``: ``wq``'s row pitch,
+    32 (packed head weights) or 160 (read in place from the context indexer projection)."""
     warp_in_block = tidx // cutlass.Int32(_WARP_SIZE)
     lane = tidx % cutlass.Int32(_WARP_SIZE)
     row_in_warp = lane // cutlass.Int32(_LANES_PER_ROW)
@@ -216,11 +261,6 @@ def indexer_q_side_fused_kernel(
         + warp_in_block * cutlass.Int32(_ROWS_PER_WARP)
         + row_in_warp
     )
-
-    if cutlass.const_expr(USE_PDL):
-        # Nothing above touches global memory; every thread waits before its first
-        # load of the predecessor GEMM's output (no CTA barrier on this path).
-        cute.arch.griddepcontrol_wait()
 
     if row < rows:
         pe_col = lane_in_row * cutlass.Int32(_VALUES_PER_LANE)

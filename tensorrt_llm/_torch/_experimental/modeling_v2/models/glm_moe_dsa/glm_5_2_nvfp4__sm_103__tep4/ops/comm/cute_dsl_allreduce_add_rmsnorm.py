@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ._lamport import TWOSHOT_ABOVE, LamportWorkspace, check_rows, tail
+from ._lamport import QUANT_TWOSHOT_ABOVE, TWOSHOT_ABOVE, LamportWorkspace, check_rows, tail
 
 
 class CuteDslAllreduceAddRmsnorm(OpWrapper):
@@ -81,7 +81,12 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
                 partial, residual, weight, out, q8, sf, residual, *tail(workspace, fused=True)
             )
             return out
-        compiled = workspace.fused_twoshot if partial.shape[0] > TWOSHOT_ABOVE else workspace.fused
+        rows = partial.shape[0]
+        compiled = workspace.fused_twoshot if rows > TWOSHOT_ABOVE else workspace.fused
+        if workspace.fused_wide is not None and QUANT_TWOSHOT_ABOVE < rows <= TWOSHOT_ABOVE:
+            # A `wide` workspace (MTP3 / MTP5 engines): the same one-shot with the wide AR levers
+            # (`_lamport.wide_ar_levers`), same bytes. Every rank has the same workspace kind.
+            compiled = workspace.fused_wide
         compiled(partial, residual, weight, out, residual, *tail(workspace, fused=True))
         return out
 
@@ -98,8 +103,8 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
 
         `partials` is the group's partials in rank order (the collective
         exception to mirroring `__call__`). `x8`'s bytes are the activation quant of the
-        norm (`self_attn_prefill_act_quant_mxf8`'s rule), which the caller derives from it. The sum is `cute_dsl_allreduce`'s
-        reference before its rounding: fp32 in rank order. `new_residual` is
+        norm (`self_attn_prefill_act_quant_mxf8`'s rule), which the caller derives from it.
+        The sum is `cute_dsl_allreduce`'s reference before its rounding: fp32 in rank order. `new_residual` is
         `bf16(sum + residual)`, rounded once. The norm is computed in fp64 from
         that bf16 residual with `workspace.eps` and rounded once. `out` is
         ignored.

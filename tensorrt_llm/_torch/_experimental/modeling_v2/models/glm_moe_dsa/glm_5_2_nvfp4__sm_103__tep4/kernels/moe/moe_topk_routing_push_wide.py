@@ -13,6 +13,18 @@ three-launch prefill top-k (histogram, prefix, scatter). Here:
 * **More token-warps, same cluster.** ``WARPS`` token-warps per CTA (16, 24 or 32: 512, 768
   or 1024 threads) on the 8-CTA cluster serve up to 128, 192 or 256 rows; one warp still
   owns one token. ``nvvm.reqntid`` (from the static block size) caps the registers.
+* **Or a 16-CTA cluster** (``cluster=16``, non-portable): half the token-warps per CTA (8,
+  12 or 16) on twice the SMs. The selection is issue-bound per SM, so it ends earlier;
+  everything else -- each token's warp code, the counts, the tile layout -- is the 8-CTA
+  kernel's, the prefix only summing 16 ranks' histograms.
+* **Optionally a trimmed winner lookup** (``trim``, ``_select_topk_trim``): the same rounds,
+  winners and order, but each winner's unbiased sigmoid value fetched once after the eight
+  rounds (eight shuffles from the owner lanes) instead of a head search and a shuffle per
+  round. Same values, so the same weights bit for bit.
+
+B300, router + top-k behind an all-reduce-like PDL producer (1 GPU, graph-replayed, 8
+cold layers): 21.6 -> 20.5 us per layer at 128 rows on the 16-CTA cluster, 20.3 with the
+trimmed lookup; 23.1 -> 21.3 / 21.0 at 192.
 * **The push kernel's selection.** ``moe_topk_routing_push._select_topk_lanevec`` with its
   one-redux rounds: winners, their order, the unbiased sigmoid values, the weight
   butterfly and the per-expert counts are that kernel's -- and the prefill top-k's, whose
@@ -52,9 +64,13 @@ _EXPERTS = _base._EXPERTS
 _TOP_K = _base._TOP_K
 _TILE = _base._TILE
 _VEC = _push._VEC
+_FULL_MASK = _base._FULL_MASK
 #: The portable cluster: every CTA of it holds ``WARPS`` tokens.
 _CLUSTER_CTAS = 8
-#: Token-warps per CTA, by row range: 65..128, 129..192, 193..256.
+#: The cluster sizes the kernel compiles for: the portable 8 and the non-portable 16.
+CLUSTERS = (8, 16)
+#: Token-warps per CTA on the 8-CTA cluster, by row range: 65..128, 129..192, 193..256 (half
+#: on the 16-CTA one).
 WARP_COUNTS = (16, 24, 32)
 MIN_TOKENS = _base._MAX_TOKENS + 1
 MAX_TOKENS = _CLUSTER_CTAS * WARP_COUNTS[-1]
@@ -63,14 +79,17 @@ assert MAX_TOKENS <= 2 * _TILE, "an expert takes at most two tiles"
 OUTPUT_ORDER = _push.OUTPUT_ORDER
 
 TopKRoutingFn = Callable[..., None]
-_CACHE: Dict[Tuple[int, int, int, bool, bool, bool], TopKRoutingFn] = {}
+_CACHE: Dict[Tuple, TopKRoutingFn] = {}
 
 
-def warps_for_tokens(num_tokens: int) -> int:
-    """Token-warps per CTA for ``num_tokens`` (65..256): 16, 24 or 32."""
+def warps_for_tokens(num_tokens: int, cluster: int = _CLUSTER_CTAS) -> int:
+    """Token-warps per CTA for ``num_tokens`` (65..256) on a ``cluster``-CTA cluster: 16, 24
+    or 32 on 8 CTAs, 8, 12 or 16 on 16. The row range of a count is the same on both."""
     if not MIN_TOKENS <= num_tokens <= MAX_TOKENS:
         raise ValueError(f"num_tokens must be in [{MIN_TOKENS}, {MAX_TOKENS}], got {num_tokens}")
-    return 8 * math.ceil(num_tokens / (8 * _CLUSTER_CTAS))
+    if cluster not in CLUSTERS:
+        raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
+    return 8 * math.ceil(num_tokens / (8 * _CLUSTER_CTAS)) * _CLUSTER_CTAS // cluster
 
 
 def max_tiles(num_tokens: int) -> int:
@@ -79,6 +98,123 @@ def max_tiles(num_tokens: int) -> int:
     expanded = int(num_tokens) * _TOP_K
     filled = min(_LOCAL_EXPERTS, expanded)
     return filled + (expanded - filled) // _TILE
+
+
+@cute.jit
+def _select_topk_trim(
+    logits: cute.Tensor,
+    logit_splits: cutlass.Constexpr,
+    window: cutlass.Constexpr,
+    bias_vals,
+    topk_weights: cute.Tensor,
+    topk_indices: cute.Tensor,
+    expert_count,
+    token: cutlass.Int32,
+    lane: cutlass.Int32,
+    valid_token,
+    local_expert_offset: cutlass.Int32,
+    routed_scaling_factor: cutlass.Float32,
+):
+    """``moe_topk_routing_push._select_topk_lanevec`` (one-redux rounds) with the winners'
+    unbiased sigmoid values fetched once after the eight rounds: winner ``e`` sits in lane
+    ``e / 8``, register ``e % 8``, so eight shuffles of the lanes' values give lane ``k`` its
+    winner's. Same winners, order, values, weight butterfly and counts, bit for bit. The
+    count histogram covers ``window`` experts from ``local_expert_offset`` (64: this EP
+    rank's local experts, as the push kernel; 256 from 0: every expert, as
+    ``moe_decode_topk_routing_rep._select_topk_global``). Returns this lane's (expert in the
+    window or -1, histogram slot)."""
+    keys = cutlass.Array(cutlass.Uint64, _VEC)
+    raw_scores = cutlass.Array(cutlass.Float32, _VEC)
+    my_raw = cutlass.Float32(0.0)
+    my_selected_idx = cutlass.Int32(-1)
+    for v in cutlass.range_constexpr(_VEC):
+        keys[v] = cutlass.Uint64(0)
+        raw_scores[v] = cutlass.Float32(0.0)
+    if valid_token:
+        lptr = logits.iterator.raw_ptr()
+        row = token * cutlass.Int32(_EXPERTS * logit_splits) + lane * cutlass.Int32(_VEC)
+        parts = []
+        for split in cutlass.range_constexpr(logit_splits):
+            lo = prims.load_ext(
+                lptr + row + cutlass.Int32(split * _EXPERTS), dtype=cutlass.Float32, count=4
+            )
+            hi = prims.load_ext(
+                lptr + row + cutlass.Int32(split * _EXPERTS + 4), dtype=cutlass.Float32, count=4
+            )
+            parts.append((lo, hi))
+        for v in cutlass.range_constexpr(_VEC):
+            half = 0 if v < 4 else 1
+            idx = v if v < 4 else v - 4
+            logit = cutlass.Float32(parts[0][half][idx])
+            for split in cutlass.range_constexpr(1, logit_splits):
+                logit = logit + cutlass.Float32(parts[split][half][idx])
+            raw = cutlass.Float32(0.5) * cute.math.tanh(
+                cutlass.Float32(0.5) * logit
+            ) + cutlass.Float32(0.5)
+            raw_scores[v] = raw
+            keys[v] = _base._pack_score_index(
+                raw + bias_vals[v], lane * cutlass.Int32(_VEC) + cutlass.Int32(v)
+            )
+        _base._sort8_key_desc(keys)
+        head_idx = cutlass.Int32(65535) - cutlass.Int32(keys[0] & cutlass.Uint64(0xFFFF))
+        for k in cutlass.range_constexpr(_TOP_K):
+            score_key = cutlass.Uint32(keys[0] >> cutlass.Uint64(32))
+            warp_score_key = cutlass.Uint32(
+                prims.redux_sync(cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK)
+            )
+            is_max = score_key == warp_score_key
+            ball = cutlass.Uint32(prims.vote_sync(_FULL_MASK, is_max, prims.VoteSync.BALLOT))
+            owner = cutlass.Int32(cute.arch.popc(ball - cutlass.Uint32(1)))
+            if cutlass.Int32(cute.arch.popc(ball)) != cutlass.Int32(1):
+                # Exact score tie: the served tie-break, smallest expert index (largest inverse index).
+                inverse_idx = cutlass.Uint32(0)
+                if is_max:
+                    inverse_idx = cutlass.Uint32(keys[0] & cutlass.Uint64(0xFFFF))
+                winner_inverse_idx = cutlass.Uint32(
+                    prims.redux_sync(
+                        cutlass.Int32(inverse_idx), prims.ReductionKind.UMAX, _FULL_MASK
+                    )
+                )
+                cand = cutlass.Int32(0)
+                if is_max and inverse_idx == winner_inverse_idx:
+                    cand = cutlass.Int32(1)
+                ball2 = cutlass.Uint32(
+                    prims.vote_sync(_FULL_MASK, cand != cutlass.Int32(0), prims.VoteSync.BALLOT)
+                )
+                owner = cutlass.Int32(cute.arch.popc(ball2 - cutlass.Uint32(1)))
+            winner_idx = cute.arch.shuffle_sync(head_idx, owner)
+            if cutlass.const_expr(k < _TOP_K - 1):
+                if lane == owner:
+                    for v in cutlass.range_constexpr(_VEC - 1):
+                        keys[v] = keys[v + 1]
+                    keys[_VEC - 1] = cutlass.Uint64(0)
+                    head_idx = cutlass.Int32(65535) - cutlass.Int32(
+                        keys[0] & cutlass.Uint64(0xFFFF)
+                    )
+            if lane == cutlass.Int32(k):
+                my_selected_idx = winner_idx
+        # Lane k (< 8) takes winner k's value from its owner lane and register.
+        src = (my_selected_idx >> cutlass.Int32(3)) & cutlass.Int32(_WARP - 1)
+        reg = my_selected_idx & cutlass.Int32(_VEC - 1)
+        for v in cutlass.range_constexpr(_VEC):
+            value = cute.arch.shuffle_sync(raw_scores[v], src)
+            if lane < cutlass.Int32(_TOP_K) and reg == cutlass.Int32(v):
+                my_raw = value
+    weight_sum = _base._warp_sum_f32(my_raw)
+    my_local = cutlass.Int32(-1)
+    my_slot = cutlass.Int32(0)
+    if valid_token and lane < cutlass.Int32(_TOP_K):
+        expert = my_selected_idx
+        expanded = token * cutlass.Int32(_TOP_K) + lane
+        topk_indices[expanded] = expert
+        topk_weights[expanded] = (
+            my_raw * routed_scaling_factor / (weight_sum + cutlass.Float32(1.0e-20))
+        )
+        local = expert - local_expert_offset
+        if local >= cutlass.Int32(0) and local < cutlass.Int32(window):
+            my_local = local
+            my_slot = prims.atomicrmw("add", expert_count.subview(local), 1)
+    return my_local, my_slot
 
 
 @cute.kernel
@@ -100,9 +236,12 @@ def fused_topk_routing_push_wide_kernel(
     LOGIT_SPLITS: cutlass.Constexpr,
     WAIT_FOR_ROUTER_PDL: cutlass.Constexpr,
     SIGNAL_GG1_PDL: cutlass.Constexpr,
+    CLUSTER: cutlass.Constexpr,
+    TRIM: cutlass.Constexpr,
     expert_hist: Optional[cute.Tensor] = None,
 ):
-    """One CTA owns ``WARPS`` tokens, one warp owns a token; push hand-off (module doc)."""
+    """One CTA of the ``CLUSTER``-CTA cluster owns ``WARPS`` tokens, one warp owns a token;
+    push hand-off (module doc). ``TRIM``: the trimmed winner lookup (``_select_topk_trim``)."""
     tidx, _, _ = cute.arch.thread_idx()
     rank, _, _ = cute.arch.block_idx()
     lane = tidx & cutlass.Int32(_WARP - 1)
@@ -112,7 +251,7 @@ def fused_topk_routing_push_wide_kernel(
     )
     all_counts = cutlass.Array(
         cutlass.Int32,
-        _CLUSTER_CTAS * _LOCAL_EXPERTS,
+        CLUSTER * _LOCAL_EXPERTS,
         space=cutlass.AddressSpace.smem,
         alignment=128,
     )
@@ -130,9 +269,7 @@ def fused_topk_routing_push_wide_kernel(
         prims.fence_mbarrier_init()
         # Armed now: a peer's complete_tx may land before this CTA reaches its wait.
         if rank == cutlass.Int32(0):
-            prims.mbarrier_arrive_expect_tx(
-                count_bar.subview(0), _CLUSTER_CTAS * _LOCAL_EXPERTS * 4
-            )
+            prims.mbarrier_arrive_expect_tx(count_bar.subview(0), CLUSTER * _LOCAL_EXPERTS * 4)
         prims.mbarrier_arrive_expect_tx(base_bar.subview(0), _LOCAL_EXPERTS * 4)
     # Router-independent: this lane's 8 contiguous bias values, before the PDL wait.
     bias_vals = cutlass.Array(cutlass.Float32, _VEC)
@@ -147,20 +284,36 @@ def fused_topk_routing_push_wide_kernel(
         cute.arch.griddepcontrol_wait()
     if cutlass.const_expr(SIGNAL_GG1_PDL):
         cute.arch.griddepcontrol_launch_dependents()
-    my_local, my_slot = _push._select_topk_lanevec(
-        logits,
-        LOGIT_SPLITS,
-        True,
-        bias_vals,
-        topk_weights,
-        topk_indices,
-        count,
-        token,
-        lane,
-        valid,
-        local_expert_offset,
-        routed_scaling_factor,
-    )
+    if cutlass.const_expr(TRIM):
+        my_local, my_slot = _select_topk_trim(
+            logits,
+            LOGIT_SPLITS,
+            _LOCAL_EXPERTS,
+            bias_vals,
+            topk_weights,
+            topk_indices,
+            count,
+            token,
+            lane,
+            valid,
+            local_expert_offset,
+            routed_scaling_factor,
+        )
+    else:
+        my_local, my_slot = _push._select_topk_lanevec(
+            logits,
+            LOGIT_SPLITS,
+            True,
+            bias_vals,
+            topk_weights,
+            topk_indices,
+            count,
+            token,
+            lane,
+            valid,
+            local_expert_offset,
+            routed_scaling_factor,
+        )
     prims.barrier_cta_sync(0)  # this CTA's histogram atomics are complete
     prims.barrier_cluster_wait()  # every CTA initialised its barriers
     if tidx < cutlass.Int32(_LOCAL_EXPERTS):
@@ -174,9 +327,9 @@ def fused_topk_routing_push_wide_kernel(
     if rank == cutlass.Int32(0) and tidx < cutlass.Int32(_LOCAL_EXPERTS):
         while not prims.mbarrier_try_wait_parity(count_bar.subview(0), 0):
             pass
-        rank_prefix = cutlass.Array(cutlass.Int32, _CLUSTER_CTAS)
+        rank_prefix = cutlass.Array(cutlass.Int32, CLUSTER)
         total = cutlass.Int32(0)
-        for r in cutlass.range_constexpr(_CLUSTER_CTAS):
+        for r in cutlass.range_constexpr(CLUSTER):
             rank_prefix[r] = total
             total = total + all_counts.subview(cutlass.Int32(r * _LOCAL_EXPERTS) + tidx).load()
         # ceil(total / 128) tiles, 0..2: one ballot for "any row", one for "past 128 rows".
@@ -192,7 +345,7 @@ def fused_topk_routing_push_wide_kernel(
         if warp == cutlass.Int32(1):
             tile = tile + first_warp_total
         expert_base = tile * cutlass.Int32(_TILE)
-        for r in cutlass.range_constexpr(_CLUSTER_CTAS):
+        for r in cutlass.range_constexpr(CLUSTER):
             _compat48.store_async(
                 prims.mapa(base, cutlass.Int32(r)).subview(tidx),
                 expert_base + rank_prefix[r],
@@ -252,10 +405,12 @@ def launch_fused_topk_routing_push_wide(
     LOGIT_SPLITS: cutlass.Constexpr,
     WAIT_FOR_ROUTER_PDL: cutlass.Constexpr,
     SIGNAL_GG1_PDL: cutlass.Constexpr,
+    CLUSTER: cutlass.Constexpr,
+    TRIM: cutlass.Constexpr,
     stream: cuda_driver.CUstream,
     expert_hist: Optional[cute.Tensor] = None,
 ):
-    """Launch the 8-CTA cluster with ``WARPS`` token-warps per CTA."""
+    """Launch the ``CLUSTER``-CTA cluster with ``WARPS`` token-warps per CTA."""
     fused_topk_routing_push_wide_kernel(
         logits,
         routing_bias,
@@ -274,11 +429,13 @@ def launch_fused_topk_routing_push_wide(
         LOGIT_SPLITS,
         WAIT_FOR_ROUTER_PDL,
         SIGNAL_GG1_PDL,
+        CLUSTER,
+        TRIM,
         expert_hist,
     ).launch(
-        grid=(_CLUSTER_CTAS, 1, 1),
+        grid=(CLUSTER, 1, 1),
         block=(WARPS * _WARP, 1, 1),
-        cluster=(_CLUSTER_CTAS, 1, 1),
+        cluster=(CLUSTER, 1, 1),
         use_pdl=WAIT_FOR_ROUTER_PDL,
         stream=stream,
     )
@@ -343,16 +500,20 @@ def compile_fused_topk_routing_wide(
     wait_for_router_pdl: bool = False,
     signal_gg1_pdl: bool = False,
     expert_hist: Optional["torch.Tensor"] = None,
+    cluster: int = _CLUSTER_CTAS,
+    trim: bool = False,
 ) -> TopKRoutingFn:
-    """Compile (once per device / token-warp count / logit planes / PDL roles / counts) the
-    handle for ``logits``' row range (``warps_for_tokens``). It takes ``(logits, bias,
-    *outputs in OUTPUT_ORDER, num_tokens, local_expert_offset, routed_scaling_factor,
-    stream[, expert_hist])``; any row count of the same range runs on it."""
+    """Compile (once per device / cluster / lookup / token-warp count / logit planes / PDL
+    roles / counts) the handle for ``logits``' row range (``warps_for_tokens``). It takes
+    ``(logits, bias, *outputs in OUTPUT_ORDER, num_tokens, local_expert_offset,
+    routed_scaling_factor, stream[, expert_hist])``; any row count of the same range runs on
+    it."""
     device, num_tokens, logit_splits = _validate(logits, routing_bias, outputs)
     _push._check_hist(expert_hist, logits.device)
-    warps = warps_for_tokens(num_tokens)
-    key = (device, warps, logit_splits, bool(wait_for_router_pdl), bool(signal_gg1_pdl)) + (
-        (True,) if expert_hist is not None else ()
+    warps = warps_for_tokens(num_tokens, cluster)
+    key = (device, int(cluster), bool(trim), warps, logit_splits, bool(wait_for_router_pdl)) + (
+        bool(signal_gg1_pdl),
+        *((True,) if expert_hist is not None else ()),
     )
     if key not in _CACHE:
         cutlass.cuda.initialize_cuda_context(device)
@@ -369,6 +530,8 @@ def compile_fused_topk_routing_wide(
             logit_splits,
             bool(wait_for_router_pdl),
             bool(signal_gg1_pdl),
+            int(cluster),
+            bool(trim),
             cutlass_torch.current_stream(),
             *((as_t(expert_hist, assumed_align=16),) if expert_hist is not None else ()),
             options="--opt-level 2 --enable-tvm-ffi",
@@ -386,6 +549,8 @@ def run_fused_topk_routing_wide(
     wait_for_router_pdl: bool = False,
     signal_gg1_pdl: bool = False,
     expert_hist: Optional["torch.Tensor"] = None,
+    cluster: int = _CLUSTER_CTAS,
+    trim: bool = False,
 ) -> None:
     """Compile if needed and launch on the current stream without allocating."""
     if local_expert_offset not in (0, 64, 128, 192):
@@ -399,6 +564,8 @@ def run_fused_topk_routing_wide(
         wait_for_router_pdl=wait_for_router_pdl,
         signal_gg1_pdl=signal_gg1_pdl,
         expert_hist=expert_hist,
+        cluster=cluster,
+        trim=trim,
     )
     as_t = _base._as_tensor
     compiled(

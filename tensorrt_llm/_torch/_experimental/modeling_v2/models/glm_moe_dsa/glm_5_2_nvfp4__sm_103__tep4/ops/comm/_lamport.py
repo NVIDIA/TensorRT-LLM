@@ -69,6 +69,38 @@ QUANT_TWOSHOT_ABOVE = 64
 #: replaces). The choice is a function of the row count alone, and every rank derives the
 #: row count from the same batch, so all ranks take the same side.
 TWOSHOT_ABOVE = 512
+#: MTP3 / MTP5 wide decode levers, wide workspaces only, rows above `QUANT_TWOSHOT_ABOVE`:
+#: the pre-MoE two-shot (`fused_quant_twoshot`) and the AR + norm one-shot at 65..`TWOSHOT_ABOVE`
+#: rows (`fused_wide`: the post-MoE, dense-layer and MTP-layer collectives of a 128 / 192-row
+#: step) are built with
+#:   * the CTA head (`TRTLLM_GLM52_WIDE_AR_CTA_HEAD`, default 1): thread 0 of each CTA loads the
+#:     slot signal and the three slot counts for the CTA, and the input row loads ahead of them.
+#:     Every thread loading them put one L2 line under 147k loads per launch at 192 rows (768
+#:     CTAs x 192 threads): per-CTA stamps on 4x B300, 1.8 us from griddepcontrol.wait to the
+#:     slot, 0.9 us with the CTA head;
+#:   * self-cleaning slots (`TRTLLM_GLM52_WIDE_AR_SELF_CLEAN`, default 1): every reader puts the
+#:     not-ready marker back on what it consumed and the launch records a clear count of 0, so
+#:     the launch two calls on clears nothing. Each rank's slots are its own, so a self-cleaning
+#:     launch interleaves with the clearing builds (MTP1 workspaces, 1..64 rows, the pure AR).
+#:     A recorded count of 0 promises a clean slot, and the clearing builds trust it: any read
+#:     or write path added to a self-cleaning build must have every vector the peers write into
+#:     the slot read and reset by its reader in the same launch, or the launch that next uses
+#:     the slot takes the stale vector as ready (a wrong sum, no hang). The compile functions
+#:     reject the poll modes that have no reset (ready flags, batch / ready-mask polls).
+#: 4-GPU decode-step chain (trunk dense + 2 MoE layers + the MTP layer, real all-reduce and
+#: routing, 80 alternating blocks), us per chain step: CTA head -4.3 at 192 rows /
+#: -1.2 at 128; with self-cleaning slots -12.8 / -8.9. Same bytes as the head builds on every
+#: rank. At 32 rows (the 1-token draft steps) the CTA head measured +0.4 us per AR pair alone
+#: (same stamps), so 1..64 rows keep `fused` / `fused_quant`.
+_WIDE_AR_ENV = {
+    "cta_head": "TRTLLM_GLM52_WIDE_AR_CTA_HEAD",
+    "self_clean": "TRTLLM_GLM52_WIDE_AR_SELF_CLEAN",
+}
+
+
+def wide_ar_levers() -> dict:
+    """The wide AR switches as read at build (each `0` restores the head build's behaviour)."""
+    return {k: os.environ.get(v, "1") == "1" for k, v in _WIDE_AR_ENV.items()}
 
 
 def ensure_process_group(rank: int, world: int) -> None:
@@ -161,6 +193,9 @@ class LamportWorkspace:
     #: `fused_quant` forming the sum two-shot, for rows above `QUANT_TWOSHOT_ABOVE`; None
     #: unless the workspace was built `wide`.
     fused_quant_twoshot: object = None
+    #: `fused` with the wide-decode levers (CTA head, self-cleaning slots) for rows above
+    #: `QUANT_TWOSHOT_ABOVE` up to `TWOSHOT_ABOVE`; None unless built `wide` with a lever on.
+    fused_wide: object = None
 
 
 def build_workspace(
@@ -174,7 +209,8 @@ def build_workspace(
     (pure, fused, fused+quant, fused two-shot, its MXF8-out variant, the lm_head
     all-gather) for this rank on the current device, plus, `wide` (an engine whose decode
     steps run above 64 rows: max_draft_len > 1), the two-shot fused+quant
-    `fused_quant_twoshot`. Launches nothing beyond the buffer fills and the one-element
+    `fused_quant_twoshot` and the 65..512-row `fused_wide`, both with the wide-decode levers
+    (`wide_ar_levers`). Launches nothing beyond the buffer fills and the one-element
     multicast and all-gather agreements.
 
     The multicast decision is agreed across the group: a rank compiling the multicast
@@ -243,7 +279,10 @@ def build_workspace(
     # at the same row counts selects -- the two-shot kernel. It publishes by unicast stores
     # whether or not the fabric has multicast.
     fused_quant_twoshot = None
+    fused_wide = None
     if wide:
+        lv = wide_ar_levers()
+        head = dict(cta_head=True, early_input_load=True) if lv["cta_head"] else {}
         fused_quant_twoshot = _ar.compile_fused_out_quant_for_rank(
             rank,
             world,
@@ -254,9 +293,26 @@ def build_workspace(
             prefetch_fused_inputs=True,
             multicast_publish=False,
             two_shot=True,
+            self_clean=lv["self_clean"],
+            **head,
             **_FUSED_OPTIONS,
             **common,
         )
+        if head or lv["self_clean"]:
+            fused_wide = _ar.compile_fused_for_rank(
+                rank,
+                world,
+                dev.index,
+                hidden,
+                eps=eps,
+                pdl_release_policy=_FUSED_PDL_POLICY,
+                prefetch_fused_inputs=True,
+                multicast_publish=use_mc,
+                self_clean=lv["self_clean"],
+                **head,
+                **_FUSED_OPTIONS,
+                **common,
+            )
     fused_twoshot = _ar.compile_fused_twoshot_for_rank(
         rank,
         world,
@@ -322,6 +378,7 @@ def build_workspace(
         gather=gather,
         fused_twoshot_x8=fused_twoshot_x8,
         fused_quant_twoshot=fused_quant_twoshot,
+        fused_wide=fused_wide,
     )
 
 

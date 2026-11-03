@@ -17,7 +17,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
 from ...kernels.moe import moe_decode_router_partials as _partials
-from ...kernels.moe import moe_decode_router_partials_wide as _partials_wide
 from ...kernels.moe import moe_frontend_router as _vec2
 from ...kernels.moe import moe_frontend_router_tc as _tc
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
@@ -35,10 +34,10 @@ DECODE_MAX_ROWS = 64
 PREFILL_MIN_ROWS = DECODE_MAX_ROWS + 1
 PREFILL_MAX_ROWS = 8192
 PREFILL_SPLIT_K = 1
-#: The wide decode router's row domain (MTP3 / MTP5 decode widths): `[rows, 4, 256]`
-#: partials, one 64-row M tile per grid row.
-WIDE_MIN_ROWS = _partials_wide.MIN_TOKENS
-WIDE_MAX_ROWS = _partials_wide.MAX_TOKENS
+#: The wide decode router's row domain (MTP3 / MTP5 decode widths): the decode partials
+#: kernel's `[rows, 4, 256]` above 64 rows, one 64-row M tile per grid row.
+WIDE_MIN_ROWS = DECODE_MAX_ROWS + 1
+WIDE_MAX_ROWS = _partials.MAX_TOKENS
 
 
 def decode_splits(rows: int) -> int:
@@ -144,12 +143,12 @@ def build_all(device, rows=range(1, DECODE_MAX_ROWS + 1)) -> dict[int, RouterRun
 
 
 def build_wide(device) -> RouterRunner:
-    """Compile the wide decode router (65..256 rows, `[rows, 4, 256]` partials) and launch it
-    once on zeros at 256 rows. Call at load. The 64-row router's schedule repeated per 64-row
-    M tile on grid y: weight slice loaded before the PDL wait, `DECODE_CLUSTER`-CTA activation
-    multicast, the top-k released at entry; each M tile's partials are the 64-row kernel's on
-    those rows bit for bit. One compile serves every row count (symbolic). Raises if the
-    compile fails."""
+    """Compile the decode partials router for 65..256 rows (`[rows, 4, 256]` partials) and
+    launch it once on zeros at 256 rows. Call at load. The same kernel and handle as `build`'s
+    6..64 rows: its schedule repeated per 64-row M tile on grid y (weight slice loaded before
+    the PDL wait, `DECODE_CLUSTER`-CTA activation multicast, the top-k released at entry);
+    each M tile's partials are the 64-row ones of its rows, bit for bit. One compile serves
+    every row count (symbolic). Raises if the compile fails."""
     rows = WIDE_MAX_ROWS
     x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
     w = torch.zeros(EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device)
@@ -159,7 +158,7 @@ def build_wide(device) -> RouterRunner:
             "tc_partials_wide",
             None,
             _partials_launch(
-                _partials_wide.compile_router_partials_wide(
+                _partials.compile_router_partials(
                     x, w, out, use_pdl=_USE_PDL, cluster=DECODE_CLUSTER
                 )
             ),
