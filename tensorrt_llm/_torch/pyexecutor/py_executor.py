@@ -8100,8 +8100,13 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        cancelled_model_ids = self._cancelled_disagg_model_request_ids()
+        scheduling_requests = [
+            request for request in self.active_requests
+            if request.py_request_id not in cancelled_model_ids
+        ] if cancelled_model_ids else self.active_requests
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            scheduling_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -10050,11 +10055,48 @@ class PyExecutor:
                                 requests=[request],
                                 charge_budget=False)
 
+    def _cancelled_disagg_model_request_ids(self) -> set[int]:
+        """Identify qualified model work whose next scheduling is cancelled.
+
+        This is an admission decision, not permission to finish or free a
+        request. The active list continues to own requests while their prior
+        model batch or transfer accesses settle.
+
+        Returns:
+            Executor request IDs excluded from further model scheduling.
+        """
+        if (not getattr(self, "canceled_req_ids", None)
+                or self.kv_cache_transceiver is None
+                or getattr(self, "kv_connector_manager", None) is not None
+                or self.dist.pp_size != 1
+                or getattr(self, "is_encoder_decoder", False)
+                or getattr(self, "_mm_encoder_item_scheduling_enabled", False)):
+            return set()
+        cancel_ids = set(self.canceled_req_ids)
+        model_ids = set()
+        for request in self.active_requests:
+            cancel_id = (request.parent_request_id
+                         if request.is_child else request.py_request_id)
+            if (cancel_id not in cancel_ids
+                    or request.py_multimodal_params is not None
+                    or not (request.is_context_only_request
+                            or request.is_generation_only_request)):
+                continue
+            if request.state not in (LlmRequestState.CONTEXT_INIT,
+                                     LlmRequestState.GENERATION_IN_PROGRESS):
+                continue
+            if self.kv_cache_transceiver.supports_idle_request_cancellation(
+                    request) is True:
+                model_ids.add(request.py_request_id)
+        return model_ids
+
     def _cancel_waiting_disagg_requests(
             self, new_requests: List[LlmRequest]) -> List[LlmRequest]:
-        """Progress qualified transfer cancellations without a model batch.
+        """Progress qualified cancellations without submitting another batch.
 
-        Model-active requests remain at the post-sampler cancellation boundary.
+        Requests in the previous batch remain at its post-sampler boundary,
+        including context chunks that produce no sampled tokens. Other model
+        requests can retire here without waiting for a new forward to run.
         Transfer-only requests can be cancelled before peer readiness admits
         more work, but stay rooted until the transceiver authorizes retirement.
         Responses and termination use the existing rank-synchronized flush.
@@ -10075,6 +10117,12 @@ class PyExecutor:
         if cancel_queued:
             self.waiting_queue.remove_by_ids(cancelled_ids)
         new_ids = {req.py_request_id for req in new_requests}
+        cancelled_model_ids = self._cancelled_disagg_model_request_ids()
+        previous_batch = getattr(self, "previous_batch", None)
+        if previous_batch is not None:
+            cancelled_model_ids.difference_update(
+                req.py_request_id
+                for req in previous_batch.scheduled_requests.all_requests())
         retired_ids = set()
         failed_ids = set()
         handled_cancel_ids = set()
@@ -10094,8 +10142,11 @@ class PyExecutor:
                     LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
                     LlmRequestState.DISAGG_TRANS_ERROR,
                 ))
-            if (not (context_waiting or generation_waiting)
+            model_cancelled = request.py_request_id in cancelled_model_ids
+            if (not (context_waiting or generation_waiting or model_cancelled)
                     or supports_idle_cancel(request) is not True):
+                continue
+            if model_cancelled and not self._try_cancel_request(request):
                 continue
             # Even an unsubmitted CTX request may be in the transceiver's
             # peer-info wait set. Cancel there before a late ready can revive it.

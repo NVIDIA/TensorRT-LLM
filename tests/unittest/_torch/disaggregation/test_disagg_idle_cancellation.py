@@ -36,7 +36,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmResponse, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
@@ -46,12 +46,15 @@ from tensorrt_llm.executor.base_worker import BaseWorker
 pytestmark = pytest.mark.cpu_only
 
 
-def _request(request_id: int, *, context: bool = False) -> LlmRequest:
+def _request(
+    request_id: int, *, context: bool = False, num_return_sequences: int = 1
+) -> LlmRequest:
     """Create a native request waiting for its generation-first peer.
 
     Args:
         request_id: Executor and transfer identity.
         context: Whether to create the context-side request.
+        num_return_sequences: Number of sequences, including any native children.
 
     Returns:
         A request that has not run a model batch.
@@ -60,7 +63,7 @@ def _request(request_id: int, *, context: bool = False) -> LlmRequest:
         request_id=request_id,
         max_new_tokens=8,
         input_tokens=list(range(8)),
-        sampling_config=SamplingConfig(1),
+        sampling_config=SamplingConfig(1, num_return_sequences=num_return_sequences),
         is_streaming=False,
         draft_tokens=None,
         llm_request_type=(
@@ -104,6 +107,9 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.enable_attention_dp = False
     engine.gather_all_responses = False
     engine.kv_connector_manager = None
+    engine.previous_batch = None
+    engine.is_encoder_decoder = False
+    engine._mm_encoder_item_scheduling_enabled = False
     engine.dist = SimpleNamespace(
         rank=0, tp_size=1, pp_size=1, world_size=1, mapping=SimpleNamespace(tp_group=[0])
     )
@@ -473,6 +479,14 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
     request.state = (
         LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
     )
+    batch = ScheduledRequests()
+    if context:
+        batch.context_requests_chunking = [request]
+    else:
+        batch.generation_requests = [request]
+    executor.previous_batch = SimpleNamespace(
+        scheduled_requests=batch, sample_state=SimpleNamespace(requests=[])
+    )
     executor.active_requests = [request]
     _abort(executor, request)
 
@@ -483,6 +497,199 @@ def test_existing_compute_request_keeps_post_batch_cancellation(
     assert not request.is_finished
     assert executor._pending_transfer_responses == []
     executor.resource_manager.free_resources.assert_not_called()
+
+
+@pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
+def test_model_request_cancels_between_batches_without_another_forward(
+    executor: PyExecutor, context: bool, bridge_enabled: bool
+) -> None:
+    """A consumed abort needs no further model work to publish its result."""
+    request, healthy = _request(1, context=context), _request(2)
+    request.state = (
+        LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
+    )
+    if context:
+        request.context_chunk_size = 4
+        request.move_to_next_context_chunk()
+        assert request.context_remaining_length == 4
+        executor.kv_cache_transceiver._wait_reqs[1] = request
+    executor.kv_cache_transceiver._fp4_mla_bridge_enabled = bridge_enabled
+    executor.active_requests = [request, healthy]
+    _abort(executor, request, repeats=2)
+
+    assert executor._cancel_waiting_disagg_requests([]) == []
+
+    assert executor.active_requests == [healthy]
+    assert not healthy.is_finished
+    assert executor.canceled_req_ids == []
+    assert executor.kv_cache_transceiver._wait_reqs == {}
+    executor.resource_manager.free_resources.assert_not_called()
+    _assert_released_once(executor, request)
+    _abort(executor, request)
+    executor._cancel_waiting_disagg_requests([])
+    _assert_released_once(executor, request)
+
+
+@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("child", [False, True])
+def test_scheduler_excludes_cancelled_model_work_without_releasing_its_roots(
+    executor: PyExecutor, context: bool, child: bool
+) -> None:
+    """Stop future batches by executor ID, including cancellation of a parent."""
+    parent = _request(1, context=context, num_return_sequences=2 if child else 1)
+    if context:
+        parent.state = LlmRequestState.CONTEXT_INIT
+    if child:
+        parent.create_child_request(3)
+        (request,) = parent.child_requests
+    else:
+        request = parent
+    request.state = (
+        LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
+    )
+    healthy = _request(2)
+    healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor.active_requests = [request, healthy]
+    executor.kv_cache_manager = SimpleNamespace()
+    executor.inflight_req_ids = set()
+    executor.scheduler = Mock()
+    executor.scheduler.schedule_request.side_effect = _ReachedScheduler
+    _abort(executor, parent)
+
+    with pytest.raises(_ReachedScheduler):
+        executor._schedule()
+
+    executor.scheduler.schedule_request.assert_called_once_with([healthy], set())
+    assert executor.active_requests == [request, healthy]
+    assert executor.canceled_req_ids == [parent.py_request_id]
+    assert not request.is_finished
+    assert executor._pending_transfer_responses == []
+    executor.resource_manager.free_resources.assert_not_called()
+    executor.sampler.release_request.assert_not_called()
+
+
+@pytest.mark.parametrize("completed", [False, True], ids=["cancelled", "already-complete"])
+def test_cancelled_overlap_request_retires_at_the_existing_post_sampler_boundary(
+    executor: PyExecutor, completed: bool
+) -> None:
+    """Update physical model resources before finishing the retained request."""
+    request = _request(1)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor.active_requests = [request]
+    batch = ScheduledRequests()
+    batch.generation_requests = [request]
+    executor.previous_batch = SimpleNamespace(scheduled_requests=batch)
+    executor._is_kv_manager_v2 = True
+    executor.enable_joint_kv_cache_reuse = False
+    executor.kv_cache_manager = Mock(spec=["update_resources", "is_preemption_pending"])
+    executor.kv_cache_manager.is_preemption_pending.return_value = False
+    executor.resource_manager = Mock(spec=["free_resources", "update_resources"])
+    executor.model_engine.attn_metadata = object()
+    executor.model_engine.kv_cache_dtype_byte_size = 2
+    executor.enable_early_first_token_response = False
+    executor.enable_iter_perf_stats = False
+    executor.disable_overlap_scheduler = False
+    executor.force_terminate_ctx_for_partial_reuse = False
+    executor.perf_manager = Mock()
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    events = []
+    executor.kv_cache_manager.update_resources.side_effect = lambda *args: events.append("update")
+    executor.resource_manager.free_resources.side_effect = lambda req: events.append("free")
+    _abort(executor, request)
+
+    executor._cancel_waiting_disagg_requests([])
+    assert not request.is_finished
+    executor.resource_manager.free_resources.assert_not_called()
+
+    # The previous sampler has now settled. Its terminal result, if any,
+    # precedes the cancellation boundary and must remain the result.
+    if completed:
+        request.finish_by_reason(FinishReason.LENGTH)
+    executor._process_previous_batch()
+
+    assert events == ["update", "free"]
+    assert request.is_finished_due_to_length is completed
+    assert request.is_finished_due_to_cancellation is not completed
+    assert executor.active_requests == []
+    assert executor.canceled_req_ids == []
+    assert len(executor.responses[1]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+    executor.sampler.release_request.assert_called_once_with(request)
+    executor._cancel_waiting_disagg_requests([])
+    executor._flush_pending_transfer_responses()
+    assert len(executor.responses[1]) == 1
+    executor.resource_manager.free_resources.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    ["bridge_disabled", "cpp", "connector", "pp", "encoder", "mm_items", "mm", "mm_empty"],
+)
+def test_model_cancellation_keeps_unqualified_scheduler_paths_unchanged(
+    executor: PyExecutor, unsupported: str
+) -> None:
+    """No new profile or connector path inherits this admission change."""
+    request = _request(1)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    executor.active_requests = [request]
+    executor.kv_cache_manager = SimpleNamespace()
+    executor.inflight_req_ids = set()
+    executor.scheduler = Mock()
+    executor.scheduler.schedule_request.side_effect = _ReachedScheduler
+    if unsupported == "bridge_disabled":
+        executor.kv_cache_transceiver._fp4_mla_bridge_enabled = False
+    elif unsupported == "cpp":
+        executor.kv_cache_transceiver = object.__new__(BindKvCacheTransceiver)
+    elif unsupported == "connector":
+        executor.kv_connector_manager = Mock()
+    elif unsupported == "pp":
+        executor.dist.pp_size = 2
+    elif unsupported == "encoder":
+        executor.is_encoder_decoder = True
+    elif unsupported == "mm_items":
+        executor._mm_encoder_item_scheduling_enabled = True
+    elif unsupported == "mm":
+        request.py_multimodal_data = {"image": object()}
+    else:
+        request.py_multimodal_data = {}
+    _abort(executor, request)
+
+    assert executor._cancel_waiting_disagg_requests([]) == []
+    with pytest.raises(_ReachedScheduler):
+        executor._schedule()
+
+    executor.scheduler.schedule_request.assert_called_once_with([request], set())
+    assert executor.active_requests == [request]
+    assert executor.canceled_req_ids == [1]
+    assert not request.is_finished
+    assert executor._pending_transfer_responses == []
+    executor.resource_manager.free_resources.assert_not_called()
+
+
+def test_model_cancel_failure_keeps_ownership_and_retries_without_new_work(
+    executor: PyExecutor,
+) -> None:
+    """A failed cancellation call is not permission to release the request."""
+    request = _request(1, context=True)
+    request.state = LlmRequestState.CONTEXT_INIT
+    executor.active_requests = [request]
+    transceiver = executor.kv_cache_transceiver
+    cancel = transceiver.cancel_request
+    transceiver.cancel_request = Mock(side_effect=RuntimeError("control endpoint unavailable"))
+    _abort(executor, request)
+
+    executor._cancel_waiting_disagg_requests([])
+
+    assert executor.active_requests == [request]
+    assert executor.canceled_req_ids == [1]
+    assert executor._cancelled_disagg_model_request_ids() == {1}
+    assert not request.is_finished
+    assert executor._pending_transfer_responses == []
+    executor.resource_manager.free_resources.assert_not_called()
+    transceiver.cancel_request = cancel
+    executor._cancel_waiting_disagg_requests([])
+    _assert_released_once(executor, request)
 
 
 @pytest.mark.parametrize(
@@ -789,8 +996,9 @@ class _ReachedScheduler(Exception):
 
 
 @pytest.mark.parametrize("context, bridge_enabled", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("model_active", [False, True], ids=["waiting", "model-active"])
 def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
-    executor: PyExecutor, context: bool, bridge_enabled: bool
+    executor: PyExecutor, context: bool, bridge_enabled: bool, model_active: bool
 ) -> None:
     """The real preparation path applies abort before admitting more work."""
     cancelled, healthy = _request(1, context=context), _request(2)
@@ -805,12 +1013,18 @@ def test_preparation_applies_worker_cancel_before_publication_or_scheduling(
     ready = Mock()
     ready.query.return_value = True
     executor.disagg._defer_unready_gen_receives = True
-    if not context:
+    if model_active:
+        cancelled.state = (
+            LlmRequestState.CONTEXT_INIT if context else LlmRequestState.GENERATION_IN_PROGRESS
+        )
+    elif not context:
         cancelled.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         executor.disagg._unpublished_gen_receives[1] = (cancelled, ready)
     executor._release_unused_connector_reservations = Mock()
     executor._poll_encoder_steps = Mock()
-    executor._fetch_and_activate_new_requests = Mock(return_value=[cancelled, healthy])
+    executor._fetch_and_activate_new_requests = Mock(
+        return_value=[] if model_active else [cancelled, healthy]
+    )
     executor._handle_control_request = Mock()
     executor._activate_completed_remote_tails = Mock()
     executor._init_iter_stats_if_sampled = Mock()
