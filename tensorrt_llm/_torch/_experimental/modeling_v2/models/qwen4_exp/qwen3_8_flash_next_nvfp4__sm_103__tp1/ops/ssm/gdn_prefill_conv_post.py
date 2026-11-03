@@ -26,6 +26,7 @@ import triton.language as tl
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from triton.language.extra.cuda import libdevice
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
@@ -45,6 +46,9 @@ SOFTPLUS_THRESHOLD = 20.0
 
 #: Channels per program of the window publish.
 _PUBLISH_BLOCK_C = 512
+#: Tokens per program of the gates: at 16384 tokens on GB300 4.4 us (6.1 at 64, 5.3 at
+#: 16 or 32).
+_GATES_BLOCK_T = 8
 
 
 @triton.jit
@@ -554,8 +558,10 @@ def _gdn_gates_kernel(
     NUM_V_HEADS: tl.constexpr,
     HP: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    LINEAR_GATE: tl.constexpr,
 ):
-    """The decay/beta gates over `[T, NUM_V_HEADS]`, one row-coalesced tile a program."""
+    """The decay/beta gates over `[T, NUM_V_HEADS]`, one row-coalesced tile a program;
+    with `LINEAR_GATE` the decay stored as `exp(g)` (libdevice `expf`, as `torch.exp`)."""
     t = (tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T))[:, None]
     h = tl.arange(0, HP)[None, :]
     m = (t < num_tokens) & (h < NUM_V_HEADS)
@@ -569,7 +575,10 @@ def _gdn_gates_kernel(
         gate_input <= softplus_threshold, tl.log(1.0 + tl.exp(gate_input)), gate_input
     )
     g_off = t64 * NUM_V_HEADS + h
-    tl.store(g_ptr + g_off, -tl.exp(A_log) * softplus, mask=m)
+    g = -tl.exp(A_log) * softplus
+    if LINEAR_GATE:
+        g = libdevice.exp(g)
+    tl.store(g_ptr + g_off, g, mask=m)
     tl.store(beta_ptr + g_off, tl.sigmoid(b_val.to(tl.float32)), mask=m)
 
 
@@ -670,6 +679,7 @@ def _launch(
     pad_slot_id,
     l2_norm_eps,
     softplus_threshold,
+    linear_gate=False,
 ):
     assert head_k_dim == head_v_dim and weight.shape[-1] == CONV_WIDTH, (
         "one program per 128-channel head: head_k_dim must equal head_v_dim, and the "
@@ -696,7 +706,7 @@ def _launch(
             x, weight, conv_states, query_start_loc, cache_indices, has_initial_state, q, k, v,
             num_k_heads, num_v_heads, head_k_dim, pad_slot_id, l2_norm_eps,
         )  # fmt: skip
-        _gdn_gates_kernel[(triton.cdiv(num_tokens, 64),)](
+        _gdn_gates_kernel[(triton.cdiv(num_tokens, _GATES_BLOCK_T),)](
             a,
             a.stride(0),
             a.stride(1),
@@ -711,7 +721,8 @@ def _launch(
             softplus_threshold,
             NUM_V_HEADS=num_v_heads,
             HP=triton.next_power_of_2(num_v_heads),
-            BLOCK_T=64,
+            BLOCK_T=_GATES_BLOCK_T,
+            LINEAR_GATE=linear_gate,
             num_warps=4,
         )
     _gdn_prefill_conv_publish_kernel[(num_seqs, triton.cdiv(conv_dim, _PUBLISH_BLOCK_C))](
@@ -751,7 +762,7 @@ class GdnPrefillConvPost(OpWrapper):
         y[t] = bf16(silu(sum_k weight[:, k] * xpad[t + k]))   (fp32 taps, in order)
         q, k = y / sqrt(sum(y^2) + l2_norm_eps)               (per head, fp32, rounded once)
         v    = y                                              (bit-exact)
-        g    = -exp(A_log) * softplus(a + dt_bias)            (fp32)
+        g    = -exp(A_log) * softplus(a + dt_bias)            (fp32; exp(g) with linear_gate)
         beta = sigmoid(b)                                     (fp32)
         conv_states[slot] = xpad[e - b : e - b + W - 1]       (raw input, exact)
 
@@ -797,6 +808,15 @@ class GdnPrefillConvPost(OpWrapper):
             ),
         ),
         Cell(
+            why="target call with linear_gate: 3000+8192+5000 tokens, the middle one fresh",
+            spec=dict(
+                lengths=(3000, 8192, 5000),
+                pool_slots=ENGINE_SLOTS,
+                initial=(True, False, True),
+                linear_gate=True,
+            ),
+        ),
+        Cell(
             why="128 short contexts (the batch ceiling), some shorter than the window",
             spec=dict(
                 lengths=tuple(1 + (i * 7) % 64 for i in range(128)),
@@ -819,8 +839,10 @@ class GdnPrefillConvPost(OpWrapper):
     whole conv pool unsliced, `pad_slot_id` -1, `l2_norm_eps` 1e-6 and
     `softplus_threshold` 20. `x`, `a`, `b` are column (and row) views, row
     stride 16480, of the one input-projection output; the outputs feed
-    `flashinfer_chunk_gated_delta_rule` (the Triton chunk on the verify path)
-    with `use_qk_l2norm_in_kernel=False`.
+    `flashinfer_chunk_gated_delta_rule` with `use_qk_l2norm_in_kernel=False`,
+    and `linear_gate=True` on both: the decay leaves this pass as `exp(g)`,
+    the factor FlashInfer's kernel takes, bitwise the `torch.exp` the chunk
+    op would otherwise launch.
 
     Three launches. The conv pass (CuTe DSL, `_ConvPassKernel`): grid
     `80 heads x cdiv(T, 64)`, 128 threads; a CTA copies its 67-row tile
@@ -830,8 +852,9 @@ class GdnPrefillConvPost(OpWrapper):
     first token's sequence by a binary search of `query_start_loc`
     (sync-free, capture-safe), and a thread whose 16 tokens and windows lie
     inside one sequence takes a straight-line branch, the rest read the pool
-    token by token. The gates (Triton): one row-coalesced `[64, 48]` tile a
-    program. Then a per-sequence window publish (Triton), after both, so no
+    token by token. The gates (Triton): one row-coalesced `[8, 48]` tile a
+    program (`exp(g)` with `linear_gate`, libdevice `expf`). Then a
+    per-sequence window publish (Triton), after both, so no
     program reads a window another has already advanced.
 
     Speed (one layer, 461-slot pool, in_proj views, us, graph replay over 4
@@ -852,8 +875,9 @@ class GdnPrefillConvPost(OpWrapper):
 
     Certified over the 461-slot pool, seen as one layer of a two-layer buffer:
     three contexts of 37, 1 and 128 tokens; a mixed step's 8065-token context
-    half, the first rows of an 8192-row projection; and 128 short contexts (1 to
-    64 tokens, some shorter than the window).
+    half, the first rows of an 8192-row projection; 128 short contexts (1 to
+    64 tokens, some shorter than the window); and the target's call with
+    `linear_gate` (3000 + 8192 + 5000 tokens, the middle one fresh).
 
     A `pad_slot_id` context reads no carry and publishes nothing; its outputs
     are computed from a zero window (the unfused conv leaves those columns
@@ -902,6 +926,7 @@ class GdnPrefillConvPost(OpWrapper):
         pad_slot_id: int = -1,
         l2_norm_eps: float = 1e-6,
         softplus_threshold: float = 20.0,
+        linear_gate: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return _launch(
             x,
@@ -921,6 +946,7 @@ class GdnPrefillConvPost(OpWrapper):
             pad_slot_id,
             l2_norm_eps,
             softplus_threshold,
+            linear_gate,
         )
 
     def reference(
@@ -942,12 +968,14 @@ class GdnPrefillConvPost(OpWrapper):
         pad_slot_id: int = -1,
         l2_norm_eps: float = 1e-6,
         softplus_threshold: float = 20.0,
+        linear_gate: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """`(q, k, v, g, beta, conv_states as the call leaves them)`; mutates
         nothing. Conv taps in fp32 in tap order and the SiLU in fp32, rounded
         to `x.dtype` once; the q/k norm in fp32 from that rounded value,
         rounded once; `g` in fp64 with the stabilised softplus, rounded to
-        fp32; `beta` the fp32 sigmoid."""
+        fp32 (with `linear_gate`, `exp` of that fp32 value in fp64, rounded to
+        fp32); `beta` the fp32 sigmoid."""
         qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
         width = weight.shape[-1]
         n_tok = x.shape[0]
@@ -983,6 +1011,8 @@ class GdnPrefillConvPost(OpWrapper):
         gx = a[:n_tok, :num_v_heads].double() + dt_bias[:num_v_heads].double()
         softplus = torch.where(gx <= softplus_threshold, torch.log1p(torch.exp(gx)), gx)
         g = (-torch.exp(A_log[:num_v_heads].double()) * softplus).float()
+        if linear_gate:
+            g = torch.exp(g.double()).float()
         beta = torch.sigmoid(b[:n_tok, :num_v_heads].float())
         return (*(t.unsqueeze(0) for t in (q, k, v, g, beta)), states)
 
@@ -1005,6 +1035,7 @@ class GdnPrefillConvPost(OpWrapper):
         pad_slot_id: int = -1,
         l2_norm_eps: float = 1e-6,
         softplus_threshold: float = 20.0,
+        linear_gate: bool = False,
     ) -> None:
         # Every address below is computed from the arguments' own extents and
         # strides only where stated; the rest is `ptr + index`, unmasked.

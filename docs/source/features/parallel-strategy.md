@@ -67,20 +67,23 @@ TensorRT LLM supports two strategies for attention modules:
 
 #### How to Enable Attention Parallelism
 
-To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, create a YAML configuration file named `parallel_config.yaml`:
+To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, choose one of the following configurations and save it as `parallel_config.yaml`.
 
-```bash
-cat <<EOF > parallel_config.yaml
-# TP-8
+**TP-8:**
+
+```yaml
 tensor_parallel_size: 8
 enable_attention_dp: false    # default
-# DP-8
-tensor_parallel_size: 8
-enable_attention_dp: true
-EOF
 ```
 
-then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
+**DP-8:**
+
+```yaml
+tensor_parallel_size: 8
+enable_attention_dp: true
+```
+
+Then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
 
 ### FFN Module
 
@@ -100,24 +103,34 @@ TensorRT LLM supports three execution patterns for MoE:
 
 #### How to Enable MoE Parallelism
 
-To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, create a YAML configuration file named `parallel_config.yaml` as follows:
+To deploy a model with the above parallel strategies using `trtllm-serve` or run benchmarking with `trtllm-bench`, choose one of the following configurations and save it as `parallel_config.yaml`.
 
-```bash
-cat <<EOF > parallel_config.yaml
-# TP only
+**TP only:**
+
+```yaml
 tensor_parallel_size: 8
 moe_tensor_parallel_size: 8
+moe_expert_parallel_size: 1
+```
 
-# EP only
+**EP only:**
+
+```yaml
 tensor_parallel_size: 8
+moe_tensor_parallel_size: 1
 moe_expert_parallel_size: 8
+```
 
-# Hybrid (TP-4 × EP-2)
+**Hybrid (TP-4 × EP-2):**
+
+```yaml
 tensor_parallel_size: 8      # 4 × 2
 moe_tensor_parallel_size: 4
 moe_expert_parallel_size: 2
-EOF
 ```
+
+Then set `--config parallel_config.yaml` in `trtllm-serve` or `trtllm-bench`.
+
 ```{note}
 The product of `moe_tensor_parallel_size` and `moe_expert_parallel_size` must equal `tensor_parallel_size`.
 ```

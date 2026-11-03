@@ -1393,15 +1393,14 @@ def _get_chat_completion_function_tools(
             # chat template cannot describe anything else, and the call is
             # intercepted server-side rather than returned to the client.
             #
-            # A request that reaches here still carrying web_search should
-            # already have been refused by the endpoint - see
-            # web_search_rejection_reason and its caller in openai_server.py -
-            # because answering without the search the client asked for is a
-            # wrong answer the client cannot detect. This branch is the
-            # fallback for any other caller of this function: drop the tool
-            # rather than describe it, since nothing on this path executes the
-            # call yet and the model would emit one the client has no
-            # implementation for ("unsupported call: web_search").
+            # Unless TRTLLM_WEB_SEARCH_UNAVAILABLE=reject makes the endpoint
+            # refuse it (see web_search_rejection_reason and its caller in
+            # openai_server.py), a request whose web_search the server cannot
+            # honour is served, and this is where the tool is dropped for a
+            # chat-template model; other callers of this function drop it the
+            # same way. It is dropped rather than described because nothing on
+            # this path executes the call yet, and the model would emit one the
+            # client has no implementation for ("unsupported call: web_search").
             #
             # Warn once per process rather than per request: what it reports is
             # a server-configuration fact, not a property of the request, so
