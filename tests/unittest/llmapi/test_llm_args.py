@@ -5837,6 +5837,12 @@ class TestDSparkConfidenceScheduling:
         c = self._cfg()
         assert c.enable_confidence_scheduling is False
         assert c.confidence_min_predicted_gain == pytest.approx(0.04)
+        assert c.enable_fused_confidence_scheduler is False
+
+    def test_device_reranking_is_opt_in(self):
+        c = self._scheduled(enable_fused_confidence_scheduler=True)
+        assert c.enable_confidence_scheduling is True
+        assert c.enable_fused_confidence_scheduler is True
 
     def test_confidence_paths_are_ignored_when_scheduling_is_off(self):
         # A static config copied from a dynamic one keeps working.

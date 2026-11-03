@@ -3890,6 +3890,17 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "verification more often.",
         status="prototype")
 
+    enable_fused_confidence_scheduler: bool = Field(
+        default=False,
+        description=
+        "Re-rank which draft positions are verified on the GPU, using the "
+        "confidence of the block being verified rather than the previous "
+        "step's host copy. The verifier budget is still chosen on the host. "
+        "Compact steps gain a device pass and a full input rebuild, so measure "
+        "it on your workload. Only used when enable_confidence_scheduling=True; "
+        "validated with attention data parallelism.",
+        status="prototype")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
