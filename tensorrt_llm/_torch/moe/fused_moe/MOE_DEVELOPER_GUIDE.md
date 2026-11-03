@@ -221,6 +221,7 @@ Still on old path (standalone, with embedded communication):
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
+| `per_layer_dynamic_eplb/` | Per-layer dynamic EPLB, created by `maybe_create_moe_load_balancer`: model-level `manager`, per-layer handle `layer`, live-weight `arena`, and HALO-Q/TMA `planner` |
 | `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
 
 ### Backends (`fused_moe/`)
@@ -438,8 +439,10 @@ literal also selects, descend from the CUTLASS family and stay in
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
 
 The exported CuteDSL kernel sources for `TrtllmCutedslMegaMoeNvfp4Impl` live under
-`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, preserving the upstream
-package structure and `KernelClass` entry points. The runner constructs
+`tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/`, a copy of the upstream
+cutedsl_megamoe sources maintained in-tree; update it by copying newer upstream
+code in. `moe/kernels/megamoe_kernels.py` exposes the `KernelClass` entry
+points. The runner constructs
 `ProblemDesc` and `ImplDesc` and dispatches internally; the public backend
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
 kernel when supported, otherwise the generic kernel. During warmup, the
@@ -861,6 +864,75 @@ set wrong has a test that catches it:
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
+  `num_slots` greater than the model expert count. Backend resolution selects
+  `MEGAMOE_CUTEDSL` when no concrete backend is requested and rejects an
+  incompatible explicit backend before model construction.
+- Per-layer dynamic EPLB requires `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA context
+  initialization. TensorRT-LLM applies the setting before `TorchLlmArgs`
+  validation and CUDA initialization/device probes, and propagates it to MPI,
+  direct, and Ray workers. Applications that initialize CUDA before TensorRT-LLM
+  must set it at process startup.
+- HALO-Q and the in-switch TMA copy run as one kernel on the higher-priority
+  copy stream, one CTA per auxiliary SM. Each CTA raises a device route epoch
+  once its routes are written. The main stream may enqueue shared-expert work
+  and input quantization before its first routed-expert use, where a stream
+  memory wait on that epoch orders it after the routes. Each layer binds one
+  main stream, the executor's execution stream, on which warmup and serving
+  submit from their own threads; the path does not require a CUDA green
+  context or a steady-state host wait.
+- HALO-Q waits for every EP rank inside the kernel and traps once a peer is
+  later than its spin bound. Each launch passes the bound, which
+  `SchedulerSpinBound` takes from the MoE communication timeout guard: the
+  warmup timeout during warmup and AutoTuner profiling, the native bound
+  otherwise.
+- `helper_slot_mode=per_layer_resident` gives each layer its own helper-slot
+  set, and the copy keeps a per-layer table of the expert each helper slot
+  holds so that it skips experts a whole team already holds. Any other writer
+  of those helper rows would invalidate the table.
+- HALO-Q and TMA follow the native-operator path under
+  `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
+  `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
+  contiguous CUDA `int32` route tensor; do not restore route staging, tail
+  fills, or a host-generated copy plan.
+- Rebalance resources are model-scoped. Worker shutdown and construction
+  rollback must release the scheduler, TMA bindings, shared-slot mappings,
+  and fabric allocations collectively. Forward execution must not retain
+  activation tensors after their consumer has been enqueued.
+- Per-layer dynamic EPLB lives in `per_layer_dynamic_eplb/` (`manager`,
+  `layer`, `arena`, `planner`) and reuses the EPLB seams.
+  `maybe_create_moe_load_balancer` builds `PerLayerDynamicMoeLoadBalancer`,
+  which shares the `BaseMoeLoadBalancer` lifecycle with `MoeLoadBalancer`, and
+  `add_layer` returns a `PerLayerDynamicMoeLayerLoadBalancer` with
+  `produces_replica_plan = True`. In every chunk `_load_balancer_route` plans,
+  the backend reads `MoERunContext.replica_plan`, and the post-`run_moe` hook
+  releases the plan. The planner consumes logical routes, so the expert
+  statistics and the layer-wise calibrator record (or replay) them before the
+  route; standard EPLB records the slots after it. When the forward raises,
+  `MoeLoadBalancerIterContext` calls `abort_iter`, which releases the pending
+  plans. Plans run during warmup too, so there is no warmup switch; only the
+  HALO-Q spin bound changes, as described above. Model code passes independent
+  main-stream work such as shared experts through
+  `MoE.load_balancer_overlap(fn)`; the route runs it once, after submitting the
+  copy stream.
+- The quant method owns the seven live kernel planes. Its `create_weights`
+  allocates them from its plane spec through the layer handle's
+  `allocate_arena` and binds them; its `cache_derived_state` checks them and
+  calls the handle's `bind_backend`, which builds the HALO-Q/TMA producer. The
+  backend only declares `supports_per_layer_dynamic_eplb`, uses
+  `compute_slot_count` (H + S, with S from the layer handle) for the planes,
+  symmetric workspace, and launch geometry while `expert_size_per_partition`
+  stays H, and consumes the replica plan, including the SMs its input
+  quantization leaves to the copy kernel. `bind_backend` reads the backend's
+  `ep_process_group` and `max_tokens_per_rank_capacity`.
+- DeepSeek-V4 selects the fused shared FC12 kernel when the routed backend
+  declares per-layer dynamic support, the final projection quantization and
+  hardware (SM100 family) support that kernel, and the model runs eagerly
+  (`cuda_graph_config: null`). Per-layer dynamic EPLB is not a condition, but it
+  requires eager mode, so an EPLB-off baseline runs the same shared kernel only
+  with `cuda_graph_config: null`. Other runs keep the model's existing shared-MLP
+  backend. With per-layer dynamic EPLB, the active configuration supplies the
+  fused kernel an SM budget that leaves the copy kernel its auxiliary SMs.
 
 ## Canonical Examples
 
@@ -982,7 +1054,7 @@ their real class name.
 - **Do NOT set a communication kernel's timeout directly or through environment variables at runtime** — A backend whose kernels wait for peers under a timeout registers a `MoECommTimeoutProxy` with the timeout guard when it is constructed and unregisters it before releasing what the proxy controls; only the guard decides the value (see [Communication timeouts](#communication-timeouts)). Writing environment variables at runtime races with NCCL threads that read them
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
-- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the 10-field tactic pattern (with legacy 8-field compatibility) (mma_tiler/cluster_shape as `list[int]`, `epi_flag_batch` as a nested `(int, int)` tuple, the rest as `bool`/`int`/`str`; `_unpack_tactic` is the single source of truth for the field order). The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
+- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the canonical 11-field tactic pattern (with legacy 10- and 8-field compatibility), including token-back READY granularity; `_unpack_tactic` is the single source of truth for field order and compatibility defaults. The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
 - **Use `distributed_tuning_strategy=DistributedTuningStrategy.MERGE` on a multi-rank `FUSED_COMM` backend's `TuningConfig`** — Every EP rank must converge on the same compiled tactic for every chunk, otherwise the in-kernel NVLink dispatch barrier deadlocks. `PARALLEL` can profile different tactics on different ranks and is unsafe for fused collectives. Reference: `Sm100MegaMoENvfp4Runner.get_tuning_config`.
 
 ### CUTLASS eager scratch reclamation

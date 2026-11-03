@@ -40,6 +40,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEEligibility,
     MoEProblem,
     MoERejectReason,
+    PreroutedRouting,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
@@ -683,6 +684,7 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool] = None,
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        prerouted: Optional[PreroutedRouting] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -699,6 +701,10 @@ class ConfigurableMoE(MoE):
 
         ``input_ready_event``: ``x`` is written on another stream; the join is
         deferred to the first kernel that reads ``x``, so routing overlaps it.
+
+        ``prerouted``: the tokens' routing, computed by the caller for a backend
+        that declares ``supports_prerouted_routing`` (one chunk, no
+        communication).
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -730,6 +736,7 @@ class ConfigurableMoE(MoE):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            prerouted=prerouted,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

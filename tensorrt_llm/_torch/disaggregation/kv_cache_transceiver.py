@@ -419,6 +419,21 @@ class KvCacheTransceiver(ABC):
         """Return True when in-flight transfers can be cancelled safely."""
         return False
 
+    def supports_idle_request_cancellation(self,
+                                           req: Optional[LlmRequest] = None
+                                           ) -> bool:
+        """Whether cancellation may progress before a model batch.
+
+        Args:
+            req: An executor-selected model-idle request, or None to query
+                support for removing queued, not-yet-activated requests.
+
+        Returns:
+            Eligibility only, not retirement proof. For activated requests,
+            cancel_request must still confirm that resources can be released.
+        """
+        return False
+
     def has_poisoned_transfer_buffer(self) -> bool:
         """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False
@@ -443,6 +458,9 @@ class KvCacheTransceiver(ABC):
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report how many admitted receives the caller has not started yet. No-op by default."""
 
     def get_data_transceiver_state(self) -> bytes:
         """Get the serialized DataTransceiverState (CacheState + CommState)."""
@@ -524,11 +542,11 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
                     f"RNN state transfer enabled: rnn_layer_num_per_pp={rnn_layer_num_per_pp_rank}"
                 )
 
-        if (cache_transceiver_config.kv_cache_bounce_size_mb > 0
-                or cache_transceiver_config.agent_bounce_buffer_enable):
+        if cache_transceiver_config.kv_cache_bounce_size_mb > 0:
             logger.warning(
-                "bounce is only supported by the Python (v2) transceiver; "
-                "ignored on the C++ transceiver path")
+                "kv_cache_bounce_size_mb (the transfer-agent bounce buffer) is only supported by "
+                "the Python (v2) transceiver; ignored on the C++ transceiver path"
+            )
 
         self.impl = CacheTransceiverCpp(
             kv_cache_manager.impl, total_num_kv_heads_per_layer, head_dim,
