@@ -401,6 +401,12 @@ class ShortestPrefillFirstOrder:
     the context state, including passes in which the batch fills up before the
     scheduler reaches it.
 
+    ``max_age_passes`` N > 0 adds a bound the waiting clock cannot give: a
+    request that reached the context state N or more passes ago counts as aged
+    too, however much leftover budget it has been given since. A long cold
+    prompt that shorter requests keep to a trickle of tokens therefore reaches
+    its first token at most N passes plus its own prefill after it arrived.
+
     The reordering may try a request that has not started prefilling ahead of
     one that has. The scheduler therefore never lets the former preempt the
     latter for KV pages: arrival order would have scheduled, and protected,
@@ -410,10 +416,12 @@ class ShortestPrefillFirstOrder:
     per request and only when there is something to reorder.
     """
 
-    def __init__(self, max_wait_passes: int):
+    def __init__(self, max_wait_passes: int, max_age_passes: int = 0):
         self.max_wait_passes = max_wait_passes
+        self.max_age_passes = max_age_passes
         self._pass = 0
         self._waiting_since: dict[int, int] = {}
+        self._arrived_at: dict[int, int] = {}
         self._uncached_estimate: dict[int, int] = {}
 
     def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
@@ -454,9 +462,11 @@ class ShortestPrefillFirstOrder:
         }
         for request_id in [rid for rid in self._waiting_since if rid not in waiting_ids]:
             del self._waiting_since[request_id]
+            self._arrived_at.pop(request_id, None)
             self._uncached_estimate.pop(request_id, None)
         for request_id in waiting_ids:
             self._waiting_since.setdefault(request_id, self._pass)
+            self._arrived_at.setdefault(request_id, self._pass)
         context_reqs = [r for r in pending_ctx if r.state_value == context_init_state_value]
         if not reorder or len(context_reqs) < 2:
             return pending_ctx
@@ -464,7 +474,10 @@ class ShortestPrefillFirstOrder:
         def admission_key(item):
             arrival, req = item
             waited = self._pass - self._waiting_since[req.py_request_id]
-            if waited >= self.max_wait_passes:
+            if waited >= self.max_wait_passes or (
+                self.max_age_passes > 0
+                and self._pass - self._arrived_at[req.py_request_id] >= self.max_age_passes
+            ):
                 return (0, 0, arrival)
             return (1, self._uncached_tokens(req, kv_cache_manager), arrival)
 
@@ -610,7 +623,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._shortest_prefill_first = None
         if os.environ.get("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "0") == "1":
             self._shortest_prefill_first = ShortestPrefillFirstOrder(
-                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128)
+                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128),
+                max_age_passes=_read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_AGE_PASSES", 0),
             )
         self._context_admission_stats: Counter = Counter()
 
@@ -645,7 +659,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "shortest_prefill_first="
                 f"{self._shortest_prefill_first is not None}"
                 + (
-                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes})"
+                    f" (max_wait_passes={self._shortest_prefill_first.max_wait_passes}, "
+                    f"max_age_passes={self._shortest_prefill_first.max_age_passes})"
                     if self._shortest_prefill_first is not None
                     else ""
                 )
