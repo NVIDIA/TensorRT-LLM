@@ -52,7 +52,8 @@ namespace kernels::kimiK3AttnRes
 //!
 //! smReserve SMs are left out of the grid: a kernel resident for the whole
 //! step (the DWDP weight gather) holds them, and CTAs that landed there would
-//! run as a second, mostly idle wave. It is clamped to [0, SM count - 1].
+//! run as a second, mostly idle wave. attn_res_add_rmsnorm_persistent_fwd
+//! rejects values outside [0, SM count); this launcher clamps to that range.
 void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, int smReserve, cudaStream_t stream);
 
 //! True when B, H, N, T >= 1, the required tensors and the aliasing rule above
