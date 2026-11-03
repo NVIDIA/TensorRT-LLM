@@ -332,6 +332,13 @@
 # top_k (still topk-devs, below), and the test followed it out of thop/. Attention
 # keeps the test because Attention is its primary consumer. See PR #19275.
 /tests/unittest/_torch/kernels/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
+# Kernel tests co-owned by the kernels and Attention teams.
+/tests/unittest/_torch/kernels/parallel/test_kda_decode.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/serial/test_sparse_kv_cache_compact.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
