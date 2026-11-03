@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
+    _insert_draft_pool_ratio,
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization import QuantAlgo
@@ -223,6 +224,29 @@ def test_append_draft_layers_rejects_other_layouts(specs, match):
         MambaHybridCacheManagerV2._append_draft_layers(
             specs, [True, False, True, False], [False, True, False, True], 1, k_only=True
         )
+
+
+def test_draft_pool_ratio_holds_the_scarcest_target_token_capacity():
+    # Lifecycles in registration order: recurrent state, FP4 MLA, FP8 MLA,
+    # draft, HP ring.
+    block_bytes = [1000, 400, 50, 300, 50]
+    full_history = [False, True, True, True, False]
+    target_ratio = [0.45, 0.4, 0.1, 0.05]
+
+    ratio = _insert_draft_pool_ratio(target_ratio, block_bytes, full_history, 3)
+
+    assert sum(ratio) == pytest.approx(1.0)
+    # Blocks per lifecycle are proportional to share / block bytes; the FP4
+    # lifecycle is the scarcer full-history one (0.4/400 < 0.1/50).
+    assert ratio[3] / block_bytes[3] == pytest.approx(ratio[1] / block_bytes[1])
+    assert [ratio[i] for i in (0, 1, 2, 4)] == pytest.approx(
+        [share * (1 - ratio[3]) for share in target_ratio]
+    )
+
+
+def test_draft_pool_ratio_needs_one_share_per_target_lifecycle():
+    with pytest.raises(ValueError, match="2 entries for 3 target layer groups"):
+        _insert_draft_pool_ratio([0.5, 0.5], [1, 1, 1, 1], [True] * 4, 1)
 
 
 def test_base_manager_hooks_read_appended_draft_specs():

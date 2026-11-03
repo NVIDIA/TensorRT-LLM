@@ -65,6 +65,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -110,6 +111,39 @@ GB = 1 << 30
 # allocated after the pools, outside the GPU cache quota.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+
+
+def _insert_draft_pool_ratio(
+    target_ratio: Sequence[float],
+    life_cycle_block_bytes: Sequence[int],
+    full_history: Sequence[bool],
+    draft_life_cycle: int,
+) -> List[float]:
+    """Pool ratio per lifecycle with the drafter's share inserted.
+
+    ``target_ratio`` lists the other lifecycles' shares in registration order.
+    The drafter keeps one context entry per target token, so its share is
+    solved for as many blocks as the scarcest full-history target lifecycle
+    holds: ``d / B_draft == (1 - d) * min_i(r_i / B_i)``. The target shares
+    keep their split of ``1 - d``.
+    """
+    target_ids = [i for i in range(len(life_cycle_block_bytes)) if i != draft_life_cycle]
+    if len(target_ratio) != len(target_ids):
+        raise ValueError(
+            f"pool_ratio has {len(target_ratio)} entries for {len(target_ids)} target layer groups"
+        )
+    blocks_per_byte = [
+        ratio / life_cycle_block_bytes[i]
+        for ratio, i in zip(target_ratio, target_ids)
+        if full_history[i]
+    ]
+    if not blocks_per_byte:
+        raise ValueError("the drafter's pool share needs a full-history target layer group")
+    draft_blocks = life_cycle_block_bytes[draft_life_cycle] * min(blocks_per_byte)
+    draft_share = draft_blocks / (1 + draft_blocks)
+    ratio = [share * (1 - draft_share) for share in target_ratio]
+    ratio.insert(draft_life_cycle, draft_share)
+    return ratio
 
 
 class InforwardSnapshotEntry(NamedTuple):
@@ -967,7 +1001,61 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             # Adds the FP4 MLA HP-ring virtual layers and the fallback-layer
             # lifecycle; SSM layers are left unchanged.
             result = layout_policy._build_cache_config(self, result)
-        return result
+        return self._with_draft_pool_ratio(result)
+
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Give appended draft layers of their own lifecycle a pool share.
+
+        A configured ``pool_ratio`` lists the target's lifecycles; the draft
+        lifecycle's share is inserted for token parity (see
+        ``_insert_draft_pool_ratio``). Native lifecycles are registered in
+        layer and buffer order.
+        """
+        ratio = config.initial_pool_ratio
+        if ratio is None or not self._appended_draft_layer_specs:
+            return config
+        keys: List[tuple] = []
+        block_bytes: List[int] = []
+        draft_keys = set()
+        target_keys = set()
+        for layer in config.layers:
+            # Empty buffers are dropped before the native manager sees them.
+            for buffer in (buffer for buffer in layer.buffers if buffer.size):
+                policy = (
+                    buffer.reuse_policy if buffer.reuse_policy is not None else layer.reuse_policy
+                )
+                if isinstance(layer, SsmLayerConfig):
+                    key = ("ssm", policy)
+                else:
+                    life_cycle = AttnLifeCycle.make(
+                        layer.sliding_window_size,
+                        layer.num_sink_tokens,
+                        config.tokens_per_block,
+                        policy,
+                    )
+                    key = (life_cycle.window_size, life_cycle.num_sink_blocks, policy)
+                if key not in keys:
+                    keys.append(key)
+                    block_bytes.append(0)
+                block_bytes[keys.index(key)] += buffer.size
+                is_draft = int(layer.layer_id) in self._appended_draft_layer_specs
+                (draft_keys if is_draft else target_keys).add(key)
+        if len(ratio) == len(keys):
+            return config
+        if len(draft_keys) != 1 or draft_keys & target_keys or len(ratio) != len(keys) - 1:
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
+                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)})"
+            )
+        full_history = [
+            key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
+        ]
+        return replace(
+            config,
+            initial_pool_ratio=_insert_draft_pool_ratio(
+                ratio, block_bytes, full_history, keys.index(draft_keys.pop())
+            ),
+        )
 
     def _setup_state_pool(self) -> None:
         """Resolve logical slots, bind base views, then initialize model state."""
