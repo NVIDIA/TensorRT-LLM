@@ -3332,6 +3332,35 @@ class OpenAIServer(_VideoRoutesMixin):
             return self.create_error_response(message=str(e),
                                               err_type="internal_error")
 
+    def _responses_prompt_tokens_excluded_from_usage(
+            self, request: ResponsesRequest) -> int:
+        """Trailing rendered prompt tokens the usage of ``request`` leaves out.
+
+        Off the Harmony path this route renders its input as the chat route
+        renders a chat request with a generation prompt and no request-level
+        template, so the model's serving extension decides for that chat
+        request and both routes report the same prompt usage for the same
+        prompt (kimi_k3 leaves out its generation channel opener). As on the
+        chat route, a server-level chat template may end the prompt
+        differently, so such prompts are reported unadjusted.
+        """
+        if self.use_harmony or self.chat_template is not None:
+            return 0
+        # A generation-only handoff runs the prompt the context worker relayed
+        # instead of rendering one: to the extension, a pre-tokenized request.
+        params = request.disaggregated_params
+        relayed = params is not None and params.request_type == "generation_only"
+        rendered_as = ChatCompletionRequest.model_construct(
+            model=request.model,
+            messages=[],
+            add_generation_prompt=True,
+            prompt_token_ids=request.prompt_token_ids if relayed else None,
+            prompt_token_ids_b64=request.prompt_token_ids_b64
+            if relayed else None,
+        )
+        extension = RenderResources.from_server(self).extension
+        return extension.prompt_tokens_excluded_from_usage(rendered_as)
+
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
         """Serve one /v1/responses request, streaming or not.
@@ -3361,7 +3390,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     use_harmony=self.use_harmony,
                     reasoning_parser=args.reasoning_parser,
                     tool_parser=args.tool_parser,
-                    num_prompt_tokens=args.num_prompt_tokens,
+                    num_prompt_tokens=args.usage_num_prompt_tokens(),
                     tokenizer=self.tokenizer,
                 )
             # A postprocessing worker's result has no prompt token ids, and the
@@ -3510,6 +3539,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 tool_parser=self.tool_parser,
                 streaming_processor=streaming_processor,
             )
+            postproc_args.num_prompt_tokens_offset = (
+                self._responses_prompt_tokens_excluded_from_usage(request))
             postproc_params = PostprocParams(
                 post_processor=responses_api_streaming_post_processor
                 if request.stream else responses_api_post_processor,

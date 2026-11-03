@@ -1076,6 +1076,16 @@ class ResponsesAPIPostprocArgs(PostprocArgs):
     tool_parser: Optional[str] = None
     streaming_processor: Optional[ResponsesStreamingProcessor] = None
 
+    def usage_num_prompt_tokens(self) -> Optional[int]:
+        """The prompt length usage reports, counted as on the chat route.
+
+        The recorded prompt length less ``num_prompt_tokens_offset``, or
+        ``None`` while no length is recorded.
+        """
+        if self.num_prompt_tokens is None:
+            return None
+        return self.num_prompt_tokens - self.num_prompt_tokens_offset
+
 
 @nvtx_range_debug("responses_api_post_processor")
 def responses_api_post_processor(
@@ -1089,7 +1099,7 @@ def responses_api_post_processor(
         use_harmony=args.use_harmony,
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
-        num_prompt_tokens=args.num_prompt_tokens,
+        num_prompt_tokens=args.usage_num_prompt_tokens(),
         tokenizer=args.tokenizer,
     )
 
@@ -1104,5 +1114,5 @@ def responses_api_streaming_post_processor(
     if rsp._done:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
-                rsp, args.num_prompt_tokens, tokenizer=args.tokenizer))
+                rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))
     return outputs

@@ -95,7 +95,13 @@ class ServingExtension:
         return []
 
     def prompt_tokens_excluded_from_usage(self, request: "ChatCompletionRequest") -> int:
-        """Number of trailing rendered prompt tokens not reported as prompt usage."""
+        """Number of trailing rendered prompt tokens not reported as prompt usage.
+
+        The Responses route asks too, with the chat request its input renders
+        as: a generation prompt, no request-level template, no messages, and
+        on a generation-only handoff the relayed prompt ids. Decide from how
+        the prompt is rendered, not from the conversation.
+        """
         return 0
 
     def apply_chat_extensions(self, request) -> None:
