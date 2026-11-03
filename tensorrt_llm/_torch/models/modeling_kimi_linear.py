@@ -541,6 +541,7 @@ def _attn_res_decode_kernel(
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
     mxfp8: bool = False,
+    snapshots_after_wait: bool = False,
 ) -> Optional[Tuple[Optional[torch.Tensor], ...]]:
     """``(updated prefix sum or None, normed mix)`` from the decode attention-residual kernel
     (``kimi_k3_attn_res``: PDL prologue, cluster per token) where ``_attn_res_kernel`` picks it,
@@ -549,6 +550,8 @@ def _attn_res_decode_kernel(
     ``addends``: ``()``; ``(addend,)`` for ``layer + addend``; ``(routed, shared)`` for the MoE
     residual update ``layer + bf16(routed + shared)``. With ``mxfp8`` (MoE residual update only)
     the result also holds the MXFP8 form ``(activation, scale)`` of the normed mix.
+    ``snapshots_after_wait`` (no addends only): ``block_residual`` was written by the kernel
+    launched immediately before, so the kernel reads it after its PDL wait.
     """
     num_candidates = int(block_residual.shape[0]) + 1
     if _attn_res_kernel(layer, num_candidates) is not _AttnResKernel.DECODE:
@@ -561,10 +564,12 @@ def _attn_res_decode_kernel(
     _note_attn_res_fusion(f"attn_res+norm/decode/add{len(addends)}", True, M, H, num_candidates)
     eps, out_eps = float(norm.eps), _rms_norm_eps(output_norm)
     if not addends:
-        output = torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(
-            layer, block_residual, *weights, eps, out_eps
+        normed = torch.ops.trtllm.kimi_k3_attn_res_rmsnorm(
+            layer, block_residual, *weights, eps, out_eps, snapshots_after_wait
         )
-        return None, output
+        return None, normed
+    if snapshots_after_wait:
+        raise ValueError("snapshots_after_wait is only implemented for the mix without addends")
     if len(addends) == 1:
         return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm(
             layer, addends[0], block_residual, *weights, eps, out_eps
@@ -627,12 +632,22 @@ def _apply_attn_res_rmsnorm_fused(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    snapshots_after_wait: bool = False,
 ) -> Optional[torch.Tensor]:
     """Fuse attention-residual mixing with its immediately following norm, on the kernel
-    ``_attn_res_kernel`` picks; None where it picks none."""
+    ``_attn_res_kernel`` picks; None where it picks none. ``snapshots_after_wait``: see
+    ``_attn_res_decode_kernel``."""
     kernel = _attn_res_kernel(prefix_sum, int(block_residual.shape[0]) + 1)
     if kernel is _AttnResKernel.DECODE:
-        return _attn_res_decode_kernel(prefix_sum, (), block_residual, proj, norm, output_norm)[1]
+        return _attn_res_decode_kernel(
+            prefix_sum,
+            (),
+            block_residual,
+            proj,
+            norm,
+            output_norm,
+            snapshots_after_wait=snapshots_after_wait,
+        )[1]
     if kernel is _AttnResKernel.PERSISTENT:
         return _attn_res_persistent_kernel(
             prefix_sum, None, block_residual, proj, norm, output_norm
@@ -704,10 +719,17 @@ def _apply_attn_res_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    snapshots_after_wait: bool = False,
 ) -> torch.Tensor:
-    """Apply attention-residual selection and the next RMSNorm."""
+    """Apply attention-residual selection and the next RMSNorm.
+
+    ``snapshots_after_wait``: ``block_residual`` was written by the kernel launched immediately
+    before this call (``_attn_res_decode_kernel``).
+    """
     if _FUSED_ATTN_RES_ENABLED:
-        fused = _apply_attn_res_rmsnorm_fused(prefix_sum, block_residual, proj, norm, output_norm)
+        fused = _apply_attn_res_rmsnorm_fused(
+            prefix_sum, block_residual, proj, norm, output_norm, snapshots_after_wait
+        )
         if fused is not None:
             return fused
     return output_norm(_apply_attn_res(prefix_sum, block_residual, proj, norm))
@@ -2317,6 +2339,7 @@ class KimiLinearDecoderLayer(nn.Module):
         capture: Optional[Tuple[Any, int]] = None,
         helix_a2a: Optional[KimiK3HelixA2A] = None,
         defer_moe_residual: bool = False,
+        fresh_block_residual: bool = False,
     ) -> Tuple[torch.Tensor | _DeferredMoEResidual, int]:
         """Port of HF ``KimiDecoderLayer._forward_attn_residual`` (per token).
 
@@ -2340,6 +2363,10 @@ class KimiLinearDecoderLayer(nn.Module):
 
         On a ``token_sliced`` layer M is this rank's chunk of the batch and
         ``helix_a2a`` moves rows between that chunk and the full batch.
+
+        ``fresh_block_residual``: the last kernel launched before this layer wrote
+        ``block_residual`` (the helix_a2a row scatter ahead of the first token-sliced
+        layer), so the pre-attention mix reads the snapshots only after its PDL wait.
         """
         sliced = helix_a2a if self.token_sliced else None
         num_tokens = attn_metadata.num_tokens if sliced is not None else None
@@ -2403,6 +2430,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.input_layernorm,
+                snapshots_after_wait=fresh_block_residual,
             )
         else:
             hidden_states = self.input_layernorm(hidden_states)
@@ -2615,6 +2643,8 @@ class KimiLinearModel(DecoderModel):
                 capture=capture,
                 helix_a2a=self.helix_a2a,
                 defer_moe_residual=i + 1 < len(self.layers),
+                # The bank scatter above is the last kernel before this layer's first mix.
+                fresh_block_residual=i == self.helix_a2a_first_layer,
             )
         sliced = self.helix_a2a is not None
 

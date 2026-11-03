@@ -402,6 +402,7 @@ def test_capture_taps_the_next_layers_aggregated_stream():
             capture,
             helix_a2a=None,
             defer_moe_residual=False,
+            fresh_block_residual=False,
         ):
             # What the real layer computes on the way into its attention, and
             # hands to the tap: the aggregated stream the previous layer's
@@ -575,6 +576,7 @@ def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
             capture,
             helix_a2a=None,
             defer_moe_residual=False,
+            fresh_block_residual=False,
         ):
             block_residual[num_snapshots] = hidden_states * (self.layer_idx + 1)
             return hidden_states + (self.layer_idx + 1), num_snapshots + 1
