@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     PREFILL_MAX_ROWS,
     PrefillSplitHandle,
     build_prefill,
+    project_unsplit,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
     compile as compile_handle,
@@ -74,6 +75,24 @@ def test_certified_cells(cell) -> None:
         got = op(x, weight, key, head_weights, compiled)
     assert got[0] is key and got[1] is head_weights, "the op writes both buffers and returns them"
     _compare(key, head_weights, *op.reference(x, weight, key, head_weights, compiled))
+
+
+@pytest.mark.parametrize("rows", [65, 129, 1099, 4097, 8192])
+def test_unsplit_columns_are_the_split_outputs_bitwise(rows) -> None:
+    """`project_unsplit` (the served context path, `TRTLLM_GLM52_CTX_IX_NOSPLIT=1`): its key
+    columns rounded to bf16 are the split's keys and its head-weight columns the split's head
+    weights, bit for bit. With the K write's and q side's own pitch-160 tests this pins the
+    unsplit path to the split one end to end."""
+    x, weight, key, head_weights = _build(rows, zlib.crc32(f"unsplit {rows}".encode()) % 2**31)
+    handle = build_prefill(weight)
+    op(x, weight, key, head_weights, handle)
+    kb, wq = project_unsplit(x, weight, handle)
+    torch.cuda.synchronize()
+    assert kb.dtype == torch.float32 and kb.stride() == (KEY + HEADS, 1)
+    assert wq.stride() == (KEY + HEADS, 1) and wq.data_ptr() == kb.data_ptr() + KEY * 4
+    assert bool(torch.isfinite(key.float()).all()), "a key was not written"
+    assert torch.equal(kb.to(torch.bfloat16).view(torch.int16), key.view(torch.int16))
+    assert torch.equal(wq.contiguous().view(torch.int32), head_weights.view(torch.int32))
 
 
 def test_a_handle_refuses_another_row_count() -> None:

@@ -32,15 +32,7 @@ from . import _swapped_dense_gemm_persistent as _swappeddensegemmpersistent
 from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
 
 GemmSchedule = _swappeddensegemmpersistent.GemmSchedule
-try:
-    from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
-except ImportError:
-    from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
 WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
-try:
-    from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
-except ImportError:
-    from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
 Mxf8SideOutput = _kbbmm.Mxf8SideOutput
 BatchedGemmAbi = _kbbmm.BatchedGemmAbi
 make_persistent_build = _kbbmm.make_build

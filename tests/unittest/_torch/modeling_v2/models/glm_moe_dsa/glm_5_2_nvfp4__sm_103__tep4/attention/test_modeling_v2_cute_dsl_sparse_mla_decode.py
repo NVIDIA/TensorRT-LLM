@@ -237,69 +237,6 @@ def test_a_batch_above_the_handle_raises_rather_than_compiling() -> None:
         op(**args, compiled=small)
 
 
-#: (spec, forced split, forced reducer): the V-reuse kernel the handle builds against the base
-#: kernel on the same specialization, one per reducer kind the handle reaches: the single CTA
-#: (256 sequences, lengths crossing top_k), split-K 2 with the cluster reducer, the widest
-#: clustered split (2 sequences), and the global-memory reducer.
-_WIDE_SAME = {
-    "mtp1_b256_single": (
-        dict(
-            p=2,
-            lens=[2049, 2048, 2047, 2] + [3 + (347 * i) % 2600 for i in range(252)],
-            index_kind="base_with_layer_offset",
-            layer=1,
-        ),
-        1,
-        False,
-    ),
-    "mtp1_b32_split2": (
-        dict(p=2, lens=[5 + (389 * i) % 4100 for i in range(32)], index_kind="global", layer=2),
-        2,
-        False,
-    ),
-    "mtp1_b2_pick": (dict(p=2, lens=[3000, 700], index_kind="global", layer=0), None, None),
-    "mtp1_gmem4": (dict(p=2, gmem_split=4, index_kind="global", layer=1), None, None),
-}
-
-
-@pytest.mark.parametrize("name", list(_WIDE_SAME))
-def test_wide_kernel_is_bitwise_the_base_kernel(name) -> None:
-    """The handle's kernel reads V from the K slots the base kernel gathers it into a second
-    time: the same fp8 bytes into the same MMAs, so every specialization the handle builds
-    writes the base kernel's bytes."""
-    raw, ctas, gmem = _WIDE_SAME[name]
-    spec = _resolve(raw)
-    if spec is None:
-        pytest.skip("no batch selects that reducer on this device")
-    args, _ = _build(spec, 23)
-    outs = []
-    for module in (entry._kernel, entry._wide_kernel):
-        out = torch.full_like(args["output"], float("nan"))
-        runner = module.prepare_runner(
-            args["quant_q_buffer"],
-            args["kv_pool_view"],
-            args["sparse_attn_indices"],
-            out,
-            args["cu_q_seqlens"],
-            args["sequence_length"],
-            mla_bmm1_scale=args["mla_bmm1_scale"],
-            mla_bmm2_scale=args["mla_bmm2_scale"],
-            all_sparse_indices_valid=False,
-            max_sq=spec["p"],
-            num_ctas_kv=ctas,
-            use_gmem_reduction=gmem,
-            index_kind=spec["index_kind"],
-            local_layer_idx=args["local_layer_idx"],
-        )
-        runner()
-        torch.cuda.synchronize()
-        outs.append((out, runner.specialization))
-    (base, base_spec), (wide, wide_spec) = outs
-    assert base_spec == wide_spec
-    assert bool(torch.isfinite(base).all()) and float(base.float().abs().amax()) > 0.0
-    assert torch.equal(base.view(torch.int16), wide.view(torch.int16))
-
-
 def _handle() -> "entry.CompiledSparseMlaDecode":
     """A handle with no kernels: `is_valid` reads only its `max_sq`."""
     return entry.CompiledSparseMlaDecode(

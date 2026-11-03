@@ -187,6 +187,32 @@ class CuteDslMhaPrefill(OpWrapper):
             why="MXF8-O: cached prefixes, and generation rows after the context rows",
             spec=dict(new=[64, 300, 1], cached=[17, 64, 300], fp8=True, q8=True, tail=16),
         ),
+        # The served handles (`kv_strided`): K and V are the two halves of the one-launch
+        # expansion's `[T_k, 8192]` rows (`cute_dsl_projection_mxf8` `kv_b_kv8`). The test
+        # also pins each to the packed handle on the same K / V made contiguous, bitwise.
+        Cell(
+            why="kv_strided MXF8-O: one request of 513 rows, the first context row count",
+            spec=dict(new=[513], cached=[0], fp8=True, q8=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided MXF8-O: 7340 rows in eight requests, one shorter, no prefix",
+            spec=dict(new=[987] * 7 + [431], cached=[0] * 8, fp8=True, q8=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided MXF8-O: eight 1024-row requests over 1032-row cached prefixes "
+            "(16448 K/V rows), and generation rows after the context rows",
+            spec=dict(
+                new=[1024] * 8, cached=[1032] * 8, fp8=True, q8=True, kv_strided=True, tail=16
+            ),
+        ),
+        Cell(
+            why="kv_strided bf16 O: four requests of 1032 rows",
+            spec=dict(new=[1032] * 4, cached=[0] * 4, fp8=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided bf16 O: cached prefixes of 17, 64 and 300 rows",
+            spec=dict(new=[64, 300, 1], cached=[17, 64, 300], fp8=True, kv_strided=True),
+        ),
     )
 
     note = """

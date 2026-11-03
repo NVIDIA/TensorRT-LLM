@@ -50,7 +50,6 @@ from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _US
 from ...kernels.moe import moe_fc1_kblock as _fc1_kblock
 from ...kernels.moe import moe_gather_grouped_gemm_act_fusion as _gg1
 from ...kernels.moe import moe_grouped_gemm_finalize_fusion as _gg2
-from ...kernels.moe import moe_grouped_gemm_finalize_fusion_dyn as _gg2_dyn
 from ...kernels.moe import moe_prefill_nvfp4_pair as _pair
 from ...kernels.moe.moe_utils import cute_tensor_from_torch as _ctf
 from .cute_dsl_moe_routing import LOCAL_EXPERTS, TILE, TOP_K, allocate_maps, max_tiles
@@ -312,6 +311,11 @@ def _fc2(
         epi_subtile_n,
         raster_along_m,
         num_sms,
+        # The static schedule: the counter pointer is not read.
+        cutlass.Int64(0),
+        False,
+        128,
+        0,
         stream,
         b_kblock,
     )
@@ -361,7 +365,7 @@ def _fc2_dyn(
     ab_stage_cap: cutlass.Constexpr,
     b_kblock: cutlass.Constexpr,
 ):
-    """`_fc2` on the copy with dynamic tile assignment: after its first tile by CTA index,
+    """`_fc2` with dynamic tile assignment (`dynamic_sched`): after its first tile by CTA index,
     each persistent CTA takes the next tile from the two-word counter at `dyn_ptr` (zero
     before the first launch, reset by every launch's last CTA), so the SMs that get more
     DRAM service take more tiles. Same operands as `_fc2`."""
@@ -392,7 +396,7 @@ def _fc2_dyn(
             ),
         ),
     )
-    _gg2_dyn.host_function(
+    _gg2.host_function(
         a,
         b,
         sfa,

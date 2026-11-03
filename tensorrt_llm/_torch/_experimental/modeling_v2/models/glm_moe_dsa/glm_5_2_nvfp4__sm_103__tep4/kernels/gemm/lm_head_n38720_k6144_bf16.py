@@ -13,6 +13,18 @@ weight-read bound: each instance moves the 476 MB shard once, at the same
 76-85 us as cuBLAS. The swapped orientation writes the logical
 ``[38720, M]`` product through a column-major epilogue into the row-major
 ``[M, 38720]`` output.
+
+Why the target owns this GEMM rather than calling ``catalog/gemm/cublas_mm``: at decode
+M the two run at the same speed, so the reason is the bits. Each M here has one fixed
+schedule (tile, cluster, orientation, K order) in this tree; cuBLASLt picks its own
+algorithm (tile and K split, hence the fp32 summation order) per shape, heuristic and
+library version, so its bf16 logits can differ from these in the last bit. Those bits
+decide the greedy tokens, and the target's served outputs, its accuracy and MTP
+acceptance gates and the bitwise checks against them were taken on this kernel. Moving
+to cuBLAS is therefore a numerics change to be gated on its own, not a drop-in
+replacement. The stock model's
+``LMHead`` does not call ``cublas_mm`` either (``UnquantizedLinearMethod`` uses it only
+with ``use_custom_cublas_mm``).
 """
 
 from ._projection_module_dispatch import ProjectionAbi, make_build, persistent_instance

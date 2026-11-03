@@ -5326,7 +5326,7 @@ def _compile_twoshot_common(
     cutlass.cuda.initialize_cuda_context(device_id)
     if emit_mxf8 and (emit_nvfp4 or not _TWOSHOT_PUSH or n % 128 != 0):
         raise ValueError(
-            "the MXF8-out two-shot is the push variant (GLM_TWOSHOT_PUSH=1), n % 128 == 0, "
+            "the MXF8-out two-shot is the push variant (module constant _TWOSHOT_PUSH = 1), n % 128 == 0, "
             f"and excludes NVFP4; got push={_TWOSHOT_PUSH} n={n} nvfp4={emit_nvfp4}"
         )
     if threads_per_block not in _TWOSHOT_THREADS_PER_BLOCK_CHOICES:

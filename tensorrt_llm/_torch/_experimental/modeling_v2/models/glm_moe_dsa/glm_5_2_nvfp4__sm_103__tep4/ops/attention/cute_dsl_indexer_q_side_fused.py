@@ -87,13 +87,30 @@ class CuteDslIndexerQSideFused(OpWrapper):
             why="an odd row count with long-context positions near the table end",
             spec=dict(tokens=300, positions="tail", max_pos=131072, is_neox=False),
         ),
+        # The served context path (`build(wq_pitch=160)`): `wq` is the head-weight columns
+        # 128..159 of the indexer projection's fp32 `[T, 160]` output, read in place.
+        Cell(
+            why="wq at pitch 160, 65 rows: the first context row count",
+            spec=dict(tokens=65, positions="arange", max_pos=8192, is_neox=False, wq_pitch=160),
+        ),
+        Cell(
+            why="wq at pitch 160, a 3001-row context chunk at long-context positions",
+            spec=dict(tokens=3001, positions="tail", max_pos=131072, is_neox=False, wq_pitch=160),
+        ),
+        Cell(
+            why="wq at pitch 160, max_num_tokens: 8192 rows, positions 0..8191",
+            spec=dict(tokens=8192, positions="arange", max_pos=8192, is_neox=False, wq_pitch=160),
+        ),
     )
 
     note = """
     `build(device_id, is_neox=...)` compiles the launcher once; the target calls
     it at load and passes the result as `compiled`. Row count is a runtime
     value, so one launcher serves decode and prefill and there is no stock-op
-    fallback at the call site.
+    fallback at the call site. With `TRTLLM_GLM52_CTX_IX_NOSPLIT=1` (the default)
+    the target also builds `wq_pitch=160` for context steps, which reads the head
+    weights in place from the projection output; its bytes equal the pitch-32
+    launcher's on the same values packed (the column split), which the test pins.
 
     The NeoX rope mode compiles and is verified by the kernel's own driver,
     but the target never builds it, so it is not certified here.

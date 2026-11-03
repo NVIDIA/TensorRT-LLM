@@ -159,7 +159,7 @@ class _EagerTwin:
 
     The cell's own launcher builds three DLPack cute tensors and packs the JIT executor's
     arguments on every call: about 100 us of Python per call for a mixed step's q_b at 16
-    generation rows (cProfile, AI Hub 858232). The twin is the prefill GEMM's
+    generation rows (cProfile, B300 serving run). The twin is the prefill GEMM's
     `compile_persistent_gemm_tvm_ffi` of the cell's schedule and kernel name -- the same kernel
     class, `bmm` entry, `can_implement` gate and dynamic layouts as the cell's
     `compile_persistent_gemm`, so the same device code -- and a call checks what the cell's

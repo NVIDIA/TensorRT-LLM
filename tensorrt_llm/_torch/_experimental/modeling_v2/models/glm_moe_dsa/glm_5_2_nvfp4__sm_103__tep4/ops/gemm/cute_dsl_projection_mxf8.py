@@ -185,6 +185,26 @@ class CuteDslProjectionMxf8(OpWrapper):
             why="kv_b_kv8 at 7300 rows with block scales: the large tile, V tiles on K < 512",
             spec=dict(kernel="kv_b_kv8", rows=7300, sfa=True),
         ),
+        # The served form (`kv_strided`): `kv_b_kv8` on the gather's `a_k` / `sfa_k`, in the
+        # target's row slices of the runner's capacity, its `[T_k, 8192]` rows read as two
+        # halves by the `kv_strided` MHA handle. The test also pins these bitwise to the two
+        # launches `kv_b_k8` + `kv_b_v8` on `a_k` / `a_v`.
+        Cell(
+            why="kv_strided: 513 K/V rows, the first context row count past the decode buckets",
+            spec=dict(kernel="kv_b_kv8", rows=513, sfa=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided: 7340 K/V rows, a served context step ending mid-tile",
+            spec=dict(kernel="kv_b_kv8", rows=7340, sfa=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided: 8192 K/V rows, the token budget with no cached prefix",
+            spec=dict(kernel="kv_b_kv8", rows=8192, sfa=True, kv_strided=True),
+        ),
+        Cell(
+            why="kv_strided: 16448 K/V rows (a cached prefix), two row slices of 16384 + 64",
+            spec=dict(kernel="kv_b_kv8", rows=16448, sfa=True, kv_strided=True),
+        ),
         Cell(
             why="dense_gate_up at 65 rows through its own activation quant",
             spec=dict(kernel="dense_gate_up", rows=65),

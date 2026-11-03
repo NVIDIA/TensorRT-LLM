@@ -132,6 +132,26 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
             why="a single-layer pool: a dense view and the contiguous launcher",
             spec=dict(tokens=64, pool_layers=1, blocks=64, pad_rows=4, misalign=False),
         ),
+        # The served context path (`build(f32_input=True)`): the keys are columns 0..127 of
+        # the indexer projection's fp32 `[T, 160]` output, read in place (row pitch 160).
+        Cell(
+            why="f32 keys at pitch 160, 65 rows: the first context count, 2 rows per CTA",
+            spec=dict(
+                tokens=65, pool_layers=78, blocks=64, pad_rows=0, misalign=False, f32_input=True
+            ),
+        ),
+        Cell(
+            why="f32 keys at pitch 160, 3001 rows: 8 rows per CTA, a partial last CTA",
+            spec=dict(
+                tokens=3001, pool_layers=78, blocks=128, pad_rows=0, misalign=False, f32_input=True
+            ),
+        ),
+        Cell(
+            why="f32 keys at pitch 160, max_num_tokens: 8192 rows",
+            spec=dict(
+                tokens=8192, pool_layers=78, blocks=300, pad_rows=0, misalign=False, f32_input=True
+            ),
+        ),
     )
 
     note = """
@@ -139,7 +159,11 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     launchers once; the target builds them on its first forward (the pool
     layout is an engine value) and passes the result as `compiled`. `__call__`
     picks the launcher on the host: 2 rows per CTA up to 1024 tokens, 8 above,
-    and 8-byte loads when `indexer_k` is 8-byte aligned. There is no stock-op
+    and 8-byte loads when `indexer_k` is 8-byte aligned. With `f32_input=True`
+    (the target's default, `TRTLLM_GLM52_CTX_IX_NOSPLIT=1`) context steps pass the
+    fp32 key columns of the projection output and take the two fp32 launchers; the
+    written bytes are those of the bf16 launchers on the keys rounded to bf16 (the
+    column split the target otherwise runs), which the test pins bitwise. There is no stock-op
     fallback; every row count runs the kernel.
 
     `validate=True` makes the kernel's wrapper check slot and position ranges

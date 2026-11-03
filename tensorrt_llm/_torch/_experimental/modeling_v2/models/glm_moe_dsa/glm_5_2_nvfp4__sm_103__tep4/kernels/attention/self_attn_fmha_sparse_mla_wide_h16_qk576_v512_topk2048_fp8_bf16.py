@@ -3,9 +3,9 @@
 """Sparse MLA decode FMHA, H16, PV reading V from the K slots, on CuTe DSL primitives.
 
 The kernel of ``self_attn_fmha_sparse_mla_h16_qk576_v512_topk2048_fp8_bf16`` (the "base"
-kernel; its module docstring describes the ABI, the warp roles, the split-K reducers and the
-valid-prefix masking, all unchanged here) with one change in how a Kv128 tile reaches the PV
-MMA, for 16 heads only:
+kernel, since removed from that module: nothing served ran it; the module's docstring still
+describes the ABI, the warp roles, the split-K reducers and the valid-prefix masking, all
+unchanged here) with one change in how a Kv128 tile reaches the PV MMA, for 16 heads only:
 
 V from the K slots
 ------------------
@@ -396,11 +396,11 @@ def _fmha_sparse_mla_wide_kernel(
         # (use `t // 2`), whose PV released the latent slots and QK the rope slot.
         # An empty split participant (num_kt == 0) loads nothing.
         for kt in cutlass.range(0, num_kt, 1, unroll=1):
-            ist = kt // cutlass.Int32(I_TILES_PER_STAGE)
-            while not prims.mbarrier_try_wait_parity(index_full.data_ptr() + ist, 0):
+            idx_stage = kt // cutlass.Int32(I_TILES_PER_STAGE)
+            while not prims.mbarrier_try_wait_parity(index_full.data_ptr() + idx_stage, 0):
                 pass
             staged_base = (
-                ist * cutlass.Int32(I_STAGE_ELTS)
+                idx_stage * cutlass.Int32(I_STAGE_ELTS)
                 + (kt % cutlass.Int32(I_TILES_PER_STAGE)) * cutlass.Int32(QK_N)
                 + producer_rank * cutlass.Int32(CTA_N // NUM_GATHER_WARPS)
             )

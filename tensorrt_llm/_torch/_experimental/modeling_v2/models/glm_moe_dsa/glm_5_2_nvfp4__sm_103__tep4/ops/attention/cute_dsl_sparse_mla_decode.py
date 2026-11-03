@@ -258,9 +258,10 @@ class CuteDslSparseMlaDecode(OpWrapper):
     `self_attn_fmha_sparse_mla_wide_...`: the base kernel with PV reading V
     from the tile's own K latent slots instead of gathering the latent a second
     time (H16 only). Same split-K picks, reducers and ABI, bitwise the same
-    outputs (`test_wide_kernel_is_bitwise_the_base_kernel`), about half the
-    gathered bytes: on B300 at 32 sequences x MTP 2, 2048 valid rows per query,
-    28.2 -> 20.7 us per call in CUDA-graph replay.
+    outputs as the base kernel (pinned by a test until that kernel, which no
+    served path ran, was removed), about half the gathered bytes: on B300 at
+    32 sequences x MTP 2, 2048 valid rows per query, 28.2 -> 20.7 us per call
+    in CUDA-graph replay.
 
     The kernel reads neither scale array: its softmax scale is compiled in as
     `1/16` and its output scale is 1. `is_valid` holds the arrays to those

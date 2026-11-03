@@ -52,10 +52,14 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
+from tensorrt_llm._torch.speculative import (
+    MTPEagleWorker,
+    get_spec_worker,
+    should_use_separate_draft_kv_cache,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
-from . import dec_hot_experts as _hot
 from . import weights as _weights
 from .kernels.moe import moe_fc1_kblock as _fc1_kblock
 from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
@@ -209,59 +213,6 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         seq_lens=md.seq_lens,
         seq_lens_cuda=md.seq_lens_cuda,
     )
-
-
-def _install_dense_topk_on_device() -> None:
-    """TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE (default 1): engine's dense top-k table on the GPU.
-
-    When every context sequence is shorter than the index top-k, the engine skips the indexer
-    and `DSAtrtllmAttentionMetadata.prepare_for_skip_indexer` writes a dense causal table of
-    `num_ctx_tokens x index_topk` entries with its host form of `prepare_dense_topk_indices`
-    (a CPU-compiled kernel plus a host-to-device copy): on B300 ~97 ms of `_prepare_inputs` per
-    8k-token context step, with the GPU idle. The method's `device=True` form computes the
-    same integer table on the GPU. The rebind keeps the engine's body (the two host skip
-    decisions) and redirects only its one table build, with the host `kv_lens` it was given
-    uploaded as-is (`num_seqs` ints), so the table is identical. Installed from this model's
-    constructor, not at import, so a stock process that only registers the target keeps the
-    stock path. Idempotent; raises if the engine's method is not the shape this relies on.
-    """
-    import inspect
-    import re
-
-    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata as _Md
-
-    if getattr(_Md.prepare_for_skip_indexer, "_glm52_dense_topk_on_device", False):
-        return
-    src = inspect.getsource(_Md.prepare_for_skip_indexer)
-    if (
-        src.count("self.prepare_dense_topk_indices(kv_lens)") != 1
-        or len(re.findall(r"\.item\(\s*\)", src)) != 2
-        or hasattr(_Md, "__slots__")
-    ):
-        raise RuntimeError(
-            "TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE=1 needs DSAtrtllmAttentionMetadata."
-            "prepare_for_skip_indexer with two `.item()` skip decisions and one host "
-            "`self.prepare_dense_topk_indices(kv_lens)` call (no __slots__); this engine's "
-            "differs. Unset the switch or update _install_dense_topk_on_device."
-        )
-    orig = _Md.prepare_for_skip_indexer
-    orig_build = _Md.prepare_dense_topk_indices
-
-    def prepare_for_skip_indexer(self, kv_lens):
-        # The instance attribute shadows the class method for exactly the one table build
-        # inside the engine's body and is removed again.
-        def build_on_device(host_kv_lens, device=False):
-            dev_kv_lens = host_kv_lens.to(self.seq_lens_cuda.device, non_blocking=True)
-            return orig_build(self, dev_kv_lens, device=True)
-
-        self.prepare_dense_topk_indices = build_on_device
-        try:
-            orig(self, kv_lens)
-        finally:
-            del self.prepare_dense_topk_indices
-
-    prepare_for_skip_indexer._glm52_dense_topk_on_device = True
-    _Md.prepare_for_skip_indexer = prepare_for_skip_indexer
 
 
 _QUANT_MODE_FP8_KV = 128
@@ -427,7 +378,8 @@ class _DcGroupsUploader:
         torch.cuda.synchronize(self._dev)
         self._cap = max(rows, 2 * self._cap, 2048 + 64)
         self._host = [
-            torch.empty((self._cap, 2), dtype=torch.int32, pin_memory=True) for _ in range(2)
+            torch.empty((self._cap, 2), dtype=torch.int32, pin_memory=prefer_pinned())
+            for _ in range(2)
         ]
         self._done = [None, None]
         self._buf = torch.empty((self._cap, 2), dtype=torch.int32, device=self._dev)
@@ -459,8 +411,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self.ep_rank = mapping.moe_ep_rank
         self.ep_size = mapping.moe_ep_size
         self.quant_mode = _QUANT_MODE_FP8_KV
-        if os.environ.get("TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE", "1") == "1":
-            _install_dense_topk_on_device()
+        # TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE (default 1): when every context sequence is shorter
+        # than the index top-k, the engine skips the indexer and builds a dense causal table of
+        # `num_ctx_tokens x index_topk` entries. Its host build (a CPU kernel plus a copy) costs
+        # ~97 ms of `_prepare_inputs` per 8k-token context step on B300 with the GPU idle; the
+        # metadata's `dense_topk_on_device` builds the same integer table on the GPU.
+        self._dense_topk_on_device = os.environ.get("TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE", "1") == "1"
         self._mixed_base = os.environ.get("TRTLLM_GLM52_MIXED_BASE", "1") == "1"
         # TRTLLM_GLM52_CTX_HOST_DIET (default 1; 0 restores the per-call paths): host time
         # only, same kernels and arguments. A context step reads its per-layer pool addressing
@@ -505,11 +461,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self.moe_inter = cfg.moe_intermediate_size
         self.local_experts = self.num_experts // mapping.moe_ep_size
         self.expert_offset = self.local_experts * self.ep_rank
-        # Decode expert replicas (`dec_hot_experts`): every rank also holds each trunk MoE
+        # Decode expert replicas (`weights.DEC_HOT`): every rank also holds each trunk MoE
         # layer's `dec_replicas` hottest experts in slots 64.. of its routed stacks; 0 = off.
-        self.dec_replicas = _hot.replicas()
+        self.dec_replicas = _weights.dec_replicas()
         self.dec_hot = (
-            {i: _hot.hot(i, self.dec_replicas) for i in _hot.HOT} if self.dec_replicas else {}
+            {i: _weights.dec_hot(i, self.dec_replicas) for i in _weights.DEC_HOT}
+            if self.dec_replicas
+            else {}
         )
         # Context expert replicas (`TRTLLM_GLM52_CTX_EXPERT_REPLICAS=R`, 0 = off): a context
         # step's top-k splits the rows of each trunk MoE layer's first R replica experts
@@ -1646,6 +1604,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         **kwargs,
     ) -> torch.Tensor:
         """Derive what the first step fixes, then route."""
+        # Set on every metadata instance this model sees (the engine's and each CUDA graph
+        # runner's); it takes effect from that instance's next `prepare()`.
+        attn_metadata.dense_topk_on_device = self._dense_topk_on_device
         self._derive_first_step(attn_metadata)
         out = self._select_target(attn_metadata).forward(
             attn_metadata,
@@ -3082,7 +3043,7 @@ class PrefillTarget:
         ):
             return None
         host_cached = step["host_ctx_cached_token_indptr"]
-        staged = torch.empty([2 * ctx + 1], dtype=torch.int32, pin_memory=True)
+        staged = torch.empty([2 * ctx + 1], dtype=torch.int32, pin_memory=prefer_pinned())
         staged[: ctx + 1].copy_(step["host_ctx_uncached_token_indptr"][: ctx + 1])
         staged[ctx + 1 :].copy_(host_cached[1 : ctx + 1] - host_cached[:ctx])
         # The caching host allocator keeps the pinned block until this copy has run.
@@ -3212,12 +3173,12 @@ class PrefillTarget:
         pos_c = torch.arange(cached, dtype=torch.int64) - (host_ci[req_c] - host_ci[0])
         req_n = torch.repeat_interleave(reqs, new_l)
         tok_n = torch.arange(tc, dtype=torch.int64) - (host_cu[req_n] - host_cu[0])
-        staged = torch.empty([3 * cached + tc], dtype=torch.int64, pin_memory=True)
+        staged = torch.empty([3 * cached + tc], dtype=torch.int64, pin_memory=prefer_pinned())
         staged[:cached].copy_(cu_k[req_c] + pos_c)  # dst_c
         staged[cached : 2 * cached].copy_(host_cu[req_c] - host_cu[0])  # tok_c
         staged[2 * cached : 3 * cached].copy_(pos_c)  # pos_c
         staged[3 * cached :].copy_(cu_k[req_n] + cached_l[req_n] + tok_n)  # dst_n
-        staged_cu = torch.empty([ctx + 1], dtype=torch.int32, pin_memory=True)
+        staged_cu = torch.empty([ctx + 1], dtype=torch.int32, pin_memory=prefer_pinned())
         staged_cu.copy_(cu_k)
         # The caching host allocator keeps the pinned blocks until these copies have run.
         plan.cached = SimpleNamespace(
@@ -3258,7 +3219,7 @@ class PrefillTarget:
     def _attn_mha(
         self, a, layer: int, q, latent, out, tc: int, step, ctx_rope, mha, o8=None
     ) -> bool:
-        """Context attention in the non-absorbed MLA form, as DLSim models it, on a
+        """Context attention in the non-absorbed MLA form (K / V expanded per head), on a
         dense-causal step; False (nothing launched) where the layer cannot take it.
 
         1. The rope kernel's `q_in_place` mode: rope(q_pe) back into the q_b output, which
@@ -3844,12 +3805,7 @@ class PrefillTarget:
         # base rows, converted once per fresh selection, and the sparse MLA decode adds each
         # layer's offset, as on a pure decode step: the same pool rows, instead of one global
         # conversion per layer (78 launches per mixed step).
-        mixed_base = (
-            core._mixed_base
-            and slot_lo == tc
-            and gen > 0
-            and gen_p == _MLA_ROPE_MTP_WIDTH
-        )
+        mixed_base = core._mixed_base and slot_lo == tc and gen > 0 and gen_p == _MLA_ROPE_MTP_WIDTH
         base = None
 
         x = core._rmsnorm(h, core._attn[0].norm1)
@@ -3937,7 +3893,7 @@ class PrefillTarget:
         n_pad = r_pad - gen
         last = (host_cu[1:] - 1).to(torch.int32)
         # One pinned block: rows [r_pad] | ke [n_pad] | req [n_pad] | groups [n_pad, 2] | ks [n_pad]
-        staged = torch.empty([r_pad + 5 * n_pad], dtype=torch.int32, pin_memory=True)
+        staged = torch.empty([r_pad + 5 * n_pad], dtype=torch.int32, pin_memory=prefer_pinned())
         staged[:ctx] = last
         staged[ctx:n_pad] = int(last[-1])
         staged[n_pad:r_pad] = torch.arange(tc, tc + gen, dtype=torch.int32)
@@ -4217,53 +4173,66 @@ class DecodeTarget:
         return core._mtp_close(attn_out, residual, rows)
 
 
-def _greedy_on_argmax(worker, core) -> None:
-    """Put the spec worker's two all-greedy picks on the CuTe DSL argmax.
+class Glm52MTPEagleWorker(MTPEagleWorker):
+    """The one-model MTP-Eagle worker with its two all-greedy picks on the CuTe DSL argmax.
 
     * `greedy_sample_draft_with_tp_gather`: the draft token. This target's draft logits
       are the gathered full vocabulary on every rank (`MTPLayer.shared_head`), so the
-      worker already takes its plain `argmax` branch; this is that argmax. A call with
-      `mapping_lm_head_tp` (LM-head TP under attention DP) keeps the worker's.
+      built-in worker takes its plain `argmax` branch; this is that argmax. A call with
+      `mapping_lm_head_tp` (LM-head TP under attention DP) keeps the built-in code.
     * `_sample_tokens_for_batch`, all-greedy batch: the target's token. `torch.argmax`
       there, int64; int32 here, which every caller stores into an int32 tensor.
 
-    Bound on this worker instance, which the target built; logits the kernel does not
-    take keep the worker's own code, counted as misses. A worker without either method is
-    left as is. Idempotent: a second load does not wrap the wrappers.
+    Logits the kernel does not take keep the built-in code, counted as misses. Until the
+    core's argmax launcher is built (`post_load_weights`), or if it failed to build, both
+    methods are the built-in ones and nothing is counted. Everything else is the built-in
+    worker's.
     """
-    if getattr(worker, "_glm_greedy_on_argmax", False):
-        return
-    draft = getattr(worker, "greedy_sample_draft_with_tp_gather", None)
-    target = getattr(worker, "_sample_tokens_for_batch", None)
-    if draft is None or target is None:
-        logger.warning("modeling_v2 GLM-5.2: spec worker has no greedy picks to route")
-        return
 
-    def _pick(logits, route: str):
+    def __init__(
+        self,
+        spec_config,
+        model_config: ModelConfig,
+        use_separate_draft_kv_cache: bool,
+        *,
+        mapping,
+        core: GlmMoeDsaTep4ModelingV2,
+    ) -> None:
+        super().__init__(spec_config, model_config, use_separate_draft_kv_cache, mapping=mapping)
+        # The core's route counter and its argmax launcher (rebuilt at post_load_weights),
+        # reached through a closure: the core belongs to the shell and is no submodule here.
+        self._glm_count = core._count
+        self._glm_argmax_rows = lambda: core._rows.argmax
+
+    def _glm_pick(self, logits: torch.Tensor, route: str) -> torch.Tensor | None:
+        """int32 argmax tokens of `logits` on the CuTe DSL kernel, or None for the built-in."""
+        rows = self._glm_argmax_rows()
+        if rows is None:
+            return None
         hit = _argmax_op.takes(logits)
-        core._count(route, hit)
+        self._glm_count(route, hit)
         if not hit:
             return None
         tokens = torch.empty([logits.shape[0]], dtype=torch.int32, device=logits.device)
-        return cute_dsl_argmax(logits, tokens, core._rows.argmax)
+        return cute_dsl_argmax(logits, tokens, rows)
 
-    def greedy_sample_draft_with_tp_gather(logits, spec_metadata=None, mapping_lm_head_tp=None):
+    def greedy_sample_draft_with_tp_gather(
+        self, logits: torch.Tensor, spec_metadata=None, mapping_lm_head_tp=None
+    ) -> torch.Tensor:
         if mapping_lm_head_tp is None:
-            tokens = _pick(logits, "greedy_draft")
+            tokens = self._glm_pick(logits, "greedy_draft")
             if tokens is not None:
                 return tokens
-        return draft(logits, spec_metadata, mapping_lm_head_tp)
+        return super().greedy_sample_draft_with_tp_gather(logits, spec_metadata, mapping_lm_head_tp)
 
-    def _sample_tokens_for_batch(logits, spec_metadata, num_contexts, batch_size):
+    def _sample_tokens_for_batch(
+        self, logits: torch.Tensor, spec_metadata, num_contexts: int, batch_size: int
+    ) -> torch.Tensor:
         if spec_metadata.is_all_greedy_sample:
-            tokens = _pick(logits, "greedy_target")
+            tokens = self._glm_pick(logits, "greedy_target")
             if tokens is not None:
                 return tokens
-        return target(logits, spec_metadata, num_contexts, batch_size)
-
-    worker.greedy_sample_draft_with_tp_gather = greedy_sample_draft_with_tp_gather
-    worker._sample_tokens_for_batch = _sample_tokens_for_batch
-    worker._glm_greedy_on_argmax = True
+        return super()._sample_tokens_for_batch(logits, spec_metadata, num_contexts, batch_size)
 
 
 class MTPLayer:
@@ -4345,6 +4314,16 @@ class ModelingV2Glm52Nvfp4Sm103Tep4(
                 model_config.mapping,
                 should_use_separate_draft_kv_cache(self.spec_config),
             )
+            if type(self.spec_worker) is MTPEagleWorker:
+                # The target's worker in place of the built-in one, with the same draft KV
+                # cache choice: the built-in worker with the greedy picks on the argmax.
+                self.spec_worker = Glm52MTPEagleWorker(
+                    self.spec_config,
+                    model_config,
+                    self.spec_worker.use_separate_draft_kv_cache,
+                    mapping=model_config.mapping,
+                    core=self.model,
+                )
 
     def forward(
         self,
@@ -4406,5 +4385,3 @@ class ModelingV2Glm52Nvfp4Sm103Tep4(
         # The shell's `lm_head` is the one module of the forward the core does not own: its
         # local GEMM compiles here, against the loaded weight.
         self.model.build_logits_head(self.lm_head)
-        if self.spec_worker is not None and self.model._rows.argmax is not None:
-            _greedy_on_argmax(self.spec_worker, self.model)

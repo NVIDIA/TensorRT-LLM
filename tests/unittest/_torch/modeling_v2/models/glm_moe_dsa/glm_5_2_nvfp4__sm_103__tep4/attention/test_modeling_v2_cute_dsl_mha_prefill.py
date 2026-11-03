@@ -5,6 +5,10 @@
 Each cell is a packed context step: per request its query rows and its K/V rows (a
 cached prefix first). The output buffer starts as NaN, so a row the kernel never
 writes fails; a second launch must give the same bytes.
+
+The `kv_strided` cells are the served handles: K and V are the two halves of one
+`[T_k, 8192]` buffer (the one-launch K / V expansion's rows). Beyond the reference, each
+must write the packed handle's bytes for the same K / V made contiguous.
 """
 
 import zlib
@@ -57,6 +61,8 @@ def _build(spec, seed):
         head_scales = entry.fp8_head_scales(float(s_q), s_k, s_v).cuda()
     else:
         q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
+    if spec.get("kv_strided"):
+        k, v = _halves(k, v)
     return dict(
         q=q,
         k=k,
@@ -69,14 +75,28 @@ def _build(spec, seed):
     )
 
 
+def _halves(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """K and V as the two halves of one `[T_k, 2 * 16 * 256]` buffer, as the one-launch
+    expansion writes them: token-row stride 8192 elements, V at element 4096 of each row."""
+    tk = k.shape[0]
+    kv = torch.empty(tk, 2 * HEADS * DIM, dtype=k.dtype, device=k.device)
+    kv[:, : HEADS * DIM] = k.reshape(tk, -1)
+    kv[:, HEADS * DIM :] = v.reshape(tk, -1)
+    k_s, v_s = kv[:, : HEADS * DIM].view(tk, HEADS, DIM), kv[:, HEADS * DIM :].view(tk, HEADS, DIM)
+    assert k_s.stride(0) == v_s.stride(0) == 2 * HEADS * DIM
+    return k_s, v_s
+
+
 _HANDLES: dict = {}
 
 
-def _compiled(fp8: bool, q8: bool = False):
+def _compiled(fp8: bool, q8: bool = False, kv_strided: bool = False):
     """The handles the target builds at load, one per variant."""
-    key = (fp8, q8)
+    key = (fp8, q8, kv_strided)
     if key not in _HANDLES:
-        _HANDLES[key] = entry.compile(torch.cuda.current_device(), fp8=fp8, q8=q8)
+        _HANDLES[key] = entry.compile(
+            torch.cuda.current_device(), fp8=fp8, q8=q8, kv_strided=kv_strided
+        )
     return _HANDLES[key]
 
 
@@ -98,7 +118,7 @@ def test_certified_cells(cell) -> None:
     if cell.spec.get("q8"):
         _check_q8_cell(cell)
         return
-    compiled = _compiled(bool(cell.spec.get("fp8")))
+    compiled = _compiled(bool(cell.spec.get("fp8")), kv_strided=bool(cell.spec.get("kv_strided")))
     args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
     ref = op.reference(**args, compiled=compiled).float()
     assert ref.abs().sum() > 0, "a degenerate reference"
@@ -121,14 +141,15 @@ def _check_q8_cell(cell) -> None:
     query rows (a mixed step's generation rows, quantized later by their own launch) are
     not touched, and `out` is not written."""
     args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
+    strided = bool(cell.spec.get("kv_strided"))
     t = int(args["q"].shape[0])
     t_o = t + int(cell.spec.get("tail", 0))
-    plain = op(**args, compiled=_compiled(True))
+    plain = op(**args, compiled=_compiled(True, kv_strided=strided))
     q8 = torch.full((t_o, HEADS * DIM), 0x5A, dtype=torch.uint8, device="cuda")
     sf = torch.zeros(entry.sf_bytes(t_o), dtype=torch.uint8, device="cuda")
     out8 = torch.full_like(args["out"], float("nan"))
     with validating(op):
-        op(**{**args, "out": out8}, compiled=_compiled(True, True), q8_out=(q8, sf))
+        op(**{**args, "out": out8}, compiled=_compiled(True, True, strided), q8_out=(q8, sf))
     torch.cuda.synchronize()
     want_q8, want_sf = entry._kernel._mxf8.reference(plain.reshape(t, HEADS * DIM))
     assert torch.equal(q8[:t], want_q8), "the MXF8 O is not the activation quant of bf16 O"
@@ -138,6 +159,69 @@ def _check_q8_cell(cell) -> None:
     ), "block scales differ"
     assert bool((q8[t:] == 0x5A).all()), "rows past the query rows were written"
     assert bool(torch.isnan(out8).all()), "the MXF8-O handle wrote the bf16 output"
+
+
+_KV_STRIDED = [c for c in op.CELLS if c.spec.get("kv_strided")]
+
+
+@pytest.mark.parametrize("cell", _KV_STRIDED, ids=[c.why[:44] for c in _KV_STRIDED])
+def test_kv_strided_is_the_packed_handle_bitwise(cell) -> None:
+    """The `kv_strided` handle on the halves == the packed handle on the same K / V made
+    contiguous: the MXF8 O operand and its scales (q8, the served handle) or the bf16 O."""
+    q8 = bool(cell.spec.get("q8"))
+    args = _build(cell.spec, zlib.crc32(f"strided {cell.why}".encode()) % 2**31)
+    packed = {**args, "k": args["k"].contiguous(), "v": args["v"].contiguous()}
+    assert not args["k"].is_contiguous() and args["v"].stride(0) == 2 * HEADS * DIM
+    outs = []
+    for a, strided in ((packed, False), (args, True)):
+        handle = _compiled(True, q8, strided)
+        if q8:
+            outs.append(_q8_run(a, handle))
+        else:
+            out = op(**{**a, "out": torch.full_like(a["out"], float("nan"))}, compiled=handle)
+            outs.append((out.view(torch.uint8),))
+    torch.cuda.synchronize()
+    for got, want in zip(outs[1], outs[0]):
+        assert torch.equal(got, want), "the kv_strided handle differs from the packed handle"
+    if q8:
+        assert not bool((outs[0][0] == 0x5A).all(-1).any()), "an O row was not written"
+    else:
+        assert bool(torch.isfinite(outs[0][0].view(torch.bfloat16)).all()), "O not written"
+
+
+def test_packed_handle_refuses_strided_kv() -> None:
+    """The packed handle ignores tensor strides: it must not accept the halves."""
+    args = _build(dict(new=[513], cached=[0], fp8=True, kv_strided=True), seed=6)
+    with pytest.raises(AssertionError):
+        with validating(op):
+            op(**args, compiled=_compiled(True))
+
+
+def test_kv_strided_graph_replay_is_eager() -> None:
+    """The served MXF8-O `kv_strided` handle captured in a CUDA graph and replayed == eager."""
+    spec = dict(new=[987] * 7 + [431], cached=[0] * 8, fp8=True, q8=True, kv_strided=True)
+    args = _build(spec, seed=7)
+    handle = _compiled(True, True, True)
+    eager = _q8_run(args, handle)
+    t = int(args["q"].shape[0])
+    q8 = torch.full((t, HEADS * DIM), 0x5A, dtype=torch.uint8, device="cuda")
+    sf = torch.zeros(entry.sf_bytes(t), dtype=torch.uint8, device="cuda")
+    out = torch.full_like(args["out"], float("nan"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(**{**args, "out": out}, compiled=handle, q8_out=(q8, sf))
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        op(**{**args, "out": out}, compiled=handle, q8_out=(q8, sf))
+    q8.fill_(0x5A)
+    sf.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(q8, eager[0]) and torch.equal(sf, eager[1]), (
+        "graph replay differs from eager"
+    )
 
 
 def test_is_valid_refuses_a_max_seqlen_short_of_the_longest_request(compiled) -> None:
@@ -182,7 +266,7 @@ def _q8_handle_without_offload():
 
 #: The q8 cells' shapes, and a peaked softmax (a much sharper q: a few keys take nearly all of
 #: each row's weight, so the e4m3 P rounding and the row sums are at their extremes).
-_OFFLOAD_SPECS = [c.spec for c in op.CELLS if c.spec.get("q8")] + [
+_OFFLOAD_SPECS = [c.spec for c in op.CELLS if c.spec.get("q8") and not c.spec.get("kv_strided")] + [
     dict(new=[987] * 8, cached=[0] * 8, fp8=True, q8=True, q_scale=24.0),
     dict(new=[300, 40, 1], cached=[17, 64, 300], fp8=True, q8=True, q_scale=24.0),
 ]

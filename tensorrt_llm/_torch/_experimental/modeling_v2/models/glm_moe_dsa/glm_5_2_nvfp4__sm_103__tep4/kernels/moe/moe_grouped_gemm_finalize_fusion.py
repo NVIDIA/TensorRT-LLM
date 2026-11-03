@@ -68,6 +68,33 @@ overlapping-accumulator schedule that shares one TMEM region between the MMA and
 the epilogue instead of double-buffering.
 
 Runs on SM100+ (Blackwell) GPUs.
+Decode launches (<= 64 tokens) can take three more compile-time switches of
+``host_function``. With ``dynamic_sched=False``, ``a_rows=128`` and ``ab_stage_cap=0``
+it is the plain kernel above, and ``dyn_ptr`` (pass 0) is not read:
+
+* ``dynamic_sched``: the scheduler warp takes its first tile by CTA index, as the
+  static schedule does, and every later tile from a global atomic counter instead of
+  the static ``+ num_persistent_clusters`` stride. ``dyn_ptr`` points at two int32
+  words, ``[next tile, finished CTAs]``, zero before the first launch. At decode
+  sizes every persistent CTA gets the same tile count, but per-SM DRAM service is
+  uneven, so under the static round robin the launch ends with the slowest SMs:
+  per-CTA timestamps on B300 (144 CTAs x 13 tiles, N = 40 experts) end between
+  43.0 us (p10) and 51.7 us, 13-15 % of SM time idle. Taking tiles on demand lets
+  the fast SMs take more. Every CTA's last counter fetch precedes (fence) its
+  finished-count increment, and the CTA that sees the count reach the grid size
+  resets both words, so one zeroed buffer serves every later launch. Launches that
+  share a buffer must not overlap; the caller keeps one buffer per call site. The
+  k-block B layout measured -1.2 .. -1.5 % on this schedule (32 / 64 tokens).
+* ``a_rows``: rows in the A TMA box. 128 is the default box. 64 is valid when every
+  M-tile holds at most 64 valid rows, which a launch of <= 64 tokens guarantees (one
+  row per token per expert). The MMA still reads 128 rows: rows 64..127 come from
+  the next stage's bytes and only feed accumulator rows the epilogue never stores
+  (rows >= ``tile_idx_to_mn_limit``).
+* ``ab_stage_cap`` caps the A/B pipeline depth (0 = as many stages as SMEM holds).
+
+The math does not depend on the switches. The bf16 finalize atomics may add a
+token's top-k contributions in a different order, as they already do from run to
+run.
 """
 
 from __future__ import annotations
@@ -170,6 +197,17 @@ num_regs_sched = 80
 num_regs_idle = 24
 
 
+def _cap_stages(num_ab_stage: int, ab_stage_cap: int) -> int:
+    """Plain-Python stage cap, evaluated while tracing (an ``if`` in the jit body would make
+    the stage count a dynamic value)."""
+    return min(num_ab_stage, ab_stage_cap) if ab_stage_cap else num_ab_stage
+
+
+# Words in a dynamic-schedule counter buffer: [0] next tile, [1] finished CTAs. Callers
+# allocate DYN_COUNTER_WORDS int32 zeros per call site.
+DYN_COUNTER_WORDS = 2
+
+
 @cute.jit
 def sched_load_work_tile(
     s_work_tile,
@@ -231,6 +269,14 @@ def host_function(
     # `cute.compile`, which would make ahead-of-time compilation require a GPU.
     # The caller passes the real value.
     num_sms: cutlass.Constexpr[int],
+    # Two int32 words, zero before the first launch (see the module docstring); read only
+    # when `dynamic_sched` (pass 0 otherwise).
+    dyn_ptr: cutlass.Int64,
+    dynamic_sched: cutlass.Constexpr[bool],
+    # Rows in the A TMA box: 128 (the default) or 64 (every M-tile holds <= 64 valid rows).
+    a_rows: cutlass.Constexpr[int],
+    # A/B pipeline depth cap; 0 = as many stages as SMEM holds.
+    ab_stage_cap: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
     # FC2 weight (B) in the k-block layout (`moe_fc1_kblock` on W2, `fc2_enabled`,
     # [expert][N/128][K/256][128 rows][128 B]): each tile_n x 128 B box is tile_n / 128
@@ -267,6 +313,7 @@ def host_function(
         stream: CUDA stream.
     """
 
+    assert a_rows in (64, 128), f"a_rows={a_rows}: the A box is 128 rows or 64"
     # MMA tile configuration for 1CTA
     mma_tiler_mnk = [128, mma_tiler_n, mma_tiler_k]  # Tile dimensions (M, N, K)
     # Per-instruction K granule: 64 for NVFP4 (kind::mxf4nvf4), not the 32 the
@@ -282,9 +329,9 @@ def host_function(
         a_tensor,
         box_dims=(
             mma_tiler_mnk[2] // fp4_lanes_per_storage,
-            mma_tiler_mnk[0],
+            a_rows,
             1,
-        ),  # (Kx2_slice, M_tile, L_tile)
+        ),  # (Kx2_slice, M_tile rows actually loaded, L_tile)
         stride_order=(0, 1, 2),
         swizzle=cuda.TensorMapSwizzle.s128b,
         dtype=fp4x2_dtype,
@@ -359,7 +406,7 @@ def host_function(
 
     # A and B are both NVFP4 (0.5 bytes per element), so B has one size for its
     # TMA transfer and SMEM tile.
-    num_bytes_a = mma_tiler_mnk[0] * mma_tiler_mnk[2] * a_dtype.width // 8
+    num_bytes_a = a_rows * mma_tiler_mnk[2] * a_dtype.width // 8
     num_bytes_b = mma_tiler_mnk[1] * mma_tiler_mnk[2] * b_dtype.width // 8
     num_bytes_sfa = (
         num_elts_atom_sf_e8 * rest_k_sf_per_ktile * rest_m_sf_per_ktile * sf_dtype.width // 8
@@ -411,6 +458,7 @@ def host_function(
     num_ab_stage = (smem_capacity - smem_reserved) // (
         num_bytes_a + num_bytes_b + num_bytes_sfa + num_bytes_sfb
     )
+    num_ab_stage = _cap_stages(num_ab_stage, ab_stage_cap)
 
     # The outer ``moe`` JIT adapter converts runtime tensor iterators to Int64
     # pointers.  host_function therefore receives dynamic addresses instead of
@@ -479,6 +527,8 @@ def host_function(
         acc_stages,
         overlapping_accum,
         sf_tmem_cols,
+        dyn_ptr,
+        dynamic_sched,
         b_kblock,
     ).launch(
         grid=grid,
@@ -536,6 +586,8 @@ def moe_grouped_gemm_finalize_fusion_kernel(
     acc_stages: cutlass.Constexpr[int],
     overlapping_accum: cutlass.Constexpr[bool],
     sf_tmem_cols: cutlass.Constexpr[int],
+    dyn_ptr: cutlass.Int64,
+    dynamic_sched: cutlass.Constexpr[bool],
     # FC2 weight (B) in the k-block layout (`moe_fc1_kblock` on W2, `fc2_enabled`,
     # [expert][N/128][K/256][128 rows][128 B]): each tile_n x 128 B box is tile_n / 128
     # contiguous 16 KB reads instead of 128 B row pieces at a K/2 = 1 KB pitch.
@@ -806,7 +858,23 @@ def moe_grouped_gemm_finalize_fusion_kernel(
         # Persistent loop: advance and write subsequent work_tiles
         sched_empty_phase = 0
         while work_tile.is_valid_tile:
-            tile_sched.advance_to_next_work()
+            if cutlass.const_expr(dynamic_sched):
+                # Next tile from the global counter; the first `num_persistent_clusters`
+                # tiles were handed out by CTA index, so the counter starts after them.
+                # The fetch runs one tile ahead of the consumers (they still work on the
+                # tile published last), so its latency is off the critical path.
+                dyn_next = cutlass.Int32(0)
+                if cute.arch.lane_idx() == 0:
+                    dyn_next = cute.arch.atomic_add(
+                        ptr=cutlass.inttoptr(dyn_ptr, mem_space=1, dtype=cutlass.Int32),
+                        val=cutlass.Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                dyn_next = cute.arch.shuffle_sync(dyn_next, 0)
+                tile_sched._current_work_linear_idx = dyn_next + tile_sched.num_persistent_clusters
+            else:
+                tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
             while not prims.mbarrier_try_wait_parity(sched_empty_mbar_ptr, sched_empty_phase):
                 pass
@@ -820,6 +888,38 @@ def moe_grouped_gemm_finalize_fusion_kernel(
                 prims.fence_acq_rel(prims.MemScope.CTA)
                 prims.mbarrier_arrive(sched_full_mbar_ptr)
             sched_empty_phase ^= 1
+        if cutlass.const_expr(dynamic_sched):
+            # This CTA has made its last counter fetch (the one that returned an invalid
+            # tile). Count it finished; the CTA that brings the count to the grid size is
+            # the last one that can touch the counter in this launch, so it resets both
+            # words for the next launch on this buffer. The fence orders this CTA's last
+            # fetch before its increment; the increment is acq_rel so the last CTA
+            # observes every other CTA's fetch before resetting.
+            if cute.arch.lane_idx() == 0:
+                cute.arch.fence_acq_rel_gpu()
+                dyn_done = cute.arch.atomic_add(
+                    ptr=cutlass.inttoptr(
+                        dyn_ptr + cutlass.Int64(4), mem_space=1, dtype=cutlass.Int32
+                    ),
+                    val=cutlass.Int32(1),
+                    sem="acq_rel",
+                    scope="gpu",
+                )
+                if dyn_done == tile_sched.num_persistent_clusters - 1:
+                    cute.arch.atomic_exch(
+                        ptr=cutlass.inttoptr(dyn_ptr, mem_space=1, dtype=cutlass.Int32),
+                        val=cutlass.Int32(0),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    cute.arch.atomic_exch(
+                        ptr=cutlass.inttoptr(
+                            dyn_ptr + cutlass.Int64(4), mem_space=1, dtype=cutlass.Int32
+                        ),
+                        val=cutlass.Int32(0),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
 
     # =========================================================================
     # TMA warp (warp 5): GMEM -> SMEM async loads for A, B, SFA, SFB

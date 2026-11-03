@@ -311,7 +311,7 @@ class EagerBatchedGemm:
 
     `CompiledBatchedGemm` builds three DLPack cute tensors and packs the JIT executor's
     arguments on every call: about 100 us of Python per call for a mixed step's K-B / V-B
-    at 16 generation rows (cProfile, AI Hub 858232). This is `_compile`'s kernel for the same
+    at 16 generation rows (cProfile, B300 serving run). This is `_compile`'s kernel for the same
     arguments -- same kernel object (`_make_gemm`), `can_implement` gate, symbol prefix,
     `bmm` entry and dynamic layouts (`from_dlpack(assumed_align=16)` with the same stride-1
     modes) -- exported with `--enable-tvm-ffi`, so the same device code: a call checks the
