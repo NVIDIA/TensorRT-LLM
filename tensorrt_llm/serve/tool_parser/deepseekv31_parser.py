@@ -124,14 +124,14 @@ class DeepSeekV31Parser(BaseToolParser):
         has_tool_call = bool(start_indices)
 
         if not has_tool_call:
-            # Text that may still become a marker waits for the next increment.
-            if any(
+            # Only a tail that may still become a marker waits for the next
+            # increment; the text before it is content.
+            held_len = max(
                 self._ends_with_partial_token(current_text, token)
                 for token in start_tokens + end_tokens
-            ):
-                return StreamingParseResult(), False
-            normal_text = current_text
-            self._buffer = ""
+            )
+            normal_text = current_text[: len(current_text) - held_len]
+            self._buffer = current_text[len(current_text) - held_len :]
             for e_token in end_tokens:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text), False

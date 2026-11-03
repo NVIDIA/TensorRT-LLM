@@ -2877,7 +2877,7 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
     must end with the calls ``detect_and_parse`` finds in the whole text,
     including when a call arrives in the last increment, after which nothing
     can release it. The streamed text is the same for every split too, and
-    carries no markup.
+    carries no markup, also when the stream ends inside a marker.
     """
 
     @staticmethod
@@ -2887,10 +2887,12 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
         search = call("search_web", _DEEPSEEK_SEARCH_ARGUMENTS)
         two_calls = ("<｜tool▁calls▁begin｜>" + weather + between + search +
                      "<｜tool▁calls▁end｜>")
+        text_around_calls = "Let me check both.\n" + two_calls + "\nDone."
         return {
             "one_call": "<｜tool▁calls▁begin｜>" + weather + "<｜tool▁calls▁end｜>",
             "two_calls": two_calls,
-            "text_around_calls": "Let me check both.\n" + two_calls + "\nDone.",
+            "text_around_calls": text_around_calls,
+            "stream_ends_inside_a_marker": text_around_calls + "<｜tool▁call",
         }
 
     @staticmethod
@@ -2899,14 +2901,16 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
 
         The whole-text parse keeps the text before the calls, stripped.
         Streaming sends that text as it is, then the text between and after
-        the calls.
+        the calls, but nothing of a marker the stream ends inside.
         """
         between = _DEEPSEEK_V3_FORMATS[parser_name][2]
+        text_around_calls = ("Let me check both.",
+                             "Let me check both.\n" + between + "\nDone.")
         return {
             "one_call": ("", ""),
             "two_calls": ("", between),
-            "text_around_calls": ("Let me check both.",
-                                  "Let me check both.\n" + between + "\nDone."),
+            "text_around_calls": text_around_calls,
+            "stream_ends_inside_a_marker": text_around_calls,
         }
 
     @staticmethod
@@ -2961,8 +2965,10 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
         return text, [(index, name, cls._decoded(arguments))
                       for index, (name, arguments) in sorted(calls.items())]
 
-    @pytest.mark.parametrize("output",
-                             ["one_call", "two_calls", "text_around_calls"])
+    @pytest.mark.parametrize("output", [
+        "one_call", "two_calls", "text_around_calls",
+        "stream_ends_inside_a_marker"
+    ])
     @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
     def test_streamed_calls_match_whole_text_parse(self, sample_tools,
                                                    parser_name, output):
@@ -3025,6 +3031,40 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
             streamed = self._streamed(parser_name, chunks, sample_tools)
 
             assert streamed == expected, chunks
+
+    @pytest.mark.parametrize(
+        "marker", [
+            "<｜tool▁calls▁begin｜>", "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>"
+        ],
+        ids=["calls_begin", "call_begin", "call_end", "calls_end"])
+    @pytest.mark.parametrize("stream_ends_in_marker", [False, True],
+                             ids=["marker_arrives", "stream_ends_in_marker"])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_text_before_a_split_marker_is_sent_with_its_increment(
+            self, sample_tools, parser_name, stream_ends_in_marker, marker):
+        """The text before part of a marker goes out with its increment.
+
+        Only the part of the marker waits, and none of it is streamed as text,
+        whether the rest arrives or the stream ends inside the marker. The
+        marker is cut at every position.
+        """
+        text = "Done: a < b."
+        for cut in range(1, len(marker)):
+            chunks = [text + marker[:cut]]
+            if not stream_ends_in_marker:
+                chunks.append(marker[cut:])
+            parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+            streamed = [(result.normal_text, result.calls)
+                        for result in results]
+
+            assert streamed == [(text, [])] + [("", [])] * len(chunks), chunks
 
     @pytest.mark.parametrize(
         "split",
