@@ -156,7 +156,7 @@ class ParallelVAEFactory:
             "ParallelVAE_TrtllmWan",
         ),
         "tensorrt_llm._torch.visual_gen.models.wan.wino_vae.WinoVae": (
-            "tensorrt_llm._torch.visual_gen.models.wan.parallel_vae",
+            "tensorrt_llm._torch.visual_gen.models.wan.parallel_wino_vae",
             "ParallelWinoVae",
         ),
     }

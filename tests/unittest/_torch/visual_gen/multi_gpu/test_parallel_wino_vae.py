@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import shard_extents
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_wino_vae import shard_extents
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
     WinoVae,
