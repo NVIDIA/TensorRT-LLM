@@ -26,7 +26,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-import tensorrt_llm.serve.anthropic_adapter as adapter
+import tensorrt_llm.serve.api.anthropic.adapter as adapter
 from tensorrt_llm.serve.api.anthropic.adapter import (
     AnthropicRequestError,
     AnthropicResponseError,
@@ -1858,7 +1858,7 @@ def test_cached_tokens_exceeding_prompt_tokens_is_logged(monkeypatch):
     tensorrt_llm.logger does not propagate to the stdlib root, so caplog sees
     nothing and the test would pass without the warning existing.
     """
-    import tensorrt_llm.serve.anthropic_adapter as adapter
+    import tensorrt_llm.serve.api.anthropic.adapter as adapter
 
     warnings = []
     monkeypatch.setattr(adapter.logger, "warning", warnings.append)
