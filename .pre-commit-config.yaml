@@ -419,6 +419,7 @@ common-files: &common_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
         tensorrt_llm/serve/_base/sse.py |
+        tensorrt_llm/serve/api/anthropic/serving.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
         tensorrt_llm/serve/disagg_auto_scaling.py |
@@ -1148,6 +1149,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
         tensorrt_llm/serve/_base/sse.py |
+        tensorrt_llm/serve/api/anthropic/serving.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
         tensorrt_llm/serve/disagg_auto_scaling.py |
