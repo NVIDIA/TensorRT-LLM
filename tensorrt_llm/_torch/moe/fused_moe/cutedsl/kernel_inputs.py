@@ -76,9 +76,9 @@ def quantize_input_nvfp4(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` to NVFP4, or unpack an already-quantized input.
 
-    The ``quantize_input`` the CuteDSL NVFP4 leaves bind. On an NVFP4_AWQ /
-    NVFP4_ARC layer, ``x`` is first scaled by ``fc31_act_scale``, the
-    checkpoint's per-channel pre-quant scale.
+    The shared helper used by CuteDSL NVFP4 leaves through a direct binding
+    or wrapper. On an NVFP4_AWQ / NVFP4_ARC layer, ``x`` is first scaled by
+    ``fc31_act_scale``, the checkpoint's per-channel pre-quant scale.
 
     Args:
         x: ``[num_tokens, hidden_size]`` bfloat16 activations, or an
