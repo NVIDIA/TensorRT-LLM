@@ -1165,7 +1165,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "'xhigh' uses its lowest or highest level instead: 'low' or "
                 "'high' on harmony/gpt-oss (low/medium/high, which also uses "
                 "'high' for 'max'), 'low' or 'max' with Kimi-style thinking "
-                "control (low/high/max, where 'none' turns thinking off)."),
+                "control (low/high/max, where 'none' turns thinking off). "
+                "gpt-oss cannot turn reasoning off, so on harmony/gpt-oss "
+                "'none' gives the server's default level, 'high', not this "
+                "field's default, 'low'."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose
