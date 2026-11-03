@@ -457,6 +457,13 @@ def _thinking_retention_kwargs(
     return {}
 
 
+# Anthropic's output_config.format has no name, but OpenAI's response_format
+# json_schema requires one, and a consumer that holds requests to the OpenAI
+# shape (the kimi_k3 serving extension does) rejects a schema without it. Guided
+# decoding reads only the schema, so the name changes nothing that is generated.
+_OUTPUT_FORMAT_SCHEMA_NAME = "structured_output"
+
+
 def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompletionRequest:
     """Translate an Anthropic Messages request into a chat completion request."""
     messages = _convert_messages(request)
@@ -517,7 +524,7 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
                 raise AnthropicRequestError("output_config.format.schema must be an object")
             chat_request["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"schema": schema},
+                "json_schema": {"name": _OUTPUT_FORMAT_SCHEMA_NAME, "schema": schema},
             }
 
     chat_template_kwargs.update(_thinking_retention_kwargs(request.context_management))
