@@ -2136,130 +2136,141 @@ constexpr static int kFinalizeWarpMaxExpertsPerToken = 32;
 // those kernels: acc = 0, then acc = acc + scale_k * (x_k [+ bias]) for each top-k slot k of the token whose expert
 // is on this rank, in increasing k, then a single conversion to OutputType. The outputs are therefore bitwise
 // identical to theirs.
-// A warp produces 32 x kFinalizeWarpVecsPerLane vectors of one output row per work item. Lanes [0, experts_per_token)
+// A warp produces 32 x kFinalizeWarpVecsPerLane vectors of one output row per work item. Lanes [0, expertsPerToken)
 // read the routing entries of the row's top-k slots in parallel, a ballot compacts the slots whose expert is on this
 // rank (keeping the k order), and the vector loads of kFinalizeWarpExpertsPerBatch slots are issued before their
-// FMAs. The grid is sized from the number of work items.
-// With kZeroFill = false a row is written iff one of its top-k slots has an expert on this rank.
-// finalizeMoeRoutingNoFillingKernel writes the same rows: the first such slot of every token always has a permuted row
-// below expert_first_token_offset[num_experts_per_node] (later duplicate slots of the same expert may not, and both
-// kernels then read the same unpermuted_row_to_permuted_row entry).
-template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE, bool kZeroFill>
+// FMAs.
+// With kZeroFill = true the work items are the (output row, slice) pairs. With kZeroFill = false they are the (valid
+// permuted row, slice) pairs, as in finalizeMoeRoutingNoFillingKernel: the permuted rows
+// [0, expertFirstTokenOffset[numExpertsPerNode]) are the top-k slots with an expert on this rank, and a token is
+// reduced at the permuted row of its first such slot only. The work therefore follows the rows routed to this rank,
+// not numRows, and the rows of tokens without an expert on this rank are not touched. The first such slot of a token
+// always has a permuted row (later duplicate slots of the same expert may not, and both kernels then read the same
+// unpermutedRowToPermutedRow entry).
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode kScaleMode, bool kZeroFill>
 __global__ void __launch_bounds__(kFinalizeWarpThreadsPerBlock, kFinalizeWarpMinBlocksPerSm)
-    finalizeMoeRoutingWarpKernel(GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
-        ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
-        int const* token_selected_experts, int64_t const num_rows, int64_t const padded_cols,
-        int64_t const unpadded_cols, int const experts_per_token, int const num_experts_per_node,
-        int const start_expert_id)
+    finalizeMoeRoutingWarpKernel(GemmOutputType const* expandedPermutedRows, OutputType* reducedUnpermutedOutput,
+        ScaleBiasType const* bias, float const* scales, int const* unpermutedRowToPermutedRow,
+        int const* permutedRowToUnpermutedRow, int const* tokenSelectedExperts, int64_t const* expertFirstTokenOffset,
+        int64_t const numRows, int64_t const paddedCols, int64_t const unpaddedCols, int const expertsPerToken,
+        int const numExpertsPerNode, int const startExpertId)
 {
     // Load 128-bits per thread, according to the smallest data type we read/write
-    constexpr int64_t FINALIZE_ELEM_PER_THREAD
-        = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+    constexpr int64_t kElemsPerVec = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
     constexpr int kWarpSize = 32;
-    constexpr unsigned kFullMask = 0xffffffffu;
+    constexpr unsigned kFullMask = 0xFFFFFFFFU;
 
     // Same element types as the block-per-row kernels; the aligned vector types make every access a single vector
     // load or store.
-    using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
-    using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
-    using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
-    using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
-    using BiasVec = cutlass::AlignedArray<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
-    using InputVec = cutlass::AlignedArray<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
-    using OutputVec = cutlass::AlignedArray<OutputType, FINALIZE_ELEM_PER_THREAD>;
+    using BiasElem = cutlass::Array<ScaleBiasType, kElemsPerVec>;
+    using InputElem = cutlass::Array<GemmOutputType, kElemsPerVec>;
+    using OutputElem = cutlass::Array<OutputType, kElemsPerVec>;
+    using ComputeElem = cutlass::Array<float, kElemsPerVec>;
+    using BiasVec = cutlass::AlignedArray<ScaleBiasType, kElemsPerVec>;
+    using InputVec = cutlass::AlignedArray<GemmOutputType, kElemsPerVec>;
+    using OutputVec = cutlass::AlignedArray<OutputType, kElemsPerVec>;
 
-    int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
-    int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
-    int64_t const elems_per_slice = kWarpSize * kFinalizeWarpVecsPerLane;
-    int64_t const num_slices = (num_elems_in_orig_col + elems_per_slice - 1) / elems_per_slice;
-    int64_t const num_work_items = num_rows * num_slices;
+    int64_t const numVecsInPaddedRow = paddedCols / kElemsPerVec;
+    int64_t const numVecsInRow = unpaddedCols / kElemsPerVec;
+    int64_t const vecsPerSlice = kWarpSize * kFinalizeWarpVecsPerLane;
+    int64_t const numSlices = (numVecsInRow + vecsPerSlice - 1) / vecsPerSlice;
 
     int const lane = threadIdx.x % kWarpSize;
     int64_t const warp = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarpSize;
-    int64_t const num_warps = static_cast<int64_t>(gridDim.x) * blockDim.x / kWarpSize;
+    int64_t const numWarps = static_cast<int64_t>(gridDim.x) * blockDim.x / kWarpSize;
 
-    auto const* bias_v = reinterpret_cast<BiasVec const*>(bias);
-    auto const* expanded_permuted_rows_v = reinterpret_cast<InputVec const*>(expanded_permuted_rows);
+    auto const* biasVecs = reinterpret_cast<BiasVec const*>(bias);
+    auto const* expandedPermutedRowVecs = reinterpret_cast<InputVec const*>(expandedPermutedRows);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
 
-    for (int64_t item = warp; item < num_work_items; item += num_warps)
+    int64_t const numItemRows = kZeroFill ? numRows : expertFirstTokenOffset[numExpertsPerNode];
+    int64_t const numWorkItems = numItemRows * numSlices;
+    for (int64_t item = warp; item < numWorkItems; item += numWarps)
     {
-        int64_t const row = item / num_slices;
-        int64_t const slice = item - row * num_slices;
+        int64_t const itemRow = item / numSlices;
+        int64_t const slice = item - itemRow * numSlices;
+        int64_t row = itemRow;
+        int64_t itemSlot = 0;
+        if constexpr (!kZeroFill)
+        {
+            int64_t const unpermutedRow = permutedRowToUnpermutedRow[itemRow];
+            itemSlot = unpermutedRow / numRows;
+            row = unpermutedRow % numRows;
+        }
 
         // Lane k looks up top-k slot k of this row.
-        bool is_local_slot = false;
-        int slot_permuted_row = 0;
-        int slot_expert_id = 0;
-        float slot_scale = 1.f;
-        if (lane < experts_per_token)
+        bool isLocalSlot = false;
+        int slotPermutedRow = 0;
+        int slotExpertId = 0;
+        float slotScale = 1.F;
+        if (lane < expertsPerToken)
         {
-            int64_t const k_offset = row * experts_per_token + lane;
-            int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
-            if (expert_id >= 0 && expert_id < num_experts_per_node)
+            int64_t const kOffset = row * expertsPerToken + lane;
+            int64_t const expertId = tokenSelectedExperts[kOffset] - startExpertId;
+            if (expertId >= 0 && expertId < numExpertsPerNode)
             {
-                is_local_slot = true;
-                slot_permuted_row = unpermuted_row_to_permuted_row[row + lane * num_rows];
-                slot_expert_id = static_cast<int>(expert_id);
-                if constexpr (SCALE_MODE == ScaleMode::DEFAULT)
+                isLocalSlot = true;
+                slotPermutedRow = unpermutedRowToPermutedRow[row + lane * numRows];
+                slotExpertId = static_cast<int>(expertId);
+                if constexpr (kScaleMode == ScaleMode::DEFAULT)
                 {
-                    slot_scale = scales[k_offset];
+                    slotScale = scales[kOffset];
                 }
             }
         }
-        uint32_t const local_slot_mask = __ballot_sync(kFullMask, is_local_slot);
+        uint32_t const localSlotMask = __ballot_sync(kFullMask, isLocalSlot);
         if constexpr (!kZeroFill)
         {
-            if (local_slot_mask == 0)
+            // Only the permuted row of the token's first local slot reduces the token.
+            if (localSlotMask == 0 || __ffs(localSlotMask) - 1 != itemSlot)
             {
                 continue;
             }
         }
         // Lane i takes the i-th local slot in increasing k.
-        int const num_local_slots = __popc(local_slot_mask);
-        uint32_t const src_lane = __fns(local_slot_mask, 0, lane + 1);
-        int const src = src_lane < kWarpSize ? static_cast<int>(src_lane) : 0;
-        int const local_permuted_row = __shfl_sync(kFullMask, slot_permuted_row, src);
-        int const local_expert_id = __shfl_sync(kFullMask, slot_expert_id, src);
-        float const local_scale = __shfl_sync(kFullMask, slot_scale, src);
+        int const numLocalSlots = __popc(localSlotMask);
+        uint32_t const srcLane = __fns(localSlotMask, 0, lane + 1);
+        int const src = srcLane < kWarpSize ? static_cast<int>(srcLane) : 0;
+        int const localPermutedRow = __shfl_sync(kFullMask, slotPermutedRow, src);
+        int const localExpertId = __shfl_sync(kFullMask, slotExpertId, src);
+        float const localScale = __shfl_sync(kFullMask, slotScale, src);
 
-        int64_t const first_elem_index = slice * elems_per_slice + lane;
+        int64_t const firstVecIndex = slice * vecsPerSlice + lane;
         // The last slice of a row can be partial.
-        bool in_row[kFinalizeWarpVecsPerLane];
-        ComputeElem thread_output[kFinalizeWarpVecsPerLane];
+        bool inRow[kFinalizeWarpVecsPerLane];
+        ComputeElem threadOutput[kFinalizeWarpVecsPerLane];
 #pragma unroll
         for (int v = 0; v < kFinalizeWarpVecsPerLane; ++v)
         {
-            in_row[v] = first_elem_index + kWarpSize * v < num_elems_in_orig_col;
-            thread_output[v].fill(0);
+            inRow[v] = firstVecIndex + kWarpSize * v < numVecsInRow;
+            threadOutput[v].fill(0);
         }
-        for (int i0 = 0; i0 < num_local_slots; i0 += kFinalizeWarpExpertsPerBatch)
+        for (int i0 = 0; i0 < numLocalSlots; i0 += kFinalizeWarpExpertsPerBatch)
         {
-            InputVec expert_vals[kFinalizeWarpExpertsPerBatch][kFinalizeWarpVecsPerLane];
-            BiasVec bias_vals[kFinalizeWarpExpertsPerBatch][kFinalizeWarpVecsPerLane];
-            float row_scales[kFinalizeWarpExpertsPerBatch];
+            InputVec expertVals[kFinalizeWarpExpertsPerBatch][kFinalizeWarpVecsPerLane];
+            BiasVec biasVals[kFinalizeWarpExpertsPerBatch][kFinalizeWarpVecsPerLane];
+            float rowScales[kFinalizeWarpExpertsPerBatch];
 #pragma unroll
             for (int b = 0; b < kFinalizeWarpExpertsPerBatch; ++b)
             {
-                int const permuted_row = __shfl_sync(kFullMask, local_permuted_row, (i0 + b) % kWarpSize);
-                int const expert_id = __shfl_sync(kFullMask, local_expert_id, (i0 + b) % kWarpSize);
-                row_scales[b] = __shfl_sync(kFullMask, local_scale, (i0 + b) % kWarpSize);
-                if (i0 + b < num_local_slots)
+                int const permutedRow = __shfl_sync(kFullMask, localPermutedRow, (i0 + b) % kWarpSize);
+                int const expertId = __shfl_sync(kFullMask, localExpertId, (i0 + b) % kWarpSize);
+                rowScales[b] = __shfl_sync(kFullMask, localScale, (i0 + b) % kWarpSize);
+                if (i0 + b < numLocalSlots)
                 {
 #pragma unroll
                     for (int v = 0; v < kFinalizeWarpVecsPerLane; ++v)
                     {
-                        if (in_row[v])
+                        if (inRow[v])
                         {
-                            int64_t const elem_index = first_elem_index + kWarpSize * v;
-                            expert_vals[b][v]
-                                = expanded_permuted_rows_v[permuted_row * num_elems_in_padded_col + elem_index];
+                            int64_t const vecIndex = firstVecIndex + kWarpSize * v;
+                            expertVals[b][v] = expandedPermutedRowVecs[permutedRow * numVecsInPaddedRow + vecIndex];
                             if (bias)
                             {
-                                bias_vals[b][v] = bias_v[expert_id * num_elems_in_padded_col + elem_index];
+                                biasVals[b][v] = biasVecs[expertId * numVecsInPaddedRow + vecIndex];
                             }
                         }
                     }
@@ -2268,36 +2279,36 @@ __global__ void __launch_bounds__(kFinalizeWarpThreadsPerBlock, kFinalizeWarpMin
 #pragma unroll
             for (int b = 0; b < kFinalizeWarpExpertsPerBatch; ++b)
             {
-                if (i0 + b < num_local_slots)
+                if (i0 + b < numLocalSlots)
                 {
-                    float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : row_scales[b];
+                    float const rowScale = (kScaleMode == ScaleMode::NO_SCALE) ? 1.F : rowScales[b];
 #pragma unroll
                     for (int v = 0; v < kFinalizeWarpVecsPerLane; ++v)
                     {
-                        if (in_row[v])
+                        if (inRow[v])
                         {
-                            ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_vals[b][v]);
+                            ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(expertVals[b][v]);
                             if (bias)
                             {
-                                expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_vals[b][v]);
+                                expertResult = expertResult + arrayConvert<BiasElem, ComputeElem>(biasVals[b][v]);
                             }
-                            thread_output[v] = thread_output[v] + row_scale * expert_result;
+                            threadOutput[v] = threadOutput[v] + rowScale * expertResult;
                         }
                     }
                 }
             }
         }
 
-        auto* reduced_row_ptr_v = reinterpret_cast<OutputVec*>(reduced_unpermuted_output + row * unpadded_cols);
+        auto* reducedRowVecs = reinterpret_cast<OutputVec*>(reducedUnpermutedOutput + row * unpaddedCols);
 #pragma unroll
         for (int v = 0; v < kFinalizeWarpVecsPerLane; ++v)
         {
-            if (in_row[v])
+            if (inRow[v])
             {
-                int64_t const elem_index = first_elem_index + kWarpSize * v;
-                OutputVec output_elem;
-                static_cast<OutputElem&>(output_elem) = arrayConvert<ComputeElem, OutputElem>(thread_output[v]);
-                reduced_row_ptr_v[elem_index] = output_elem;
+                int64_t const vecIndex = firstVecIndex + kWarpSize * v;
+                OutputVec outputVec;
+                static_cast<OutputElem&>(outputVec) = arrayConvert<ComputeElem, OutputElem>(threadOutput[v]);
+                reducedRowVecs[vecIndex] = outputVec;
             }
         }
     }
@@ -2316,63 +2327,66 @@ constexpr bool isFinalizeWarpKernelType()
         ;
 }
 
-// Whether finalizeMoeRoutingWarpKernel supports the shapes and pointers: the rows are whole vectors, the pointers are
-// aligned to the vector size and the top-k slots of a token fit in a warp.
+// Whether finalizeMoeRoutingWarpKernel runs for this launch: the GPU is SM100 or SM103, the rows are whole vectors, the
+// pointers are aligned to the vector size and the top-k slots of a token fit in a warp.
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
-bool canUseFinalizeMoeRoutingWarpKernel(GemmOutputType const* expanded_permuted_rows,
-    OutputType const* reduced_unpermuted_output, ScaleBiasType const* bias, int64_t const padded_cols,
-    int64_t const unpadded_cols, int64_t const experts_per_token)
+bool canUseFinalizeMoeRoutingWarpKernel(GemmOutputType const* expandedPermutedRows,
+    OutputType const* reducedUnpermutedOutput, ScaleBiasType const* bias, int64_t const paddedCols,
+    int64_t const unpaddedCols, int64_t const expertsPerToken)
 {
-    constexpr int64_t FINALIZE_ELEM_PER_THREAD
-        = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
-    auto const is_aligned
+    constexpr int64_t kElemsPerVec = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+    static int const smVersion = tensorrt_llm::common::getSMVersion();
+    auto const isAligned
         = [](void const* ptr, size_t alignment) { return reinterpret_cast<uintptr_t>(ptr) % alignment == 0; };
-    return experts_per_token >= 1 && experts_per_token <= kFinalizeWarpMaxExpertsPerToken
-        && padded_cols % FINALIZE_ELEM_PER_THREAD == 0 && unpadded_cols % FINALIZE_ELEM_PER_THREAD == 0
-        && is_aligned(expanded_permuted_rows, alignof(cutlass::AlignedArray<GemmOutputType, FINALIZE_ELEM_PER_THREAD>))
-        && is_aligned(reduced_unpermuted_output, alignof(cutlass::AlignedArray<OutputType, FINALIZE_ELEM_PER_THREAD>))
-        && is_aligned(bias, alignof(cutlass::AlignedArray<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>));
+    return (smVersion == 100 || smVersion == 103) && expertsPerToken >= 1
+        && expertsPerToken <= kFinalizeWarpMaxExpertsPerToken && paddedCols % kElemsPerVec == 0
+        && unpaddedCols % kElemsPerVec == 0
+        && isAligned(expandedPermutedRows, alignof(cutlass::AlignedArray<GemmOutputType, kElemsPerVec>))
+        && isAligned(reducedUnpermutedOutput, alignof(cutlass::AlignedArray<OutputType, kElemsPerVec>))
+        && isAligned(bias, alignof(cutlass::AlignedArray<ScaleBiasType, kElemsPerVec>));
 }
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
-void launchFinalizeMoeRoutingWarpKernel(cudaLaunchConfig_t& config, GemmOutputType const* expanded_permuted_rows,
-    OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
-    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts, int64_t const num_rows,
-    int64_t const padded_cols, int64_t const unpadded_cols, int64_t const experts_per_token,
-    int64_t const num_experts_per_node, int const start_expert_id, bool const zero_fill)
+void launchFinalizeMoeRoutingWarpKernel(cudaLaunchConfig_t& config, GemmOutputType const* expandedPermutedRows,
+    OutputType* reducedUnpermutedOutput, ScaleBiasType const* bias, float const* finalScales,
+    int const* unpermutedRowToPermutedRow, int const* permutedRowToUnpermutedRow, int const* tokenSelectedExperts,
+    int64_t const* expertFirstTokenOffset, int64_t const numRows, int64_t const paddedCols, int64_t const unpaddedCols,
+    int64_t const expertsPerToken, int64_t const numExpertsPerNode, int const startExpertId, bool const zeroFill)
 {
-    constexpr int64_t FINALIZE_ELEM_PER_THREAD
-        = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+    constexpr int64_t kElemsPerVec = 128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
     constexpr int kWarpSize = 32;
     constexpr int64_t kWarpsPerBlock = kFinalizeWarpThreadsPerBlock / kWarpSize;
-    constexpr int64_t kElemsPerSlice = kWarpSize * kFinalizeWarpVecsPerLane;
+    constexpr int64_t kVecsPerSlice = kWarpSize * kFinalizeWarpVecsPerLane;
 
-    int64_t const num_slices = (unpadded_cols / FINALIZE_ELEM_PER_THREAD + kElemsPerSlice - 1) / kElemsPerSlice;
-    int64_t const num_work_items = num_rows * num_slices;
-    if (num_work_items == 0)
+    int64_t const numSlices = (unpaddedCols / kElemsPerVec + kVecsPerSlice - 1) / kVecsPerSlice;
+    // Without zero-filling the kernel reads its number of work items from expertFirstTokenOffset; it is at most one
+    // per expanded row and slice.
+    int64_t const maxWorkItems = (zeroFill ? numRows : numRows * expertsPerToken) * numSlices;
+    if (maxWorkItems == 0)
     {
         return;
     }
 
-    auto func = final_scales
-        ? (zero_fill
+    auto func = finalScales
+        ? (zeroFill
                 ? &finalizeMoeRoutingWarpKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, true>
                 : &finalizeMoeRoutingWarpKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT, false>)
-        : (zero_fill
+        : (zeroFill
                 ? &finalizeMoeRoutingWarpKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, true>
                 : &finalizeMoeRoutingWarpKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE, false>);
 
     static int32_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int32_t const maxBlocksPerSM
+    int32_t const maxBlocksPerSm
         = std::max(tensorrt_llm::common::getMaxActiveBlocksPerSM(func, kFinalizeWarpThreadsPerBlock, 0), 1);
     int64_t const blocks = std::min(
-        (num_work_items + kWarpsPerBlock - 1) / kWarpsPerBlock, static_cast<int64_t>(smCount) * maxBlocksPerSM);
+        (maxWorkItems + kWarpsPerBlock - 1) / kWarpsPerBlock, static_cast<int64_t>(smCount) * maxBlocksPerSm);
 
     config.gridDim = blocks;
     config.blockDim = kFinalizeWarpThreadsPerBlock;
-    cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias, final_scales,
-        unpermuted_row_to_permuted_row, token_selected_experts, num_rows, padded_cols, unpadded_cols,
-        static_cast<int>(experts_per_token), static_cast<int>(num_experts_per_node), start_expert_id);
+    cudaLaunchKernelEx(&config, func, expandedPermutedRows, reducedUnpermutedOutput, bias, finalScales,
+        unpermutedRowToPermutedRow, permutedRowToUnpermutedRow, tokenSelectedExperts, expertFirstTokenOffset, numRows,
+        paddedCols, unpaddedCols, static_cast<int>(expertsPerToken), static_cast<int>(numExpertsPerNode),
+        startExpertId);
 }
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
@@ -2405,10 +2419,11 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
                 unpadded_cols, experts_per_token))
         {
             // With all-to-all comm the output rows of tokens without an expert on this rank are not filled with zeros.
-            bool const zero_fill = !(parallelism_config.ep_size > 1 && enable_alltoall);
+            bool const zeroFill = !(parallelism_config.ep_size > 1 && enable_alltoall);
             launchFinalizeMoeRoutingWarpKernel(config, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr,
-                final_scales, unpermuted_row_to_permuted_row, token_selected_experts, num_rows, padded_cols,
-                unpadded_cols, experts_per_token, num_experts_per_node, start_expert_id, zero_fill);
+                final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
+                expert_first_token_offset, num_rows, padded_cols, unpadded_cols, experts_per_token,
+                num_experts_per_node, start_expert_id, zeroFill);
             return;
         }
     }

@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-// finalizeMoeRoutingKernelLauncher runs finalizeMoeRoutingWarpKernel when the rows are whole 128-bit vectors, the
-// pointers are vector aligned and top_k <= 32, and the block-per-row kernels otherwise. Both must produce bitwise
-// identical outputs. The tests run the launcher several times on the same data, with the buffers it reads or writes
-// either 16-byte aligned (warp kernel) or shifted by 4, 8 or 12 bytes (block-per-row kernels, which access memory in
-// 32-bit words), compare the outputs bit for bit and check, with a stream capture, which kernel each launch runs.
+// On SM100 and SM103, finalizeMoeRoutingKernelLauncher runs finalizeMoeRoutingWarpKernel when the rows are whole
+// 128-bit vectors, the pointers are vector aligned and top_k <= 32, and the block-per-row kernels otherwise; on other
+// GPUs it always runs the block-per-row kernels. Both must produce bitwise identical outputs. The tests run the
+// launcher several times on the same data, with the buffers it reads or writes either 16-byte aligned (warp kernel) or
+// shifted by 4, 8 or 12 bytes (block-per-row kernels, which access memory in 32-bit words), compare the outputs bit for
+// bit and check, with a stream capture, which kernel each launch runs.
 
 #include <gtest/gtest.h>
 
@@ -30,17 +31,19 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <random>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-namespace tensorrt_llm::tests::kernels::moe_finalize
+namespace tensorrt_llm::tests::kernels::moeFinalize
 {
 
 namespace
@@ -148,7 +151,7 @@ struct BufferOffsets
 };
 
 //! Every buffer aligned (warp kernel when the shape allows it), then every buffer shifted by 4 bytes.
-std::vector<BufferOffsets> const kAlignedAndShifted{{}, {4, 4, 4}};
+constexpr std::array<BufferOffsets, 2> kAlignedAndShifted{{{}, {4, 4, 4}}};
 
 struct FinalizeCase
 {
@@ -164,6 +167,8 @@ struct FinalizeCase
     bool withScales = true;
     bool withBias = false;
     bool specialValues = false;
+    //! The last numPaddingRows rows have no expert at all, like the padding rows of an all-to-all receive buffer.
+    int64_t numPaddingRows = 0;
     uint32_t seed = 0;
 };
 
@@ -228,7 +233,7 @@ protected:
 
     //! Runs the launcher on the same data with each set of buffer offsets, checks which finalize kernel it launches
     //! and compares the outputs bit for bit with those of the first run.
-    void runCase(FinalizeCase const& c, std::vector<BufferOffsets> const& offsetsList = kAlignedAndShifted)
+    void runCase(FinalizeCase const& c, std::span<BufferOffsets const> offsetsList = kAlignedAndShifted)
     {
         std::mt19937 rng(c.seed);
         int64_t const paddedHidden = c.paddedHidden > 0 ? c.paddedHidden : c.hidden;
@@ -236,7 +241,8 @@ protected:
         int64_t const startExpert = numExpertsPerNode * c.epRank;
         int64_t const expandedRows = c.numRows * c.topK;
 
-        // Distinct experts per token; about one slot in ten has an id that belongs to no rank.
+        // Distinct experts per token; about one slot in ten has an id that belongs to no rank, and every slot of the
+        // padding rows does.
         std::vector<int> tokenSelectedExperts(expandedRows);
         std::vector<int> experts(c.numExperts);
         std::iota(experts.begin(), experts.end(), 0);
@@ -246,7 +252,8 @@ protected:
             std::shuffle(experts.begin(), experts.end(), rng);
             for (int64_t k = 0; k < c.topK; ++k)
             {
-                tokenSelectedExperts[row * c.topK + k] = uniform(rng) < 0.1F ? -1 : experts[k];
+                bool const isPadding = row >= c.numRows - c.numPaddingRows;
+                tokenSelectedExperts[row * c.topK + k] = (isPadding || uniform(rng) < 0.1F) ? -1 : experts[k];
             }
         }
 
@@ -307,8 +314,9 @@ protected:
         ck::MOEParallelismConfig const parallelismConfig(c.tpRank + 1, c.tpRank, c.epSize, c.epRank);
 
         constexpr int64_t kElemsPerVector = 16 / sizeof(T);
-        bool const shapeFitsWarpKernel
-            = c.topK >= 1 && c.topK <= 32 && c.hidden % kElemsPerVector == 0 && paddedHidden % kElemsPerVector == 0;
+        int const smVersion = tensorrt_llm::common::getSMVersion();
+        bool const shapeFitsWarpKernel = (smVersion == 100 || smVersion == 103) && c.topK >= 1 && c.topK <= 32
+            && c.hidden % kElemsPerVector == 0 && paddedHidden % kElemsPerVector == 0;
         bool const biasIsRead = c.withBias && c.tpRank == 0;
         std::vector<std::vector<Bits<T>>> outputs;
         for (auto const& offsets : offsetsList)
@@ -475,7 +483,7 @@ TYPED_TEST(MoeFinalizeKernelTest, TokenCounts)
 TYPED_TEST(MoeFinalizeKernelTest, EachMisalignedBufferFallsBack)
 {
     // Aligned, then the GEMM output, the output and the bias shifted one at a time, then all three.
-    std::vector<BufferOffsets> const offsetsList{{}, {4, 0, 0}, {0, 8, 0}, {0, 0, 12}, {4, 8, 12}};
+    constexpr std::array<BufferOffsets, 5> kOffsetsList{{{}, {4, 0, 0}, {0, 8, 0}, {0, 0, 12}, {4, 8, 12}}};
     for (bool const enableAlltoall : {false, true})
     {
         this->runCase({.numRows = 97,
@@ -487,18 +495,56 @@ TYPED_TEST(MoeFinalizeKernelTest, EachMisalignedBufferFallsBack)
                           .enableAlltoall = enableAlltoall,
                           .withBias = true,
                           .seed = 11},
-            offsetsList);
+            kOffsetsList);
     }
 }
 
 TYPED_TEST(MoeFinalizeKernelTest, MisalignedBiasIgnoredOffTpRank0)
 {
     // The bias is only added on TP rank 0, so on other ranks its alignment does not keep the warp kernel from running.
+    constexpr std::array<BufferOffsets, 3> kOffsetsList{{{}, {0, 0, 12}, {4, 4, 4}}};
     this->runCase(
         {.numRows = 97, .hidden = 2048, .topK = 8, .numExperts = 64, .tpRank = 1, .withBias = true, .seed = 5},
-        {{}, {0, 0, 12}, {4, 4, 4}});
+        kOffsetsList);
+}
+
+TYPED_TEST(MoeFinalizeKernelTest, AllToAllReceiveBufferLayouts)
+{
+    // All-to-all receive buffers: mostly padding rows without any expert (one rank with a large batch, the others
+    // with small ones), and wide EP where few tokens have an expert on this rank. The no-filling variant must write
+    // exactly the rows of tokens with an expert on this rank.
+    for (bool const enableAlltoall : {true, false})
+    {
+        this->runCase({.numRows = 4096,
+            .hidden = 7168,
+            .topK = 8,
+            .numExperts = 256,
+            .epSize = 8,
+            .epRank = 5,
+            .enableAlltoall = enableAlltoall,
+            .withBias = true,
+            .numPaddingRows = 3840,
+            .seed = 21});
+        this->runCase({.numRows = 2048,
+            .hidden = 4096,
+            .topK = 8,
+            .numExperts = 256,
+            .epSize = 32,
+            .epRank = 17,
+            .enableAlltoall = enableAlltoall,
+            .seed = 22});
+        this->runCase({.numRows = 1024,
+            .hidden = 2048,
+            .topK = 1,
+            .numExperts = 64,
+            .epSize = 8,
+            .epRank = 0,
+            .enableAlltoall = enableAlltoall,
+            .numPaddingRows = 900,
+            .seed = 23});
+    }
 }
 
 } // namespace
 
-} // namespace tensorrt_llm::tests::kernels::moe_finalize
+} // namespace tensorrt_llm::tests::kernels::moeFinalize

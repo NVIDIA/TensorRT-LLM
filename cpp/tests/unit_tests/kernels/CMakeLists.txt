@@ -97,8 +97,7 @@ add_tllm_gtest(
   moe/moeFinalizeKernelTest.cu
   FULL_STACK
   LABELS
-  "unit;kernel;gpu"
-  REQUIRES_GPU)
+  "unit;full-stack;kernels;moe;gpu")
 
 add_gtest(moeLoadBalanceKernelTest moe/moeLoadBalanceKernelTest.cpp)
 
