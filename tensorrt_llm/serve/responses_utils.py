@@ -111,6 +111,10 @@ REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
     "medium": ReasoningEffort.MEDIUM,
     "low": ReasoningEffort.LOW,
+    # OpenAI's "minimal" and "xhigh" take harmony's lowest and highest level,
+    # as on the chat completions route.
+    "minimal": ReasoningEffort.LOW,
+    "xhigh": ReasoningEffort.HIGH,
 }
 
 # Set TRTLLM_RESPONSES_DEBUG=1 to log each parsed input item and the full
@@ -503,7 +507,8 @@ class ConversationHistoryStore:
 
 def _get_system_message(
     model_identity: Optional[str] = None,
-    reasoning_effort: Optional[Literal["high", "medium", "low"]] = None,
+    reasoning_effort: Optional[Literal["minimal", "low", "medium", "high",
+                                       "xhigh"]] = None,
     start_date: Optional[str] = None,
     browser_description: Optional[str] = None,
     python_description: Optional[str] = None,

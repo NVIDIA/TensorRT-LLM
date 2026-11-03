@@ -1980,14 +1980,18 @@ def _create_usage_info(num_prompt_tokens,
 
 def maybe_transform_reasoning_effort(
     reasoning_effort: ReasoningEffort
-    | Literal["low", "medium", "high", "max", "none"] | None
+    | Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+    | None
 ) -> ReasoningEffort | None:
     str_to_effort = {
         "low": ReasoningEffort.LOW,
         "medium": ReasoningEffort.MEDIUM,
         "high": ReasoningEffort.HIGH,
-        # Kimi-style efforts accepted by the shared request schema; map to
-        # the nearest harmony level ("none" means no explicit effort).
+        # The other efforts the request schema accepts map to the nearest
+        # harmony level: "minimal" to the lowest, "xhigh" and "max" to the
+        # highest ("none" means no explicit effort).
+        "minimal": ReasoningEffort.LOW,
+        "xhigh": ReasoningEffort.HIGH,
         "max": ReasoningEffort.HIGH,
         "none": None,
     }

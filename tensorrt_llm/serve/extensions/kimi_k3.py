@@ -38,6 +38,17 @@ _DYNAMIC_TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,255}\Z")
 _RESPONSE_CHANNEL_OPEN = "<|open|>response<|sep|>"
 _RESPONSE_CHANNEL_CLOSE = "<|close|>response<|sep|>"
 
+# Request ``reasoning_effort`` -> K3 ``thinking_effort``. K3 has three efforts
+# (low, high, max); OpenAI's "minimal" and "xhigh" take the lowest and the
+# highest of them.
+_K3_THINKING_EFFORTS = {
+    "minimal": "low",
+    "low": "low",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
 
 def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
     """Enforce Kimi's pinned sampling-parameter policy when opted in.
@@ -205,8 +216,8 @@ class KimiK3ServingExtension(ServingExtension):
             if effort == "none":
                 if request.thinking is None:
                     derived["thinking"] = False
-            elif effort in ("low", "high", "max"):
-                derived["thinking_effort"] = effort
+            elif effort in _K3_THINKING_EFFORTS:
+                derived["thinking_effort"] = _K3_THINKING_EFFORTS[effort]
             # Other efforts (e.g. harmony's "medium") have no K3 equivalent;
             # leave the template default.
         if (

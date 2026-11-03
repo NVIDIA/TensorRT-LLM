@@ -298,6 +298,13 @@ class TestKimiExtensionMapping:
         req = self.apply(thinking={"type": "enabled", "keep": "all"}, reasoning_effort=effort)
         assert self.kwargs_of(req)["thinking_effort"] == effort
 
+    @pytest.mark.parametrize("effort, k3_effort", [("minimal", "low"), ("xhigh", "max")])
+    def test_openai_efforts_take_the_lowest_and_highest_k3_effort(
+        self, effort: str, k3_effort: str
+    ) -> None:
+        req = self.apply(reasoning_effort=effort)
+        assert self.kwargs_of(req) == {"thinking_effort": k3_effort}
+
     def test_reasoning_effort_none_disables_thinking_when_alone(self) -> None:
         req = self.apply(reasoning_effort="none")
         assert self.kwargs_of(req)["thinking"] is False
