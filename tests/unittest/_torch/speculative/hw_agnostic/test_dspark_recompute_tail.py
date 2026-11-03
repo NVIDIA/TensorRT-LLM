@@ -241,31 +241,30 @@ def _spec(tmp_path: Path, config: Optional[dict] = None, **kwargs: Any) -> DSpar
     return DSparkDecodingConfig(max_draft_len=7, speculative_model=str(tmp_path), **kwargs)
 
 
+_EMBEDDED = {"model_type": "deepseek_v4", "dspark_block_size": 7}
+
+
 class TestDSparkTailResolution:
-    def test_the_default_is_no_recompute(self, tmp_path: Path) -> None:
-        spec = _spec(tmp_path, _M31)
-        assert spec.context_recompute_tail == 0
-        spec.resolve_context_recompute_tail()
-        assert spec.context_recompute_tail == 0
-
-    def test_none_resolves_to_the_drafter_window(self, tmp_path: Path) -> None:
-        spec = _spec(tmp_path, _M31, context_recompute_tail=None)
-        assert spec.context_recompute_tail is None
-        spec.resolve_context_recompute_tail()
-        assert spec.context_recompute_tail == 4096
-
-    @pytest.mark.parametrize("tail", [0, 2048, -1])
-    def test_an_explicit_tail_is_kept(self, tmp_path: Path, tail: int) -> None:
-        spec = _spec(tmp_path, _M31, context_recompute_tail=tail)
-        spec.resolve_context_recompute_tail()
-        assert spec.context_recompute_tail == tail
-
-    def test_none_on_an_unwindowed_drafter_resolves_to_a_full_re_prefill(
-        self, tmp_path: Path
+    @pytest.mark.parametrize(
+        "config, requested, expected",
+        [
+            (_M31, 0, 0),
+            (_M31, None, 4096),
+            (_M31, 2048, 2048),
+            (_M31, -1, -1),
+            (_SPECULATORS, None, -1),
+            (_EMBEDDED, None, 0),
+        ],
+        ids=["default", "window", "explicit", "full-re-prefill", "unwindowed", "embedded"],
+    )
+    def test_llm_args_validation_resolves_the_tail(
+        self, tmp_path: Path, config: dict, requested: Optional[int], expected: int
     ) -> None:
-        spec = _spec(tmp_path, _SPECULATORS, context_recompute_tail=None)
-        spec.resolve_context_recompute_tail()
-        assert spec.context_recompute_tail == -1
+        spec = _spec(tmp_path, config, context_recompute_tail=requested)
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model", skip_tokenizer_init=True, speculative_config=spec
+        )
+        assert args.speculative_config.context_recompute_tail == expected
 
     def test_an_unreadable_checkpoint_waits_for_the_download(self, tmp_path: Path) -> None:
         spec = _spec(tmp_path / "hub-id", context_recompute_tail=None)
@@ -285,26 +284,6 @@ class TestDSparkTailResolution:
         (tmp_path / "hub-id" / "config.json").write_text(json.dumps(_M31))
         spec.resolve_from_checkpoint()
         assert spec.context_recompute_tail == 4096
-
-    def test_the_embedded_drafter_keeps_no_recompute(self, tmp_path: Path) -> None:
-        spec = _spec(
-            tmp_path,
-            {"model_type": "deepseek_v4", "dspark_block_size": 7},
-            context_recompute_tail=None,
-        )
-        assert spec.draft_is_embedded_in_target
-        spec.resolve_context_recompute_tail()
-        assert spec.context_recompute_tail == 0
-
-    @pytest.mark.parametrize("requested, expected", [(None, 4096), (0, 0), (1024, 1024)])
-    def test_llm_args_validation_resolves_the_tail(
-        self, tmp_path: Path, requested: Optional[int], expected: int
-    ) -> None:
-        spec = _spec(tmp_path, _M31, context_recompute_tail=requested)
-        args = TorchLlmArgs(
-            model="/tmp/dummy_model", skip_tokenizer_init=True, speculative_config=spec
-        )
-        assert args.speculative_config.context_recompute_tail == expected
 
     def test_remote_code_in_the_drafter_config_runs_only_when_trusted(self, tmp_path: Path) -> None:
         """Resolving ``None`` reads the drafter config under the user's ``trust_remote_code``."""
@@ -355,41 +334,32 @@ def _worker(*, addressable: bool = False, requested_tail: Optional[int] = 4096) 
     )
 
 
-class TestPrefixReuseReport:
-    @pytest.mark.parametrize(
-        "worker, target",
-        [
-            (_worker(addressable=True), _target(tail=0)),
-            (_worker(requested_tail=0), _target(enable_block_reuse=False, tail=0)),
-            (_worker(requested_tail=0), None),
-        ],
-        ids=["paired-pool-hands-the-prefix-back", "no-block-reuse", "no-target-manager"],
-    )
-    def test_nothing_to_report(self, worker: SimpleNamespace, target: Any) -> None:
-        with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
-            DFlashWorker._report_prefix_reuse(worker, target)
-        log.warning.assert_not_called()
-        log.info.assert_not_called()
-
-    def test_a_recomputed_tail_is_logged(self) -> None:
-        with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
-            DFlashWorker._report_prefix_reuse(_worker(), _target(tail=4096))
-        log.warning.assert_not_called()
-        assert "4096-token prompt tail" in log.info.call_args.args[0]
-
-    @pytest.mark.parametrize(
-        "requested_tail, expected",
-        [
-            (4096, "disabled context_recompute_tail=4096"),  # e.g. a per_conversation policy
-            (0, "context_recompute_tail is 0"),
-        ],
-    )
-    def test_a_starved_drafter_is_reported_with_the_reason(
-        self, requested_tail: int, expected: str
-    ) -> None:
-        with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
-            DFlashWorker._report_prefix_reuse(
-                _worker(requested_tail=requested_tail), _target(tail=0)
-            )
-        warnings = [c.args[0] for c in log.warning.call_args_list]
-        assert len(warnings) == 1 and expected in warnings[0]
+@pytest.mark.parametrize(
+    "worker, target, info, warning",
+    [
+        (_worker(addressable=True), _target(tail=0), None, None),
+        (_worker(requested_tail=0), _target(enable_block_reuse=False, tail=0), None, None),
+        (_worker(requested_tail=0), None, None, None),
+        (_worker(), _target(tail=4096), "4096-token prompt tail", None),
+        # e.g. a per_conversation policy disabled the configured tail
+        (_worker(), _target(tail=0), None, "disabled context_recompute_tail=4096"),
+        (_worker(requested_tail=0), _target(tail=0), None, "context_recompute_tail is 0"),
+    ],
+    ids=[
+        "paired-pool-hands-the-prefix-back",
+        "no-block-reuse",
+        "no-target-manager",
+        "recomputed-tail",
+        "tail-disabled-by-the-manager",
+        "no-tail-requested",
+    ],
+)
+def test_prefix_reuse_report(
+    worker: SimpleNamespace, target: Any, info: Optional[str], warning: Optional[str]
+) -> None:
+    with patch("tensorrt_llm._torch.speculative.dflash.logger") as log:
+        DFlashWorker._report_prefix_reuse(worker, target)
+    infos = [c.args[0] for c in log.info.call_args_list]
+    warnings = [c.args[0] for c in log.warning.call_args_list]
+    assert len(infos) == (info is not None) and all(info in m for m in infos)
+    assert len(warnings) == (warning is not None) and all(warning in m for m in warnings)

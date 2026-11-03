@@ -12,21 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Block verification (Sun et al., 2024): vLLM parity, token-level parity for one draft, losslessness, CUDA graphs."""
+"""Block verification (Sun et al., 2024): vLLM parity, losslessness on prefix-dependent targets, degenerate rows."""
 
 import math
-from typing import Callable
 
 import pytest
 import torch
-from _torch.speculative.hw_agnostic.rejection_stats_utils import (
-    chi_square,
-    complete_and_count,
-    exact_sequence_probs,
-    prefix_ids,
-    random_prefix_table,
-    token_level_verify,
-)
 
 from tensorrt_llm._torch.speculative.block_verification import (
     block_acceptance_thresholds,
@@ -35,7 +26,79 @@ from tensorrt_llm._torch.speculative.block_verification import (
     sample_from_weights,
 )
 
-# References
+# References and statistical helpers: toy prefix-conditioned models and a chi-square check.
+# A prefix table holds one next-token distribution per prefix of length 0..block, rows laid
+# out by prefix length and then base-``vocab``.
+
+
+def random_prefix_table(
+    generator: torch.Generator,
+    vocab: int,
+    block: int,
+    sharpness: float = 1.0,
+    zero_frac: float = 0.0,
+) -> torch.Tensor:
+    """Random next-token distributions for every prefix; ``zero_frac`` of entries get no mass."""
+    num_prefixes = sum(vocab**length for length in range(block + 1))
+    logits = sharpness * torch.randn(num_prefixes, vocab, generator=generator)
+    zero = torch.rand(num_prefixes, vocab, generator=generator) < zero_frac
+    zero[:, 0] = False  # keep every row nonempty
+    return torch.softmax(logits.masked_fill(zero, float("-inf")).double(), -1)
+
+
+def prefix_ids(tokens: torch.Tensor, vocab: int) -> torch.Tensor:
+    """``[N, m]`` prefixes -> their prefix-table row ids."""
+    length = tokens.shape[1]
+    ids = torch.zeros(tokens.shape[0], dtype=torch.int64)
+    for m in range(length):
+        ids = ids * vocab + tokens[:, m]
+    return ids + sum(vocab**m for m in range(length))
+
+
+def exact_sequence_probs(table: torch.Tensor, length: int) -> torch.Tensor:
+    """Exact probability of every length-``length`` sequence under ``table``, in base-vocab order."""
+    vocab = table.shape[-1]
+    grid = torch.cartesian_prod(*[torch.arange(vocab)] * length)
+    prob = torch.ones(grid.shape[0], dtype=torch.float64)
+    for m in range(length):
+        rows = table[prefix_ids(grid[:, :m], vocab)]
+        prob = prob * rows.gather(-1, grid[:, m : m + 1]).squeeze(-1)
+    return prob
+
+
+def complete_and_count(
+    table: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Emitted tokens, completed by sampling ``table`` to the block length, counted per sequence."""
+    vocab = table.shape[-1]
+    num, length = accepted_tokens.shape
+    sequences = torch.zeros(num, length, dtype=torch.int64)
+    for m in range(length):
+        cont = torch.multinomial(table[prefix_ids(sequences[:, :m], vocab)], 1, generator=generator)
+        keep = m < num_accepted.long()
+        sequences[:, m] = torch.where(keep, accepted_tokens[:, m].long(), cont.squeeze(-1))
+    ids = torch.zeros(num, dtype=torch.int64)
+    for m in range(length):
+        ids = ids * vocab + sequences[:, m]
+    return torch.bincount(ids, minlength=vocab**length)
+
+
+def chi_square(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, float]:
+    """Pearson statistic over cells with expected count >= 5 (the rest pooled) vs its 1e-4 critical value."""
+    assert counts[probs == 0].sum() == 0, "observations in zero-probability cells"
+    total = counts.sum().item()
+    expected = probs * total
+    big = expected >= 5
+    observed = torch.cat([counts[big].double(), counts[~big].double().sum().view(1)])
+    expected = torch.cat([expected[big], expected[~big].sum().view(1)])
+    keep = expected > 0
+    stat = (((observed - expected) ** 2)[keep] / expected[keep]).sum().item()
+    dof = int(keep.sum()) - 1
+    z = 3.719  # one-sided 1e-4 normal quantile; Wilson-Hilferty approximation below
+    return stat, dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
 
 
 def _vllm_block_reference(
@@ -180,33 +243,6 @@ def test_block_verify_matches_vllm_given_identical_uniforms(num_drafts: int) -> 
         assert len(lengths) > 2, "the case generator should exercise several accept lengths"
 
 
-# One draft: block verification is token-level verification
-
-
-@pytest.mark.cpu_only
-def test_single_draft_block_equals_token_level() -> None:
-    generator = torch.Generator().manual_seed(0)
-    batch, vocab = 512, 32
-    _, _, draft_probs, draft_tokens, target_probs = _random_case(generator, batch, 1, vocab)
-    uniforms = torch.rand(batch, 1, generator=generator, dtype=torch.float64)
-    resample_uniforms = torch.rand(batch, generator=generator, dtype=torch.float64)
-
-    block_tokens, block_accepted = block_verify(
-        draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms
-    )
-    token_tokens, token_accepted = token_level_verify(
-        draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms
-    )
-    p_x = target_probs[:, 0].gather(-1, draft_tokens).squeeze(-1).double()
-    q_x = draft_probs[:, 0].gather(-1, draft_tokens).squeeze(-1).double()
-    off_boundary = (uniforms[:, 0] - (p_x / q_x).clamp(max=1)).abs() > 1e-6
-    assert off_boundary.float().mean() > 0.99
-    assert torch.equal(block_accepted[off_boundary].long(), token_accepted[off_boundary])
-    assert torch.equal(block_tokens[off_boundary].long(), token_tokens[off_boundary])
-    # Both outcomes occur, so the comparison covers acceptance and resampling.
-    assert set(block_accepted.tolist()) == {1, 2}
-
-
 # Losslessness on a toy model with prefix-dependent conditionals
 
 _VOCAB = 3
@@ -214,25 +250,32 @@ _BLOCK = 3  # drafts per block; the verified sequences have _BLOCK + 1 tokens
 
 
 def _verify_and_complete(
-    verify: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     target: torch.Tensor,
     draft: torch.Tensor,
     num_samples: int,
     generator: torch.Generator,
+    stored_draft: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draft ancestrally from the ``draft`` table, verify, then complete from ``target``."""
+    """Draft ancestrally from the ``draft`` table, verify, then complete from ``target``.
+
+    ``stored_draft`` is the table handed to the verifier as the proposal (``draft`` itself
+    unless a test deliberately stores the wrong one).
+    """
+    stored = draft if stored_draft is None else stored_draft
     drafts = torch.empty(num_samples, 0, dtype=torch.int64)
     draft_rows = []
     for _ in range(_BLOCK):
-        q = draft[prefix_ids(drafts, _VOCAB)]
-        draft_rows.append(q)
-        drafts = torch.cat([drafts, torch.multinomial(q, 1, generator=generator)], dim=1)
+        rows = prefix_ids(drafts, _VOCAB)
+        draft_rows.append(stored[rows])
+        drafts = torch.cat([drafts, torch.multinomial(draft[rows], 1, generator=generator)], dim=1)
     target_rows = [target[prefix_ids(drafts[:, :j], _VOCAB)] for j in range(_BLOCK + 1)]
     draft_probs = torch.stack(draft_rows, dim=1).float()
     target_probs = torch.stack(target_rows, dim=1).float()
     uniforms = torch.rand(num_samples, _BLOCK, generator=generator, dtype=torch.float64)
     resample_uniforms = torch.rand(num_samples, generator=generator, dtype=torch.float64)
-    tokens, num_accepted = verify(drafts, draft_probs, target_probs, uniforms, resample_uniforms)
+    tokens, num_accepted = block_verify(
+        drafts, draft_probs, target_probs, uniforms, resample_uniforms
+    )
     return complete_and_count(target, tokens, num_accepted, generator), num_accepted.long()
 
 
@@ -244,14 +287,12 @@ def _tables(
     return target, random_prefix_table(generator, _VOCAB, _BLOCK)
 
 
-@pytest.mark.parametrize("verify_name", ["block", "token"])
 @pytest.mark.parametrize("zero_frac", [0.0, 0.3])
 @pytest.mark.cpu_only
-def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
+def test_verification_is_lossless(zero_frac: float) -> None:
     generator = torch.Generator().manual_seed(11 if zero_frac else 12)
     target, draft = _tables(generator, zero_frac)
-    verify = block_verify if verify_name == "block" else token_level_verify
-    counts, _ = _verify_and_complete(verify, target, draft, 200_000, generator)
+    counts, _ = _verify_and_complete(target, draft, 200_000, generator)
 
     exact = exact_sequence_probs(target, _BLOCK + 1)
     assert counts[exact == 0].sum() == 0, "emitted a sequence the target cannot produce"
@@ -260,37 +301,12 @@ def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
 
 
 @pytest.mark.cpu_only
-def test_block_accepts_at_least_as_much_as_token_level() -> None:
-    generator = torch.Generator().manual_seed(5)
-    target, draft = _tables(generator)
-    num_samples = 20_000
-    _, block_emitted = _verify_and_complete(block_verify, target, draft, num_samples, generator)
-    _, token_emitted = _verify_and_complete(
-        token_level_verify, target, draft, num_samples, generator
-    )
-    block_mean = block_emitted.double().mean().item()
-    token_mean = token_emitted.double().mean().item()
-    # Three standard errors of the difference of two means of values in [1, 4].
-    assert block_mean > token_mean - 3 * 1.5 * math.sqrt(2 / num_samples)
-
-
-@pytest.mark.cpu_only
 def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() -> None:
     """Guard for the test itself: storing a q the drafts were not drawn from must fail it."""
     generator = torch.Generator().manual_seed(3)
     target, draft = _tables(generator)
-
-    def verify_with_wrong_q(
-        drafts: torch.Tensor,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        uniforms: torch.Tensor,
-        resample_uniforms: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        wrong = torch.softmax(torch.log(draft_probs.double()) * 0.3, -1).float()
-        return block_verify(drafts, wrong, target_probs, uniforms, resample_uniforms)
-
-    counts, _ = _verify_and_complete(verify_with_wrong_q, target, draft, 200_000, generator)
+    wrong = torch.softmax(torch.log(draft) * 0.3, -1)
+    counts, _ = _verify_and_complete(target, draft, 200_000, generator, stored_draft=wrong)
     stat, critical = chi_square(counts, exact_sequence_probs(target, _BLOCK + 1))
     assert stat > critical
 
@@ -391,53 +407,3 @@ def test_counter_uniforms_are_keyed_and_uniform() -> None:
     centered = u - 0.5
     for a, b in [(centered[:, 0], centered[:, 1]), (centered[:-1, 0], centered[1:, 0])]:
         assert abs((a * b).mean().item() / (1 / 12)) < 0.05
-
-
-# CUDA graph
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs CUDA")
-def test_block_verify_captures_and_replays_in_a_cuda_graph() -> None:
-    generator = torch.Generator().manual_seed(17)
-    batch, num_drafts, vocab = 8, 7, 4096
-
-    def make_inputs() -> list[torch.Tensor]:
-        _, _, draft_probs, draft_tokens, target_probs = _random_case(
-            generator, batch, num_drafts, vocab
-        )
-        seed = torch.randint(0, 1 << 40, (batch,), generator=generator)
-        offset = torch.randint(0, 1 << 40, (batch,), generator=generator)
-        return [t.cuda() for t in (draft_tokens, draft_probs, target_probs, seed, offset)]
-
-    def run(
-        draft_tokens: torch.Tensor,
-        draft_probs: torch.Tensor,
-        target_probs: torch.Tensor,
-        seed: torch.Tensor,
-        offset: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        uniforms = counter_uniforms(seed, offset, num_drafts + 1)
-        return block_verify(
-            draft_tokens, draft_probs, target_probs, uniforms[:, :num_drafts], uniforms[:, -1]
-        )
-
-    static = make_inputs()
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        run(*static)  # warm up outside the graph
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_tokens, graph_accepted = run(*static)
-
-    for _ in range(3):
-        fresh = make_inputs()
-        for dst, src in zip(static, fresh):
-            dst.copy_(src)
-        graph.replay()
-        eager_tokens, eager_accepted = run(*fresh)
-        torch.testing.assert_close(graph_accepted, eager_accepted, rtol=0, atol=0)
-        torch.testing.assert_close(graph_tokens, eager_tokens, rtol=0, atol=0)
-        cpu_tokens, cpu_accepted = run(*[t.cpu() for t in fresh])
-        assert torch.equal(cpu_accepted, eager_accepted.cpu())

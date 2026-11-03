@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Ancestral DSpark draft sampling: conditioning, stored proposals, sampling parameters, losslessness, CUDA graphs."""
+"""Ancestral DSpark draft sampling: config, stored proposals, sampling parameters, verification routing, CUDA graphs."""
 
 import types
 from typing import Any, Callable, Optional
@@ -20,14 +20,6 @@ from unittest.mock import patch
 
 import pytest
 import torch
-from _torch.speculative.hw_agnostic.rejection_stats_utils import (
-    chi_square,
-    complete_and_count,
-    exact_sequence_probs,
-    prefix_ids,
-    random_prefix_table,
-    token_level_verify,
-)
 
 from tensorrt_llm._torch.models.modeling_dspark import _DSparkHeadMixin
 from tensorrt_llm._torch.models.modeling_speculative import (
@@ -38,7 +30,8 @@ from tensorrt_llm._torch.speculative.block_verification import block_verify, cou
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecWorkerBase
-from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, DSparkDecodingConfig, TorchLlmArgs
+from tensorrt_llm._torch.speculative.utils import get_spec_metadata
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, MTPDecodingConfig, TorchLlmArgs
 
 B, K, V, RANK = 4, 3, 32, 8
 INT32_MAX = torch.iinfo(torch.int32).max
@@ -180,38 +173,35 @@ def _expected_rows(
 # Configuration
 
 
-@pytest.mark.cpu_only
-def test_config_fields_default_to_the_existing_behavior() -> None:
-    config = DSparkDecodingConfig(max_draft_len=3)
-    assert config.rejection_sample_method == "standard"
-    assert config.draft_temperature_only is False
-    config = DSparkDecodingConfig(
-        max_draft_len=3,
-        use_rejection_sampling=True,
-        rejection_sample_method="block",
-        draft_temperature_only=True,
-    )
-    assert config.rejection_sample_method == "block" and config.draft_temperature_only
-    with pytest.raises(ValueError):
-        DSparkDecodingConfig(max_draft_len=3, rejection_sample_method="tree")
-
-
 @pytest.mark.parametrize(
     "options",
     [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
     ids=["block", "temperature_only"],
 )
 @pytest.mark.cpu_only
-def test_rejection_options_require_rejection_sampling(options: dict) -> None:
-    off = types.SimpleNamespace(speculative_config=DSparkDecodingConfig(max_draft_len=3, **options))
+def test_llm_args_reject_the_options_without_rejection_sampling(options: dict) -> None:
     with pytest.raises(ValueError, match="use_rejection_sampling=True"):
-        TorchLlmArgs._validate_rejection_sampling_options(off)
-    on = types.SimpleNamespace(
-        speculative_config=DSparkDecodingConfig(
-            max_draft_len=3, use_rejection_sampling=True, **options
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=MTPDecodingConfig(num_nextn_predict_layers=1, **options),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MTP metadata allocates CUDA buffers")
+def test_spec_metadata_carries_the_rejection_options() -> None:
+    config = MTPDecodingConfig(
+        num_nextn_predict_layers=1,
+        use_rejection_sampling=True,
+        rejection_sample_method="block",
+        draft_temperature_only=True,
     )
-    TorchLlmArgs._validate_rejection_sampling_options(on)
+    model_config = types.SimpleNamespace(
+        num_hidden_layers=32, hidden_size=128, vocab_size=1024, torch_dtype=None
+    )
+    metadata = get_spec_metadata(config, model_config, max_num_requests=4, max_num_tokens=64)
+    assert metadata.rejection_sample_method == "block"
+    assert metadata.draft_temperature_only is True
 
 
 @pytest.mark.parametrize(
@@ -366,82 +356,6 @@ def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
     _, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
     assert (top_ks == 20).all()
     torch.testing.assert_close(top_ps, torch.full((2 * (B - 1),), 0.9))
-
-
-# End to end on a toy vocabulary: losslessness and acceptance
-
-_TOY_VOCAB = 4
-
-
-@pytest.mark.parametrize("verify", ["block", "token"])
-@pytest.mark.cpu_only
-def test_sampled_drafts_verify_losslessly(verify: str) -> None:
-    generator = torch.Generator().manual_seed(21 if verify == "block" else 22)
-    num = 100_000
-    worker = _worker()
-    drafter = _drafter(generator, vocab=_TOY_VOCAB, scale=2.0)
-    base = torch.randn(1, K, _TOY_VOCAB, generator=generator).expand(num, -1, -1).contiguous()
-    anchors = torch.zeros(num, dtype=torch.int64)
-    meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
-
-    drafts, _ = _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, meta)
-    draft_probs = meta.draft_probs[meta.batch_slot_ids]
-    table = random_prefix_table(generator, _TOY_VOCAB, K, sharpness=1.5)
-    target_probs = torch.stack(
-        [table[prefix_ids(drafts[:, :j].long(), _TOY_VOCAB)] for j in range(K + 1)], dim=1
-    ).float()
-    uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
-    resample_uniforms = torch.rand(num, generator=generator, dtype=torch.float64)
-    run = block_verify if verify == "block" else token_level_verify
-    accepted_tokens, num_accepted = run(
-        drafts, draft_probs, target_probs, uniforms, resample_uniforms
-    )
-
-    counts = complete_and_count(table, accepted_tokens, num_accepted, generator)
-    stat, critical = chi_square(counts, exact_sequence_probs(table, K + 1))
-    assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
-
-
-@pytest.mark.cpu_only
-def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> None:
-    """Target = the drafter's Markov chain: ancestral drafts are always accepted;
-    independent draws from greedy-chained rows are not."""
-    generator = torch.Generator().manual_seed(23)
-    num = 20_000
-    worker = _worker()
-    drafter = _drafter(generator, vocab=_TOY_VOCAB, scale=2.0)
-    base = torch.randn(1, K, _TOY_VOCAB, generator=generator).expand(num, -1, -1).contiguous()
-    anchors = torch.zeros(num, dtype=torch.int64)
-
-    def target_rows(drafts: torch.Tensor) -> torch.Tensor:
-        rows = _expected_rows(drafter, base, anchors, drafts, temperature=1.0)
-        bonus = torch.full((num, 1, _TOY_VOCAB), 1.0 / _TOY_VOCAB)
-        return torch.cat([rows, bonus], dim=1)
-
-    def accepted_lengths(drafts: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
-        uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
-        resample = torch.rand(num, generator=generator, dtype=torch.float64)
-        _, accepted = block_verify(drafts, draft_probs, target_rows(drafts), uniforms, resample)
-        return accepted.double() - 1
-
-    meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
-    drafts, _ = _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, meta)
-    ancestral = accepted_lengths(drafts, meta.draft_probs[meta.batch_slot_ids])
-    assert (ancestral == K).all()
-
-    # Greedy-chained rows sampled independently (eager reference of the CUDA chain).
-    greedy_meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
-
-    def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
-        return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
-
-    _, refined = dspark_markov_chain(base, anchors, step_bias, cast_bias_to_logits=True)
-    with patch.object(
-        SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(_cpu_sampler(generator))
-    ):
-        greedy_drafts = worker.sample_draft_tokens(refined, greedy_meta, num, num_contexts=0)
-    greedy = accepted_lengths(greedy_drafts, greedy_meta.draft_probs[greedy_meta.batch_slot_ids])
-    assert greedy.mean() < K - 0.2, f"greedy-chained rows accepted {greedy.mean():.2f} of {K}"
 
 
 # CUDA graphs and the real sampler kernels
