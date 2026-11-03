@@ -5407,8 +5407,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "(2000 samples / 120s by default). When False (default) the rebalance "
         "hook is skipped entirely and pool ratios remain at their "
         "warmup-derived values. Beta: enable at your own risk. Only used when "
-        "using KV cache manager v2 (experimental). This option is incompatible "
-        "with dtype='fp8_ds_mla'.")
+        "using KV cache manager v2 (experimental). With dtype='fp8_ds_mla' it "
+        "requires kv_pool_rebalance_config.copy_based_rebalancing.")
 
     kv_pool_rebalance_config: KvPoolRebalanceConfig = Field(
         default_factory=KvPoolRebalanceConfig,
@@ -5557,12 +5557,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
-        """Reject resizing while packed sparse-MLA pool views are fixed."""
-        if self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance:
+        """Reject VMM resizing while packed sparse-MLA pool views are fixed.
+
+        The packed sparse-MLA views (pool base pointers, per-layer buffer pointers and the
+        footer-scale pool extents) are captured once at construction. VMM resizing changes them;
+        copy-based rebalancing (CoReba) keeps every pool in one arena whose base address and
+        page-index upper bound never change, so those views stay valid and only the page
+        indices (block tables) move.
+        """
+        if (self.dtype == "fp8_ds_mla" and self.enable_kv_pool_rebalance
+                and not self.kv_pool_rebalance_config.copy_based_rebalancing):
             raise ValueError(
-                "kv_cache_config.dtype='fp8_ds_mla' is incompatible with "
-                "kv_cache_config.enable_kv_pool_rebalance=True because packed "
-                "sparse-MLA pool views are fixed at cache-manager construction time."
+                "kv_cache_config.dtype='fp8_ds_mla' with "
+                "kv_cache_config.enable_kv_pool_rebalance=True requires "
+                "kv_pool_rebalance_config.copy_based_rebalancing=True: packed "
+                "sparse-MLA pool views are fixed at cache-manager construction time, "
+                "and only copy-based rebalancing keeps the pool addresses fixed."
             )
         return self
 
