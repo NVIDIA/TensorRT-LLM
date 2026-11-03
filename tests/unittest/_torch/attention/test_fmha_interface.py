@@ -115,6 +115,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn.qk_nope_head_dim = 4
     attn.qk_rope_head_dim = 2
     attn.print_skip_softmax_stat = False
+    attn.cache_context_plan = False
     attn.kv_scale_orig_quant = None
     attn.kv_scale_quant_orig = None
     attn.get_local_layer_idx.return_value = 0

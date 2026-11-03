@@ -984,6 +984,12 @@ def _create_py_executor(
         kv_cache_config.enable_block_reuse = False
         model_engine.attn_runtime_features.cache_reuse = False
 
+    # A user-set budget also bounds the transfers where PyExecutor would
+    # bypass the transfer window.
+    transfer_budget_is_explicit = (
+        cache_transceiver_config is not None
+        and cache_transceiver_config.max_tokens_in_buffer is not None)
+
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
     # tokens_per_block multiple: CacheTransBufferManager requires
@@ -1296,6 +1302,7 @@ def _create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
+            transfer_budget_is_explicit=transfer_budget_is_explicit,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
             max_num_sequences=max_num_seq_slots,

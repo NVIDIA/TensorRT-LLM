@@ -7,7 +7,9 @@ replaces (`renorm_moe_routing_op` -> pre-routed `fp4_block_scale_moe_runner`),
 and it sits inside the pre-routed entry's band against this entry's own
 fp32 reference. The NVFP4 operand construction (layout, activations, scalars,
 the band) uses ordinary shared test helpers. Beyond the cells: the refusal
-of an uncertified (num_experts, top_k) pair.
+of an uncertified (num_experts, top_k) pair, and per `DECODE_TACTICS` bucket
+that the pinned tactic is a valid runner config and answers bitwise what the
+AutoTuner path's untuned (runner-default) tactic answers.
 """
 
 import zlib
@@ -16,7 +18,13 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
+    ACT_SWIGLU,
     CERTIFIED_PAIRS,
+    DECODE_TACTICS,
+    DECODE_TACTICS_GEOMETRY,
+    ROUTING_RENORMALIZE,
+    _ckpt,
+    _pinned_tactic,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as op,
@@ -95,3 +103,53 @@ def test_uncertified_pair_refused(many_expert_layer):  # noqa: F811
     )
     with validating(op), pytest.raises(AssertionError, match="certified Renormalize"):
         _routed(args, data, sf, logits, scalars, spec, top_k=9)
+
+
+@pytest.mark.parametrize("bucket", sorted(DECODE_TACTICS))
+def test_decode_tactic_valid_and_bitwise(bucket, many_expert_layer):  # noqa: F811
+    """The pinned tactic of each decode bucket is what a call there runs, is a valid config of
+    the runner, and gives bitwise the output of the AutoTuner path outside tuning mode (the
+    runner's default tactic for the shape)."""
+    spec = _ckpt(bucket)
+    num_experts, top_k, hidden, inter = DECODE_TACTICS_GEOMETRY
+    assert (spec["num_experts"], spec["top_k"], spec["hidden"], spec["intermediate"]) == (
+        num_experts,
+        top_k,
+        hidden,
+        inter,
+    )
+    # None (the AutoTuner path, with a warning) if the runner does not list it as valid here.
+    assert _pinned_tactic(bucket, num_experts, top_k, hidden, inter) == DECODE_TACTICS[bucket]
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 7000 + bucket, renorm_moe_routing_op
+    )
+    y = _routed(args, data, sf, logits, scalars, spec)
+    y_tuner = torch.ops.trtllm.fp4_block_scale_moe_runner(
+        logits,
+        None,
+        data,
+        sf.view(torch.float8_e4m3fn),
+        args["gemm1_weights"],
+        args["gemm1_weights_scale"],
+        None,
+        None,
+        None,
+        None,
+        args["gemm2_weights"],
+        args["gemm2_weights_scale"],
+        None,
+        *scalars,
+        num_experts,
+        top_k,
+        None,
+        None,
+        inter,
+        0,
+        num_experts,
+        None,
+        ROUTING_RENORMALIZE,
+        True,
+        ACT_SWIGLU,
+    )[0]
+    differing = (y.view(torch.int16) != y_tuner.view(torch.int16)).any(dim=1).sum().item()
+    assert differing == 0, f"{differing} of {bucket} rows differ from the AutoTuner path"

@@ -81,6 +81,21 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
+  # GDN fused target verify.
+  - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/modules/mamba/test_gdn_kernel_optimizations.py
+  - unittest/_torch/moe/test_moe_decode_front.py
+  - unittest/_torch/moe/test_draft_experts_nvfp4.py
+  - unittest/_torch/modules/test_embedding_lookup.py
+  # GQA decode FMHA libraries (SM100 runs them with unittest/_torch/attention in l0_b200).
+  - unittest/_torch/attention/test_gqa_decode_fmha.py
+  # One-model speculative decoding: step copies, MXFP8 draft head, MTP fc input, steady prepare.
+  - unittest/_torch/kernels/test_spec_step_copies.py
+  - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/modules/test_mxfp8_draft_head.py
+  - unittest/_torch/modules/test_q35_mtp_glue.py
+  - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
 - condition:
     ranges:
       system_gpu_count:

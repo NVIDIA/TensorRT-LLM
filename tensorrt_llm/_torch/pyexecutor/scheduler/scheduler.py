@@ -372,6 +372,15 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        """Register the executor's disaggregated KV-transfer window
+        (DisaggTransferAdmissionController), when it bounds admission.
+
+        Only schedulers that allocate KV cache while scheduling use it, to skip
+        the generation-init requests the window would defer; the default is a
+        no-op.
+        """
+
 
 @dataclass
 class SerializableSchedulerOutput:
@@ -722,6 +731,9 @@ class MultimodalScheduler(RequestScheduler):
     @property
     def scheduling_state_range(self) -> tuple[LlmRequestState, LlmRequestState]:
         return self.scheduler.scheduling_state_range
+
+    def set_disagg_transfer_admission_controller(self, controller) -> None:
+        self.scheduler.set_disagg_transfer_admission_controller(controller)
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(

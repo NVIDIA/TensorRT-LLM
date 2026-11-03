@@ -561,6 +561,26 @@ def test_prefix_token_cache_retokenizes_extended_text():
     assert tokenizer.calls == ["ab", "abc"]
 
 
+def test_router_tokenization_cache_reuses_cached_prompt_prefix():
+    class CharTokenizer:
+        is_fast = True
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            return {
+                "input_ids": [ord(c) for c in text],
+                "offset_mapping": [(i, i + 1) for i in range(len(text))],
+            }
+
+    tokenizer = CharTokenizer()
+    block_hashing = SharedBlockHashMixin()
+    block_hashing._init_block_hashing(enable_tokenization_cache=True)
+    previous = "system prompt and tools. " * 400
+    for prompt in (previous, previous + "<|im_start|>user\nmore"):
+        ids = block_hashing._encode_with_prefix_cache(prompt, 1, tokenizer)
+        assert ids == [ord(c) for c in prompt]
+    assert block_hashing._prefix_token_cache(tokenizer).hits == 1
+
+
 def test_stateless_router_places_locally_in_worker():
     """Verify stateless round-robin placement remains local.
 
