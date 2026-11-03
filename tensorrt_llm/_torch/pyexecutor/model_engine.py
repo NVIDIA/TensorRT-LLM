@@ -80,17 +80,16 @@ from .scheduler import ScheduledRequests
 
 
 def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
-    """``spec_decode_fast_paths`` of the one-engine speculative language model
-    (the model itself, or a multimodal model's language model); False for any
-    other model."""
-    from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
-
+    """``spec_decode_fast_paths`` of the language model (the model itself, or a
+    multimodal model's language model): the one-engine speculative language
+    model's, or that of a model that builds its own speculative branch, such as
+    a Modeling V2 target; False for a model that does not set it."""
     if isinstance(model, MultimodalModelMixin):
         try:
             model = model.language_model
         except NotImplementedError:
             return False
-    return isinstance(model, SpecDecOneEngineForCausalLM) and model.spec_decode_fast_paths
+    return bool(getattr(model, "spec_decode_fast_paths", False))
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -417,12 +416,14 @@ class ModelEngine:
             self.model,
             llm_args=self.llm_args,
             mapping=self.mapping,
+            dist=self.dist,
             max_num_tokens=self.max_num_tokens,
             prefill_capture_num_tokens=self._prefill_cuda_graph_num_tokens,
         )
         self.model = compiled.model
         self._torch_compile_backend = compiled.backend
         self._torch_compile_prefill_only = compiled.prefill_only
+        self._nccl_window_tensor_scope_hooks = compiled.nccl_window_tensor_scope_hooks
         # Capture local encoders after their metadata is sized and before
         # KV-cache estimation, so graph memory is included in the profile.
         mm_config = self.llm_args.multimodal_config

@@ -137,6 +137,7 @@ class CompiledModel:
     caller: ModelCaller
     backend: Backend | None
     prefill_only: bool
+    nccl_window_tensor_scope_hooks: list
 
 
 def _eager_decoder_scope(model: torch.nn.Module) -> torch.nn.Module:
@@ -240,6 +241,7 @@ def compile_model(
     *,
     llm_args: TorchLlmArgs,
     mapping: Mapping,
+    dist: Distributed | None,
     max_num_tokens: int,
     prefill_capture_num_tokens: list[int],
 ) -> CompiledModel:
@@ -279,6 +281,11 @@ def compile_model(
 
     backend = None
     prefill_only = False
+    nccl_window_tensor_scope_hooks = []
+    # A forward without peers cannot allocate NCCL window leases. DWDP
+    # peers are separate from the model-parallel communicator's world size.
+    window_scopes_enabled = dist is not None and (dist.world_size > 1 or mapping.dwdp_enabled)
+
     backend_num_streams = None
     try:
         if torch_compile_enabled:
@@ -340,7 +347,8 @@ def compile_model(
             torch._dynamo.config.cache_size_limit = 16
         else:
             set_torch_compiling(False)
-            install_eager_nccl_window_tensor_scopes(model)
+            if window_scopes_enabled:
+                nccl_window_tensor_scope_hooks = install_eager_nccl_window_tensor_scopes(model)
     except Exception as e:
         traceback.print_exception(Exception, e, e.__traceback__)
         raise e
@@ -349,8 +357,15 @@ def compile_model(
         compile_backend=backend,
         aux_streams=backend_num_streams,
         prefill_compile_only=prefill_only,
+        nccl_window_scopes_enabled=window_scopes_enabled,
     )
-    return CompiledModel(model=model, caller=caller, backend=backend, prefill_only=prefill_only)
+    return CompiledModel(
+        model=model,
+        caller=caller,
+        backend=backend,
+        prefill_only=prefill_only,
+        nccl_window_tensor_scope_hooks=nccl_window_tensor_scope_hooks,
+    )
 
 
 _DEEP_GEMM_PDL_CONFIGURED = False

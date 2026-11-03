@@ -32,6 +32,10 @@ from .._utils import nvtx_mark, nvtx_range_debug
 from ..llmapi.utils import (ManagedThread, enable_llm_debug, logger_debug,
                             print_colored)
 
+# Linger applied by ZeroMqQueue.close() to a socket still at zmq's infinite
+# default, so closing never waits forever for a peer that has exited.
+CLOSE_LINGER_MS = 1000
+
 
 class ZeroMqQueue:
     ''' A Queue-like container for IPC using ZeroMQ. '''
@@ -396,7 +400,17 @@ class ZeroMqQueue:
                 raise asyncio.TimeoutError()
 
     def close(self):
+        """Close the socket and terminate the queue's context.
+
+        ``context.term()`` blocks until every message queued on the socket has
+        been sent or the socket's linger expires. A socket left at zmq's
+        infinite default linger (-1) is given ``CLOSE_LINGER_MS`` first, so a
+        message addressed to a peer that has already exited cannot block
+        teardown forever. A linger set explicitly by the caller is kept.
+        """
         if self.socket:
+            if self.socket.getsockopt(zmq.LINGER) < 0:
+                self.socket.setsockopt(zmq.LINGER, CLOSE_LINGER_MS)
             self.socket.close()
             self.socket = None
         if self.context:

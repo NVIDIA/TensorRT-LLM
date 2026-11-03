@@ -133,6 +133,7 @@ class EncoderExecutor:
                 model,
                 llm_args=llm_args,
                 mapping=mapping,
+                dist=dist,
                 max_num_tokens=max_num_tokens,
                 prefill_capture_num_tokens=plan.prefill_num_tokens,
             )
