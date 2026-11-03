@@ -22,7 +22,11 @@ from tensorrt_llm import bindings
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    _LEGACY_PROTOCOL_VERSION,
+    NATIVE_TRANSFER_PROTOCOL_VERSION,
+    RankInfo,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -276,3 +280,38 @@ class TestMambaHelixCP:
         # Paired sender
         paired_ri = _mamba_rank_info(tp_size=2, tp_rank=1)
         assert MambaPolicy.is_paired(paired_ri, peer_ri)
+
+
+def test_from_bytes_defaults_missing_protocol_version_to_legacy():
+    import msgpack
+
+    ri = RankInfo(
+        instance_name="gen_0",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[1],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+    # A current RankInfo defaults to the current version and carries it on the wire.
+    assert ri.protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+    assert RankInfo.from_bytes(ri.to_bytes()).protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
+
+    # A peer that predates the versioned frames sends no version field; it must
+    # decode as the legacy version (so validate_protocol_version rejects it)
+    # rather than silently adopting the current version.
+    without_version = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    without_version.pop("protocol_version", None)
+    legacy = RankInfo.from_bytes(msgpack.packb(without_version))
+    assert legacy.protocol_version == _LEGACY_PROTOCOL_VERSION
+    assert _LEGACY_PROTOCOL_VERSION != NATIVE_TRANSFER_PROTOCOL_VERSION
+    # A peer that predates the versioned frames sends no version field.
+    older = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    older.pop("protocol_version")
+    restored = RankInfo.from_bytes(msgpack.packb(older))
+    assert restored.protocol_version == _LEGACY_PROTOCOL_VERSION
+    assert restored.protocol_version != NATIVE_TRANSFER_PROTOCOL_VERSION
