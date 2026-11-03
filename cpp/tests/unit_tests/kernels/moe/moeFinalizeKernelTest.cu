@@ -366,6 +366,33 @@ protected:
                 << ", hidden=" << c.hidden << ", topK=" << c.topK << ", epSize=" << c.epSize
                 << ", enableAlltoall=" << c.enableAlltoall << ")";
         }
+
+        // The no-filling variant must leave the rows of tokens without an expert on this rank untouched.
+        if (c.epSize > 1 && c.enableAlltoall)
+        {
+            for (int64_t row = 0; row < c.numRows; ++row)
+            {
+                bool hasLocalExpert = false;
+                for (int64_t k = 0; k < c.topK; ++k)
+                {
+                    int64_t const expert = tokenSelectedExperts[row * c.topK + k] - startExpert;
+                    hasLocalExpert = hasLocalExpert || (expert >= 0 && expert < numExpertsPerNode);
+                }
+                if (hasLocalExpert)
+                {
+                    continue;
+                }
+                auto const init = outputInit.begin() + row * c.hidden;
+                for (size_t i = 0; i < outputs.size(); ++i)
+                {
+                    auto const first = outputs[i].begin() + row * c.hidden;
+                    ASSERT_TRUE(std::equal(first, first + c.hidden, init))
+                        << "run " << i << " wrote row " << row
+                        << ", which has no expert on this rank (numRows=" << c.numRows << ", topK=" << c.topK
+                        << ", epSize=" << c.epSize << ")";
+                }
+            }
+        }
     }
 
     cudaStream_t mStream{};
