@@ -3686,6 +3686,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # The fused MLA RoPE kernels fit: the context latents of every layer in one
     # launch, and per layer the query RoPE plus the block latent norm/RoPE/store.
     _fused_mla_rope: bool = False
+    # Side stream of the step's split-KV plan, joined before the first decode.
+    _side_stream: Optional[torch.cuda.Stream] = None
+    # Scratch row indices of the fused block store, per (tokens, device).
+    _scratch_index: Optional[Dict] = None
+    waits_for_ctx_store = True
 
     def __init__(
         self,
@@ -3969,12 +3974,19 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         self._cute_dsl_checked_shape = key
 
-    def _mla_split_kv_plan(self, seq_lens: torch.Tensor, num_heads: int, block_size: int):
+    def _mla_split_kv_plan(
+        self,
+        seq_lens: torch.Tensor,
+        num_heads: int,
+        block_size: int,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
         """Per-request split-KV counts of the block decode, planned once per step.
 
         The planner the target's CuTe DSL MLA decode uses, from this step's
         lengths and the block decode's geometry. None (the kernel's uniform
         split) when its buffer cannot be allocated, inside a graph capture.
+        ``stream``: launch there, behind the current stream's work.
         """
         from ..attention.backends.fmha.cute_dsl_mla import (
             _SPLIT_PLAN_MAX_REQUESTS,
@@ -3996,13 +4008,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 _SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device=seq_lens.device
             )
         rows_per_request, wave_clusters = mla_split_kv_plan_geometry(num_heads, block_size)
-        launch_mla_split_kv_plan(
-            seq_lens,
-            self._mla_split_plan,
-            num_requests=batch,
-            rows_per_request=rows_per_request,
-            wave_clusters=wave_clusters,
-        )
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream or torch.cuda.current_stream()):
+            launch_mla_split_kv_plan(
+                seq_lens,
+                self._mla_split_plan,
+                num_requests=batch,
+                rows_per_request=rows_per_request,
+                wave_clusters=wave_clusters,
+            )
         return self._mla_split_plan[:batch]
 
     def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
@@ -4133,9 +4148,18 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
 
     def _block_scratch_index(self, num_tokens: int, device):
-        """Pages ``arange(num_tokens)`` and offsets 0 of ``[num_tokens, 1, D]`` scratch rows."""
+        """Pages ``arange(num_tokens)`` and offsets 0 of ``[num_tokens, 1, D]`` scratch rows,
+        built once per shape outside graph capture (they depend on the shape only)."""
+        key = (num_tokens, device)
+        if self._scratch_index is not None and key in self._scratch_index:
+            return self._scratch_index[key]
         rows = torch.arange(num_tokens, device=device)
-        return rows, torch.zeros_like(rows)
+        index = (rows, torch.zeros_like(rows))
+        if not torch.cuda.is_current_stream_capturing():
+            if self._scratch_index is None:
+                self._scratch_index = {}
+            self._scratch_index[key] = index
+        return index
 
     def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
@@ -4440,10 +4464,19 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 num_ctx_per_req[:batch], page_tables.long(), block_size, page_size, shard
             )
         attn_heads = num_heads if shard is None else num_heads * shard.cp_size
+        # Side work joined before layer 0's first draft-pool write: the context
+        # latent store the worker may have queued, and the split-KV plan, which
+        # runs beside layer 0's projections.
+        ctx_stored = None if block_placement is None else block_placement.ctx_stored
+        plan_stream = None
         if variant == "cute_dsl":
-            fixup = fixup._replace(
-                split_kvs=self._mla_split_kv_plan(fixup.seq_lens_i32, attn_heads, block_size)
+            if self._side_stream is None:
+                self._side_stream = torch.cuda.Stream(device=device)
+            split_kvs = self._mla_split_kv_plan(
+                fixup.seq_lens_i32, attn_heads, block_size, stream=self._side_stream
             )
+            plan_stream = None if split_kvs is None else self._side_stream
+            fixup = fixup._replace(split_kvs=split_kvs)
         logger.info_once(
             "MLA DSpark block decode: "
             + {
@@ -4505,6 +4538,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             # dual-source split is the DFlash contract, not an MLA detail.
             blk_latent = attn.kv_a_proj_with_mqa(hs_normed)
             blk_kv = None
+            if layer_idx == 0:
+                if plan_stream is not None:
+                    torch.cuda.current_stream().wait_stream(plan_stream)
+                if ctx_stored is not None:
+                    torch.cuda.current_stream().wait_event(ctx_stored)
             if fused_rope:
                 self._fused_block_rope(q, query, blk_latent, attn, layer_idx, ctx_kv_cache,
                                        fixup, flat_positions, freqs_real)  # fmt: skip

@@ -211,6 +211,9 @@ class DraftBlockPlacement(NamedTuple):
     offsets: torch.Tensor  # [G, block] int64
     seq_lens: torch.Tensor  # [G] int32
     kv_bounds: torch.Tensor  # [G * block] int32
+    # Recorded after the step's context latent store when it runs on a side
+    # stream; the drafter waits on it before its first draft-pool write.
+    ctx_stored: Optional[torch.cuda.Event] = None
 
 
 class PagedLatentPrepare(NamedTuple):

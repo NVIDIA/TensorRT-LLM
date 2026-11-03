@@ -1261,6 +1261,9 @@ class DSparkWorker(DFlashWorker):
             self.spec_config, shift_label=getattr(draft_model, "_dspark_shift_label", False)
         )
 
+    def _draft_first_slot(self, draft_model) -> int:
+        return 0 if getattr(draft_model, "_dspark_shift_label", False) else 1
+
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
     ) -> torch.Tensor:

@@ -153,8 +153,11 @@ def _paged_worker(draft_len, page_size, max_blocks, num_slots, layers, head_dim,
     return worker, storage
 
 
+@pytest.mark.parametrize("side_stream", [False, True])
 @pytest.mark.parametrize("draft_len", [3, 7])
-def test_paged_latent_prepare_matches_eager(draft_len):
+def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
+    """``side_stream``: the fused path stores the context latents on the
+    worker's side stream and hands the drafter the event to wait on."""
     vocab, hidden, features, layers, head_dim = 100, 64, 128, 3, 96
     page_size, max_blocks, num_slots, max_ctx = 16, 6, 10, 70
     num_ctx_reqs, num_gens = 1, 6
@@ -203,6 +206,7 @@ def test_paged_latent_prepare_matches_eager(draft_len):
         w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
         w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
         w._fused_gen_prepare_applies = lambda *_: fused
+        w._ctx_store_stream = torch.cuda.Stream() if fused and side_stream else None
         md = attn_metadata()
         inputs = w.prepare_1st_drafter_inputs(
             input_ids=None,
@@ -215,6 +219,10 @@ def test_paged_latent_prepare_matches_eager(draft_len):
             draft_model=drafter,
             total_target_tokens=captured.shape[0],
         )
+        stored = None if inputs["block_placement"] is None else inputs["block_placement"].ctx_stored
+        assert (stored is not None) == (fused and side_stream)
+        if stored is not None:
+            torch.cuda.current_stream().wait_event(stored)
         return inputs, w._ctx_len, md, pool_storage
 
     eager, eager_len, eager_md, eager_pool = prepare(False)

@@ -759,6 +759,10 @@ class DFlashWorker(SpecWorkerBase):
     # Pages of the drafter's context this helix CP rank holds when a helix
     # target manager hosts them; None when every rank holds the whole context.
     _ctx_helix: Optional[HelixDraftShard] = None
+    # The paged context latent store's side stream, and the operands of its
+    # last launch (kept alive until the next step, after the drafter joined it).
+    _ctx_store_stream: Optional[torch.cuda.Stream] = None
+    _ctx_store_operands: tuple = ()
 
     def __init__(
         self,
@@ -1359,6 +1363,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_helix = None
         draft_model.ctx_helix_shard = None
         self._paged_latent_prepare = False
+        self._ctx_store_stream = None
         max_batch = spec_metadata.max_num_requests
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
@@ -1533,6 +1538,8 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_kv_ptrs = torch.tensor(
                     [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
                 )
+                if draft_model.waits_for_ctx_store:
+                    self._ctx_store_stream = torch.cuda.Stream()
                 # The fused preparation stores single-latent context entries
                 # projected from the captured target features through fc and
                 # hidden_norm (which every loaded DFlash drafter owns), as the
@@ -2131,13 +2138,17 @@ class DFlashWorker(SpecWorkerBase):
                 # Which block slots carry them is a drafter-family convention,
                 # resolved through _draft_slot_ids.
                 block_size = self._compute_block_size
-                gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
-                # Shields only the last request: at block_size == K with
-                # shift_label off, slots run 1..K, so every request reads the
-                # next one's slot 0 and the last overruns. Degrades, never raises.
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
-
-                gen_hidden_states = hidden_states_out[gen_gather_ids]
+                first = self._draft_first_slot(draft_model)
+                if num_gens == 1 and first + K <= hidden_states_out.shape[0]:
+                    # One request: its slots are a contiguous row range, read in place.
+                    gen_hidden_states = hidden_states_out[first : first + K]
+                else:
+                    gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
+                    # Shields only the last request: at block_size == K with
+                    # shift_label off, slots run 1..K, so every request reads the
+                    # next one's slot 0 and the last overruns. Degrades, never raises.
+                    gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+                    gen_hidden_states = hidden_states_out[gen_gather_ids]
                 vocab_parallel = self._vocab_parallel
                 if (
                     vocab_parallel is not None
@@ -2277,6 +2288,11 @@ class DFlashWorker(SpecWorkerBase):
     def block_width_for(spec_config) -> int:
         """Block slots a worker of this family computes for ``spec_config``."""
         return spec_config.max_draft_len + 1
+
+    def _draft_first_slot(self, draft_model) -> int:
+        """The block slot whose hidden state predicts the first draft token; must
+        agree with :meth:`_draft_slot_ids` (slots ``first .. first + K - 1``)."""
+        return 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -2721,7 +2737,7 @@ class DFlashWorker(SpecWorkerBase):
         latent, _ = draft_model.precompute_context_kv(
             projected.to(self._ctx_dtype), prep.ctx_positions
         )
-        store_context_latents(
+        store_args = (
             latent[:, :, 0],
             self._ctx_kv_buf,
             self._ctx_kv_ptrs,
@@ -2729,6 +2745,20 @@ class DFlashWorker(SpecWorkerBase):
             prep.store_offsets,
             prep.store_mask,
         )
+        ctx_stored = None
+        store = self._ctx_store_stream
+        if store is None:
+            store_context_latents(*store_args)
+        else:
+            # Beside the drafter's first projections; the drafter waits on
+            # ctx_stored before its first draft-pool write (the store's masked
+            # rows zero slots the block latents then take).
+            store.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(store):
+                store_context_latents(*store_args)
+                ctx_stored = torch.cuda.Event()
+                ctx_stored.record()
+            self._ctx_store_operands = (latent, prep)
         return {
             "lilicorr_anchor": None,
             "noise_embedding": noise_embedding,
@@ -2743,6 +2773,6 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_kv_cache": self._ctx_kv_buf,
             "ctx_page_table": self._ctx_block_tables,
             "block_placement": DraftBlockPlacement(
-                prep.blk_pages, prep.blk_offsets, prep.blk_seq_lens, prep.blk_kv_bounds
+                prep.blk_pages, prep.blk_offsets, prep.blk_seq_lens, prep.blk_kv_bounds, ctx_stored
             ),
         }

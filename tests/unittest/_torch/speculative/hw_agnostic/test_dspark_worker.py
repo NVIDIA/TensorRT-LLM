@@ -968,6 +968,12 @@ def test_dspark_worker_policies_come_from_the_drafter():
         worker, legacy, num_gens=2, block_size=5, num_draft_tokens=3
     )
     assert ids.tolist() == base_ids.tolist()
+    # The single-request row range reads exactly the slots _draft_slot_ids names.
+    for shift_label in (False, True):
+        drafter = types.SimpleNamespace(_dspark_shift_label=shift_label)
+        first = worker._draft_first_slot(drafter)
+        ids = worker._draft_slot_ids(drafter, num_gens=1, block_size=5, num_draft_tokens=3)
+        assert ids.tolist() == list(range(first, first + 3))
 
     # No Markov head -> the backbone logits pass through untouched.
     logits = torch.randn(2, 3, 8, device="cuda")

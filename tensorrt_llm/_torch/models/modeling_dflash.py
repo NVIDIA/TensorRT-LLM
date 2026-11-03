@@ -525,6 +525,10 @@ class DFlashForCausalLM(nn.Module):
     # The helix shard of the context the worker bound (DFlashWorker), or None.
     ctx_helix_shard = None
 
+    # The block decode waits on block_placement.ctx_stored before its first
+    # draft-pool write, so the worker may store the context latents on a side stream.
+    waits_for_ctx_store = False
+
     @property
     def reads_helix_sharded_ctx_pages(self) -> bool:
         """Whether the block decode reads a context whose pages are sharded over
