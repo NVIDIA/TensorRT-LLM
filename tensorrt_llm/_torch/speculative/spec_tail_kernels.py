@@ -134,6 +134,7 @@ def _decode_block_table_kernel(
     stride_src_col,
     n_blocks,
     divisor,
+    block_offset,
     table_ptr,
     stride_table,
     counts_ptr,
@@ -148,16 +149,25 @@ def _decode_block_table_kernel(
         cols = start + offs
         mask = cols < n_blocks
         encoded = tl.load(src_row + cols * stride_src_col, mask=mask, other=-1).to(tl.int64)
+        encoded -= block_offset
         extent = tl.maximum(extent, tl.where(encoded >= 0, cols.to(tl.int64) + 1, 0))
         tl.store(table_row + cols, (tl.maximum(encoded, 0) // divisor).to(tl.int32), mask=mask)
     tl.store(counts_ptr + row, tl.max(extent, axis=0))
 
 
 def decode_draft_block_table(
-    src: torch.Tensor, divisor: int, table: torch.Tensor, counts: torch.Tensor
+    src: torch.Tensor,
+    divisor: int,
+    table: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    block_offset: int = 0,
 ) -> None:
-    """``counts[i]`` = one past the last ``j`` with ``src[i, j] >= 0`` (0 when
-    none); ``table[i] = src[i].clamp(min=0) // divisor``.
+    """Decode layer-relative block offsets without modifying ``src``.
+
+    For ``encoded = src - block_offset``, computes
+    ``table[i] = encoded[i].clamp(min=0) // divisor`` and ``counts[i]`` = one
+    past the last ``j`` with ``encoded[i, j] >= 0`` (0 when none).
 
     The extent, not the number of backed entries: a sliding-window pool
     releases a row's low entries, and positions are indexed from entry 0, so
@@ -168,6 +178,7 @@ def decode_draft_block_table(
         divisor: encoded offset -> pool block index divisor.
         table: ``[>= rows, blocks]`` int32 output, unit inner stride.
         counts: ``[>= rows]`` int64 output.
+        block_offset: this layer's K-buffer offset within each physical slot.
     """
     rows, n_blocks = src.shape
     assert table.shape[-1] == n_blocks and table.stride(-1) == 1
@@ -179,6 +190,7 @@ def decode_draft_block_table(
         src.stride(1),
         n_blocks,
         int(divisor),
+        int(block_offset),
         table,
         table.stride(0),
         counts,

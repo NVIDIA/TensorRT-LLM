@@ -64,8 +64,10 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
 
 
-def test_decode_draft_block_table_matches_eager() -> None:
-    """The decoded table is the clamped, divided offsets; the count is each
+@pytest.mark.parametrize("block_offset", [0, 3])
+def test_decode_draft_block_table_matches_eager(block_offset: int) -> None:
+    """The decoded table is the clamped, divided layer-relative offsets
+    (``src - block_offset``, with ``src`` left untouched); the count is each
     row's extent, one past its last backed entry, so a sliding window that
     released the low entries leaves the count covering the positions the row
     still addresses."""
@@ -81,22 +83,30 @@ def test_decode_draft_block_table_matches_eager() -> None:
     view = src[1, :rows, 0]
     view[0] = -torch.randint(1, 1 << 20, (n_blocks,), device="cuda", generator=gen).to(torch.int32)
     view[1] = 0
+    view[2] = block_offset
     # A windowed row: entries 0..99 released, 100..139 backed, the rest unfunded.
-    view[2] = -1
-    view[2, 100:140] = torch.arange(100, 140, device="cuda", dtype=torch.int32) * divisor
+    view[3] = -1
+    view[3, 100:140] = (
+        torch.arange(100, 140, device="cuda", dtype=torch.int32) * divisor + block_offset
+    )
     assert bool((view < 0).float().mean() > 0.3) and bool((view == 0).float().mean() > 0.2)
     table = torch.full((rows + 3, n_blocks), -7, dtype=torch.int32, device="cuda")
     counts = torch.full((rows + 3,), -7, dtype=torch.long, device="cuda")
-    decode_draft_block_table(view, divisor, table, counts)
-    encoded = view.to(torch.int64)
+    original = src.clone()
+    decode_draft_block_table(view, divisor, table, counts, block_offset=block_offset)
+    assert torch.equal(src, original)
+    encoded = view.to(torch.int64) - block_offset
     ordinals = torch.arange(1, n_blocks + 1, device="cuda")
     extent = torch.where(encoded >= 0, ordinals, 0).max(dim=1).values
     assert torch.equal(counts[:rows], extent)
-    assert counts[2].item() == 140
+    assert counts[3].item() == 140
+    assert torch.equal(table[3, 100:140], torch.arange(100, 140, device="cuda", dtype=torch.int32))
     expected = encoded.clamp(min=0).div(divisor, rounding_mode="floor").to(torch.int32)
     assert torch.equal(table[:rows], expected)
     assert counts[0].item() == 0 and bool((table[0] == 0).all())
-    assert counts[1].item() == n_blocks and bool((table[1] == 0).all())
+    assert counts[1].item() == (n_blocks if block_offset == 0 else 0)
+    assert bool((table[1] == 0).all())
+    assert counts[2].item() == n_blocks and bool((table[2] == 0).all())
     assert bool((table[rows:] == -7).all()) and bool((counts[rows:] == -7).all())
 
 
