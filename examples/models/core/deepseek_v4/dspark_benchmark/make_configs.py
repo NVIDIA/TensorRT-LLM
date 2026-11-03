@@ -3,9 +3,10 @@
 """Write the runtime YAMLs of CONFIDENCE_REPRODUCTION.md for 8 GPUs (attention DP + 8-way EP).
 
 For every global batch size BS it writes bs<BS>-fixed-k<K>.yaml (DSpark with a fixed draft length)
-and bs<BS>-confidence-k<K>.yaml (confidence scheduling with maximum draft length K). The rank-local
-batch size is BS/8, and the decode CUDA graphs are captured at 16, 32, 64, 128 and 256 below BS/8
-plus BS/8 itself.
+and bs<BS>-confidence-k<K>.yaml (confidence scheduling with maximum draft length K). With --rerank it
+also writes bs<BS>-confidence-rerank-k<K>.yaml, the same with device re-ranking turned on. The
+rank-local batch size is BS/8, and the decode CUDA graphs are captured at 16, 32, 64, 128 and 256
+below BS/8 plus BS/8 itself.
 """
 
 import argparse
@@ -67,9 +68,15 @@ def main() -> None:
     )
     parser.add_argument("--fixed-k", type=int, nargs="+", default=[1, 2, 3, 4, 5])
     parser.add_argument("--confidence-k", type=int, nargs="+", default=[3, 4, 5])
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="also write confidence configs with device re-ranking (enable_fused_confidence_scheduler)",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    variants = [("confidence", False)] + ([("confidence-rerank", True)] if args.rerank else [])
     for batch_size in args.batch_sizes:
         for k in args.fixed_k:
             config = base_config(batch_size)
@@ -81,21 +88,22 @@ def main() -> None:
             path = args.output_dir / f"bs{batch_size}-fixed-k{k}.yaml"
             path.write_text(yaml.safe_dump(config, sort_keys=False))
         for k in args.confidence_k:
-            config = base_config(batch_size)
-            config["speculative_config"] = {
-                "decoding_type": "DSpark",
-                "max_draft_len": k,
-                "block_size": k,
-                "enable_confidence_scheduling": True,
-                "confidence_cost_table_path": str(args.cost_table.resolve()),
-                "confidence_calibration_path": str(args.calibration.resolve()),
-            }
-            path = args.output_dir / f"bs{batch_size}-confidence-k{k}.yaml"
-            path.write_text(yaml.safe_dump(config, sort_keys=False))
-    print(
-        f"wrote {len(args.batch_sizes) * (len(args.fixed_k) + len(args.confidence_k))} configs "
-        f"to {args.output_dir}"
-    )
+            for name, rerank in variants:
+                config = base_config(batch_size)
+                config["speculative_config"] = {
+                    "decoding_type": "DSpark",
+                    "max_draft_len": k,
+                    "block_size": k,
+                    "enable_confidence_scheduling": True,
+                    "confidence_cost_table_path": str(args.cost_table.resolve()),
+                    "confidence_calibration_path": str(args.calibration.resolve()),
+                }
+                if rerank:
+                    config["speculative_config"]["enable_fused_confidence_scheduler"] = True
+                path = args.output_dir / f"bs{batch_size}-{name}-k{k}.yaml"
+                path.write_text(yaml.safe_dump(config, sort_keys=False))
+    count = len(args.batch_sizes) * (len(args.fixed_k) + len(args.confidence_k) * len(variants))
+    print(f"wrote {count} configs to {args.output_dir}")
 
 
 if __name__ == "__main__":

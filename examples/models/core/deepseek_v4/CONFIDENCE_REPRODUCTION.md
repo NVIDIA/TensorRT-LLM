@@ -47,6 +47,9 @@ batch size 256 up.
 Points that set a peak are the mean of three runs on different nodes; the others are single runs.
 Run-to-run variation in throughput per GPU is mostly within 2%.
 
+These results use only what PR #20078 provides. This branch also has device re-ranking, a one-line
+setting that added up to 5.5% more throughput at most of the batch sizes tried (section 8).
+
 ## Quick start
 
 From `examples/models/core/deepseek_v4`, with the checkpoint in `$CKPT`:
@@ -55,12 +58,12 @@ From `examples/models/core/deepseek_v4`, with the checkpoint in `$CKPT`:
 B=dspark_benchmark
 # 1. Datasets (section 2)
 python $B/build_datasets.py --model $CKPT --output-dir data --specdec-bench /path/to/Model-Optimizer/examples/specdec_bench
-# 2. Runtime YAMLs (section 3)
-python $B/make_configs.py --output-dir configs \
+# 2. Runtime YAMLs (section 3); --rerank adds the device re-ranking configs (section 8)
+python $B/make_configs.py --output-dir configs --rerank \
   --cost-table dspark_artifacts/costs-b300-dep8.json --calibration dspark_artifacts/calibration.json
 # 3. One run per setting (section 5); here SPEED-Bench around its peak
 for bs in 256 384 512; do
-  for arm in fixed-k3 fixed-k4 fixed-k5 confidence-k5; do
+  for arm in fixed-k3 fixed-k4 fixed-k5 confidence-k5 confidence-rerank-k5; do
     bash $B/run_benchmark.sh $CKPT configs/bs$bs-$arm.yaml data/speed.jsonl $bs runs/speed-bs$bs-$arm-1
   done
 done
@@ -124,7 +127,9 @@ download the data yourself. Check that each license fits your use.
 
 [`make_configs.py`](dspark_benchmark/make_configs.py) writes one YAML per batch size and setting:
 `bs<BS>-fixed-k<K>.yaml` for a fixed draft length and `bs<BS>-confidence-k<K>.yaml` for confidence
-scheduling with maximum draft length K. BS512 with confidence scheduling, for example:
+scheduling with maximum draft length K. With `--rerank` it also writes
+`bs<BS>-confidence-rerank-k<K>.yaml`, the same with device re-ranking on (section 8). BS512 with
+confidence scheduling, for example:
 
 ```yaml
 gpus_per_node: 8
@@ -162,6 +167,7 @@ speculative_config:
   enable_confidence_scheduling: true
   confidence_cost_table_path: /abs/path/dspark_artifacts/costs-b300-dep8.json
   confidence_calibration_path: /abs/path/dspark_artifacts/calibration.json
+  # enable_fused_confidence_scheduler: true   # device re-ranking, section 8 (this branch only)
 ```
 
 A fixed draft length uses the same file with only `decoding_type`, `max_draft_len` and
@@ -254,7 +260,9 @@ Settings run per batch size:
 | Fixed | K3-K5 | K2-K5 | K3-K5 | K1-K5 | K2-K5 | K1-K5 |
 | Confidence scheduling | K5 | K5 | K5 | K4, K5 | K5 | K3-K5 |
 
-BS384 and BS768 were run for SPEED-Bench, ShareGPT and Arena-Hard only. Run every setting of one
+To add device re-ranking (section 8), run the `confidence-rerank-k<K>` config next to each
+`confidence-k<K>` one; the analysis counts both as confidence scheduling and keeps the faster at
+each batch size. BS384 and BS768 were run for SPEED-Bench, ShareGPT and Arena-Hard only. Run every setting of one
 dataset and batch size on the same node, one after another. To confirm a peak, repeat its points on
 other nodes in a different order and let the analysis average them.
 
@@ -302,7 +310,52 @@ by less than 1.5 tok/s. Keep the default and leave `confidence_min_predicted_gai
 configuration; there is no need to tune it per workload or batch size. Check it again only after
 retraining the confidence head or changing its calibration.
 
-## 8. Troubleshooting
+## 8. Device re-ranking (this branch only)
+
+PR #20078 ranks the draft positions to verify on the host, from a copy of the previous step's
+confidence, so the host never waits for the GPU. This branch adds an opt-in setting that keeps the
+host's verifier budget but re-ranks the positions on the GPU, using the confidence of the block
+being verified. To turn it on, add one line to a confidence-scheduling config:
+
+```yaml
+speculative_config:
+  enable_confidence_scheduling: true
+  enable_fused_confidence_scheduler: true   # device re-ranking
+```
+
+`make_configs.py --rerank` writes these as `bs<BS>-confidence-rerank-k<K>.yaml` (section 3).
+
+Compact steps then rebuild their inputs in full and run a small extra GPU pass, so the gain depends
+on the workload: it raised throughput in 13 of the 15 settings below, by up to 5.5%, and lowered it
+in two.
+Treat it like the draft length: run your batch size with and without it and keep the faster (the
+analysis in section 6 does this). Confidence scheduling with and without it, alternating on one
+node, two runs each (throughput per GPU):
+
+| Dataset | Batch size | Max K | Without | With | Change | Acceptance length |
+| --- | --- | --- | --- | --- | --- | --- |
+| SPEED-Bench | 256 | 5 | 1,528 | 1,567 | +2.5% | 2.78 → 2.86 |
+| SPEED-Bench | 384 | 5 | 1,985 | 1,941 | -2.2% | 2.88 → 2.92 |
+| SPEED-Bench | 512 | 5 | 2,189 | 2,228 | +1.8% | 2.72 → 2.83 |
+| SPEED-Bench | 1024 | 5 | 2,163 | 2,202 | +1.8% | 2.74 → 2.83 |
+| SPEED-Bench | 2048 | 2 | 2,270 | 2,276 | +0.3% | 2.19 → 2.21 |
+| ShareGPT | 256 | 5 | 1,993 | 2,059 | +3.3% | 2.89 → 3.03 |
+| ShareGPT | 512 | 5 | 3,255 | 3,362 | +3.3% | 2.88 → 3.02 |
+| ShareGPT | 1024 | 5 | 4,612 | 4,765 | +3.3% | 2.88 → 3.02 |
+| ShareGPT | 2048 | 2 | 5,994 | 6,049 | +0.9% | 2.32 → 2.33 |
+| Arena-Hard | 256 | 5 | 2,295 | 2,374 | +3.4% | 3.25 → 3.41 |
+| Arena-Hard | 512 | 5 | 3,890 | 4,044 | +3.9% | 3.20 → 3.37 |
+| Arena-Hard | 1024 | 5 | 5,629 | 5,854 | +4.0% | 3.20 → 3.37 |
+| Arena-Hard | 2048 | 5 | 7,216 | 7,611 | +5.5% | 3.02 → 3.19 |
+| GSM8K | 256 | 5 | 633 | 630 | -0.4% | 4.02 → 3.99 |
+| GSM8K | 1024 | 3 | 639 | 639 | 0.0% | 3.19 → 3.19 |
+
+It does not change what the model outputs beyond ordinary run-to-run variation: GSM8K accuracy
+(1,319 questions, the 5-shot prompts above, greedy) was 96.7%, 96.6% and 96.8% in three runs with
+it, 96.8% without it and 96.5% with fixed K5, and any two of these runs gave the same answer to
+about 99% of the questions. It has been run with attention data parallelism only.
+
+## 9. Troubleshooting
 
 | Message | Fix |
 | --- | --- |

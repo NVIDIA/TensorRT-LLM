@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compare confidence scheduling with fixed draft lengths at equal per-user speed.
 
-Reads the output directories of run_benchmark.sh. Runs of the same dataset, batch size, method and
-draft length are averaged. For each dataset and method, the points that no other point beats on
+Reads the output directories of run_benchmark.sh. Runs of the same dataset, batch size, method,
+draft length and re-ranking setting are averaged; confidence settings with and without device
+re-ranking both count as confidence scheduling, so each point uses whichever is faster. For each
+dataset and method, the points that no other point beats on
 both per-user speed (tok/s/user) and throughput per GPU (tok/s/GPU) form a line; neighbouring
 points are joined linearly. The two lines are compared where both exist, without extrapolation,
 and the largest gain of confidence scheduling over fixed draft lengths is reported. The ratio of
@@ -39,6 +41,8 @@ def load_runs(run_dirs: list[Path]) -> list[dict]:
                 "bs": meta["batch_size"],
                 "method": "confidence" if spec.get("enable_confidence_scheduling") else "fixed",
                 "k": spec["max_draft_len"],
+                "rerank": bool(spec.get("enable_confidence_scheduling"))
+                and bool(spec.get("enable_fused_confidence_scheduler")),
                 "tps_gpu": perf["system_output_throughput_tok_s"] / GPUS,
                 "tps_user": perf["output_throughput_per_user_tok_s"],
             }
@@ -49,19 +53,24 @@ def load_runs(run_dirs: list[Path]) -> list[dict]:
 def average(runs: list[dict]) -> list[dict]:
     groups = defaultdict(list)
     for r in runs:
-        groups[(r["dataset"], r["bs"], r["method"], r["k"])].append(r)
+        groups[(r["dataset"], r["bs"], r["method"], r["k"], r["rerank"])].append(r)
     return [
         {
             "dataset": d,
             "bs": bs,
             "method": m,
             "k": k,
+            "rerank": rerank,
             "n": len(rs),
             "tps_gpu": round_half_up(sum(r["tps_gpu"] for r in rs) / len(rs)),
             "tps_user": round_half_up(sum(r["tps_user"] for r in rs) / len(rs), 1),
         }
-        for (d, bs, m, k), rs in groups.items()
+        for (d, bs, m, k, rerank), rs in groups.items()
     ]
+
+
+def setting(point: dict) -> str:
+    return f"K{point['k']}{' re-rank' if point['rerank'] else ''}"
 
 
 def frontier(points: list[dict]) -> list[dict]:
@@ -108,7 +117,7 @@ def iso_gain(fixed: list[dict], conf: list[dict]) -> list[tuple[float, float, fl
 def describe(point: dict | None) -> str:
     if point is None:
         return "-"
-    return f"K{point['k']} {point['tps_gpu']:.0f}, {point['tps_user']:.1f} (n={point['n']})"
+    return f"{setting(point)} {point['tps_gpu']:.0f}, {point['tps_user']:.1f} (n={point['n']})"
 
 
 def plot(results: dict, path: Path) -> None:
@@ -144,7 +153,7 @@ def plot(results: dict, path: Path) -> None:
             )
             for p in line:
                 ax.annotate(
-                    f"{p['bs']} K{p['k']}",
+                    f"{p['bs']} {setting(p)}",
                     (p["tps_user"], p["tps_gpu"]),
                     fontsize=7,
                     textcoords="offset points",
