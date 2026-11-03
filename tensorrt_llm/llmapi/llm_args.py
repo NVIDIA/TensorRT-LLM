@@ -3916,7 +3916,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "drafter). A smaller tail trades acceptance length for TTFT. The V2 "
         "KV cache manager requires the all_reusable block-reuse policy; the "
         "V1 manager requires chunked prefill and no sliding-window target "
-        "layers; otherwise the managers disable it with a warning.")
+        "layers; otherwise the managers disable it with a warning. On "
+        "recurrent-state targets a positive tail becomes -1 (full re-prefill).")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 

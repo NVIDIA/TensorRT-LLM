@@ -1090,7 +1090,7 @@
             }
           ],
           "default": 0,
-          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens; not needed when the draft KV pool is paired with the target's block reuse. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning.",
+          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens; not needed when the draft KV pool is paired with the target's block reuse. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
           "title": "Context Recompute Tail"
         },
         "decoding_type": {
