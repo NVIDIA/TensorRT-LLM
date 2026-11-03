@@ -130,6 +130,8 @@ def _byte_range(t: torch.Tensor) -> tuple[int, int]:
     """[first, last + 1) device bytes ``t`` covers."""
     if t.numel() == 0:
         return (t.data_ptr(), t.data_ptr())
+    if t.is_contiguous():
+        return (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
     span = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride())) + 1
     return (t.data_ptr(), t.data_ptr() + span * t.element_size())
 
@@ -168,7 +170,7 @@ class _Pack:
         self.d2d: list[tuple[int, int, int]] = []
         # Bytes every staged device copy reads or writes: a later host copy into them would land out of order.
         self.d2d_ranges: list[tuple[int, int]] = []
-        # Bytes every staged copy writes.
+        # Check mode: bytes every staged copy writes.
         self.dst_ranges: list[tuple[int, int]] = []
         # Every tensor a staged copy reads or writes, kept alive until the pack is issued.
         self.staged: list[torch.Tensor] = []
@@ -198,16 +200,17 @@ class _Pack:
         self.used = self.data_start
 
     def writes(self, t: torch.Tensor) -> bool:
-        """Whether a staged copy writes any byte of ``t``."""
+        """Whether a staged copy writes any byte of ``t`` (check mode only)."""
         return _overlaps(_byte_range(t), self.dst_ranges)
 
     def stage(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
         if not dst.is_cuda or dst.numel() != src.numel():
             return False
         nbytes = dst.numel() * dst.element_size()
-        dst_range = _byte_range(dst)
-        if src.device.type == "cpu":
-            if _overlaps(dst_range, self.d2d_ranges):
+        # Byte ranges are needed only against staged device copies, and in check mode.
+        dst_range = _byte_range(dst) if self.d2d_ranges or self.check or src.is_cuda else None
+        if not src.is_cuda:
+            if self.d2d_ranges and _overlaps(dst_range, self.d2d_ranges):
                 return False
             # A contiguous destination is one descriptor; a 2-D slice with contiguous rows (a page table's leading
             # rows and columns) is one per row.
@@ -250,8 +253,8 @@ class _Pack:
             self.d2d.append((dst.data_ptr(), src.data_ptr(), nbytes))
             self.d2d_ranges += (dst_range, src_range)
             self.staged += (dst, src)
-        self.dst_ranges.append(dst_range)
         if self.check:
+            self.dst_ranges.append(dst_range)
             dst.view(torch.uint8).fill_(_POISON)
             self.poisoned.append((site, dst))
         return True
@@ -334,8 +337,9 @@ class _SkipCache:
         self.tails.clear()
         self.inputs.clear()
 
-    def holds(self, dst: torch.Tensor, src: torch.Tensor) -> bool:
-        entry = self.shadow.get(dst.untyped_storage().data_ptr())
+    def holds(self, addr: int, dst: torch.Tensor, src: torch.Tensor) -> bool:
+        """Whether the shadow of storage ``addr`` (``dst``'s) says ``dst`` holds ``src``."""
+        entry = self.shadow.get(addr)
         return entry is not None and entry[1].matches(src, key=_view_key(dst), exact=True)
 
     def record(
@@ -348,12 +352,12 @@ class _SkipCache:
         buffer.record(src, key=_view_key(dst))
         self.shadow[storage.data_ptr()] = (storage, buffer)
 
-    def forget(self, dst: torch.Tensor) -> Optional[DeviceCopyBuffer]:
-        """Drop the value shadow of ``dst``'s storage (a copy the shadow does not describe wrote it).
+    def forget(self, addr: int) -> Optional[DeviceCopyBuffer]:
+        """Drop the value shadow of storage ``addr`` (a copy the shadow does not describe wrote it).
 
         Returns the dropped shadow, invalidated, for ``record`` to reuse.
         """
-        entry = self.shadow.pop(dst.untyped_storage().data_ptr(), None)
+        entry = self.shadow.pop(addr, None)
         if entry is None:
             return None
         entry[1].invalidate()
@@ -396,6 +400,12 @@ class DeviceCopier:
         self.check = os.environ.get(CHECK_ENV, "0") == "1"
         self._pack = _Pack(device, self.check) if plan.defer else None
         self._skip = _SkipCache() if plan.skip_unchanged else None
+        # Site membership by identity: an Enum member hashes through a Python-level __hash__.
+        self._defer_ids = frozenset(map(id, plan.defer))
+        self._skip_ids = frozenset(map(id, plan.skip_unchanged))
+
+    def skips(self, site: CopySiteEnum) -> bool:
+        return id(site) in self._skip_ids
 
     @property
     def defers(self) -> bool:
@@ -423,22 +433,22 @@ class DeviceCopier:
     def _expect(self, site: CopySiteEnum, src: torch.Tensor) -> None:
         if site.direction is Direction.FILL:
             raise ValueError(f"{_site_name(site)} is a fill site; use fill_tail")
-        on_host = src.device.type == "cpu"
-        if on_host != (site.direction is Direction.H2D):
+        if src.is_cuda == (site.direction is Direction.H2D):
             raise ValueError(
                 f"{_site_name(site)} is declared {site.direction.value}, but its source is on {src.device}"
             )
 
     def copy(self, site: CopySiteEnum, dst: torch.Tensor, src: torch.Tensor) -> bool:
         self._expect(site, src)
+        addr = dst.untyped_storage().data_ptr() if self._skip is not None else 0
         if torch.cuda.is_current_stream_capturing():
             # A captured copy reruns on every replay, so no shadow can vouch for the buffer.
             if self._skip is not None:
-                self._skip.forget(dst)
+                self._skip.forget(addr)
             dst.copy_(src, non_blocking=True)
             return True
-        skip = self._skip is not None and site in self.plan.skip_unchanged and dst.is_cuda
-        if skip and self._skip.holds(dst, src):
+        skip = self._skip is not None and id(site) in self._skip_ids and dst.is_cuda
+        if skip and self._skip.holds(addr, dst, src):
             if self.check and not (self._pack is not None and self._pack.writes(dst)):
                 if not torch.equal(dst.cpu(), src.to(dst.dtype)):
                     raise RuntimeError(
@@ -447,8 +457,8 @@ class DeviceCopier:
                     )
             return False
         # Forget the shadow before issuing, so a copy that fails leaves no record.
-        shadow = self._skip.forget(dst) if self._skip is not None else None
-        if site in self.plan.defer and self.is_open:
+        shadow = self._skip.forget(addr) if self._skip is not None else None
+        if id(site) in self._defer_ids and self._pack.open:
             self._pack.copy(site, dst, src)
         else:
             dst.copy_(src, non_blocking=True)
@@ -459,7 +469,7 @@ class DeviceCopier:
     def fill_tail(self, site: CopySiteEnum, buf: torch.Tensor, start: int, value: int) -> None:
         if site.direction is not Direction.FILL:
             raise ValueError(f"{_site_name(site)} is not a fill site")
-        skip = self._skip is not None and site in self.plan.skip_unchanged
+        skip = self._skip is not None and id(site) in self._skip_ids
         if start >= buf.shape[0]:
             # The live rows cover the whole view: a previous tail fill was overwritten.
             if skip:
@@ -488,7 +498,7 @@ class DeviceCopier:
         False it issues the copy and then calls ``record_inputs``, so a copy that fails leaves no record. ``key=None``
         marks a gather whose inputs the caller does not compare.
         """
-        if self._skip is None or site not in self.plan.skip_unchanged:
+        if self._skip is None or id(site) not in self._skip_ids:
             return False
         if key is not None and not torch.cuda.is_current_stream_capturing():
             if self._skip.inputs_hold(dst, key, host):
@@ -500,7 +510,7 @@ class DeviceCopier:
         self, site: CopySiteEnum, dst: torch.Tensor, key: Optional[tuple], host: torch.Tensor
     ) -> None:
         """Record the inputs of a gather into ``dst`` the caller has just issued (see ``inputs_unchanged``)."""
-        if self._skip is None or site not in self.plan.skip_unchanged:
+        if self._skip is None or id(site) not in self._skip_ids:
             return
         if key is None or torch.cuda.is_current_stream_capturing():
             # A captured gather reruns on every replay, and an uncompared one leaves nothing to compare with.
@@ -552,7 +562,7 @@ def fill_tail(site: CopySiteEnum, buf: torch.Tensor, start: int, value: int) -> 
 def skips(site: CopySiteEnum) -> bool:
     """Whether the active copier's plan skips ``site`` when unchanged."""
     copier = _active.get()
-    return copier is not None and site in copier.plan.skip_unchanged
+    return copier is not None and copier.skips(site)
 
 
 def inputs_unchanged(
