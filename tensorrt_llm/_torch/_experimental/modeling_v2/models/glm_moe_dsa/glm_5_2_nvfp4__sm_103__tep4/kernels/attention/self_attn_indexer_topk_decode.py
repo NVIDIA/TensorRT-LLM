@@ -212,6 +212,11 @@ def compile_indexer_topk_decode(
         )
     if top_k != _DEFAULT_TOP_K:
         raise ValueError(f"decode top-k expects top_k=2048, got {top_k}")
+    if max_num_columns > _histogram.MAX_COLUMNS:
+        raise ValueError(
+            f"decode top-k separates tied columns below {_histogram.MAX_COLUMNS}; "
+            f"got max_num_columns={max_num_columns}"
+        )
     if next_n <= 0:
         raise ValueError(f"next_n must be positive, got {next_n}")
     if refine_cutoff is None:

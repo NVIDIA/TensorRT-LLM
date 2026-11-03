@@ -147,6 +147,12 @@ class CuteDslIndexerTopkDecode(OpWrapper):
             spec=dict(next_n=6, max_columns=8192, seq_lens=[1, 6, 700, 2051, 2053], width=8192),
         ),
         Cell(
+            why="tie groups of thousands past column 32768: the refine's column digits",
+            spec=dict(
+                next_n=1, max_columns=212992, seq_lens=[200000, 70000], width=212992, levels=64
+            ),
+        ),
+        Cell(
             why="MTP3, heavy ties at the k-th value on a row-padded view",
             spec=dict(
                 next_n=4,
