@@ -544,6 +544,12 @@ def _parse_args() -> argparse.Namespace:
         "otherwise)",
     )
     parser.add_argument(
+        "--alloc-stats",
+        action="store_true",
+        help="after timing, run the op once more eagerly and record the caching allocator's "
+        "allocation count, allocated bytes and peak memory for that steady-state run",
+    )
+    parser.add_argument(
         "--span-diffs",
         action="store_true",
         help="also time whole-clip decodes of 1, 1 + chunk and 1 + 2 * chunk latent frames and "
@@ -677,6 +683,8 @@ def _run_backend(
         out_cpu = _accuracy_pass(row, run_fn, backend, reference, native_out)
 
     row["timing"] = _time_cupti(run_fn, args.warmup, args.iters, use_graph=not args.no_graph)
+    if args.alloc_stats:
+        row["alloc_stats"] = _allocation_pass(run_fn)
     if args.span_diffs and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
         row["span_diffs"] = _span_diffs(model, inp, decode_chunk, args)
     row["setup_s"] = time.time() - t_start
@@ -684,6 +692,33 @@ def _run_backend(
     del model, run_fn
     torch.cuda.empty_cache()
     return row, out_cpu
+
+
+def _allocation_pass(run_fn: Callable[[], Any]) -> dict[str, Any]:
+    """One steady-state eager run, measured with the caching allocator's counters.
+
+    Returns the allocation count, the bytes allocated and the peak memory above the memory
+    in use when the run starts.
+    """
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()
+    torch.cuda.reset_peak_memory_stats()
+    with torch.inference_mode():
+        out = run_fn()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    del out
+    return {
+        "allocations": after["allocation.all.allocated"] - before["allocation.all.allocated"],
+        "allocated_gb": (
+            after["allocated_bytes.all.allocated"] - before["allocated_bytes.all.allocated"]
+        )
+        / 2**30,
+        "peak_above_start_gb": (
+            after["allocated_bytes.all.peak"] - before["allocated_bytes.all.current"]
+        )
+        / 2**30,
+    }
 
 
 def _accuracy_pass(
