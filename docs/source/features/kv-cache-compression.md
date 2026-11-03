@@ -247,17 +247,17 @@ most recent N tokens of every sequence at the active-cache precision in the cold
 tiers; the rest of the history is stored in NVFP4. This is the cold-page
 counterpart of the mixed-precision KV cache
 (`KvCacheConfig(dtype="mixed_nvfp4_...")`): the KV cache manager adds the same
-retained-token layer group, Attention reads the retained tokens from it (dense
-backends through the same staging copy; the DSA backend in place, since that
-group shares the history pool's memory), and the retained group migrates to
-Host or Disk unchanged while the history pool is quantized. The GPU keeps the full history at the active
-precision, plus one window-sized copy of the retained tokens per Attention
-layer.
+mixed-precision high layer group, Attention reads the first/last-N tokens from
+it (dense backends through the same staging copy; the DSA backend in place,
+since that group shares the history pool's memory), and that group migrates to
+Host or Disk unchanged while the history pool is quantized. The GPU keeps the
+full history at the active precision, plus one window-sized copy of the
+first/last-N tokens per Attention layer.
 
 The active precision is the one `kv_cache_config.dtype` resolves to: FP8 below,
 or the checkpoint's KV type under the default `auto`. In the cold tiers the
-retained tokens stay in that type and the rest of the history becomes NVFP4; on
-the GPU the whole history stays in that type.
+first/last-N tokens stay in that type and the rest of the history becomes
+NVFP4; on the GPU the whole history stays in that type.
 
 ```yaml
 kv_cache_config:
@@ -275,8 +275,9 @@ The option is a prototype and shares the limits of the mixed-precision KV cache
 (see [KV cache](kvcache.md)): `use_kv_cache_manager_v2: true` with the TRTLLM or
 FlashInfer Attention backend, the KV cache managers that support the
 mixed-precision KV cache except DeepSeek-V4's, single-beam decoding, speculative decoding except
-dynamic-tree drafting, and no KV connector. MTP layers keep retained-token twins
-like the target layers; a drafter with its own architecture keeps a plain cache.
+dynamic-tree drafting, and no KV connector. MTP layers get mixed-precision high
+layers like the target layers; a drafter with its own architecture keeps a plain
+cache.
 It cannot be combined with `dtype="mixed_nvfp4_..."`.
 
 ### TriAttention

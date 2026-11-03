@@ -1873,7 +1873,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and getattr(kv_cache_config, "mixed_precision_kv", None) is not None
         ):
             raise ValueError("layer_specs does not support mixed-precision KV cache.")
-        # The cold-page retained window follows the draft rule of kv_cache_config.dtype:
+        # The cold-page first/last-N window follows the draft rule of kv_cache_config.dtype:
         # MTP layers go mixed with the target, a drafter with its own architecture
         # keeps a plain cache (its separate manager takes no window).
         window_provider = cold_page_codec_provider
@@ -2378,7 +2378,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
-            # The estimation run only takes the provider's retained-token window.
+            # The estimation run only takes the provider's first/last-N window.
             if cold_page_codec_provider is None or self.is_estimating_kv_cache:
                 return None
             if (
@@ -2395,7 +2395,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                 head_dim_per_layer=self.head_dim_per_layer,
                 is_draft=self.is_draft,
-                retained_layers=tuple(self.mixed_precision_high_layers.values()),
+                mixed_precision_high_layers=tuple(self.mixed_precision_high_layers.values()),
             )
 
         candidate: Optional[KVCacheManagerPy] = None
@@ -3995,7 +3995,7 @@ class KVCacheManagerV2(BaseResourceManager):
         cold_page_codec_provider: Optional[object] = None,
     ) -> None:
         """Record the mixed-precision layout requested through kv_cache_config.dtype or
-        through the cold-page codec provider's retained_token_window."""
+        through the cold-page codec provider's mixed_precision_high_window."""
         # Local layer id -> layer id of its mixed-precision high layer.
         self.mixed_precision_high_layers: dict[int, int] = {}
         self.mixed_precision_low_dtype: DataType | None = None
@@ -4008,11 +4008,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self._shared_kv_layers: set[int] = set()
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-        retained = getattr(cold_page_codec_provider, "retained_token_window", None)
-        if not isinstance(retained, tuple):
+        window = getattr(cold_page_codec_provider, "mixed_precision_high_window", None)
+        if not isinstance(window, tuple):
             # Providers without the property, and Mock providers in tests.
-            retained = None
-        if mixed is None and retained is None:
+            window = None
+        if mixed is None and window is None:
             return
         requested = (
             f"kv_cache_config.dtype={kv_cache_config.dtype!r}"
@@ -4041,7 +4041,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Cold-page mixed precision: the history pool keeps the active dtype and only its
             # cold pages are quantized. The mixed-precision high group migrates unchanged, and
             # attention reads both pools through the staging copy.
-            self.first_n, self.last_n = retained
+            self.first_n, self.last_n = window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config

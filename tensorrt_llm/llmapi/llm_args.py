@@ -4696,9 +4696,9 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         description=
         "Number of leading tokens per sequence whose KV stays at the active-cache "
         "precision in the cold tiers instead of NVFP4. The KV cache manager keeps "
-        "these tokens in a retained-token layer group, as the mixed-precision KV "
-        "cache does, and migrates that group unchanged. Retention follows the "
-        "cache page granularity. Requires KV cache manager V2.")
+        "these tokens in a mixed-precision high layer group, as the mixed-precision "
+        "KV cache does, and migrates that group unchanged. Tokens are kept in whole "
+        "cache pages. Requires KV cache manager V2.")
     mixed_precision_last_n: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -4708,7 +4708,7 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         "mixed_precision_first_n.")
 
     @property
-    def retained_token_window(self) -> Optional[tuple[int, int]]:
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
         """``(first_n, last_n)`` kept at the active precision, else None."""
         if self.mixed_precision_first_n or self.mixed_precision_last_n:
             return (self.mixed_precision_first_n, self.mixed_precision_last_n)
@@ -7372,14 +7372,14 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
-        """Reject runtime features the retained-token KV layers do not support.
+        """Reject runtime features the mixed-precision high layers do not support.
 
         ``kv_cache_config.dtype="mixed_nvfp4_*"`` and cold-page compression with
-        ``mixed_precision_first_n/last_n`` both add a retained-token layer group.
+        ``mixed_precision_first_n/last_n`` both add a mixed-precision high layer group.
         """
         hot = self.kv_cache_config.mixed_precision_kv is not None
         cold = getattr(self.kv_cache_compression_config,
-                       "retained_token_window", None) is not None
+                       "mixed_precision_high_window", None) is not None
         if not hot and not cold:
             return self
         feature = "Mixed-precision KV" if hot else "Mixed-precision cold pages"

@@ -4638,7 +4638,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "mixed_precision_first_n": 0,
         "mixed_precision_last_n": 0,
     }
-    assert cold_config.retained_token_window is None
+    assert cold_config.mixed_precision_high_window is None
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert cold_config.supports_speculative_decoding()
@@ -4691,7 +4691,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
             },
         )
 
-    retained = {
+    cold_window = {
         "algorithm": "quantization_for_cold_page",
         "mixed_precision_first_n": 64,
         "mixed_precision_last_n": 256,
@@ -4699,29 +4699,30 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     args = TorchLlmArgs(
         model="/tmp/dummy_model",
         kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-        kv_cache_compression_config=retained)
-    assert args.kv_cache_compression_config.retained_token_window == (64, 256)
-    # The retained-token layers share the mixed-precision KV cache's limits.
+        kv_cache_compression_config=cold_window)
+    assert args.kv_cache_compression_config.mixed_precision_high_window == (64,
+                                                                            256)
+    # The mixed-precision high layers share the mixed-precision KV cache's limits.
     with pytest.raises(ValueError, match="use_kv_cache_manager_v2"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False),
-            kv_cache_compression_config=retained)
+            kv_cache_compression_config=cold_window)
     with pytest.raises(ValueError, match="attention backends"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             attn_backend="VANILLA",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=retained)
+            kv_cache_compression_config=cold_window)
     with pytest.raises(ValueError, match="cold-page compression"):
         TorchLlmArgs(model="/tmp/dummy_model",
                      kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
                                                    dtype="mixed_nvfp4_fp8"),
-                     kv_cache_compression_config=retained)
+                     kv_cache_compression_config=cold_window)
     # Speculative decoding is allowed, except dynamic-tree drafting.
     TorchLlmArgs(model="/tmp/dummy_model",
                  kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-                 kv_cache_compression_config=retained,
+                 kv_cache_compression_config=cold_window,
                  speculative_config={
                      "decoding_type": "MTP",
                      "num_nextn_predict_layers": 1
@@ -4730,7 +4731,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=retained,
+            kv_cache_compression_config=cold_window,
             speculative_config={
                 "decoding_type": "MTP",
                 "num_nextn_predict_layers": 1,
@@ -4738,18 +4739,17 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "use_dynamic_tree": True,
                 "dynamic_tree_max_topK": 2,
             })
-    # DSA reads the retained rows through the same gather as the mixed-precision
-    # KV cache; DeepSeek-V4 is pending.
+    # DSA reads the mixed-precision high rows in place; DeepSeek-V4 is pending.
     TorchLlmArgs(model="/tmp/dummy_model",
                  kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-                 kv_cache_compression_config=retained,
+                 kv_cache_compression_config=cold_window,
                  sparse_attention_config=DeepSeekSparseAttentionConfig(
                      index_head_dim=128))
     with pytest.raises(NotImplementedError, match="deepseek_v4"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
-            kv_cache_compression_config=retained,
+            kv_cache_compression_config=cold_window,
             sparse_attention_config=DeepSeekV4SparseAttentionConfig(
                 index_head_dim=128, window_size=128, compress_ratios=[1, 4]))
     # Plain cold-page compression keeps its unrestricted backend choice.

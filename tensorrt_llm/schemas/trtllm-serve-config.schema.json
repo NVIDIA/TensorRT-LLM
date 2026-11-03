@@ -576,7 +576,7 @@
         },
         "mixed_precision_first_n": {
           "default": 0,
-          "description": "Number of leading tokens per sequence whose KV stays at the active-cache precision in the cold tiers instead of NVFP4. The KV cache manager keeps these tokens in a retained-token layer group, as the mixed-precision KV cache does, and migrates that group unchanged. Retention follows the cache page granularity. Requires KV cache manager V2.",
+          "description": "Number of leading tokens per sequence whose KV stays at the active-cache precision in the cold tiers instead of NVFP4. The KV cache manager keeps these tokens in a mixed-precision high layer group, as the mixed-precision KV cache does, and migrates that group unchanged. Tokens are kept in whole cache pages. Requires KV cache manager V2.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision First N",

@@ -15,9 +15,9 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
     provides_cold_page_codec = True
 
     @property
-    def retained_token_window(self) -> Optional[tuple[int, int]]:
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
         """The first/last-N tokens the config keeps at the active precision."""
-        return getattr(self.config, "retained_token_window", None)
+        return getattr(self.config, "mixed_precision_high_window", None)
 
     def create_cold_page_codec(
         self,
@@ -28,23 +28,23 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-        retained_layers: Sequence[int] = (),
+        mixed_precision_high_layers: Sequence[int] = (),
     ) -> object:
         """Create one native codec with state isolated to this KVCM.
 
-        The retained-token layers stay out of the codec: the native codec migrates the
-        lifecycles it does not own unchanged, which keeps those tokens at the active
+        The mixed-precision high layers stay out of the codec: the native codec migrates
+        the lifecycles it does not own unchanged, which keeps those tokens at the active
         precision in the cold tiers.
         """
 
         from tensorrt_llm.bindings.internal import kv_cache_compression as native
 
-        if retained_layers:
-            retained = {int(layer) for layer in retained_layers}
+        if mixed_precision_high_layers:
+            excluded = {int(layer) for layer in mixed_precision_high_layers}
             cache_config = replace(
                 cache_config,
                 layers=[
-                    layer for layer in cache_config.layers if int(layer.layer_id) not in retained
+                    layer for layer in cache_config.layers if int(layer.layer_id) not in excluded
                 ],
             )
         codec_state = self.build_codec_state(

@@ -70,12 +70,12 @@ def make_manager():
 
 
 class _ColdPageProvider:
-    """Cold-page codec provider stand-in: the manager reads only its retained window."""
+    """Cold-page codec provider stand-in: the manager reads only its first/last-N window."""
 
     config = SimpleNamespace(algorithm="quantization_for_cold_page")
 
     def __init__(self, first_n=1, last_n=65):
-        self.retained_token_window = (first_n, last_n)
+        self.mixed_precision_high_window = (first_n, last_n)
         self.calls = []
 
     def create_cold_page_codec(self, cache_config, **kwargs):
@@ -84,7 +84,7 @@ class _ColdPageProvider:
 
 
 def cold_page_config(**overrides):
-    """A reuse-enabled plain-dtype config; the retained window comes from the provider."""
+    """A reuse-enabled plain-dtype config; the first/last-N window comes from the provider."""
     options = dict(
         max_tokens=65536,
         enable_block_reuse=True,
@@ -264,7 +264,7 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
 
 @pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16, DataType.HALF))
 def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
-    """first/last-N from the cold-page codec adds the retained group; the history pool stays native."""
+    """first/last-N from the cold-page codec adds the high group; the history pool stays native."""
     provider = _ColdPageProvider()
     manager = make_manager(
         config=cold_page_config(), dtype=dtype, cold_page_codec_provider=provider
@@ -272,8 +272,8 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert manager.mixed_precision_low_dtype == dtype
     assert (manager.first_n, manager.last_n) == (1, 65)
     assert manager.mixed_precision_high_layers == {0: 1}
-    # The retained layer is left to the codec provider, which keeps it out of its codec.
-    assert [call["retained_layers"] for call in provider.calls] == [(1,)]
+    # The high layer is left to the codec provider, which keeps it out of its codec.
+    assert [call["mixed_precision_high_layers"] for call in provider.calls] == [(1,)]
     element_size = 1 if dtype == DataType.FP8 else 2
     low = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
     high = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
@@ -574,7 +574,7 @@ def test_dsa_prepare_fills_the_mixed_precision_high_page_table():
 
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
 def test_cold_page_window_appended_draft_layers(make_manager, drafter):
-    """The cold-page window follows the same rule: MTP layers get twins, an Eagle3 layer does not."""
+    """The cold-page window follows the same rule: MTP layers go mixed, an Eagle3 layer does not."""
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 
     spec_config = (
@@ -593,8 +593,8 @@ def test_cold_page_window_appended_draft_layers(make_manager, drafter):
     assert manager.mixed_precision_high_layers == (
         {0: 3, 1: 4, 2: 5} if drafter == "mtp" else {0: 3, 1: 4}
     )
-    # Every twin stays out of the cold-page codec.
-    assert [call["retained_layers"] for call in provider.calls] == [
+    # Every mixed-precision high layer stays out of the cold-page codec.
+    assert [call["mixed_precision_high_layers"] for call in provider.calls] == [
         tuple(manager.mixed_precision_high_layers.values())
     ]
 
@@ -604,7 +604,7 @@ def test_cold_page_window_separate_draft_manager(make_manager, drafter):
     """A separate MTP draft manager takes the cold-page window; another drafter keeps a plain cache.
 
     The target's pool_ratio is fitted like the mixed-precision draft manager's: dropped for the
-    MTP manager with its retained-token pool, collapsed to [1.0] for a plain one-group cache.
+    MTP manager with its mixed-precision high pool, collapsed to [1.0] for a plain one-group cache.
     """
     from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
@@ -616,7 +616,7 @@ def test_cold_page_window_separate_draft_manager(make_manager, drafter):
     )
     provider = _ColdPageProvider()
     config = cold_page_config()
-    _fit_draft_pool_ratio(config, retained_window=drafter == "mtp")
+    _fit_draft_pool_ratio(config, mixed_precision_high_window=drafter == "mtp")
     assert config.pool_ratio == (None if drafter == "mtp" else [1.0])
     manager = make_manager(
         config=config,
@@ -698,8 +698,8 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
         assert pages[2] == kv.BAD_PAGE_INDEX
 
 
-def test_dsa_cold_page_window_twins_share_the_pool():
-    """On a plain DSA pool a twin mirrors its layer's buffers and lands in the layer's pool."""
+def test_dsa_cold_page_window_high_layers_share_the_pool():
+    """On a plain DSA pool a mixed-precision high layer mirrors its layer's buffers, in one pool."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
     from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
@@ -722,20 +722,20 @@ def test_dsa_cold_page_window_twins_share_the_pool():
     try:
         assert manager.mixed_precision_high_layers == {0: 2, 1: 3}
         layers = manager.kv_cache_manager_py_config.layers
-        for local, twin in manager.mixed_precision_high_layers.items():
-            assert [(b.role, b.size) for b in layers[twin].buffers] == [
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            assert [(b.role, b.size) for b in layers[high_layer].buffers] == [
                 (b.role, b.size) for b in layers[local].buffers
             ]
         pool = manager.get_unique_primary_pool()
         assert pool.shape[1] == 2
         base = manager.impl.get_mem_pool_base_address(0, Role.KEY, PageIndexMode.SHARED)
         stride = manager.impl.get_page_stride(0, Role.KEY)
-        assert sorted(manager.retained_row_layer_offsets) == [0, 1]
-        for local, twin in manager.mixed_precision_high_layers.items():
-            offset = manager.retained_row_layer_offsets[local]
-            assert (
-                manager.impl.get_mem_pool_base_address(twin, Role.KEY, PageIndexMode.SHARED)
-                == base + offset * stride
+        assert sorted(manager.mixed_precision_high_layer_offsets) == [0, 1]
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            offset = manager.mixed_precision_high_layer_offsets[local]
+            address = manager.impl.get_mem_pool_base_address(
+                high_layer, Role.KEY, PageIndexMode.SHARED
             )
+            assert address == base + offset * stride
     finally:
         manager.shutdown()

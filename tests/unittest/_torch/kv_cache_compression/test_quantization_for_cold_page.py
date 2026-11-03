@@ -1374,30 +1374,30 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
     log.assert_called_once()
 
 
-def test_retained_window_keeps_the_cold_manager_during_estimation(monkeypatch) -> None:
-    """The estimation KVCM needs the window to build the retained-token layer group."""
+def test_mixed_precision_high_window_keeps_the_cold_manager_during_estimation(monkeypatch) -> None:
+    """The estimation KVCM needs the window to build the mixed-precision high layer group."""
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
     config = ColdPageQuantizationCompressionConfig(mixed_precision_last_n=64)
     _, creator = _build_cold_creator(config, estimating=True)
     provider = creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
     assert isinstance(provider, Nvfp4ColdPageQuantizationCompression)
-    assert provider.retained_token_window == (0, 64)
+    assert provider.mixed_precision_high_window == (0, 64)
     assert not provider.uses_iteration_lifecycle
 
 
-def test_retained_token_window_comes_from_the_config() -> None:
-    assert _manager().retained_token_window is None
+def test_mixed_precision_high_window_comes_from_the_config() -> None:
+    assert _manager().mixed_precision_high_window is None
     config = ColdPageQuantizationCompressionConfig(mixed_precision_first_n=64)
     provider = Nvfp4ColdPageQuantizationCompression(
         config, pretrained_config=SimpleNamespace(model_type="qwen3")
     )
-    assert provider.retained_token_window == (64, 0)
-    assert config.retained_token_window == (64, 0)
-    assert ColdPageQuantizationCompressionConfig().retained_token_window is None
+    assert provider.mixed_precision_high_window == (64, 0)
+    assert config.mixed_precision_high_window == (64, 0)
+    assert ColdPageQuantizationCompressionConfig().mixed_precision_high_window is None
 
 
-def test_retained_layers_stay_out_of_the_codec() -> None:
-    """Retained-token layers are not provider-owned, so the native codec migrates them unchanged."""
+def test_mixed_precision_high_layers_stay_out_of_the_codec() -> None:
+    """Mixed-precision high layers are not provider-owned; the native codec migrates them unchanged."""
 
     @dataclass
     class _Config:
@@ -1413,7 +1413,7 @@ def test_retained_layers_stay_out_of_the_codec() -> None:
             pp_layers=(0, 1),
             num_kv_heads_per_layer=(1, 1),
             head_dim_per_layer=(16, 16),
-            retained_layers=(2,),
+            mixed_precision_high_layers=(2,),
         )
     assert _codec_state(native).layer_ids == (0, 1)
     assert sorted(layout.layer_id for layout in _layouts(native)) == [0, 1]
