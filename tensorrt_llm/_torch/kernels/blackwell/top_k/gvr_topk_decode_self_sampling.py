@@ -3009,6 +3009,12 @@ class GvrMainKernel:
         # lead lanes masked, one CTA per row (no SPLIT); every edit is
         # const_expr-gated so other codegen is unchanged.
         self.prefill = bool(prefill)
+        # The FP32 key of a BF16 value has constant low 16 bits, so BF16 prefill builds
+        # narrow 16-bit keys: degen A/B use fkey16 (as FP16 does everywhere) and the P6
+        # refine narrowing reads ck64 >> 48. Tie-heavy BF16 rows otherwise spend up to
+        # two radix levels on the constant bits.
+        self.k16 = dtype is cutlass.Float16 or (dtype is cutlass.BFloat16 and self.prefill)
+        self.ck_key_shift = 16 if (dtype is cutlass.BFloat16 and self.prefill) else 0
         self.warp_rank = bool(warp_rank) and not self.det
         self.staged_k = 0 if self.det else int(staged_k)
         assert self.staged_k >= 0 and (self.staged_k == 0 or not split)
@@ -6825,7 +6831,7 @@ class GvrMainKernel:
                         cute.arch.barrier()  # ---- barrier (narrowing init) ----
                         i = tidx
                         while i < mc:
-                            kk = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
+                            kk = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32 + self.ck_key_shift))
                             C.atomic_min_cta(s_kmm.iterator + 0, kk)
                             C.atomic_max_cta(s_kmm.iterator + 1, kk)
                             i = i + cutlass.Int32(BLK)
@@ -6861,7 +6867,9 @@ class GvrMainKernel:
                                 sh2u = cutlass.Uint32(sh2)
                                 i = tidx
                                 while i < mc:  # re-bin
-                                    uq = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
+                                    uq = cutlass.Uint32(
+                                        s_ck64[i] >> cutlass.Uint64(32 + self.ck_key_shift)
+                                    )
                                     if uq >= cutlass.Uint32(rlo):
                                         if uq <= cutlass.Uint32(rhi):
                                             du = (uq - cutlass.Uint32(rlo)) >> sh2u
@@ -7157,7 +7165,11 @@ class GvrMainKernel:
                                 idv = cutlass.Int32(0)
                                 if i < mc:
                                     w64 = s_ck64[i]
-                                    iu = cutlass.Int64(cutlass.Uint32(w64 >> cutlass.Uint64(32)))
+                                    iu = cutlass.Int64(
+                                        cutlass.Uint32(
+                                            w64 >> cutlass.Uint64(32 + self.ck_key_shift)
+                                        )
+                                    )
                                     idv = cutlass.Int32(
                                         cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
                                     )
@@ -7216,9 +7228,9 @@ class GvrMainKernel:
                                         j = j + cutlass.Int32(32)
                                 cute.arch.barrier()  # ---- barrier (DET WSEG compaction step) ----
                                 cw_ = cw_ + cutlass.Int32(1)
-                    # FP16 narrows 16-bit keys (fkey16 of the code); BF16/FP32 narrow 32-bit fkeys
+                    # k16 builds narrow 16-bit keys (fkey16 of the code); the others 32-bit fkeys
                     rlo = Uint32(0)
-                    if cutlass.const_expr(self.dtype == cutlass.Float16):
+                    if cutlass.const_expr(self.k16):
                         rhi = Uint32(0xFFFF)
                     else:
                         rhi = Uint32(0xFFFFFFFF)
@@ -7275,14 +7287,14 @@ class GvrMainKernel:
                                         vx = cutlass.Int32(
                                             cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
                                         )
-                                    if cutlass.const_expr(self.dtype == cutlass.Float16):
+                                    if cutlass.const_expr(self.k16):
                                         uq = key16_of_f32(self.dtype, C.f32_of_i32(vx))
                                     else:
                                         uq = C.fkey_bits(Uint32(vx))
                                 else:
                                     if cutlass.const_expr(self.v16):
                                         wq = Uint32(s_cbuf[i])
-                                        if cutlass.const_expr(self.dtype == cutlass.Float16):
+                                        if cutlass.const_expr(self.k16):
                                             uq = fkey16_of_code16(wq >> Uint32(16))
                                         else:
                                             uq = key_of_hi16(self.dtype, wq)
@@ -7292,7 +7304,7 @@ class GvrMainKernel:
                                         )
                                         if cutlass.const_expr(self.dtype == cutlass.Float32):
                                             uq = C.fkey(C.ldg_f32(x_addr, id0))
-                                        elif cutlass.const_expr(self.dtype == cutlass.Float16):
+                                        elif cutlass.const_expr(self.k16):
                                             uq = fkey16_of_code16(
                                                 _ld_g_nc_u16(x_addr + Int64(id0) * Int64(2))
                                             )
@@ -7505,7 +7517,7 @@ class GvrMainKernel:
                                             cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
                                         )
                                         vy = Int32(pk64 >> cutlass.Uint64(32))
-                                    if cutlass.const_expr(self.dtype == cutlass.Float16):
+                                    if cutlass.const_expr(self.k16):
                                         uq = key16_of_f32(self.dtype, C.f32_of_i32(vx))
                                     else:
                                         uq = C.fkey_bits(Uint32(vx))
@@ -7514,7 +7526,7 @@ class GvrMainKernel:
                                     if cutlass.const_expr(self.v16):
                                         wq = Uint32(s_cbuf[i])
                                         idv = Int32(wq & Uint32(0xFFFF))
-                                        if cutlass.const_expr(self.dtype == cutlass.Float16):
+                                        if cutlass.const_expr(self.k16):
                                             uq = fkey16_of_code16(wq >> Uint32(16))
                                         else:
                                             uq = key_of_hi16(self.dtype, wq)
@@ -7524,7 +7536,7 @@ class GvrMainKernel:
                                         )
                                         if cutlass.const_expr(self.dtype == cutlass.Float32):
                                             uq = C.fkey(C.ldg_f32(x_addr, idv))
-                                        elif cutlass.const_expr(self.dtype == cutlass.Float16):
+                                        elif cutlass.const_expr(self.k16):
                                             uq = fkey16_of_code16(
                                                 _ld_g_nc_u16(x_addr + Int64(idv) * Int64(2))
                                             )
@@ -7545,9 +7557,9 @@ class GvrMainKernel:
                             )
                             it = it + cutlass.Int32(1)
                 else:
-                    # FP16 narrows 16-bit keys (fkey16 of the code); BF16/FP32 narrow 32-bit fkeys
+                    # k16 builds narrow 16-bit keys (fkey16 of the code); the others 32-bit fkeys
                     rlo = Uint32(0)
-                    if cutlass.const_expr(self.dtype == cutlass.Float16):
+                    if cutlass.const_expr(self.k16):
                         rhi = Uint32(0xFFFF)
                     else:
                         rhi = Uint32(0xFFFFFFFF)
@@ -7593,7 +7605,7 @@ class GvrMainKernel:
                             while i < n:  # whole row (window [lead, n))
                                 if cutlass.const_expr(self.dtype == cutlass.Float32):
                                     uq = C.fkey(C.ldg_f32(x_addr, i))
-                                elif cutlass.const_expr(self.dtype == cutlass.Float16):
+                                elif cutlass.const_expr(self.k16):
                                     uq = fkey16_of_code16(
                                         _ld_g_nc_u16(x_addr + Int64(i) * Int64(2))
                                     )
@@ -7775,7 +7787,7 @@ class GvrMainKernel:
                                 if i >= lead_db:  # prefill: exclude lead lanes
                                     if cutlass.const_expr(self.dtype == cutlass.Float32):
                                         uq = C.fkey(C.ldg_f32(x_addr, i))
-                                    elif cutlass.const_expr(self.dtype == cutlass.Float16):
+                                    elif cutlass.const_expr(self.k16):
                                         uq = fkey16_of_code16(
                                             _ld_g_nc_u16(x_addr + Int64(i) * Int64(2))
                                         )

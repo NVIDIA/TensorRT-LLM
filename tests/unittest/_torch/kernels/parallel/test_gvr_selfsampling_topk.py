@@ -1990,6 +1990,28 @@ def test_prefill_neginf_tie_class(top_k, rows, lead, dtype):
 
 
 @_PREFILL_DTYPES
+@pytest.mark.parametrize("rows", [128, 256, 300], ids=lambda r: f"r{r}")
+@pytest.mark.parametrize("top_k", [512, 1024, 2048], ids=lambda k: f"k{k}")
+def test_prefill_tie_heavy_chunk(top_k, rows, dtype):
+    """A chunk of tie-heavy rows (values on a half-integer grid, so the K-th value sits in a
+    large tie class) whose windows grow by one column every four rows: the radix narrowing
+    ends inside a tie class on most rows, on the BLK=1024, 512 and 256 plans (BF16 prefill
+    narrows 16-bit keys)."""
+    n = 4096
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + rows)
+    stride = ((n + 256 + 255) // 256) * 256
+    full = torch.round(torch.randn((rows, stride), generator=gen, device=_DEV) * 64) / 2
+    lg = full.to(dtype)[:, :n]
+    r = torch.arange(rows, device=_DEV)
+    re = (n - (rows - 1 - r) // 4).to(torch.int32)
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    _check_prefill_exact(lg, out, rs, re, top_k)
+
+
+@_PREFILL_DTYPES
 @pytest.mark.parametrize("top_k, n", [(512, 4099), (2048, 131075)], ids=lambda v: f"n{v}")
 def test_prefill_deepgemm_single_row_odd_width(top_k, n, dtype):
     """A 1-row tile with an odd num_k_tokens on a DeepGEMM-strided view must
