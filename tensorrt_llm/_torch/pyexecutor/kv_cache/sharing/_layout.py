@@ -32,7 +32,7 @@ from ..page_layout import (
     Paged,
     PageLayout,
     Tensor,
-    axis_to_dict,
+    axis_document,
     replicated,
 )
 from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
@@ -122,10 +122,7 @@ def _tensors_document(buffer: BufferDesc) -> list[dict] | None:
     if buffer.tensors == replicated(buffer.size):
         return None
     return [
-        {
-            "axes": [axis_to_dict(axis, sparse=True) for axis in tensor.axes],
-            **_set_fields(tensor, {}),
-        }
+        {"axes": [axis_document(axis) for axis in tensor.axes], **_set_fields(tensor, {})}
         for tensor in buffer.tensors
     ]
 

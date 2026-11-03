@@ -17,11 +17,13 @@ standard library only.
 
 A buffer holds the local pieces of one or more tensors. A tensor names its axes and their extents
 over all ranks together; each axis says how its indices spread over the parallel dimensions
-(``Axis.split``: whole on every rank, a contiguous run per rank, or every n-th index per rank) and
+(``Axis.kind``: whole on every rank, a contiguous run per rank, or every n-th index per rank) and
 the byte stride of its local index. Which global indices a rank holds is therefore a progression
 per axis (``held``), and how two ranks' pages correspond follows from intersecting them
-(``layout_mapping``). How a layer group addresses a request's pages is the group's kind
-(``GroupKind``); a new kind adds a class here and its pairing in ``layout_mapping``."""
+(``layout_mapping``). An axis may instead index token positions (``AxisKind.positional``), whose
+bytes move by the positions a request has written. How an axis spreads is its
+kind (``AxisKind``), and how a layer group addresses a request's pages is the group's
+(``GroupKind``); a new kind adds a class here and its mapping in ``layout_mapping``."""
 
 from __future__ import annotations
 
@@ -37,7 +39,10 @@ from typing import ClassVar, Literal, Mapping
 __all__ = [
     "GRID_DIMENSIONS",
     "Axis",
+    "AxisKind",
     "BufferDesc",
+    "Contiguous",
+    "Cyclic",
     "GroupKind",
     "LayerGroupDesc",
     "PageLayout",
@@ -47,6 +52,10 @@ __all__ = [
     "RankTopology",
     "ShardDesc",
     "Tensor",
+    "Whole",
+    "axis_document",
+    "axis_from_dict",
+    "axis_kind_from_dict",
     "axis_to_dict",
     "content_shard",
     "grid_place",
@@ -153,80 +162,236 @@ def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
     return size, rank
 
 
+_AXIS_KINDS: dict[str, type[AxisKind]] = {}
+
+
+def _register(registry: dict, cls: type, what: str) -> None:
+    """Enter ``cls`` in ``registry`` by its name; a class defined again in its own place (a module
+    reloaded, a test run again) replaces itself, while another class of the same name is refused."""
+    if not cls.name:
+        return
+    known = registry.get(cls.name)
+    if known is not None and (known.__module__, known.__qualname__) != (
+        cls.__module__,
+        cls.__qualname__,
+    ):
+        raise ValueError(f"{what} {cls.name!r} is registered twice")
+    registry[cls.name] = cls
+
+
+def _split(split: Sequence[str], what: str) -> tuple[str, ...]:
+    """``split`` as a tuple of distinct dimensions from ``GRID_DIMENSIONS``, at least one."""
+    dims = tuple(str(dim) for dim in split)
+    if not dims or len(set(dims)) != len(dims) or not set(dims) <= set(GRID_DIMENSIONS):
+        raise ValueError(f"{what} splits over {dims}, not over distinct dims of {GRID_DIMENSIONS}")
+    return dims
+
+
+def _sparse(kind: object) -> dict:
+    """The fields of a kind not at their defaults, as plain values (a tuple as a list, which the
+    kind's constructor converts back)."""
+    doc = {}
+    for f in dataclasses.fields(kind):
+        value = getattr(kind, f.name)
+        if f.default is not dataclasses.MISSING and value == f.default:
+            continue
+        doc[f.name] = list(value) if isinstance(value, tuple) else value
+    return doc
+
+
+@dataclass(frozen=True)
+class AxisKind:
+    """How the indices of an axis spread over ranks, or which token positions the axis holds.
+
+    A subclass is one such way. It states its data here; its mapping between ranks is registered
+    in ``layout_mapping`` (``owned_indices``, and ``position_rule`` for a positional kind), so a new
+    way adds a subclass and edits no existing function. Each subclass names itself (``name``) for
+    peers and for ``layout_id``; its fields are its data, and a subclass overriding none of the
+    methods below holds every index on every rank.
+
+    Attributes:
+        name: The kind's name, unique among axis kinds.
+        positional: Whether the axis indexes token positions, which a page holds according to the
+            positions it has written, rather than fixed indices.
+    """
+
+    name: ClassVar[str] = ""
+    positional: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        _register(_AXIS_KINDS, cls, "axis kind")
+
+    @property
+    def split(self) -> tuple[str, ...]:
+        """The parallel dimensions the axis spreads over, outer to inner; none by default."""
+        return ()
+
+    def check(self, axis: Axis) -> None:
+        """Raise ValueError if ``axis`` cannot be of this kind."""
+
+    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
+        """The global indices of ``axis`` the rank at ``topology`` holds, in local order: all of
+        them by default."""
+        return Progression(0, 1, axis.extent)
+
+    def count(self, axis: Axis) -> int | None:
+        """How many indices of ``axis`` a rank holds, or None where that differs by rank."""
+        return axis.extent
+
+    def corresponds(self, axis: Axis, peer: Axis) -> bool:
+        """Whether ``peer``, a peer's axis of the same name, can pair with ``axis``: by default
+        when it indexes no token positions and has the same extent, however it spreads."""
+        return not peer.kind.positional and peer.extent == axis.extent
+
+    def document(self) -> dict:
+        """What ``layout_id`` hashes of the kind besides the axis' name, extent and stride: by
+        default its name and its fields not at their defaults."""
+        return {"kind": self.name, **_sparse(self)}
+
+    def to_dict(self) -> dict:
+        """The kind as plain values for a peer, which ``axis_kind_from_dict`` reads back."""
+        return {"name": self.name, **_sparse(self)}
+
+
+def axis_kind_from_dict(data: Mapping) -> AxisKind:
+    """The axis kind ``AxisKind.to_dict`` wrote, checked as its constructor checks it."""
+    fields = dict(data)
+    name = fields.pop("name")
+    if name not in _AXIS_KINDS:
+        raise ValueError(f"unknown axis kind {name!r}; known: {sorted(_AXIS_KINDS)}")
+    return _AXIS_KINDS[name](**fields)
+
+
+@dataclass(frozen=True)
+class Whole(AxisKind):
+    """Every rank holds every index."""
+
+    name: ClassVar[str] = "whole"
+
+    def document(self) -> dict:
+        return {}
+
+
+@dataclass(frozen=True)
+class Contiguous(AxisKind):
+    """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds ``held`` indices from
+    ``r * extent // n``; ranks hold overlapping or equal runs when ``held * n`` exceeds the extent.
+
+    Attributes:
+        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
+            tensor-parallel ranks by default. Normalized to a tuple.
+        held: Positive number of indices a rank holds, at most the axis' extent.
+
+    Raises:
+        ValueError: If split is empty or names a dimension twice or one outside
+            ``GRID_DIMENSIONS``, or held is not a positive integer.
+    """
+
+    name: ClassVar[str] = "contiguous"
+    split: tuple[str, ...] = ("tp",)
+    held: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "split", _split(self.split, "a contiguous axis"))
+        object.__setattr__(self, "held", _integer(self.held, "indices held", 1))
+
+    def check(self, axis: Axis) -> None:
+        if self.held > axis.extent:
+            raise ValueError(f"axis {axis.name}: {self.held} held of {axis.extent} indices")
+
+    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
+        n, r = grid_place(topology, self.split)
+        start = r * axis.extent // n
+        if start + self.held > axis.extent:
+            raise ValueError(
+                f"axis {axis.name}: rank {r} of {n} holds {self.held} indices from {start}, past "
+                f"its extent of {axis.extent}"
+            )
+        return Progression(start, 1, self.held)
+
+    def count(self, axis: Axis) -> int | None:
+        return self.held
+
+    def document(self) -> dict:
+        return {"split": list(self.split), "held": self.held}
+
+
+@dataclass(frozen=True)
+class Cyclic(AxisKind):
+    """Rank ``r`` of ``n`` in the grid of the ``split`` dimensions holds indices ``r, r + n, ...``
+    below the extent.
+
+    Attributes:
+        split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner, at least one; the
+            tensor-parallel ranks by default. Normalized to a tuple.
+
+    Raises:
+        ValueError: If split is empty or names a dimension twice or one outside
+            ``GRID_DIMENSIONS``.
+    """
+
+    name: ClassVar[str] = "cyclic"
+    split: tuple[str, ...] = ("tp",)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "split", _split(self.split, "a cyclic axis"))
+
+    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
+        n, r = grid_place(topology, self.split)
+        return Progression(r, n, len(range(r, axis.extent, n)))
+
+    def count(self, axis: Axis) -> int | None:
+        return None
+
+    def document(self) -> dict:
+        return {"split": list(self.split), "cyclic": True}
+
+
 @dataclass(frozen=True)
 class Axis:
-    """One dimension of a tensor: its extent over all ranks together, which of its indices a rank
-    holds, and the byte stride between consecutive indices a rank holds.
-
-    A rank at ``r`` of ``n`` in the grid of the ``split`` dimensions holds every index when
-    ``split`` is empty; ``held`` indices from ``r * extent // n`` when split contiguously (ranks
-    hold overlapping or equal runs when ``held * n`` exceeds ``extent``); or indices
-    ``r, r + n, ...`` below ``extent`` when ``cyclic``. Local index ``k`` (the k-th index held, in
-    order) lies at byte ``k * stride`` of its tensor.
+    """One dimension of a tensor: its extent over all ranks together, the byte stride between
+    consecutive indices a rank holds, and its kind, which says which of its indices a rank holds
+    (``held``). Local index ``k`` (the k-th index held, in order) lies at byte ``k * stride`` of
+    its tensor.
 
     Attributes:
         name: The axis' name; peers match tensors' axes on it.
         extent: Positive number of indices over all ranks together.
         stride: Positive bytes between consecutive local indices.
-        split: Parallel dimensions from ``GRID_DIMENSIONS`` the axis spreads over, outer to inner;
-            empty when every rank holds every index. Normalized to a tuple.
-        held: Positive number of indices a rank holds of a contiguous split, at most extent;
-            required for a contiguous split, None otherwise.
-        cyclic: Whether a split rank holds every n-th index rather than a contiguous run.
+        kind: How the indices spread (``Whole``, ``Contiguous``, ``Cyclic`` or another
+            ``AxisKind``).
 
     Raises:
-        ValueError: If a number is not a positive integer or is a boolean, split names a dimension
-            twice or one outside ``GRID_DIMENSIONS``, held is missing from a contiguous split or
-            given for another, or held exceeds extent.
+        ValueError: If extent or stride is not a positive integer or is a boolean, kind is no
+            ``AxisKind``, or the kind does not fit the axis (``AxisKind.check``).
     """
 
     name: str
     extent: int
     stride: int
-    split: tuple[str, ...] = ()
-    held: int | None = None
-    cyclic: bool = False
+    kind: AxisKind = Whole()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError(f"an axis needs a name, got {self.name!r}")
         object.__setattr__(self, "extent", _integer(self.extent, f"extent of {self.name}", 1))
         object.__setattr__(self, "stride", _integer(self.stride, f"stride of {self.name}", 1))
-        split = tuple(str(dim) for dim in self.split)
-        if len(set(split)) != len(split) or not set(split) <= set(GRID_DIMENSIONS):
-            raise ValueError(f"axis {self.name} splits over {split}, not over {GRID_DIMENSIONS}")
-        object.__setattr__(self, "split", split)
-        object.__setattr__(self, "cyclic", bool(self.cyclic))
-        contiguous = bool(split) and not self.cyclic
-        if self.cyclic and not split:
-            raise ValueError(f"axis {self.name} is cyclic but not split")
-        if contiguous != (self.held is not None):
-            raise ValueError(
-                f"axis {self.name}: a contiguous split, and only one, says how many indices a "
-                f"rank holds (held={self.held!r}, split={split}, cyclic={self.cyclic})"
-            )
-        if self.held is not None:
-            held_ = _integer(self.held, f"indices held of {self.name}", 1)
-            if held_ > self.extent:
-                raise ValueError(f"axis {self.name}: {held_} held of {self.extent} indices")
-            object.__setattr__(self, "held", held_)
+        if not isinstance(self.kind, AxisKind):
+            raise ValueError(f"axis {self.name}: kind must be an AxisKind, got {self.kind!r}")
+        self.kind.check(self)
+
+    @property
+    def split(self) -> tuple[str, ...]:
+        """The parallel dimensions the axis spreads over (``AxisKind.split``)."""
+        return self.kind.split
 
     @classmethod
-    def unchecked(
-        cls,
-        name: str,
-        extent: int,
-        stride: int,
-        split: tuple[str, ...] = (),
-        held: int | None = None,
-        cyclic: bool = False,
-    ) -> Axis:
+    def unchecked(cls, name: str, extent: int, stride: int, kind: AxisKind = Whole()) -> Axis:
         """The constructor's axis of these values, without its checks and conversions; see
         ``PageLayout.unchecked``."""
         axis = object.__new__(cls)
-        axis.__dict__.update(
-            name=name, extent=extent, stride=stride, split=split, held=held, cyclic=cyclic
-        )
+        axis.__dict__.update(name=name, extent=extent, stride=stride, kind=kind)
         return axis
 
 
@@ -245,7 +410,7 @@ class Tensor:
 
     Raises:
         ValueError: If there is no axis, two axes share a name, a parallel dimension splits two
-            axes, or offset is not a non-negative integer.
+            axes, two axes index token positions, or offset is not a non-negative integer.
     """
 
     axes: tuple[Axis, ...]
@@ -263,6 +428,8 @@ class Tensor:
         dims = [dim for a in axes for dim in a.split]
         if len(set(dims)) != len(dims):
             raise ValueError(f"a parallel dimension splits two axes: {dims}")
+        if sum(a.kind.positional for a in axes) > 1:
+            raise ValueError(f"axes {names}: more than one indexes token positions")
         object.__setattr__(self, "axes", axes)
         object.__setattr__(self, "offset", _integer(self.offset, "tensor offset"))
         object.__setattr__(self, "name", str(self.name))
@@ -273,6 +440,11 @@ class Tensor:
     def split(self) -> bool:
         """Whether some axis spreads over parallel dimensions."""
         return any(a.split for a in self.axes)
+
+    @property
+    def positional(self) -> Axis | None:
+        """The tensor's axis of token positions (``AxisKind.positional``), or None."""
+        return next((a for a in self.axes if a.kind.positional), None)
 
     @classmethod
     def unchecked(
@@ -287,28 +459,18 @@ class Tensor:
 
 def held(axis: Axis, topology: RankTopology) -> Progression:
     """The global indices of ``axis`` that the rank at ``topology`` holds, in local order."""
-    if not axis.split:
-        return Progression(0, 1, axis.extent)
-    n, r = grid_place(topology, axis.split)
-    if axis.cyclic:
-        return Progression(r, n, len(range(r, axis.extent, n)))
-    start = r * axis.extent // n
-    if start + axis.held > axis.extent:
-        raise ValueError(
-            f"axis {axis.name}: rank {r} of {n} holds {axis.held} indices from {start}, past "
-            f"its extent of {axis.extent}"
-        )
-    return Progression(start, 1, axis.held)
+    return axis.kind.indices(axis, topology)
 
 
 def _footprint(tensor: Tensor) -> int | None:
-    """Bytes from its buffer's start to the end of a tensor's local piece, or None when a cyclic
-    axis leaves the count of its indices to the rank."""
+    """Bytes from its buffer's start to the end of a tensor's local piece, or None when an axis
+    leaves the count of its indices to the rank."""
     end = tensor.offset + 1
     for a in tensor.axes:
-        if a.cyclic:
+        count = a.kind.count(a)
+        if count is None:
             return None
-        end += ((a.held if a.split else a.extent) - 1) * a.stride
+        end += (count - 1) * a.stride
     return end
 
 
@@ -321,7 +483,10 @@ def owned(size: int, ranks: int, split: Sequence[str] = ("tp",)) -> tuple[Tensor
     """A buffer of ``size`` bytes that is this rank's own share of ``ranks`` ranks along ``split``,
     in a split the manager does not describe further: it corresponds only to the same rank's."""
     return (
-        Tensor((Axis("shard", ranks, size, tuple(split), 1), Axis("byte", size, 1)), name="own"),
+        Tensor(
+            (Axis("shard", ranks, size, Contiguous(tuple(split), 1)), Axis("byte", size, 1)),
+            name="own",
+        ),
     )
 
 
@@ -340,7 +505,10 @@ def head_major(
     head = size // heads
     return (
         Tensor(
-            (Axis("head", total_heads, head, tuple(split), heads), Axis("byte", head, 1)),
+            (
+                Axis("head", total_heads, head, Contiguous(tuple(split), heads)),
+                Axis("byte", head, 1),
+            ),
             dtype=dtype,
         ),
     )
@@ -364,7 +532,7 @@ def token_major(
         Tensor(
             (
                 Axis("token", tokens, heads * head),
-                Axis("head", total_heads, head, tuple(split), heads),
+                Axis("head", total_heads, head, Contiguous(tuple(split), heads)),
                 Axis("byte", head, 1),
             ),
             dtype=dtype,
@@ -386,7 +554,7 @@ def sectioned(
     for i, n in enumerate(section_bytes):
         out.append(
             Tensor(
-                (Axis("byte", n * ranks, 1, tuple(split), n),),
+                (Axis("byte", n * ranks, 1, Contiguous(tuple(split), n)),),
                 offset=offset,
                 name=f"s{i}",
                 dtype=dtype,
@@ -426,32 +594,6 @@ class ShardDesc:
         shard = object.__new__(cls)
         shard.__dict__.update(count=count, index=index)
         return shard
-
-
-def _register(registry: dict, cls: type, what: str) -> None:
-    """Enter ``cls`` in ``registry`` by its name; a class defined again in its own place (a module
-    reloaded, a test run again) replaces itself, while another class of the same name is refused."""
-    if not cls.name:
-        return
-    known = registry.get(cls.name)
-    if known is not None and (known.__module__, known.__qualname__) != (
-        cls.__module__,
-        cls.__qualname__,
-    ):
-        raise ValueError(f"{what} {cls.name!r} is registered twice")
-    registry[cls.name] = cls
-
-
-def _sparse(kind: object) -> dict:
-    """The fields of a kind not at their defaults, as plain values (a tuple as a list, which the
-    kind's constructor converts back)."""
-    doc = {}
-    for f in dataclasses.fields(kind):
-        value = getattr(kind, f.name)
-        if f.default is not dataclasses.MISSING and value == f.default:
-            continue
-        doc[f.name] = list(value) if isinstance(value, tuple) else value
-    return doc
 
 
 _GROUP_KINDS: dict[str, type[GroupKind]] = {}
@@ -644,8 +786,9 @@ class BufferDesc:
     Raises:
         ValueError: If an index is not a non-negative integer, size or expansion is not a positive
             integer, any such value is a boolean, two tensors share a name, a tensor's piece
-            reaches past size, or the pieces of several tensors do not lie back to back over the
-            whole buffer."""
+            reaches past size, the pieces of several tensors do not lie back to back over the
+            whole buffer, or an axis of token positions shares its buffer with another tensor or
+            with sub-pages."""
 
     layer: int
     role: str
@@ -684,12 +827,23 @@ class BufferDesc:
                     f"buffer ({self.layer}, {self.role}): sections {pieces} do not cover its "
                     f"{self.size} bytes"
                 )
+        if any(t.positional for t in tensors) and (len(tensors) > 1 or self.expansion != 1):
+            raise ValueError(
+                f"buffer ({self.layer}, {self.role}): an axis of token positions lies in the "
+                f"buffer's only tensor, in a page without sub-pages ({len(tensors)} tensors, "
+                f"expansion {self.expansion})"
+            )
         object.__setattr__(self, "tensors", tensors)
 
     @property
     def split(self) -> bool:
         """Whether some tensor spreads over parallel dimensions; else every rank holds it alike."""
         return any(t.split for t in self.tensors)
+
+    @property
+    def positional(self) -> Axis | None:
+        """The buffer's axis of token positions (``AxisKind.positional``), or None."""
+        return next((t.positional for t in self.tensors if t.positional is not None), None)
 
     @classmethod
     def unchecked(
@@ -1083,17 +1237,26 @@ def replica_ranks(
     return tuple(out)
 
 
-def axis_to_dict(axis: Axis, *, sparse: bool = False) -> dict:
-    """Every field of ``axis`` as plain values, which ``Axis(**d)`` reads back; with ``sparse``,
-    only the fields not at their defaults, so that a field added later leaves the document of every
-    axis not using it unchanged (the lender's ``layout_id``)."""
-    out = {}
-    for f in dataclasses.fields(Axis):
-        value = getattr(axis, f.name)
-        if sparse and f.default is not dataclasses.MISSING and value == f.default:
-            continue
-        out[f.name] = list(value) if isinstance(value, tuple) else value
-    return out
+def axis_to_dict(axis: Axis) -> dict:
+    """``axis`` as plain values for a peer, which ``axis_from_dict`` reads back."""
+    return {
+        "name": axis.name,
+        "extent": axis.extent,
+        "stride": axis.stride,
+        "kind": axis.kind.to_dict(),
+    }
+
+
+def axis_from_dict(data: Mapping) -> Axis:
+    """The axis ``axis_to_dict`` wrote, checked as the constructors check it."""
+    return Axis(data["name"], data["extent"], data["stride"], axis_kind_from_dict(data["kind"]))
+
+
+def axis_document(axis: Axis) -> dict:
+    """What ``layout_id`` hashes of ``axis``: its name, extent and stride, and its kind's
+    ``AxisKind.document``, which leaves out what a kind's defaults say, so that a kind or field
+    added later leaves the document of every axis not using it unchanged."""
+    return {"name": axis.name, "extent": axis.extent, "stride": axis.stride, **axis.kind.document()}
 
 
 def layout_to_dict(layout: PageLayout) -> dict:
@@ -1174,7 +1337,7 @@ def layout_from_dict(data: Mapping) -> PageLayout:
                 size=b["size"],
                 tensors=tuple(
                     Tensor(
-                        tuple(Axis(**a) for a in t["axes"]),
+                        tuple(axis_from_dict(a) for a in t["axes"]),
                         t["offset"],
                         t["name"],
                         t.get("dtype"),

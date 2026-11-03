@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, ClassVar
 
 import numpy as np
 import pytest
@@ -36,17 +36,22 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     fan,
     map_buffers,
     merge_runs,
+    owned_indices,
     pair_pages,
     sent_bytes,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
+    AxisKind,
     BufferDesc,
+    Contiguous,
+    Cyclic,
     LayerGroupDesc,
     PageLayout,
     Progression,
     RankTopology,
     Tensor,
+    grid_place,
     head_major,
     held,
     replicated,
@@ -249,8 +254,8 @@ def test_a_two_dimensional_split_reshards_both_axes():
         return (
             Tensor(
                 (
-                    Axis("token", 8, heads * HEAD, ("cp",), tokens),
-                    Axis("head", 4, HEAD, ("tp",), heads),
+                    Axis("token", 8, heads * HEAD, Contiguous(("cp",), tokens)),
+                    Axis("head", 4, HEAD, Contiguous(("tp",), heads)),
                     Axis("byte", HEAD, 1),
                 )
             ),
@@ -266,7 +271,7 @@ def test_a_cyclic_split_hands_each_rank_every_nth_index():
     rows lie outside its fan, which is refused."""
 
     def tensors(topology):
-        return (Tensor((Axis("row", 12, HEAD, ("tp",), cyclic=True), Axis("byte", HEAD, 1))),)
+        return (Tensor((Axis("row", 12, HEAD, Cyclic(("tp",))), Axis("byte", HEAD, 1))),)
 
     def rows(rank, count):
         return set(range(rank, 12, count))
@@ -662,3 +667,64 @@ def test_a_per_request_group_pairs_its_one_slot_and_paged_groups_pair_with_their
     paged = layout(RankTopology(), (0,), [("key", kv(4), "attention")])
     with pytest.raises(ValueError, match="layer group 0 of attention against 0 of state"):
         pair_pages(paged, 0, np.array([7]), state, 0, np.array([9]), window)
+
+
+@dataclass(frozen=True)
+class _Halves(AxisKind):
+    """A kind only this test defines: rank ``r`` of ``n`` holds the ``r``-th of ``n`` equal runs
+    of the axis. Nothing in page_layout or layout_mapping names it; it registers its sender."""
+
+    name: ClassVar[str] = "test-halves"
+    split: tuple[str, ...] = ("tp",)
+
+    def indices(self, axis: Axis, topology: RankTopology) -> Progression:
+        n, r = grid_place(topology, self.split)
+        return Progression(r * axis.extent // n, 1, axis.extent // n)
+
+    def count(self, axis: Axis) -> None:
+        return None
+
+
+@owned_indices.register(_Halves)
+def _owned_halves(kind, axis, src, fans, key, wanted):
+    # Each index lies on one rank, which sends it to every destination it pairs with.
+    return [held(axis, src)] if grid_place(src, kind.split)[1] in fans["tp"] else []
+
+
+def test_a_new_axis_kind_reshards_by_its_own_registration():
+    """A kind added beside the others, with its sender registered, reshards through the same
+    functions, which name no kind."""
+
+    def tensors(topology):
+        return (Tensor((Axis("row", 8, HEAD, _Halves()), Axis("byte", HEAD, 1))),)
+
+    specs = [("rows", tensors, "attention")]
+    for src_tp, dst_tp in [(1, 2), (2, 1), (2, 4), (4, 2), (4, 4)]:
+        check(Instance(tp=src_tp), Instance(tp=dst_tp), specs)
+    check_compatible(
+        layout(Instance(tp=2).ranks(0)[0], (0,), specs),
+        layout(Instance(tp=4).ranks(0)[3], (0,), specs),
+    )
+
+
+def test_an_unregistered_split_kind_is_refused_rather_than_sent_whole():
+    """A kind spreading over ranks sends what its registration says; one without is refused, as
+    sending every index it holds could send an index twice. A subclass inherits its base's."""
+
+    @dataclass(frozen=True)
+    class Derived(_Halves):
+        name: ClassVar[str] = "test-derived"
+
+    assert owned_indices.dispatch(Derived) is _owned_halves
+
+    @dataclass(frozen=True)
+    class Bare(AxisKind):
+        name: ClassVar[str] = "test-bare"
+
+        @property
+        def split(self) -> tuple[str, ...]:
+            return ("tp",)
+
+    axis = Axis("row", 8, HEAD, Bare())
+    with pytest.raises(ValueError, match="registers no owned_indices"):
+        owned_indices(axis.kind, axis, RankTopology(), {"tp": range(1)}, 0, Progression(0, 1, 8))

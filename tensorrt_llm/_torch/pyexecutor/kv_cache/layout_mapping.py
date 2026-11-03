@@ -31,12 +31,17 @@ so that destinations of several data-parallel groups spread over the sources. A 
 holding an index no paired source rank holds, as an uneven head split or a cyclic split between
 different rank counts can make, is refused rather than left without it.
 
-Token positions: a transfer moves each page by ``page_runs``, given the page's position among the
-request's pages and the request's transfer window (``TransferWindow``), so that runs may depend on
-the positions a page has written (``BufferRuns.by_position``); runs that do not are computed once
-per peer and only add each page's address. Which slots of a request pair in one transfer is
-``pair_pages``: each layer-group kind registers its pairing (``pair_slots``), so a new kind in
-``page_layout`` registers its own here and leaves every function above unchanged.
+Token positions: runs are fixed per peer and only add each page's address, except for a buffer
+holding an axis of token positions (``AxisKind.positional``), whose place of a position depends
+on each side. Its runs are those of one position, and ``page_runs`` moves them to
+the places of the positions a page has written within a request's transfer window
+(``TransferWindow``); a transfer applies ``page_runs`` to every buffer, getting the fixed runs back
+for all others. Which slots of a request pair in one transfer is ``pair_pages``.
+
+Kinds: each axis kind registers the indices a source rank is elected to send (``owned_indices``)
+and, if positional, how its runs move with position (``position_rule``); each layer-group kind
+registers which slots pair (``pair_slots``). A new kind in ``page_layout`` registers its rules
+here and leaves every function above unchanged.
 """
 
 from __future__ import annotations
@@ -44,14 +49,17 @@ from __future__ import annotations
 import functools
 import itertools
 from dataclasses import dataclass
-from typing import Hashable, Sequence
+from typing import Sequence
 
 import numpy as np
 
 from .page_layout import (
     GRID_DIMENSIONS,
     Axis,
+    AxisKind,
     BufferDesc,
+    Contiguous,
+    Cyclic,
     GroupKind,
     Paged,
     PageLayout,
@@ -66,16 +74,19 @@ from .page_layout import (
 __all__ = [
     "BufferRuns",
     "PagePairs",
+    "PositionRule",
     "TransferWindow",
     "check_compatible",
     "fan",
     "layer_group_of",
     "map_buffers",
     "merge_runs",
+    "owned_indices",
     "page_runs",
     "pair_pages",
     "pair_slots",
     "paired_ordinals",
+    "position_rule",
     "sent_bytes",
 ]
 
@@ -102,11 +113,36 @@ class TransferWindow:
     reused: int = 0
 
 
+class PositionRule:
+    """How the runs a buffer moves of a page depend on the token positions the page has written:
+    the runs are those of one position, moved to each position's place on either side.
+
+    Subclasses are frozen dataclasses, so that buffers whose runs move by equal rules share one
+    computation per page.
+    """
+
+    @property
+    def kept(self) -> int:
+        """The most positions of one page that a transfer moves."""
+        raise NotImplementedError
+
+    def positions(self, page: int, window: TransferWindow) -> np.ndarray:
+        """The token positions of page ``page`` (its position among a request's pages, from 0)
+        that a transfer over ``window`` moves, as int64."""
+        raise NotImplementedError
+
+    def offsets(self, positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The byte offset of each position's place from its buffer's position-0 runs, on the
+        source and on the destination."""
+        raise NotImplementedError
+
+
 @dataclass(frozen=True, eq=False)
 class BufferRuns:
     """The bytes a source rank sends of one buffer the destination rank also holds: run ``i`` is
     ``sizes[i]`` bytes from ``src_offsets[i]`` of the source page's pool slot to ``dst_offsets[i]``
-    of the destination's.
+    of the destination's. For a buffer of token positions, these are the runs of the position at
+    index 0 on both sides, and ``page_runs`` gives what a page moves.
 
     Attributes:
         src: The source rank's buffer.
@@ -114,6 +150,9 @@ class BufferRuns:
         src_offsets: int64 offsets within the source buffer's pool slot.
         dst_offsets: int64 offsets within the destination buffer's pool slot.
         sizes: int64 run lengths in bytes.
+        by_position: How the runs it moves of a page depend on the token positions the page has
+            written (``page_runs``): None when they do not, and equal for buffers whose runs
+            depend on them alike.
     """
 
     src: BufferDesc
@@ -121,13 +160,7 @@ class BufferRuns:
     src_offsets: np.ndarray
     dst_offsets: np.ndarray
     sizes: np.ndarray
-
-    @property
-    def by_position(self) -> Hashable | None:
-        """How the runs it moves of a page depend on the token positions the page has written
-        (``page_runs``): None when they do not, and equal for buffers whose runs depend on them
-        alike."""
-        return None
+    by_position: PositionRule | None = None
 
     @property
     def fixed(self) -> bool:
@@ -137,15 +170,25 @@ class BufferRuns:
     @property
     def page_bytes(self) -> int:
         """The most bytes it moves of one page."""
-        return int(self.sizes.sum())
+        sent = int(self.sizes.sum())
+        return sent if self.by_position is None else sent * self.by_position.kept
 
 
 def page_runs(
     runs: BufferRuns, page: int, window: TransferWindow
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The runs that move page ``page`` (its position among a request's pages, from 0) in a
-    transfer over ``window``: ``runs``' own, the same for every page."""
-    return runs.src_offsets, runs.dst_offsets, runs.sizes
+    transfer over ``window``: ``runs``' own for a buffer laid out alike for every position; else
+    those of each position the buffer's rule moves (``PositionRule``), from its place on the
+    source to its place on the destination."""
+    rule = runs.by_position
+    if rule is None:
+        return runs.src_offsets, runs.dst_offsets, runs.sizes
+    src_at, dst_at = rule.offsets(rule.positions(page, window))
+    src = src_at[:, None] + runs.src_offsets[None, :]
+    dst = dst_at[:, None] + runs.dst_offsets[None, :]
+    sizes = np.broadcast_to(runs.sizes, src.shape).ravel()
+    return merge_runs(src.ravel(), dst.ravel(), sizes)
 
 
 def _dims(topology: RankTopology) -> dict[str, tuple[int, int]]:
@@ -171,31 +214,54 @@ def _elected(candidates: Sequence[int], key: int) -> int:
     return candidates[key % len(candidates)]
 
 
-def _owned(
-    axis: Axis, src: RankTopology, fans: dict[str, range], key: int, wanted: Progression
+@functools.singledispatch
+def owned_indices(
+    kind: AxisKind,
+    axis: Axis,
+    src: RankTopology,
+    fans: dict[str, range],
+    key: int,
+    wanted: Progression,
 ) -> list[Progression]:
-    """The runs of indices of ``axis`` that the source rank sends: the whole axis when it does not
-    split it, else the indices it is elected for among the paired ranks holding them.
+    """The runs of indices of ``axis``, of kind ``kind``, that the source rank at ``src`` sends:
+    of the indices it holds, those it is the elected sender of among the source ranks paired with
+    the destination (``fans``: each parallel dimension's paired source ranks; ``key``: breaks ties
+    as ``map_buffers`` says). A kind registers its own; one that spreads over no dimension, as
+    the default, sends every index it holds.
 
     Raises:
         ValueError: If the destination holds (``wanted``) an index no paired rank holds.
     """
-    if not axis.split:
-        return [Progression(0, 1, axis.extent)]
-    n, r = grid_place(src, axis.split)
-    sizes = [_dims(src)[dim][0] for dim in axis.split]
-    paired = sorted(
-        {_flat(c, sizes) for c in itertools.product(*(fans[dim] for dim in axis.split))}
-    )
-    if axis.cyclic:
-        # One rank holds each index: index i lies on rank i modulo n.
-        for rank in range(n):
-            if rank not in paired and rank < axis.extent:
-                _refuse_unpaired(
-                    axis, Progression(rank, n, len(range(rank, axis.extent, n))), wanted
-                )
-        return [held(axis, src)] if r in paired else []
-    runs = [(rank * axis.extent // n, rank * axis.extent // n + axis.held) for rank in range(n)]
+    if kind.split:
+        raise ValueError(
+            f"axis {axis.name!r}: kind {kind.name!r} spreads over {kind.split} but registers no "
+            "owned_indices"
+        )
+    return [held(axis, src)]
+
+
+def _paired(split: Sequence[str], src: RankTopology, fans: dict[str, range]) -> list[int]:
+    """The source ranks paired with the destination, by flat place in the grid of ``split``."""
+    sizes = [_dims(src)[dim][0] for dim in split]
+    return sorted({_flat(c, sizes) for c in itertools.product(*(fans[dim] for dim in split))})
+
+
+@owned_indices.register(Cyclic)
+def _owned_cyclic(kind, axis, src, fans, key, wanted):
+    # One rank holds each index: index i lies on rank i modulo n.
+    n, r = grid_place(src, kind.split)
+    paired = _paired(kind.split, src, fans)
+    for rank in range(n):
+        if rank not in paired and rank < axis.extent:
+            _refuse_unpaired(axis, Progression(rank, n, len(range(rank, axis.extent, n))), wanted)
+    return [held(axis, src)] if r in paired else []
+
+
+@owned_indices.register(Contiguous)
+def _owned_contiguous(kind, axis, src, fans, key, wanted):
+    n, r = grid_place(src, kind.split)
+    paired = _paired(kind.split, src, fans)
+    runs = [(rank * axis.extent // n, rank * axis.extent // n + kind.held) for rank in range(n)]
     bounds = sorted({0, axis.extent} | {min(b, axis.extent) for run in runs for b in run})
     out: list[Progression] = []
     for lo, hi in zip(bounds, bounds[1:]):
@@ -264,7 +330,7 @@ def _tensor_runs(
             )
         src_held, dst_held = held(src_axis, src), held(dst_axis, dst)
         parts = []
-        for owned in _owned(src_axis, src, fans, key, dst_held):
+        for owned in owned_indices(src_axis.kind, src_axis, src, fans, key, dst_held):
             part = owned.intersect(src_held)
             part = None if part is None else part.intersect(dst_held)
             if part is not None:
@@ -347,10 +413,75 @@ def merge_runs(
     return src_offsets[first], dst_offsets[first], merged
 
 
+def _pinned(tensor: Tensor) -> Tensor:
+    """The tensor with its axis of token positions narrowed to index 0, so that its runs are those
+    of one position."""
+    if tensor.positional is None:
+        return tensor
+    axes = tuple(
+        Axis.unchecked(a.name, 1, a.stride) if a.kind.positional else a for a in tensor.axes
+    )
+    return Tensor.unchecked(axes, tensor.offset, tensor.name, tensor.dtype)
+
+
+@functools.singledispatch
+def position_rule(
+    kind: AxisKind, src_axis: Axis, dst_axis: Axis, tokens_per_page: int
+) -> PositionRule:
+    """How the runs of a buffer whose axis of token positions is ``src_axis`` on the source and
+    ``dst_axis`` on the destination move with position, for pages of ``tokens_per_page`` tokens.
+    A positional axis kind registers its own.
+
+    Raises:
+        ValueError: If ``kind`` registers no rule.
+    """
+    raise ValueError(f"axis {src_axis.name!r}: kind {kind.name!r} registers no position_rule")
+
+
+def _by_position(
+    src: PageLayout,
+    src_buffer: BufferDesc,
+    dst: PageLayout,
+    dst_buffer: BufferDesc,
+    groups: tuple[dict[tuple[int, int], int], dict[tuple[int, int], int]],
+) -> PositionRule | None:
+    """How a buffer both ranks transfer moves with token position, or None when it holds no axis
+    of token positions; ``groups`` are both layouts' ``layer_group_of``.
+
+    Raises:
+        ValueError: If one side's buffer has an axis of token positions and the other's has none,
+            the axes are named or kinded apart, or the axis lies in a layer group holding one
+            slot per request.
+    """
+    src_axis, dst_axis = src_buffer.positional, dst_buffer.positional
+    if src_axis is None and dst_axis is None:
+        return None
+    where = f"buffer ({src_buffer.layer}, {src_buffer.role})"
+    if (
+        src_axis is None
+        or dst_axis is None
+        or src_axis.name != dst_axis.name
+        or type(src_axis.kind) is not type(dst_axis.kind)
+    ):
+        raise ValueError(
+            f"{where}: token positions {src_axis and (src_axis.name, src_axis.kind.name)!r} "
+            f"against {dst_axis and (dst_axis.name, dst_axis.kind.name)!r}"
+        )
+    for page, buffer, group_of in ((src, src_buffer, groups[0]), (dst, dst_buffer, groups[1])):
+        group = page.layer_groups[group_of[buffer.pool_group, buffer.layer]]
+        if group.kind.per_request:
+            raise ValueError(
+                f"{where}: a {src_axis.kind.name} of token positions in a {group.kind} layer "
+                "group, which holds one slot per request"
+            )
+    return position_rule(src_axis.kind, src_axis, dst_axis, src.tokens_per_page)
+
+
 def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> list[BufferRuns]:
     """What the rank of ``src`` sends the rank of ``dst``: for each buffer both transfer (same
     global layer and role), the runs of its tensors the source is the elected sender of. Buffers
-    that move nothing are left out.
+    that move nothing are left out. A buffer of token positions gives the runs of one position, to
+    be moved with ``page_runs``.
 
     Args:
         src: The source rank's page layout.
@@ -359,11 +490,14 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
             data-parallel rank by default.
 
     Raises:
-        ValueError: If two matched buffers' tensors or axes differ in name or extent, or the
-            destination holds an index no source rank it pairs with holds.
+        ValueError: If two matched buffers' tensors or axes differ in name or extent other than an
+            axis of token positions', one has such an axis the other has not, such an axis lies in
+            a group holding one slot per request, or the destination holds an index no source rank
+            it pairs with holds.
     """
     key = dst.topology.dp_rank if key is None else key
     fans = _fans(src.topology, dst.topology)
+    groups = (layer_group_of(src), layer_group_of(dst))
     dst_buffers = {(b.layer, b.role): b for b in dst.buffers if b.transferred}
     out = []
     for src_buffer in src.buffers:
@@ -376,14 +510,15 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
                 f"buffer ({src_buffer.layer}, {src_buffer.role}): tensors "
                 f"{[t.name for t in src_buffer.tensors]} against {list(dst_tensors)}"
             )
+        rule = _by_position(src, src_buffer, dst, dst_buffer, groups)
         parts = []
         for src_tensor in src_buffer.tensors:
             runs = _tensor_runs(
                 src_buffer,
-                src_tensor,
+                _pinned(src_tensor),
                 src.topology,
                 dst_buffer,
-                dst_tensors[src_tensor.name],
+                _pinned(dst_tensors[src_tensor.name]),
                 dst.topology,
                 fans,
                 key,
@@ -397,8 +532,20 @@ def map_buffers(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> 
         src_offsets = np.concatenate([p[0] for p in parts])
         dst_offsets = np.concatenate([p[1] for p in parts])
         sizes = np.concatenate([np.full(p[0].size, p[2], dtype=np.int64) for p in parts])
-        out.append(BufferRuns(src_buffer, dst_buffer, *merge_runs(src_offsets, dst_offsets, sizes)))
+        out.append(
+            BufferRuns(
+                src_buffer,
+                dst_buffer,
+                *merge_runs(src_offsets, dst_offsets, sizes),
+                by_position=rule,
+            )
+        )
     return out
+
+
+def _axes_summary(tensor: Tensor) -> dict[str, object]:
+    """Each axis' extent by name, or its kind's name for an axis of token positions."""
+    return {a.name: a.kind.name if a.kind.positional else a.extent for a in tensor.axes}
 
 
 @dataclass(frozen=True, eq=False)
@@ -543,7 +690,8 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     caches a context-only worker keeps none of past its split), rather than left unwritten.
     On the layers both hold, every buffer either rank transfers the other transfers too, but for
     such a rebuilt role, as the same tensors: the same names, axes and extents over all ranks,
-    however each splits them, and elements of the same type where the tensors state one, in pages
+    however each splits them, as each axis' kind judges (``AxisKind.corresponds``), and elements of
+    the same type where the tensors state one, in pages
     of as many sub-pages, in layer groups of the same kind. The KV data is of one element type and
     quantization. Pages pair one to one, so where both transfer buffers of paged groups (not
     ``GroupKind.per_request``) their pages hold as many tokens.
@@ -577,10 +725,15 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
             problems.append(f"buffer {key}: tensors {sorted(xs)} against {sorted(ys)}")
         for name in sorted(set(xs) & set(ys)):
             tx, ty = xs[name], ys[name]
-            ex = {axis.name: axis.extent for axis in tx.axes}
-            ey = {axis.name: axis.extent for axis in ty.axes}
-            if ex != ey:
-                problems.append(f"buffer {key} tensor {name!r}: axes {ex} against {ey}")
+            ax, ay = {a.name: a for a in tx.axes}, {a.name: a for a in ty.axes}
+            if set(ax) != set(ay) or not all(
+                ax[n].kind.corresponds(ax[n], ay[n]) and ay[n].kind.corresponds(ay[n], ax[n])
+                for n in ax
+            ):
+                problems.append(
+                    f"buffer {key} tensor {name!r}: axes {_axes_summary(tx)} against "
+                    f"{_axes_summary(ty)}"
+                )
             if tx.dtype != ty.dtype:
                 problems.append(
                     f"buffer {key} tensor {name!r}: elements of type {tx.dtype} against {ty.dtype}"
@@ -656,8 +809,9 @@ def _held_model_layers(layout: PageLayout, groups: dict[tuple[int, int], int]) -
 def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:
     """The most bytes the rank of ``src`` sends the rank of ``dst`` into one page of each of the
     destination's layer groups, a per-request group's slot counting as its page: ``map_buffers``'
-    runs, summed by the index of the destination's layer group (``BufferRuns.page_bytes``). Groups
-    it sends nothing of are left out.
+    runs, summed by the index of the destination's layer group, a buffer of token positions' at
+    the most positions a page moves (``BufferRuns.page_bytes``). Groups it sends nothing of are
+    left out.
 
     Raises:
         ValueError: As ``map_buffers`` and ``layer_group_of`` do.

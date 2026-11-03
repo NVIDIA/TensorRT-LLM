@@ -26,7 +26,7 @@ import sys
 import types
 import weakref
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence
+from typing import ClassVar, Dict, List, Optional, Sequence
 
 import numpy as np
 import pytest
@@ -38,7 +38,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache import page_layout, page_table, sha
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     Axis,
+    AxisKind,
     BufferDesc,
+    Contiguous,
+    Cyclic,
     GroupKind,
     LayerGroupDesc,
     Paged,
@@ -47,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     RankTopology,
     ShardDesc,
     Tensor,
+    Whole,
     content_shard,
     head_major,
     replicated,
@@ -288,15 +292,25 @@ def test_named_keys_at_their_defaults_are_left_out_and_others_are_written():
     assert "kind" not in layout_document(layout)["groups"][0]
 
 
+@dataclasses.dataclass(frozen=True)
+class _Stretched(AxisKind):
+    """An axis kind the lender has never heard of, holding every index on every rank."""
+
+    name: ClassVar[str] = "test-stretched"
+    factor: int = 1
+
+
 @pytest.mark.cpu_only
-def test_layout_id_hashes_every_axis_field():
-    """The lender hashes each axis as ``page_layout.axis_to_dict`` writes it, so a field ``Axis``
-    gains reaches ``layout_id`` with no change to the lender: every field, each set away from its
-    default by one of these buffers, appears in the hashed document. A new field is set here too.
+def test_layout_id_hashes_every_axis_and_kind_field():
+    """The lender hashes each axis as ``page_layout.axis_document`` writes it: its name, extent
+    and stride and its kind's document. The kinds of old encode as the fields ``Axis`` had before
+    it had a kind (split, held, cyclic), so their ids are unchanged; a kind added later, as
+    one a test defines, reaches ``layout_id`` with its name and every field set away from its
+    default, with no change to the lender, and leaves every other document alone.
     """
     layout = make_layout(layers=((0,), (1,)))
     key, scale, other = layout.buffers
-    cyclic = Tensor((Axis("head", 4, 5, ("tp",), cyclic=True), Axis("byte", 5, 1)))
+    cyclic = Tensor((Axis("head", 4, 5, Cyclic(("tp",))), Axis("byte", 5, 1)))
     buffers = (
         dataclasses.replace(key, tensors=head_major(50, 5, 10)),  # split, held
         dataclasses.replace(scale, tensors=(cyclic,)),
@@ -310,7 +324,22 @@ def test_layout_id_hashes_every_axis_field():
         for axis in tensor["axes"]
         for field in axis
     }
-    assert hashed == {f.name for f in dataclasses.fields(Axis)}
+    assert hashed == {"name", "extent", "stride", "split", "held", "cyclic"}
+    stretched = (Tensor((Axis("byte", 20, 1, _Stretched(factor=3)),)),)
+    novel = layout_document(
+        dataclasses.replace(
+            layout,
+            buffers=(key, scale, other)[:2] + (dataclasses.replace(other, tensors=stretched),),
+        )
+    )
+    assert novel["buffers"][2]["tensors"] == [
+        {
+            "axes": [
+                {"name": "byte", "extent": 20, "stride": 1, "kind": "test-stretched", "factor": 3}
+            ]
+        }
+    ]
+    assert novel["buffers"][:2] == layout_document(layout)["buffers"][:2]
 
 
 @pytest.mark.cpu_only
@@ -363,16 +392,23 @@ def test_tensors_that_do_not_fit_their_buffer_are_refused():
 
 @pytest.mark.cpu_only
 def test_an_axis_says_how_its_split_holds():
-    with pytest.raises(ValueError, match="says how many indices"):
-        Axis("head", 8, 4, ("tp",))
-    with pytest.raises(ValueError, match="says how many indices"):
-        Axis("head", 8, 4, held=2)
-    with pytest.raises(ValueError, match="not split"):
-        Axis("row", 8, 4, cyclic=True)
     with pytest.raises(ValueError, match="splits over"):
-        Axis("head", 8, 4, ("pp",), 2)
+        Contiguous((), 2)
+    with pytest.raises(ValueError, match="positive"):
+        Contiguous(("tp",), 0)
+    with pytest.raises(ValueError, match="splits over"):
+        Cyclic(())
+    with pytest.raises(ValueError, match="splits over"):
+        Contiguous(("pp",), 2)
+    with pytest.raises(ValueError, match="splits over"):
+        Cyclic(("tp", "tp"))
+    with pytest.raises(ValueError, match="9 held of 8"):
+        Axis("head", 8, 4, Contiguous(("tp",), 9))
+    with pytest.raises(ValueError, match="AxisKind"):
+        Axis("head", 8, 4, ("tp",))
     with pytest.raises(ValueError, match="splits two axes"):
-        Tensor((Axis("a", 4, 4, ("tp",), 2), Axis("b", 4, 1, ("tp",), 2)))
+        Tensor((Axis("a", 4, 4, Contiguous(("tp",), 2)), Axis("b", 4, 1, Contiguous(("tp",), 2))))
+    assert Axis("head", 8, 4).kind == Whole() and Axis("head", 8, 4).split == ()
 
 
 @pytest.mark.cpu_only
@@ -401,7 +437,7 @@ def described(b):
     if rest or "head" not in axes:
         return "SECTIONED", None, None
     kind = "NHD" if tensor.axes[0].name == "token" else "INDEXED"
-    return kind, axes["head"].held, b.size // axes["head"].held
+    return kind, axes["head"].kind.held, b.size // axes["head"].kind.held
 
 
 # -- a stand-in manager --------------------------------------------------------------------------
@@ -2796,9 +2832,19 @@ LAYOUT_TYPES = (
     Axis,
 )
 # Each layout type's public names beyond its fields and ``unchecked``.
-LAYOUT_TYPE_EXTRAS = {BufferDesc: {"split"}, Tensor: {"split"}}
+LAYOUT_TYPE_EXTRAS = {
+    BufferDesc: {"positional", "split"},
+    Tensor: {"positional", "split"},
+    Axis: {"split"},
+}
 # The kinds page_layout defines, and their fields.
-LAYOUT_KINDS = {Paged: "", PerRequest: ""}
+LAYOUT_KINDS = {
+    Whole: "",
+    Contiguous: "split=('tp',) held=1",
+    Cyclic: "split=('tp',)",
+    Paged: "",
+    PerRequest: "",
+}
 
 
 def pinned_fields(cls):
@@ -2816,9 +2862,13 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         [
             *(t.__name__ for t in LAYOUT_TYPES),
             *(t.__name__ for t in LAYOUT_KINDS),
+            "AxisKind",
             "GroupKind",
             "GRID_DIMENSIONS",
             "Progression",
+            "axis_document",
+            "axis_from_dict",
+            "axis_kind_from_dict",
             "axis_to_dict",
             "content_shard",
             "grid_place",
@@ -2853,11 +2903,17 @@ def test_the_layout_types_keep_their_module_fields_and_members():
         "layer role pool_group pool_index slot_offset size tensors=() transferred=True expansion=1"
     )
     assert pinned_fields(Tensor) == "axes offset=0 name='' dtype=None"
-    assert pinned_fields(Axis) == "name extent stride split=() held=None cyclic=False"
+    assert pinned_fields(Axis) == "name extent stride kind=Whole()"
     for kind, fields in LAYOUT_KINDS.items():
         assert pinned_fields(kind) == fields, kind
         assert kind.__dataclass_params__.frozen, kind
-    assert [k.name for k in LAYOUT_KINDS] == ["attention", "state"]
+    assert [k.name for k in LAYOUT_KINDS] == [
+        "whole",
+        "contiguous",
+        "cyclic",
+        "attention",
+        "state",
+    ]
     assert pinned_fields(RankTopology) == (
         "tp_size=1 tp_rank=0 pp_size=1 pp_rank=0 cp_size=1 cp_rank=0 dp_size=1 dp_rank=0 "
         "attention_dp=False"
@@ -3091,7 +3147,7 @@ def every_field_set():
                 48,
                 (
                     Tensor(
-                        (Axis("row", 12, 8, ("tp",), cyclic=True), Axis("byte", 8, 1)),
+                        (Axis("row", 12, 8, Cyclic(("tp",))), Axis("byte", 8, 1)),
                         offset=8,
                         name="r",
                     ),
@@ -3110,7 +3166,7 @@ def every_field_set():
 def rebuilt(value):
     """``value`` rebuilt through the unchecked constructors from plain values; kinds are values
     of their own, kept as they are."""
-    if isinstance(value, GroupKind):
+    if isinstance(value, (AxisKind, GroupKind)):
         return value
     if dataclasses.is_dataclass(value):
         parts = {f.name: rebuilt(getattr(value, f.name)) for f in dataclasses.fields(value)}
