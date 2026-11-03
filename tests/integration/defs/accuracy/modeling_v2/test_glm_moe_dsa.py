@@ -872,7 +872,10 @@ def _high_throughput_engine_kwargs(batch_size: int, draft_len: int) -> dict:
         ),
         env_overrides=dict(_HIGH_THROUGHPUT_ENV),
     )
-    kwargs["speculative_config"].max_draft_len = draft_len
+    kwargs["speculative_config"] = MTPDecodingConfig(
+        max_draft_len=draft_len, use_relaxed_acceptance_for_thinking=False
+    )
+    kwargs["speculative_config"]._allow_separate_draft_kv_cache = False
     return kwargs
 
 
