@@ -7,7 +7,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from tensorrt_llm.evaluate.visual_gen import video_evaluators as evaluators
+from tensorrt_llm.evaluate.visual_gen import evaluators
 from tensorrt_llm.evaluate.visual_gen import video_generation_eval as cli
 
 pytestmark = pytest.mark.cpu_only
@@ -303,7 +303,7 @@ def test_script_scores_without_importing_trtllm(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_existing_videos_skip_generation_and_model(tmp_path, monkeypatch):
+def test_existing_videos_skip_model_loading(tmp_path, monkeypatch):
     import tensorrt_llm.commands.eval as root
 
     references = tmp_path / "baselines"
@@ -337,6 +337,8 @@ def test_existing_videos_skip_generation_and_model(tmp_path, monkeypatch):
     result = CliRunner().invoke(
         root.main,
         [
+            "--model",
+            "unused-model",
             "video_generation_eval",
             "--prompts",
             str(prompts),
@@ -386,13 +388,16 @@ def test_missing_existing_videos_fail_before_loading_models(tmp_path, monkeypatc
     assert "generated_dir" in result.output or "Missing videos" in result.output
 
 
-def test_generation_requires_model(tmp_path):
+@pytest.mark.parametrize("existing", [False, True])
+def test_video_eval_requires_root_model(tmp_path, existing):
     import tensorrt_llm.commands.eval as root
 
     prompts = tmp_path / "prompts.txt"
     prompts.write_text("A fox\n")
     options = tmp_path / "lpips.yaml"
-    options.write_text("reference_dir: baselines\n")
+    options.write_text(
+        "reference_dir: baselines\n" + ("generated_dir: existing\n" if existing else "")
+    )
     result = CliRunner().invoke(
         root.main,
         [
@@ -406,7 +411,8 @@ def test_generation_requires_model(tmp_path):
         ],
     )
     assert result.exit_code == 2
-    assert "--model is required" in result.output
+    assert "Missing option" in result.output
+    assert "--model" in result.output
 
 
 def test_other_evaluators_still_require_model():
