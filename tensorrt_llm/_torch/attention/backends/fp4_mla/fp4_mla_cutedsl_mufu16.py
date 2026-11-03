@@ -5144,6 +5144,12 @@ def _runtime_t336_prepare_p_source(
                 has_previous_tile,
             )
         )
+    # Both score halves must finish reading this shared row max before any
+    # producer publishes the next tile's maximum into the same buffer.
+    prims.barrier(
+        barrier_id=SMEM_P4_DUAL_HALF_BAR_ID,
+        number_of_threads=SMEM_P4_DUAL_HALF_BAR_THREADS,
+    )
     if is_compute_warp:
         if prims.elect_sync():
             prims.mbarrier_arrive(pair_rowmax_read_done_mbar)
@@ -5548,8 +5554,12 @@ def _runtime_t336_producer_tile(
 
 @cute.jit
 def _issue_pipelined_score_loads(
-    qk_full_mbar, stream_li_idx: ctm.Int32, warp_idx, base_col_id, base_row_id
-):
+    qk_full_mbar: ctm.Array,
+    stream_li_idx: ctm.Int32,
+    warp_idx: ctm.Int32,
+    base_col_id: ctm.Int32,
+    base_row_id: ctm.Int32,
+) -> list[tuple[ctm.Int32, ...]]:
     """Wait for tile ``stream_li_idx``'s scores and issue their TMEM loads without waiting on them."""
     bank_idx = stream_li_idx % ctm.Int32(SMEM_P4_TMEM_BANKS)
     qk_phase = (
@@ -5578,13 +5588,13 @@ def _issue_pipelined_score_loads(
 
 @cute.jit
 def _finish_pipelined_score_loads(
-    pending,
-    sPipelinedRowMax,
-    leader_pair_overlap_sync_mbars,
+    pending: list[tuple[ctm.Int32, ...]],
+    sPipelinedRowMax: ctm.Array,
+    leader_pair_overlap_sync_mbars: ctm.Array,
     stream_li_idx: ctm.Int32,
     warp_idx: ctm.Int32,
     tidx: ctm.Int32,
-):
+) -> tuple[ctm.Vector, ctm.Vector]:
     """Wait for the score loads, publish the tile row max by tile parity and release the score bank."""
     producer_warp_base = (warp_idx >> ctm.Int32(2)) << ctm.Int32(2)
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
@@ -5623,14 +5633,14 @@ def _finish_pipelined_score_loads(
 
 @cute.jit
 def _prepack_pipelined_tile(
-    score_values,
-    group_max_values,
-    warp_idx,
-    softmax_scale_log2,
-    stream_li_idx,
-    valid_k,
+    score_values: ctm.Vector,
+    group_max_values: ctm.Vector,
+    warp_idx: ctm.Int32,
+    softmax_scale_log2: ctm.Float32,
+    stream_li_idx: ctm.Int32,
+    valid_k: ctm.Int32,
     use_mixed_imlp: ctm.Constexpr,
-):
+) -> tuple:
     """Pack an unmasked tile's FP4 P words and group sums ahead of its row-max exchange.
 
     Returns 16 scalars (8 P words, 4 group maxima, 4 group sums): the tile loop carries them to

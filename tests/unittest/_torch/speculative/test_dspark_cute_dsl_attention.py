@@ -227,7 +227,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
     def unexpected_launch(*args):
         pytest.fail("invalid inputs reached compilation or a kernel launch")
 
-    monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100a")
+    monkeypatch.setattr(attention_op, "_get_dspark_arch_str", lambda: "sm_100")
     key = (6, 128, 32, attention_op._get_dspark_arch_str(), None)
     monkeypatch.setattr(attention_op, "_dspark_attention_kernel_cache", {key: unexpected_launch})
     monkeypatch.setattr(attention_op, "_compile_dspark_attention", unexpected_launch)
@@ -244,9 +244,9 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
         heads=heads,
         block=block,
         page_size=page_size,
-        positions=[0, 1, 32, 33, 127, 128, 129, 257, 390, 99],
-        valid_lengths=[0, 1, 3, 32, 127, 128, 17, 128, 3, 128],
-        capacities=[512] * 9 + [0],
+        positions=[0, 1, 17, 32, 33, 63, 64, 65, 127, 128, 129, 193, 257, 390, 99],
+        valid_lengths=[0, 1, 1, 3, 32, 1, 1, 127, 1, 0, 1, 127, 32, 3, 128],
+        capacities=[512] * 14 + [0],
     )
     original_cache = inputs["kv_pages"].clone()
     expected = _reference(**inputs)
@@ -255,17 +255,21 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
     torch.testing.assert_close(inputs["kv_pages"], original_cache, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("heads,page_size", [(64, 32), (128, 64), (128, 256)])
-def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size):
+@pytest.mark.parametrize(
+    "heads,page_size,batch_repeats",
+    [(64, 32, 1), (128, 64, 1), (128, 256, 1), (128, 64, 64)],
+)
+def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size, batch_repeats):
     inputs = _make_inputs(
         3,
         heads=heads,
         page_size=page_size,
-        positions=[257, 5, 390],
-        capacities=[512, 512, 0],
+        positions=[257, 5, 390] * batch_repeats,
+        capacities=[512, 512, 0] * batch_repeats,
     )
-    main_x = torch.randn(3, 1, 512, device="cuda", dtype=torch.bfloat16)
-    block_x = torch.randn(3, 6, 512, device="cuda", dtype=torch.bfloat16)
+    batch = 3 * batch_repeats
+    main_x = torch.randn(batch, 1, 512, device="cuda", dtype=torch.bfloat16)
+    block_x = torch.randn(batch, 6, 512, device="cuda", dtype=torch.bfloat16)
     weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
     freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
     main_freqs = torch.view_as_real(freqs[inputs["positions"]]).contiguous()
@@ -292,9 +296,9 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay(heads, page_size):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured, draft = forward()
-    for end in (127, 128, 129, 255):
+    for end in (17, 65, 127, 128, 129, 193, 255):
         inputs["positions"][:2].copy_(torch.tensor([end, end + 1], device="cuda"))
-        inputs["valid_lengths"].copy_(torch.tensor([128, 3, 128], device="cuda"))
+        inputs["valid_lengths"].copy_(torch.tensor([127, 1, 128] * batch_repeats, device="cuda"))
         inputs["block_tables"][:2].copy_(inputs["block_tables"][:2].roll(1, dims=1))
         main_x.normal_()
         block_x.normal_()
@@ -334,7 +338,8 @@ def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, page_siz
     torch.testing.assert_close(actual_cache, g["kv_cache0"], rtol=2e-2, atol=2e-2)
 
 
-def test_warmup_is_best_effort(monkeypatch):
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_warmup_is_best_effort(monkeypatch, num_heads):
     import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
     warnings = []
@@ -346,7 +351,7 @@ def test_warmup_is_best_effort(monkeypatch):
     )
     monkeypatch.setattr(dspark_attention_op.logger, "warning", warnings.append)
 
-    dspark_attention_op.warmup_fused_dsv4_dspark_attention(5, 1e-6)
+    dspark_attention_op.warmup_fused_dsv4_dspark_attention(5, 1e-6, num_heads)
 
     assert len(warnings) == 1
     assert "self-JIT on first use" in warnings[0]
@@ -667,7 +672,7 @@ def test_sparse_attn_masked_indices_excluded():
     "start_pos,page_size,block", [(1, 128, 5), (3, 64, 5), (10, 16, 5), (200, 256, 6)]
 )
 def test_page_mapping_matches_reference(start_pos, page_size, block):
-    from tensorrt_llm._torch.attention.backends.dspark import write_dspark_context
+    from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
 
     inputs = _make_inputs(block=block, positions=[start_pos] * 3, page_size=page_size)
     values = inputs["draft_block"][:, :1].contiguous()
@@ -684,7 +689,7 @@ def test_page_mapping_matches_reference(start_pos, page_size, block):
 
 
 def test_page_mapping_masks_non_generation_rows():
-    from tensorrt_llm._torch.attention.backends.dspark import write_dspark_context
+    from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
 
     values = torch.randn(1, 1, 16, device="cuda")
     pool = torch.randn(1, 128, 16, device="cuda")
@@ -850,7 +855,7 @@ def test_batched_attention_dummy_rows_keep_pages():
 
 @pytest.mark.parametrize("start_positions", [(1, 3, 20), (5, 5, 5), (2, 7, 200)])
 def test_batched_page_writes_match_per_request(start_positions):
-    from tensorrt_llm._torch.attention.backends.dspark import write_dspark_context
+    from tensorrt_llm._torch.attention.kernels.dspark import write_dspark_context
 
     g = _make_batched_inputs(start_positions=start_positions)
     values = torch.randn(g["b"], 1, g["head_dim"], device="cuda", dtype=torch.bfloat16)
@@ -1065,7 +1070,7 @@ def test_dspark_fp8_input_producers_match_reference_and_reuse_dynamic_m_compile(
     get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The fused DSpark output projection requires SM107 Rubin CuTe DSL",
 )
-def test_dspark_fused_fp8_output_projection_matches_separate_and_reuses_cache():
+def test_dspark_fused_fp8_output_projection_matches_separate_and_replays_graph():
     from _torch.helpers import per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0
 
     from tensorrt_llm._torch.autotuner import autotune
@@ -1074,6 +1079,7 @@ def test_dspark_fused_fp8_output_projection_matches_separate_and_reuses_cache():
         CuteDSLMXFP8RubinLinear,
     )
     from tensorrt_llm._torch.models.modeling_dspark import _output_projection
+    from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
     from tensorrt_llm.quantization.utils import fp8_utils
 
     torch.manual_seed(41)
@@ -1118,9 +1124,7 @@ def test_dspark_fused_fp8_output_projection_matches_separate_and_reuses_cache():
                 activation, scale = input
             else:
                 activation, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
-            return torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                activation, self.weight, scale, self.weight_scale
-            )
+            return FP8BlockScalesLinearMethod().apply(self, (activation, scale), None)
 
     output_linear = OutputLinear()
     args = dict(
@@ -1159,3 +1163,141 @@ def test_dspark_fused_fp8_output_projection_matches_separate_and_reuses_cache():
     expected = output_linear(o_lora.transpose(0, 1).reshape(rows, flat_n))
     expected = expected.view(batch, block, hidden)
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _output_projection(o, **args)
+    o.mul_(1.125)
+    graph.replay()
+    expected = _output_projection(o, **args)
+    torch.testing.assert_close(captured, expected, rtol=5e-2, atol=3e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_warmup_uses_configured_head_count(monkeypatch, num_heads):
+    monkeypatch.setattr(
+        attention_op,
+        "cute_dsl_dspark_rmsnorm_rope_cache_write",
+        lambda main, weight, freqs, cache, slots, pos, eps: (slots.int(), pos.int()),
+    )
+    monkeypatch.setattr(
+        attention_op,
+        "cute_dsl_dspark_rmsnorm_rope_draft_block",
+        lambda block, *args: block.new_empty((1, 8, 512)),
+    )
+    calls = []
+
+    def attention(q, draft, cache, tables, positions, lengths, capacities, sink, freqs, scale):
+        assert q.shape == (1, 5, num_heads, 512)
+        assert sink.shape == (num_heads,)
+        calls.append(num_heads)
+
+    monkeypatch.setattr(attention_op, "fused_dsv4_dspark_attention", attention)
+    attention_op.warmup_fused_dsv4_dspark_attention(5, 1e-6, num_heads)
+    assert calls == [num_heads]
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("block", [5, 6])
+def test_production_ring_fused_qkv_layout_numbers_and_graph(monkeypatch, batch, block):
+    torch.manual_seed(220 + batch * 10 + block)
+    heads, dim, hidden, rank, groups, o_rank, window = 64, 512, 128, 64, 8, 32, 128
+
+    def weight(*shape):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    x, main = weight(batch, block, hidden), weight(batch, 1, hidden)
+    qkv_weight = weight(rank + dim, hidden)
+
+    def projection(inp):
+        return F.linear(inp, qkv_weight)
+
+    kwargs = dict(
+        wq_a=None,
+        wkv=None,
+        q_norm_w=torch.ones(rank, device="cuda", dtype=x.dtype),
+        wq_b=weight(heads * dim, rank),
+        kv_norm_w=torch.ones(dim, device="cuda", dtype=x.dtype),
+        wo_a=weight(groups * o_rank, heads * dim // groups),
+        wo_b=weight(hidden, groups * o_rank),
+        attn_sink=torch.randn(heads, device="cuda"),
+        n_heads=heads,
+        head_dim=dim,
+        rope_head_dim=64,
+        n_groups=groups,
+        o_lora_rank=o_rank,
+        window_size=window,
+        eps=1e-6,
+        softmax_scale=dim**-0.5,
+        freqs_cis=dspark.precompute_dspark_freqs_cis(64, 1024, device="cuda"),
+        persist=True,
+        qkv_proj=projection,
+    )
+    slots = torch.tensor([2, 0][:batch], device="cuda", dtype=torch.long)
+    start = torch.tensor([64, 192][:batch], device="cuda", dtype=torch.long)
+    lengths = torch.tensor([1, 127][:batch], device="cuda", dtype=torch.long)
+    initial = weight(3, window, dim)
+    cache = initial.clone()
+    _, block_view, main_view = dspark._qkv_projections(
+        x, main, wq_a=None, wkv=None, q_norm_w=kwargs["q_norm_w"], qkv_proj=projection
+    )
+    assert block_view.stride(-2) == rank + dim and not block_view.is_contiguous()
+    assert main_view.stride(-2) == rank + dim
+    if batch > 1:
+        assert not main_view.is_contiguous()
+
+    def run(target):
+        metadata = dspark._dspark_ring_attention_metadata(slots, start, lengths, window)
+        return dspark.dspark_attention_forward_batched(
+            x, main, start, target, slots, lengths, ring_attention_metadata=metadata, **kwargs
+        )
+
+    # The actual source fallback computes the oracle; only path selection changes.
+    expected_cache = initial.clone()
+    with monkeypatch.context() as patch:
+        patch.setattr(dspark, "IS_CUTLASS_DSL_AVAILABLE", False)
+        expected = run(expected_cache)
+    real_cache_write = dspark.cute_dsl_dspark_rmsnorm_rope_cache_write
+    real_draft = dspark.cute_dsl_dspark_rmsnorm_rope_draft_block
+    observed = []
+
+    def cache_write(inp, *rest):
+        assert inp.is_contiguous()
+        observed.append(("main", inp.stride()))
+        return real_cache_write(inp, *rest)
+
+    def draft(inp, *rest):
+        assert inp.is_contiguous()
+        observed.append(("block", inp.stride()))
+        return real_draft(inp, *rest)
+
+    cache_spy, draft_spy = Mock(wraps=cache_write), Mock(wraps=draft)
+    with monkeypatch.context() as patch:
+        patch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope_cache_write", cache_spy)
+        patch.setattr(dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block", draft_spy)
+        actual = run(cache)
+    cache_spy.assert_called_once()
+    draft_spy.assert_called_once()
+    assert [x[0] for x in observed] == ["main", "block"]
+    torch.testing.assert_close(actual, expected, rtol=8e-2, atol=1e-2)
+    torch.testing.assert_close(cache, expected_cache, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(cache[1], initial[1], rtol=0, atol=0)
+
+    # Capture the unchanged production path after all specializations are warm.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run(cache)
+    for position, valid in ((16, 1), (64, 127), (192, 127)):
+        start.copy_(torch.tensor([position, position + 1][:batch], device="cuda"))
+        lengths.fill_(valid)
+        x.normal_(0, 0.02)
+        main.normal_(0, 0.02)
+        cache.copy_(initial)
+        expected_cache = initial.clone()
+        with monkeypatch.context() as patch:
+            patch.setattr(dspark, "IS_CUTLASS_DSL_AVAILABLE", False)
+            expected = run(expected_cache)
+        graph.replay()
+        torch.testing.assert_close(captured, expected, rtol=8e-2, atol=1e-2)
+        torch.testing.assert_close(cache, expected_cache, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(cache[1], initial[1], rtol=0, atol=0)

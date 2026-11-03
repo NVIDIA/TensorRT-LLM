@@ -25,10 +25,9 @@ from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
-# TRTLLM lowering ``validate_block_attention_windows`` reports for a draft
-# layer that runs the context kernel; every other lowering is the block decode,
-# so only this one is subject to the context kernel's head-size limits.
-DFLASH_CONTEXT_LOWERING = "non-causal context"
+# Full non-causal blocks fold their query positions into the decode heads;
+# they use the generation kernel's shape constraints.
+DFLASH_FOLDED_DECODE_LOWERING = "non-causal folded decode"
 
 
 @dataclass(frozen=True)
