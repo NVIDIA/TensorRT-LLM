@@ -1496,14 +1496,22 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
 def test_peer_registrar_shares_draft_layers_when_heads_per_rank_agree(
     self_kwargs: dict, peer_kwargs: dict, compatible: bool
 ) -> None:
-    self_rankinfo = make_rankinfo(instance_name="local", **self_kwargs)
+    def mamba_tp(kwargs: dict) -> int:
+        # The synthetic recurrent state is sharded by TP unless attention DP.
+        return 1 if kwargs.get("enable_attention_dp") else kwargs["tp_size"]
+
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        page_table=make_page_table(mamba_tp=mamba_tp(self_kwargs)),
+        **self_kwargs,
+    )
     self_rankinfo.num_draft_layers = 5
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
         instance_rank=1,
         layer_num_per_pp=[2],
-        page_table=make_page_table(),
+        page_table=make_page_table(mamba_tp=mamba_tp(peer_kwargs)),
         **peer_kwargs,
     )
     peer_ri.num_draft_layers = 5
