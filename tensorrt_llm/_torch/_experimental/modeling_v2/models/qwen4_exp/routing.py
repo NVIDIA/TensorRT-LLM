@@ -12,7 +12,7 @@ mirrored fields are unreliable.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -57,6 +57,7 @@ class EngineChoices(NamedTuple):
     mamba_ssm_cache_dtype: torch.dtype  # the recurrent-state cache's dtype
     gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
     prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
+    encoder_attention_backend: Optional[Dict[str, str]]  # `multimodal_config` encoder backends
 
 
 def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineChoices:
@@ -65,6 +66,7 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
     from tensorrt_llm._torch.utils import is_gdn_replay_enabled
 
     kv_cache_config = llm_args.kv_cache_config
+    mm_config = llm_args.multimodal_config
     return EngineChoices(
         torch_dtype=model_config.torch_dtype,
         moe_backend=model_config.moe_backend_requested,
@@ -73,16 +75,20 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
         ),
         gdn_replay=is_gdn_replay_enabled(),
         prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
+        encoder_attention_backend=(
+            mm_config.encoder_attention_backend if mm_config is not None else None
+        ),
     )
 
 
 def _check_engine(
     spec_config: Optional[Any], kv_cache_quant_algo: Optional[Any], engine: EngineChoices
 ) -> None:
-    """Decline what the target's constructor or first forward would refuse.
+    """Decline what the target's constructor or first forward would refuse or ignore.
 
-    Without this ``auto`` claims the deployment and then fails mid-build instead of
-    falling back to the built-in implementation.
+    Without this ``auto`` claims the deployment and then fails mid-build, or runs
+    without a requested setting, instead of falling back to the built-in
+    implementation.
     """
     if spec_config is not None and (
         getattr(spec_config, "draft_len_schedule", None) is not None
@@ -115,6 +121,11 @@ def _check_engine(
             "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
             "which the target does not implement; 'breakable' runs the prefill step as a "
             "breakable CUDA graph"
+        )
+    if engine.encoder_attention_backend:
+        raise NoTarget(
+            f"multimodal_config.encoder_attention_backend={engine.encoder_attention_backend}; "
+            "the target's vision tower runs its own attention and does not apply it"
         )
     if spec_config is None:
         return
