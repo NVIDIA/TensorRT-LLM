@@ -277,9 +277,7 @@ class KimiK3ServingExtension(ServingExtension):
         generic_effort = chat_template_kwargs.get("reasoning_effort")
         if isinstance(generic_effort, str) and generic_effort.lower() in (
             "none",
-            "low",
-            "high",
-            "max",
+            *_K3_THINKING_EFFORTS,
         ):
             # The extension consumes this control even if a higher-precedence
             # K3 setting wins. Keep it available to custom templates as well.
