@@ -61,6 +61,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+    MooncakeStoreMetadata,
     PageTransfer,
     RequestTransfers,
 )
@@ -927,7 +928,7 @@ def test_worker_load_raises_when_a_page_is_missing(store_config, fake_store):
     with make_worker(fake_store, layout=make_layout()) as worker:
         transfers = RequestTransfers(7, [PageTransfer(b"\x00" * 16, 0, 1)])
         worker.bind_allocation_fence(AllocationFence(fake_store))
-        worker.bind_connector_meta(SimpleNamespace(loads=[transfers], saves=[]))
+        worker.bind_connector_meta(MooncakeStoreMetadata(loads=[transfers], saves=[]))
         with pytest.raises(RuntimeError, match="already"):
             worker.start_load_kv(None)
 
@@ -956,7 +957,9 @@ class AllocationFence:
 def bind_one_load(worker, fake_store, block_hash):
     fake_store.objects.add(worker._namespaces[0].key(block_hash))
     worker.bind_connector_meta(
-        SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
+        MooncakeStoreMetadata(
+            loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[]
+        )
     )
 
 
@@ -1024,18 +1027,11 @@ def test_a_save_that_raises_is_dropped_and_its_request_still_retires(
 
 @contextlib.contextmanager
 def make_staged_worker(fake_store, store_config, *, layout, budget=None):
-    """A worker configured to pass pages through pinned host slots.
-
-    `budget` patches the pinned-memory ceiling rather than setting a field:
-    the allocation follows from the layout and the transfer batch now, so the
-    ceiling is the only thing left that can bind.
-    """
+    """A worker configured to pass pages through bounded pinned host slots."""
     set_pool_setting(store_config, stage_through_host=True)
-    with contextlib.ExitStack() as stack:
-        if budget is not None:
-            patch = stack.enter_context(pytest.MonkeyPatch.context())
-            patch.setattr(worker_module, "MAX_STAGING_BUFFER_BYTES", budget)
-        worker = stack.enter_context(make_worker(fake_store, layout=layout))
+    if budget is not None:
+        set_pool_setting(store_config, staging_buffer_bytes=budget)
+    with make_worker(fake_store, layout=layout) as worker:
         yield worker
 
 
@@ -1122,7 +1118,9 @@ def test_staging_get_scatters_back_to_the_device_regions(store_config, fake_stor
         fake_store.objects.add(worker._namespaces[0].key(block_hash))
 
         worker.bind_connector_meta(
-            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 5)])], saves=[])
+            MooncakeStoreMetadata(
+                loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 5)])], saves=[]
+            )
         )
         worker.start_load_kv(None)
 
@@ -1151,7 +1149,9 @@ def test_staging_does_not_scatter_a_failed_load(store_config, fake_store, staged
         fake_store.fail_gets_for.add(key)
 
         worker.bind_connector_meta(
-            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[])
+            MooncakeStoreMetadata(
+                loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], saves=[]
+            )
         )
         with pytest.raises(RuntimeError, match="failed to load"):
             worker.start_load_kv(None)
@@ -1303,12 +1303,12 @@ def make_scheduler(store_config, hit_blocks=0):
     return scheduler
 
 
-def request_data(request_id, new_tokens, page_indices):
+def request_data(request_id, new_tokens, page_indices, *, computed_position=0):
     return RequestData(
         request_id=request_id,
         new_tokens=list(new_tokens),
         new_block_ids=list(page_indices),
-        computed_position=0,
+        computed_position=computed_position,
         num_scheduled_tokens=len(new_tokens),
         # One entry per layer group, indexed by layer group id.
         new_block_ids_by_layer_group=[list(page_indices)],
@@ -1369,7 +1369,11 @@ def test_scheduler_does_not_resave_blocks_across_iterations(store_config):
     # A generation step completes one more block; only that block is saved.
     more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
     second = scheduler.build_connector_meta(
-        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+        SchedulerOutput(
+            cached_requests=[
+                request_data(1, more_tokens, [6], computed_position=2 * TOKENS_PER_BLOCK)
+            ]
+        )
     )
     assert [page.page_index for page in second.saves[0].pages] == [6]
 
@@ -1551,3 +1555,165 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+# ---- asynchronous prefix loading ----
+
+
+@pytest.mark.parametrize("honoured", [0, TOKENS_PER_BLOCK])
+def test_async_scheduler_queues_only_honoured_pages(store_config, honoured):
+    set_pool_setting(store_config, async_load=True)
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    request = make_request(7, list(range(3 * TOKENS_PER_BLOCK)))
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, True)
+    request.py_num_connector_matched_tokens = honoured
+    scheduler.update_state_after_alloc_by_layer_group(request, [[4, 5, 6]])
+    metadata = scheduler.build_connector_meta(SchedulerOutput())
+    assert [page.page_index for page in metadata.async_loads[0].pages] == ([4] if honoured else [])
+    assert not metadata.loads
+    assert not scheduler.build_connector_meta(SchedulerOutput()).async_loads
+
+
+def test_async_scheduler_rejects_missing_destination(store_config):
+    set_pool_setting(store_config, async_load=True)
+    scheduler = make_scheduler(store_config, hit_blocks=2)
+    request = make_request(7, list(range(3 * TOKENS_PER_BLOCK)))
+    scheduler.get_num_new_matched_tokens(request, 0)
+    request.py_num_connector_matched_tokens = 2 * TOKENS_PER_BLOCK
+    with pytest.raises(RuntimeError, match="missing destination"):
+        scheduler.update_state_after_alloc_by_layer_group(request, [[4]])
+
+
+def test_scheduler_never_publishes_allocated_but_uncomputed_pages(store_config):
+    scheduler = make_scheduler(store_config)
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(make_request(7, tokens), 0)
+    data = request_data(7, tokens, [4, 5, 6])
+    data.num_scheduled_tokens = TOKENS_PER_BLOCK
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert [page.page_index for page in metadata.saves[0].pages] == [4]
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_async_load_waits_for_fence_and_preserves_active_metadata(
+    store_config, fake_store, staged_copies, staged
+):
+    set_pool_setting(store_config, role="consumer", async_load=True, stage_through_host=staged)
+    entered, release = threading.Event(), threading.Event()
+
+    def fence(ids):
+        assert ids == {7}
+        entered.set()
+        assert release.wait(5)
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"a" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        active = MooncakeStoreMetadata()
+        worker.bind_connector_meta(active)
+        try:
+            worker.start_async_loads([RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], fence)
+            assert entered.wait(5)
+            assert worker.get_connector_meta() is active
+            assert not fake_store.get_calls
+            assert worker.get_finished([], [7]) == ([], [])
+        finally:
+            release.set()
+        deadline = time.monotonic() + 5
+        finished = []
+        while not finished and time.monotonic() < deadline:
+            _, finished = worker.get_finished([], [])
+            time.sleep(0.01)
+        assert finished == [7]
+        assert worker.get_finished([], []) == ([], [])
+        assert len(fake_store.get_calls) == 1
+
+
+def test_failed_async_load_is_fatal_and_never_reports_completion(store_config, fake_store):
+    set_pool_setting(store_config, role="consumer", async_load=True)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker.start_async_loads(
+            [RequestTransfers(7, [PageTransfer(b"missing", 0, 1)])], lambda ids: None
+        )
+        deadline = time.monotonic() + 5
+        while worker._load_error is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        with pytest.raises(RuntimeError, match="prefix load failed"):
+            worker.get_finished([], [7])
+        assert not worker._completed_loads
+
+
+def test_shutdown_keeps_buffers_alive_until_async_load_stops(store_config, fake_store, monkeypatch):
+    set_pool_setting(store_config, role="consumer", async_load=True)
+    monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 0.01)
+    entered, release = threading.Event(), threading.Event()
+
+    def fence(ids):
+        entered.set()
+        assert release.wait(5)
+
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        block_hash = b"a" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        try:
+            worker.start_async_loads([RequestTransfers(7, [PageTransfer(block_hash, 0, 1)])], fence)
+            assert entered.wait(5)
+            worker.shutdown()
+            assert not fake_store.closed
+            assert not fake_store.unregistered
+        finally:
+            release.set()
+        monkeypatch.setattr(worker_module, "SAVE_DRAIN_TIMEOUT", 30)
+        worker.shutdown()
+        assert fake_store.closed
+
+
+def test_async_staging_workers_share_one_load_budget(store_config, fake_store, staged_copies):
+    layout = make_layout()
+    page_bytes = PageAddressing(layout).bytes_per_page(0)
+    set_pool_setting(store_config, role="consumer", async_load=True, async_load_workers=2)
+    with make_staged_worker(
+        fake_store, store_config, layout=layout, budget=4 * page_bytes
+    ) as worker:
+        assert [pool.num_slots for pool in worker._async_staging] == [2, 2]
+
+
+def test_attention_dp_uses_one_complete_kv_namespace(store_config, fake_store, monkeypatch):
+    monkeypatch.setattr(worker_module, "mpi_rank", lambda: 3)
+    monkeypatch.setattr(worker_module, "mpi_world_size", lambda: 4)
+    args = make_llm_args()
+    args.enable_attention_dp = True
+    worker = MooncakeStoreConnectorWorker(args)
+    fake_store.workers.append(worker)
+    try:
+        worker.register_kv_cache_layout(make_layout())
+        assert worker._namespaces[0].rank == 0
+        assert worker._namespaces[0].world_size == 1
+        assert len(worker._peer_namespaces[0]) == 1
+        fake_store.objects.add(worker._namespaces[0].key(b"prefix"))
+        assert worker.count_prefix_hit([b"prefix"]) == 1
+    finally:
+        worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "tp,attention_dp,supported", [(1, False, True), (4, True, True), (4, False, False)]
+)
+def test_async_load_rejects_uncoordinated_tp_failures(store_config, tp, attention_dp, supported):
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+        MooncakeStoreConnectorConfig,
+    )
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
+        validate_speculative_config,
+    )
+
+    set_pool_setting(store_config, async_load=True)
+    args = make_llm_args()
+    args.tensor_parallel_size = tp
+    args.enable_attention_dp = attention_dp
+    config = MooncakeStoreConnectorConfig.from_file(store_config)
+    if supported:
+        assert validate_speculative_config(args, config) == 0
+    else:
+        with pytest.raises(NotImplementedError, match="attention DP or TP1"):
+            validate_speculative_config(args, config)

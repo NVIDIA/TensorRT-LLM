@@ -1116,3 +1116,51 @@ def test_final_admission_rejects_an_invalid_local_allocation() -> None:
     assert req.py_served_prefix_end == 0
     manager.release_unused_connector_reservations(set())
     assert connector.releases == [(1, 0, 64)]
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_early_async_admission_owns_and_fences_pages_before_dispatch(monkeypatch, busy):
+    from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorManager
+    from tensorrt_llm.bindings import LlmRequestState
+
+    req = FakeRequest(7)
+    req.is_context_only_request = True
+    order = []
+    connector = SimpleNamespace(
+        scheduler_async_load_capacity=2,
+        new_async_requests=SimpleNamespace(loading={}),
+        scheduler_output_manager=SimpleNamespace(external_loads={7: 32}),
+        get_num_pending_loads=lambda: 2 if busy else 0,
+    )
+    manager = make_manager(connector)
+    manager._scheduler_async_load_admission = True
+    manager._connector_reservations_enabled = lambda: False
+    manager._on_allocation_stream = {7}
+    manager._allocation_stream = object()
+    ready = SimpleNamespace(record=lambda stream: order.append(("fence", stream)))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.torch.cuda.Event",
+        lambda: ready,
+    )
+
+    def allocated(request):
+        order.append(("allocated", request.request_id))
+        connector.new_async_requests.loading[request.request_id] = request
+
+    def dispatch(fence):
+        assert connector.new_async_requests.loading[7] is req
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        assert 7 not in connector.scheduler_output_manager.external_loads
+        assert manager._allocation_ready[7] is ready
+        assert fence == manager.wait_allocation_fences
+        order.append(("dispatch", 7))
+
+    manager._run_request_kv_connector_hooks = allocated
+    connector.scheduler = SimpleNamespace(start_scheduler_async_loads=dispatch)
+    connector.park_request_for_async_load = lambda request, fence: (
+        KvCacheConnectorManager.park_request_for_async_load(connector, request, fence)
+    )
+    assert manager.try_admit_async_connector_load(req) is (not busy)
+    assert order == (
+        [] if busy else [("allocated", 7), ("fence", manager._allocation_stream), ("dispatch", 7)]
+    )

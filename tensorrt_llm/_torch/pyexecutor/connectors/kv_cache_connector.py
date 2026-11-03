@@ -180,6 +180,12 @@ class KvCacheConnectorWorker(ABC):
     # Opt in only when transfers, endpoints and completion are owner-local,
     # and the backend can safely share compatible cache content across owners.
     supports_attention_dp: bool = False
+    # Context-only speculation never rejects draft tokens. Opt in only when
+    # transfers include every target and draft layer in the registered pool.
+    supports_speculative_prefill: bool = False
+    # A whole-block connector can prefer complete local matches to the
+    # one-model draft's lookahead backoff. Only draft acceptance can change.
+    drops_reuse_match_backoff: bool = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -372,6 +378,20 @@ class KvCacheConnectorScheduler(ABC):
     # ADP creates one adapter per rank. Adapters may connect to the same
     # logical storage pool; their request and allocation state stays local.
     supports_attention_dp: bool = False
+    # Store keys must include draft prompt lookahead, and only computed whole
+    # blocks may be saved. The worker must opt in as well.
+    supports_speculative_prefill: bool = False
+    # Owner-local lookup followed by post-allocation asynchronous dispatch.
+    supports_scheduler_async_load: bool = False
+    scheduler_async_load_capacity: int = 0
+
+    def start_scheduler_async_loads(self, allocation_fence: AllocationFence) -> None:
+        """Dispatch accepted loads without changing an active forward's metadata.
+
+        Called only after destination allocation and runtime load ownership
+        are established. The worker must fence each destination before DMA.
+        """
+        raise NotImplementedError
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -766,6 +786,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         scheduler: Optional[KvCacheConnectorScheduler],
         *,
         enable_attention_dp: bool = False,
+        speculative_prefill_only: bool = False,
     ) -> None:
         assert (scheduler is not None) == (enable_attention_dp or mpi_rank() == 0), (
             "A scheduler is required on every attention-DP owner, or only rank 0 for TP."
@@ -783,6 +804,20 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         #: because this disables most of the per-request path, which is too
         #: much to infer from a merely truthy value.
         self.capacity_only = worker.capacity_only is True
+        self.speculative_prefill_only = speculative_prefill_only is True
+        if self.speculative_prefill_only and not self.declares_speculative_prefill(
+            type(worker), None if scheduler is None else type(scheduler)
+        ):
+            raise NotImplementedError(
+                "Speculative prefill requires both connector halves to declare "
+                "supports_speculative_prefill=True."
+            )
+        self.supports_scheduler_async_load = (
+            scheduler is not None and scheduler.supports_scheduler_async_load is True
+        )
+        self.scheduler_async_load_capacity = (
+            scheduler.scheduler_async_load_capacity if scheduler is not None else 0
+        )
 
         # Requests that haven't yet been passed into get_finished.
         self.new_async_requests = AsyncRequests(dict(), dict())
@@ -832,6 +867,25 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
                     "The connector must declare supports_attention_dp=True "
                     "and implement owner-local scheduling/transfers against a shared pool."
                 )
+
+    @staticmethod
+    def declares_speculative_prefill(worker_cls: type, scheduler_cls: Optional[type]) -> bool:
+        return all(
+            getattr(cls, "supports_speculative_prefill", False) is True
+            for cls in (worker_cls, scheduler_cls)
+            if cls is not None
+        )
+
+    def _validate_speculative_prefill_request(self, request: LlmRequest) -> None:
+        if (
+            self.speculative_prefill_only
+            and not request.is_dummy_request
+            and not request.is_context_only_request
+        ):
+            raise NotImplementedError(
+                "A speculative-prefill connector accepts context-only requests. "
+                "Use capacity_only or no connector on the generation server."
+            )
 
     def _run_on_leader(self, f: Callable[[], _SchedulerResult]) -> _SchedulerResult:
         """
@@ -909,6 +963,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             self.enable_attention_dp and request.is_dummy_request
         ):
             return None
+        self._validate_speculative_prefill_request(request)
         if local_end < 0:
             raise ValueError("A prefix reservation cannot start before the prompt")
         existing = self.get_prefix_reservation(request)
@@ -1116,6 +1171,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # every request.
             return 0, False
 
+        self._validate_speculative_prefill_request(request)
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
         )
@@ -1314,6 +1370,29 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             requests.update(transfers.saving)
         return requests
 
+    def get_num_pending_loads(self) -> int:
+        return sum(
+            len(requests.loading)
+            for requests in (
+                self.new_async_requests,
+                self.pending_async_requests,
+                self.local_finished_async_requests,
+            )
+        )
+
+    def park_request_for_async_load(
+        self, request: LlmRequest, allocation_fence: AllocationFence
+    ) -> bool:
+        """Start an owner-local load while retaining its pages until completion."""
+        if request.request_id not in self.new_async_requests.loading:
+            return False
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        self.new_async_requests.loading[request.request_id] = request
+        # A load-only admission may publish no compute batch to clear this delta.
+        self.scheduler_output_manager.external_loads.pop(request.request_id, None)
+        self.scheduler.start_scheduler_async_loads(allocation_fence)
+        return True
+
     def build_scheduler_output(
         self, scheduled_batch: ScheduledRequests, kv_cache_manager: "KVCacheManager"
     ) -> None:
@@ -1323,6 +1402,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # which on a generation server is inter-token latency.
             # `handle_metadata` returns early when none was built.
             return
+        if self.speculative_prefill_only:
+            for request in (
+                *scheduled_batch.context_requests,
+                *scheduled_batch.generation_requests,
+            ):
+                self._validate_speculative_prefill_request(request)
         async_requests = AsyncRequests(
             {},
             {

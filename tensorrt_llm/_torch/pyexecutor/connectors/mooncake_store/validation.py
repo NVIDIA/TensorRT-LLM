@@ -33,7 +33,12 @@ if TYPE_CHECKING:
     from ..kv_cache_layout import KvCacheLayout
     from .config import MooncakeStoreConnectorConfig
 
-__all__ = ["validate_layout", "validate_llm_args", "validate_node_budget"]
+__all__ = [
+    "validate_layout",
+    "validate_llm_args",
+    "validate_node_budget",
+    "validate_speculative_config",
+]
 
 _GIB = 1 << 30
 
@@ -73,6 +78,45 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "replayed prefix would carry index-K from the store alongside stale "
             "index-V. This is the same restriction disaggregated serving applies."
         )
+
+
+def validate_speculative_config(
+    llm_args: TorchLlmArgs, config: "MooncakeStoreConnectorConfig"
+) -> int:
+    """Return the prompt lookahead for draft KV stored in the target's pools."""
+    spec = getattr(llm_args, "speculative_config", None)
+    if (
+        config.role.loads
+        and config.async_load
+        and llm_args.tensor_parallel_size > 1
+        and not getattr(llm_args, "enable_attention_dp", False)
+    ):
+        raise NotImplementedError(
+            "mooncake-store asynchronous loads require attention DP or TP1 "
+            "so failed loads can stop every participating worker safely"
+        )
+    if config.role.loads and (config.async_load or spec is not None):
+        if getattr(llm_args.kv_cache_config, "enable_partial_reuse", False):
+            raise ValueError(
+                "mooncake-store async or speculative prefix loading requires "
+                "kv_cache_config.enable_partial_reuse=False"
+            )
+    if spec is None or config.capacity_only:
+        return 0
+    from tensorrt_llm._torch.speculative import (
+        draft_prompt_lookahead,
+        should_use_separate_draft_kv_cache,
+    )
+
+    mode = spec.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        raise NotImplementedError("mooncake-store supports only one-model MTP or EAGLE3 draft KV")
+    if should_use_separate_draft_kv_cache(spec):
+        raise NotImplementedError("mooncake-store cannot restore a separate draft KV cache")
+    lookahead = draft_prompt_lookahead(spec)
+    if lookahead is None or spec.max_draft_len is None:
+        raise RuntimeError("mooncake-store requires a resolved speculative prompt lookahead")
+    return lookahead
 
 
 def _available_host_memory() -> Optional[int]:
@@ -132,11 +176,9 @@ def validate_node_budget(
     # DRAM, so it belongs in the sum even when no segment is mounted.
     staging_claim = 0
     if config.stage_through_host:
-        from .staging import MAX_STAGING_BUFFER_BYTES
-
         # One pool per direction, and a capacity-only rank opens neither.
         directions = int(config.role.loads) + int(config.role.saves)
-        staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
+        staging_claim = ranks_on_node * directions * config.staging_buffer_bytes
 
     claimed = segment_claim + staging_claim
     if claimed <= 0:

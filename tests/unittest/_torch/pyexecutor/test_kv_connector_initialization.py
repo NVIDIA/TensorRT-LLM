@@ -143,3 +143,46 @@ def test_single_group_priorities_follow_new_page_ordinals() -> None:
     assert unchanged.new_block_ids == []
     assert unchanged.priorities == []
     cache.get_page_priorities.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "disagg,worker_opt_in,scheduler_opt_in,v2,expected",
+    [
+        (True, True, True, True, True),
+        (True, True, True, "auto", True),
+        (False, True, True, True, False),
+        (True, False, True, True, False),
+        (True, True, False, True, False),
+        (True, True, True, False, False),
+    ],
+)
+def test_mtp_connector_creator_requires_disagg_and_both_capabilities(
+    disagg, worker_opt_in, scheduler_opt_in, v2, expected
+):
+    from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+        _connector_runs_speculative_prefill_only,
+    )
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    spec = MTPDecodingConfig(num_nextn_predict_layers=1, max_draft_len=1)
+    worker = type("Worker", (), {"supports_speculative_prefill": worker_opt_in})
+    scheduler = type("Scheduler", (), {"supports_speculative_prefill": scheduler_opt_in})
+    transceiver = CacheTransceiverConfig(backend="NIXL") if disagg else None
+    assert (
+        _connector_runs_speculative_prefill_only(spec, worker, scheduler, transceiver, v2)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("context_only", [False, True])
+def test_speculative_prefill_connector_rejects_generation_requests(context_only):
+    from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorManager
+
+    manager = SimpleNamespace(speculative_prefill_only=True)
+    request = SimpleNamespace(is_dummy_request=False, is_context_only_request=context_only)
+    if context_only:
+        KvCacheConnectorManager._validate_speculative_prefill_request(manager, request)
+    else:
+        with pytest.raises(NotImplementedError, match="context-only"):
+            KvCacheConnectorManager._validate_speculative_prefill_request(manager, request)

@@ -188,6 +188,13 @@ def _restate_pool_block(
         ("model_key", effective.model_key, pool.model_key),
         ("transfer_batch_size", effective.transfer_batch_size, pool.transfer_batch_size),
         ("stage_through_host", effective.stage_through_host, pool.stage_through_host),
+        ("async_load", effective.async_load, pool.async_load),
+        ("async_load_workers", effective.async_load_workers, pool.async_load_workers),
+        (
+            "staging_buffer_bytes",
+            effective.staging_buffer_bytes,
+            parse_size(pool.staging_buffer_bytes, strict_units=True),
+        ),
     )
     # Assignment adds to `model_fields_set`, so what the deployment stated for
     # itself has to be read before any of it is replaced. Only a value it chose

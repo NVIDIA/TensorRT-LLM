@@ -2769,6 +2769,23 @@ class MooncakeStoreConfig(StrictBaseModel):
         "registering the KV pools with Mooncake. For a host whose HCA cannot "
         "pin GPU pages; costs a copy each way. Ignored when role is "
         "'capacity'.")
+    async_load: bool = Field(
+        False,
+        telemetry=False,
+        description="Load external KV pages in background threads while other "
+        "requests run. Requests become runnable only after their load completes."
+    )
+    async_load_workers: PositiveInt = Field(
+        1,
+        telemetry=False,
+        description=
+        "Background load threads per rank when async_load is enabled.")
+    staging_buffer_bytes: Union[PositiveInt, str] = Field(
+        "1GiB",
+        telemetry=False,
+        description="Pinned host memory ceiling per rank and transfer direction "
+        "when stage_through_host is enabled. Load threads share this budget. "
+        "Accepts a byte count or a binary size such as '2GiB'.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2791,6 +2808,16 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
+
+    @field_validator("staging_buffer_bytes", mode="after")
+    @classmethod
+    def _check_staging_buffer_bytes(cls, value):
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        if parse_size(value, strict_units=True) <= 0:
+            raise ValueError(
+                "mooncake_store.staging_buffer_bytes must be positive")
+        return value
 
     @field_validator("segment_size", mode="after")
     @classmethod

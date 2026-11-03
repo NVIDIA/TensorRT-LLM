@@ -5761,3 +5761,28 @@ class TestDisaggAdmitBeforeAlloc:
         base, gated = self._both(64, reqs)
         assert ids(base.out.generation_requests) == ids(gated.out.generation_requests) == [2, 4]
         assert gated.admitted == [0] and gated.allocated == [0, 1]
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_early_async_load_preserves_compute_budget(monkeypatch, admitted):
+    monkeypatch.setenv("TRTLLM_MOONCAKE_EARLY_ADMISSION", "1")
+    mgr = make_kv_cache_manager()
+    mgr.mapping = SimpleNamespace(pp_size=1, cp_size=1)
+    mgr.kv_connector_manager = Mock(
+        supports_scheduler_async_load=True,
+        scheduler_async_load_capacity=2,
+        capacity_only=False,
+        prefix_reservations_enabled=False,
+    )
+    mgr.try_admit_async_connector_load.side_effect = lambda req: admitted and req.request_id == 1
+    sched = make_scheduler(
+        mgr,
+        max_batch_size=1,
+        max_num_tokens=64,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64),
+    )
+    assert mgr._scheduler_async_load_admission is True
+    requests = [make_ctx_request(1, 64), make_ctx_request(2, 64)]
+    out = sched.schedule_request(requests, set())
+    assert [req.request_id for req in out.context_requests] == ([2] if admitted else [1])
+    assert out.context_requests[0].context_chunk_size == 64

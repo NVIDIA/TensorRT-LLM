@@ -14,8 +14,8 @@
 # limitations under the License.
 """Leader side of the Mooncake store KV cache connector.
 
-Runs only on rank 0, deciding what to load and what to save while the workers
-do the moving. That needs two pieces of per-request bookkeeping:
+Runs on rank 0 under TP, or each attention-DP owner, deciding what to load
+and save while workers move the pages. That needs per-request bookkeeping:
 
 * a hash chain, since `KVCacheManagerV2` reports `RequestData.block_hashes`
   empty and a block has no content identity otherwise;
@@ -31,11 +31,16 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
-from ..kv_cache_connector import KvCacheConnectorScheduler, RequestData, SchedulerOutput
+from ..kv_cache_connector import (
+    AllocationFence,
+    KvCacheConnectorScheduler,
+    RequestData,
+    SchedulerOutput,
+)
 from .config import MooncakeStoreConnectorConfig
 from .keys import BlockHashChain, ReuseScope
 from .metadata import MooncakeStoreMetadata, PageTransfer, RequestTransfers
-from .validation import validate_llm_args
+from .validation import validate_llm_args, validate_speculative_config
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
@@ -105,6 +110,8 @@ class _RequestState:
         "load_first_block",
         "load_blocks",
         "emitted_saves",
+        "load_async",
+        "async_loaded_upto",
     )
 
     def __init__(self, chain: BlockHashChain):
@@ -119,10 +126,15 @@ class _RequestState:
         self.load_first_block = 0
         self.load_blocks = 0
         self.emitted_saves = False
+        self.load_async = False
+        self.async_loaded_upto = 0
 
 
 class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     """Chooses which pages the Mooncake pool serves and which it receives."""
+
+    supports_attention_dp = True
+    supports_speculative_prefill = True
 
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
@@ -130,6 +142,13 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
         self._tokens_per_block = int(llm_args.kv_cache_config.tokens_per_block)
+        self._prompt_lookahead = validate_speculative_config(llm_args, self._config)
+        self._async_load = self._config.async_load and self._config.role.loads
+        self._pending_async_loads: List[RequestTransfers] = []
+        self.supports_scheduler_async_load = self._async_load and (
+            getattr(llm_args, "enable_attention_dp", False) or llm_args.tensor_parallel_size == 1
+        )
+        self.scheduler_async_load_capacity = self._config.async_load_workers
         self._requests: Dict[int, _RequestState] = {}
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
 
@@ -154,7 +173,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             num_computed_tokens: Tokens already matched in the local KV cache.
 
         Returns:
-            Tokens the store can supply, and `False` for a synchronous load.
+            Tokens the store can supply, and whether loading is asynchronous.
         """
         if self._config.capacity_only:
             # Neither a lookup nor a save will read the hash chain this would
@@ -172,6 +191,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         state = self._state_for(request, tokens, scope)
         state.load_first_block = 0
         state.load_blocks = 0
+        state.load_async = False
 
         if not self._config.role.loads:
             return 0, False
@@ -197,26 +217,67 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
 
         state.load_first_block = first_block
         state.load_blocks = hit_blocks
+        state.load_async = self._async_load
         logger.debug(
             f"mooncake-store matched {hit_blocks} blocks "
             f"({hit_blocks * self._tokens_per_block} tokens) "
             f"for request {request.request_id}"
         )
-        return hit_blocks * self._tokens_per_block, False
+        return hit_blocks * self._tokens_per_block, state.load_async
 
     def update_state_after_alloc(self, request: LlmRequest, block_ids: List[int]):
-        """No-op: page indices are read from the scheduler output instead.
+        self.update_state_after_alloc_by_layer_group(request, [block_ids])
 
-        The flat `block_ids` here are a single space, but a V2 page index is
-        scoped to a layer group, so this connector reads only
-        `RequestData.new_block_ids_by_layer_group`.
-        """
+    def update_state_after_alloc_by_layer_group(
+        self, request: LlmRequest, block_ids_by_layer_group: List[List[int]]
+    ) -> None:
+        """Queue the honoured async prefix against its complete destination allocation."""
+        state = self._requests.get(request.request_id)
+        if state is None or not state.load_blocks:
+            return
+        honoured = int(request.py_num_connector_matched_tokens)
+        blocks, remainder = divmod(honoured, self._tokens_per_block)
+        if remainder or not 0 <= blocks <= state.load_blocks:
+            raise RuntimeError(
+                f"mooncake-store: request {request.request_id} honoured {honoured} "
+                f"tokens outside its {state.load_blocks}-block offer"
+            )
+        state.load_blocks = blocks
+        if not state.load_async:
+            return
+        transfers = RequestTransfers(request.request_id)
+        limit = min(
+            len(state.chain.hashes),
+            min((len(indices) for indices in block_ids_by_layer_group), default=0),
+        )
+        load_end = state.load_first_block + blocks
+        for block in range(state.load_first_block, load_end):
+            if block >= limit:
+                raise RuntimeError("mooncake-store: honoured prefix has missing destination pages")
+            for group, indices in enumerate(block_ids_by_layer_group):
+                index = int(indices[block])
+                if index == BAD_PAGE_INDEX:
+                    raise RuntimeError("mooncake-store: honoured prefix has an invalid destination")
+                transfers.pages.append(PageTransfer(state.chain.hashes[block], group, index))
+        state.async_loaded_upto = load_end
+        state.load_blocks = 0
+        # An empty honoured offer still releases the request parked by the runtime.
+        self._pending_async_loads.append(transfers)
+
+    def start_scheduler_async_loads(self, allocation_fence: AllocationFence) -> None:
+        """Start owner-local loads admitted before a forward batch exists."""
+        if not self.supports_scheduler_async_load:
+            raise RuntimeError("mooncake-store scheduler async loading is not enabled")
+        pending, self._pending_async_loads = self._pending_async_loads, []
+        if pending:
+            self._require_worker().start_async_loads(pending, allocation_fence)
 
     # ---- work lists ----
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> MooncakeStoreMetadata:
         """Turn this iteration's scheduled requests into load and save lists."""
-        metadata = MooncakeStoreMetadata()
+        metadata = MooncakeStoreMetadata(async_loads=self._pending_async_loads)
+        self._pending_async_loads = []
         for request_data in (*scheduler_output.new_requests, *scheduler_output.cached_requests):
             state = self._requests.get(request_data.request_id)
             if state is None:
@@ -228,6 +289,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             state.chain.extend(state.tokens)
             self._record_pages(state, request_data)
 
+            num_loaded_tokens = state.load_blocks * self._tokens_per_block
             loads = self._loads_for(state, request_data)
             if loads.pages:
                 metadata.loads.append(loads)
@@ -235,13 +297,17 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # Whatever the store just supplied, and whatever the local cache
             # matched, is not ours to write back: the store already has the
             # former, and the latter was never allocated during this run.
-            state.saved_upto = max(state.saved_upto, state.load_first_block + state.load_blocks)
+            state.saved_upto = max(
+                state.saved_upto,
+                state.load_first_block + state.load_blocks,
+                state.async_loaded_upto,
+            )
             # An offer is consumed once. The load is issued in exactly the
             # iteration the runtime allocated pages to hold it.
             state.load_blocks = 0
 
             if self._config.role.saves:
-                saves = self._saves_for(state, request_data)
+                saves = self._saves_for(state, request_data, num_loaded_tokens)
                 if saves.pages:
                     state.emitted_saves = True
                     metadata.saves.append(saves)
@@ -271,6 +337,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         and the lookup preceding the next attempt rebuilds the rest.
         """
         self._requests.pop(request.request_id, None)
+        self._pending_async_loads = [
+            entry for entry in self._pending_async_loads if entry.request_id != request.request_id
+        ]
 
     # ---- internals ----
 
@@ -284,7 +353,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
     ) -> _RequestState:
         state = self._requests.get(request.request_id)
         if state is None:
-            state = _RequestState(BlockHashChain(self._tokens_per_block, scope=scope))
+            state = _RequestState(
+                BlockHashChain(
+                    self._tokens_per_block, scope=scope, prompt_lookahead=self._prompt_lookahead
+                )
+            )
             self._requests[request.request_id] = state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.
@@ -313,16 +386,22 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         for offset in range(state.load_blocks):
             block = state.load_first_block + offset
             if block >= limit:
-                # The runtime allocated fewer pages than it accepted tokens
-                # for, so the tail of the offer has nowhere to land. Dropping
-                # it here leaves the runtime to recompute it.
-                break
+                raise RuntimeError("mooncake-store: honoured prefix has missing destination pages")
+            before = len(transfers.pages)
             self._append_pages(state, transfers, block)
+            if len(transfers.pages) - before != len(state.pages):
+                raise RuntimeError("mooncake-store: honoured prefix has an invalid destination")
         return transfers
 
-    def _saves_for(self, state: _RequestState, request_data: RequestData) -> RequestTransfers:
+    def _saves_for(
+        self, state: _RequestState, request_data: RequestData, num_loaded_tokens: int
+    ) -> RequestTransfers:
         transfers = RequestTransfers(request_data.request_id)
-        limit = self._addressable_blocks(state)
+        # Allocation can run ahead of a trimmed context chunk or MTP lookahead.
+        computed_end = (
+            request_data.computed_position + num_loaded_tokens + request_data.num_scheduled_tokens
+        )
+        limit = min(self._addressable_blocks(state), computed_end // self._tokens_per_block)
         for block in range(state.saved_upto, limit):
             self._append_pages(state, transfers, block)
         state.saved_upto = max(state.saved_upto, limit)

@@ -803,3 +803,27 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     # The worker thread first: it is the one still handing the connector work.
     executor.worker_thread.join.assert_called_once_with()
     assert order == ["connector", "kv pools"]
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_early_admission_votes_on_errors_before_later_adp_collectives(local_failure):
+    executor = _executor()
+    executor.enable_attention_dp = True
+    executor.kv_cache_manager._scheduler_async_load_admission = True
+    executor._maybe_record_hang_diagnostic_phase = Mock()
+    executor.inflight_req_ids = set()
+    executor.scheduler = Mock()
+    executor._balance_adp_requests = Mock()
+    if local_failure:
+        executor.scheduler.schedule_request.side_effect = ValueError("store lookup failed")
+
+    def vote(waiting, error):
+        assert waiting is False
+        assert error == ("ValueError: store lookup failed" if local_failure else None)
+        raise RuntimeError("fleet stopped")
+
+    executor._kv_connector_sync_status = Mock(side_effect=vote)
+    with pytest.raises(RuntimeError, match="fleet stopped"):
+        executor._schedule()
+    executor._kv_connector_sync_status.assert_called_once()
+    executor._balance_adp_requests.assert_not_called()

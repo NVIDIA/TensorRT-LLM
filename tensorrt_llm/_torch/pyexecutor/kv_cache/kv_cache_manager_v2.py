@@ -1796,6 +1796,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    _scheduler_async_load_admission: bool = False
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -2071,6 +2072,17 @@ class KVCacheManagerV2(BaseResourceManager):
         # Unsupported adapters keep their main-like reuse endpoint.
         self.reuse_match_backoff = self._draft_prompt_lookahead
         if not self._supports_reuse_match_backoff:
+            self.reuse_match_backoff = 0
+        elif (
+            not self.is_draft
+            and self.kv_connector_manager is not None
+            and self.kv_connector_manager.capacity_only is not True
+            and getattr(self.kv_connector_manager.worker, "drops_reuse_match_backoff", False)
+            is True
+        ):
+            # Whole-block connectors cannot serve the fractional block left by
+            # draft lookahead backoff. Target KV stays valid; only draft
+            # acceptance can change when the next prompt token differs.
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -5696,29 +5708,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         served_any = False
         for request in scheduled_batch.context_requests:
-            # An allocation is asked about and reported exactly once, and it
-            # takes all three guards. The first two describe a fresh allocation
-            # -- a request whose asynchronous load has completed re-enters on
-            # its first chunk with the same pages and nothing left to load.
-            # `should_add_sequence` only goes false once that load *completes*,
-            # so a batch dropped between here and the forward pass brings every
-            # context request back with both predicates still true; the memo is
-            # what stops `update_state_after_alloc` reporting the same pages
-            # twice.
-            if not request.is_first_context_chunk:
-                continue
-            if not self.kv_connector_manager.should_add_sequence(request):
-                continue
-            if request.py_connector_allocation_reported:
-                continue
-            served_any |= self._apply_connector_matched_prefix(request)
-            request.py_connector_allocation_reported = True
-            # Both forms are offered; the manager picks the one this connector
-            # implements. With several layer groups the flat list is empty,
-            # because a page index is scoped to a group.
-            by_group = self.get_page_indices_by_layer_group(request)
-            flat = by_group[0] if len(by_group) == 1 else []
-            self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
+            served_any |= self._run_request_kv_connector_hooks(request)
 
         if served_any:
             # A served prefix can carry a request past its last chunk boundary,
@@ -5726,6 +5716,51 @@ class KVCacheManagerV2(BaseResourceManager):
             # `context_requests_last_chunk`. `build_scheduler_output` walks
             # those two lists, so the split has to be rebuilt before it runs.
             scheduled_batch.reset_context_requests()
+
+    def _run_request_kv_connector_hooks(self, request: LlmRequest) -> bool:
+        """Report a fresh destination allocation once, including cache misses."""
+        manager = self.kv_connector_manager
+        if (
+            not request.is_first_context_chunk
+            or not manager.should_add_sequence(request)
+            or request.py_connector_allocation_reported
+        ):
+            return False
+        served = self._apply_connector_matched_prefix(request)
+        request.py_connector_allocation_reported = True
+        by_group = self.get_page_indices_by_layer_group(request)
+        flat = by_group[0] if len(by_group) == 1 else []
+        manager.update_state_after_alloc(request, flat, by_group)
+        return served
+
+    def try_admit_async_connector_load(self, request: LlmRequest) -> bool:
+        """Park allocated loads before spending a forward slot or token budget.
+
+        Only opportunistic admission is worker-credit bounded. The ordinary
+        batch path remains available when workers are busy or the store misses.
+        Pending load ownership prevents page eviction until completion.
+        """
+        if (
+            not self._scheduler_async_load_admission
+            or not request.is_context_only_request
+            or request.is_dummy
+            or self._connector_reservations_enabled()
+        ):
+            return False
+        manager = self.kv_connector_manager
+        if manager.get_num_pending_loads() >= manager.scheduler_async_load_capacity:
+            return False
+        self._run_request_kv_connector_hooks(request)
+        if (
+            request.request_id in manager.new_async_requests.loading
+            and request.py_request_id in self._on_allocation_stream
+        ):
+            # No forward batch will adopt this allocation yet. Publish its
+            # side-stream fence before the background loader can touch pages.
+            ready = torch.cuda.Event()
+            ready.record(self._allocation_stream)
+            self._allocation_ready[request.py_request_id] = ready
+        return manager.park_request_for_async_load(request, self.wait_allocation_fences)
 
     def report_batch_to_connector(
         self, scheduled_batch: ScheduledRequests, *, finalize_prefix_reservations: bool = True

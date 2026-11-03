@@ -871,3 +871,28 @@ def test_version_metadata_sync_validates_all_files_before_writing(
         generator.sync_schema_version_metadata(tmp_path)
 
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+@pytest.mark.parametrize(
+    "settings,valid",
+    [
+        ({"async_load": True, "async_load_workers": 2, "staging_buffer_bytes": "2GiB"}, True),
+        ({"staging_buffer_bytes": 1024}, True),
+        ({"async_load_workers": 0}, False),
+        ({"staging_buffer_bytes": 0}, False),
+        ({"async_load": "true"}, False),
+    ],
+)
+def test_mooncake_async_load_config_schema(schemas, settings, valid):
+    config = {
+        "kv_connector_config": {
+            "connector": "mooncake-store",
+            "mooncake_store": {
+                "pool": "file:///pool.json",
+                "model_key": "test-model",
+                **settings,
+            },
+        }
+    }
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(config) is valid

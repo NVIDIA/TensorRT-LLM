@@ -634,3 +634,17 @@ def test_unstage_batch_after_get_leaves_the_pages_not_asked_for_alone(staged_cop
     unstage_batch_after_get(pool, pages, [PAGE_SIZES, PAGE_SIZES], stream=0, only=[1])
 
     assert [copy[0] for copy in staged_copies] == [0xC000, 0xD000]
+
+
+@pytest.mark.parametrize("lookahead", [1, 3])
+def test_prompt_lookahead_is_part_of_prefix_identity(lookahead):
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    original = list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(tokens))
+    altered = list(tokens)
+    altered[TOKENS_PER_BLOCK + lookahead - 1] += 100
+    changed = list(BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(altered))
+    assert original[0] != changed[0]
+    assert original[0] != BlockHashChain(TOKENS_PER_BLOCK).extend(tokens)[0]
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert not chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1])
+    assert list(chain.extend(tokens)) == original
