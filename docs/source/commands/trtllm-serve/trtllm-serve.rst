@@ -240,6 +240,16 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
      ]}
 
 .. note::
+   Media URLs may be ``http(s)`` URLs or base64 ``data:`` URLs. A ``file://``
+   URI or a bare filesystem path is read from the server's own filesystem, so it
+   is refused unless the server is started with
+   ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=<directory>``; then only regular files whose
+   resolved path is inside that directory are read. This applies to
+   ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
+   clients send local paths today must set the variable to the directory
+   that holds those files.
+
+.. note::
    To convert images to base64-encoded format, use the utility function
    :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
    `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__

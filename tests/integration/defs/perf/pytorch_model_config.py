@@ -17,6 +17,8 @@
 Model PyTorch YAML config for trtllm-bench performance tests.
 """
 
+import copy
+
 from ..conftest import llm_models_root
 
 # DeepSeek FP8 (block-scale) models that hit the DeepGEMM-on-Hopper-only
@@ -28,6 +30,34 @@ _DEEPSEEK_FP8_BLOCK_SCALE_MODELS = (
     'deepseek_v3_lite_fp8',
     'deepseek_r1_0528_fp8',
 )
+
+# Named LLM API overrides, selected by the "cfg:<name>[+<name>...]" test-name
+# label and applied after every other rule in get_model_yaml_config().
+PERF_CONFIG_PRESETS = {
+    # KV cache block reuse (prefix caching) on or off. Hybrid linear-attention
+    # and Mamba models reuse a prefix only up to a recurrent-state snapshot,
+    # taken here every 8192 tokens (the long-context prefill chunk size).
+    'reuse': {
+        'kv_cache_config': {
+            'enable_block_reuse': True,
+            'mamba_state_config': {
+                'periodic_snapshot_interval': 8192
+            }
+        }
+    },
+    'noreuse': {
+        'kv_cache_config': {
+            'enable_block_reuse': False
+        }
+    },
+    # MTP drafting three tokens per step.
+    'mtp3': {
+        'speculative_config': {
+            'decoding_type': 'MTP',
+            'max_draft_len': 3
+        }
+    },
+}
 
 
 def _get_sm_version_safe() -> int:
@@ -437,11 +467,61 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
             }
         },
-        # GLM-5.3-Flash serving cases send text-only requests.
+        # GLM-5.3 B200 TP8/EP8 deployment recipe, without MTP.
         {
-            'patterns': ['glm_5.3_flash_fp8-serve-pytorch'],
+            'patterns': ['glm_5.3_fp8-serve-pytorch'],
             'config': {
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 128,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.75,
+                },
+                'moe_config': {
+                    'backend': 'DEEPGEMM',
+                },
+                'stream_interval': 10,
+            }
+        },
+        # GLM-5.3-Flash B200 TP4/EP4: FP8 weights and BF16 KV cache.
+        {
+            'patterns': [
+                'glm_5.3_flash_fp8-serve-pytorch',
+                'glm_5.3_flash_fp8_mtp-serve-pytorch',
+            ],
+            'config': {
+                # Text-only perf does not need the image/video processor.
                 'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'max_seq_len': 16384,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 64,
+                },
+                'kv_cache_config': {
+                    'dtype': 'auto',
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.5,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
+            'patterns': ['glm_5.3_flash_fp8_mtp-serve-pytorch'],
+            'config': {
+                'speculative_config': {
+                    'decoding_type': 'MTP',
+                    'max_draft_len': 3,
+                },
             }
         },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
@@ -556,6 +636,18 @@ def get_model_yaml_config(model_label: str,
                 'enable_attention_dp': True,
             }
         },
+        # Long-context and shared-prefix cases.
+        {
+            'patterns': [
+                'maxnt:8192-input_output_len:16384,',
+                'maxnt:8192-input_output_len:32768,',
+                'maxnt:8192-input_output_len:65536,',
+                '-prefix:',
+            ],
+            'config': {
+                'enable_chunked_prefill': True,
+            }
+        },
         # Qwen3.6-35B-A3B NVFP4 GDN-attn MoE: trust_remote_code, TRTLLM-Gen NVFP4 MoE (SM100/103), block reuse off.
         {
             'patterns': ['qwen3.6_35b_a3b_fp4'],
@@ -571,7 +663,10 @@ def get_model_yaml_config(model_label: str,
         },
         # Qwen3.6-35B-A3B NVFP4 streaming (Spark) cases: CuteDSL MoE, FP8 KV cache with block reuse.
         {
-            'patterns': ['qwen3.6_35b_a3b_fp4-bench-pytorch-streaming'],
+            'patterns': [
+                'qwen3.6_35b_a3b_fp4-bench-pytorch-streaming',
+                'qwen3.6_35b_a3b_fp4-serve-pytorch-streaming',
+            ],
             'config': {
                 'trust_remote_code': True,
                 'kv_cache_config': {
@@ -596,7 +691,10 @@ def get_model_yaml_config(model_label: str,
         },
         # Qwen3.6-35B-A3B NVFP4 one-model MTP drafting
         {
-            'patterns': ['qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming'],
+            'patterns': [
+                'qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming',
+                'qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming',
+            ],
             'config': {
                 'trust_remote_code': True,
                 'moe_config': {
@@ -707,6 +805,7 @@ def get_model_yaml_config(model_label: str,
         {
             'patterns': [
                 'gpt_oss_120b_eagle3-bench-pytorch',
+                'gpt_oss_120b_eagle3-serve-pytorch',
             ],
             'config': {
                 'enable_attention_dp': False,
@@ -968,6 +1067,12 @@ def get_model_yaml_config(model_label: str,
     # GPUs keep the model's own get_model_defaults() choice.
     if 'gemma_4_' in model_label.lower() and _get_sm_version_safe() == 121:
         base_config['attn_backend'] = 'FLASHINFER'
+
+    for label in model_label.split('-'):
+        if label.startswith('cfg:'):
+            for preset in label.removeprefix('cfg:').split('+'):
+                recursive_update(base_config,
+                                 copy.deepcopy(PERF_CONFIG_PRESETS[preset]))
 
     # lora-specific change for pytorch
     if 'pytorch' in model_label and 'loras' in model_label:
