@@ -108,8 +108,12 @@ def _run_rank(world_size, token_counts):
             if not bool(((got - ref).abs() <= scale * 2.0**-6 + 1e-6).all()):
                 bad.append(f"{tag}: {float((got - ref).abs().max())}")
 
+        # The target-shaped launches' inputs, built outside any graph capture (a generator
+        # cannot be created while capturing).
+        target_cases = {n: _case(n, TARGET_HEADS, 7 + rank) for n in token_counts}
+
         def target_launch(n):
-            rows, stats, mask = _case(n, TARGET_HEADS, 7 + rank)
+            rows, stats, mask = target_cases[n]
             out = torch.empty((n, TARGET_HEADS // world_size * V_DIM), **_bf16())
             tail(rows.view(n, -1), stats, w_target, mask, fold=None, out=out)
 
