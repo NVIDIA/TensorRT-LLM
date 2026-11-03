@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Direct tests for :mod:`tensorrt_llm.serve.visual_gen_utils`.
+"""Direct tests for :mod:`tensorrt_llm.serve.api.visual_gen.utils`.
 
 These tests bypass the HTTP transport and call ``parse_visual_gen_params``
 and the ``_warn_if_set_with_no_semantic`` / ``_merge_extra_params``
@@ -23,7 +23,7 @@ import pytest
 from fastapi import UploadFile
 from PIL import Image
 
-from tensorrt_llm.serve import visual_gen_utils
+from tensorrt_llm.serve.api.visual_gen import utils as visual_gen_utils
 from tensorrt_llm.serve.api.visual_gen.protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
@@ -206,7 +206,7 @@ class TestWarnOnSet:
                 rendered = str(msg)
             captured.append(rendered)
 
-        from tensorrt_llm.serve import visual_gen_utils as vgu
+        from tensorrt_llm.serve.api.visual_gen import utils as vgu
 
         monkeypatch.setattr(vgu.logger, "warning", _fake_warning)
         return captured
