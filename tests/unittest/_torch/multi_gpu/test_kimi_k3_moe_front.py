@@ -16,10 +16,10 @@
 
 Per rank: the replicated router logits (``dsv3_router_gemm_op`` per 16-row tile), the routing
 kernel on them (``kimi_k3_routing``: top-16 + ``moe_sort`` tables of the rank's routed experts)
-and latent_down with its NVFP4 output (``run_low_m_gemm_nvfp4``). Bitwise where the replaced path
-runs the same arithmetic: routing at every M (per 16-row tile of the router), the NVFP4 latent
-against the low-M GEMM at the front's tactic at every M and against the default NVFP4 route where
-that runs the low-M kernel. Other differences are printed.
+and latent_down with its NVFP4 output (``run_low_m_gemm_nvfp4``), also in the publish mode.
+Bitwise where the replaced path runs the same arithmetic: routing at every M (per 16-row tile of
+the router), the NVFP4 latent against the low-M GEMM at the front's tactic at every M and against
+the default NVFP4 route where that runs the low-M kernel. Other differences are printed.
 """
 
 import os
@@ -184,6 +184,15 @@ def _run_rank(world_size):
                 out = front.run_moe_front(x, plan, ws, gsf)
                 torch.cuda.synchronize()
                 bad += _check(x, out, router, bias, w, w_scale, gsf, offset, num_local, info)
+                # Publish mode: the same top-k and latent, one release add per token, no tables.
+                word = torch.zeros(1, dtype=torch.int32, device="cuda")
+                ids, vals, sort, codes, scales = front.run_moe_front(x, plan, ws, gsf, word)
+                torch.cuda.synchronize()
+                r_ids, r_vals, _ = _route(_router_logits(x, router), bias, offset, num_local)
+                q_front, s_front = _nvfp4(x, w, w_scale, gsf, tactic=front.latent_tactic(m))
+                bad += int(sort is not None) + abs(int(word.item()) - m)
+                bad += _differ(ids, r_ids) + _differ(vals, r_vals)
+                bad += _differ(codes, q_front) + _differ(scales, s_front)
             if m > 16:
                 cublas = _trt().dsv3_router_gemm_op(
                     x, router.t(), bias=None, out_dtype=torch.float32

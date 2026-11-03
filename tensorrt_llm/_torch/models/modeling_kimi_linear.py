@@ -2174,8 +2174,16 @@ class KimiK3MoERuntime(nn.Module):
         if scale is None or not kimi_k3_moe_front.can_run(hidden_states, plan, scale):
             return False
         return not torch.cuda.is_current_stream_capturing() or kimi_k3_moe_front.is_compiled(
-            num_tokens, plan
+            num_tokens, plan, self._moe_front_publish_word(num_tokens) is not None
         )
+
+    def _moe_front_publish_word(self, num_tokens: int) -> Optional[torch.Tensor]:
+        """The routed experts' word for the front to publish the top-k into, where they build
+        their tables from it (``MoEImplBase.published_routing_word``)."""
+        backend = self.routed_experts.backend
+        if not isinstance(backend, MoEImplBase):
+            return None
+        return backend.published_routing_word(num_tokens)
 
     def _moe_front(self, hidden_states: torch.Tensor) -> Tuple[Fp4QuantizedTensor, SortedRouting]:
         """The sharded decode front on the current stream: the routed experts' NVFP4 input and
@@ -2183,15 +2191,19 @@ class KimiK3MoERuntime(nn.Module):
         from ..moe.kernels.blackwell import kimi_k3_moe_front, kimi_k3_routing
 
         num_tokens = hidden_states.shape[0]
+        publish_word = self._moe_front_publish_word(num_tokens)
         ids, weights, sort_outputs, codes, scales = kimi_k3_moe_front.run_moe_front(
             hidden_states,
             self._moe_front_plan,
             self._moe_front_ws,
             self.routed_experts.nvfp4_input_scale(num_tokens),
+            publish_word,
         )
-        routing = SortedRouting(
-            ids, weights, MoESortTables(kimi_k3_routing.TILE_SIZE, tuple(sort_outputs))
-        )
+        if publish_word is not None:
+            tables = MoESortTables(kimi_k3_routing.TILE_SIZE, (), published=True)
+        else:
+            tables = MoESortTables(kimi_k3_routing.TILE_SIZE, tuple(sort_outputs))
+        routing = SortedRouting(ids, weights, tables)
         return Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False), routing
 
     @staticmethod

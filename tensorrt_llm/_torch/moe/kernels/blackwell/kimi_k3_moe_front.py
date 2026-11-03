@@ -40,6 +40,9 @@ stream:
   polls from the workspace (sentinel ``0x80000000``) instead of reading a tensor, and gather CTAs
   that poll every rank's latent slots and write the NVFP4 quantization of the gathered BF16 latent
   (``fp4_quantize``'s arithmetic, linear scale layout). Every reader re-arms what it read.
+  With ``publish`` the route kernel writes no ``moe_sort`` tables: it releases its dependent (the
+  routed experts) at entry and publishes each token's top-k (stores, then a GPU-scope release add
+  of 1 to a word of the experts), which build their tables from it while this grid still runs.
 
 Workspace (:class:`MoEFrontWorkspace`): an MNNVL multicast buffer of two halves; consecutive calls
 alternate between them (the half is a launch argument through a constant flags tensor, so a CUDA
@@ -204,6 +207,18 @@ def _st_sentinel_v4(addr, *, loc=None, ip=None):
         [ptx.i64(addr, loc=loc, ip=ip)],
         "{\n.reg .b32 t;\nmov.b32 t, 0x80000000;\nst.global.v4.b32 [$0], {t, t, t, t};\n}",
         "l",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _red_add_release_gpu(addr, value, *, loc=None, ip=None):
+    ptx.inline_asm(
+        None,
+        [ptx.i64(addr, loc=loc, ip=ip), ptx.i32(value, loc=loc, ip=ip)],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
         loc=loc,
         ip=ip,
     )
@@ -698,10 +713,15 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
     Args:
         num_warps, warps_per_token, local_cap: as ``NoauxTcRouteSortKernel``.
         world: Ranks of the group.
+        publish: Publish each token's top-k (release add to the word at ``num_tiles_addr``) and
+            release the dependent at entry instead of writing the ``moe_sort`` tables.
     """
 
-    def __init__(self, num_warps: int, warps_per_token: int, local_cap: int, world: int):
+    def __init__(
+        self, num_warps: int, warps_per_token: int, local_cap: int, world: int, publish: bool
+    ):
         super().__init__(NUM_EXPERTS, num_warps, warps_per_token, local_cap)
+        self.publish = publish
         self.world = world
         self.slot_n = slot_cols(world)
         self.logits_off = logits_offset(world)
@@ -811,6 +831,9 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.publish):
+            # The experts poll the published top-k; their reads of the latent wait for this grid.
+            cute.arch.griddepcontrol_launch_dependents()
         # The halves' flags never change: no ordering needed to read them.
         cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(flags)
         half = uc_local + Int64(cur) * Int64(nbytes)
@@ -888,8 +911,9 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
         for e4 in cutlass.range(tidx, NUM_EXPERTS // 4, self.threads, unroll=1):
             v = ptx.ld_global_nc_v4_f32(bias_addr + Int64(e4 * 16))
             ptx.st_shared_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
-        # Every CTA of the cluster must be running before a peer writes its shared memory.
-        cute.arch.cluster_arrive_relaxed()
+        if cutlass.const_expr(not self.publish):
+            # Every CTA of the cluster must be running before a peer writes its shared memory.
+            cute.arch.cluster_arrive_relaxed()
         cute.arch.barrier()
 
         stride = self.team_lanes
@@ -919,8 +943,60 @@ class KimiK3MoEFrontRouteKernel(NoauxTcRouteSortKernel):
             row = logits_addr + Int64(token) * Int64(NUM_EXPERTS * 4)
             for s in cutlass.range_constexpr(self.slots):
                 _st_sentinel_b32(row + Int64((s * stride + gl) * 4))
+            if cutlass.const_expr(self.publish):
+                # The team's first warp stored the ids / weights (lanes < 16): publish the token.
+                if team_warp == 0:
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        _red_add_release_gpu(num_tiles_addr, Int32(1))
         cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.publish):
+            self.exchange_and_sort(
+                tidx,
+                warp,
+                lane,
+                rank,
+                t_begin,
+                t_end,
+                mask_smem,
+                masks_smem,
+                base_smem,
+                ids_smem,
+                warp_tot_smem,
+                e2p_addr,
+                p2e_addr,
+                tile_expert_addr,
+                tile_limit_addr,
+                total_addr,
+                num_tiles_addr,
+                local_offset,
+                local_num,
+            )
 
+    @cute.jit
+    def exchange_and_sort(
+        self,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        rank: Int32,
+        t_begin: Int32,
+        t_end: Int32,
+        mask_smem: Int32,
+        masks_smem: Int32,
+        base_smem: Int32,
+        ids_smem: Int32,
+        warp_tot_smem: Int32,
+        e2p_addr: Int64,
+        p2e_addr: Int64,
+        tile_expert_addr: Int64,
+        tile_limit_addr: Int64,
+        total_addr: Int64,
+        num_tiles_addr: Int64,
+        local_offset: Int32,
+        local_num: Int32,
+    ):
+        """The token-mask exchange over the cluster and the ``moe_sort`` tables."""
         cute.arch.barrier()
         cute.arch.cluster_wait()
         # Broadcast this CTA's token masks into every CTA of the cluster.
@@ -1197,8 +1273,10 @@ def _local_cap(local_num: int) -> int:
 
 
 @functools.cache
-def _compiled_route(num_warps: int, warps_per_token: int, local_cap: int, world: int):
-    kernel = KimiK3MoEFrontRouteKernel(num_warps, warps_per_token, local_cap, world)
+def _compiled_route(
+    num_warps: int, warps_per_token: int, local_cap: int, world: int, publish: bool
+):
+    kernel = KimiK3MoEFrontRouteKernel(num_warps, warps_per_token, local_cap, world, publish)
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1218,8 +1296,9 @@ def _compiled_route(num_warps: int, warps_per_token: int, local_cap: int, world:
 _READY: set = set()
 
 
-def _shape_key(m: int, plan: MoEFrontPlan) -> tuple:
+def _shape_key(m: int, plan: MoEFrontPlan, publish: bool) -> tuple:
     return (
+        publish,
         plan.latent_w.shape[0],
         latent_tactic(m),
         plan.world,
@@ -1228,10 +1307,10 @@ def _shape_key(m: int, plan: MoEFrontPlan) -> tuple:
     )
 
 
-def is_compiled(m: int, plan: MoEFrontPlan) -> bool:
+def is_compiled(m: int, plan: MoEFrontPlan, publish: bool = False) -> bool:
     """Whether a call of ``m`` rows with this plan's shapes runs without compiling (required
     inside CUDA graph capture)."""
-    return _shape_key(m, plan) in _READY
+    return _shape_key(m, plan, publish) in _READY
 
 
 def _gptr(dtype, t: torch.Tensor):
@@ -1263,7 +1342,10 @@ def run_moe_front(
     plan: MoEFrontPlan,
     ws: MoEFrontWorkspace,
     global_sf: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, ...], torch.Tensor, torch.Tensor]:
+    publish_word: Optional[torch.Tensor] = None,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, ...]], torch.Tensor, torch.Tensor
+]:
     """Launch the head and the route kernel on the current stream (every rank of the group with
     the same ``M``).
 
@@ -1271,7 +1353,10 @@ def run_moe_front(
     outputs for the logits (int32 / FP32 ``[M, 16]`` and the six ``moe_sort`` tables of
     ``plan.local_offset`` / ``local_num`` at 128-row tiles), and the NVFP4 latent, ``codes``
     uint8 ``[M, 1792]`` and ``scales`` uint8 ``[M, 224]`` (linear layout) under ``global_sf``.
-    The first call of each shape compiles (outside CUDA graph capture)."""
+    ``publish_word``: an int32 word (zero) the route kernel adds 1 to per routed token (release)
+    instead of writing the tables (``sort_outputs`` is then ``None``); the next launch on the
+    stream, which polls it, must be the routed experts. The first call of each shape compiles
+    (outside CUDA graph capture)."""
     m = x.shape[0]
     if not can_run(x, plan, global_sf):
         raise ValueError(f"Kimi-K3 MoE front: unsupported call x {tuple(x.shape)} {x.dtype}")
@@ -1296,20 +1381,26 @@ def run_moe_front(
     i32 = dict(dtype=torch.int32, device=device)
     topk_ids = torch.empty((m, TOP_K), **i32)
     topk_weights = torch.empty((m, TOP_K), dtype=torch.float32, device=device)
-    sort_outputs = (
-        torch.empty((max_tiles,), **i32),
-        torch.empty((max_tiles,), **i32),
-        torch.empty((m, TOP_K), **i32),
-        torch.empty((max_permuted,), **i32),
-        torch.empty((1,), **i32),
-        torch.empty((1,), **i32),
-    )
     codes = torch.empty((m, LATENT // 2), dtype=torch.uint8, device=device)
     scales = torch.empty((m, LATENT // _FP4_VEC), dtype=torch.uint8, device=device)
-    tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
+    publish = publish_word is not None
+    sort_outputs = None
+    if publish:
+        tile_expert = tile_limit = e2p = p2e = total = 0
+        num_tiles = publish_word.data_ptr()
+    else:
+        sort_outputs = (
+            torch.empty((max_tiles,), **i32),
+            torch.empty((max_tiles,), **i32),
+            torch.empty((m, TOP_K), **i32),
+            torch.empty((max_permuted,), **i32),
+            torch.empty((1,), **i32),
+            torch.empty((1,), **i32),
+        )
+        tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
     scale_bits = struct.unpack("<q", struct.pack("<d", plan.routed_scaling_factor))[0]
     warps_per_token, num_warps = _config(m)
-    _compiled_route(num_warps, warps_per_token, _local_cap(plan.local_num), plan.world)(
+    _compiled_route(num_warps, warps_per_token, _local_cap(plan.local_num), plan.world, publish)(
         Int32(m),
         Int64(ws.uc_local),
         Int64(flags.data_ptr()),
@@ -1330,7 +1421,7 @@ def run_moe_front(
         Int64(global_sf.data_ptr()),
         stream,
     )
-    _READY.add(_shape_key(m, plan))
+    _READY.add(_shape_key(m, plan, publish))
     return topk_ids, topk_weights, sort_outputs, codes, scales
 
 

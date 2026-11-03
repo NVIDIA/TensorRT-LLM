@@ -30,6 +30,7 @@ __all__ = [
     "SMALL_BATCH_MOE_MAX_TOKENS",
     "die_major_layout",
     "new_small_batch_moe_counters",
+    "small_batch_moe_route_word",
     "small_batch_moe_supports",
 ]
 
@@ -77,6 +78,14 @@ def new_small_batch_moe_counters(device: torch.device) -> torch.Tensor:
     return torch.zeros(counter_words(_MAX_TILES), dtype=torch.int32, device=device)
 
 
+def small_batch_moe_route_word(counters: torch.Tensor) -> torch.Tensor:
+    """The int32 word of ``counters`` into which a routing kernel publishes the step's tokens
+    for a launch with ``published_routing``."""
+    from ..kernels.rubin.rubin_small_batch_fused_moe import CTR_ROUTE
+
+    return counters[CTR_ROUTE : CTR_ROUTE + 1]
+
+
 @functools.cache
 def _persistent_ctas(device_index: int, n_tok: int) -> int:
     num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -115,6 +124,8 @@ class _SmallBatchMoeRunner:
         num_ctas: int,
         deterministic_combine: bool,
         die_major: bool,
+        published_routing: bool,
+        expert_offset: int,
     ) -> None:
         import cutlass
         import cutlass.cute as cute
@@ -142,6 +153,10 @@ class _SmallBatchMoeRunner:
         k2 = n1 // 2
         assert k2 % 256 == 0, "the FC1-output scale buffer is not zero-padded"
         m = permuted_idx_to_expanded_idx.size(0)
+        if published_routing:
+            from ..kernels.blackwell.kimi_k3_routing import sort_buffer_sizes
+
+            m = sort_buffer_sizes(orig_m, num_local)[1]
         assert m // 128 <= _MAX_TILES and counters.numel() >= counter_words(m // 128)
         assert expanded_idx_to_permuted_idx.numel() == orig_m * top_k
         n_tok = n_tok_for(orig_m)
@@ -201,6 +216,7 @@ class _SmallBatchMoeRunner:
             deterministic_combine,
             die_major,
             sm_domain_words,
+            published_routing,
             TRTLLM_ENABLE_PDL,
         )
         compiled = cls.kernel_cache.get(key)
@@ -223,10 +239,13 @@ class _SmallBatchMoeRunner:
                 use_pdl=TRTLLM_ENABLE_PDL,
                 die_major=die_major,
                 sm_domain_words=sm_domain_words,
+                published_routing=published_routing,
             )
-            compiled = cute.compile(kernel.wrapper, *ptrs, orig_m, m, num_local, num_ctas, stream)
+            compiled = cute.compile(
+                kernel.wrapper, *ptrs, orig_m, m, num_local, expert_offset, num_ctas, stream
+            )
             cls.kernel_cache[key] = compiled
-        compiled(*ptrs, orig_m, m, num_local, stream)
+        compiled(*ptrs, orig_m, m, num_local, expert_offset, stream)
 
 
 @torch.library.custom_op(
@@ -259,6 +278,8 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     num_ctas: int = 0,
     deterministic_combine: bool = False,
     die_major: bool = False,
+    published_routing: bool = False,
+    expert_offset: int = 0,
 ) -> None:
     """Routed NVFP4 SiTU MoE of at most 32 tokens: writes the sum of this rank's experts'
     weighted down-projections into every element of ``output`` [tokens, hidden].
@@ -271,7 +292,10 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     ``num_ctas`` > 0 overrides the persistent CTA count. ``deterministic_combine``: the
     schedule-independent slice combine instead of BF16 vector reds (a test reference).
     ``die_major``: the four weight tensors hold :func:`die_major_layout` bytes under their
-    ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``).
+    ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``). ``published_routing``
+    (``token_indexed``): instead of the tables, ``expanded_idx_to_permuted_idx`` holds the top-k
+    ids, which a routing kernel publishes into :func:`small_batch_moe_route_word` of ``counters``
+    (the other table arguments are not read); ``expert_offset``: this rank's first expert.
     """
     if die_major:
         fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale = (
@@ -303,6 +327,8 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
         num_ctas,
         deterministic_combine,
         die_major,
+        published_routing,
+        expert_offset,
     )
 
 
@@ -332,5 +358,7 @@ def _(
     num_ctas=0,
     deterministic_combine=False,
     die_major=False,
+    published_routing=False,
+    expert_offset=0,
 ) -> None:
     return None

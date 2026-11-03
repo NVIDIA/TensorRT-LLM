@@ -51,6 +51,7 @@ from ...custom_ops.cute_dsl_small_batch_moe_custom_op import (
     SMALL_BATCH_MOE_MAX_TOKENS,
     die_major_layout,
     new_small_batch_moe_counters,
+    small_batch_moe_route_word,
     small_batch_moe_supports,
 )
 from ..activation import (
@@ -323,6 +324,20 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         super().post_load_weights()
         if not self.weights_die_major and self._die_major_applies():
             self._place_weights_die_major()
+        if self.small_batch_max_tokens and self._small_batch_counters is None:
+            self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
+
+    def published_routing_word(self, num_tokens: int) -> torch.Tensor | None:
+        """The small-batch kernel's routing word where it serves ``num_tokens`` tokens in the
+        token-indexed layout (MoE-TP slices): it then builds its tables from the published
+        top-k."""
+        if (
+            not 1 <= num_tokens <= self.small_batch_max_tokens
+            or self.tp_size <= 1
+            or self._small_batch_counters is None
+        ):
+            return None
+        return small_batch_moe_route_word(self._small_batch_counters)
 
     def pre_reload_weights(self) -> None:
         super().pre_reload_weights()
@@ -439,6 +454,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._join_pending_x_ready()
             return moe_output
 
+        if sort_tables is not None and sort_tables.published:
+            assert token_selected_experts.size(0) <= self.small_batch_max_tokens
+            assert not enable_alltoall and self.tp_size > 1
         if token_selected_experts.size(0) <= self.small_batch_max_tokens and not enable_alltoall:
             return self._run_small_batch(
                 x,
@@ -511,7 +529,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
         """The small-batch kernel; it writes every element of ``moe_output``."""
-        if sort_tables is not None and sort_tables.tile_size == 128:
+        published = sort_tables is not None and sort_tables.published
+        if published:
+            # the kernel builds the tables from the published ids; nothing reads these
+            ids = token_selected_experts.reshape(-1)
+            sort_outputs = (ids, ids, ids, ids, ids, ids)
+        elif sort_tables is not None and sort_tables.tile_size == 128:
             sort_outputs = sort_tables.outputs
         else:
             sort_outputs = self._sort_routing(
@@ -542,7 +565,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             tile_idx_to_group_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            expanded_idx_to_permuted_idx=ids if published else expanded_idx_to_permuted_idx,
             num_non_exiting_tiles=num_non_exiting_tiles,
             global_sf=self.fc2_input_scale,
             token_final_scales=token_final_scales,
@@ -553,6 +576,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             # MoE-TP ranks hold a slice of every expert's intermediate
             token_indexed=self.tp_size > 1,
             die_major=self.weights_die_major,
+            published_routing=published,
+            expert_offset=weight_view.slot_start,
         )
         return moe_output
 

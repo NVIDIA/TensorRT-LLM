@@ -336,6 +336,16 @@ class MoEImplBase(
         """
         return False
 
+    def published_routing_word(self, num_tokens: int) -> "torch.Tensor | None":
+        """An int32 word into which a routing kernel that runs right before
+        ``run_moe`` may publish each routed token of a forward of ``num_tokens``
+        tokens (its ids and weights stored, then a GPU-scope release add of 1),
+        so that ``run_moe`` builds its tables from them while the routing grid
+        still runs (``MoESortTables.published``); or ``None``. Declining is the
+        default; overriding this is how a backend opts in.
+        """
+        return None
+
     def try_route_with_sort(
         self, router_logits: "torch.Tensor"
     ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":

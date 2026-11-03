@@ -757,11 +757,14 @@ class MoESortTables:
 
     ``outputs`` are the six tensors ``torch.ops.trtllm.moe_sort`` returns, in
     its order, for the routed expert ids, the rank's expert range and
-    ``tile_size``.
+    ``tile_size``. ``published``: instead, the routing kernel published the
+    routed ids token by token into the impl's ``published_routing_word`` and
+    the impl builds the tables itself (``outputs`` is empty).
     """
 
     tile_size: int
     outputs: Tuple[torch.Tensor, ...]
+    published: bool = False
 
 
 @dataclass(frozen=True)

@@ -111,6 +111,8 @@ def _setup(shape, num_tokens, seed, local_tokens=True):
         inter_size=inter_size,
         num_local=num_local,
         top_k=top_k,
+        offset=offset,
+        ids=ids,
         scales=scales,
         t2g=t2g,
         t2lim=t2lim,
@@ -318,6 +320,74 @@ def test_small_batch_moe_token_indexed_matches_permuted(shape, num_tokens):
         assert int(counters.abs().sum().item()) == 0
         a, b = out_g.float(), ref.float()
         assert float((a - b).norm() / b.norm().clamp_min(1e-30)) < 1e-2, "red combine replay"
+
+
+def _run_published(d, out, counters, *, deterministic, num_ctas=0):
+    """The token-indexed kernel on the top-k a routing kernel published: the routing word holds
+    the token count before the launch (the publish), the tables are not passed."""
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
+        small_batch_moe_route_word,
+    )
+
+    small_batch_moe_route_word(counters).fill_(d["ids"].size(0))
+    ids = d["ids"].reshape(-1)
+    torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+        input=d["x"].view(torch.float4_e2m1fn_x2),
+        input_scale=d["x_sf"].view(torch.uint8),
+        fc1_weight=d["w1"].view(torch.float4_e2m1fn_x2),
+        fc1_weight_scale=d["w1_sf"],
+        fc1_alpha=d["alpha1"],
+        fc2_weight=d["w2"].view(torch.float4_e2m1fn_x2),
+        fc2_weight_scale=d["w2_sf"],
+        fc2_alpha=d["alpha2"],
+        output=out,
+        tile_idx_to_group_idx=ids,
+        tile_idx_to_mn_limit=ids,
+        permuted_idx_to_expanded_idx=ids,
+        expanded_idx_to_permuted_idx=ids,
+        num_non_exiting_tiles=ids,
+        global_sf=d["global_sf"],
+        token_final_scales=d["scales"],
+        counters=counters,
+        top_k=d["top_k"],
+        situ_beta=SITU_BETA,
+        situ_linear_beta=SITU_LINEAR_BETA,
+        token_indexed=True,
+        num_ctas=num_ctas,
+        deterministic_combine=deterministic,
+        published_routing=True,
+        expert_offset=d["offset"],
+    )
+
+
+@pytest.mark.parametrize("shape", list(SHAPES))
+@pytest.mark.parametrize("num_tokens", [1, 8, 13, 32])
+def test_small_batch_moe_published_routing_matches_tables(shape, num_tokens):
+    """Tables built in the kernel from the published top-k are moe_sort's: bitwise the
+    token-indexed launch on the tables with the slice combine, for any CTA count; the counters
+    (the routing word too) are zero after every launch, also over graph replays."""
+    d = _setup(shape, num_tokens, 1357 + num_tokens)
+    counters = _counters()
+    ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
+    _run(d, ref, counters, token_indexed=True, deterministic=True)
+    for ctas in (0, 1, 37):
+        out = torch.full_like(ref, float("nan"))
+        _run_published(d, out, counters, deterministic=True, num_ctas=ctas)
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0, f"counters not reset (ctas={ctas})"
+        assert torch.equal(ref.view(torch.int16), out.view(torch.int16)), f"ctas={ctas}"
+    out_g = torch.empty_like(ref)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _run_published(d, out_g, counters, deterministic=True)
+    for _ in range(2):
+        out_g.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert int(counters.abs().sum().item()) == 0
+        assert torch.equal(ref.view(torch.int16), out_g.view(torch.int16)), "graph replay"
 
 
 @pytest.mark.parametrize("token_indexed", [False, True])

@@ -61,6 +61,13 @@ tables, and writes every element of the routed output.
 * Warp roles: epilogue warpgroups (warpgroup 0 also converts the token scales and runs every FC1
   epilogue; FC2 tasks alternate between the warpgroups), the MMA warp, the weight TMA warp, the
   token warp.
+* Published routing (``published_routing``, token-indexed layout): instead of the ``moe_sort``
+  tables the kernel takes the step's top-k ids / weights, which the routing kernel before it
+  publishes token by token (stores, then a GPU-scope release add to the counter word
+  ``CTR_ROUTE``). The CTAs poll that word, build this rank's tables in shared memory (the active
+  local experts in ascending order are the tiles, ``moe_sort``'s tile order at <= 32 tokens) and
+  start the weight stream without waiting for the routing grid; the token warp and the epilogue
+  wait for it before they read the tokens or write the output. Same tables, same arithmetic.
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
   released right after it (every consumer of the output waits for the whole grid).
 """
@@ -101,6 +108,9 @@ _EPI_BARRIER_BASE = 1
 #: domain 0 / 1 (own 128-byte lines); [CTR_MTILE_BASE + c] FC2 arrivals of m-tile c,
 #: [CTR_TILE_BASE + t] FC1 units stored / FC2 tasks started of tile t.
 CTR_DIE1 = 32
+#: Published routing: tokens whose top-k the routing kernel has published (release adds; the CTA
+#: that exits last resets it).
+CTR_ROUTE = 24
 CTR_FC2 = 48
 CTR_FC2_DIE1 = 56
 CTR_MTILE_BASE = 64
@@ -110,6 +120,8 @@ CTR_TILE_BASE = CTR_MTILE_BASE + MAX_MTILES
 _SLOT_BYTES = _MMA_M * _KBLK // 2
 #: Largest slice count (the partial workspace is sized for it).
 MAX_SLICES = 32
+#: Published routing: words of the shared-memory active-expert mask (local experts <= 896).
+_ROUTE_MASK_WORDS = 28
 #: Slices whose partial loads the slice combine keeps in flight at once.
 _COMBINE_CHUNK = 4
 #: Red combine: slices of the output zeroed by the kernel (the CTAs that run units
@@ -384,6 +396,40 @@ def _ld_relaxed_u32(addr, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_relaxed_f32(addr, *, loc=None, ip=None):
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.relaxed.gpu.global.f32 $0, [$1];",
+            "=f,l",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _red_shared_or(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_iv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "red.shared.or.b32 [$0], $1;",
+        "r,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _bit(n, *, loc=None, ip=None):
+    """``1 << n`` for ``0 <= n < 32``."""
+    return Int32(
+        _asm(T.i32(), [_iv(n, loc=loc, ip=ip)], "shl.b32 $0, 1, $1;", "=r,r", loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
 def _atom_add_relaxed(addr, value, *, loc=None, ip=None):
     return Int32(
         _asm(
@@ -505,6 +551,8 @@ class RubinSmallBatchFusedMoeKernel:
     :param use_pdl: Launch with programmatic dependent launch.
     :param die_major: Die-major expert weights, work claimed per locality domain.
     :param sm_domain_words: :func:`pack_sm_domain_words` of the device (with ``die_major``).
+    :param published_routing: Tables built in the kernel from the top-k the routing kernel
+        publishes (token-indexed layout only).
     """
 
     @staticmethod
@@ -545,8 +593,11 @@ class RubinSmallBatchFusedMoeKernel:
         use_pdl: bool = True,
         die_major: bool = False,
         sm_domain_words: tuple = (),
+        published_routing: bool = False,
     ):
         assert self.supports(n_tok, n1, k1), (n_tok, n1, k1)
+        assert not published_routing or token_indexed, "published routing is token-indexed"
+        self.published_routing = published_routing
         assert not die_major or sm_domain_words, "die-major claiming needs the SM table"
         self.die_major = die_major
         self.sm_domain_words = tuple(sm_domain_words)
@@ -617,6 +668,11 @@ class RubinSmallBatchFusedMoeKernel:
             + 64
             + 4 * 1024  # barriers, TMEM holder, flags and alignment slack
         )
+        # published routing: tile -> expert table (at most one tile per expanded slot), the
+        # active-expert mask with its word prefix counts, the tile count
+        self.route_t2e = self.n_x if published_routing else 4
+        if published_routing:
+            fixed += 4 * self.route_t2e + 8 * _ROUTE_MASK_WORDS + 64
         self.num_ab_stage = min(max_ab_stage, (_smem_capacity() - fixed) // per_stage)
         assert self.num_ab_stage >= 2, "ring too small"
         self.claim_free = min(self.claim_free_req, self.num_ab_stage)
@@ -664,6 +720,7 @@ class RubinSmallBatchFusedMoeKernel:
         ctr_ptr: cute.Pointer,
         ws_ptr: cute.Pointer,
         orig_m: Int32,
+        expert_offset: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -756,6 +813,10 @@ class RubinSmallBatchFusedMoeKernel:
             sSc: cute.struct.Align[cute.struct.MemRange[Float32, self.n_x], 16]
             sSv: cute.struct.Align[cute.struct.MemRange[Float32, self.n_sv], 16]
             sSvMask: cute.struct.Align[cute.struct.MemRange[Int32, 2 * NWG], 16]
+            sT2e: cute.struct.Align[cute.struct.MemRange[Int32, self.route_t2e], 16]
+            sAm: cute.struct.Align[cute.struct.MemRange[Int32, _ROUTE_MASK_WORDS], 16]
+            sApre: cute.struct.Align[cute.struct.MemRange[Int32, _ROUTE_MASK_WORDS], 16]
+            sNt: cute.struct.Align[cute.struct.MemRange[Int32, 4], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(
@@ -788,6 +849,7 @@ class RubinSmallBatchFusedMoeKernel:
             ctr_ptr,
             ws_ptr,
             orig_m,
+            expert_offset,
             a_layout,
             b_layout,
             sfa_layout,
@@ -898,6 +960,7 @@ class RubinSmallBatchFusedMoeKernel:
         ctr_ptr: cute.Pointer,
         ws_ptr: cute.Pointer,
         orig_m: Int32,
+        expert_offset: Int32,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
@@ -937,11 +1000,12 @@ class RubinSmallBatchFusedMoeKernel:
             cute.arch.relinquish_tmem_alloc_permit()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive(st.tmem_ready)
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and not self.published_routing):
             griddepcontrol_wait()
             griddepcontrol_launch_dependents()
         # The CTA's first claim after the grid dependency: the previous launch on this counter
-        # buffer may still run until then (die-major: claimed by the weight producer).
+        # buffer may still run until then (die-major: claimed by the weight producer). With
+        # published routing the routing kernel's producer waited for every earlier grid.
         first = Int32(0)
         if cutlass.const_expr(not self.die_major):
             if warp_idx == self.tma_warp:
@@ -949,12 +1013,24 @@ class RubinSmallBatchFusedMoeKernel:
                     first = _atom_add_relaxed(ctr_ptr.toint(), 1)
 
         t2e_pre = Int32(0)
-        if warp_idx == self.tma_warp:
-            lane = cute.arch.lane_idx()
-            t2e_pre = tile_idx_to_expert_idx[
-                cutlass.min(lane, cute.size(tile_idx_to_expert_idx) - 1)
-            ]
-        nt = Int32(num_non_exiting_tiles[0])
+        nt = Int32(0)
+        if cutlass.const_expr(self.published_routing):
+            self._published_tables(
+                st, alpha2, expanded_idx_to_permuted_idx, ctr_ptr, orig_m, expert_offset, tidx
+            )
+            nt = st.sNt.get_tensor(cute.make_layout(4))[0]
+            if warp_idx == self.tma_warp:
+                lane = cute.arch.lane_idx()
+                t2e_pre = st.sT2e.get_tensor(cute.make_layout(self.route_t2e))[
+                    cutlass.min(lane, self.route_t2e - 1)
+                ]
+        else:
+            if warp_idx == self.tma_warp:
+                lane = cute.arch.lane_idx()
+                t2e_pre = tile_idx_to_expert_idx[
+                    cutlass.min(lane, cute.size(tile_idx_to_expert_idx) - 1)
+                ]
+            nt = Int32(num_non_exiting_tiles[0])
         w1 = nt * self.nblk1
         ns = cutlass.min(Int32(self.max_slices), (nt + (self.slice_tiles - 1)) // self.slice_tiles)
         total = w1 + ns * self.nblk2
@@ -1013,10 +1089,24 @@ class RubinSmallBatchFusedMoeKernel:
             acc_ptr = cute.arch.retrieve_tmem_ptr(
                 Float32, alignment=16, ptr_to_buffer_holding_addr=st.tmem_holding_buf
             )
+            if cutlass.const_expr(self.published_routing and self.use_pdl):
+                # the token scales and the output come with the routing grid's end
+                griddepcontrol_wait()
+                griddepcontrol_launch_dependents()
             if wg == 0:
                 if w1 > 0:
                     self._token_scales_to_smem(st, x_sf_ptr, orig_m, et)
-            if cutlass.const_expr(self.token_indexed):
+            if cutlass.const_expr(self.published_routing):
+                self._published_slots(
+                    st,
+                    alpha2,
+                    expanded_idx_to_permuted_idx,
+                    token_final_scales,
+                    orig_m,
+                    expert_offset,
+                    tidx,
+                )
+            elif cutlass.const_expr(self.token_indexed):
                 self._build_slot_table(
                     st,
                     alpha2,
@@ -1160,13 +1250,17 @@ class RubinSmallBatchFusedMoeKernel:
         return idx, ph
 
     @cute.jit
-    def _expert_of(self, tile_idx_to_expert_idx, t2e_pre: Int32, tile: Int32):
-        """Expert of ``tile`` (warp-uniform): from the prefetched lanes for the first 32 tiles."""
+    def _expert_of(self, st, tile_idx_to_expert_idx, t2e_pre: Int32, tile: Int32):
+        """Expert of ``tile`` (warp-uniform): from the prefetched lanes for the first 32 tiles
+        (published routing: the shared-memory table)."""
         expert = Int32(0)
         if tile < 32:
             expert = cute.arch.shuffle_sync(t2e_pre, tile)
         else:
-            expert = tile_idx_to_expert_idx[tile]
+            if cutlass.const_expr(self.published_routing):
+                expert = st.sT2e.get_tensor(cute.make_layout(self.route_t2e))[tile]
+            else:
+                expert = tile_idx_to_expert_idx[tile]
         return expert
 
     @cute.jit
@@ -1243,7 +1337,7 @@ class RubinSmallBatchFusedMoeKernel:
             if cur < w1:
                 tile = cur // self.nblk1
                 blk = cur - tile * self.nblk1
-                expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, tile)
+                expert = self._expert_of(st, tile_idx_to_expert_idx, t2e_pre, tile)
                 tblk = blk
                 texp = expert
                 if cutlass.const_expr(self.die_major):
@@ -1276,7 +1370,7 @@ class RubinSmallBatchFusedMoeKernel:
                         tc = c - self.nblk2 // 2
                         eoff = nloc
                 for t in cutlass.range(t0, t1, unroll=1):
-                    expert = self._expert_of(tile_idx_to_expert_idx, t2e_pre, t) + eoff
+                    expert = self._expert_of(st, tile_idx_to_expert_idx, t2e_pre, t) + eoff
                     for kb in cutlass.range(self.nkb2, unroll=1):
                         g = self._load_stage(
                             tma_a2,
@@ -1324,6 +1418,8 @@ class RubinSmallBatchFusedMoeKernel:
             if _atom_add_acq_rel(ctr + 4, 1) == nctas - 1:
                 _st_relaxed_u32(ctr, 0)
                 _st_relaxed_u32(ctr + 4, 0)
+                # a routing kernel may have published into it for a launch with tables too
+                _st_relaxed_u32(ctr + CTR_ROUTE * 4, 0)
                 if cutlass.const_expr(self.die_major):
                     _st_relaxed_u32(ctr + CTR_DIE1 * 4, 0)
                     _st_relaxed_u32(ctr + CTR_FC2 * 4, 0)
@@ -1364,6 +1460,9 @@ class RubinSmallBatchFusedMoeKernel:
         tBsB2, tBgB2 = cpasync.tma_partition(
             tma_b2, 0, b_cta, cute.group_modes(sB, 0, 3), cute.group_modes(tCgB2, 0, 3)
         )
+        if cutlass.const_expr(self.published_routing and self.use_pdl):
+            # the tokens (and the output this warp zeroes) come with the routing grid's end
+            griddepcontrol_wait()
         if w1 > 0:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(st.tok_full, self.x_bytes)
@@ -1628,6 +1727,95 @@ class RubinSmallBatchFusedMoeKernel:
         cute.arch.barrier(barrier_id=_EPI_BARRIER_BASE + self.num_epi_wg, number_of_threads=nthr)
 
     @cute.jit
+    def _published_tables(
+        self, st, alpha2, ids_t, ctr_ptr, orig_m: Int32, expert_offset: Int32, tidx: Int32
+    ):
+        """Published routing: once the routing kernel has published every token's top-k
+        (``CTR_ROUTE``), this rank's active-expert mask with its word prefix counts, the tile ->
+        expert table (the active local experts in ascending order) and the tile count into shared
+        memory, by the epilogue warps; every warp of the CTA waits at the closing barrier."""
+        nthr = 128 * self.num_epi_wg
+        bar = _EPI_BARRIER_BASE + self.num_epi_wg
+        if tidx < nthr:
+            ids_base = ids_t.iterator.toint()
+            num_local = Int32(cute.size(alpha2))
+            am_base = st.sAm.data_ptr().toint()
+            am = st.sAm.get_tensor(cute.make_layout(_ROUTE_MASK_WORDS))
+            apre = st.sApre.get_tensor(cute.make_layout(_ROUTE_MASK_WORDS))
+            t2e = st.sT2e.get_tensor(cute.make_layout(self.route_t2e))
+            ntt = st.sNt.get_tensor(cute.make_layout(4))
+            if tidx < _ROUTE_MASK_WORDS:
+                am[tidx] = Int32(0)
+            if tidx == 0:
+                # relaxed polls, one acquire once complete
+                addr = ctr_ptr.toint() + Int64(CTR_ROUTE * 4)
+                done = _ld_relaxed_u32(addr)
+                while done < orig_m:
+                    done = _ld_relaxed_u32(addr)
+                done = _ld_acquire_u32(addr)
+            cute.arch.barrier(barrier_id=bar, number_of_threads=nthr)
+            for x in cutlass.range(tidx, orig_m * self.topk, nthr, unroll=1):
+                local = _ld_relaxed_u32(ids_base + Int64(x) * 4) - expert_offset
+                if local >= 0 and local < num_local:
+                    _red_shared_or(am_base + (local >> 5) * 4, _bit(local & 31))
+            cute.arch.barrier(barrier_id=bar, number_of_threads=nthr)
+            nwords = (num_local + 31) >> 5
+            if tidx < 32:
+                pre = Int32(0)
+                tot = Int32(0)
+                for w in cutlass.range(nwords, unroll=1):
+                    c = cute.arch.popc(am[w])
+                    if w < tidx:
+                        pre = pre + c
+                    tot = tot + c
+                if tidx < nwords:
+                    apre[tidx] = pre
+                if tidx == 0:
+                    ntt[0] = tot
+            cute.arch.barrier(barrier_id=bar, number_of_threads=nthr)
+            for e in cutlass.range(tidx, num_local, nthr, unroll=1):
+                word = am[e >> 5]
+                bit = _bit(e & 31)
+                if (word & bit) != 0:
+                    t2e[apre[e >> 5] + cute.arch.popc(word & (bit - 1))] = e
+        cute.arch.barrier()
+
+    @cute.jit
+    def _published_slots(
+        self,
+        st,
+        alpha2,
+        ids_t,
+        vals_t,
+        orig_m: Int32,
+        expert_offset: Int32,
+        tidx: Int32,
+    ):
+        """Published routing: the token-indexed slot table (expanded slot -> tile, ``alpha2 x
+        weight``, as :meth:`_build_slot_table`) from the published top-k and the mask of
+        :meth:`_published_tables`, by the epilogue warps."""
+        nthr = 128 * self.num_epi_wg
+        ids_base = ids_t.iterator.toint()
+        vals_base = vals_t.iterator.toint()
+        num_local = Int32(cute.size(alpha2))
+        am = st.sAm.get_tensor(cute.make_layout(_ROUTE_MASK_WORDS))
+        apre = st.sApre.get_tensor(cute.make_layout(_ROUTE_MASK_WORDS))
+        tl_t = st.sTl.get_tensor(cute.make_layout(self.n_x))
+        sc_t = st.sSc.get_tensor(cute.make_layout(self.n_x))
+        for x in cutlass.range(tidx, self.n_x, nthr, unroll=1):
+            t = Int32(-1)
+            sc = Float32(0.0)
+            if x < orig_m * self.topk:
+                local = _ld_relaxed_u32(ids_base + Int64(x) * 4) - expert_offset
+                if local >= 0 and local < num_local:
+                    word = am[local >> 5]
+                    t = apre[local >> 5] + cute.arch.popc(word & (_bit(local & 31) - 1))
+                    sc = alpha2[local] * _ld_relaxed_f32(vals_base + Int64(x) * 4)
+            tl_t[x] = t
+            sc_t[x] = sc
+        cute.arch.barrier(barrier_id=_EPI_BARRIER_BASE + self.num_epi_wg, number_of_threads=nthr)
+
+    @cute.jit
     def _tile_scales(self, st, t: Int32, sbuf: Int32, et: Int32, wg: Int32):
         """Token-indexed layout: token j's scale for tile ``t`` (0 if the tile's expert does not
         serve it) into buffer ``sbuf`` of the warpgroup (thread j scans token j's top-k slots) and
@@ -1790,7 +1978,13 @@ class RubinSmallBatchFusedMoeKernel:
                 if wg == 0:
                     tile = u // self.nblk1
                     blk = u - tile * self.nblk1
-                    alpha_val = alpha1[tile_idx_to_expert_idx[tile]]
+                    alpha_val = Float32(0.0)
+                    if cutlass.const_expr(self.published_routing):
+                        alpha_val = alpha1[
+                            st.sT2e.get_tensor(cute.make_layout(self.route_t2e))[tile]
+                        ]
+                    else:
+                        alpha_val = alpha1[tile_idx_to_expert_idx[tile]]
                     tok = Int32(0)
                     n_valid = Int32(n_tok)
                     if cutlass.const_expr(self.token_indexed):
@@ -2096,6 +2290,7 @@ class RubinSmallBatchFusedMoeKernel:
         orig_m: Int32,
         m: Int32,
         num_local: Int32,
+        expert_offset: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -2103,8 +2298,9 @@ class RubinSmallBatchFusedMoeKernel:
         output buffers ([m, k2] rows, 128x4-blocked scales); ``out`` the BF16 [orig_m, k1] output
         (fully written); ``ctr`` int32 [counter_words(m // 128)] zeros; ``ws``
         [workspace_words(...)] scratch of the slice combine; ``expanded_idx_to_permuted_idx``
-        [orig_m * topk] (read with the token-indexed layout only). Die-major weights are
-        ``[2 L, rows / 2, cols]`` (``num_local`` is L)."""
+        [orig_m * topk] (read with the token-indexed layout only; published routing: the top-k ids,
+        ``token_final_scales`` the weights, ``expert_offset`` this rank's first expert). Die-major
+        weights are ``[2 L, rows / 2, cols]`` (``num_local`` is L)."""
         n1, k1, n2, k2 = self.n1, self.k1, self.n2, self.k2
         L = num_local
         num_tiles = m // _MMA_M
@@ -2153,6 +2349,7 @@ class RubinSmallBatchFusedMoeKernel:
             ctr_ptr,
             ws_ptr,
             orig_m,
+            expert_offset,
             num_ctas,
             stream,
         )
