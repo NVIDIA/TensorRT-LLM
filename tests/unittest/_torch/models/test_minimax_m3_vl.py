@@ -2143,6 +2143,7 @@ def test_fast_path_expand_video_placeholders_use_video_token_id():
     assert expanded.count(vid) == 2
 
 
+@pytest.mark.cpu_only
 def test_fast_path_expand_video_one_bracket_per_temporal_patch():
     """A video spans ``grid_t`` framed brackets, as the HF processor lays it out.
 
@@ -2170,6 +2171,7 @@ def test_fast_path_expand_video_one_bracket_per_temporal_patch():
         )
 
 
+@pytest.mark.cpu_only
 def test_video_token_count_is_one_bracket_per_temporal_patch():
     """``grid_t * (grid_h*grid_w/merge^2 + 2)`` for the processor's grid.
 
@@ -2188,6 +2190,7 @@ def test_video_token_count_is_one_bracket_per_temporal_patch():
         proc.get_num_tokens_per_video(video=[])
 
 
+@pytest.mark.cpu_only
 def test_preferred_media_io_format_is_uint8_numpy():
     """The registered processor asks media_io for uint8 HWC arrays.
 
@@ -2246,6 +2249,7 @@ def test_fast_path_expand_rejects_placeholder_count_mismatch():
         )
 
 
+@pytest.mark.cpu_only
 def test_token_id_request_takes_the_fast_path_without_detokenizing():
     """A ``prompt_token_ids`` + image request is expanded in token space.
 

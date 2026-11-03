@@ -138,7 +138,6 @@ MODEL_CLASS_TO_MODULE = {
     "DeepseekV41ForCausalLM": "modeling_deepseekv41",
     "DeepseekV41ForConditionalGeneration": "modeling_deepseekv41_multimodal",
     "DeepseekV4ForCausalLM": "modeling_deepseekv4",
-    "MiniMaxDSparkBackbone": "modeling_dspark",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
     "ExaoneMoeForCausalLM": "modeling_exaone_moe",

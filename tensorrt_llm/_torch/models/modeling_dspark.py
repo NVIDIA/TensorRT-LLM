@@ -3749,7 +3749,7 @@ class MiniMaxDSparkModel(DecoderModel):
         )
 
 
-@register_auto_model(MINIMAX_DSPARK_DRAFT_ARCH)
+@register_auto_model("DSparkMiniMaxDraftModel")
 class MiniMaxDSparkBackbone(DecoderModelForCausalLM[MiniMaxDSparkModel, PretrainedConfig]):
     """Registry entry for the MiniMax DSpark drafter checkpoint
     (``config.architectures == ["DSparkMiniMaxDraftModel"]``)."""
