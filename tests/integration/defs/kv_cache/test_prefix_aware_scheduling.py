@@ -1028,7 +1028,15 @@ def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
     """Install and resolve the pinned LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
-    llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
+    # Retry installs that fail early on transient network errors; the timeout
+    # already bounds a stalled install.
+    for attempt in range(3):
+        try:
+            llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 2:
+                raise
     LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
     return llm_venv
 
