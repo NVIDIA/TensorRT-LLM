@@ -119,17 +119,20 @@ class DeepSeekV31Parser(BaseToolParser):
 
         # Check if we have a tool call (either the start token or individual tool call)
         start_tokens = [self.bot_token, "<｜tool▁call▁begin｜>"]
+        end_tokens = [self.eot_token, "<｜tool▁call▁end｜>"]
         start_indices = [idx for idx in map(current_text.find, start_tokens) if idx != -1]
         has_tool_call = bool(start_indices)
 
         if not has_tool_call:
+            # Text that may still become a marker waits for the next increment.
             if any(
-                self._ends_with_partial_token(current_text, b_token) for b_token in start_tokens
+                self._ends_with_partial_token(current_text, token)
+                for token in start_tokens + end_tokens
             ):
                 return StreamingParseResult(), False
             normal_text = current_text
             self._buffer = ""
-            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
+            for e_token in end_tokens:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text), False
 
@@ -159,9 +162,7 @@ class DeepSeekV31Parser(BaseToolParser):
                 func_args_raw = partial_match.group(2).strip()
                 is_tool_end = partial_match.group(3)
                 # Complete arguments may be followed by the first characters of
-                # the end marker, which are not part of them. The call then
-                # stays open: completed now, it would leave the rest of the
-                # marker to be read as text.
+                # the end marker, which are not part of them.
                 marker_len = (
                     0
                     if is_tool_end
@@ -205,9 +206,6 @@ class DeepSeekV31Parser(BaseToolParser):
                         calls[0].parameters = func_args_raw
                         self._last_arguments = func_args_raw
                         self.streamed_args_for_tool[self.current_tool_id] = func_args_raw
-                    # Without its end marker yet, the call is closed by a later
-                    # increment, as a call named earlier is.
-                    close_call = is_complete and bool(is_tool_end)
                 else:
                     argument_diff = (
                         func_args_raw[len(self._last_arguments) :]
@@ -225,9 +223,11 @@ class DeepSeekV31Parser(BaseToolParser):
                         )
                         self._last_arguments += argument_diff
                         self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-                    close_call = is_complete and not end_pending
 
-                if close_call:
+                # The call closes with its whole end marker, which may arrive
+                # after the arguments are complete: closed before that, it
+                # would leave the rest of the marker to be read as text.
+                if is_complete and is_tool_end:
                     # Update the stored arguments
                     try:
                         parsed_args = json.loads(func_args_raw)
@@ -235,12 +235,8 @@ class DeepSeekV31Parser(BaseToolParser):
                     except json.JSONDecodeError:
                         pass
 
-                    # Find the end of the current tool call and remove only that part from buffer
-                    if is_tool_end:
-                        # Remove the completed tool call from buffer, keep any remaining content
-                        self._buffer = current_text[partial_match.end(3) :]
-                    else:
-                        self._buffer = ""
+                    # Remove the completed tool call from buffer, keep any remaining content
+                    self._buffer = current_text[partial_match.end(3) :]
 
                     result = StreamingParseResult(normal_text=normal_text, calls=calls)
                     self.current_tool_id += 1
