@@ -1632,6 +1632,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "glm_5.3_fp8":
                 # Allow time for checkpoint loading and cold executor warmup.
                 server_timeout = 1800
+            elif self._config.model_name == "muse_spark_open_nvfp4":
+                # Allow time for NVFP4 checkpoint loading and executor warmup.
+                server_timeout = 3600
             elif self._config.model_name in {
                     "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
             }:
