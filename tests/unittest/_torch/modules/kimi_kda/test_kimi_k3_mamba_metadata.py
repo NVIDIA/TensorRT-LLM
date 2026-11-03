@@ -62,6 +62,11 @@ def test_prepare_packed_kda_metadata(lengths: list[int]) -> None:
         torch.testing.assert_close(metadata.query_start_loc, expected.int())
         assert metadata.query_start_loc_long.is_contiguous()
         assert metadata.query_start_loc.is_contiguous()
+        torch.testing.assert_close(metadata.kda_cu_seqlens, expected)
+        torch.testing.assert_close(metadata.kda_cu_seqlens_cpu, expected.cpu())
+    else:
+        assert metadata.kda_cu_seqlens is None
+        assert metadata.kda_cu_seqlens_cpu is None
 
 
 def test_prepare_refreshes_offsets_without_changing_storage() -> None:
