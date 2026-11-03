@@ -5718,6 +5718,8 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
             calls += streaming.parse_streaming_increment(
                 text[i:i + 4], sample_tools).calls
         calls += streaming.finish(sample_tools).calls
+        assert [call.tool_index for call in calls] == [0]
+        assert streaming.current_tool_id == 1
         # Assemble parameter deltas as the streaming client does.
         for call in calls:
             entry = streamed.setdefault(call.tool_index, {})
@@ -5749,25 +5751,29 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         calls += streaming.finish(sample_tools).calls
         assert calls == []
 
-    @pytest.mark.parametrize("text", [
-        "Sure. " + _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
-        _g4_tc("search_web", f'query:{_g4_s("AI")}'),
-        _g4_tc("search_web", f'query:{_g4_s("a")}') +
-        _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
-        _g4_tc("search_web", f'query:{_g4_s("b")}'),
-        _g4_tc("search_web", f'query:{_g4_s("a")}') +
-        _g4_tc("search_web", f'query:{_g4_s("b")}') + " Done.",
-        _g4_tc("search_web", f'query:{_g4_s("a")}') + f'{BOT_TOKEN}' +
-        f'{CALL_PREFIX}get_weather{{location:{_g4_s("LA")}}}',
-        _g4_tc("search_web", f'query:{_g4_s("a")}') +
-        _g4_tc("get_weather", "opts:" + "{a:" * 5000 + "1" + "}" * 5000),
-    ],
-                             ids=[
-                                 "text_and_two_calls", "three_calls",
-                                 "two_calls_then_text",
-                                 "complete_then_incomplete",
-                                 "valid_then_unparsable"
-                             ])
+    @pytest.mark.parametrize(
+        "text", [
+            "Sure. " + _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+            _g4_tc("search_web", f'query:{_g4_s("AI")}'),
+            _g4_tc("search_web", f'query:{_g4_s("a")}') +
+            _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+            _g4_tc("search_web", f'query:{_g4_s("b")}'),
+            _g4_tc("search_web", f'query:{_g4_s("a")}') +
+            _g4_tc("search_web", f'query:{_g4_s("b")}') + " Done.",
+            _g4_tc("search_web", f'query:{_g4_s("a")}') + f'{BOT_TOKEN}' +
+            f'{CALL_PREFIX}get_weather{{location:{_g4_s("LA")}}}',
+            _g4_tc("search_web", f'query:{_g4_s("a")}') +
+            _g4_tc("get_weather", "opts:" + "{a:" * 5000 + "1" + "}" * 5000),
+            _g4_tc("get_weather", "opts:" + "{a:" * 5000 + "1" + "}" * 5000) +
+            _g4_tc("search_web", f'query:{_g4_s("AI")}'),
+            _g4_tc("get_weather", "tags:" + "[" * 5000 + "]" * 5000) +
+            _g4_tc("search_web", f'query:{_g4_s("AI")}'),
+        ],
+        ids=[
+            "text_and_two_calls", "three_calls", "two_calls_then_text",
+            "complete_then_incomplete", "valid_then_unparsable",
+            "unparsable_object_then_valid", "unparsable_array_then_valid"
+        ])
     def test_streaming_reports_every_call_in_one_increment(
             self, sample_tools, parser, text):
         """An increment that holds several calls reports each complete one."""
@@ -5781,6 +5787,7 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         calls += streaming.finish(sample_tools).calls
 
         assert [call.tool_index for call in calls] == list(range(len(expected)))
+        assert streaming.current_tool_id == len(expected)
         assert [(call.name, json.loads(call.parameters))
                 for call in calls] == expected
         assert [(entry["name"], entry["arguments"])
