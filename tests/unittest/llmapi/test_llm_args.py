@@ -391,8 +391,16 @@ class TestMoeConfigPerLayerDynamicEplb:
     # re-raises a load-balancer error with only the input dictionary in its
     # message, which would hide the reason these tests check.
     @pytest.mark.parametrize("planner, auxiliary_sms, valid", [
+        pytest.param("halo_q", 0, False, id="halo-q-0"),
+        pytest.param("halo_q", 1, True, id="halo-q-1"),
+        pytest.param("halo_q", 4, True, id="halo-q-4"),
         pytest.param("halo_q", 8, True, id="halo-q-8"),
         pytest.param("halo_q", 9, False, id="halo-q-9"),
+        pytest.param("halo_q", 16, False, id="halo-q-16"),
+        pytest.param("halo_r", 0, False, id="halo-r-0"),
+        pytest.param("halo_r", 2, True, id="halo-r-2"),
+        pytest.param("halo_r", 4, True, id="halo-r-4"),
+        pytest.param("halo_r", 12, True, id="halo-r-12"),
         pytest.param("halo_r", 16, True, id="halo-r-16"),
         pytest.param("halo_r", 17, False, id="halo-r-17"),
     ])
@@ -418,6 +426,35 @@ class TestMoeConfigPerLayerDynamicEplb:
         with pytest.raises(ValidationError,
                            match="requires `auxiliary_sms` >= 2; got 1"):
             MoePerLayerDynamicLoadBalancerConfig(**values)
+
+    @pytest.mark.parametrize("planner, default", [
+        pytest.param(None, 4, id="planner-unset"),
+        pytest.param("halo_q", 4, id="halo-q"),
+        pytest.param("halo_r", 16, id="halo-r"),
+    ])
+    def test_auxiliary_sm_default_follows_the_planner(self, planner: str | None,
+                                                      default: int) -> None:
+        values = self._per_layer_dynamic()
+        if planner is not None:
+            values["planner"] = planner
+        direct = MoePerLayerDynamicLoadBalancerConfig(**values)
+        config = MoeConfig(load_balancer=values)
+        assert direct.auxiliary_sms == default
+        assert config.load_balancer.auxiliary_sms == default
+        if planner != "halo_r":
+            # HALO-Q leaves the field default alone: an unset value stays unset.
+            assert "auxiliary_sms" not in direct.model_fields_set
+
+    def test_halo_r_yaml_defaults_to_sixteen_auxiliary_sms(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text(
+            "mode: per_layer_dynamic\nnum_slots: 72\nplanner: halo_r\n")
+
+        config = MoeConfig(load_balancer=str(config_path))
+
+        assert config.load_balancer.planner == "halo_r"
+        assert config.load_balancer.auxiliary_sms == 16
 
     def test_rejects_unknown_planner(self) -> None:
         values = self._per_layer_dynamic()

@@ -1964,6 +1964,8 @@ _HALO_R_MAX_EP = 32
 _HALO_R_MIN_AUXILIARY_SMS = 2
 # HALO-R's relay copy runs on the auxiliary SMs, one CTA each, so they bound its copy bandwidth.
 _HALO_R_MAX_AUXILIARY_SMS = 16
+# An unset `auxiliary_sms` gives HALO-R's relay copy the most SMs it supports.
+_HALO_R_DEFAULT_AUXILIARY_SMS = _HALO_R_MAX_AUXILIARY_SMS
 # HALO-Q's in-switch TMA copy runs on at most 8 SMs.
 _HALO_Q_MAX_AUXILIARY_SMS = 8
 
@@ -1985,7 +1987,7 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         ge=1,
         le=_HALO_R_MAX_AUXILIARY_SMS,
         description=
-        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the replica planner and then the copy of its plan on the copy stream, one CTA per SM: the HALO-Q scheduler and the in-switch TMA copy (1 to 8 SMs), or the HALO-R scheduler and its relay copy (2 to 16 SMs). Must be smaller than the device SM count.",
+        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the replica planner and then the copy of its plan on the copy stream, one CTA per SM: the HALO-Q scheduler and the in-switch TMA copy (1 to 8 SMs, 4 by default), or the HALO-R scheduler and its relay copy (2 to 16 SMs, 16 by default). Must be smaller than the device SM count.",
         status="prototype")
     helper_slot_mode: Literal["per_layer_resident", "shared_banks"] = Field(
         default="per_layer_resident",
@@ -1995,7 +1997,7 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     planner: Literal["halo_q", "halo_r"] = Field(
         default="halo_q",
         description=
-        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the lowest-indexed ranks with room for them below the balanced load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler and relay copy on `auxiliary_sms` CTAs (2 to 16), supports up to 4 helper slots per rank, an even EP size from 2 to 32 and at least 4 experts per rank.",
+        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the lowest-indexed ranks with room for them below the balanced load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler and relay copy on `auxiliary_sms` CTAs (2 to 16, 16 by default), supports up to 4 helper slots per rank, an even EP size from 2 to 32 and at least 4 experts per rank.",
         status="prototype")
 
     @model_validator(mode="after")
@@ -2003,8 +2005,10 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
             self) -> 'MoePerLayerDynamicLoadBalancerConfig':
         """Check each planner's requirements on the shared per-layer fields.
 
-        HALO-Q's TMA copy runs on at most 8 SMs. HALO-R's scheduler plans on
-        CTA 0 while the other CTAs map routes.
+        HALO-Q's TMA copy runs on at most 8 SMs, and an unset `auxiliary_sms`
+        keeps the field default of 4. HALO-R's scheduler plans on CTA 0 while
+        the other CTAs map routes, and an unset `auxiliary_sms` gives its relay
+        copy 16 SMs.
         """
         if self.planner != "halo_r":
             if self.auxiliary_sms > _HALO_Q_MAX_AUXILIARY_SMS:
@@ -2012,6 +2016,8 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
                     f"`planner: {self.planner}` supports `auxiliary_sms` up to "
                     f"{_HALO_Q_MAX_AUXILIARY_SMS}; got {self.auxiliary_sms}.")
             return self
+        if "auxiliary_sms" not in self.model_fields_set:
+            self.auxiliary_sms = _HALO_R_DEFAULT_AUXILIARY_SMS
         if self.auxiliary_sms < _HALO_R_MIN_AUXILIARY_SMS:
             raise ValueError(
                 f"`planner: halo_r` requires `auxiliary_sms` >= "
