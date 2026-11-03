@@ -27,18 +27,23 @@ Servers are built through the real constructor with the fake generator from
 
 import asyncio
 import json
+import logging
 import signal
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from fastapi.responses import Response
 from test_common.serve.app_factory import AggConfig
 from test_common.serve.fakes import ScriptedOutput
 
 from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve import openai_server
+from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
@@ -224,4 +229,117 @@ def test_health_generate_still_fails_with_500_on_engine_failure(serve_env, engin
     server._create_chat_response = AsyncMock(return_value=_chat_response())
     response = asyncio.run(server.health_generate(_raw_request()))
     assert response.status_code == 200, f"/health_generate on a success: {KEEP}"
-    assert json.loads(json.dumps(response.body.decode())) == "Generation health check OK"
+    assert response.body == b"Generation health check OK"
+
+
+# ---------------------------------------------------------------------------
+# The typed core: create_chat_completion
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def error_records():
+    """Messages of the ERROR records the TRT-LLM logger emits during the test.
+
+    The library logger does not propagate, so ``caplog`` would see nothing; a
+    handler is attached to it instead. The positive control that the handler
+    sees records is ``test_unexpected_error_is_a_serving_error_with_one_traceback``.
+    """
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture(level=logging.ERROR)
+    logger._logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger._logger.removeHandler(handler)
+
+
+def _request(**overrides) -> ChatCompletionRequest:
+    return ChatCompletionRequest(**_chat_body(**overrides))
+
+
+def _run_core(server, request):
+    return asyncio.run(server.create_chat_completion(request, _raw_request()))
+
+
+def test_typed_result_for_a_non_streaming_request(serve_env):
+    server = _build(serve_env)
+    chat_response = _chat_response()
+    server._create_chat_response = AsyncMock(return_value=chat_response)
+
+    result = _run_core(server, _request())
+
+    assert result is chat_response
+    assert not isinstance(result, Response)
+
+
+def test_stream_is_returned_as_sse_strings(serve_env):
+    server = _build(serve_env, AggConfig(num_postprocess_workers=1))
+    server.generator.generate_async = Mock(
+        return_value=_StreamedGeneration([["data: a\n\n"], ["data: b\n\n"]])
+    )
+
+    async def run():
+        result = await server.create_chat_completion(_request(stream=True), _raw_request())
+        assert not isinstance(result, Response)
+        return [frame async for frame in result]
+
+    frames = asyncio.run(run())
+
+    assert all(isinstance(frame, str) for frame in frames)
+    assert frames == ["data: a\n\n", "data: b\n\n", "data: [DONE]\n\n"]
+
+
+def test_named_tool_choice_on_token_ids_raises_serving_error(serve_env, error_records):
+    server = _build(serve_env)
+    expected = OpenAIServer.create_error_response(
+        message=NAMED_TOOL_ON_TOKEN_IDS_MESSAGE, err_type="BadRequestError"
+    )
+
+    with pytest.raises(ServingError) as raised:
+        _run_core(server, ChatCompletionRequest(**_named_tool_body()))
+
+    assert raised.value.status == 400
+    assert raised.value.body.model_dump() == json.loads(expected.body)
+    assert error_records == [], "a rejected request is not an error of the server"
+
+
+def test_value_error_is_a_serving_error_without_a_log(serve_env, error_records):
+    server = _build(serve_env)
+    server.generator.script(ScriptedOutput(raise_on_call=ValueError("bad")))
+
+    with pytest.raises(ServingError) as raised:
+        _run_core(server, _request())
+
+    assert raised.value.status == 400
+    assert raised.value.body.message == "bad"
+    assert error_records == []
+
+
+def test_unexpected_error_is_a_serving_error_with_one_traceback(serve_env, error_records):
+    server = _build(serve_env)
+    server.generator.script(ScriptedOutput(raise_on_call=RuntimeError("boom")))
+
+    with pytest.raises(ServingError) as raised:
+        _run_core(server, _request())
+
+    assert raised.value.status == 400
+    assert raised.value.body.message == "boom"
+    assert len(error_records) == 1, error_records
+    assert "RuntimeError: boom" in error_records[0]
+
+
+def test_engine_failure_raises_engine_fatal_error_after_sigint(serve_env, engine_failure_recorder):
+    server = _build(serve_env)
+    server.generator.script(ScriptedOutput(raise_on_call=CppExecutorError("dead")))
+
+    with pytest.raises(EngineFatalError):
+        _run_core(server, _request())
+
+    assert engine_failure_recorder.signals == [signal.SIGINT]
+    assert len(engine_failure_recorder.terminations) == 1
