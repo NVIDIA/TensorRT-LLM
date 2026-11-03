@@ -931,6 +931,16 @@ def launchReleaseCheck(pipeline, globalVars)
     })
 }
 
+def skipTestListCheck(String message)
+{
+    // Mark a nested stage so Blue Ocean renders the skip; a mark on the parallel branch's own stage shows as NOT_BUILT.
+    def runStage = "[Check-Test-List] Run"
+    stage(runStage) {
+        echo message
+        jUtils.markStageSkippedForConditional(runStage)
+    }
+}
+
 def launchTestListCheck(pipeline, globalVars)
 {
     def key = "Check-Test-List"
@@ -2560,24 +2570,19 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Check-Test-List": {
             script {
                 if (testFilter[INFRA_DRY_RUN]) {
-                    echo "Skipping Check Test List for the infrastructure dry run."
-                    jUtils.markStageSkippedForConditional(STAGE_NAME)
+                    skipTestListCheck("Skipping Check Test List for the infrastructure dry run.")
                     return
                 } else if (GEN_POST_MERGE_BUILDS_ONLY) {
-                    echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
-                    jUtils.markStageSkippedForConditional(STAGE_NAME)
+                    skipTestListCheck("Skipping Check Test List (GenPostMergeBuilds mode: builds only)")
                     return
                 } else if (runMode == "nightly_release") {
-                    echo "Skipping Check Test List for nightly_release."
-                    jUtils.markStageSkippedForConditional(STAGE_NAME)
+                    skipTestListCheck("Skipping Check Test List for nightly_release.")
                     return
                 } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                    echo "Skipping Check Test List for Docs-only changes."
-                    jUtils.markStageSkippedForConditional(STAGE_NAME)
+                    skipTestListCheck("Skipping Check Test List for Docs-only changes.")
                     return
                 } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                    echo "Skipping Check Test List for BuildDockerImageSanityTest."
-                    jUtils.markStageSkippedForConditional(STAGE_NAME)
+                    skipTestListCheck("Skipping Check Test List for BuildDockerImageSanityTest.")
                     return
                 }
                 launchTestListCheck(this, globalVars)
@@ -3350,17 +3355,13 @@ pipeline {
                             "Check-Test-List": {
                                 stage("Check-Test-List") {
                                     if (testFilter[INFRA_DRY_RUN]) {
-                                        echo "Skipping Check Test List for the infrastructure dry run."
-                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                                        skipTestListCheck("Skipping Check Test List for the infrastructure dry run.")
                                     } else if (runMode == "nightly_release") {
-                                        echo "Skipping Check Test List for nightly_release."
-                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                                        skipTestListCheck("Skipping Check Test List for nightly_release.")
                                     } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
-                                        echo "Skipping Check Test List for Docs-only changes."
-                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                                        skipTestListCheck("Skipping Check Test List for Docs-only changes.")
                                     } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
-                                        echo "Skipping Check Test List for BuildDockerImageSanityTest."
-                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
+                                        skipTestListCheck("Skipping Check Test List for BuildDockerImageSanityTest.")
                                     } else {
                                         launchTestListCheck(this, globalVars)
                                     }
