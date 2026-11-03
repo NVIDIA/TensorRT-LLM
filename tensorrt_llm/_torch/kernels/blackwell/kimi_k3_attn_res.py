@@ -555,7 +555,9 @@ class KimiK3AttnResKernel:
     flags. ``finish_world > 0`` (with ``in_place_addend``): the addend is the pushed call over
     that many ranks, which the kernel finishes (``finish_two_shot``: two-shot transport;
     ``mc_addr`` / ``ar_rank``: the workspace's multicast base and this rank); ``early_poll``
-    (one-shot) does so before the grid wait.
+    (one-shot) does so before the grid wait; ``finish_chunk`` / ``finish_sanitize``: the slot
+    sums in the order of another C++ transport. ``finish_all_gather`` (``ADD_MOE``): the call
+    is an all-gather call, ``routed`` its all-gather row and ``shared`` its slot sum.
     """
 
     def __init__(
@@ -569,6 +571,9 @@ class KimiK3AttnResKernel:
         finish_world: int = 0,
         finish_two_shot: bool = False,
         early_poll: bool = False,
+        finish_chunk: int = 0,
+        finish_sanitize: bool = False,
+        finish_all_gather: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -576,19 +581,26 @@ class KimiK3AttnResKernel:
             raise ValueError(f"add_mode={add_mode} cluster={cluster}")
         if not supports_hidden_size(hidden):
             raise ValueError(f"hidden={hidden} is not supported")
-        if in_place_addend and add_mode != ADD_PREFIX:
-            raise ValueError("the in-place all-reduce addend is an ADD_PREFIX variant")
+        if in_place_addend and add_mode != (ADD_MOE if finish_all_gather else ADD_PREFIX):
+            raise ValueError("an in-place addend is ADD_PREFIX, or ADD_MOE for an all-gather call")
         if finish_world and (not in_place_addend or finish_world not in pushed_ar.WORLD_SIZES):
             raise ValueError(f"cannot finish an in-place addend over {finish_world} ranks")
         if (finish_two_shot or early_poll) and not finish_world:
             raise ValueError("finish_two_shot / early_poll need finish_world")
-        if early_poll and finish_two_shot:
-            raise ValueError("early_poll finishes one-shot calls only")
+        if finish_two_shot and (early_poll or finish_chunk or finish_sanitize or finish_all_gather):
+            raise ValueError("early_poll, sum orders and all-gather calls are one-shot only")
+        if finish_all_gather and not finish_world:
+            raise ValueError("finish_all_gather needs finish_world")
         self.mxfp8 = mxfp8
         self.in_place_addend = in_place_addend
         self.finish_world = finish_world
         self.finish_two_shot = finish_two_shot
         self.early_poll = early_poll
+        self.finish_chunk = finish_chunk or (
+            pushed_ar.reduce_chunk(finish_world, True) if finish_world else 0
+        )
+        self.finish_sanitize = finish_sanitize
+        self.finish_all_gather = finish_all_gather
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -785,43 +797,45 @@ class KimiK3AttnResKernel:
             _griddepcontrol_launch_dependents()
 
         state = None
+        finished = []
+        if cutlass.const_expr(self.finish_world > 0):
+            # This kernel finishes the pushed call: the state is this call's (its producer read it
+            # after its own wait), the previous call's buffer is re-armed while the rows travel.
+            # Threads past the row work on the row's first vector, do not store and use zeros.
+            world = self.finish_world
+            state = pushed_ar.lamport_state(add2_addr)
+            cur, dirty, nbytes, dstages, c0, c1, c2, c3 = state
+            pushed_ar.clear_dirty_stages(
+                add_addr,
+                dirty,
+                nbytes,
+                dstages,
+                c0,
+                c1,
+                c2,
+                c3,
+                bidx * self.threads + tidx,
+                m * (c * self.threads),
+            )
+            off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+            if cutlass.const_expr(self.finish_two_shot):
+                finished = pushed_ar.finish_two_shot_v4(
+                    add_addr, mc_addr, cur, nbytes, token, off, ar_rank, valid, world, hidden
+                )
+            else:
+                acc = pushed_ar.reduce_slots_v4(
+                    pushed_ar.one_shot_slots(add_addr, cur, nbytes, token, world, hidden)
+                    + Int64(off),
+                    hidden * 2,
+                    world,
+                    self.finish_chunk,
+                )
+                finished = pushed_ar.round_sum_v4(acc, self.finish_sanitize)
+            finished = [_selp_b32(valid, w, Int32(0)) for w in finished]
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             pre = unpack(load(layer_addr + row + col, False))
             if cutlass.const_expr(self.finish_world > 0):
-                # This kernel finishes the pushed call: the state is this call's (its producer
-                # read it after its own wait), the previous call's buffer is re-armed while the
-                # rows travel. Threads past the row work on the row's first vector, do not
-                # store and use zeros.
-                world = self.finish_world
-                state = pushed_ar.lamport_state(add2_addr)
-                cur, dirty, nbytes, dstages, c0, c1, c2, c3 = state
-                pushed_ar.clear_dirty_stages(
-                    add_addr,
-                    dirty,
-                    nbytes,
-                    dstages,
-                    c0,
-                    c1,
-                    c2,
-                    c3,
-                    bidx * self.threads + tidx,
-                    m * (c * self.threads),
-                )
-                off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
-                if cutlass.const_expr(self.finish_two_shot):
-                    words = pushed_ar.finish_two_shot_v4(
-                        add_addr, mc_addr, cur, nbytes, token, off, ar_rank, valid, world, hidden
-                    )
-                    addend = unpack([_selp_b32(valid, w, Int32(0)) for w in words])
-                else:
-                    acc = pushed_ar.reduce_slots_v4(
-                        pushed_ar.one_shot_slots(add_addr, cur, nbytes, token, world, hidden)
-                        + Int64(off),
-                        hidden * 2,
-                        world,
-                        pushed_ar.reduce_chunk(world, True),
-                    )
-                    addend = [_selp(valid, _round_bf16(a), _zero_f32()) for a in acc]
+                addend = unpack(finished)
             elif cutlass.const_expr(self.in_place_addend):
                 # Threads past the row poll the row's first vector and use zeros.
                 off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
@@ -832,8 +846,17 @@ class KimiK3AttnResKernel:
             x = [_round_bf16(_add_ftz(pre[e], addend[e])) for e in range(8)]
         elif cutlass.const_expr(self.add_mode == ADD_MOE):
             pre = unpack(load(layer_addr + row + col, False))
-            routed = unpack(load(add_addr + row + col, False))
-            shared = unpack(load(add2_addr + row + col, False))
+            if cutlass.const_expr(self.finish_all_gather):
+                # routed: this token's all-gather row; shared: the finished slot sum.
+                routed_words = pushed_ar.poll_v4(
+                    pushed_ar.all_gather_row(add_addr, cur, nbytes, m, token, world, hidden)
+                    + Int64(off)
+                )
+                routed = unpack([_selp_b32(valid, w, Int32(0)) for w in routed_words])
+                shared = unpack(finished)
+            else:
+                routed = unpack(load(add_addr + row + col, False))
+                shared = unpack(load(add2_addr + row + col, False))
             x = [
                 _round_bf16(_add(pre[e], _round_bf16(_add(routed[e], shared[e])))) for e in range(8)
             ]
@@ -929,6 +952,7 @@ class KimiK3AttnResKernel:
                     self.finish_world,
                     hidden,
                     not self.finish_two_shot,
+                    self.finish_all_gather,
                 )
 
 
@@ -940,14 +964,19 @@ class KimiK3AttnResKernel:
 class AllReduceFinish(NamedTuple):
     """A pushed MNNVL all-reduce the kernel finishes (``finish`` of :func:`run_attn_res`):
     ``world`` ranks, this ``rank``, the workspace's multicast base ``mc_base``, the transport
-    (``two_shot``) and whether the kernel finishes it before its grid wait (``early_poll``,
-    one-shot only)."""
+    (``two_shot``) and whether the kernel finishes it before its grid wait (``early_poll``).
+    One-shot calls may sum ``chunk`` ranks at a time and ``sanitize`` the sum (the order of
+    another C++ transport, 0 / False: their own) and be ``all_gather`` calls (``(routed,
+    shared)`` addends: the all-gather rows and the slot sum)."""
 
     world: int
     rank: int
     mc_base: int
     two_shot: bool
     early_poll: bool
+    chunk: int = 0
+    sanitize: bool = False
+    all_gather: bool = False
 
 
 def cluster_size(num_tokens: int, num_candidates: int) -> int:
@@ -967,6 +996,9 @@ def _compiled(
     finish_world: int = 0,
     finish_two_shot: bool = False,
     early_poll: bool = False,
+    finish_chunk: int = 0,
+    finish_sanitize: bool = False,
+    finish_all_gather: bool = False,
 ):
     kernel = KimiK3AttnResKernel(
         num_candidates,
@@ -978,6 +1010,9 @@ def _compiled(
         finish_world,
         finish_two_shot,
         early_poll,
+        finish_chunk,
+        finish_sanitize,
+        finish_all_gather,
     )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -1080,13 +1115,18 @@ def run_attn_res(
         finish: with ``in_place_addend``, the addend is instead the pushed call whose finish
             was left to this kernel (``distributed.ops.MnnvlPendingResult``): the kernel
             finishes it (see :class:`AllReduceFinish`). It must be the call's only finish, run
-            on every rank before the next all-reduce on the workspace.
+            on every rank before the next all-reduce on the workspace. For an ``all_gather``
+            call the mix is the MoE residual update ``bf16(layer + bf16(routed + shared))``
+            with the call's all-gather rows as ``routed`` and its slot sum as ``shared``.
     """
     if in_place_addend is not None and addends:
         raise ValueError("pass either addends or in_place_addend")
     if finish is not None and in_place_addend is None:
         raise ValueError("finish needs in_place_addend")
-    add_mode = ADD_PREFIX if in_place_addend is not None else len(addends)
+    if in_place_addend is not None:
+        add_mode = ADD_MOE if finish is not None and finish.all_gather else ADD_PREFIX
+    else:
+        add_mode = len(addends)
     num_tokens, hidden = layer.shape
     num_candidates = block.shape[0] + 1
     compiled = _compiled(
@@ -1097,9 +1137,16 @@ def run_attn_res(
         mxfp8_out is not None,
         in_place_addend is not None,
         *(
-            (finish.world, finish.two_shot, finish.early_poll)
+            (
+                finish.world,
+                finish.two_shot,
+                finish.early_poll,
+                finish.chunk,
+                finish.sanitize,
+                finish.all_gather,
+            )
             if finish is not None
-            else (0, False, False)
+            else ()
         ),
     )
     if in_place_addend is not None:

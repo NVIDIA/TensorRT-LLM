@@ -96,7 +96,7 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.seen_all_rank_num_tokens = []
 
     class _MoE:
-        def forward_parts(self, x, all_rank_num_tokens):
+        def forward_parts(self, x, all_rank_num_tokens, column_parallel_tail=False):
             layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
             return torch.tanh(x @ moe_weight), torch.zeros_like(x)
 

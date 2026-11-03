@@ -5927,6 +5927,80 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return (torch.empty_like(residual), torch.empty_like(residual),
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
+    def _kimi_k3_attn_res_moe_finish(residual, uc_local, mc_base, flags, world,
+                                     rank, chunk, sanitize, block, weights,
+                                     rms_eps, out_eps, mxfp8):
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        mxfp8_out = _kimi_k3_attn_res_mxfp8_outputs(residual) if mxfp8 else None
+        kimi_k3_attn_res.run_attn_res(
+            residual, (),
+            block,
+            *weights,
+            rms_eps,
+            out_eps,
+            output,
+            prefix,
+            mxfp8_out=mxfp8_out,
+            in_place_addend=(uc_local, flags.data_ptr()),
+            finish=kimi_k3_attn_res.AllReduceFinish(world,
+                                                    rank,
+                                                    mc_base,
+                                                    False,
+                                                    True,
+                                                    chunk=chunk,
+                                                    sanitize=sanitize,
+                                                    all_gather=True))
+        return (prefix, output) + (tuple(mxfp8_out) if mxfp8 else ())
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_finish_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_finish_rmsnorm(
+            residual: torch.Tensor, uc_local: int, mc_base: int,
+            flags: torch.Tensor, world: int, rank: int, chunk: int,
+            sanitize: bool, block: torch.Tensor, res_weight: torch.Tensor,
+            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``kimi_k3_attn_res_moe_add_rmsnorm`` whose ``(routed, shared)``
+        are a pending all-gather call over ``world`` ranks on the workspace
+        (``uc_local``, ``mc_base``, ``flags``; ``MnnvlPendingResult`` with
+        ``all_gather``): ``routed`` its all-gather rows, ``shared`` its slot
+        sum (``chunk`` ranks at a time, ``sanitize``: ``-0`` as ``+0``). The
+        kernel finishes the call before its grid wait."""
+        return _kimi_k3_attn_res_moe_finish(
+            residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+            block, (res_weight, rms_weight, out_weight), rms_eps, out_eps,
+            False)
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_finish_rmsnorm")
+    def _(residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+          block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+        return torch.empty_like(residual), torch.empty_like(residual)
+
+    @torch.library.custom_op(
+        "trtllm::kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8",
+        mutates_args=(),
+        device_types="cuda")
+    def kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8(
+        residual: torch.Tensor, uc_local: int, mc_base: int,
+        flags: torch.Tensor, world: int, rank: int, chunk: int, sanitize: bool,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``kimi_k3_attn_res_moe_finish_rmsnorm`` plus the MXFP8 form ``(xq,
+        xs)`` of its output (as ``kimi_k3_attn_res_moe_add_rmsnorm_mxfp8``)."""
+        return _kimi_k3_attn_res_moe_finish(
+            residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+            block, (res_weight, rms_weight, out_weight), rms_eps, out_eps, True)
+
+    @torch.library.register_fake(
+        "trtllm::kimi_k3_attn_res_moe_finish_rmsnorm_mxfp8")
+    def _(residual, uc_local, mc_base, flags, world, rank, chunk, sanitize,
+          block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+        return (torch.empty_like(residual), torch.empty_like(residual),
+                *_kimi_k3_attn_res_mxfp8_outputs(residual))
+
     # Ungrouped ``noaux_tc_op`` top-16 + ``moe_sort`` (128-row tiles) of one
     # expert-parallel rank in one launch (``kimi_k3_routing.py``); inputs as
     # ``kimi_k3_routing.can_run`` accepts them.

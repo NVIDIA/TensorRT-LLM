@@ -760,6 +760,101 @@ def test_one_shot_finish_sums_rank_chunks(world):
 
 
 @skip_pre_blackwell
+@pytest.mark.parametrize("world, m", [(4, 3), (16, 2)])
+@pytest.mark.parametrize("cpp_one_shot", [True, False])
+def test_all_gather_call_finish_on_one_gpu(world, m, cpp_one_shot):
+    """An all-gather call finished by the finish kernel (``bf16(y + bf16(sum))``) and by the
+    decode MoE-residual mix, with the sum order of either C++ transport, on one GPU: every
+    rank's slots and the all-gather rows are written into the local buffer."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("needs the CuTe DSL")
+    from tensorrt_llm._torch.distributed.ops import LamportWorkspaceView
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res as attn_res
+    from tensorrt_llm._torch.kernels.blackwell import mnnvl_pushed_allreduce as pushed
+
+    h, k = 7168, 3
+    nbytes = max(pushed.all_gather_call_bytes(m, h, world), 1 << 16)
+    chunk = pushed.reduce_chunk(world, cpp_one_shot)
+    gen = torch.Generator(device="cuda").manual_seed(world + m)
+    slots = (torch.randn(m, world, h, device="cuda", generator=gen) * 0.25).to(torch.bfloat16)
+    bits = slots.view(torch.int16)
+    slots = torch.where(bits == -32768, torch.zeros_like(bits), bits).view(torch.bfloat16)
+    y = (torch.randn(m, h, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    y_bits = y.view(torch.int16)
+    y = torch.where(y_bits == -32768, torch.zeros_like(y_bits), y_bits).view(torch.bfloat16)
+    shared = _finish_reference(slots, chunk)
+    if not cpp_one_shot:
+        shared_bits = shared.view(torch.int16)
+        shared = torch.where(shared_bits == -32768, torch.zeros_like(shared_bits), shared_bits)
+        shared = shared.view(torch.bfloat16)
+    cur = 1
+
+    def workspace():
+        ws = torch.zeros(pushed.NUM_BUFFERS * nbytes, dtype=torch.uint8, device="cuda")
+        buf = ws[cur * nbytes : cur * nbytes + pushed.all_gather_call_bytes(m, h, world)]
+        buf.view(torch.bfloat16).copy_(torch.cat([slots.flatten(), y.flatten()]))
+        flags = torch.tensor(
+            [cur, (cur + 2) % 3, nbytes, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
+        ).view(torch.uint32)
+        view = LamportWorkspaceView(
+            world=world,
+            rank=0,
+            uc_local=ws.data_ptr(),
+            mc_base=0,
+            peer_ptrs=torch.tensor([ws.data_ptr()], dtype=torch.int64, device="cuda"),
+            flags=flags,
+            bytes_per_buffer=nbytes,
+        )
+        return ws, view
+
+    expected_state = [(cur + 1) % 3, cur, nbytes, 1, m * (world + 1) * h * 2, 0, 0, 0, 0]
+    ws, view = workspace()
+    out = pushed.run_finish(
+        view,
+        torch.empty(m, h, device="cuda", dtype=torch.bfloat16),
+        True,
+        all_gather=True,
+        chunk=chunk,
+        sanitize=not cpp_one_shot,
+    )
+    torch.cuda.synchronize()
+    assert _differ(y + shared, out) == 0
+    assert view.flags.cpu().long().tolist() == expected_state
+
+    if not attn_res.is_supported_device(torch.cuda.current_device()):
+        return
+    residual = (torch.randn(m, h, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    block = (torch.randn(k, m, h, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    weights = [
+        (1 + 0.1 * torch.randn(h, device="cuda", generator=gen)).to(torch.bfloat16)
+        for _ in range(3)
+    ]
+    ref_out, ref_upd = torch.empty_like(residual), torch.empty_like(residual)
+    attn_res.run_attn_res(residual, (y, shared), block, *weights, 1e-6, 1e-6, ref_out, ref_upd)
+    ws, view = workspace()
+    got_out, got_upd = torch.empty_like(residual), torch.empty_like(residual)
+    attn_res.run_attn_res(
+        residual,
+        (),
+        block,
+        *weights,
+        1e-6,
+        1e-6,
+        got_out,
+        got_upd,
+        in_place_addend=(view.uc_local, view.flags.data_ptr()),
+        finish=attn_res.AllReduceFinish(
+            world, 0, 0, False, True, chunk=chunk, sanitize=not cpp_one_shot, all_gather=True
+        ),
+    )
+    torch.cuda.synchronize()
+    assert _differ(ref_upd, got_upd) == 0 and _differ(ref_out, got_out) == 0
+    assert view.flags.cpu().long().tolist() == expected_state
+
+
+@skip_pre_blackwell
 @pytest.mark.parametrize("early_poll", [False, True])
 @pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (64, 2)])
 def test_attn_res_finishes_one_shot_call(world, m, early_poll):
@@ -823,6 +918,164 @@ def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     assert state == [(cur + 1) % 3, cur, nbytes, 1, m * world * h * 2, 0, 0, 0, 0]
     rearmed = workspace[dirty * nbytes : dirty * nbytes + 4096].view(torch.int32)
     assert bool((rearmed == -(2**31)).all())
+
+
+def _run_rank_all_gather(world_size):
+    """An all-gather call (the column-parallel MoE tail): the shared partial in the slots and
+    every rank's columns of ``y`` in the all-gather rows, finished into ``bf16(y + all-reduce)``
+    and by the decode MoE-residual mix, against the C++ all-reduce of the partials and the tensor
+    mix; one-shot and two-shot sizes of that all-reduce, eagerly and in a CUDA graph with C++
+    calls on the workspace in between."""
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, MnnvlPendingResult
+    from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm.mapping import Mapping
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    torch.cuda.set_device(rank)
+    try:
+        from torch import nn
+
+        mapping = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        allreduce = AllReduce(
+            mapping=mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.bfloat16
+        )
+        hidden = 7168
+        blocks = hidden // 128
+        first = rank * (blocks // world_size) + min(rank, blocks % world_size)
+        count = blocks // world_size + (rank < blocks % world_size)
+        c0, n = first * 128, count * 128
+        gen = torch.Generator(device="cuda").manual_seed(5)
+        proj = nn.Linear(hidden, 1, bias=False, dtype=torch.bfloat16, device="cuda")
+        proj.weight.data.copy_(torch.randn(1, hidden, device="cuda", generator=gen) * 0.05)
+        norm = kimi.KimiK3RMSNorm(hidden, eps=1e-6, dtype=torch.bfloat16, device="cuda")
+        norm.weight.data.copy_(1 + 0.1 * torch.randn(hidden, device="cuda", generator=gen))
+        out_norm = RMSNorm(hidden_size=hidden, eps=1e-6, dtype=torch.bfloat16).cuda()
+        out_norm.weight.data.copy_(1 + 0.1 * torch.randn(hidden, device="cuda", generator=gen))
+        bad = 0
+
+        def tail(y, shared_partial):
+            target = allreduce.push_target(y.shape[0], hidden, all_gather=True)
+            allreduce.push_input(target, shared_partial)
+            allreduce.push_input(target, y[:, c0 : c0 + n].contiguous(), columns=c0)
+            return allreduce.finish_push(target)
+
+        # 64 rows: the all-reduce of the partials is two-shot at 2 and 4 ranks.
+        for m in (1, 8, 64):
+            for kind in (0, 2):
+                y = _input(m, hidden, 3 * m + kind, 0, kind)  # replicated, as latent_up's output
+                shared_partial = _input(m, hidden, 7 * m + kind, rank, kind)
+                residual = _input(m, hidden, 11 * m, 0)
+                block = _input(4 * m, hidden, 13 * m, 0).view(4, m, hidden)
+                shared = allreduce(shared_partial)
+                ref_sum = y + shared
+                pending = tail(y, shared_partial)
+                assert isinstance(pending, MnnvlPendingResult) and pending.all_gather
+                bad += _differ(ref_sum, pending.materialize())
+                bad += _differ(shared, allreduce(shared_partial))
+                ref = kimi._attn_res_decode_kernel(
+                    residual, (y, shared), block, proj, norm, out_norm, mxfp8=True
+                )
+                if ref is None:  # no decode mix on this device
+                    continue
+                got = kimi._attn_res_decode_kernel(
+                    residual, (tail(y, shared_partial), None), block, proj, norm, out_norm, True
+                )
+                for a, b in zip(ref, got):
+                    bad += _differ(a, b)
+                bad += _differ(shared, allreduce(shared_partial))
+
+        # A CUDA graph: tail call, C++ call, tail call finished by the mix, C++ call.
+        m = 8
+        ys = [_input(m, hidden, 300 + i, 0) for i in range(2)]
+        parts = [_input(m, hidden, 400 + i, rank) for i in range(2)]
+        residual = _input(m, hidden, 500, 0)
+        block = _input(4 * m, hidden, 501, 0).view(4, m, hidden)
+
+        def calls():
+            return [
+                tail(ys[0], parts[0]).materialize(),
+                allreduce(parts[1]),
+                *kimi._attn_res_decode_kernel(
+                    residual, (tail(ys[1], parts[1]), None), block, proj, norm, out_norm
+                ),
+                allreduce(parts[0]),
+            ]
+
+        if kimi._attn_res_decode_kernel(residual, (ys[1], parts[1]), block, proj, norm, out_norm):
+            calls()
+            torch.cuda.synchronize()
+            comm.Barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                results = calls()
+            for rep in range(3):
+                for i in range(2):
+                    parts[i].copy_(_input(m, hidden, 600 + 10 * rep + i, rank))
+                torch.cuda.synchronize()
+                comm.Barrier()
+                graph.replay()
+                torch.cuda.synchronize()
+                s0, s1 = allreduce(parts[0]), allreduce(parts[1])
+                ref = [ys[0] + s0, s1]
+                ref += list(
+                    kimi._attn_res_decode_kernel(residual, (ys[1], s1), block, proj, norm, out_norm)
+                )
+                ref.append(s0)
+                for a, b in zip(ref, results):
+                    bad += _differ(a, b)
+            del graph
+        torch.cuda.synchronize()
+        assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_all_gather_call_matches_replicated_tail(mpi_pool_executor):
+    world_size = mpi_pool_executor.num_workers
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"needs {world_size} GPUs")
+    results = mpi_pool_executor.map(_run_rank_all_gather, *zip(*[(world_size,)] * world_size))
+    for r in results:
+        assert r is True
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("m", [1, 7, 16, 32])
+def test_latent_up_output_rows_match_whole_projection(m):
+    """latent_up's row slice (whole 128-row blocks) projects bitwise like the matching columns
+    of the whole projection, prequantized input, on every rank's slice of 8 and 16 ranks."""
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    hidden, latent = 7168, 3072
+    weight, scale = _weight(hidden, latent, 17)
+    x = _input(m, latent, 19 + m, 0)
+    xq, xs = _mxfp8_operand(x)
+    whole = _Fp8BlockScaleWeightReadLinear(weight, scale, hidden)
+    whole.post_load_weights()
+    if not whole.takes_prequantized_input(m):
+        pytest.skip("latent_up's low-M GEMM does not serve these rows here")
+    ref = whole.forward_prequantized(xq, xs)
+    blocks = hidden // 128
+    for world in (8, 16):
+        for rank in range(world):
+            first = rank * (blocks // world) + min(rank, blocks % world)
+            rows = (first * 128, (blocks // world + (rank < blocks % world)) * 128)
+            part = _Fp8BlockScaleWeightReadLinear(weight, scale, hidden)
+            part.set_output_rows(rows)
+            part.post_load_weights()
+            if not part.serves_output_rows(m):
+                continue
+            got = part.forward_rows_prequantized(xq, xs)
+            torch.cuda.synchronize()
+            assert _differ(ref[:, rows[0] : rows[0] + rows[1]].contiguous(), got) == 0
 
 
 @skip_pre_blackwell

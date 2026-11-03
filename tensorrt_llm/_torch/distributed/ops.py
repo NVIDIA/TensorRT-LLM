@@ -917,7 +917,9 @@ class MnnvlPushTarget:
     completes the all-reduce, bitwise like the C++ MNNVL kernel. With ``in_place`` the result
     stays in the workspace (``MnnvlInPlaceResult``), else it goes to ``output``. With
     ``consumer_finishes`` no finish kernel runs: the consumer finishes the call
-    (``MnnvlPendingResult``).
+    (``MnnvlPendingResult``). An ``all_gather`` call (one-shot, consumer-finished) also carries
+    an all-gather row per token, which every rank fills with its columns of a column-parallel
+    output; its slot sums follow ``sum_chunk`` / ``sanitize_sum`` (``MnnvlPendingResult``).
     """
 
     view: LamportWorkspaceView
@@ -927,6 +929,9 @@ class MnnvlPushTarget:
     in_place: bool
     output: Optional[torch.Tensor]
     consumer_finishes: bool = False
+    all_gather: bool = False
+    sum_chunk: int = 0
+    sanitize_sum: bool = False
 
 
 class MnnvlWorkspaceResult:
@@ -986,27 +991,40 @@ class MnnvlPendingResult(MnnvlWorkspaceResult):
     Either reads the rotation state before waiting for the producer, which releases its
     dependents (PDL) only after its own ``griddepcontrol.wait``; a consumer that also polls the
     slots before its own wait (``early_poll``) may store only after it.
+
+    An ``all_gather`` call stands for ``bf16(y + bf16(slot sum))``, ``y`` its all-gather rows;
+    its slot sums take ``sum_chunk`` ranks at a time and ``sanitize_sum`` replaces ``-0`` by
+    ``+0`` (the C++ all-reduce of the slots at their size; 0 / False: the call's own transport).
     """
 
     view: LamportWorkspaceView
     shape: Tuple[int, int]
     one_shot: bool
+    all_gather: bool = False
+    sum_chunk: int = 0
+    sanitize_sum: bool = False
 
     @property
-    def finish_args(self) -> Tuple[int, int, int, bool]:
-        """``(world, rank, mc_base, two_shot)`` of the call for a consumer that finishes it."""
+    def finish_args(self) -> Tuple[int, int, int, bool, int, bool, bool]:
+        """``(world, rank, mc_base, two_shot, sum_chunk, sanitize_sum, all_gather)`` of the
+        call for a consumer that finishes it."""
         return (self.view.world, self.view.rank, self.view.mc_base,
-                not self.one_shot)
+                not self.one_shot, self.sum_chunk, self.sanitize_sum,
+                self.all_gather)
 
     def materialize(self) -> torch.Tensor:
         """Finish the all-reduce into a BF16 tensor (the finish kernel on the current
-        stream)."""
+        stream); for an ``all_gather`` call ``bf16(y + bf16(slot sum))``."""
         from ..kernels.blackwell import mnnvl_pushed_allreduce
         output = torch.empty(self.shape,
                              dtype=torch.bfloat16,
                              device=self.view.flags.device)
-        return mnnvl_pushed_allreduce.run_finish(self.view, output,
-                                                 self.one_shot)
+        return mnnvl_pushed_allreduce.run_finish(self.view,
+                                                 output,
+                                                 self.one_shot,
+                                                 all_gather=self.all_gather,
+                                                 chunk=self.sum_chunk,
+                                                 sanitize=self.sanitize_sum)
 
 
 class MNNVLAllReduce(nn.Module):
@@ -1441,12 +1459,12 @@ class MNNVLAllReduce(nn.Module):
                     scale=params.scale if quant else None,
                     norm_out=norm_out)
 
-    def push_target(
-            self,
-            num_tokens: int,
-            hidden_dim: int,
-            in_place: bool,
-            consumer_finishes: bool = False) -> Optional[MnnvlPushTarget]:
+    def push_target(self,
+                    num_tokens: int,
+                    hidden_dim: int,
+                    in_place: bool,
+                    consumer_finishes: bool = False,
+                    all_gather: bool = False) -> Optional[MnnvlPushTarget]:
         """See ``AllReduce.push_target``."""
         from ..kernels.blackwell import mnnvl_pushed_allreduce
         world = self.mapping.tp_size
@@ -1454,6 +1472,14 @@ class MNNVLAllReduce(nn.Module):
             return None
         one_shot, need = mnnvl_allreduce_transport(num_tokens, hidden_dim,
                                                    world, self.dtype)
+        sum_chunk, sanitize_sum = 0, False
+        if all_gather:
+            # One-shot slots summed in the order of the C++ call of their size.
+            sum_chunk = mnnvl_pushed_allreduce.reduce_chunk(world, one_shot)
+            sanitize_sum = not one_shot
+            one_shot, consumer_finishes = True, True
+            need = mnnvl_pushed_allreduce.all_gather_call_bytes(
+                num_tokens, hidden_dim, world)
         if need >= 2**32 - 1:
             return None
         workspace = get_or_scale_allreduce_mnnvl_workspace(
@@ -1465,7 +1491,8 @@ class MNNVLAllReduce(nn.Module):
             dtype=self.dtype,
             device=workspace["uc_buffer"].device)
         return MnnvlPushTarget(workspace["push_view"], num_tokens, hidden_dim,
-                               one_shot, in_place, output, consumer_finishes)
+                               one_shot, in_place, output, consumer_finishes,
+                               all_gather, sum_chunk, sanitize_sum)
 
     @staticmethod
     def finish_push(
@@ -1475,7 +1502,8 @@ class MNNVLAllReduce(nn.Module):
         if target.consumer_finishes:
             return MnnvlPendingResult(target.view,
                                       (target.num_tokens, target.hidden_dim),
-                                      target.one_shot)
+                                      target.one_shot, target.all_gather,
+                                      target.sum_chunk, target.sanitize_sum)
         if target.in_place:
             mnnvl_pushed_allreduce.run_finish_in_place(target.view,
                                                        target.num_tokens,
@@ -1671,6 +1699,7 @@ class AllReduce(nn.Module):
         in_place: bool = False,
         all_reduce_params: Optional[AllReduceParams] = None,
         consumer_finishes: bool = False,
+        all_gather: bool = False,
     ) -> Optional[MnnvlPushTarget]:
         """The MNNVL all-reduce of a BF16 ``[num_tokens, hidden_dim]`` input as a target a
         producer kernel pushes its output into (the FP8 block-scale low-M GEMM's push epilogue),
@@ -1683,7 +1712,10 @@ class AllReduce(nn.Module):
         transport; ``in_place`` asks for the result in the workspace (``MnnvlInPlaceResult``),
         which the two-shot transport (above the one-shot size threshold) leaves there.
         ``consumer_finishes`` leaves the finish itself to the consumer of the result, with
-        either transport (``MnnvlPendingResult``).
+        either transport (``MnnvlPendingResult``). ``all_gather``: a consumer-finished one-shot
+        call that also carries all-gather rows (``push_input`` with ``columns``), standing for
+        the column-parallel output plus this all-reduce, summed as the C++ all-reduce of the
+        slots at their size would sum them.
         """
         if all_reduce_params is not None and (
                 not all_reduce_params.enable_allreduce
@@ -1695,7 +1727,8 @@ class AllReduce(nn.Module):
                 or hidden_dim % 8 or torch.compiler.is_compiling()):
             return None
         return self.mnnvl_allreduce.push_target(num_tokens, hidden_dim,
-                                                in_place, consumer_finishes)
+                                                in_place, consumer_finishes,
+                                                all_gather)
 
     def mnnvl_runs_fusion(self, fusion_op: AllReduceFusionOp) -> bool:
         """Whether ``forward`` runs ``fusion_op`` on the MNNVL kernels, the only strategy that
@@ -1708,11 +1741,20 @@ class AllReduce(nn.Module):
                 and fusion_op in MNNVLAllReduce.SUPPORTED_FUSION_OPS)
 
     @staticmethod
-    def push_input(target: MnnvlPushTarget, input: torch.Tensor) -> None:
+    def push_input(target: MnnvlPushTarget,
+                   input: torch.Tensor,
+                   columns: Optional[int] = None) -> None:
         """Push the contiguous BF16 ``input`` into ``target`` with a copy kernel, for a producer
-        without a push epilogue; the copy kernel is then the producer ``finish_push`` follows."""
+        without a push epilogue; the copy kernel is then the producer ``finish_push`` follows.
+        ``columns`` (``all_gather`` target): ``input`` is ``[num_tokens, n]``, this rank's
+        columns ``columns .. columns + n`` of the all-gather rows."""
         from ..kernels.blackwell import mnnvl_pushed_allreduce
-        mnnvl_pushed_allreduce.run_push(target.view, input, target.one_shot)
+        mnnvl_pushed_allreduce.run_push(target.view,
+                                        input,
+                                        target.one_shot,
+                                        all_gather=target.all_gather,
+                                        columns=None if columns is None else
+                                        (columns, target.hidden_dim))
 
     def finish_push(
         self, target: MnnvlPushTarget

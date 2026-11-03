@@ -9,6 +9,7 @@ gives the same prefix and normalized mix, bit for bit, as materializing it first
 """
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -115,10 +116,14 @@ class _PlainKdaMixer:
         return (h.float() * 0.75).to(torch.bfloat16)
 
 
+# Attention metadata of a generation-only batch (the decoder asks it for the MoE tail).
+_GENERATION = SimpleNamespace(num_contexts=0)
+
+
 class _FakeMoE(nn.Module):
     """Stands in for ``KimiK3MoERuntime``: routed/shared outputs derived from the input."""
 
-    def forward_parts(self, hidden_states, all_rank_num_tokens=None):
+    def forward_parts(self, hidden_states, all_rank_num_tokens=None, column_parallel_tail=False):
         routed = (hidden_states.float() * 0.5).to(torch.bfloat16)
         shared = (hidden_states.float() * -0.25).to(torch.bfloat16)
         return routed, shared
@@ -160,7 +165,7 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
     def run(defer: bool):
         h, snaps = hidden, 3
         for layer in layers:
-            h, snaps = layer(h, bank, snaps, None, defer_moe_residual=defer)
+            h, snaps = layer(h, bank, snaps, _GENERATION, defer_moe_residual=defer)
         return h
 
     deferred = run(defer=True)

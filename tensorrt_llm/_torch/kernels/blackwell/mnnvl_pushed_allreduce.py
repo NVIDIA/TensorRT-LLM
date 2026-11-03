@@ -48,6 +48,12 @@ them), re-arms the previous call's buffer with :func:`clear_dirty_stages` and co
 finish kernel's, so the consumer reads the bits the finish kernel would have stored.
 :class:`PushedAllReduceCopyKernel` pushes a tensor for a producer without a push epilogue.
 
+An all-gather call (one-shot) carries, after its ``W`` slots per row, one all-gather row per token
+(:func:`all_gather_row`) into which every rank multicasts its columns of a column-parallel
+output ``y``; its finish gives ``bf16(y + bf16(slot sum))``. The slot sums may follow the order
+of another C++ transport (``chunk``; ``sanitize``: ``-0`` replaced by ``+0`` as the two-shot
+kernel does), so the call reproduces the C++ all-reduce of the slots at their size.
+
 Ordering: the producer reads the rotation state after its own ``griddepcontrol.wait`` and
 releases its dependent (the finish kernel) only after that wait; the finish kernel's workers then
 read the state and poll without waiting for the producer, and only its updater CTA waits for the
@@ -469,6 +475,45 @@ def reduce_slots_v4(base: Int64, slot_bytes: int, world: int, chunk: int):
 
 
 @cute.jit
+def all_gather_row(
+    base: Int64, cur: Int32, nbytes: Int32, m: Int32, tok: Int32, world: int, hidden: int
+):
+    """Address of token ``tok``'s all-gather row in buffer ``cur`` of an all-gather call of ``m``
+    rows (after the ``m * world`` one-shot slots); ``base``: unicast or multicast base."""
+    return _stage_addr(base, cur, Int32(0), 1, nbytes) + Int64(m * world + tok) * (hidden * 2)
+
+
+@cute.jit
+def poll_v4(addr: Int64):
+    """16 bytes of a Lamport buffer, polled until they arrived."""
+    w = ld_volatile_v4(addr)
+    while arrived_v4(*w) == 0:
+        w = ld_volatile_v4(addr)
+    return w
+
+
+@cute.jit
+def add_bf16x8(a, b):
+    """``bf16(a + b)`` of two vectors of eight BF16 values (four packed words each), FP32
+    round-to-nearest add, as PyTorch adds two BF16 tensors."""
+    out = []
+    for q in cutlass.range_constexpr(4):
+        lo, hi = _acc_bf16x2(a[q], cutlass.Float32(0.0), cutlass.Float32(0.0))
+        lo, hi = _acc_bf16x2(b[q], lo, hi)
+        out.append(_pack_bf16x2(lo, hi))
+    return out
+
+
+@cute.jit
+def round_sum_v4(acc, sanitize: bool):
+    """The BF16 words of the FP32 slot sum ``acc`` (``sanitize``: ``-0`` replaced by ``+0``)."""
+    words = [_pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)]
+    if cutlass.const_expr(sanitize):
+        words = [_sanitize_bf16x2(w) for w in words]
+    return words
+
+
+@cute.jit
 def one_shot_slots(uc_local: Int64, cur: Int32, nbytes: Int32, tok: Int32, world: int, hidden: int):
     """Address of rank 0's slot of token ``tok`` in buffer ``cur`` of a one-shot call (the slots
     of the other ranks follow, ``hidden * 2`` bytes apart)."""
@@ -504,12 +549,20 @@ def clear_dirty_stages(
 
 @cute.jit
 def _write_next_state(
-    flags: Int64, cur: Int32, nbytes: Int32, m: Int32, world: int, hidden: int, one_shot: bool
+    flags: Int64,
+    cur: Int32,
+    nbytes: Int32,
+    m: Int32,
+    world: int,
+    hidden: int,
+    one_shot: bool,
+    all_gather: bool = False,
 ):
     """The state after a call of ``m`` rows in buffer ``cur``: the next buffer is current, ``cur``
-    dirty with the stages and bytes the transport used (``LamportFlags::waitAndUpdate``)."""
+    dirty with the stages and bytes the transport used (``LamportFlags::waitAndUpdate``; an
+    all-gather call also its all-gather rows)."""
     row_bytes = hidden * 2
-    clear0 = m * (world * row_bytes)
+    clear0 = m * ((world + (1 if all_gather else 0)) * row_bytes)
     clear1 = Int32(0)
     if cutlass.const_expr(not one_shot):
         clear0 = ((m + (world - 1)) // world) * (world * row_bytes)
@@ -528,6 +581,7 @@ def arrive_finish(
     world: int,
     hidden: int,
     one_shot: bool,
+    all_gather: bool = False,
 ):
     """Count one CTA of a consumer grid of ``total`` CTAs that finishes a call of ``m`` rows (one
     thread per CTA, once every thread of the CTA has read the state and the call's producer has
@@ -536,7 +590,7 @@ def arrive_finish(
     arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
     old = _atom_add_acq_rel_u32(arrivals, Int32(1))
     if old == total - 1:
-        _write_next_state(flags, cur, nbytes, m, world, hidden, one_shot)
+        _write_next_state(flags, cur, nbytes, m, world, hidden, one_shot, all_gather)
         _st_u32(arrivals, Int32(0))
 
 
@@ -635,23 +689,39 @@ class PushedAllReduceFinishKernel:
     eight ranks above eight ranks and stores the rounded sum as is; the two-shot kernel sums up to
     sixteen ranks in one chunk and replaces ``-0`` by ``+0`` (its result passes through a Lamport
     buffer). ``gather=False`` (two-shot only) leaves the result in the broadcast stages.
+    ``all_gather`` (one-shot): the call carries all-gather rows ``y`` and the kernel stores
+    ``bf16(y + bf16(sum))``, the sums ``chunk`` ranks at a time (``sanitize``: ``-0`` as ``+0``).
     """
 
-    def __init__(self, world: int, hidden: int, one_shot: bool, gather: bool, use_pdl: bool):
+    def __init__(
+        self,
+        world: int,
+        hidden: int,
+        one_shot: bool,
+        gather: bool,
+        use_pdl: bool,
+        all_gather: bool = False,
+        chunk: int = 0,
+        sanitize: bool = False,
+    ):
         if hidden % 8:
             raise ValueError(f"hidden={hidden} must be a multiple of 8")
         if world not in WORLD_SIZES:
             raise ValueError(f"world={world} is not one of {WORLD_SIZES}")
         if not gather and one_shot:
             raise ValueError("only the two-shot transport leaves its result in the workspace")
+        if (all_gather or chunk or sanitize) and not one_shot:
+            raise ValueError("all-gather calls and sum orders of another transport are one-shot")
         self.W = world
         self.H = hidden
         self.one_shot = one_shot
         self.gather = gather
         self.use_pdl = use_pdl
+        self.all_gather = all_gather
+        self.sanitize = sanitize
         self.vecs = hidden // 8
         self.cols = _ceil_div(self.vecs, THREADS)
-        self.chunk = reduce_chunk(world, one_shot)
+        self.chunk = chunk or reduce_chunk(world, one_shot)
 
     @cute.jit
     def __call__(
@@ -690,7 +760,7 @@ class PushedAllReduceFinishKernel:
                 arrived = _ld_acquire_u32(arrivals)
                 while arrived < workers:
                     arrived = _ld_acquire_u32(arrivals)
-                _write_next_state(flags, cur, nbytes, m, W, H, self.one_shot)
+                _write_next_state(flags, cur, nbytes, m, W, H, self.one_shot, self.all_gather)
                 _st_u32(arrivals, Int32(0))
         else:
             tok = bidx // self.cols
@@ -711,7 +781,13 @@ class PushedAllReduceFinishKernel:
                     acc = reduce_slots_v4(
                         buf + Int64(tok * W * H + v * 8) * 2, row_bytes, W, self.chunk
                     )
-                    st_v4(out_v, *[_pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)])
+                    words = round_sum_v4(acc, self.sanitize)
+                    if cutlass.const_expr(self.all_gather):
+                        y = poll_v4(
+                            all_gather_row(uc_local, cur, nbytes, m, tok, W, H) + Int64(v * 16)
+                        )
+                        words = add_bf16x8(y, words)
+                    st_v4(out_v, *words)
             else:
                 if v < self.vecs:
                     if tok % W == rank:
@@ -787,19 +863,24 @@ class PushedAllReduceGatherKernel:
 class PushedAllReduceCopyKernel:
     """Push a BF16 ``[m, hidden]`` tensor into the slots of the next call on the workspace: the
     producer side of a pushed all-reduce for an output that no kernel epilogue pushes. Grid
-    ``(m, ceil(hidden / 8 / 128))``; like the push epilogues it waits for its predecessor (which
-    wrote the tensor), releases its dependent right after that wait and then reads the state."""
+    ``(m, ceil(width / 8 / 128))``; like the push epilogues it waits for its predecessor (which
+    wrote the tensor), releases its dependent right after that wait and then reads the state.
+    ``columns > 0`` (one-shot): the tensor is ``[m, columns]``, columns ``col0 ..`` of a
+    column-parallel output, multicast into the all-gather rows of an all-gather call."""
 
-    def __init__(self, world: int, hidden: int, one_shot: bool, use_pdl: bool):
-        if hidden % 8:
-            raise ValueError(f"hidden={hidden} must be a multiple of 8")
+    def __init__(self, world: int, hidden: int, one_shot: bool, use_pdl: bool, columns: int = 0):
+        if hidden % 8 or columns % 8:
+            raise ValueError(f"hidden={hidden} and columns={columns} must be multiples of 8")
         if world not in WORLD_SIZES:
             raise ValueError(f"world={world} is not one of {WORLD_SIZES}")
+        if columns and not one_shot:
+            raise ValueError("all-gather rows travel with the one-shot transport")
         self.W = world
         self.H = hidden
         self.one_shot = one_shot
         self.use_pdl = use_pdl
-        self.vecs = hidden // 8
+        self.columns = columns
+        self.vecs = (columns or hidden) // 8
         self.cols = _ceil_div(self.vecs, THREADS)
 
     @cute.jit
@@ -811,15 +892,23 @@ class PushedAllReduceCopyKernel:
         inp: Int64,
         m: Int32,
         rank: Int32,
+        col0: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(peer_ptrs, mc_base, flags, inp, m, rank).launch(
+        self.kernel(peer_ptrs, mc_base, flags, inp, m, rank, col0).launch(
             grid=(m, self.cols, 1), block=(THREADS, 1, 1), stream=stream, use_pdl=self.use_pdl
         )
 
     @cute.kernel
     def kernel(
-        self, peer_ptrs: Int64, mc_base: Int64, flags: Int64, inp: Int64, m: Int32, rank: Int32
+        self,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        inp: Int64,
+        m: Int32,
+        rank: Int32,
+        col0: Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         tok, by, _ = cute.arch.block_idx()
@@ -829,11 +918,19 @@ class PushedAllReduceCopyKernel:
             griddepcontrol_launch_dependents()
         cur, _, nbytes, _, _, _, _, _ = lamport_state(flags)
         if v < self.vecs:
-            w = _ld_v4(inp + Int64(tok * self.H + v * 8) * 2)
-            addr = push_slot(
-                peer_ptrs, mc_base, cur, nbytes, tok, rank, v * 8, self.W, self.H, self.one_shot
-            )
-            push_v4(addr, *w, self.one_shot)
+            if cutlass.const_expr(self.columns > 0):
+                w = _ld_v4(inp + Int64(tok * self.columns + v * 8) * 2)
+                addr = (
+                    all_gather_row(mc_base, cur, nbytes, m, tok, self.W, self.H)
+                    + Int64(col0 + v * 8) * 2
+                )
+                push_v4(addr, *w, True)
+            else:
+                w = _ld_v4(inp + Int64(tok * self.H + v * 8) * 2)
+                addr = push_slot(
+                    peer_ptrs, mc_base, cur, nbytes, tok, rank, v * 8, self.W, self.H, self.one_shot
+                )
+                push_v4(addr, *w, self.one_shot)
 
 
 # ---------------------------------------------------------------------------
@@ -841,17 +938,32 @@ class PushedAllReduceCopyKernel:
 # ---------------------------------------------------------------------------
 
 
+def all_gather_call_bytes(num_tokens: int, hidden: int, world: int) -> int:
+    """Bytes of one Lamport buffer an all-gather call of ``[num_tokens, hidden]`` uses: the
+    one-shot slots of every rank and the all-gather rows."""
+    return num_tokens * hidden * (world + 1) * 2
+
+
 def check_transport(
-    view: LamportWorkspaceView, num_tokens: int, hidden: int, one_shot: bool
+    view: LamportWorkspaceView,
+    num_tokens: int,
+    hidden: int,
+    one_shot: bool,
+    all_gather: bool = False,
 ) -> None:
     """Raise unless a pushed BF16 ``[num_tokens, hidden]`` call on ``view`` with the ``one_shot``
     (else two-shot) transport is the call the C++ MNNVL all-reduce makes
-    (``ops.mnnvl_allreduce_transport``) and fits the workspace."""
+    (``ops.mnnvl_allreduce_transport``; an ``all_gather`` call is one-shot at every size) and
+    fits the workspace."""
     from ...distributed.ops import mnnvl_allreduce_transport
 
     if hidden % 8:
         raise ValueError(f"hidden={hidden} must be a multiple of 8")
     cpp_one_shot, need = mnnvl_allreduce_transport(num_tokens, hidden, view.world, torch.bfloat16)
+    if all_gather:
+        if not one_shot:
+            raise ValueError("all-gather calls are one-shot")
+        cpp_one_shot, need = True, all_gather_call_bytes(num_tokens, hidden, view.world)
     if one_shot != cpp_one_shot:
         raise ValueError(
             f"{num_tokens} x {hidden} on {view.world} ranks takes the "
@@ -869,8 +981,19 @@ def _stream() -> cuda.CUstream:
 
 
 @functools.cache
-def _compiled_finish(world: int, hidden: int, one_shot: bool, gather: bool, use_pdl: bool):
-    kernel = PushedAllReduceFinishKernel(world, hidden, one_shot, gather, use_pdl)
+def _compiled_finish(
+    world: int,
+    hidden: int,
+    one_shot: bool,
+    gather: bool,
+    use_pdl: bool,
+    all_gather: bool = False,
+    chunk: int = 0,
+    sanitize: bool = False,
+):
+    kernel = PushedAllReduceFinishKernel(
+        world, hidden, one_shot, gather, use_pdl, all_gather, chunk, sanitize
+    )
     a = Int64(1 << 20)
     return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), _stream())
 
@@ -883,26 +1006,37 @@ def _compiled_gather(hidden: int, use_pdl: bool):
 
 
 @functools.cache
-def _compiled_push(world: int, hidden: int, one_shot: bool, use_pdl: bool):
-    kernel = PushedAllReduceCopyKernel(world, hidden, one_shot, use_pdl)
+def _compiled_push(world: int, hidden: int, one_shot: bool, use_pdl: bool, columns: int = 0):
+    kernel = PushedAllReduceCopyKernel(world, hidden, one_shot, use_pdl, columns)
     a = Int64(1 << 20)
-    return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), _stream())
+    return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), Int32(0), _stream())
 
 
 def run_push(
-    view: LamportWorkspaceView, inp: torch.Tensor, one_shot: bool, use_pdl: bool = True
+    view: LamportWorkspaceView,
+    inp: torch.Tensor,
+    one_shot: bool,
+    use_pdl: bool = True,
+    all_gather: bool = False,
+    columns: tuple[int, int] | None = None,
 ) -> None:
     """Push ``inp`` (contiguous BF16 ``[m, hidden]``) into the slots of the next call on
-    ``view`` with the ``one_shot`` (else two-shot) transport, as a push epilogue would."""
-    m, hidden = inp.shape
-    check_transport(view, m, hidden, one_shot)
-    _compiled_push(view.world, hidden, one_shot, use_pdl)(
+    ``view`` with the ``one_shot`` (else two-shot) transport, as a push epilogue would
+    (``all_gather``: the call carries all-gather rows). ``columns = (col0, hidden)``: ``inp`` is
+    ``[m, n]``, columns ``col0 .. col0 + n`` of the all-gather call's rows of ``hidden``."""
+    m, n = inp.shape
+    col0, hidden = columns if columns is not None else (0, n)
+    if columns is not None and (not all_gather or col0 % 8 or col0 + n > hidden):
+        raise ValueError(f"columns [{col0}, {col0 + n}) of {hidden} need an all-gather call")
+    check_transport(view, m, hidden, one_shot, all_gather)
+    _compiled_push(view.world, hidden, one_shot, use_pdl, n if columns is not None else 0)(
         Int64(view.peer_ptrs.data_ptr()),
         Int64(view.mc_base),
         Int64(view.flags.data_ptr()),
         Int64(inp.data_ptr()),
         Int32(m),
         Int32(view.rank),
+        Int32(col0),
         _stream(),
     )
 
@@ -912,12 +1046,18 @@ def run_finish(
     out: torch.Tensor,
     one_shot: bool,
     use_pdl: bool = True,
+    all_gather: bool = False,
+    chunk: int = 0,
+    sanitize: bool = False,
 ) -> torch.Tensor:
     """Complete the all-reduce whose input every rank pushed with the ``one_shot`` (else
-    two-shot) transport into ``out`` (contiguous BF16 ``[m, hidden]``); returns ``out``."""
+    two-shot) transport into ``out`` (contiguous BF16 ``[m, hidden]``); returns ``out``.
+    ``all_gather`` (one-shot): ``out = bf16(y + bf16(sum))`` with ``y`` the all-gather rows;
+    ``chunk`` / ``sanitize``: the sum order of another transport (see
+    :class:`PushedAllReduceFinishKernel`)."""
     m, hidden = out.shape
-    check_transport(view, m, hidden, one_shot)
-    _compiled_finish(view.world, hidden, one_shot, True, use_pdl)(
+    check_transport(view, m, hidden, one_shot, all_gather)
+    _compiled_finish(view.world, hidden, one_shot, True, use_pdl, all_gather, chunk, sanitize)(
         Int64(view.uc_local),
         Int64(view.mc_base),
         Int64(view.flags.data_ptr()),
@@ -966,6 +1106,9 @@ __all__ = [
     "PushedAllReduceCopyKernel",
     "PushedAllReduceFinishKernel",
     "PushedAllReduceGatherKernel",
+    "add_bf16x8",
+    "all_gather_call_bytes",
+    "all_gather_row",
     "arrive_finish",
     "arrived_v4",
     "check_transport",
@@ -975,10 +1118,12 @@ __all__ = [
     "ld_volatile_v4",
     "one_shot_slots",
     "poll_result_v4",
+    "poll_v4",
     "push_slot",
     "push_v4",
     "reduce_chunk",
     "reduce_slots_v4",
+    "round_sum_v4",
     "run_finish",
     "run_finish_in_place",
     "run_gather",
