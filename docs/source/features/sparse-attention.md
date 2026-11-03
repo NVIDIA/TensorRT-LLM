@@ -280,6 +280,15 @@ enable_chunked_prefill: false
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
 
+RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
+cache manager (the default), each KV cache page also stores the KT rows of its
+own tokens, so the KV cache memory budget covers the KT cache and
+`tokens_per_block` must be a multiple of `page_size`. The Vanilla
+implementation keeps each sequence in a single cache block, so it sets
+`tokens_per_block` to `max_num_tokens`, which must then be a multiple of
+`page_size` with the V2 manager. Set `use_kv_cache_manager_v2=False` to use the
+V1 manager.
+
 #### DeepSeek Sparse Attention
 
 DeepSeek Sparse Attention (DSA) is a model-native mechanism introduced by
