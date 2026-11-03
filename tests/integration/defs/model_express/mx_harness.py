@@ -819,6 +819,74 @@ def assert_weight_manifests(
             )
 
 
+ROUTED_EXPERT_SUFFIXES = (".w3_w1_weight", ".w2_weight")
+
+
+def assert_moe_partition(
+    case: MxE2ECase,
+    manifests: Mapping[ManifestKey, WeightManifest],
+    model_path: Path,
+    roles: Sequence[str] = ROLES,
+) -> None:
+    """Check from the final manifests that every rank realized the row's MoE partition.
+
+    The output and manifest comparisons hold for any partition that all roles
+    share, so a MoE row whose `moe_ep_size` never reached the model would still
+    pass them. With MoE EP size `ep` and MoE TP size `tp_size // ep`, each rank
+    holds `num_experts // ep` routed experts; `w3_w1_weight` stacks
+    `2 * moe_intermediate_size // (tp_size // ep)` rows of `hidden_size`, and
+    `w2_weight` holds `moe_intermediate_size // (tp_size // ep)` columns. A
+    checkpoint without `num_experts` whose manifests hold no routed-expert
+    tensors is dense and needs no check.
+    """
+    roles = _validated_roles(roles)
+    realized = {
+        (role, rank): {
+            fqn: entry.shape
+            for fqn, entry in manifests[("final", role, rank)].entries_by_fqn().items()
+            if fqn.endswith(ROUTED_EXPERT_SUFFIXES)
+        }
+        for role in roles
+        for rank in range(case.tp_size)
+    }
+    config = json.loads((model_path / "config.json").read_text())
+    if "num_experts" not in config:
+        assert not any(realized.values()), (
+            "The final manifests hold routed-expert tensors, but the checkpoint config has no "
+            "`num_experts`; teach `assert_moe_partition` this MoE config"
+        )
+        return
+
+    assert case.moe_ep_size >= 1 and case.tp_size % case.moe_ep_size == 0, (
+        f"MoE EP size {case.moe_ep_size} does not divide TP size {case.tp_size}"
+    )
+    moe_tp_size = case.tp_size // case.moe_ep_size
+    num_experts = config["num_experts"]
+    intermediate_size = config["moe_intermediate_size"]
+    assert num_experts % case.moe_ep_size == 0 and intermediate_size % moe_tp_size == 0, (
+        f"MoE EP {case.moe_ep_size} x MoE TP {moe_tp_size} does not divide {num_experts} experts "
+        f"of intermediate size {intermediate_size}"
+    )
+    local_experts = num_experts // case.moe_ep_size
+    local_intermediate = intermediate_size // moe_tp_size
+    hidden_size = config["hidden_size"]
+    expected_shapes = {
+        ".w3_w1_weight": (local_experts, 2 * local_intermediate, hidden_size),
+        ".w2_weight": (local_experts, hidden_size, local_intermediate),
+    }
+    for (role, rank), shapes in realized.items():
+        for suffix, expected_shape in expected_shapes.items():
+            found = {fqn: shape for fqn, shape in shapes.items() if fqn.endswith(suffix)}
+            assert found, (
+                f"{role} rank {rank}: the final manifest holds no routed-expert `{suffix[1:]}` tensor"
+            )
+            wrong = sorted(fqn for fqn, shape in found.items() if shape != expected_shape)
+            assert not wrong, (
+                f"{role} rank {rank} did not realize MoE EP {case.moe_ep_size} x MoE TP "
+                f"{moe_tp_size}: `{wrong[0]}` has shape {found[wrong[0]]}, expected {expected_shape}"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Artifacts and timing
 # --------------------------------------------------------------------------- #
