@@ -36,6 +36,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
 from tensorrt_llm._torch.modules.dwdp.dense.manager import (
     STANDALONE_GROUP_TAG,
     DenseDwdpManager,
+    StandaloneTransfer,
     get_global_dense_dwdp_manager,
     standalone_group,
 )
@@ -242,43 +243,39 @@ def test_an_attached_dense_manager_takes_no_config() -> None:
 @pytest.mark.parametrize(
     "kernel, env, expected",
     [
-        ("tma", None, "tma"),
-        ("register", "tma", "register"),
-        (None, "tma", "tma"),
-        (None, None, None),
+        ("tma", None, True),
+        ("register", "tma", False),
+        (None, "tma", True),
+        (None, None, False),
     ],
     ids=["config", "config-over-env", "env-only", "unset"],
 )
-def test_a_standalone_gather_selects_its_kernel_before_setup(
+def test_a_standalone_gather_sets_up_with_its_kernel(
     monkeypatch: pytest.MonkeyPatch,
     gather_blocks: int,
     kernel: str | None,
     env: str | None,
-    expected: str | None,
+    expected: bool,
 ) -> None:
-    """``gather_kernel`` reaches the launcher before ``setup_dense_dwdp``, whose gathers are the
-    launcher's first."""
-    monkeypatch.setenv("TRTLLM_DWDP_GATHER_KERNEL", "")
-    monkeypatch.delenv("TRTLLM_DWDP_GATHER_KERNEL")
+    """The transfer standalone setup builds runs the kernel ``gather_kernel`` picks (the
+    deprecated environment variable while it is unset); the environment stays as it was."""
+    monkeypatch.delenv("TRTLLM_DWDP_GATHER_KERNEL", raising=False)
     if env is not None:
         monkeypatch.setenv("TRTLLM_DWDP_GATHER_KERNEL", env)
     seen = []
 
-    def setup_dense_dwdp(*args: object, **kwargs: object) -> None:
-        seen.append(os.environ.get("TRTLLM_DWDP_GATHER_KERNEL"))
+    def setup_dense_dwdp(
+        model: nn.Module, transfer: StandaloneTransfer, *args: object, **kwargs: object
+    ) -> None:
+        seen.append((transfer.use_gather, transfer.use_tma))
 
     monkeypatch.setattr(dense_manager, "refuse_dense_dwdp_without_roots", lambda model: None)
     monkeypatch.setattr(dense_manager, "setup_dense_dwdp", setup_dense_dwdp)
     config = DenseConfig(enabled=True, copy="gather", gather_kernel=kernel)
-    transfer = SimpleNamespace(use_gather=True, use_batched_prefetch=False)
     with _standalone_manager("gather") as manager:
-        assert (
-            manager.setup(
-                nn.Module(), comm=MagicMock(), transfer=transfer, config=config, device_id=0
-            )
-            is None
-        )
-    assert seen == [expected]
+        assert manager.setup(nn.Module(), comm=MagicMock(), config=config, device_id=0) is None
+    assert seen == [(True, expected)]
+    assert os.environ.get("TRTLLM_DWDP_GATHER_KERNEL") == env
 
 
 def test_a_standalone_setup_refuses_a_model_without_dense_roots_before_its_group(

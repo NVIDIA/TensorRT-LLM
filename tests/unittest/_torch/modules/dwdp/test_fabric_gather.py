@@ -161,41 +161,45 @@ def test_sm_reserve_shrinks_supported_grids_only(full, cluster_size, reserve, ex
 _KERNEL_ENV = "TRTLLM_DWDP_GATHER_KERNEL"
 
 
-def _unset_kernel_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset the kernel variable, and restore it afterwards: ``select_kernel`` writes
-    ``os.environ`` directly, and ``monkeypatch.delenv`` records nothing for an unset variable."""
-    monkeypatch.setenv(_KERNEL_ENV, "")
-    monkeypatch.delenv(_KERNEL_ENV)
-
-
 @pytest.mark.parametrize(
     "kernel, env, expected, warned",
     [
-        ("tma", None, "tma", None),
-        ("register", "register", "register", None),
-        ("register", "tma", "register", "overrides TRTLLM_DWDP_GATHER_KERNEL='tma'"),
-        (None, "tma", "tma", "is deprecated; set dwdp_config.gather_kernel"),
-        (None, None, None, None),
+        ("tma", None, True, None),
+        ("register", "register", False, None),
+        ("register", "tma", False, "overrides TRTLLM_DWDP_GATHER_KERNEL='tma'"),
+        ("tma", "register", True, "overrides TRTLLM_DWDP_GATHER_KERNEL='register'"),
+        (None, "tma", True, "is deprecated; set dwdp_config.gather_kernel"),
+        (None, "register", False, "is deprecated; set dwdp_config.gather_kernel"),
+        (None, None, False, None),
     ],
-    ids=["config", "same-value", "config-over-env", "env-only", "unset"],
+    ids=[
+        "config",
+        "same-value",
+        "register-over-env",
+        "tma-over-env",
+        "env-tma",
+        "env-register",
+        "unset",
+    ],
 )
-def test_select_kernel_points_the_launcher_at_the_config(
+def test_use_tma_takes_the_config_then_the_environment(
     monkeypatch: pytest.MonkeyPatch,
     kernel: str | None,
     env: str | None,
-    expected: str | None,
+    expected: bool,
     warned: str | None,
 ) -> None:
-    """The configured kernel wins over the environment; the environment alone still applies."""
-    _unset_kernel_env(monkeypatch)
+    """The configured kernel wins over the environment, which alone still applies; the
+    environment is read, never written."""
+    monkeypatch.delenv(_KERNEL_ENV, raising=False)
     if env is not None:
         monkeypatch.setenv(_KERNEL_ENV, env)
     warnings = []
     monkeypatch.setattr(fabric_gather.logger, "warning", warnings.append)
 
-    fabric_gather.select_kernel(kernel)
+    assert fabric_gather.use_tma(kernel) is expected
 
-    assert os.environ.get(_KERNEL_ENV) == expected
+    assert os.environ.get(_KERNEL_ENV) == env
     if warned is None:
         assert warnings == []
     else:

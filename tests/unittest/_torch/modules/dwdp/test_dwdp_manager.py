@@ -392,15 +392,15 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
                 DwdpManager(config=config, dist=MagicMock(spec=MPIDist), mapping=_make_mapping())
         mock_comm_world.Create_group.assert_not_called()
 
-    def test_the_gather_kernel_is_selected_before_the_first_prefetch(
-        self, mock_comm_world: MagicMock, _rank: MagicMock, _setup: MagicMock
+    def test_the_gather_kernel_reaches_the_expert_setup(
+        self, mock_comm_world: MagicMock, _rank: MagicMock, mock_setup: MagicMock
     ) -> None:
-        """With the gather, gather_kernel reaches fabric_gather.select_kernel when the manager is
-        built, before any prefetch; TRTLLM_DWDP_PREFETCH_GATHER without copy_mode is reported as
-        deprecated."""
+        """With the gather, the manager resolves gather_kernel once (``fabric_gather.use_tma``)
+        and hands the result to the expert setup, whose weight manager passes it to every launch;
+        TRTLLM_DWDP_PREFETCH_GATHER without copy_mode is reported as deprecated."""
         _configure_mock_comm_world(mock_comm_world)
         cases = [
-            # (copy_mode, gather_kernel, TRTLLM_DWDP_PREFETCH_GATHER, selected, deprecated)
+            # (copy_mode, gather_kernel, TRTLLM_DWDP_PREFETCH_GATHER, resolved, deprecated)
             ("gather", "tma", None, ["tma"], False),
             ("gather", None, None, [None], False),
             ("batched", None, None, [], False),
@@ -408,13 +408,15 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             (None, None, "1", [None], True),
             (None, None, "0", [], True),
         ]
-        for copy_mode, kernel, env, selected, deprecated in cases:
+        for copy_mode, kernel, env, resolved, deprecated in cases:
             with (
                 self.subTest(copy_mode=copy_mode, kernel=kernel, env=env),
                 patch.dict(os.environ),
                 patch(f"{_FAC}.fabric_gather.gather_op", return_value=object()),
                 patch(f"{_FAC}.fabric_gather.resident_sms", return_value=0),
-                patch(f"{_FAC}.fabric_gather.select_kernel") as select_kernel,
+                patch(
+                    f"{_FAC}.fabric_gather.use_tma", side_effect=lambda name: name == "tma"
+                ) as use_tma,
                 patch(f"{_FAC}.logger.warning") as warning,
                 patch(f"{_FAC}.torch.cuda.current_device", return_value=0),
             ):
@@ -427,13 +429,15 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
                 mgr = DwdpManager(
                     config=config, dist=MagicMock(spec=MPIDist), mapping=_make_mapping()
                 )
-                self.assertEqual([c.args[0] for c in select_kernel.call_args_list], selected)
+                self.assertEqual([c.args[0] for c in use_tma.call_args_list], resolved)
                 notes = [
                     c.args[0]
                     for c in warning.call_args_list
                     if "TRTLLM_DWDP_PREFETCH_GATHER is deprecated" in c.args[0]
                 ]
                 self.assertEqual(len(notes), int(deprecated))
+                mgr.setup(MagicMock())
+                self.assertIs(mock_setup.call_args.kwargs["use_tma"], kernel == "tma")
                 mgr.cleanup()
 
     def test_cleanup_frees_comm_and_idempotent(self, mock_comm_world, _rank, _setup):
@@ -675,6 +679,7 @@ class _FakeWeightManager:
         self.log = log
         # What DwdpManager.setup compares with the transfer dense DWDP ran on.
         self.copy_stream, self.use_gather, self.use_batched_prefetch = None, False, False
+        self.use_tma = False
 
     def start_forward(self) -> None:
         self.log.append(("start_forward",))
@@ -821,8 +826,8 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
         """The dense and the expert copies must share one copy stream and one transfer.
 
         A weight manager on another copy stream than dense setup made, or with another
-        ``use_batched_prefetch``, is refused after the expert setup; the runtime no manager took
-        over is released.
+        ``use_batched_prefetch`` or ``use_tma``, is refused after the expert setup; the runtime no
+        manager took over is released.
         """
         _start(self, patch.dict(os.environ))
         os.environ.pop("TRTLLM_DWDP_PREFETCH_GATHER", None)
@@ -836,11 +841,16 @@ class TestDwdpManagerDenseSetup(unittest.TestCase):
             return _FakeDense(self.log, self.LAYERS)
 
         self.setup_dense.side_effect = dense_setup
-        for copy_stream, batched in ((object(), False), (stream, True)):
-            with self.subTest(other_stream=copy_stream is not stream, batched=batched):
+        for copy_stream, batched, tma in (
+            (object(), False, False),
+            (stream, True, False),
+            (stream, False, True),
+        ):
+            with self.subTest(other_stream=copy_stream is not stream, batched=batched, tma=tma):
                 self.log.clear()
                 self.weight_manager.copy_stream = copy_stream
                 self.weight_manager.use_batched_prefetch = batched
+                self.weight_manager.use_tma = tma
                 manager = self.new_manager()
                 with self.assertRaisesRegex(RuntimeError, "must share one copy stream"):
                     manager.setup(_DenseModel())

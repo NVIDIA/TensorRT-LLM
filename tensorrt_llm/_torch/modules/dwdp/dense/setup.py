@@ -102,6 +102,11 @@ class DenseTransfer(Protocol):
         """Whether the copies use one batched copy-engine copy per layer (``CopyMode.BATCHED``)."""
         ...
 
+    @property
+    def use_tma(self) -> bool:
+        """Whether the SM fabric gather runs the TMA kernel (``DwdpConfig.gather_kernel``)."""
+        ...
+
 
 class PhaseReport(NamedTuple):
     """What one rank contributes to a setup collective.
@@ -755,7 +760,7 @@ class _DenseSetup:
 def _copy_launcher(
     plans: Mapping[int, LayerCopyPlan], transfer: DenseTransfer, device: torch.device
 ) -> LayerLauncher:
-    """The production launcher in the transfer's mode.
+    """The production launcher in the transfer's mode, with its gather kernel.
 
     With expert DWDP that is the transfer the expert DWDP prefetch uses; standalone, the one
     ``DwdpConfig.copy_mode`` picks.
@@ -763,7 +768,7 @@ def _copy_launcher(
     mode = select_copy_mode(
         use_gather=transfer.use_gather, use_batched=transfer.use_batched_prefetch
     )
-    return DenseCopyLauncher(plans, mode, device=device)
+    return DenseCopyLauncher(plans, mode, device=device, use_tma=transfer.use_tma)
 
 
 def _device_mem_get_info(device_id: int) -> MemGetInfo:

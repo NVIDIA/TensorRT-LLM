@@ -138,21 +138,28 @@ class StandaloneTransfer:
     Args:
         mode: The transfer, normally ``DenseConfig.standalone_copy_mode()``.
         stream_factory: Creates the copy stream; called at the first :attr:`copy_stream` read.
+        use_tma: With the gather, its launches run the TMA kernel (``fabric_gather.use_tma`` of
+            ``DenseConfig.gather_kernel``).
     """
 
-    def __init__(self, mode: CopyMode, stream_factory: Callable[[], StreamLike]) -> None:
+    def __init__(
+        self, mode: CopyMode, stream_factory: Callable[[], StreamLike], *, use_tma: bool = False
+    ) -> None:
         self._mode = CopyMode(mode)
         self._stream_factory = stream_factory
+        self._use_tma = use_tma
         self._stream: StreamLike | None = None
 
     @classmethod
-    def on_device(cls, mode: CopyMode, device_id: int) -> StandaloneTransfer:
+    def on_device(
+        cls, mode: CopyMode, device_id: int, *, use_tma: bool = False
+    ) -> StandaloneTransfer:
         """A transfer whose copy stream is ``new_copy_stream(device_id)``.
 
         ``new_copy_stream`` is looked up when the stream is created, so a monkeypatched one
         applies.
         """
-        return cls(mode, lambda: new_copy_stream(device_id))
+        return cls(mode, lambda: new_copy_stream(device_id), use_tma=use_tma)
 
     @property
     def mode(self) -> CopyMode:
@@ -175,6 +182,11 @@ class StandaloneTransfer:
     def use_batched_prefetch(self) -> bool:
         """Whether the copies use one batched copy-engine copy per layer (``CopyMode.BATCHED``)."""
         return self._mode is CopyMode.BATCHED
+
+    @property
+    def use_tma(self) -> bool:
+        """Whether the SM fabric gather runs the TMA kernel; False without the gather."""
+        return self._mode is CopyMode.GATHER and self._use_tma
 
 
 def standalone_group(mapping: Mapping) -> MPI.Intracomm:
@@ -379,9 +391,8 @@ class DenseDwdpManager:
            and no collective.
         5. The settings (``config``, or the manager's) and the device.
         6. The transfer (``transfer``, or :meth:`StandaloneTransfer.on_device` with
-           ``config.standalone_copy_mode()``; no stream yet).  With the gather,
-           ``fabric_gather.select_kernel(config.gather_kernel)``, so that setup's gathers, the
-           launcher's first, use the configured kernel.
+           ``config.standalone_copy_mode()`` and, with the gather, the kernel
+           ``fabric_gather.use_tma(config.gather_kernel)`` picks; no stream yet).
         7. One INFO line, so that ranks waiting for a peer in the next step show where they wait.
         8. The group: ``comm``, which the caller owns, or a new :func:`standalone_group`, the
            first collective of setup.
@@ -446,10 +457,12 @@ class DenseDwdpManager:
         if device_id is None:
             device_id = torch.cuda.current_device()
         if transfer is None:
-            transfer = StandaloneTransfer.on_device(config.standalone_copy_mode(), device_id)
-        if transfer.use_gather:
-            # Before setup, whose gathers are the launcher's first.
-            fabric_gather.select_kernel(config.gather_kernel)
+            mode = config.standalone_copy_mode()
+            transfer = StandaloneTransfer.on_device(
+                mode,
+                device_id,
+                use_tma=mode is CopyMode.GATHER and fabric_gather.use_tma(config.gather_kernel),
+            )
         mapping = self._mapping
         copy_mode = select_copy_mode(
             use_gather=transfer.use_gather, use_batched=transfer.use_batched_prefetch

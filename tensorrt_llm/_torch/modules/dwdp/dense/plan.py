@@ -451,7 +451,7 @@ class DenseCopyLauncher:
 
     * ``GATHER``: :func:`gather_launch_args` per layer, built on the current stream (construct it
       under the copy stream); a launch is one ``trtllm::dwdp_fabric_gather`` with
-      ``fabric_gather.THREADS``.
+      ``fabric_gather.THREADS`` and ``use_tma``.
     * ``BATCHED``: :func:`batched_copies` per layer; a launch is one ``cudaMemcpyBatchAsync`` on
       the current stream.
     * ``PER_SLICE``: one ``uint8`` destination and source view per descriptor on ``device``
@@ -463,6 +463,7 @@ class DenseCopyLauncher:
         plans: Plan per covered layer, from :func:`build_copy_plans`.
         mode: Transfer, from :func:`select_copy_mode`.
         device: The dense CUDA device; a CUDA device without an index is the current device.
+        use_tma: With ``GATHER``, the launches run the TMA kernel (``DenseTransfer.use_tma``).
 
     Raises:
         DenseSetupError: ``GATHER`` without a registered ``trtllm::dwdp_fabric_gather``, or a plan
@@ -472,7 +473,12 @@ class DenseCopyLauncher:
     """
 
     def __init__(
-        self, plans: Mapping[int, LayerCopyPlan], mode: CopyMode, *, device: torch.device
+        self,
+        plans: Mapping[int, LayerCopyPlan],
+        mode: CopyMode,
+        *,
+        device: torch.device,
+        use_tma: bool = False,
     ) -> None:
         self._mode = CopyMode(mode)
         device = torch.device(device)
@@ -496,7 +502,7 @@ class DenseCopyLauncher:
             threads = fabric_gather.THREADS
 
             def prepare(plan: LayerCopyPlan) -> Callable[[], None]:
-                return functools.partial(op, *gather_launch_args(plan, device), threads)
+                return functools.partial(op, *gather_launch_args(plan, device), threads, use_tma)
 
         elif self._mode is CopyMode.BATCHED:
             try:

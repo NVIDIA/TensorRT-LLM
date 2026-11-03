@@ -18,9 +18,10 @@
 Opt-in via ``DwdpConfig.copy_mode='gather'`` (or the deprecated ``TRTLLM_DWDP_PREFETCH_GATHER=1``):
 an SM kernel issuing 16-byte loads out-runs the copy engine but occupies SMs for the whole step, so
 it only pays off while compute hides behind the copy.  ``DwdpConfig.gather_kernel`` picks the kernel
-(:func:`select_kernel`).  ``TRTLLM_DWDP_GATHER_LIB`` loads the op from a prebuilt library;
-``TRTLLM_DWDP_GATHER_BLOCKS`` and ``TRTLLM_DWDP_GATHER_THREADS`` size the grid; the launcher reads
-``TRTLLM_DWDP_GATHER_CLUSTER``.  See ``apply_compute_side_defaults`` for the compute-side knobs.
+of every launch of a manager (:func:`use_tma`).  ``TRTLLM_DWDP_GATHER_LIB`` loads the op from a
+prebuilt library; ``TRTLLM_DWDP_GATHER_BLOCKS`` and ``TRTLLM_DWDP_GATHER_THREADS`` size the grid;
+the launcher reads ``TRTLLM_DWDP_GATHER_CLUSTER``.  See ``apply_compute_side_defaults`` for the
+compute-side knobs.
 """
 
 from __future__ import annotations
@@ -138,30 +139,30 @@ def resident_sms(gather: Optional[bool] = None) -> int:
     return total_blocks()
 
 
-def select_kernel(kernel: Optional[str]) -> None:
-    """Point the gather launcher at ``kernel`` (``DwdpConfig.gather_kernel``).
+def use_tma(kernel: Optional[str]) -> bool:
+    """Whether a manager's gather launches run the TMA kernel (``DwdpConfig.gather_kernel``).
 
-    The launcher reads ``TRTLLM_DWDP_GATHER_KERNEL`` once, at its first launch, so this must run
-    before the first gather.  ``kernel`` replaces a different value the environment holds, with a
-    warning; without ``kernel`` the environment variable still applies and is reported as
-    deprecated.
+    Each DWDP manager resolves this once and passes it to every launch of its gather.  ``kernel``
+    wins over a different ``TRTLLM_DWDP_GATHER_KERNEL``, with a warning; without ``kernel`` that
+    environment variable still applies and is reported as deprecated.  The environment is read,
+    never written.
 
     Args:
-        kernel: ``"register"`` or ``"tma"``; None keeps the environment as it is.
+        kernel: ``"register"`` or ``"tma"``; None leaves the choice to the environment, and to the
+            register kernel when the variable is unset.
     """
-    current = os.environ.get(_KERNEL_ENV)
+    env = os.environ.get(_KERNEL_ENV)
     if kernel is None:
-        if current:
+        if env:
             logger.warning(
-                f"[DWDP] {_KERNEL_ENV}={current!r} is deprecated; set dwdp_config.gather_kernel "
-                "instead"
+                f"[DWDP] {_KERNEL_ENV}={env!r} is deprecated; set dwdp_config.gather_kernel instead"
             )
-        return
-    if current and current != kernel:
+        return env == "tma"
+    if env and env != kernel:
         logger.warning(
-            f"[DWDP] dwdp_config.gather_kernel={kernel!r} overrides {_KERNEL_ENV}={current!r}"
+            f"[DWDP] dwdp_config.gather_kernel={kernel!r} overrides {_KERNEL_ENV}={env!r}"
         )
-    os.environ[_KERNEL_ENV] = kernel
+    return kernel == "tma"
 
 
 def apply_compute_side_defaults() -> None:

@@ -333,7 +333,7 @@ class Rank:
         self.snapshot = Snapshot(self.decoder)
         self.ops = FakeOps()
         self.transfer = SimpleNamespace(
-            copy_stream=self.ops.copy, use_gather=False, use_batched_prefetch=False
+            copy_stream=self.ops.copy, use_gather=False, use_batched_prefetch=False, use_tma=False
         )
         self.stores = []
         self.launchers = []

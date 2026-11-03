@@ -134,6 +134,7 @@ class DWDPWeightManager:
         "_use_batched_prefetch",
         "_batched_copy_plans",
         "_use_gather",
+        "_use_tma",
         "_gather_plans",
         "_layer_order",
         "_schedule",
@@ -154,6 +155,7 @@ class DWDPWeightManager:
         repeated_layer_indices: Sequence[int] = (),
         copy_mode: Optional[str] = None,
         copy_stream: Optional[torch.cuda.Stream] = None,
+        use_tma: bool = False,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
@@ -195,6 +197,9 @@ class DWDPWeightManager:
                 on the buffer's device if None.  With attached dense DWDP,
                 ``DwdpManager.setup`` passes the stream the dense copies
                 already run on.
+            use_tma: Gather launches run the TMA kernel
+                (``DwdpConfig.gather_kernel``, resolved by
+                ``fabric_gather.use_tma``); ignored without the gather.
 
         Raises:
             ValueError: If dwdp_rank is out of range, dwdp_size is invalid,
@@ -276,6 +281,7 @@ class DWDPWeightManager:
         # op is not registered.  Layers whose descriptors are not 16-byte aligned
         # cache None and fall back to the copy engine.
         self._use_gather, self._use_batched_prefetch = expert_transfer(copy_mode, contention_opt)
+        self._use_tma = self._use_gather and use_tma
         self._batched_copy_plans: Dict[int, _CopyBatch] = {}
         self._released = False
         if self._use_gather:
@@ -299,6 +305,7 @@ class DWDPWeightManager:
             f"contention_opt={contention_opt}, "
             f"copy_mode={copy_mode}, "
             f"gather={self._use_gather}, "
+            f"tma={self._use_tma}, "
             f"batched={self._use_batched_prefetch}"
         )
 
@@ -331,6 +338,11 @@ class DWDPWeightManager:
     def use_batched_prefetch(self) -> bool:
         """Whether prefetches use one batched copy-engine copy per layer (``contention_opt``)."""
         return self._use_batched_prefetch
+
+    @property
+    def use_tma(self) -> bool:
+        """Whether gather launches run the TMA kernel (``DwdpConfig.gather_kernel``)."""
+        return self._use_tma
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a given layer index is a MoE layer.
@@ -581,7 +593,7 @@ class DWDPWeightManager:
 
         dst_ptrs, src_ptrs, lines, row_starts, blocks = plan
         fabric_gather.gather_op()(
-            dst_ptrs, src_ptrs, lines, row_starts, blocks, fabric_gather.THREADS
+            dst_ptrs, src_ptrs, lines, row_starts, blocks, fabric_gather.THREADS, self._use_tma
         )
 
     def start_forward(self) -> None:

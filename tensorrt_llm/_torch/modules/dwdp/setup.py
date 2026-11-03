@@ -183,6 +183,7 @@ def setup_dwdp(
     copy_mode: Optional[str] = None,
     copy_stream: Optional[torch.cuda.Stream] = None,
     reserved_storages: frozenset[int] = frozenset(),
+    use_tma: bool = False,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -229,6 +230,9 @@ def setup_dwdp(
             ``DwdpManager.setup`` passes the slots of the committed attached
             dense DWDP runtime.  An expert weight in one of them raises a
             RuntimeError before the transport starts.
+        use_tma: Gather launches run the TMA kernel
+            (``DwdpConfig.gather_kernel``, resolved by
+            ``fabric_gather.use_tma``); ignored without the gather.
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -402,6 +406,7 @@ def setup_dwdp(
             repeated_layer_indices=repeated_layer_indices,
             copy_mode=copy_mode,
             copy_stream=copy_stream,
+            use_tma=use_tma,
         )
         # Transfer resource ownership before backend fixup so every later failure
         # can be rolled back through one idempotent manager release.

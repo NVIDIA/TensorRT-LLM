@@ -115,18 +115,26 @@ class _AttachedTransfer:
     * ``use_gather`` and ``use_batched_prefetch``: computed when read, as
       ``DWDPWeightManager.__init__`` computes them (``expert_transfer`` of ``copy_mode`` and
       ``contention_opt``).
+    * ``use_tma``: the gather kernel ``DwdpManager`` resolved, which it also gives the weight
+      manager.
 
     Construction touches no CUDA, probes nothing and logs nothing.
     """
 
-    __slots__ = ("_device_id", "_contention_opt", "_copy_mode", "_stream")
+    __slots__ = ("_device_id", "_contention_opt", "_copy_mode", "_use_tma", "_stream")
 
     def __init__(
-        self, device_id: int, *, contention_opt: bool, copy_mode: Optional[str] = None
+        self,
+        device_id: int,
+        *,
+        contention_opt: bool,
+        copy_mode: Optional[str] = None,
+        use_tma: bool = False,
     ) -> None:
         self._device_id = device_id
         self._contention_opt = contention_opt
         self._copy_mode = copy_mode
+        self._use_tma = use_tma
         self._stream: Optional[torch.cuda.Stream] = None
 
     @property
@@ -151,6 +159,11 @@ class _AttachedTransfer:
         """Whether the expert prefetch uses one batched copy per layer."""
         return expert_transfer(self._copy_mode, self._contention_opt)[1]
 
+    @property
+    def use_tma(self) -> bool:
+        """Whether the gather runs the TMA kernel; False without the gather."""
+        return self.use_gather and self._use_tma
+
 
 def _check_shared_transfer(
     transfer: _AttachedTransfer | DWDPWeightManager, weight_manager: DWDPWeightManager
@@ -173,14 +186,18 @@ def _check_shared_transfer(
             return
     else:
         stream = transfer.copy_stream
-    dense_flags = (transfer.use_gather, transfer.use_batched_prefetch)
-    expert_flags = (weight_manager.use_gather, weight_manager.use_batched_prefetch)
+    dense_flags = (transfer.use_gather, transfer.use_batched_prefetch, transfer.use_tma)
+    expert_flags = (
+        weight_manager.use_gather,
+        weight_manager.use_batched_prefetch,
+        weight_manager.use_tma,
+    )
     if weight_manager.copy_stream is not stream or expert_flags != dense_flags:
         raise RuntimeError(
             "DwdpManager.setup(): the expert weight manager does not run on the copy stream and "
             "transfer dense DWDP was set up with; the dense and the expert copies must share one "
             f"copy stream (expert: {weight_manager.copy_stream}, (use_gather, "
-            f"use_batched_prefetch)={expert_flags}; dense: {stream}, {dense_flags})"
+            f"use_batched_prefetch, use_tma)={expert_flags}; dense: {stream}, {dense_flags})"
         )
 
 
@@ -317,9 +334,8 @@ class DwdpManager:
                 "[DwdpManager] TRTLLM_DWDP_PREFETCH_GATHER is deprecated; set "
                 "dwdp_config.copy_mode instead ('gather' for the SM gather)"
             )
-        if use_gather:
-            # Before the first prefetch, whose launch reads the kernel choice.
-            fabric_gather.select_kernel(config.gather_kernel)
+        # The kernel of every gather this manager launches, expert and attached dense alike.
+        self._use_tma = use_gather and fabric_gather.use_tma(config.gather_kernel)
         # SMs the expert gather holds for the whole step; persistent grids leave
         # them out (``set_sm_reserve`` on ``__enter__``, before the model is built).
         self.resident_sms = fabric_gather.resident_sms(gather=use_gather)
@@ -653,6 +669,7 @@ class DwdpManager:
                 device_id,
                 contention_opt=self.config.contention_opt,
                 copy_mode=self.config.copy_mode,
+                use_tma=self._use_tma,
             )
         )
         transfer = self._weight_manager if attached is None else attached
@@ -692,6 +709,7 @@ class DwdpManager:
                 ],
                 copy_stream=None if attached is None else attached.created_stream,
                 reserved_storages=_dense_slot_storages(dense),
+                use_tma=self._use_tma,
             )
             self._model_ref = weakref.ref(model)
             if dense is not None:
