@@ -322,12 +322,16 @@ class Shard:
         """Line ``index`` along the split axis of ``phys [..., rows, cols, C]``."""
         return phys[..., index, :, :] if self.axis == "h" else phys[..., :, index, :]
 
-    def _buffer(self, role: str, like: torch.Tensor) -> torch.Tensor:
-        """A persistent contiguous buffer of ``like``'s shape and dtype for ``role``."""
-        key = (role, tuple(like.shape), like.dtype, like.device)
+    def _buffer(
+        self, role: str, like: torch.Tensor, shape: tuple[int, ...] | None = None
+    ) -> torch.Tensor:
+        """A persistent contiguous buffer for ``role`` with ``like``'s dtype and device, of
+        ``shape`` (default ``like``'s)."""
+        shape = tuple(like.shape) if shape is None else shape
+        key = (role, shape, like.dtype, like.device)
         buf = self._buffers.get(key)
         if buf is None:
-            buf = torch.empty(like.shape, dtype=like.dtype, device=like.device)
+            buf = torch.empty(shape, dtype=like.dtype, device=like.device)
             self._buffers[key] = buf
         return buf
 
@@ -445,9 +449,9 @@ class Shard:
         if most == rows.shape[0]:
             staged = self._staged("gather_in", rows)
         else:
-            staged = self._buffer("gather_in", rows.new_empty((most, rows.shape[1])))
+            staged = self._buffer("gather_in", rows, (most, rows.shape[1]))
             staged[: rows.shape[0]].copy_(rows)
-        out = self._buffer("gather_out", rows.new_empty((self.world_size, most, rows.shape[1])))
+        out = self._buffer("gather_out", rows, (self.world_size, most, rows.shape[1]))
         dist.all_gather(list(out.unbind(0)), staged, group=self.pg)
         if self.extents is None:
             return out.view(-1, rows.shape[-1])

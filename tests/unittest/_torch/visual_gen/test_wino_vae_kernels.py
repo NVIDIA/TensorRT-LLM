@@ -1199,6 +1199,7 @@ def test_cudnn_frontend_conv3d_matches_torch(
     ref = F.conv3d(x, w, b, 1, (0, 1, 1))
     got = conv_frontend(x, w, b, (1, 1, 1), (0, 1, 1), (1, 1, 1))
     assert got.shape == ref.shape and got.dtype == dtype
+    assert got.is_contiguous(memory_format=torch.channels_last_3d)
     rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 5e-3, f"rel_l2={rel:.2e}"
     # second call reuses the selected plan

@@ -27,6 +27,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
     WinoVaeCausalConv3d,
     WinoVaeOptions,
 )
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import Shard
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
 
 from ._worker_pool import run_distributed
@@ -225,6 +226,34 @@ class TestParallelWinoVaeEncode:
     @pytest.mark.parametrize("split_dim", ["height", "width"])
     def test_encode_4gpu_uneven(self, split_dim: str) -> None:
         _run(4, _logic_encode, split_dim, "direct", 9, (144, 208))
+
+
+def _logic_gather_rows(rank: int, world_size: int, extents: list[int]):
+    """Equal and unequal row gathers, repeated: every rank's rows in rank order, and the
+    communication buffers are allocated once and reused."""
+    torch.cuda.set_device(rank)
+    group = dist.group.WORLD
+    adj = [dist.new_group([i, i + 1]) for i in range(world_size - 1)]
+    shard = Shard(rank, world_size, "h", group, adj, halo="nccl")
+    shard.set_extents(extents)
+    channels, scale = 16, 3
+    counts = [e * scale for e in extents]
+    for step in range(3):
+        parts = [
+            torch.full((n, channels), 100 * step + r, dtype=torch.bfloat16, device="cuda")
+            for r, n in enumerate(counts)
+        ]
+        got = shard.gather_rows(parts[rank])
+        assert torch.equal(got, torch.cat(parts)), f"rank {rank} step {step}"
+        if step == 0:
+            buffers = {k: b.data_ptr() for k, b in shard._buffers.items()}
+        else:
+            assert {k: b.data_ptr() for k, b in shard._buffers.items()} == buffers
+
+
+@pytest.mark.parametrize("extents", [[2, 2, 2, 2], [3, 2, 2, 2]])
+def test_gather_rows_4gpu(extents: list[int]) -> None:
+    _run(4, _logic_gather_rows, extents)
 
 
 def test_shard_extents() -> None:

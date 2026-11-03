@@ -231,9 +231,7 @@ def conv_frontend(
     ]
     if out is None:
         memory_format = torch.channels_last if dims == 2 else torch.channels_last_3d
-        y = torch.empty(out_shape, dtype=x.dtype, device=x.device).contiguous(
-            memory_format=memory_format
-        )
+        y = torch.empty(out_shape, dtype=x.dtype, device=x.device, memory_format=memory_format)
     else:
         if list(out.shape) != out_shape or out.dtype != x.dtype:
             raise ValueError("out must have the conv's output shape and dtype")
