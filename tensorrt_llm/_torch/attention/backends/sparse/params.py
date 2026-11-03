@@ -71,21 +71,27 @@ def use_self_sampling_gvr(
     compress_ratio: int,
     is_cute_dsl_available: bool,
     sm_version: int,
+    is_prefill: bool = False,
 ) -> bool:
     """Return whether the two-level dispatch picks the self-sampling engine.
 
     Shared by the indexer (per-layer TopK construction) and the attention
     metadata (prior-state allocation and warmup) so both sides of the
-    dispatch agree.
+    dispatch agree. Callers default to the decode policy; prefill callers
+    opt in explicitly.
     """
-    return (
+    supported = (
         enable_heuristic_topk
         and use_self_sampling_topk
         and is_cute_dsl_available
-        and sm_version in (100, 103)
+        and sm_version in (100, 103, 107)
         and index_topk in (512, 1024, 2048)
         and compress_ratio in (1, 4)
     )
+    # SM107 self-sampling decode regresses measured synthetic-KV GEN throughput
+    # (TP8 C1: -1.27%, C256: -5.95%, C8192: -6.69%). Keep decode disabled
+    # independently of the engine's hardware support.
+    return supported and (is_prefill or sm_version != 107)
 
 
 class SparseParams:

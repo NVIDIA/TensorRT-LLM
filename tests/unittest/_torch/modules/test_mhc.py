@@ -16,6 +16,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.modules.mhc.hyper_connection as hyper_connection
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
+from tensorrt_llm._torch.modules.mhc.mhc_lowm import mhc_post_collapse_norm
+from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
@@ -2022,7 +2024,7 @@ def _reference_collapse(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     return torch.sum(pre_mix.reshape(*x.shape[:-1], 1) * x.float(), dim=-2).to(x.dtype)
 
 
-def _build_mhc(hidden_size: int = V41_HIDDEN_SIZE, seed: int = 0) -> mHC:
+def _build_mhc(hidden_size: int = V41_HIDDEN_SIZE, seed: int = 0, single_pass: bool = False) -> mHC:
     """An mHC with V4.1 hyperparameters and small, well-conditioned weights."""
     torch.manual_seed(seed)
     module = mHC(
@@ -2034,11 +2036,13 @@ def _build_mhc(hidden_size: int = V41_HIDDEN_SIZE, seed: int = 0) -> mHC:
         norm_eps=V41_RMS_NORM_EPS,
         sinkhorn_eps=V41_HC_EPS,
         post_mult_value=V41_POST_MULT,
+        single_pass_boundary=single_pass,
     ).cuda()
     with torch.no_grad():
         module.fn.copy_(torch.randn_like(module.fn) * 1e-3)
         module.base.copy_(torch.randn_like(module.base) * 0.1)
         module.scale.copy_(torch.randn_like(module.scale) * 0.1)
+    module.post_load_weights()
     return module
 
 
@@ -2141,9 +2145,14 @@ def _assert_coeffs_match_reference(module: mHC, x: torch.Tensor, what: str):
 @requires_cuda
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
 def test_coeffs_match_reference_transcription(num_tokens: int):
-    """All three coefficient sets, including ``pre``, against the reference."""
+    """All three coefficient sets, including ``pre``, and ``collapse`` against the reference."""
     module = _build_mhc()
-    _assert_coeffs_match_reference(module, _residual(num_tokens), f"synthetic/{num_tokens}")
+    x = _residual(num_tokens)
+    _assert_coeffs_match_reference(module, x, f"synthetic/{num_tokens}")
+    pre_mix = torch.rand(num_tokens, V41_HC_MULT, 1, device=x.device) + 0.25
+    torch.testing.assert_close(
+        mHC.collapse(x, pre_mix), _reference_collapse(x, pre_mix), rtol=0, atol=0
+    )
 
 
 @skip_pre_blackwell
@@ -2337,19 +2346,43 @@ def test_lagged_consumes_the_external_pre():
     )
 
 
+# Rows per rank of the delivered boundaries: mid and hi decode steps, a context forward.
+_MID_ROWS, _HI_ROWS, _CTX_ROWS = 150, 1280, 32768
+
+
 @skip_pre_blackwell
 @requires_cuda
-@pytest.mark.parametrize("num_tokens", [1, 17, 128])
-def test_fused_hc_lagged_matches_eager_composition(num_tokens: int):
-    """``fused_hc_lagged`` == post update, coefficients, collapse with the external pre, RMSNorm."""
-    module_prev = _build_mhc(seed=0)
-    module = _build_mhc(seed=2)
-    residual_prev = _residual(num_tokens, seed=1)
-    x_prev = (_residual(num_tokens, seed=4)[:, 0, :]).contiguous()
+# On SM100/SM103, (128, 5120) runs the single-pass CuTe DSL boundary, (384, 5120) its stream and
+# finalize kernels and (1024, 1024) DeepGEMM's mega_mhc; the rest keep the in-tree kernels. At 5120
+# the mid rows run the single-pass boundary on small tiles, the hi rows mega_mhc with fewer K splits
+# than its default 16 (two waves of tasks instead of three), and the context rows mega_mhc too.
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size",
+    [
+        (1, V41_HIDDEN_SIZE),
+        (17, V41_HIDDEN_SIZE),
+        (128, V41_HIDDEN_SIZE),
+        (128, V41_REAL_HIDDEN_SIZE),
+        (384, V41_REAL_HIDDEN_SIZE),
+        (1024, 1024),
+        (_MID_ROWS, V41_REAL_HIDDEN_SIZE),
+        (_HI_ROWS, V41_REAL_HIDDEN_SIZE),
+        (_CTX_ROWS, V41_REAL_HIDDEN_SIZE),
+    ],
+)
+def test_fused_hc_lagged_matches_eager_composition(
+    num_tokens: int, hidden_size: int, monkeypatch: pytest.MonkeyPatch
+):
+    """``fused_hc_lagged`` == post update, coefficients, collapse with the external pre, RMSNorm;
+    the delivered shapes also check their quantized outputs and graph replay bit for bit."""
+    module_prev = _build_mhc(hidden_size, seed=0)
+    module = _build_mhc(hidden_size, seed=2, single_pass=True)
+    residual_prev = _residual(num_tokens, hidden_size, seed=1)
+    x_prev = (_residual(num_tokens, hidden_size, seed=4)[:, 0, :]).contiguous()
     _, post_prev, comb_prev = module_prev.hc_coeffs(residual_prev)
-    pre_ext = module_prev.hc_coeffs(_residual(num_tokens, seed=3))[0]
+    pre_ext = module_prev.hc_coeffs(_residual(num_tokens, hidden_size, seed=3))[0]
     torch.manual_seed(9)
-    norm_w = (torch.rand(V41_HIDDEN_SIZE, device="cuda") + 0.5).bfloat16()
+    norm_w = (torch.rand(hidden_size, device="cuda") + 0.5).bfloat16()
     norm_eps = 1e-6
 
     residual_ref = module_prev.post_mapping(x_prev, residual_prev, post_prev, comb_prev)
@@ -2367,6 +2400,372 @@ def test_fused_hc_lagged_matches_eager_composition(num_tokens: int):
     torch.testing.assert_close(post_cur, post_ref, rtol=1e-3, atol=3e-3)
     torch.testing.assert_close(comb_cur, comb_ref, rtol=1e-3, atol=5e-3)
     torch.testing.assert_close(layer_input.float(), li_ref.float(), rtol=2e-2, atol=2e-2)
+
+    lagged = module.pre_mapping_lagged(residual_ref, pre_ext, norm_weight=norm_w, norm_eps=norm_eps)
+    for got, ref in zip(lagged[:3], (pre_ref, post_ref, comb_ref)):
+        torch.testing.assert_close(got, ref, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(lagged[3].float(), li_ref.float(), rtol=2e-2, atol=2e-2)
+    if hidden_size == V41_REAL_HIDDEN_SIZE and num_tokens in (_MID_ROWS, _HI_ROWS, _CTX_ROWS):
+        args = (x_prev, residual_prev, post_prev, comb_prev, pre_ext)
+        _check_delivered_boundary(module, args, norm_w, monkeypatch, ffn=num_tokens == _CTX_ROWS)
+
+
+def _check_delivered_boundary(
+    module: mHC, args: tuple, norm_w: torch.Tensor, monkeypatch: pytest.MonkeyPatch, ffn: bool
+) -> None:
+    """Bitwise checks of a delivered boundary: its MXFP8 ``layer_input`` (and with ``ffn`` its
+    NVFP4 and FP8 1x128 copies) against the native quantizers and the plain outputs, a graph
+    captured on its own stream, and for the single-pass boundary the full-tile kernel."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+    from tensorrt_llm._utils import get_sm_version
+
+    rows, hidden = args[1].shape[0], module.hidden_size
+    kernel = hyper_connection._boundary_kernel(torch.device("cuda"), hidden)
+    single_pass = rows < 1024
+    if (
+        kernel is None
+        or module._boundary_weight is None
+        or get_sm_version() not in (100, 103)
+        or mhc_cuda._get_mega_mhc() is None
+    ):
+        pytest.skip("the delivered boundaries need SM100/SM103, the CuTe DSL and mega_mhc")
+    norm_w = norm_w.clone()
+    if not single_pass:
+        # All-zero blocks, tiny ones whose scales fall below DeepGEMM's 2^-22 floor, huge ones.
+        for group, weight in enumerate((0.0, 2.0**-20, 2.0**-40, 3e-6, 1e4)):
+            norm_w[32 * group : 32 * (group + 1)] = weight
+    plain = module.fused_hc_lagged(*args, norm_weight=norm_w, norm_eps=1e-6)
+    index = _mxfp8_scale_index(rows, hidden)
+
+    def boundary():
+        *outputs, (values, scales) = module.fused_hc_lagged(
+            *args, norm_weight=norm_w, norm_eps=1e-6, mxfp8=True
+        )
+        # Joins the side-stream Sinkhorn that writes comb under multi-stream.
+        hyper_connection._join_sinkhorn()
+        # The single-pass boundary leaves the scales of the last tile's padding rows unwritten.
+        scales = scales.view(-1)[index] if single_pass else scales.view(-1)
+        return (*outputs, values.view(torch.uint8), scales)
+
+    # As the pass graphs capture: on the stream that launched it eagerly, under multi-stream.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        eager = boundary()
+        with with_multi_stream(True):
+            boundary()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = boundary()
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(eager, plain):
+        assert torch.equal(got, want)
+    for got, want in zip(captured, eager):
+        assert torch.equal(got, want)
+    ref_values, ref_scales = torch.ops.trtllm.mxfp8_quantize(plain[4], True)
+    assert torch.equal(eager[5], ref_values.view(torch.uint8))
+    if single_pass:
+        assert torch.equal(eager[6], ref_scales.view(-1)[index])
+        monkeypatch.setattr(kernel, "TILES", (kernel.TILE,))
+        for got, want in zip(boundary(), eager):
+            assert torch.equal(got, want)
+    else:
+        assert torch.equal(eager[6], ref_scales.view(-1))
+        token_scales = eager[6][index]
+        assert (token_scales[:, 0] == 0).all() and (token_scales[:, 1:4] < 105).all()
+    if not ffn:
+        return
+    # The FFN boundary of an NVFP4 MoE whose shared expert reads FP8 1x128 rows.
+    scale = torch.tensor([336.0], device="cuda")
+    ffn_input = module.fused_hc_lagged(
+        *args, norm_weight=norm_w, norm_eps=1e-6, nvfp4_scale=scale, fp8_1x128=True
+    )[4]
+    assert torch.equal(ffn_input.unquantized_hidden_states, plain[4])
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(plain[4], scale, 16, False, False)
+    assert torch.equal(ffn_input.fp4_tensor, ref_fp4)
+    assert torch.equal(ffn_input.scaling_factor.flatten(), ref_sf.flatten())
+    fp8, fp8_scale = ffn_input.fp8_1x128
+    ref_fp8, ref_fp8_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(plain[4], False)
+    assert torch.equal(fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+    assert fp8_scale.shape == ref_fp8_scale.shape and fp8_scale.stride() == ref_fp8_scale.stride()
+    assert torch.equal(fp8_scale.t().contiguous(), ref_fp8_scale.t().contiguous())
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_single_pass_boundary_weight_follows_weight_updates():
+    """The single-pass boundary's prepared weight follows weight updates, in place."""
+    module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True)
+    prepared = module._boundary_weight
+    if prepared is None:
+        pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
+    residual_prev = _residual(17, V41_REAL_HIDDEN_SIZE, seed=1)
+    x_prev = _residual(17, V41_REAL_HIDDEN_SIZE, seed=4)[:, 0, :].contiguous()
+    pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
+    norm_w = torch.ones(V41_REAL_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+
+    def assert_matches(reference: mHC):
+        args = (x_prev, residual_prev, post_prev, comb_prev, pre_prev)
+        got = module.fused_hc_lagged(*args, norm_weight=norm_w, norm_eps=1e-6)
+        expected = reference.fused_hc_lagged(*args, norm_weight=norm_w, norm_eps=1e-6)
+        assert torch.equal(got[0], expected[0])
+        for a, b, atol in zip(got[1:4], expected[1:4], (2e-3, 3e-3, 5e-3)):
+            torch.testing.assert_close(a, b, rtol=1e-3, atol=atol)
+        assert module._boundary_weight.data_ptr() == prepared.data_ptr()
+
+    # Parameters overwritten in place, then the post-load hook (loading and weight updates).
+    updated = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=3)
+    with torch.no_grad():
+        for name, param in updated.named_parameters():
+            module.get_parameter(name).copy_(param)
+    module.post_load_weights()
+    assert_matches(updated)
+    loaded = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=5)
+    module.load_state_dict(loaded.state_dict())
+    assert_matches(loaded)
+
+
+@skip_pre_blackwell
+@requires_cuda
+@pytest.mark.parametrize("num_tokens", [17, 384])
+def test_single_pass_boundary_side_stream_sinkhorn_cuda_graph(num_tokens: int):
+    """Captured with multi-stream, the boundary's Sinkhorn iterations run on a side stream that
+    ``post_mapping`` joins; the replay matches the eager in-kernel results bit for bit."""
+    module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True)
+    if module._boundary_weight is None:
+        pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
+    residual_prev = _residual(num_tokens, V41_REAL_HIDDEN_SIZE, seed=1)
+    x_prev = _residual(num_tokens, V41_REAL_HIDDEN_SIZE, seed=4)[:, 0, :].contiguous()
+    pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
+    norm_w = torch.ones(V41_REAL_HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+
+    def boundary_then_post_mapping():
+        residual, _, post, comb, layer_input = module.fused_hc_lagged(
+            x_prev, residual_prev, post_prev, comb_prev, pre_prev, norm_weight=norm_w, norm_eps=1e-6
+        )
+        return comb, module.post_mapping(layer_input, residual, post, comb)
+
+    expected = boundary_then_post_mapping()
+    graph = torch.cuda.CUDAGraph()
+    with with_multi_stream(True):
+        boundary_then_post_mapping()
+        with torch.cuda.graph(graph):
+            captured = boundary_then_post_mapping()
+    graph.replay()
+    torch.cuda.synchronize()
+    for replayed, eager in zip(captured, expected):
+        assert torch.equal(replayed, eager)
+
+
+def _mxfp8_scale_index(rows: int, hidden: int) -> torch.Tensor:
+    """Indices of the token rows' scales in the 128x4 swizzled MXFP8 scale layout."""
+    r = torch.arange(rows, device="cuda")[:, None]
+    k = torch.arange(hidden // 32, device="cuda")[None, :]
+    return r // 128 * (hidden // 128 * 512) + k // 4 * 512 + r % 32 * 16 + r % 128 // 32 * 4 + k % 4
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_single_pass_boundary_mxfp8_layer_input():
+    """The single-pass boundary's MXFP8 ``layer_input`` is ``mxfp8_quantize(layer_input, True)``
+    byte for byte: the values and the swizzled scales of the token rows."""
+    module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True)
+    if module._boundary_weight is None:
+        pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
+    num_tokens, hidden = 196, V41_REAL_HIDDEN_SIZE
+    residual_prev = _residual(num_tokens, hidden, seed=1)
+    x_prev = _residual(num_tokens, hidden, seed=4)[:, 0, :].contiguous()
+    pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
+    torch.manual_seed(9)
+    norm_w = (torch.rand(hidden, device="cuda") + 0.5).bfloat16()
+    args = (x_prev, residual_prev, post_prev, comb_prev, pre_prev)
+    *outputs, (values, scales) = module.fused_hc_lagged(*args, norm_w, 1e-6, mxfp8=True)
+    ref_values, ref_scales = torch.ops.trtllm.mxfp8_quantize(outputs[4], True)
+    assert torch.equal(values.view(torch.uint8), ref_values.view(torch.uint8))
+    index = _mxfp8_scale_index(num_tokens, hidden)
+    assert torch.equal(scales.view(-1)[index], ref_scales.view(-1)[index])
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_nvfp4_quantize_matches_fp4_quantize():
+    """``nvfp4_quantize`` writes the bytes of ``fp4_quantize(x, s, 16, False, False)``, including
+    16-element blocks of zeros, BF16 denormals, tiny and huge values."""
+    kernel = hyper_connection._boundary_kernel(torch.device("cuda"), V41_REAL_HIDDEN_SIZE)
+    if kernel is None:
+        pytest.skip("the NVFP4 quantization kernel needs SM100/SM103 and the CuTe DSL")
+    rows = 3
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    x = torch.randn(rows, V41_REAL_HIDDEN_SIZE // 16, 16, generator=g, device="cuda")
+    magnitudes = torch.tensor([0.0, 1e-39, 2.0**-120, 1e-30, 3e-5, 1.0, 448.0, 1e4], device="cuda")
+    x *= magnitudes[torch.arange(x.shape[1], device="cuda") % len(magnitudes)].view(1, -1, 1)
+    x = x.view(rows, V41_REAL_HIDDEN_SIZE).bfloat16()
+    scale = torch.tensor([336.0], device="cuda")
+    fp4, sf = kernel.nvfp4_quantize(x, scale)
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(x, scale, 16, False, False)
+    assert torch.equal(fp4, ref_fp4)
+    assert torch.equal(sf.flatten(), ref_sf.flatten())
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_fused_hc_lagged_mega_mhc_cuda_graph_matches_eager():
+    """A captured 1024-token lagged boundary replays the eager ``mega_mhc`` result exactly."""
+    module_prev = _build_mhc(1024, seed=0)
+    module = _build_mhc(1024, seed=2)
+    residual_prev = _residual(1024, 1024, seed=1)
+    x_prev = (_residual(1024, 1024, seed=4)[:, 0, :]).contiguous()
+    _, post_prev, comb_prev = module_prev.hc_coeffs(residual_prev)
+    pre_ext = module_prev.hc_coeffs(_residual(1024, 1024, seed=3))[0]
+    norm_w = (torch.rand(1024, device="cuda") + 0.5).bfloat16()
+
+    def boundary():
+        return module.fused_hc_lagged(
+            x_prev, residual_prev, post_prev, comb_prev, pre_ext, norm_weight=norm_w, norm_eps=1e-6
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    # Creates torch's default capture stream, which the eager launch then warms.
+    capture = torch.cuda.graph(graph)
+    eager = boundary()
+    with capture:
+        captured = boundary()
+    graph.replay()
+    torch.cuda.synchronize()
+    for replayed, expected in zip(captured, eager):
+        assert torch.equal(replayed, expected)
+
+
+@skip_pre_blackwell
+@requires_cuda
+def test_fused_hc_lagged_deterministic_on_replicated_streams():
+    """A replicated stream's boundary (DeepGEMM's mega_mhc below 1024 tokens on SM100/SM103, the
+    composition elsewhere) repeats bitwise, so tensor-parallel replicas stay identical."""
+    module = _build_mhc(1024, seed=2)
+    module.replicated = True
+    residual_prev = _residual(6, 1024, seed=1)
+    x_prev = _residual(6, 1024, seed=4)[:, 0, :].contiguous()
+    pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
+    norm_w = (torch.rand(1024, device="cuda") + 0.5).bfloat16()
+    args = (x_prev, residual_prev, post_prev, comb_prev, pre_prev, norm_w, 1e-6)
+    first = module.fused_hc_lagged(*args)
+    for _ in range(3):
+        for got, want in zip(module.fused_hc_lagged(*args), first):
+            assert torch.equal(got, want)
+
+
+# Split boundary for decode-sized M (mHC.split_hc_lagged, mhc_lowm.py).
+
+
+def _split_inputs(m: int):
+    hidden, mult = V41_REAL_HIDDEN_SIZE, V41_HC_MULT
+    x = torch.randn(m, hidden, device="cuda").to(torch.bfloat16)
+    res = torch.randn(m, mult, hidden, device="cuda").to(torch.bfloat16)
+    post = 2 * torch.sigmoid(torch.randn(m, mult, device="cuda"))
+    comb = torch.softmax(torch.randn(m, mult, mult, device="cuda"), -1)
+    pre = torch.sigmoid(torch.randn(m, mult, device="cuda")) + 1e-6
+    weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
+    return x, res, post, comb, pre, weight
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("quant", [None, "mxfp8", "nvfp4"])
+def test_post_collapse_norm(quant):
+    """The critical half matches the production small-M fused boundary (residual bit-exact, the
+    normalized output within one BF16 ulp of the RMS reduction order); its quantized copy is the
+    native quantizer's, byte for byte."""
+    import tensorrt_llm._torch.modules.mhc.mhc_cuda as mhc_cuda
+
+    torch.manual_seed(0)
+    m, hidden = 6, V41_REAL_HIDDEN_SIZE
+    x, res, post, comb, pre, weight = _split_inputs(m)
+    if quant is None:
+        hc = _build_mhc(V41_REAL_HIDDEN_SIZE)
+        runner = mhc_cuda._get_fused_hc_runner(
+            V41_HC_MULT,
+            hidden,
+            V41_RMS_NORM_EPS,
+            V41_HC_EPS,
+            V41_HC_EPS,
+            V41_POST_MULT,
+            V41_SINKHORN_ITERS,
+        )
+        ref_res, _, _, ref_li, _ = runner.forward(
+            [x, res, post, comb, hc.fn, hc.scale, hc.base],
+            tactic=("fused_half_fma", 2, 1, 256, 1),
+            norm_weight=weight,
+            norm_eps=V41_RMS_NORM_EPS,
+            pre_mix_ext=pre,
+        )
+        out_res, li = mhc_post_collapse_norm(x, res, post, comb, pre, weight, V41_RMS_NORM_EPS)
+        assert torch.equal(out_res, ref_res)
+        _assert_bf16_within_one_ulp(li, ref_li, "layer_input")
+        # Collapse-only (resolved residual): the residual passes through untouched.
+        same_res, li = mhc_post_collapse_norm(
+            None, ref_res, None, None, pre, weight, V41_RMS_NORM_EPS
+        )
+        assert same_res.data_ptr() == ref_res.data_ptr()
+        _assert_bf16_within_one_ulp(li, ref_li, "collapse-only layer_input")
+        return
+    # Blocks of 32 norm-weight values across the FP8/FP4 ranges, zero and denormal outputs included.
+    scales = torch.tensor([1.0, 0.0, 1e-38, 1e-30, 3e-5, 1e4], device="cuda")
+    blocks = torch.arange(hidden // 32, device="cuda") % len(scales)
+    weight = (weight.view(-1, 32).float() * scales[blocks, None]).to(torch.bfloat16).view(-1)
+    args = (x, res, post, comb, pre, weight, V41_RMS_NORM_EPS)
+    ref_res, ref_li = mhc_post_collapse_norm(*args)
+    if quant == "mxfp8":
+        out_res, li, (q, sf) = mhc_post_collapse_norm(*args, mxfp8=True)
+        ref_q, ref_sf = torch.ops.trtllm.mxfp8_quantize(ref_li, True)
+        index = _mxfp8_scale_index(m, hidden)
+    else:
+        scale = torch.tensor([37.25], device="cuda")
+        out_res, li, (q, sf) = mhc_post_collapse_norm(*args, nvfp4_scale=scale)
+        ref_q, ref_sf = torch.ops.trtllm.fp4_quantize(ref_li, scale, 16, False, False)
+        index = torch.arange(m * hidden // 16, device="cuda")
+    assert torch.equal(out_res, ref_res) and torch.equal(li, ref_li)
+    assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8).view(q.shape))
+    assert torch.equal(sf[index], ref_sf.view(torch.uint8).reshape(-1)[index])
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("rows", [6, 12])
+def test_split_boundary_side_stream_in_cuda_graph(rows: int) -> None:
+    """Coefficients on a side stream, joined through the returned event, replay the eager split
+    boundary under graph capture; they come from the BF16 residual like ``hc_coeffs`` and keep the
+    bits of the full collapse."""
+    torch.manual_seed(2)
+    hc = _build_mhc(V41_REAL_HIDDEN_SIZE)
+    x, res, post, comb, pre, weight = _split_inputs(rows)
+    expected = hc.split_hc_lagged(x, res, post, comb, pre, weight, V41_RMS_NORM_EPS)
+    for got, want, tol in zip(expected[1:4], hc.hc_coeffs(expected[0]), (1e-5, 1e-5, 1e-4)):
+        torch.testing.assert_close(got, want, rtol=1e-3, atol=tol)
+    # The coefficient half collapses a zero stand-in: the full collapse's coefficients, bit for bit.
+    full = hc.pre_mapping_lagged(expected[0], torch.ones_like(pre))
+    for got, want in zip(expected[1:4], full[:3]):
+        assert torch.equal(got, want)
+    side = torch.cuda.Stream()
+    events = (torch.cuda.Event(), torch.cuda.Event())
+
+    def run():
+        out = hc.split_hc_lagged(
+            x, res, post, comb, pre, weight, V41_RMS_NORM_EPS, coeff_stream=side, events=events
+        )
+        torch.cuda.current_stream().wait_event(out[-1])
+        return out
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        run()
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want in zip(out[:5], expected[:5]):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 @skip_pre_blackwell

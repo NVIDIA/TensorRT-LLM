@@ -1811,8 +1811,15 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         )
 
 
-class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
-    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend."""
+class CSA2SparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend.
+
+    The indexer runtime options are shared with DSA. The indexer geometry
+    (``index_n_heads``, ``index_head_dim``, ``index_topk``), the index cache
+    format and RoPE layout come from the checkpoint, so ``indexer_k_dtype``,
+    ``indexer_rope_interleave``, ``index_share_for_mtp_iteration`` and
+    ``seq_len_threshold`` do not apply to CSA2.
+    """
     algorithm: Literal["csa2"] = "csa2"
     use_fp8_staging: Optional[bool] = Field(
         default=None,
@@ -1826,9 +1833,37 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         "kv_cache_config.dtype, and no packed sparse attention. Set True to "
         "require it, which rejects a configuration that cannot serve it instead "
         "of falling back, or False to pin BF16 staging.")
+    use_cute_dsl_topk: bool = Field(
+        default=True,
+        description=
+        "Whether to use the CuTe DSL radix Top-K kernel instead of the CUDA "
+        "C++ radix Top-K on SM100-family GPUs.")
+    use_cute_dsl_paged_mqa_logits: bool = Field(
+        default=False,
+        description=
+        "Whether to score each CSA2 decode row on its own with the CuTe DSL "
+        "paged MQA logits kernel on SM100-family GPUs. When off, DeepGEMM "
+        "scores the rows; from four requests up, six 32-head rows per request "
+        "run the CuTe DSL kernel as three 64-head rows.")
+
+    @model_validator(mode="after")
+    def _validate_gvr_emission(self):
+        if self.use_gvr_emission and (not self.enable_heuristic_topk
+                                      or self.use_self_sampling_topk or
+                                      not self.use_cute_dsl_paged_mqa_logits):
+            raise ValueError(
+                "use_gvr_emission requires enable_heuristic_topk=True, "
+                "use_self_sampling_topk=False and "
+                "use_cute_dsl_paged_mqa_logits=True")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # CSA2 skips the indexer inside its graphs instead of capturing a
+        # separate short-sequence family.
+        return False
 
     def to_sparse_params(self, **kwargs):
         from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
@@ -1837,6 +1872,12 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
         return CSA2Params(
             layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
             use_fp8_staging=self.use_fp8_staging,
+            skip_indexer_for_short_seqs=self.skip_indexer_for_short_seqs,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
+            use_cute_dsl_paged_mqa_logits=self.use_cute_dsl_paged_mqa_logits,
+            enable_heuristic_topk=self.enable_heuristic_topk,
+            use_self_sampling_topk=self.use_self_sampling_topk,
+            use_gvr_emission=self.use_gvr_emission,
         )
 
     def to_sparse_metadata_params(self, **kwargs):
@@ -1844,7 +1885,10 @@ class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
             CSA2Layout, CSA2MetadataParams)
 
         return CSA2MetadataParams(
-            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
+            indexer_max_chunk_size=self.indexer_max_chunk_size or 32768,
+            q_split_threshold=self.q_split_threshold,
+        )
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -1945,6 +1989,88 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                                  uses_spcompress=self.uses_spcompress)
 
 
+class MoeWarmupPlacementConfig(StrictBaseModel):
+    """Expert placement learned online from a server's own traffic, in bounded swap rounds.
+
+    The MoE layers stay static load-balancer layers: with ``num_slots`` equal to the expert count
+    each expert keeps one slot, and extra slots per rank get copies of the hottest experts (no
+    ``initial_global_assignments``). From ``start_step`` on, per-layer expert
+    counters run on the GPU over the live rows of real requests; at ``start_step + k *
+    interval_steps`` a round swaps slots between heavy and light ranks, at most
+    ``max_moved_fraction`` of a layer's slots (moved GPU to GPU, in place); after
+    ``max_migrations`` rounds the placement is frozen. Steps are the executor's forward steps.
+    With ``decay < 1``, a large ``max_migrations`` and ``min_pos >= 2`` the placement keeps
+    following the served decode traffic. Outputs equal those of any other placement except for
+    the order of sums across EP ranks.
+    """
+
+    start_step: int = Field(
+        ge=0, description="Executor step from which the expert counters run.")
+    interval_steps: int = Field(
+        ge=1,
+        description="A placement round every this many steps after start_step.")
+    max_migrations: int = Field(
+        default=1,
+        ge=1,
+        description=
+        "Rounds before the placement is frozen for the rest of the run.")
+    min_rows: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "A round with fewer rows counted since the previous one waits for the next boundary."
+    )
+    deadline_step: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=
+        "At this step a last round runs on the rows counted since the previous one (if any), "
+        "then the placement is frozen.")
+    planner: Literal["lpt", "cost"] = Field(
+        default="lpt",
+        description=
+        "Weigh each expert by its counted routes (lpt), or by its modelled MegaMoE cost "
+        "(active experts and routed rows per rank; better at EP16 / EP32).")
+    min_pos: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Count only the rows of generation requests that have produced at least this many tokens."
+    )
+    decay: float = Field(
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description=
+        "After each round every counter keeps this fraction of its value, so later rounds follow "
+        "recent traffic.")
+    max_moved_fraction: float = Field(
+        default=0.1,
+        gt=0.0,
+        le=1.0,
+        description=
+        "A round swaps slots between heavy and light ranks, each swap only for a gain over "
+        "min_gain, and moves at most this fraction of a layer's slots.")
+    min_gain: float = Field(
+        default=0.01,
+        ge=0.0,
+        description=
+        "A swap must lower the heavier of its two ranks by more than this fraction of the mean "
+        "rank load.")
+    count_every_steps: int = Field(
+        default=1,
+        ge=1,
+        description=
+        "Count the routes of one forward in this many (lowers the host work of a placement that "
+        "keeps learning).")
+    min_round_gain: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=
+        "A round whose plan lowers the slowest rank over the mean rank load, averaged over the "
+        "layers, by fewer percentage points moves nothing (0: off).")
+
+
 class _MoeLoadBalancerConfigBase(StrictBaseModel):
     """Common slot layout and expert-parallel runtime state for EPLB."""
 
@@ -2018,6 +2144,11 @@ class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
         description=
         "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB."
     )
+    warmup_placement: Optional[MoeWarmupPlacementConfig] = Field(
+        default=None,
+        description=
+        "Learn the expert placement from the warmup's traffic, then freeze it (needs "
+        "layer_updates_per_iter 0).")
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
@@ -2156,6 +2287,14 @@ class MoeConfig(StrictBaseModel):
         default=False,
         description=
         "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
+    )
+
+    megamoe_fuse_shared_expert: bool = Field(
+        default=False,
+        description=
+        "With the MEGAMOE_CUTEDSL backend on SM100/SM103 under attention DP, run a DeepSeek-V4 model's single FP8 "
+        "block-scale shared expert inside the fused MoE kernel.",
+        status="prototype",
     )
 
     use_low_precision_moe_combine: bool = Field(
@@ -2318,7 +2457,7 @@ class AttentionDpConfig(StrictBaseModel):
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
     kv_cache_routing_new_conv_placement: Literal[
-        "round_robin", "least_queued", "least_tokens"] = Field(
+        "round_robin", "least_queued", "least_tokens", "least_prefill"] = Field(
             default="round_robin",
             description=
             "Placement policy in conversation-affinity routing for requests "
@@ -2328,9 +2467,26 @@ class AttentionDpConfig(StrictBaseModel):
             "the fewest live requests. 'least_tokens' chooses the fewest active "
             "prompt tokens, including requests assigned in the current batch; "
             "ties use live request count, then the rotating rank cursor. "
-            "Active prompt tokens estimate work, not cached KV residency. Existing "
-            "conversation->rank pins are unaffected. Only used when "
-            "kv_cache_routing_conversation_affinity is True.")
+            "Active prompt tokens estimate work, not cached KV residency. "
+            "'least_prefill' is 'least_tokens' on the prefill still to compute: "
+            "the remaining context of started requests, and for the others the "
+            "prompt minus the conversation's previous prompt (all of it for a "
+            "first turn). Existing conversation->rank pins are unaffected. Only "
+            "used when kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_strict_conversation_affinity: bool = Field(
+        default=False,
+        description=
+        "Admit a later turn of a conversation only on its conversation's rank. "
+        "While that rank is at its active-request limit, the turn waits in the "
+        "queue in arrival order and the requests behind it are still admitted, "
+        "instead of overflowing to a rank that does not cache its prefix. Only "
+        "used when kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_strict_affinity_max_wait_iters: NonNegativeInt = Field(
+        default=0,
+        description=
+        "Scheduler iterations a turn may wait for its conversation's rank under "
+        "kv_cache_routing_strict_conversation_affinity before it overflows to "
+        "another rank; 0 waits without limit.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -4138,6 +4294,26 @@ class AutoDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class PromptTokenCacheConfig(StrictBaseModel):
+    """Token ids of earlier prompts, shared by all serving frontends of a node.
+
+    A multi-turn prompt repeats the previous turn's prompt; frontends that support the
+    cache tokenize only the text after the longest cached prefix. The ids always equal a
+    full tokenization.
+    """
+
+    path: str = Field(
+        description=
+        "Directory for the cache on a node-local file system such as a tmpfs, created "
+        "if missing. Every frontend of the server must use the same directory.",
+        status="prototype")
+    max_bytes: PositiveInt = Field(
+        description=
+        "Cap on the cached bytes in ``path``; the least recently used entries "
+        "are evicted first.",
+        status="prototype")
+
+
 class PrometheusMetricsConfig(StrictBaseModel):
     """Configuration for Prometheus metrics collection.
 
@@ -4710,6 +4886,16 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     gen_preemption: GenPreemptionConfig = Field(
         default_factory=GenPreemptionConfig,
         description="GEN slot preemption on disaggregated generation workers.",
+        status="prototype")
+
+    max_gen_init_admissions_per_pass: Optional[PositiveInt] = Field(
+        default=None,
+        description=(
+            "Bounds how many disaggregated generation requests a rank admits "
+            "per scheduling pass of the KV cache manager V2 scheduler (each "
+            "admission allocates the request's KV cache); None admits all that "
+            "fit. A bound trades the start latency of a burst of such requests "
+            "for shorter passes, which every attention-DP rank waits for."),
         status="prototype")
 
     context_scheduling_policy: ContextSchedulingPolicy = Field(
@@ -5327,6 +5513,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         description=
         "Size of the host cache in bytes. If both `max_tokens` and `host_cache_size` are specified, memory corresponding to the minimum will be used."
+    )
+    host_cache_bind_to_gpu_numa_node: bool = Field(
+        default=False,
+        description=
+        "Allocate the host cache tier only on the GPU's host NUMA node, reclaiming page "
+        "cache there instead of spilling to another node. Startup fails on every rank when "
+        "that node cannot hold the tiers of all co-located ranks. Only used by KV cache "
+        "manager v2 in the PyTorch backend, on devices that report a host NUMA node."
     )
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
@@ -6481,7 +6675,11 @@ class BaseLlmArgs(StrictBaseModel):
 
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
-        description="Enable LM head TP in attention dp.",
+        description=
+        "Enable LM head TP in attention dp. Under DSpark it also shards the "
+        "target verify head over the attention-DP ranks of a node, for greedy "
+        "and temperature-only CUDA-graph decode steps of up to 256 rows per "
+        "rank.",
         status="prototype")
 
     pp_partition: Optional[List[int]] = Field(
@@ -7470,6 +7668,14 @@ class TorchLlmArgs(BaseLlmArgs):
         "Cache the tokenization of recent prompts so that a prompt extending a cached one only tokenizes its tail, which speeds up multi-turn serving with long prompts. Requires a fast tokenizer and applies only to prompts tokenized with add_special_tokens=False and no truncation. The output is identical to tokenizing the whole prompt.",
         status="prototype")
 
+    prompt_token_cache_config: Optional[PromptTokenCacheConfig] = Field(
+        default=None,
+        description=
+        "Prompt token ids shared by all serving frontends of a node, for multi-turn prompts. "
+        "Used by input processors that support it (DeepSeek-V4.1), where it takes precedence "
+        "over enable_tokenization_cache.",
+        status="prototype")
+
     enable_iter_req_stats: bool = Field(
         default=False,
         description=
@@ -7494,12 +7700,40 @@ class TorchLlmArgs(BaseLlmArgs):
         "decoding draft and accepted token totals) reach only about 1/N of the "
         "true totals, and gauges such as KV cache utilization refresh every N "
         "iterations. With enable_iter_req_stats, requests that finish in a "
-        "skipped iteration get no requestStats entry.",
+        "skipped iteration get no requestStats entry. With print_iter_log, the "
+        "iteration log likewise prints only on every Nth iteration, whether or "
+        "not enable_iter_perf_stats is true, and a printed line's num_fetched "
+        "counts the requests fetched since the previous line.",
         status="prototype")
 
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
+
+    enable_client_io_during_gpu_wait: bool = Field(
+        default=False,
+        description=
+        "With the overlap scheduler, publish the iteration's responses and "
+        "parse newly received requests while the executor waits on the GPU, "
+        "so the response and request threads do not compete with the "
+        "executor's own host work. Responses reach clients up to one "
+        "iteration later, and a new request is scheduled up to one iteration "
+        "later.",
+        status="prototype")
+
+    gen_prompt_tail_tokens: Optional[int] = Field(
+        default=None,
+        ge=256,  # The Engram lookback and stop-sequence tails, with margin.
+        description="On a disaggregated generation server, send an eligible "
+        "generation-only request to the workers with only its last N prompt "
+        "ids and the number of ids left out: the KV cache comes from the "
+        "context server, and the workers read the prompt length but only ids "
+        "near its end. Requests that read their full prompt (penalties, "
+        "prompt logprobs, logits processors, beams, multimodal input, ...) "
+        "keep it. Not allowed with KV cache block reuse, KV cache events, a "
+        "KV cache connector, routed-expert capture, context parallelism or "
+        "the SA / NGram drafters. None sends full prompts.",
+        status="prototype")
 
     batch_wait_timeout_ms: NonNegativeFloat = Field(
         default=0,
@@ -7882,6 +8116,35 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "GEN slot preemption (scheduler_config.gen_preemption) does "
                 "not support pipeline parallelism or attention DP.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_gen_prompt_tail_tokens(self) -> 'TorchLlmArgs':
+        """Prompt-tail transport needs an engine that reads no full prompt."""
+        if self.gen_prompt_tail_tokens is None:
+            return self
+        spec = self.speculative_config
+        full_prompt_readers = {
+            "KV cache block reuse":
+            self.kv_cache_config.enable_block_reuse,
+            "KV cache events":
+            self.kv_cache_config.event_buffer_max_size > 0,
+            "a KV cache connector":
+            self.kv_connector_config is not None,
+            "routed-expert capture":
+            self.enable_return_routed_experts,
+            "context parallelism":
+            self.context_parallel_size > 1,
+            "the SA / NGram drafters":
+            isinstance(spec, (SADecodingConfig, NGramDecodingConfig,
+                              SaveHiddenStatesDecodingConfig))
+            or getattr(spec, "sa_config", None) is not None,
+        }
+        enabled = [name for name, on in full_prompt_readers.items() if on]
+        if enabled:
+            raise ValueError(
+                "gen_prompt_tail_tokens sends generation workers only the "
+                f"prompt tail, but {', '.join(enabled)} read full prompts")
         return self
 
     @model_validator(mode="after")
@@ -8897,7 +9160,9 @@ class TorchLlmArgs(BaseLlmArgs):
             self.use_cute_dsl_bf16_bmm = True
             self.use_cute_dsl_bf16_gemm = True
 
-        if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
+        # Skipped without a visible GPU (attached serving frontends, CPU-only hosts).
+        if ((self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm)
+                and torch.cuda.is_available()):
             major, minor = torch.cuda.get_device_capability()
             sm = major * 10 + minor
             if sm < 100:

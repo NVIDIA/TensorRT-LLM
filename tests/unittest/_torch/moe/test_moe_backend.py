@@ -2542,6 +2542,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
+    moe._shared_expert = None
     moe.fc31_input_scale = torch.ones(1)
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
@@ -3928,11 +3929,13 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     activation, which leaves ``quantize_input`` as the one place to apply it.
 
     ``__new__`` without ``__init__``: the real constructor wants a GPU and a
-    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    symmetric-memory provider, and ``quantize_input`` reads two parameters and
+    the fused shared expert, which stays unset here.
     """
     hidden_size = 64
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
+    backend._shared_expert = None
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
@@ -7007,6 +7010,7 @@ class _FreshOutputBackend:
 
     capabilities = MoEStaticCapability()
     input_requirement = MoEInputRequirement()
+    fused_route_quant_enabled = True
 
     def __init__(self, stream_stack: list) -> None:
         self._stream_stack = stream_stack
@@ -7065,7 +7069,8 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,
-        _using_load_balancer=lambda: False,
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
         _load_balancer_done_set_cpu_stage=no_op,

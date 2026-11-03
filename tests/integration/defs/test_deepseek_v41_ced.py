@@ -5,6 +5,7 @@
 Run on four Blackwell GPUs through trtllm-llmapi-launch. Set DSV41_MODEL_PATH,
 GSM8K_DATASET_PATH and DSV41_CED_RESULTS to local checkpoint/data/output paths.
 Set TRTLLM_V41_DECODER_BOUNDED_REPLAY=1 before workers are launched.
+SWA scratch reuse is enabled for this suite.
 GSM8K uses 256 requests by default; DSV41_CED_GSM8K_SAMPLES overrides the count.
 """
 
@@ -16,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.configs.deepseek_v41 import encoder_replay_enabled
 from tensorrt_llm.evaluate import GSM8K
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -59,7 +61,7 @@ def ced_llm():
         kv_cache_config=dict(
             dtype="fp8",
             enable_block_reuse=True,
-            enable_swa_scratch_reuse=False,
+            enable_swa_scratch_reuse=True,
             tokens_per_block=128,
             max_tokens=kv_max_tokens or None,
             free_gpu_memory_fraction=float(os.environ.get("DSV41_CED_KV_MEMORY_FRACTION", 0.5)),
@@ -74,6 +76,12 @@ def ced_llm():
     out.mkdir(parents=True, exist_ok=True)
     (out / "model_config.json").write_text(json.dumps(args, indent=2))
     with LLM(str(model_path), **args) as llm:
+        # Start the module-owned result dispatcher before per-test thread checks.
+        llm.generate(
+            prompt_ids(llm, 1),
+            SamplingParams(max_tokens=1, temperature=0, ignore_eos=True),
+            cache_salt="ced-fixture-warmup",
+        )
         yield llm
 
 
@@ -127,9 +135,7 @@ def test_ced_adp_asymmetric_replay(ced_llm):
     assert all(len(future.result().outputs[0].token_ids) == 32 for future in futures)
 
 
-@pytest.mark.skipif(
-    os.environ.get("TRTLLM_V41_ENCODER_REPLAY") != "1", reason="Optional Encoder recovery only"
-)
+@pytest.mark.skipif(not encoder_replay_enabled(), reason="Optional Encoder recovery only")
 def test_ced_snapshot_short_fallback_and_long_suffix_restore(ced_llm):
     salt = "ced-m4-snapshot-short-suffix"
     # Finish the longer prompt with a question: an indefinitely repeated story
@@ -162,9 +168,7 @@ def test_ced_snapshot_short_fallback_and_long_suffix_restore(ced_llm):
     assert longer.outputs[0].token_ids == isolated.outputs[0].token_ids
 
 
-@pytest.mark.skipif(
-    os.environ.get("TRTLLM_V41_ENCODER_REPLAY") == "1", reason="Required Encoder state only"
-)
+@pytest.mark.skipif(encoder_replay_enabled(), reason="Required Encoder state only")
 def test_ced_required_encoder_snapshot(ced_llm):
     params = SamplingParams(max_tokens=1, temperature=0, ignore_eos=True)
     salt = "ced-required-encoder"
@@ -183,9 +187,7 @@ def test_ced_required_encoder_snapshot(ced_llm):
     assert len(short.outputs[0].token_ids) == 1
 
 
-@pytest.mark.skipif(
-    os.environ.get("TRTLLM_V41_ENCODER_REPLAY") != "1", reason="Optional Encoder recovery only"
-)
+@pytest.mark.skipif(not encoder_replay_enabled(), reason="Optional Encoder recovery only")
 @pytest.mark.parametrize("prefix,suffix", [(255, 1), (383, 129), (4097, 903)])
 def test_ced_partial_global_hit_replays_encoder(ced_llm, prefix, suffix):
     salt = f"ced-partial-global-{prefix}-{suffix}"

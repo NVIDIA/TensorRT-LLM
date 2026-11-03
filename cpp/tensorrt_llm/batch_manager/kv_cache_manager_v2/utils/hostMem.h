@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <thread>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -76,7 +77,11 @@ public:
     //! waits before publishing a sub-range has already covered every later read
     //! of it. Reaching past the watermark faults, so a range that nothing waits
     //! for fails loudly rather than reading zeros.
-    HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true);
+    //!
+    //! `numaNode`, when set, binds the whole reservation strictly (MPOL_BIND) to
+    //! that node before anything is committed, in place of the backing's placement.
+    HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options = {}, bool waitForFill = true,
+        std::optional<int> numaNode = std::nullopt);
 
     //! Reserves exactly as much as it commits, for an allocation that never
     //! resizes. Takes no waitForFill: a caller that cannot resize has no reason

@@ -47,7 +47,7 @@ namespace kernels
 //
 // Layouts:
 //   o            : bf16 [num_tokens, num_heads, head_dim]
-//   positions    : int64 [num_tokens]
+//   positions    : int32 or int64 [num_tokens]
 //   cos_sin_cache: fp32 [max_positions, 2, 32] (cos block then sin block, NEOX)
 //   fp8_out      : fp8  [..., num_tokens, num_heads * head_dim]
 //   scale_out    : fp32 with stride scale_stride_k between adjacent quant
@@ -55,8 +55,9 @@ namespace kernels
 //                  layout [..., num_heads * chunks_per_head, scale_buf_m]
 //                  where scale_buf_m = pad_up(num_tokens, 4) per the BMM
 //                  dequant consumer's hard-coded m-dim stride.
+template <typename TPosition>
 void invokeInverseRopeFp8Quant(void const* o, //
-    void const* positions,                    //
+    TPosition const* positions,               //
     void const* cos_sin_cache,                //
     void* fp8_out,                            //
     void* scale_out,                          //

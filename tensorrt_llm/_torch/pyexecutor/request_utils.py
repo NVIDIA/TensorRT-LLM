@@ -3,6 +3,7 @@
 
 """Utility functions for request processing."""
 
+import dataclasses
 import os
 import time
 from typing import TYPE_CHECKING, Optional
@@ -10,10 +11,12 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from .executor_request_queue import RequestQueueItem
     from .scheduler import WaitingQueue
+    from .scheduler.adp_router import ADPRouter
 
 import numpy as np
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
@@ -65,6 +68,7 @@ def can_process_attention_dp_request(
     req_item: "RequestQueueItem",
     all_ranks_num_active_requests: list[int],
     max_num_active_requests: int,
+    router: Optional["ADPRouter"] = None,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -72,17 +76,20 @@ def can_process_attention_dp_request(
         req_item: The request queue item to check.
         all_ranks_num_active_requests: Number of active requests for each rank.
         max_num_active_requests: Maximum number of active requests per rank.
+        router: ADP router whose admission rank, when it names one, wins over
+            an explicit non-relaxed ``attention_dp_rank``.
 
     Returns:
         True if the request can be processed, False otherwise.
     """
-    scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-    if scheduling_params is None:
-        return True
-
-    target_dp_rank = scheduling_params.attention_dp_rank
-    if target_dp_rank is None or scheduling_params.attention_dp_relax:
-        return True
+    target_dp_rank = None if router is None else router.admission_rank(req_item)
+    if target_dp_rank is None:
+        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+        if scheduling_params is None or scheduling_params.attention_dp_relax:
+            return True
+        target_dp_rank = scheduling_params.attention_dp_rank
+        if target_dp_rank is None:
+            return True
 
     if all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests:
         all_ranks_num_active_requests[target_dp_rank] += 1
@@ -97,6 +104,7 @@ def get_from_waiting_queue(
     enable_attention_dp: bool,
     max_num_active_requests: int,
     all_ranks_num_active_requests: Optional[list[int]] = None,
+    router: Optional["ADPRouter"] = None,
 ) -> list["RequestQueueItem"]:
     """Get requests from the waiting queue.
 
@@ -106,6 +114,7 @@ def get_from_waiting_queue(
         enable_attention_dp: Whether to enable attention DP scheduling.
         max_num_active_requests: Maximum number of active requests per rank.
         all_ranks_num_active_requests: Number of active requests for each rank.
+        router: ADP router consulted for each request's admission rank.
 
     Returns:
         List of requests that can be processed.
@@ -131,7 +140,10 @@ def get_from_waiting_queue(
 
         can_process = (
             can_process_attention_dp_request(
-                req_item, scheduling_all_ranks_num_active_requests, max_num_active_requests
+                req_item,
+                scheduling_all_ranks_num_active_requests,
+                max_num_active_requests,
+                router=router,
             )
             if enable_attention_dp
             else True
@@ -141,6 +153,7 @@ def get_from_waiting_queue(
             items.append(req_item)
             req_count += 1 + num_children
         else:
+            req_item.admission_wait_iters += 1
             pending_requests.append(req_item)
 
     # Put the pending requests back to the waiting queue
@@ -208,7 +221,9 @@ def partition_context_for_helix(
 
 
 def merge_requests_to_llm_requests(
-    new_requests: list["RequestQueueItem"], exclude_last_generation_logits: bool
+    new_requests: list["RequestQueueItem"],
+    exclude_last_generation_logits: bool,
+    track_unique_tokens: bool = True,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
@@ -222,7 +237,12 @@ def merge_requests_to_llm_requests(
     req_with_children = []
     for req_item in new_requests:
         req = executor_request_to_llm_request(
-            req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
+            req_item.id,
+            req_item.request,
+            req_item.child_req_ids,
+            exclude_last_generation_logits,
+            input_token_ids=req_item.prompt_token_ids,
+            track_unique_tokens=track_unique_tokens,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -284,6 +304,7 @@ def merge_requests(
     cp_size: int,
     exclude_last_generation_logits: bool,
     is_disagg: bool,
+    track_unique_tokens: bool = True,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -302,6 +323,7 @@ def merge_requests(
         is_disagg: Whether this executor serves disaggregated generation. Only
             disaggregated Helix slices the prompt per rank; aggregated Helix
             keeps the full prompt on every rank.
+        track_unique_tokens: Whether the requests keep the unique tokens block reuse keys on.
 
     Returns:
         List of LlmRequest objects.
@@ -324,17 +346,46 @@ def merge_requests(
         elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
-    return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
+    return merge_requests_to_llm_requests(
+        new_requests, exclude_last_generation_logits, track_unique_tokens
+    )
+
+
+# A tag of its own: other point-to-point traffic (PP, autotuner) shares the world communicator.
+_OWNER_PROMPT_TAG = 21000
+_PROMPT_PLACEHOLDER = np.zeros(1, dtype=np.int32).tobytes()
+
+
+def _without_prompt(item):
+    """A copy of a queued request whose prompt is a one-token placeholder."""
+    if item.request is None:
+        return item
+    num_input_tokens = item.request.num_input_tokens
+    state = item.request.request.__getstate__()
+    # The binding's pickled state leads with the prompt as int32 bytes.
+    assert len(state[0]) == 4 * num_input_tokens
+    request = Request.__new__(Request)
+    request.__setstate__((_PROMPT_PLACEHOLDER, *state[1:]))
+    return dataclasses.replace(
+        item,
+        request=ExecutorRequest(request, item.request.inputs),
+        num_input_tokens=num_input_tokens,
+    )
 
 
 class RequestBroadcaster:
-    """Broadcasts requests across distributed ranks (TP, PP, CP)."""
+    """Broadcasts requests across distributed ranks (TP, PP, CP).
+
+    With ``prompts_to_owners`` the broadcast carries requests without their prompts, and
+    ``deliver_prompts`` sends each prompt only to the rank the request is admitted on.
+    """
 
     def __init__(
         self,
         dist: Distributed,
         hang_detector: HangDetector,
         sync_clock: bool = False,
+        prompts_to_owners: bool = False,
     ) -> None:
         self.dist = dist
         self.hang_detector = hang_detector
@@ -346,6 +397,7 @@ class RequestBroadcaster:
         self.rank0_now: Optional[float] = None
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
+        self.prompts_to_owners = prompts_to_owners
 
     def broadcast(
         self,
@@ -478,6 +530,8 @@ class RequestBroadcaster:
         self, new_requests: list["RequestQueueItem"]
     ) -> list["RequestQueueItem"]:
         """Broadcast request envelopes across pipeline stages."""
+        if self.prompts_to_owners and self.dist.rank == 0:
+            new_requests = [_without_prompt(item) for item in new_requests]
         payloads = new_requests
 
         if self.dist.world_size == 1:
@@ -519,3 +573,24 @@ class RequestBroadcaster:
                 self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
 
         return payloads
+
+    @nvtx_range("deliver_prompts")
+    def deliver_prompts(self, all_ranks_new_requests: dict[int, list["RequestQueueItem"]]) -> None:
+        """Send rank 0's prompts of the admitted requests to their owning ranks."""
+        if not self.prompts_to_owners:
+            return
+        if self.dist.rank == 0:
+            prompts, sends = [], []
+            for rank, items in all_ranks_new_requests.items():
+                if rank == 0:
+                    continue
+                for item in items:
+                    prompts.append(item.request.get_input_token_ids_array())
+                    sends.append(self.dist.isend(prompts[-1], rank, _OWNER_PROMPT_TAG))
+            for send in sends:
+                send.Wait()
+            return
+        for item in all_ranks_new_requests[self.dist.rank]:
+            prompt = np.empty(item.num_input_tokens, dtype=np.int32)
+            self.dist.recv(prompt, 0, _OWNER_PROMPT_TAG)
+            item.prompt_token_ids = prompt

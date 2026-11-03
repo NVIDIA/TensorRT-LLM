@@ -243,3 +243,82 @@ def test_deepseek_dense_layer_enables_locality_domain_bf16_mlp(
     call = gated_mlp_constructor.call_args
     assert call.kwargs["config"] is config
     assert call.kwargs["enable_locality_domain_bf16_linear"] is True
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="needs SM100/SM103/SM107",
+)
+@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("backend", ["deep_gemm", "cute_dsl", "disable_deep_gemm"])
+@torch.inference_mode()
+def test_fp8_block_scale_mlp_small_m_matches_deep_gemm(rows, backend):
+    """A tuned shared-expert-sized FP8 MLP is at least as close to the exact product as its
+    untuned forward."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    if backend != "deep_gemm" and (
+        torch.cuda.get_device_capability() != (10, 7) or not IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    ):
+        pytest.skip("The CuTe DSL candidate requires Rubin helpers on SM107")
+    torch.manual_seed(0)
+    hidden, intermediate = 5120, 1152
+    config = ModelConfig(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    )
+    mlp = GatedMLP(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=config,
+        use_cute_dsl_blockscaling_mm=backend == "cute_dsl",
+    ).cuda()
+    if backend == "disable_deep_gemm":
+        for linear in (mlp.gate_up_proj, mlp.down_proj):
+            linear.disable_deep_gemm = True
+
+    def block_scaled(out_features, in_features):
+        weight = torch.randn(out_features, in_features) * in_features**-0.5
+        blocks = weight.view(out_features // 128, 128, in_features // 128, 128)
+        scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax((1, 3)) / 448)))
+        quantized = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn)
+        dequantized = (quantized.double() * scale[:, None, :, None]).view(out_features, in_features)
+        return {
+            "weight": quantized.view(out_features, in_features),
+            "weight_scale_inv": scale,
+        }, dequantized.cuda()
+
+    gate, gate_ref = block_scaled(intermediate, hidden)
+    up, up_ref = block_scaled(intermediate, hidden)
+    down, down_ref = block_scaled(hidden, intermediate)
+    mlp.gate_up_proj.load_weights([gate, up])
+    mlp.down_proj.load_weights([down])
+    for linear in (mlp.gate_up_proj, mlp.down_proj):
+        linear.post_load_weights()
+    x = torch.randn(rows, hidden, dtype=torch.bfloat16, device="cuda")
+    reference = (F.silu(x.double() @ gate_ref.t()) * (x.double() @ up_ref.t())) @ down_ref.t()
+
+    def rms_error(output):
+        return (output.double() - reference).square().mean().sqrt().item()
+
+    AutoTuner.get().clear_cache()
+    plain = mlp(x)
+    with autotune():
+        mlp(x)
+    tuned = mlp(x)
+    # Whichever kernels win, the tuned forward is at least as close to the exact product.
+    assert rms_error(tuned) <= 1.05 * rms_error(plain)
+    assert rms_error(tuned) <= 2e-2 * reference.square().mean().sqrt().item()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mlp(x)
+    x.copy_(torch.randn_like(x))
+    expected = mlp(x)
+    graph.replay()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)

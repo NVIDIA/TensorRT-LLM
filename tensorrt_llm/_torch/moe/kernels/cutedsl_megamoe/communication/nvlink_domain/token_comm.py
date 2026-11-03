@@ -35,6 +35,7 @@ from ...helpers.smem_workspace import SmemWorkspace
 from ...helpers.utils import ceil_div, round_up
 from ...quant_def import CombineFormat, QuantKind
 from ..token_protocol import TokenSrcMetadata
+from .one_round_router import _OneRoundRouter, fence_proxy_async_global
 from .symmetric_buffer import SymmetricBufferDevice
 
 
@@ -737,6 +738,8 @@ class _MetadataPushRouter(KernelComponent):
             expert = Int32(expert_round * block_thread_count) + self._router_thread_idx
             if expert < Int32(self.expert_count_padded):
                 totals[expert] = size_counter[expert]
+        # The bulk copies to the peers read this row through the async proxy.
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
 
         publish_sizes = self._broadcast_sizes_to_peers(totals)
@@ -1153,6 +1156,8 @@ class _MetadataPushRouter(KernelComponent):
                     histogram.iterator + expert_registers[register_idx], Int32(1), sem="relaxed", scope="cta"
                 )
             )
+        # The bulk copies to the peers read this histogram through the async proxy.
+        cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
         return within_expert_indices
 
@@ -1371,6 +1376,7 @@ class TokenCommNonDeterministic(KernelComponent):
             "token_back_ready_granularity": OptionalRequirement(str),
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
+            "one_round_dispatch": OptionalRequirement(bool),
             "comm_cta_count": OptionalRequirement(int),
             "comm_warps": OptionalRequirement(tuple),
             "token_back_on_compute_ctas": OptionalRequirement(bool),
@@ -1443,9 +1449,20 @@ class TokenCommNonDeterministic(KernelComponent):
         self.dispatch_sf_group = impl_desc.get("dispatch_sf_group", 1)
         self.token_in_stage_split = impl_desc.get("token_in_stage_split", False)
         self._token_in_stage_chunk_count = 2 if self.token_in_stage_split else 1
+        # One-round push dispatch (``_OneRoundRouter``): the router launch pushes payloads and records, and
+        # ``token_in`` copies rows from the local received plane instead of pulling them from the peers.
+        self.one_round_dispatch = bool(impl_desc.get("one_round_dispatch", False))
+        # Tail parity (the kernel enables it on its workspace): the shared tail-reset counters are kept twice and
+        # selected by a per-rank call epoch. Call n zeroes the copy call n + 1 uses right after its pulls, so the
+        # tail needs only the drain barrier: no shared reset and no publish barrier after it.
+        self.tail_parity = bool(impl_desc.get("tail_parity", False))
 
         self._validate_configuration()
-        self._router = _MetadataPushRouter(problem_desc, impl_desc)
+        self._router = (
+            _OneRoundRouter(problem_desc, impl_desc)
+            if self.one_round_dispatch
+            else _MetadataPushRouter(problem_desc, impl_desc)
+        )
         self._nvlink_barrier = NvlinkBarrier(world_size=self.world_size, barrier_id=self.grid_sync_barrier_id)
         self._device_workspace = None
         self._token_comm_args = None
@@ -1551,6 +1568,10 @@ class TokenCommNonDeterministic(KernelComponent):
                 raise ValueError("Multi-stage token-back requires static scheduling.")
             if self.combine_format.is_quantized:
                 raise ValueError("Multi-stage token-back supports BF16 combine only.")
+        if (self.one_round_dispatch or self.tail_parity) and (
+            self.cta_specialized or self.dispatch_stage_depth > 1 or self.token_in_stage_split
+        ):
+            raise NotImplementedError("One-round dispatch and tail parity require the fused single-stage token_in.")
 
     @property
     def experts_per_rank(self) -> int:
@@ -1689,22 +1710,36 @@ class TokenCommNonDeterministic(KernelComponent):
         activation_sf: Optional[cute.Tensor] = None,
         activation_scales: Optional[cute.Tensor] = None,
     ) -> None:
-        self._router.launch_router(
-            topk_indices,
-            topk_scores,
-            local_rank,
-            local_workspace,
-            shared_workspace,
-            peer_rank_ptr_mapper_host,
-            device_workspace,
-            stream,
-            gin_dev_comm,
-            gin_window,
-            gin_shared_window_offset,
-            activation,
-            activation_sf,
-            activation_scales,
-        )
+        if cutlass.const_expr(self.one_round_dispatch):
+            self._router.launch_router(
+                topk_indices,
+                topk_scores,
+                activation,
+                activation_sf,
+                local_rank,
+                local_workspace,
+                shared_workspace,
+                peer_rank_ptr_mapper_host,
+                device_workspace,
+                stream,
+            )
+        else:
+            self._router.launch_router(
+                topk_indices,
+                topk_scores,
+                local_rank,
+                local_workspace,
+                shared_workspace,
+                peer_rank_ptr_mapper_host,
+                device_workspace,
+                stream,
+                gin_dev_comm,
+                gin_window,
+                gin_shared_window_offset,
+                activation,
+                activation_sf,
+                activation_scales,
+            )
 
     # Pool-layout hooks. The NVLink-domain component consumes the router's tables directly; the
     # internode component redirects them to the final layout (intra + relay segments) that SM0 of the
@@ -1819,6 +1854,8 @@ class TokenCommNonDeterministic(KernelComponent):
         return None
 
     def fc1_activation_per_token_scales_tensor(self, device_workspace: DeviceWorkspace) -> Optional[cute.Tensor]:
+        if cutlass.const_expr(self.one_round_dispatch):
+            return None
         return self._router.fc1_activation_per_token_scales_tensor(device_workspace)
 
     @cute.jit
@@ -2578,6 +2615,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
         iket.range_push("token_in.wait_metadata_ready")
         self._router.wait_for_metadata_ready(self._device_workspace)
+        if cutlass.const_expr(self.one_round_dispatch):
+            # The plane rows were written by peers' generic stores and are read below through TMA.
+            fence_proxy_async_global()
         iket.range_pop()
 
         for size_copy_round in cutlass.range_constexpr(size_copy_rounds):
@@ -2671,8 +2711,20 @@ class TokenCommNonDeterministic(KernelComponent):
                     token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes),
                     wide_topk=self.wide_topk_records,
                 )
-                peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
-                remote_activation_address, remote_sf_address = self.pull_source_addresses(metadata, peer_offset)
+                if cutlass.const_expr(self.one_round_dispatch):
+                    # The source rank already pushed this row into its plane of the local workspace.
+                    plane_row = Int64(metadata.src_rank) * Int64(self.max_tokens_per_rank) + Int64(metadata.src_token)
+                    remote_activation_address = (
+                        self._router.plane_activation_pointer(self._device_workspace).toint()
+                        + plane_row * Int64(self.bytes_per_token)
+                    )
+                    remote_sf_address = (
+                        self._router.plane_activation_sf_pointer(self._device_workspace).toint()
+                        + plane_row * Int64(self._router.sf_row_bytes)
+                    )
+                else:
+                    peer_offset = self._token_comm_args.peer_rank_ptr_mapper.map(Int64(0), metadata.src_rank, Int64(0))
+                    remote_activation_address, remote_sf_address = self.pull_source_addresses(metadata, peer_offset)
 
                 if cutlass.const_expr(self.token_in_stage_split):
                     # Chunked pull: the halved stage bounces each token row in two pieces,
@@ -2774,6 +2826,15 @@ class TokenCommNonDeterministic(KernelComponent):
 
         flag_tracker.fire()
         cute.arch.sync_warp()
+        if cutlass.const_expr(self.tail_parity):
+            # The copy call n + 1 uses was last used by call n - 1, whose peer writes all landed before call n - 1's
+            # metadata wait passed; this rank's drain arrival (fence.acq_rel.sys + release) orders the zeroing before
+            # any peer can start call n + 1.
+            iket.range_push("token_in.zero_next_tail_copy")
+            self._device_workspace.reset_next_tail_shared(
+                global_warp_idx * Int32(32) + lane_idx, self.dispatch_cta_count * self.dispatch_warp_count * 32
+            )
+            iket.range_pop()
         if cutlass.const_expr(self.token_back_enabled and self.token_back_mode != "standalone_warps"):  # nosec B105
             iket.range_push("token_in.transfer_barrier")
             transfer_lifetime_barrier = pipeline.NamedBarrier(
@@ -3366,20 +3427,31 @@ class TokenCommNonDeterministic(KernelComponent):
         iket.range_pop()
         total_reset_threads = self.promised_launchable_sm_count * self.transfer_thread_count
         global_reset_thread = self._linear_cta_idx * Int32(self.transfer_thread_count) + transfer_thread_idx
-        iket.range_push("tail.reset_workspace")
-        self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
-        self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
-        iket.range_pop()
-        iket.range_push("tail.nvlink_publish")
-        self._nvlink_barrier.arrive_and_wait(
-            self.transfer_thread_count,
-            Int32(self.promised_launchable_sm_count),
-            self._linear_cta_idx,
-            transfer_thread_idx,
-            prologue_grid_sync=True,
-            epilogue_grid_sync=False,
-        )
-        iket.range_pop()
+        if cutlass.const_expr(self.tail_parity):
+            # Shared tail-reset counters: this call's copy is zeroed during call n + 1 (as that call's "next" copy),
+            # the next call's copy was zeroed after this call's pulls, so only the rank-local counters are reset here
+            # and no publish barrier follows (the next launch on this rank is stream-ordered after this one).
+            iket.range_push("tail.reset_local")
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            iket.range_pop()
+            if self._linear_cta_idx == Int32(0):
+                if transfer_thread_idx == Int32(0):
+                    self._device_workspace.advance_epoch(self._device_workspace.epoch_value + Int32(1))
+        else:
+            iket.range_push("tail.reset_workspace")
+            self._device_workspace.reset_tail_space("shared", global_reset_thread, total_reset_threads)
+            self._device_workspace.reset_tail_space("local", global_reset_thread, total_reset_threads)
+            iket.range_pop()
+            iket.range_push("tail.nvlink_publish")
+            self._nvlink_barrier.arrive_and_wait(
+                self.transfer_thread_count,
+                Int32(self.promised_launchable_sm_count),
+                self._linear_cta_idx,
+                transfer_thread_idx,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=False,
+            )
+            iket.range_pop()
         if cutlass.const_expr(os.environ.get("MEGA_USE_NCU", "0") == "1"):
             iket.range_push("tail.ncu_finalize")
             self._nvlink_barrier.finalize(

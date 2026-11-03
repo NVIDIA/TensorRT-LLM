@@ -1722,3 +1722,86 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
             assert cap_mode == "tight", f"unexpected void {tag}"
     if cap_mode == "tight":
         assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("batch_size, avg_ctx", [(1, 3001), (7, 40001), (25, 6000)])
+def test_cute_dsl_fp4_paged_mqa_logits_split_rows_match_deepgemm(batch_size, avg_ctx):
+    """Six 32-head queries per request, run as three 64-head rows, give DeepGEMM's next_n=6 logits."""
+    page, next_n, heads = 64, 6, 32
+    gen = torch.Generator(device="cuda").manual_seed(batch_size)
+    context_lens = torch.randint(
+        int(0.85 * avg_ctx),
+        int(1.15 * avg_ctx),
+        (batch_size,),
+        generator=gen,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    blocks = ceil_div_tensor(context_lens, page)
+    total = int(blocks.sum().item()) + 2 * batch_size
+    block_table = torch.zeros(
+        (batch_size, int(blocks.max().item())), dtype=torch.int32, device="cuda"
+    )
+    pool = torch.randperm(total, generator=gen, device="cuda").to(torch.int32)
+    offset = 0
+    for i, n in enumerate(blocks.tolist()):
+        block_table[i, :n] = pool[offset : offset + n]
+        offset += n
+    # Every FP4 code and UE8M0 scales around 1.
+    data = torch.randint(
+        0, 256, (total, page * 64), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    scales = torch.randint(
+        118, 137, (total, page * 4), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    kv = torch.cat([data, scales], dim=1).view(total, page, 1, 68)
+    q = torch.randint(
+        0, 256, (batch_size, next_n, heads, 64), generator=gen, device="cuda", dtype=torch.uint8
+    )
+    sf_q = (
+        torch.randint(
+            118,
+            137,
+            (batch_size, next_n, heads, 4),
+            generator=gen,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        .view(torch.int32)
+        .view(batch_size, next_n, heads)
+    )
+    weights = torch.randn((batch_size * next_n, heads), generator=gen, device="cuda")
+    row_lens = torch.stack([context_lens - next_n + j + 1 for j in range(next_n)], dim=1).to(
+        torch.int32
+    )
+    max_ctx = int(context_lens.max().item())
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+
+    ref = deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q.view(torch.int8), sf_q),
+        kv,
+        weights,
+        row_lens,
+        block_table,
+        deep_gemm.get_paged_mqa_logits_metadata(row_lens, page, num_sms),
+        max_ctx,
+    )
+    rows = next_n * heads // 64
+    # The CSA2 indexer passes each request's first-row page table: a strided view.
+    row_tables = block_table.unsqueeze(1).expand(-1, next_n, -1).contiguous()
+    got = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q.view(batch_size, rows, 64, 64),
+        sf_q.view(batch_size, rows, 64),
+        kv,
+        weights.view(batch_size * rows, 64),
+        context_lens,
+        row_tables[:, 0],
+        deep_gemm.get_paged_mqa_logits_metadata(context_lens.unsqueeze(-1), page, num_sms),
+        max_ctx,
+        row_heads=heads,
+    )
+    valid = torch.arange(max_ctx, device="cuda")[None, :] < row_lens.flatten()[:, None]
+    assert torch.equal(
+        got[:, :max_ctx][valid].view(torch.int32), ref[:, :max_ctx][valid].view(torch.int32)
+    )

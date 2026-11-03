@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import re
 from typing import Dict, List, Optional, Set
 
 from tensorrt_llm.bindings.executor import (
@@ -16,6 +17,7 @@ from tensorrt_llm.bindings.executor import (
 )
 from tensorrt_llm.logger import logger
 
+from .iteration_stats_json import iteration_stats_row
 from .scheduler.adp_router import RankIterStatsPayload, RankState
 from .scheduler.rank_state import RankKvCacheStats, RankSpecDecodingStats
 
@@ -35,6 +37,65 @@ _ITERATION_STATS_SCALAR_FIELDS = (
 )
 
 _ITERATION_STATS_OPTIONAL_FIELDS = ("static_batching_stats",)
+
+
+# The /metrics JSON key of each InflightBatchingStats field taken from a rank's payload; the other
+# fields of a rank's row come from rank 0's stats.
+_PAYLOAD_IFB_KEYS = {
+    "num_context_requests": "numContextRequests",
+    "num_ctx_tokens": "numCtxTokens",
+    "num_ctx_kv_tokens": "numCtxKvTokens",
+    "num_gen_requests": "numGenRequests",
+    "num_gen_kv_tokens": "numGenKvTokens",
+    "num_paused_requests": "numPausedRequests",
+    "num_paused_kv_tokens": "numPausedKvTokens",
+}
+# The /metrics JSON key of each KvCacheStats field, in the native serializer's (sorted) key order.
+_KV_CACHE_STATS_KEYS = {
+    "alloc_new_blocks": "allocNewBlocks",
+    "alloc_total_blocks": "allocTotalBlocks",
+    "cache_hit_rate": "cacheHitRate",
+    "free_num_blocks": "freeNumBlocks",
+    "max_num_blocks": "maxNumBlocks",
+    "missed_blocks": "missedBlocks",
+    "reused_blocks": "reusedBlocks",
+    "tokens_per_block": "tokensPerBlock",
+    "used_num_blocks": "usedNumBlocks",
+}
+# A rank's kvCacheStats text as json.dumps writes it: repr of each value, in key order.
+_KV_CACHE_STATS_FORMAT = (
+    "{" + ", ".join(f'"{key}": %r' for key in _KV_CACHE_STATS_KEYS.values()) + "}"
+)
+# The /metrics JSON key of each SpecDecodingStats field, in the native serializer's (sorted) key order.
+_SPECDEC_STATS_KEYS = {
+    "acceptance_length": "acceptanceLength",
+    "draft_overhead": "draftOverhead",
+    "iter_latency_ms": "iterLatencyMS",
+    "num_accepted_tokens": "numAcceptedTokens",
+    "num_draft_tokens": "numDraftTokens",
+    "num_requests_with_draft_tokens": "numRequestsWithDraftTokens",
+}
+_SPECDEC_STATS_FORMAT = (
+    "{" + ", ".join(f'"{key}": %r' for key in _SPECDEC_STATS_KEYS.values()) + "}"
+)
+# Marks for the parts of a rank row that differ between ranks other than 0, and their row text.
+_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK = (
+    "@adp-row-inflight-batching-stats@",
+    "@adp-row-kv-cache-stats@",
+    "@adp-row-specdec-stats@",
+    "@adp-row-attention-dp-rank@",
+)
+_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT = (
+    json.dumps(_IFB_MARK),
+    json.dumps(_KV_MARK),
+    json.dumps(_SPECDEC_MARK),
+    json.dumps(_RANK_MARK),
+)
+_MARK_TEXTS = re.compile(
+    "("
+    + "|".join(re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT))
+    + ")"
+)
 
 
 def _snapshot_kv_cache_stats(stats: KvCacheStats | None) -> RankKvCacheStats | None:
@@ -121,22 +182,21 @@ def _restore_specdec_stats(
     return stats
 
 
-@dataclass
-class ADPIterStatsRecord:
-    """Append-ready stats row produced by Attention-DP fanout."""
+def _kv_cache_stats_text(snapshot: RankKvCacheStats | None) -> str:
+    """A rank's ``kvCacheStats`` row text, as serializing its restored stats would write it."""
+    if snapshot is None:
+        return "null"
+    return _KV_CACHE_STATS_FORMAT % tuple(getattr(snapshot, name) for name in _KV_CACHE_STATS_KEYS)
 
-    stats: IterationStats
-    req_stats: Optional[List[RequestStats]]
-    kv_iter_stats: Optional[Dict[int, object]]
-    attention_dp_rank: int
-    # Per-loop CPU wall and GPU forward time captured on rank 0 alongside
-    # the IterationStats at queue time. Currently broadcast unchanged to all
-    # rank rows during fanout (true per-rank timing would require widening
-    # the rank-state allgather payload). Under steady-state ADP all ranks
-    # step in lockstep, so this is a reasonable approximation.
-    host_step_time_ms: Optional[float] = None
-    prev_device_step_time_ms: Optional[float] = None
-    gpu_forward_time_ms: Optional[float] = None
+
+def _specdec_stats_text(
+    snapshot: RankSpecDecodingStats | None, rank0_stats: SpecDecodingStats | None
+) -> str:
+    """A rank's ``specDecodingStats`` row text, as serializing its restored stats would write it."""
+    if snapshot is None:
+        return "null"
+    stats = _restore_specdec_stats(snapshot, rank0_stats)
+    return _SPECDEC_STATS_FORMAT % tuple(getattr(stats, name) for name in _SPECDEC_STATS_KEYS)
 
 
 class ADPIterStatsBuffer:
@@ -344,9 +404,14 @@ class ADPIterStatsBuffer:
         return stats
 
     def finalize(
-        self, all_rank_states: List[RankState], *, is_rank0: bool
-    ) -> List[ADPIterStatsRecord]:
-        """Align payloads and return per-rank rows once all ranks are ready."""
+        self,
+        all_rank_states: List[RankState],
+        *,
+        is_rank0: bool,
+        scheduler_mode: Optional[str] = None,
+    ) -> List[str]:
+        """Align payloads; once every rank is ready, rank 0 returns each rank's ``/metrics`` JSON
+        row (``iteration_stats_row`` of that rank's stats) in rank order."""
         pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
         if not pending_states:
             return []
@@ -378,7 +443,7 @@ class ADPIterStatsBuffer:
             )
             return []
 
-        records: List[ADPIterStatsRecord] = []
+        rows: List[str] = []
         if is_rank0:
             rank0_stats = self._rank0_iter_stats.get(iter_stats_iter)
             if rank0_stats is None:
@@ -389,26 +454,66 @@ class ADPIterStatsBuffer:
                 )
                 self._clear_through(iter_stats_iter)
                 return []
-
-            req_stats = self._rank0_req_stats.get(iter_stats_iter)
-            kv_iter_stats = self._rank0_kv_iter_stats.get(iter_stats_iter)
-            host_step_time_ms = self._rank0_host_step_time_ms.get(iter_stats_iter)
-            prev_device_step_time_ms = self._rank0_prev_device_step_time_ms.get(iter_stats_iter)
-            gpu_forward_time_ms = self._rank0_gpu_forward_time_ms.get(iter_stats_iter)
-
-            for rank_state in sorted(matching_states, key=lambda s: s.rank):
-                rank = rank_state.rank
-                records.append(
-                    ADPIterStatsRecord(
-                        stats=self._make_rank_iter_stats(rank0_stats, rank_state),
-                        req_stats=req_stats if rank == 0 else None,
-                        kv_iter_stats=kv_iter_stats if rank == 0 else None,
-                        attention_dp_rank=rank,
-                        host_step_time_ms=host_step_time_ms,
-                        prev_device_step_time_ms=prev_device_step_time_ms,
-                        gpu_forward_time_ms=gpu_forward_time_ms,
-                    )
-                )
+            rows = self._rank_rows(
+                rank0_stats,
+                sorted(matching_states, key=lambda s: s.rank),
+                self._rank0_req_stats.get(iter_stats_iter),
+                self._rank0_kv_iter_stats.get(iter_stats_iter),
+                # Per-loop timings exist on rank 0 only; every rank's row carries them (ADP ranks
+                # step in lockstep).
+                timings=dict(
+                    host_step_time_ms=self._rank0_host_step_time_ms.get(iter_stats_iter),
+                    prev_device_step_time_ms=self._rank0_prev_device_step_time_ms.get(
+                        iter_stats_iter
+                    ),
+                    scheduler_mode=scheduler_mode,
+                    gpu_forward_time_ms=self._rank0_gpu_forward_time_ms.get(iter_stats_iter),
+                ),
+            )
 
         self._clear_through(iter_stats_iter)
-        return records
+        return rows
+
+    def _rank_rows(
+        self,
+        rank0_stats: IterationStats,
+        states: List[RankState],
+        req_stats: Optional[List[RequestStats]],
+        kv_iter_stats: Optional[Dict[int, object]],
+        timings: Dict[str, object],
+    ) -> List[str]:
+        """Rows of ranks other than 0 differ only in their payload counts, KV cache stats,
+        speculative-decoding stats and rank: the first is built in full and the others are
+        spliced into its text."""
+        rows: List[str] = []
+        template = None
+        for state in states:
+            if state.rank == 0:
+                stats = self._make_rank_iter_stats(rank0_stats, state)
+                row = iteration_stats_row(stats, req_stats, kv_iter_stats, 0, **timings)
+                rows.append(json.dumps(row))
+                continue
+            if template is None:
+                stats = self._make_rank_iter_stats(rank0_stats, state)
+                row = iteration_stats_row(stats, attention_dp_rank=state.rank, **timings)
+                ifb = row["inflightBatchingStats"]
+                row["inflightBatchingStats"] = _IFB_MARK
+                row["kvCacheStats"] = _KV_MARK
+                row["specDecodingStats"] = _SPECDEC_MARK
+                row["attentionDpRank"] = _RANK_MARK
+                template = (_MARK_TEXTS.split(json.dumps(row)), ifb)
+            pieces, ifb = template
+            payload = state.iter_stats
+            for name, key in _PAYLOAD_IFB_KEYS.items():
+                ifb[key] = getattr(payload, name)
+            ifb["numScheduledRequests"] = payload.num_context_requests + payload.num_gen_requests
+            fills = {
+                _IFB_TEXT: json.dumps(ifb),
+                _KV_TEXT: _kv_cache_stats_text(payload.kv_cache_stats),
+                _SPECDEC_TEXT: _specdec_stats_text(
+                    payload.specdec_stats, rank0_stats.specdec_stats
+                ),
+                _RANK_TEXT: str(state.rank),
+            }
+            rows.append("".join(fills.get(piece, piece) for piece in pieces))
+        return rows

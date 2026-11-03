@@ -39,6 +39,7 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
+                                          PrefillCudaGraphBackend,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -1247,6 +1248,18 @@ class ModelLoader:
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
 
+    def _megamoe_fuse_shared_expert(
+            self, checkpoint_loader: BaseCheckpointLoader) -> bool:
+        """The moe_config switch, off when the weights are shared: the fused copy is per process."""
+        requested = self.llm_args.moe_config.megamoe_fuse_shared_expert
+        if requested and self._needs_source_identity(checkpoint_loader,
+                                                     self.llm_args.load_format):
+            logger.warning(
+                "megamoe_fuse_shared_expert is off: shared weights (GMS / MX) "
+                "keep the separate shared expert")
+            return False
+        return requested
+
     @staticmethod
     def _build_source_identity(
         config: ModelConfig,
@@ -2360,6 +2373,8 @@ class ModelLoader:
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
+            megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(
+                checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
@@ -2409,6 +2424,9 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        config.extra_attrs["breakable_prefill_cuda_graph"] = (
+            self.llm_args.prefill_cuda_graph_backend ==
+            PrefillCudaGraphBackend.BREAKABLE)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,12 +15,14 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/helixAllToAll.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <c10/cuda/CUDAGuard.h>
 #include <optional>
 #include <vector>
 
@@ -111,6 +113,57 @@ std::vector<torch::Tensor> alltoall_helix(
 #else
     return {};
 #endif // ENABLE_MULTI_DEVICE
+}
+
+torch::Tensor alltoallvTokens(
+    torch::Tensor input, torch::List<int64_t> counts, torch::List<int64_t> groupRanks, int64_t rank)
+{
+#if ENABLE_MULTI_DEVICE
+    CHECK_TH_CUDA(input);
+    CHECK_CONTIGUOUS(input);
+    auto const groupSize = static_cast<int>(groupRanks.size());
+    std::set<int> group;
+    int64_t localStart = 0;
+    for (int peer = 0; peer < groupSize; ++peer)
+    {
+        group.insert(static_cast<int>(groupRanks[peer]));
+        localStart += peer < rank ? counts[peer] : 0;
+    }
+    c10::cuda::CUDAGuard deviceGuard(input.device());
+    auto const localRows = counts[rank];
+    auto output = torch::empty({groupSize, localRows, input.size(1)}, input.options());
+    auto const stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    auto const communicator = getComm(group);
+    auto const rowBytes = static_cast<size_t>(input.size(1)) * input.element_size();
+    auto const localBytes = static_cast<size_t>(localRows) * rowBytes;
+    auto const* source = static_cast<uint8_t const*>(input.data_ptr());
+    auto* destination = static_cast<uint8_t*>(output.mutable_data_ptr());
+    if (localBytes > 0)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(destination + rank * localBytes, source + localStart * rowBytes, localBytes,
+            cudaMemcpyDeviceToDevice, stream));
+    }
+    ncclGroupStart();
+    size_t sourceOffset = 0;
+    for (int peer = 0; peer < groupSize; ++peer)
+    {
+        auto const sendBytes = static_cast<size_t>(counts[peer]) * rowBytes;
+        if (peer != rank && sendBytes > 0)
+        {
+            ncclSend(source + sourceOffset, sendBytes, ncclUint8, peer, *communicator, stream);
+        }
+        if (peer != rank && localBytes > 0)
+        {
+            ncclRecv(destination + peer * localBytes, localBytes, ncclUint8, peer, *communicator, stream);
+        }
+        sourceOffset += sendBytes;
+    }
+    NCCLCHECK_THROW(ncclGroupEnd());
+    return output;
+#else
+    TORCH_CHECK(false, "alltoallv_tokens requires multi-device support");
+    return {};
+#endif
 }
 
 /**
@@ -285,6 +338,7 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("alltoallv_tokens(Tensor input, int[] counts, int[] group, int rank) -> Tensor");
     m.def("alltoall_helix(Tensor[] input_list, int[] group, int? num_lists) -> Tensor[]");
     m.def(
         "alltoall_helix_native(Tensor partial_o, Tensor softmax_stats, Tensor(a!) workspace, int "
@@ -296,6 +350,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("alltoallv_tokens", &tensorrt_llm::torch_ext::alltoallvTokens);
     m.impl("alltoall_helix", &tensorrt_llm::torch_ext::alltoall_helix);
     m.impl("alltoall_helix_native", &tensorrt_llm::torch_ext::alltoall_helix_native);
     m.impl("initialize_helix_workspace", &tensorrt_llm::torch_ext::initialize_helix_workspace);

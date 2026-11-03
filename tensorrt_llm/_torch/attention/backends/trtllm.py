@@ -28,6 +28,7 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...host_staging import HostUploader
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
@@ -47,7 +48,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
-from ...pyexecutor import step_inputs
+from ...pyexecutor import h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -213,6 +214,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
+
+    # Set by the runner that owns this metadata: per-step uploads go through it.
+    host_uploader: Optional["HostUploader"] = None
 
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
@@ -1088,6 +1092,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def _upload_to_device(self, key: str, destination: torch.Tensor,
+                          value: torch.Tensor, engine_staging: bool) -> bool:
+        """Copy host ``value`` into ``destination`` through the runner's uploader, unless the
+        engine stages this copy itself (``engine_staging``) or no uploader is set: then False."""
+        if self.host_uploader is None or engine_staging:
+            return False
+        self.host_uploader.upload(key, value, destination)
+        return True
+
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
@@ -1119,9 +1132,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
+        if not self._upload_to_device(
+                "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
+                self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                                 self.prompt_lens_cpu[:self.num_seqs],
+                                 pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1176,8 +1192,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                          maybe_pin_memory(kv_lens[:self.num_seqs]))
+        if not self._upload_to_device(
+                "kv_lens", self.kv_lens_cuda[:self.num_seqs],
+                kv_lens[:self.num_seqs], step_inputs.is_open()):
+            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                              maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

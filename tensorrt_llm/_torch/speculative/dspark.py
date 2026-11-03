@@ -19,6 +19,7 @@
 # produces the whole block and fixed-shape confidence scores inside a single
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
+import itertools
 import json
 import math
 from collections import deque
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
@@ -33,15 +35,27 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceStrategy
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.multi_stream_utils import do_multi_stream, private_stream
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import (
+    _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+    _FORCE_ACCEPT_RNG_POOL_SIZE,
+    _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+    SpecMetadata,
+    SpecWorkerBase,
+)
 from .vocab_parallel import tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
     from ..pyexecutor.llm_request import LlmRequest
+    from .group_sharded_sampling import GroupShardedVerify
+    from .sharded_sampling import VocabShardedSampler
+
+# Verify rows per rank up to which a group shares the LM head; the replicated head wins above it.
+_GROUP_VERIFY_MAX_ROWS = 256
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -196,6 +210,9 @@ class DSparkSpecMetadata(SpecMetadata):
 
     batch_indices_cuda: Optional[torch.Tensor] = None
 
+    # Owns the request->slot map that prepare() maintains.
+    _dspark_worker: Optional["DSv4DSparkWorker"] = field(default=None, init=False, repr=False)
+
     # The engine sets this only for the duration of a target forward. Its
     # return_context_logits flag also serves sparse speculative gather and is
     # not itself evidence that every context row is needed. None means the
@@ -219,6 +236,7 @@ class DSparkSpecMetadata(SpecMetadata):
             dtype=torch.int,
             device="cuda",
         )
+        torch.arange(self.max_num_requests, out=self.batch_indices_cuda)
 
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
@@ -254,28 +272,32 @@ class DSparkSpecMetadata(SpecMetadata):
     def prepare(self):
         self.context_capture_lens = None
         assert self.request_ids is not None
-        num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(
-            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
         # CUDA-graph-safe path: maintain the request->slot mapping on the host
         # (outside the captured region) and mirror it into ``_batch_to_slot`` so the
         # captured gen forward can index the rolling windows by tensor. Mirrors
         # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
-        worker = getattr(self, "_dspark_worker", None)
+        worker = self._dspark_worker
         if worker is not None and worker._win_inited:
-            # Requests paused in place (GEN slot preemption) keep their window.
-            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
-            for rid in list(worker._req_to_slot.keys()):
-                if rid not in current:
-                    slot = worker._req_to_slot.pop(rid)
-                    worker._ctx_len[slot].zero_()
-                    worker._valid_len[slot].zero_()
-                    worker._position_initialized[slot].zero_()
-                    worker._kv_windows[slot].zero_()
+            req_to_slot = worker._req_to_slot
+            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
+            # requests, or disagg seed forwards without a real id) map to the
+            # dedicated throwaway scratch row so they cannot overwrite a live
+            # request's rolling window.
+            scratch = worker._scratch_slot
+            request_ids = self.request_ids
+            slots = list(map(req_to_slot.get, request_ids, itertools.repeat(scratch)))
+            unknown = slots.count(scratch)
+            # Live slots not referenced by this batch belong to finished requests, except
+            # those of requests paused in place (GEN slot preemption), which keep their
+            # window. Freed and newly assigned slots are cleared together below.
+            resets = []
+            if len(req_to_slot) > len(slots) - unknown:
+                paused = getattr(self, "paused_in_place_ids", frozenset())
+                for rid in req_to_slot.keys() - set(request_ids) - paused:
+                    slot = req_to_slot.pop(rid)
                     worker._free_slots.append(slot)
+                    resets.append(slot)
             # Assign a persistent rolling-window slot to every real generation
             # request that never ran a context/seed forward on this worker. In
             # disaggregated serving the prompt is prefilled (and the window
@@ -288,34 +310,33 @@ class DSparkSpecMetadata(SpecMetadata):
             # persistent slot only once; prepare()
             # runs before every replay, so it must never reset a live slot.
             # ADP-idle (id 0) and high-ID CUDA-graph padding dummies use scratch.
-            num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            for rid in self.request_ids[num_contexts:]:
-                if (
-                    rid != ATTENTION_DP_DUMMY_REQUEST_ID
-                    and rid < worker._graph_dummy_id_floor
-                    and rid not in worker._req_to_slot
-                ):
-                    worker._assign_slot(rid, reset=False)
-            # Unknown request IDs (synthetic warmup / CUDA-graph padding, ADP idle
-            # requests, or disagg seed forwards without a real id) map to the
-            # dedicated throwaway scratch row so they cannot overwrite a live
-            # request's rolling window (they previously aliased to slot 0).
-            scratch = worker._scratch_slot
-            # Reset every iteration. The scratch row has no prefill to seed it
-            # and no completion to free it, so _advance_generation_state's
-            # unconditional advance would leave its ABSOLUTE position climbing
-            # across graph shapes and iterations until it indexes past the RoPE
-            # table. A real slot is bounded instead by its request's lifetime.
-            worker._ctx_len[scratch].zero_()
-            worker._valid_len[scratch].zero_()
-            worker._position_initialized[scratch].zero_()
-            mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, scratch) for rid in self.request_ids],
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            )
-            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            num_contexts = max(0, len(slots) - self.num_generations)
+            if unknown:
+                for i in range(num_contexts, len(slots)):
+                    rid = request_ids[i]
+                    if (
+                        slots[i] == scratch
+                        and rid != ATTENTION_DP_DUMMY_REQUEST_ID
+                        and rid < worker._graph_dummy_id_floor
+                    ):
+                        slots[i] = worker._assign_slot(rid, reset=False, resets=resets)
+            # The scratch slot's decode state is reset in every forward
+            # (_advance_generation_state).
+            if resets:
+                cleared = torch.tensor(resets, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                    worker._kv_windows.device, non_blocking=True
+                )
+                worker._kv_windows.index_fill_(0, cleared, 0)
+                worker._ctx_len.index_fill_(0, cleared, 0)
+                worker._valid_len.index_fill_(0, cleared, 0)
+                worker._position_initialized.index_fill_(0, cleared, False)
+            # Steady decode repeats the mapping already on the device.
+            if slots != worker._host_batch_to_slot:
+                worker._batch_to_slot[: len(slots)].copy_(
+                    torch.tensor(slots, dtype=torch.long, pin_memory=prefer_pinned()),
+                    non_blocking=True,
+                )
+                worker._host_batch_to_slot = slots
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -346,19 +367,54 @@ class DSparkSpecMetadata(SpecMetadata):
         if i is not None:
             num_tokens = hidden_states.shape[0]
             to_save = hidden_states + residual if residual is not None else hidden_states
-            # mHC residual -> mean over the hc_mult streams.
-            if to_save.shape[-1] != self.hidden_size:
-                hc_mult = to_save.shape[-1] // self.hidden_size
-                to_save = to_save.reshape(num_tokens, hc_mult, self.hidden_size).mean(dim=1)
             destination = self.captured_hidden_states[
                 :, i * self.hidden_size : (i + 1) * self.hidden_size
             ]
+            # mHC residual -> mean over the hc_mult streams.
+            if to_save.shape[-1] != self.hidden_size:
+                hc_mult = to_save.shape[-1] // self.hidden_size
+                if row_indices is None:
+                    from ..attention.kernels.blackwell.dspark.generation_prepare import (
+                        dspark_capture_mean,
+                    )
+
+                    dspark_capture_mean(to_save, destination[:num_tokens])
+                    self._after_capture(i, num_tokens)
+                    return
+                to_save = to_save.reshape(num_tokens, hc_mult, self.hidden_size)
+                to_save = to_save.mean(dim=1)
             if row_indices is None:
                 destination[:num_tokens].copy_(to_save, non_blocking=True)
+                self._after_capture(i, num_tokens)
             else:
                 if row_indices.ndim != 1 or row_indices.shape[0] != num_tokens:
                     raise ValueError("DSpark capture row_indices must map every replay query row")
                 destination.index_copy_(0, row_indices, to_save)
+
+    def _after_capture(self, i: int, num_tokens: int) -> None:
+        """Once the last captured layer is stored every captured row is final, so the draft's
+        back-fill projection may start (``DSv4DSparkWorker._fork_backfill_projection``)."""
+        if i == self.num_capture_layers - 1 and self._dspark_worker is not None:
+            self._dspark_worker._fork_backfill_projection(self, num_tokens)
+
+    def capture_on_side_stream(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        row_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.cuda.Event]:
+        """:meth:`maybe_capture_hidden_states` on a side stream in a multi-stream forward; the caller
+        waits for the returned event within the same forward (None: captured on this stream)."""
+        if not do_multi_stream() or self.captured_hidden_states is None:
+            self.maybe_capture_hidden_states(layer_id, hidden_states, row_indices=row_indices)
+            return None
+        side = private_stream(hidden_states.device.index, "dspark_capture")
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            self.maybe_capture_hidden_states(layer_id, hidden_states, row_indices=row_indices)
+        done = torch.cuda.Event()
+        done.record(side)
+        return done
 
     def get_hidden_states(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Get captured hidden states (all layers concatenated)."""
@@ -367,6 +423,26 @@ class DSparkSpecMetadata(SpecMetadata):
         return self.captured_hidden_states[
             :num_tokens, : self.hidden_size * self.num_capture_layers
         ]
+
+
+def _fused_accept_applies(
+    worker: "DSv4DSparkWorker", attn_metadata, spec_metadata: "DSparkSpecMetadata", rows: int
+) -> bool:
+    """Whether ``worker`` accepts a generation-only batch of ``rows`` target rows in one fused
+    launch: a uniform verify window and strict acceptance (no rejection sampling, guided decoding
+    or occurrence penalties)."""
+    num_gens = attn_metadata.num_seqs
+    K = spec_metadata.runtime_draft_len
+    return not (
+        attn_metadata.num_contexts != 0
+        or num_gens == 0
+        or K <= 0
+        or spec_metadata.is_ragged_verify
+        or worker._can_use_rejection_sampling(spec_metadata)
+        or getattr(spec_metadata, "enable_penalty", False)
+        or worker.guided_decoder is not None
+        or rows != num_gens * (K + 1)
+    )
 
 
 class DSv4DSparkWorker(SpecWorkerBase):
@@ -405,6 +481,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
     Reference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).
     """
 
+    # The target logits only feed the guided-decoder bitmask, the acceptance helpers
+    # and the ``logits`` output; the draft computes its own.
+    reads_lm_head_dtype_logits = True
+
     def __init__(
         self,
         spec_config: "DSparkDecodingConfig",
@@ -441,6 +521,12 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # unknown request IDs (set in ``_lazy_init`` to ``max_batch``); it is
         # never handed out through ``_free_slots``.
         self._scratch_slot = 0
+        # Greedy target sampling from this rank's LM-head columns, set up after load.
+        self._vocab_sharded_sampler: Optional["VocabShardedSampler"] = None
+        # The draft model of the last forward, boxed so it is not registered as a submodule, and the
+        # back-fill projection forked in this forward (_fork_backfill_projection).
+        self._prep_fork_model: tuple = ()
+        self._prep_fork: Optional[tuple] = None
 
         # ``return_confidence`` is read once here (never per step) so the
         # captured draft graph cannot diverge. ``_confidence_logits`` is the
@@ -541,6 +627,100 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def prepare_vocab_sharded_sampling(self, lm_head: nn.Module) -> None:
+        """Exchange buffers for greedy target sampling from a column-parallel ``lm_head``, or, with
+        ``enable_lm_head_tp_in_adp``, from attention DP's replicated BF16 head shared by the
+        attention-DP ranks of a node (:class:`GroupShardedVerify`). Collective over the TP group."""
+        from ..modules.embedding import LMHead
+        from .group_sharded_sampling import GroupShardedVerify
+        from .sharded_sampling import VocabShardedSampler
+
+        if self._vocab_sharded_sampler is not None or not isinstance(lm_head, LMHead):
+            return
+        if lm_head.mapping.enable_attention_dp:
+            spec, mapping = self.spec_config, lm_head.mapping
+            if mapping.enable_lm_head_tp_in_adp:
+                group_size = min(mapping.gpus_per_node, mapping.tp_size)
+                # Only where target rows are sampled from shards (samples_from_vocab_shards) and every
+                # rank keeps its draft length: the acceptance-rate gate can stop one rank alone.
+                if not (
+                    spec.use_rejection_sampling
+                    or spec.enable_penalty
+                    or (
+                        spec.acceptance_rate_window_size
+                        and spec.acceptance_rate_threshold is not None
+                    )
+                ):
+                    self._vocab_sharded_sampler = GroupShardedVerify.create(
+                        mapping, lm_head.weight, group_size, _GROUP_VERIFY_MAX_ROWS
+                    )
+                logger.info(
+                    "DSpark verify head: "
+                    + (f"groups of {group_size}" if self._vocab_sharded_sampler else "replicated")
+                )
+            return
+        if not (
+            lm_head.tp_mode == TensorParallelMode.COLUMN
+            and lm_head.gather_output
+            and lm_head.tp_size > 1
+        ):
+            return
+        self._vocab_sharded_sampler = VocabShardedSampler.create(
+            lm_head.mapping, lm_head.out_features, lm_head.num_embeddings
+        )
+
+    @property
+    def group_verify(self) -> Optional["GroupShardedVerify"]:
+        """The attention-DP group's sharded verify head, if this worker samples from one."""
+        from .group_sharded_sampling import GroupShardedVerify
+
+        sampler = self._vocab_sharded_sampler
+        return sampler if isinstance(sampler, GroupShardedVerify) else None
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        """Greedy and temperature-only rows are sampled from this rank's columns unless the
+        drafts are drawn (rejection sampling) or the target logits penalized."""
+        return (
+            self._vocab_sharded_sampler is not None
+            and not self.spec_config.use_rejection_sampling
+            and not self.spec_config.enable_penalty
+        )
+
+    def takes_vocab_sharded_target_logits(self, attn_metadata, spec_metadata) -> bool:
+        """Greedy and temperature-only fused-acceptance steps sample the target from this rank's
+        LM-head columns."""
+        from .sharded_sampling import MAX_ROWS
+
+        if not self.samples_from_vocab_shards or not (
+            spec_metadata.is_all_greedy_sample or spec_metadata.is_all_temperature_only
+        ):
+            return False
+        rows = spec_metadata.gather_ids.shape[0]
+        group = self.group_verify
+        if group is not None:
+            # Every member must take this path with the same rows: decode CUDA graphs only, whose
+            # attention-DP ranks agreed on one batch and (by the group sync) one sampling variant.
+            return (
+                spec_metadata.is_cuda_graph
+                and group.supports(rows, attn_metadata.all_rank_num_tokens)
+                and _fused_accept_applies(self, attn_metadata, spec_metadata, rows)
+            )
+        return rows <= MAX_ROWS and _fused_accept_applies(self, attn_metadata, spec_metadata, rows)
+
+    def vocab_sharded_head(self, lm_head: nn.Module, spec_metadata):
+        """With a group verify head, its logits: this rank's slice of the vocabulary for the rows of
+        every member, gathered with their sampling parameters."""
+        group = self.group_verify
+        if group is None:
+            return super().vocab_sharded_head(lm_head, spec_metadata)
+        params = (None, None, None)
+        if spec_metadata.is_all_temperature_only:
+            rows = spec_metadata.gather_ids.shape[0]
+            seeds, offsets = self._rng_state_per_token(spec_metadata, rows)
+            params = (spec_metadata.temperatures[:rows], seeds, offsets)
+        return lambda normalized: group.logits(normalized, *params)
+
     def _publish_position_ceiling(self, draft_model, attn_metadata, block_size: int) -> None:
         """Size the drafter's RoPE table from the runtime bound, and bound positions by it.
 
@@ -633,6 +813,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._batch_to_slot = torch.full(
                 (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
             )
+            # The prefix of _batch_to_slot that prepare() last wrote.
+            self._host_batch_to_slot = []
             if self.return_confidence:
                 # Neutral fill = large positive logit (sigmoid ~ 1.0):
                 # unscored slots fail safe by verifying the full block. The
@@ -755,14 +937,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
             f"device_windows={self.verify_planner.device_windows}"
         )
 
-    def _assign_slot(self, req_id: int, reset: bool) -> int:
-        """Get (or refresh) the slot for a request; reset clears its window."""
+    def _assign_slot(self, req_id: int, reset: bool, resets: Optional[list] = None) -> int:
+        """Get (or refresh) the slot for a request; reset clears its window.
+
+        With ``resets``, a newly assigned slot is appended to it for the caller to clear.
+        """
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
-            self._ctx_len[old].zero_()
-            self._valid_len[old].zero_()
-            self._position_initialized[old].zero_()
-            self._kv_windows[old].zero_()
+            self._clear_slot(old)
             self._free_slots.append(old)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
@@ -772,16 +954,26 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
-            self._ctx_len[slot].zero_()
-            self._valid_len[slot].zero_()
-            self._position_initialized[slot].zero_()
-            self._kv_windows[slot].zero_()
+            if resets is not None:
+                resets.append(slot)
+            else:
+                self._clear_slot(slot)
             if self._confidence_logits is not None:
                 # A recycled slot still holds the previous occupant's scores;
                 # reset to neutral so the first scheduling decision verifies
                 # the full block.
                 self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
+
+    def _clear_slot(self, slot: int) -> None:
+        """Zero a slot's window and decode state with in-place fills.
+
+        ``tensor[slot] = 0`` would be a blocking H2D copy that drains the overlap scheduler.
+        """
+        self._ctx_len[slot].zero_()
+        self._valid_len[slot].zero_()
+        self._position_initialized[slot].zero_()
+        self._kv_windows[slot].zero_()
 
     def _seed_context_windows(
         self,
@@ -834,34 +1026,276 @@ class DSv4DSparkWorker(SpecWorkerBase):
     def _advance_generation_state(
         self,
         slots: torch.Tensor,
+        accepted_tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor,
-        input_positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Bootstrap and advance per-slot decode state without host synchronization."""
-        # Reset inside the captured region: many padding / ADP-idle rows share this
-        # one scratch slot within a single forward, so its position has to restart
-        # from ``input_positions`` rather than accumulate across capture shapes.
+        position_ids: torch.Tensor,
+        gen_start: int,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """Bootstrap and advance per-slot decode state without host synchronization.
+
+        One launch resets the scratch slot (many padding / ADP-idle rows share it
+        within a single forward, so its position has to restart from the input
+        positions rather than accumulate across capture shapes), advances every
+        slot and derives the draft block inputs; see ``dspark_generation_prepare``.
+        Positions are bounded by ``_position_cap`` inside the graph because
+        prepare() cannot tell a synthetic warmup request from a real one.
+        """
+        from ..attention.kernels.blackwell.dspark.generation_prepare import (
+            dspark_generation_prepare,
+        )
+
+        return dspark_generation_prepare(
+            accepted_tokens,
+            num_accepted_tokens,
+            position_ids,
+            slots,
+            self._ctx_len,
+            self._valid_len,
+            self._position_initialized,
+            gen_start=gen_start,
+            num_rows=num_rows,
+            scratch_slot=self._scratch_slot,
+            draft_len=self.max_draft_len,
+            window=self._win,
+            position_cap=self._position_cap,
+        )
+
+    def _advance_ragged_generation_state(
+        self,
+        slots: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        position_ids: torch.Tensor,
+        base: torch.Tensor,
+        num_rows: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """``_advance_generation_state`` for requests whose target rows start at ``base`` ``[G]``.
+
+        Graph-padding rows own only scratch state and may lie beyond the captured
+        token extent, so they read row 0; an invalid real-request offset must not
+        silently read another row.
+        """
         scratch = self._scratch_slot
         self._ctx_len[scratch].zero_()
         self._valid_len[scratch].zero_()
         self._position_initialized[scratch].zero_()
+        nacc = num_accepted_tokens.long()
+        gidx = nacc - 1  # index of the bonus within each verified prefix
+        bonus = accepted_tokens.gather(1, gidx.unsqueeze(1)).squeeze(1).long()
+        is_scratch = slots == scratch
+        base = torch.where(is_scratch, torch.zeros_like(base), base)
+        main_rows = torch.where(is_scratch, torch.zeros_like(base), base + gidx)
+        input_positions = position_ids.index_select(0, base).long()
         old = torch.where(self._position_initialized[slots], self._ctx_len[slots], input_positions)
-        start_pos = old + num_accepted_tokens
-        # Bound both positions by the RoPE table they index. Warmup reaches this
-        # through a captured graph replay, and prepare() cannot tell a synthetic
-        # warmup request from a real one, so the bound has to live in the graph.
-        # Only a warmup row climbs -- no completion frees its slot, and it ran 53
-        # entries past the table [measured job 3097207] -- while _position_cap sits
-        # exactly at what a full-length real request reaches.
+        start_pos = old + nacc
         if self._position_cap is not None:
             old = torch.clamp(old, max=self._position_cap)
             start_pos = torch.clamp(start_pos, max=self._position_cap)
         self._ctx_len[slots] = start_pos
-        self._valid_len[slots] = torch.clamp(
-            self._valid_len[slots] + num_accepted_tokens, max=self._win
-        )
+        self._valid_len[slots] = torch.clamp(self._valid_len[slots] + nacc, max=self._win)
         self._position_initialized[slots] = torch.ones_like(slots, dtype=torch.bool)
-        return old, start_pos
+        j = torch.arange(self.max_draft_len, device=slots.device)
+        interim_rows = (base.unsqueeze(1) + j).clamp(min=0, max=num_rows - 1)
+        interim_pos = old.unsqueeze(1) + 1 + j
+        interim_valid = j < (nacc.unsqueeze(1) - 1)
+        return (
+            bonus,
+            main_rows,
+            start_pos,
+            self._valid_len[slots],
+            interim_rows,
+            interim_pos,
+            interim_valid,
+        )
+
+    def _fused_accept(
+        self,
+        logits: torch.Tensor,
+        attn_metadata,
+        spec_metadata: "DSparkSpecMetadata",
+        vocab_sharded: bool = False,
+        prepare: Optional[tuple] = None,
+    ):
+        """``sample_and_accept_draft_tokens`` through ``dspark_strict_accept`` (which also takes
+        the greedy argmax), or None where it does not apply (``_fused_accept_applies``).
+
+        With ``vocab_sharded`` the logits are this rank's LM-head columns. With ``prepare``
+        (``(position_ids, num_rows)`` of the step) the same launch also runs
+        ``_advance_generation_state``, whose results follow the acceptance's.
+        """
+        num_gens = attn_metadata.num_seqs
+        K = spec_metadata.runtime_draft_len
+        # A group's slice holds the rows of every member of the group.
+        group = self.group_verify if vocab_sharded else None
+        rows = logits.shape[0] // group.group_size if group is not None else logits.shape[0]
+        if (
+            not _fused_accept_applies(self, attn_metadata, spec_metadata, rows)
+            or not logits.is_cuda
+            or logits.dim() != 2
+        ):
+            return None
+        from ..attention.kernels.blackwell.dspark.generation_prepare import (
+            dspark_accept_prepare,
+            dspark_strict_accept,
+        )
+
+        device = logits.device
+        draft_tokens = self._reshape_draft_tokens_for_accept(spec_metadata, num_gens, device)
+        if group is not None:
+            target_tokens = group.sample(logits)
+        elif vocab_sharded and spec_metadata.is_all_temperature_only:
+            seeds, offsets = self._rng_state_per_token(spec_metadata, rows)
+            target_tokens = self._vocab_sharded_sampler.sample(
+                logits, spec_metadata.temperatures[:rows], seeds, offsets
+            )
+        elif vocab_sharded:
+            target_tokens = self._vocab_sharded_sampler.sample(logits)
+        elif spec_metadata.is_all_greedy_sample and logits.stride(1) == 1:
+            target_tokens = logits
+        else:
+            target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0, num_gens)
+            target_tokens = target_tokens.reshape(-1).contiguous()
+        # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS, as _apply_force_accepted_tokens.
+        force_base, force_frac = None, 0.0
+        if self.force_num_accepted_tokens != 0.0 and not (
+            spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        ):
+            int_part = int(self.force_num_accepted_tokens)
+            frac_part = self.force_num_accepted_tokens - int_part
+            force_base = min(int_part + 1, K + 1)
+            if frac_part > 0.0 and force_base < K + 1:
+                self._ensure_force_accept_rng_state(device)
+                self._force_accept_rng_counter += 1
+                force_frac = frac_part
+        force = dict(
+            force_base=force_base,
+            force_frac=force_frac,
+            rng_pool=self._force_accept_rng_pool,
+            rng_counter=self._force_accept_rng_counter,
+            rng=(
+                _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+                _FORCE_ACCEPT_RNG_SLOT_STRIDE,
+                _FORCE_ACCEPT_RNG_POOL_SIZE - 1,
+            ),
+        )
+        if prepare is None:
+            return dspark_strict_accept(target_tokens, draft_tokens, **force)
+        position_ids, num_rows = prepare
+        return dspark_accept_prepare(
+            target_tokens,
+            draft_tokens,
+            position_ids.reshape(-1),
+            self._batch_to_slot[:num_gens],
+            self._ctx_len,
+            self._valid_len,
+            self._position_initialized,
+            gen_start=attn_metadata.num_ctx_tokens,
+            num_rows=num_rows,
+            scratch_slot=self._scratch_slot,
+            window=self._win,
+            position_cap=self._position_cap,
+            **force,
+        )
+
+    def _prepare_next_new_tokens(
+        self,
+        accepted_tokens,
+        next_draft_tokens,
+        batch_indices_cuda,
+        batch_size,
+        num_accepted_tokens,
+    ):
+        """The base class's result in one launch (``dspark_next_new_tokens``)."""
+        from ..attention.kernels.blackwell.dspark.generation_prepare import dspark_next_new_tokens
+
+        return dspark_next_new_tokens(
+            accepted_tokens, next_draft_tokens, batch_indices_cuda, num_accepted_tokens
+        )
+
+    def _can_reuse_draft_tokens(self, draft_model, spec_metadata: "DSparkSpecMetadata") -> bool:
+        """Reuse the draft's greedy proposals unless rejection sampling draws the drafts.
+
+        Without it only the target samples, so greedy and sampled batches alike draft the
+        argmax of the corrected logits: the tokens the draft's Markov chain proposed.
+        """
+        return (
+            (
+                self.mapping.enable_attention_dp
+                or (self.mapping.pp_size == 1 and self.mapping.cp_size == 1)
+            )
+            and self.guided_decoder is None
+            and self._d2t is None
+            and not spec_metadata.use_rejection_sampling
+            and draft_model.supports_greedy_token_reuse
+        )
+
+    def _fork_backfill_projection(
+        self, spec_metadata: "DSparkSpecMetadata", num_tokens: int
+    ) -> None:
+        """Start the draft step's captured-row projection on a side stream once the target has
+        written its last captured layer.
+
+        In a generation-only step the projection of every captured row (``main_proj`` K-slice,
+        its all-reduce with ``main_norm``, the back-fill ``wkv`` of the intermediate rows) does not
+        depend on the acceptance, so it runs under the rest of the target forward, the LM head and
+        the acceptance, its all-reduce on a workspace of its own. The decision reads only values
+        every TP rank shares; :meth:`_draft_gen_block_batched` takes the result when its rows are
+        these.
+        """
+        self._join_prep_fork()
+        if not self._prep_fork_model or not do_multi_stream():
+            return
+        draft_model = self._prep_fork_model[0]
+        num_gens = spec_metadata.num_generations
+        width = spec_metadata.runtime_draft_len + 1
+        if (
+            width <= 1
+            or spec_metadata.is_ragged_verify
+            or spec_metadata.request_ids is None
+            or len(spec_metadata.request_ids) != num_gens
+            or num_gens * width != num_tokens
+        ):
+            return
+        captured = spec_metadata.get_hidden_states(num_tokens)
+        if captured is None or not draft_model.forks_backfill(captured, num_gens, width):
+            return
+        side = private_stream(captured.device.index, "dspark_prep_fork")
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            rows = torch.arange(num_tokens, device=captured.device).view(num_gens, width)
+            main_x, kv = draft_model.project_backfill_rows(captured, rows)
+            done = torch.cuda.Event()
+            done.record(side)
+        self._prep_fork = (spec_metadata, num_gens, width, main_x, kv, done)
+
+    def _join_prep_fork(self) -> None:
+        """Make the current stream wait for a pending forked projection and drop it."""
+        fork = self._prep_fork
+        if fork is not None:
+            self._prep_fork = None
+            torch.cuda.current_stream().wait_event(fork[5])
+            for tensor in fork[3:5]:
+                tensor.record_stream(torch.cuda.current_stream())
+
+    def _take_prep_fork(
+        self,
+        spec_metadata: "DSparkSpecMetadata",
+        gen_start: int,
+        stride: int,
+        num_gens: int,
+        num_captured: int,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """The forked ``(main_x, kv)``, joined, if it covers this draft step's captured rows: a
+        step starting at ``gen_start`` with ``stride`` rows per request of ``num_gens`` requests."""
+        fork = self._prep_fork
+        if fork is None or fork[0] is not spec_metadata:
+            return None
+        _, gens, width, main_x, kv, _ = fork
+        if gen_start != 0 or stride != width or num_gens != gens or num_captured < gens * width:
+            return None
+        self._join_prep_fork()
+        return main_x, kv
 
     def _draft_gen_block_batched(
         self,
@@ -875,7 +1309,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
         total_target_tokens: int,
         position_ids: torch.Tensor,
         all_rank_num_tokens: Optional[List[int]] = None,
-    ) -> torch.Tensor:
+        return_tokens: bool = False,
+        prepared: Optional[tuple] = None,
+    ) -> Optional[torch.Tensor]:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
         Free of host syncs and data-dependent shapes: per-request quantities
@@ -885,18 +1321,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
         ``DSv4DSparkDraftModel.forward_batched``. Returns the per-position corrected
         block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
         draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
+        With ``return_tokens``, returns the model's greedy ``[num_gens, K]``
+        int32 proposals instead; the caller must first check sampler eligibility.
         Confidence truncation stays disabled — the full block is proposed. When
         enabled, fixed-shape confidence scores are stored separately for
         verification scheduling; they never truncate the proposal.
+        ``prepared`` is ``_advance_generation_state``'s result when the acceptance launch ran it.
         """
         num_gens = batch_size - num_contexts
-        # K is the draft block width (fixed by the checkpoint); Kp1 is the
-        # target's per-gen-request token stride in ``captured``
-        # (runtime_draft_len + 1, which shrinks when verification is trimmed).
-        # Striding by max_draft_len instead reads into the next request's
-        # hidden states.
-        K = self.max_draft_len
-        device = accepted_tokens.device
 
         if num_gens == 0:
             return None
@@ -915,78 +1347,84 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Bootstrap iterations can process one target token per request, while
         # normal speculative verification processes K+1. Use the actual accepted
         # row width to index both captured hidden states and position IDs.
-        target_width = accepted_tokens.shape[1]
-        nacc = num_accepted_tokens[num_contexts:batch_size].long()  # [G]
-        gidx = nacc - 1  # [G] index of the bonus within each verified prefix
-
-        # Bonus token = last accepted token of the verified prefix.
-        bonus = (
-            accepted_tokens[num_contexts:batch_size].gather(1, gidx.unsqueeze(1)).squeeze(1).long()
-        )  # [G]
-
-        # Start offset of each request's processed tokens inside ``captured``.
-        # Ragged verification uses the same qo_indptr as the packed input;
-        # uniform and bootstrap iterations use the accepted-row width.
-        qo_indptr = spec_metadata.qo_indptr
-        if spec_metadata.verify_lens is not None and qo_indptr is not None:
-            base = gen_start + qo_indptr[:num_gens].to(device=device, dtype=torch.long)
-        else:
-            arange_g = torch.arange(num_gens, device=device)
-            base = gen_start + arange_g * target_width  # [G]
-        # Graph-padding rows own only scratch state and may lie beyond the
-        # captured token extent. Route only those rows to a safe placeholder;
-        # an invalid real-request offset must not silently read another row.
-        is_scratch = slots == self._scratch_slot
-        base = torch.where(is_scratch, torch.zeros_like(base), base)
-        bonus_row = torch.where(is_scratch, torch.zeros_like(base), base + gidx)
-        main_hidden = captured.index_select(0, bonus_row)
-
-        # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
-        # (everything but the bonus) into the rolling window — same frames as the
-        # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out.
         # A disaggregated generation worker never sees prompt prefill, so a new
         # slot has no absolute decode position. Bootstrap it once from the first
         # target input position; locally-prefilled and existing slots keep their
         # monotonically advanced position.
-        input_positions = position_ids.reshape(-1).index_select(0, base).long()
-        old, start_pos = self._advance_generation_state(slots, nacc, input_positions)
-        j = torch.arange(K, device=device)  # [K]
-        interim_valid = j.unsqueeze(0) < (nacc.unsqueeze(1) - 1)  # [G, K]
-        interim_pos = old.unsqueeze(1) + 1 + j.unsqueeze(0)  # [G, K]
-        interim_base = (base.unsqueeze(1) + j.unsqueeze(0)).clamp(
-            min=0, max=captured.shape[0] - 1
-        )  # [G, K] (clamped; invalid entries are masked out anyway)
-        interim_hidden = captured[interim_base]  # [G, K, ncap*hidden]
-        draft_model.write_context_windows_batched(
-            interim_hidden, interim_pos, slots, interim_valid, self._kv_windows
+        if prepared is None:
+            qo_indptr = spec_metadata.qo_indptr
+            if spec_metadata.verify_lens is not None and qo_indptr is not None:
+                # Ragged verification uses the same qo_indptr as the packed input.
+                base = gen_start + qo_indptr[:num_gens].to(device=slots.device, dtype=torch.long)
+                prepared = self._advance_ragged_generation_state(
+                    slots,
+                    accepted_tokens[num_contexts:batch_size],
+                    num_accepted_tokens[num_contexts:batch_size],
+                    position_ids.reshape(-1),
+                    base,
+                    captured.shape[0],
+                )
+            else:
+                prepared = self._advance_generation_state(
+                    slots,
+                    accepted_tokens[num_contexts:batch_size],
+                    num_accepted_tokens[num_contexts:batch_size],
+                    position_ids.reshape(-1),
+                    gen_start,
+                    captured.shape[0],
+                )
+        bonus, main_rows, start_pos, valid_len, interim_rows, interim_pos, interim_valid = prepared
+        # Fixed-size ([G, K]) masked back-fill of the intermediate accepted tokens
+        # (everything but the bonus) into the rolling window — same frames as the
+        # eager path (old+1 .. old+nacc-1), with j >= nacc-1 masked out. The back-fill
+        # rows and the bonus row are projected in one GEMM.
+        K = interim_rows.shape[1]
+        fork = self._take_prep_fork(
+            spec_metadata, gen_start, accepted_tokens.shape[1], num_gens, captured.shape[0]
         )
+        if fork is not None:
+            # Projected on the side stream: request g's interim rows are its first K rows.
+            main_x, kv = fork
+            draft_model.write_context_windows_batched(
+                None, interim_pos, slots, interim_valid, self._kv_windows, kv=kv
+            )
+            # index_select: a vectorized gather; advanced indexing runs the slow generic kernel.
+            bonus_x = main_x.flatten(0, 1).index_select(0, main_rows)
+        else:
+            row_index = torch.cat((interim_rows, main_rows.unsqueeze(1)), dim=1)
+            projected = draft_model.project_captured_rows(captured, row_index)  # [G, K + 1, hidden]
+            draft_model.write_context_windows_batched(
+                None, interim_pos, slots, interim_valid, self._kv_windows, main_x=projected[:, :K]
+            )
+            bonus_x = projected[:, K]
 
-        # Surface the per-position corrected block logits ([num_gens, K, vocab])
-        # and let SpecWorkerBase.sample_draft_tokens do the (greedy or rejection)
-        # sampling + TP gather + draft_probs scatter, rather than argmaxing here.
-        _toks, confidence, block_logits = draft_model.forward_batched(
-            main_hidden,
+        # Keep the full padded generation batch and all window updates in either
+        # path. Token reuse bypasses only corrected-logit collection and sampling.
+        draft_output = draft_model.forward_batched(
+            None,
             bonus,
             start_pos,
             kv_windows=self._kv_windows,
             slots=slots,
-            valid_len=self._valid_len[slots],
+            valid_len=valid_len,
             temperature=0.0,
             return_confidence=self.return_confidence,
-            return_logits=True,
+            return_logits=not return_tokens,
             all_rank_num_tokens=all_rank_num_tokens,
+            main_x=bonus_x,
         )
         # Stash the [G, K] confidence for the verification scheduler.
         # Slot-indexed (survives batch reshuffles), written in place (a
         # captured graph keeps the same storage), and scattered through
         # ``slots`` so a replay lands on the current batch's slots.
+        confidence = draft_output[1]
         if confidence is not None:
             # Padding may write the same scratch slot repeatedly; its content
             # is undefined and must never be consumed as a real confidence row.
             self._confidence_logits[slots] = confidence.detach()
             # Same slots, same capture region: content-only update, graph-safe.
             self._confidence_stamp[slots] = self._draft_seq_cuda
-        return block_logits
+        return draft_output[0].to(torch.int32) if return_tokens else draft_output[2]
 
     def _sample_draft_tokens_guided(
         self,
@@ -1036,6 +1474,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         spec_metadata,
         draft_model,
         resource_manager=None,
+        vocab_sharded_logits: bool = False,
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -1045,18 +1484,11 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         self._lazy_init(draft_model, spec_metadata, attn_metadata)
         # Backref so DSparkSpecMetadata.prepare() can maintain the host slot map
-        # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path.
+        # and mirror it into _batch_to_slot for the CUDA-graph-safe gen path; the
+        # next forward's last capture also forks the back-fill projection from it.
         spec_metadata._dspark_worker = self
+        self._prep_fork_model = (draft_model,)
         self._execute_guided_decoder_if_present(logits)
-
-        # Target-verify acceptance via the unified SpecWorkerBase entry: it
-        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
-        # hook), then routes to strict or rejection sampling. Greedy parity with
-        # the previous hand-rolled path is preserved (rejection only engages for a
-        # non-greedy batch with valid draft_probs).
-        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
-            logits, attn_metadata, spec_metadata
-        )
 
         total_target_tokens = input_ids.shape[0]
 
@@ -1083,6 +1515,32 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 None if self._confidence_logits is None else self._confidence_logits.clone()
             )
             saved_stamp = None if self._confidence_stamp is None else self._confidence_stamp.clone()
+
+        # Target-verify acceptance via the unified SpecWorkerBase entry: it
+        # reshapes the stored draft tokens (default (num_gens, runtime_draft_len)
+        # hook), then routes to strict or rejection sampling. Greedy parity with
+        # the previous hand-rolled path is preserved (rejection only engages for a
+        # non-greedy batch with valid draft_probs). At the full draft length the
+        # fused launch also advances the generation state.
+        captured = spec_metadata.get_hidden_states(total_target_tokens)
+        prepare = (
+            None
+            if spec_metadata.runtime_draft_len != K or captured is None
+            else (position_ids, captured.shape[0])
+        )
+        accepted = self._fused_accept(
+            logits,
+            attn_metadata,
+            spec_metadata,
+            vocab_sharded=vocab_sharded_logits,
+            prepare=prepare,
+        )
+        if accepted is None:
+            if vocab_sharded_logits:
+                raise RuntimeError("Vocabulary-sharded target logits need the fused acceptance")
+            accepted = self.sample_and_accept_draft_tokens(logits, attn_metadata, spec_metadata)
+        accepted_tokens, num_accepted_tokens = accepted[:2]
+        prepared = accepted[2:] or None
 
         # Assign / reset window slots for context (prefill) requests and seed each
         # request's rolling KV window from its prompt's captured context, so the
@@ -1125,9 +1583,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            # The batched gen-block draft returns the per-position corrected block
-            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
-            gen_logits = self._draft_gen_block_batched(
+            reuse_draft_tokens = self._can_reuse_draft_tokens(draft_model, spec_metadata)
+            draft_output = self._draft_gen_block_batched(
                 draft_model,
                 spec_metadata,
                 attn_metadata,
@@ -1138,8 +1595,14 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 total_target_tokens,
                 position_ids,
                 all_rank_num_tokens=all_rank_draft_tokens,
+                return_tokens=reuse_draft_tokens,
+                prepared=prepared,
             )
-            if gen_logits is not None:
+            if reuse_draft_tokens:
+                gen_draft_tokens = draft_output
+                gen_vocab = None
+            elif draft_output is not None:
+                gen_logits = draft_output
                 if self.guided_decoder is not None:
                     gen_draft_tokens = self._sample_draft_tokens_guided(
                         gen_logits,
@@ -1191,6 +1654,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             batch_size,
             num_accepted_tokens,
         )
+        # A forked projection this forward did not take (no graph may end with side-stream work).
+        self._join_prep_fork()
 
         if is_warmup:
             self._ctx_len.copy_(saved_ctx_len)

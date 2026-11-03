@@ -302,6 +302,12 @@ class ModelConfig(Generic[TConfig]):
     moe_backend_requested: str = 'AUTO'
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
+    # Row space of the MoE input for the warmup expert placement ("main": the step's tokens), and
+    # for a drafter's own pass its MoE rows per generation request
+    moe_row_space: str = "main"
+    moe_row_space_rows_per_request: Optional[int] = None
+    # If true, MEGAMOE_CUTEDSL kernels also run the FP8 shared expert (MXFP8 input)
+    megamoe_fuse_shared_expert: bool = False
     # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
     use_low_precision_moe_combine: bool = False
 

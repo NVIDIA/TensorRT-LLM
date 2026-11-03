@@ -155,6 +155,11 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     calls = {}
 
     class Worker:
+        reads_lm_head_dtype_logits = False
+
+        def takes_vocab_sharded_target_logits(self, *args):
+            return False
+
         def target_logits(self, *args):
             calls["target_logits"] = args
             return "worker logits"

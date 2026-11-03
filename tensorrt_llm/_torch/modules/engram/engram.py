@@ -24,23 +24,41 @@ All operations run on device:
   - GPU main stream forward: SDP gating + short conv
 """
 
+import ctypes
+import hashlib
 import math
+import os
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import triton  # type: ignore[import]
-import triton.language as tl  # type: ignore[import]
+from cuda.bindings import runtime as cudart
 from tokenizers import Regex, normalizers
 from torch import nn
 from transformers import AutoTokenizer
 
 from tensorrt_llm._torch.host_staging import copy_host_to_device
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._torch.kernels.blackwell.engram.decode_hash import compile_engram_decode_hash
+from tensorrt_llm._torch.kernels.blackwell.engram.lookup import (
+    compile_engram_lookup,
+    packed_row_bytes,
+)
+from tensorrt_llm._utils import CUASSERT, prefer_pinned
+from tensorrt_llm.logger import logger
 
-from ._decode_hash import _decode_hash_kernel
+from ._host_memory import (
+    HostNumaMem,
+    HostNumaOutOfMemoryError,
+    HostRegisteredMem,
+    ImportedHostMem,
+    host_numa_mem,
+    host_numa_node,
+    node_gpu_numa_nodes,
+)
+from ._node_share import NodeShare
 
 # Default Engram embedding vocabulary size per n-gram level.
 # Derived from the DeepSeek-V3 tokenizer vocab size (129280) scaled by 5.
@@ -407,10 +425,13 @@ class EngramHashProvider:
 
         self._device: Optional[torch.device] = None
 
-        # Retain per-shape buffers so captured addresses survive shape changes;
-        # _cached_hashes selects the most recently computed shape.
+        # Per-shape output buffers: a CUDA graph reads its captured shape's buffers by address, so
+        # captured shapes keep theirs for good; of the other shapes only the latest is retained, as
+        # eager passes (context steps) come in arbitrary token counts. _cached_hashes selects the
+        # most recently computed shape.
         self._cached_hashes: Optional[Dict[int, torch.Tensor]] = None
         self._cached_hashes_store: Dict[tuple, Dict[int, torch.Tensor]] = {}
+        self._captured_shapes: set = set()
 
         # Per-request history of compressed token ids, so that an n-gram at a
         # decode step can reach the tokens that preceded it. Without this the
@@ -694,7 +715,10 @@ class EngramHashProvider:
         if self._decode_row_map is not None and self._decode_row_map[0] == key:
             return self._decode_row_map[1]
         row_map = self._upload_history_tensor(
-            "decode_rows", torch.tensor(rows, dtype=torch.long, device="cpu")
+            "decode_rows",
+            torch.tensor(rows, dtype=torch.long, device="cpu").repeat_interleave(
+                torch.tensor(lengths)
+            ),
         )
         self._decode_row_map = (key, row_map)
         return row_map
@@ -709,10 +733,11 @@ class EngramHashProvider:
         token_mask: torch.Tensor | None,
         padded_num_tokens: int | None,
     ) -> dict[int, torch.Tensor] | None:
-        # Packed contexts, speculative batches, and incomplete host metadata
-        # keep the general path. Capture already returned its warmup buffers.
-        # Unique rows fuse the scatter too; aliased rows retain Torch's scatter
-        # before any hash reads, including repeated CUDA graph dummy requests.
+        # Incomplete host metadata keeps the general path. Capture already
+        # returned its warmup buffers. Single-token unique rows fuse the
+        # scatter too; aliased rows and multi-token requests, whose tokens read
+        # each other's cells, retain Torch's scatter before any hash reads,
+        # including repeated CUDA graph dummy requests.
         if (
             not input_ids.is_cuda
             or input_ids.ndim != 1
@@ -725,7 +750,6 @@ class EngramHashProvider:
             or position_ids.dtype not in (torch.int32, torch.int64)
             or request_ids is None
             or not request_ids
-            or len(request_ids) != input_ids.numel()
             or seq_lens_host is None
             or seq_lens_host.device.type != "cpu"
             or seq_lens_host.ndim != 1
@@ -741,12 +765,12 @@ class EngramHashProvider:
         ):
             return None
         lengths = tuple(seq_lens_host[: len(request_ids)].tolist())
-        if any(length != 1 for length in lengths):
+        if min(lengths) < 1 or sum(lengths) != input_ids.numel():
             return None
 
         # Constants can move independently of retained history and captured
         # outputs. Keep cross-device calls on the general path instead of
-        # passing another device's storage to a raw Triton kernel.
+        # passing another device's storage to a raw CuTe kernel.
         if self._history is not None and self._history.device != input_ids.device:
             return None
         num_tokens = input_ids.numel()
@@ -760,7 +784,8 @@ class EngramHashProvider:
             return None
 
         aliased_rows = len(set(request_ids)) != len(request_ids)
-        if aliased_rows:
+        scatter_first = aliased_rows or len(request_ids) != input_ids.numel()
+        if scatter_first:
             # Preserve the general path's compression and int32 index_put
             # geometry/order. Repeated IDs may have different input tokens or
             # positions: hashing each token's register value would bypass the
@@ -781,7 +806,7 @@ class EngramHashProvider:
         # a released request can immediately reuse the same physical row.
         self._consume_history_seeds(request_ids, rows)
         row_map = self._decode_history_rows(rows, lengths, input_ids.device)
-        if aliased_rows:
+        if scatter_first:
             self._history[row_map, positions] = compressed.to(torch.int32)
         elif token_mask is not None:
             token_mask = token_mask.to(device=input_ids.device)
@@ -792,30 +817,30 @@ class EngramHashProvider:
                 )
                 for layer_id in self.config.layer_ids
             }
-            self._cached_hashes_store[shape_key] = cached
+            self._retain_hashes(shape_key, cached)
+        mask = (
+            None if scatter_first or token_mask is None else token_mask.view(-1).view(torch.uint8)
+        )
         for index, layer_id in enumerate(self.config.layer_ids):
-            _decode_hash_kernel[(num_output_tokens,)](
-                input_ids,
-                position_ids,
+            compile_engram_decode_hash(
+                tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
+                self._pad_id,
+                self._DEAD,
+                index == 0 and not scatter_first,
+                scatter_first,
+                mask is not None,
+                input_ids.dtype,
+                position_ids.dtype,
+            )(
+                input_ids.view(-1),
+                position_ids.view(-1),
                 row_map,
-                None if aliased_rows else token_mask,
+                mask,
                 self._lookup_table,
                 self._history,
                 self._multipliers[layer_id],
                 cached[layer_id],
                 num_tokens,
-                self._history.shape[1],
-                VOCAB_SIZE=self._lookup_table.numel(),
-                PAD_ID=self._pad_id,
-                DEAD=self._DEAD,
-                MODULI=tuple(tuple(moduli) for moduli in self._moduli_ints[layer_id]),
-                N_HEAD=self.config.n_head_per_ngram,
-                MAX_NGRAM=self.config.max_ngram_size,
-                WRITE_HISTORY=index == 0 and not aliased_rows,
-                READ_CURRENT_HISTORY=aliased_rows,
-                HAS_MASK=token_mask is not None and not aliased_rows,
-                BLOCK_HEAD=triton.next_power_of_2(self.config.n_head_per_ngram),
-                num_warps=1,
             )
         self._cached_hashes = cached
         return cached
@@ -865,6 +890,9 @@ class EngramHashProvider:
         """
         if torch.cuda.is_current_stream_capturing():
             if self._cached_hashes is not None:
+                self._captured_shapes.add(
+                    tuple(tuple(v.shape) for v in self._cached_hashes.values())
+                )
                 return self._cached_hashes
             raise RuntimeError(
                 "EngramHashProvider.compute_hashes() called during CUDA "
@@ -983,9 +1011,15 @@ class EngramHashProvider:
                 cached[layer_id].copy_(hashes)
             self._cached_hashes = cached
         else:
-            self._cached_hashes_store[shape_key] = result
+            self._retain_hashes(shape_key, result)
             self._cached_hashes = result
         return self._cached_hashes
+
+    def _retain_hashes(self, shape_key: tuple, buffers: Dict[int, torch.Tensor]) -> None:
+        """Retain a new shape's buffers, dropping the other shapes no captured graph reads."""
+        for key in [k for k in self._cached_hashes_store if k not in self._captured_shapes]:
+            del self._cached_hashes_store[key]
+        self._cached_hashes_store[shape_key] = buffers
 
     def refresh_captured_hashes(
         self,
@@ -1067,8 +1101,8 @@ class _CudaArrayInterfaceView:
 def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
     """Return a zero-copy CUDA view with the pinned tensor's shape and dtype.
 
-    UVA maps pinned host memory at the same device address. The byte view
-    requires contiguous single-byte storage to preserve element strides.
+    CUDA-allocated pinned memory shares its host and device address under UVA.
+    The byte view requires contiguous single-byte storage to preserve strides.
     """
     if host_tensor.device.type != "cpu":
         raise ValueError(
@@ -1091,6 +1125,125 @@ def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
         device=torch.device("cuda", torch.cuda.current_device()),
     )
     return view.view(host_tensor.dtype)
+
+
+def _host_numa_table(shape: Tuple[int, ...], dtype: torch.dtype) -> Optional[torch.Tensor]:
+    """Prefer host-NUMA VMM, with a registered host mapping if its node is full."""
+    device = torch.cuda.current_device()
+    numa_node = host_numa_node(device)
+    if numa_node is None:
+        return None
+    nbytes = math.prod(shape) * dtype.itemsize
+    # The driver API maps memory in the context current on this thread.
+    CUASSERT(cudart.cudaSetDevice(device))
+    try:
+        host = host_numa_mem(nbytes, device, numa_node)
+    except HostNumaOutOfMemoryError as error:
+        if not _can_use_host_pointer(device):
+            logger.warning(f"Engram: {error}; retrying with the default pinned allocator")
+            return None
+        logger.warning(
+            f"Engram: {error}; retrying with CUDA-registered host memory under the process NUMA "
+            "policy. Pages may span NUMA nodes; lookup performance may be lower."
+        )
+        host = HostRegisteredMem(nbytes, device)
+    return _host_bytes(host, nbytes).view(dtype).view(shape)
+
+
+def _can_use_host_pointer(device: int) -> bool:
+    """``device`` reads registered host memory at its host address."""
+    (supported,) = CUASSERT(
+        cudart.cudaDeviceGetAttribute(
+            cudart.cudaDeviceAttr.cudaDevAttrCanUseHostPointerForRegisteredMem, device
+        )
+    )
+    return bool(supported)
+
+
+def _host_bytes(host: object, nbytes: int) -> torch.Tensor:
+    """The first ``nbytes`` of a host mapping as a CPU tensor that keeps the mapping alive."""
+    raw = (ctypes.c_uint8 * nbytes).from_address(host.address)
+    # The tensor's storage keeps ``raw``, and so the mapping, alive.
+    raw.host_mem = host
+    return torch.frombuffer(raw, dtype=torch.uint8)
+
+
+# A node's workers reach a table seconds apart; one off the home node waits for home owners this long
+# in all, so a node without one costs the wait once per process.
+_OFF_HOME_CLAIM_WAIT_S = 120  # 2 min
+_off_home_waited_s = 0.0
+
+
+def _join_off_home(share: NodeShare) -> tuple[list[int], dict] | None:
+    """``share.join`` for a worker off the table's home node, out of this process's wait budget."""
+    global _off_home_waited_s
+    start = time.monotonic()
+    try:
+        return share.join(max(0.0, _OFF_HOME_CLAIM_WAIT_S - _off_home_waited_s))
+    finally:
+        _off_home_waited_s += time.monotonic() - start
+
+
+def _shared_table_home_node(own: Optional[int], tp_rank: int, tp_size: int) -> Optional[int]:
+    """Host NUMA node a node-shared table belongs on: the owner's own (``own``) if the split has a
+    shard per GPU, else the ``tp_rank``-th GPU host node (modulo), as workers on several may share it."""
+    gpu_nodes = node_gpu_numa_nodes()
+    homes = sorted({node for node in gpu_nodes if node >= 0})
+    if own is None or len(homes) < 2 or tp_size >= len(gpu_nodes):
+        return own
+    return homes[tp_rank % len(homes)]
+
+
+def _shareable_host_mem(nbytes: int, device: int) -> Union[HostNumaMem, HostRegisteredMem]:
+    """Host memory other processes can map: VMM on the device's host NUMA node, else a memfd."""
+    numa_node = host_numa_node(device)
+    if numa_node is not None:
+        try:
+            return host_numa_mem(nbytes, device, numa_node, shareable=True)
+        except HostNumaOutOfMemoryError as error:
+            logger.warning(
+                f"Engram: {error}; sharing CUDA-registered host memory under the process NUMA "
+                "policy instead. Pages may span NUMA nodes; lookup performance may be lower."
+            )
+    if not _can_use_host_pointer(device):
+        raise RuntimeError(f"device {device} cannot read registered host memory in place")
+    return HostRegisteredMem(nbytes, device, shareable=True)
+
+
+def _import_host_mem(
+    fds: List[int], meta: Dict, nbytes: int, device: int
+) -> Union[ImportedHostMem, HostRegisteredMem]:
+    """Map the memory a node-share owner published, which must hold ``nbytes``."""
+    try:
+        if len(fds) != 1 or meta["size"] < nbytes:
+            raise RuntimeError(f"its owner published {len(fds)} handles of {meta['size']} bytes")
+        if meta["granularity"] is not None:
+            return ImportedHostMem(fds[0], meta["size"], meta["granularity"], device)
+        if not _can_use_host_pointer(device):
+            raise RuntimeError(f"device {device} cannot read registered host memory in place")
+        return HostRegisteredMem(meta["size"], device, fd=fds[0])
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _pinned_host_table(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a page-locked host table for random-row UVA gathers.
+
+    With base pages, nearly every row of a multi-GB table misses the GPU's
+    address-translation caches, capping the gather far below the host-link
+    bandwidth, so tables are mapped in large pages with ``HostNumaMem``. If that
+    NUMA node cannot satisfy the allocation, a CUDA-registered anonymous mapping
+    uses the process NUMA policy and requests transparent huge pages. Devices
+    without host-NUMA virtual memory management use the default pinned allocator,
+    as does construction under an init mode that defers host allocations to the
+    meta device; such tables are materialized later through this function.
+    """
+    if not torch.empty(0, dtype=dtype, device="cpu").is_meta:
+        table = _host_numa_table(shape, dtype)
+        if table is not None:
+            return table
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=prefer_pinned())
 
 
 class MultiHeadEmbedding(nn.Module):
@@ -1441,97 +1594,10 @@ class Engram(nn.Module):
         return output
 
 
-# Rows per program in the fused lookup below. A row is one (token, head) pair, so a
-# block of 16 rows is 16 scattered gathers of `D` bytes; larger blocks buy nothing
-# because the addresses are unrelated and each one misses on its own.
-_LOOKUP_BLOCK_R = 16
-
-# The exponent bitcast needs explicit ue8m0 code 0 (2**-127, FP32 denormal)
-# and code 255 (NaN) handling.
-_E8M0_DENORM = tl.constexpr(5.877471754111438e-39)
-
-
 @lru_cache(maxsize=None)
 def _multi_processor_count(device_index: int) -> int:
     """Cache the fixed per-device SM count to avoid repeated property queries."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-@triton.jit(
-    do_not_specialize=[
-        "num_rows",
-        "vocab_start",
-        "vocab_end",
-        "ids_stride_t",
-        "ids_stride_h",
-        "grid_size",
-    ]
-)
-def _engram_lookup_kernel(
-    weight_ptr,
-    scale_ptr,
-    ids_ptr,
-    offsets_ptr,
-    out_ptr,
-    vocab_start,
-    vocab_end,
-    num_rows,
-    ids_stride_t,
-    ids_stride_h,
-    grid_size,
-    HEAD_START: tl.constexpr,
-    LOCAL_HEADS: tl.constexpr,
-    DIM: tl.constexpr,
-    DIM_PAD: tl.constexpr,
-    QB: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-    MASKED: tl.constexpr,
-):
-    """Gather and dequantize into contiguous ``[T * LOCAL_HEADS, DIM]`` output.
-
-    A capped grid-stride loop processes ``BLOCK_R`` rows per program, limiting
-    TLB contention and reserving SMs for main-stream work on background calls.
-    Head shards use rebased offsets. Row shards mask unowned values to zero
-    with scale code 127 (1.0), so their contribution is exactly zero.
-    """
-    cols = tl.arange(0, DIM_PAD)
-    in_dim = cols < DIM
-    scale_cols = cols // QB
-    for base in tl.range(tl.program_id(0) * BLOCK_R, num_rows, grid_size * BLOCK_R):
-        rows = base + tl.arange(0, BLOCK_R)
-        valid = rows < num_rows
-        # Contiguous [T, LOCAL_HEADS, DIM]: heads are adjacent within each token.
-        head = rows % LOCAL_HEADS
-        token = (rows // LOCAL_HEADS).to(tl.int64)
-        index = tl.load(
-            ids_ptr + token * ids_stride_t + (HEAD_START + head) * ids_stride_h,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        # Keep int64 addressing: ~48M rows * 256 lanes exceeds the int32 range.
-        index += tl.load(offsets_ptr + head, mask=valid, other=0).to(tl.int64)
-        if MASKED:
-            owned = valid & (index >= vocab_start) & (index < vocab_end)
-            local = tl.where(owned, index - vocab_start, 0)
-        else:
-            owned = valid
-            local = index
-        gather = owned[:, None] & in_dim[None, :]
-        values = tl.load(weight_ptr + local[:, None] * DIM + cols[None, :], mask=gather, other=0.0)
-        code = tl.load(
-            scale_ptr + local[:, None] * (DIM // QB) + scale_cols[None, :],
-            mask=gather,
-            other=127,
-        )
-        # ue8m0 codes map to the FP32 exponent field, except 0 and 255 below.
-        scale = (code.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        scale = tl.where(code == 0, _E8M0_DENORM, scale)
-        scale = tl.where(code == 255, float("nan"), scale)
-        tl.store(
-            out_ptr + rows[:, None] * DIM + cols[None, :],
-            (values.to(tl.float32) * scale).to(out_ptr.dtype.element_ty),
-            mask=valid[:, None] & in_dim[None, :],
-        )
 
 
 class ShardedFp8MultiHeadEmbedding(nn.Module):
@@ -1544,7 +1610,9 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
     ``shard_heads`` selects the collective in ``DeepseekV41Engram.precompute``.
 
     Both shard layouts stay in pinned host memory; lookup reads them through UVA.
-    The default scale block size is 32 lanes.
+    The default scale block size is 32 lanes. Processes of one node and user that pass
+    the same ``share_key`` map one copy, which ``load_weights`` elects an owner to load;
+    the others' copy is complete after ``post_load_weights``.
     """
 
     def __init__(
@@ -1555,6 +1623,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         dtype: Optional[torch.dtype] = None,
         tp_size: int = 1,
         tp_rank: int = 0,
+        share_key: Optional[str] = None,
     ):
         super().__init__()
         if D % block_size != 0:
@@ -1602,29 +1671,34 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
 
         self.register_buffer("offsets", offsets)
 
+        self._share_name: Optional[str] = None
+        self._share_spec = ""
+        # The owner of a node-shared table serves it while this module lives.
+        self._share: Optional[NodeShare] = None
+        # An importer's checkpoint rows until its owner marks the table ready.
+        self._share_source: Optional[Dict] = None
+        if share_key is not None:
+            self._share_spec = (
+                f"{share_key} heads {self.num_heads} rows {self.num_embeddings} "
+                f"tp {tp_rank}/{tp_size} dim {D} block {block_size}"
+            )
+            digest = hashlib.blake2b(f"{os.getuid()} {self._share_spec}".encode(), digest_size=16)
+            self._share_name = f"trtllm-engram-{digest.hexdigest()}"
+
         # Override the model's CUDA construction context for table storage.
         if not prefer_pinned():
             raise RuntimeError("Engram tables require the pinned-memory runtime policy")
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                D,
-                dtype=torch.float8_e4m3fn,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            ),
-            requires_grad=False,
-        )
-        self.scale = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                D // block_size,
-                dtype=torch.float8_e8m0fnu,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            ),
-            requires_grad=False,
-        )
+        weight_shape = (self.part_num_embeddings, D)
+        scale_shape = (self.part_num_embeddings, D // block_size)
+        if share_key is None:
+            weight = _pinned_host_table(weight_shape, torch.float8_e4m3fn)
+            scale = _pinned_host_table(scale_shape, torch.float8_e8m0fnu)
+        else:
+            # load_weights places a node-shared table once its owner is elected.
+            weight = torch.empty(weight_shape, dtype=torch.float8_e4m3fn, device="meta")
+            scale = torch.empty(scale_shape, dtype=torch.float8_e8m0fnu, device="meta")
+        self.weight = nn.Parameter(weight, requires_grad=False)
+        self.scale = nn.Parameter(scale, requires_grad=False)
 
     def _materialize_pinned(self) -> None:
         """Materialize meta shards directly on the host, without an HBM staging copy."""
@@ -1639,13 +1713,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             if not prefer_pinned():
                 raise RuntimeError("Engram tables require the pinned-memory runtime policy")
             pinned = nn.Parameter(
-                torch.empty(
-                    param.shape,
-                    device="cpu",
-                    dtype=param.dtype,
-                    pin_memory=prefer_pinned(),
-                ),
-                requires_grad=False,
+                _pinned_host_table(tuple(param.shape), param.dtype), requires_grad=False
             )
             if not pinned.is_pinned():
                 raise RuntimeError(f"Engram {name} allocation is not pinned")
@@ -1662,7 +1730,8 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             result = super()._apply(fn, recurse=recurse)
         finally:
             self._parameters.update(host_parameters)
-        self._materialize_pinned()
+        if self._share_name is None:
+            self._materialize_pinned()
         return result
 
     def load_weights(self, weights: List[Dict]) -> None:
@@ -1670,8 +1739,139 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
 
         Slice safetensors lazily so unowned rows are not read into host memory.
         """
-        self._materialize_pinned()
         weights = weights[0] if isinstance(weights, list) else weights
+        if self._share_name is not None and self._load_node_shared(weights):
+            return
+        self._materialize_pinned()
+        self._load_rows(weights)
+
+    def _load_node_shared(self, weights: Dict) -> bool:
+        """Map the node's copy of this table, or allocate, serve and fill it if this process is
+        elected its owner; False, after one warning, if this process must load a private copy.
+
+        The owner serves the memory before it fills it, and importers wait for it only in
+        ``post_load_weights``: a rank of a multi-rank worker never waits on another worker's table
+        while its own peers may still need it in a collective of the weight load.
+        """
+        share = NodeShare(self._share_name)
+        device = torch.cuda.current_device()
+        # The driver API maps memory in the context current on this thread.
+        CUASSERT(cudart.cudaSetDevice(device))
+        try:
+            own = host_numa_node(device)
+            home = _shared_table_home_node(own, self.tp_rank, self.tp_size)
+            # CUDA allocates host-NUMA memory only on the owner's node, so off-home workers let a home one claim.
+            received = _join_off_home(share) if home != own else share.join(0.0)
+            if received is None:
+                host = _shareable_host_mem(self._table_bytes(), device)
+                registered = isinstance(host, HostRegisteredMem)
+                # A memfd has no VMM granularity; importers map it instead.
+                share.publish(
+                    [host.export_fd()],
+                    {"size": host.size, "granularity": None if registered else host.granularity},
+                )
+            else:
+                host = _import_host_mem(*received, self._table_bytes(), device)
+            views = self._table_views(host)
+        except (OSError, RuntimeError, ValueError) as error:
+            share.close()
+            logger.warning(
+                f"Engram: cannot share table ({self._share_spec}): {error}; loading a private copy"
+            )
+            return False
+        self._share = share
+        for name, view in zip(("weight", "scale"), views):
+            self.register_parameter(name, nn.Parameter(view, requires_grad=False))
+        if received is not None:
+            # Checked against this process's checkpoint once the owner marks the table ready.
+            self._share_source = weights
+            return True
+        try:
+            self._load_rows(weights)
+        except BaseException:
+            # Processes waiting for this owner elect another one.
+            share.close()
+            raise
+        share.mark_ready()
+        place = "in registered memory" if registered else f"on NUMA node {host.numa_node}"
+        logger.info(
+            f"Engram: serving node-shared table ({self._share_spec}), "
+            f"{host.size / (1 << 30):.1f} GiB {place}"
+        )
+        return True
+
+    def post_load_weights(self) -> None:
+        self.wait_shared_ready()
+
+    def wait_shared_ready(self) -> None:
+        """Importer of a node-shared table: wait until its owner marks the table ready and check
+        it against this process's checkpoint; elect again if the owner left first, and load a
+        private copy if the rows differ or this process cannot share."""
+        while self._share_source is not None:
+            weights, self._share_source = self._share_source, None
+            if self._share.wait_ready():
+                if self._rows_match((self.weight.data, self.scale.data), weights):
+                    logger.info(
+                        f"Engram: mapped node-shared table ({self._share_spec}); "
+                        "checkpoint rows match"
+                    )
+                    return
+                logger.warning(
+                    f"Engram: cannot share table ({self._share_spec}): its rows differ from this "
+                    "process's checkpoint; loading a private copy"
+                )
+            else:
+                logger.info(
+                    f"Engram: the owner of node-shared table ({self._share_spec}) left before "
+                    "filling it; electing again"
+                )
+                self._release_shared()
+                if self._load_node_shared(weights):
+                    continue
+            self._release_shared()
+            self._materialize_pinned()
+            self._load_rows(weights)
+
+    def _release_shared(self) -> None:
+        """Drop this process's mapping of a node-shared table; the table is meta until reloaded."""
+        if self._share is not None:
+            self._share.close()
+            self._share = None
+        for name in ("weight", "scale"):
+            param = self._parameters[name]
+            meta = torch.empty(param.shape, dtype=param.dtype, device="meta")
+            self.register_parameter(name, nn.Parameter(meta, requires_grad=False))
+        self._views = self._views_src = None
+
+    def _table_bytes(self) -> int:
+        return self.part_num_embeddings * (
+            self.embedding_dim + self.embedding_dim // self.block_size
+        )
+
+    def _table_views(self, host: object) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Weight rows, then scale rows, of one host mapping."""
+        data = _host_bytes(host, self._table_bytes())
+        split = self.part_num_embeddings * self.embedding_dim
+        return (
+            data[:split].view(torch.float8_e4m3fn).view(self.part_num_embeddings, -1),
+            data[split:].view(torch.float8_e8m0fnu).view(self.part_num_embeddings, -1),
+        )
+
+    def _rows_match(self, views: Tuple[torch.Tensor, torch.Tensor], weights: Dict) -> bool:
+        """64 spread rows of this shard, read by the GPU as lookups read them, equal the checkpoint."""
+        start = self.vocab_start_idx
+        count = self.vocab_end_idx - start
+        picks = sorted({i * (count - 1) // 63 for i in range(64)})
+        index = torch.tensor(picks, device="cuda")
+        for name, view in zip(("weight", "scale"), views):
+            rows = [torch.as_tensor(weights[name][start + row : start + row + 1]) for row in picks]
+            expected = torch.cat(rows).to(view.dtype).view(torch.uint8)
+            actual = _uva_device_view(view).view(torch.uint8)[index]
+            if not torch.equal(actual, expected.to(actual.device)):
+                return False
+        return True
+
+    def _load_rows(self, weights: Dict) -> None:
         start, end = self.vocab_start_idx, self.vocab_end_idx
         for name, param in (("weight", self.weight), ("scale", self.scale)):
             src = weights[name]
@@ -1697,6 +1897,7 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
 
     def storage(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return cached UVA ``(weight, scale)`` views, refreshed if host addresses change."""
+        self.wait_shared_ready()
         src = (self.weight.data_ptr(), self.scale.data_ptr())
         if self._views_src != src:
             self._views = (
@@ -1726,31 +1927,77 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
             return out
         weight, scale = self.storage()
         num_sms = _multi_processor_count(input_ids.device.index)
-        grid_size = min(
-            triton.cdiv(num_rows, _LOOKUP_BLOCK_R),
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            # Hashes must stay within each head's bucket. With rebased offsets,
+            # head shards own every lookup and need no ownership mask.
+            not self.shard_heads,
+            self.dtype,
+        )(
+            weight.view(torch.uint8),
+            scale.view(torch.uint8),
+            input_ids,
+            self.offsets,
+            out.view(num_rows, self.embedding_dim),
+            self.vocab_start_idx,
+            self.vocab_end_idx,
             max(1, num_sms // 2) if background else num_sms,
         )
-        _engram_lookup_kernel[(grid_size,)](
-            weight,
-            # Triton reads ue8m0 exponent bytes through uint8.
+        return out
+
+    def empty_packed(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        """Uninitialized ``forward_packed`` rows for ``num_tokens`` tokens."""
+        return torch.empty(
+            (
+                num_tokens,
+                packed_row_bytes(self.num_local_heads, self.embedding_dim, self.block_size),
+            ),
+            dtype=torch.uint8,
+            device=device,
+        )
+
+    def forward_packed(
+        self,
+        input_ids: torch.Tensor,
+        max_ctas: Optional[int],
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[T, num_heads]`` indices -> uint8 rows of the owned heads' E4M3 bytes, then their
+        UE8M0 codes, padded to 16 bytes, into ``out`` (from ``empty_packed``); the lookup uses at
+        most half the SMs, or ``max_ctas`` CTAs."""
+        if (
+            out.shape[0] != input_ids.shape[0]
+            or out.dtype != torch.uint8
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "Engram packed rows must be a contiguous uint8 buffer from empty_packed"
+            )
+        weight, scale = self.storage()
+        num_ctas = max(1, _multi_processor_count(input_ids.device.index) // 2)
+        if max_ctas is not None:
+            num_ctas = min(num_ctas, max_ctas)
+        compile_engram_lookup(
+            self.head_start,
+            self.num_local_heads,
+            input_ids.shape[1],
+            self.embedding_dim,
+            self.block_size,
+            False,
+            torch.uint8,
+            packed=True,
+        )(
+            weight.view(torch.uint8),
             scale.view(torch.uint8),
             input_ids,
             self.offsets,
             out,
             self.vocab_start_idx,
             self.vocab_end_idx,
-            num_rows,
-            input_ids.stride(0),
-            input_ids.stride(1),
-            grid_size,
-            HEAD_START=self.head_start,
-            LOCAL_HEADS=self.num_local_heads,
-            DIM=self.embedding_dim,
-            DIM_PAD=triton.next_power_of_2(self.embedding_dim),
-            QB=self.block_size,
-            # Hashes must stay within each head's bucket. With rebased offsets,
-            # head shards own every lookup and need no ownership mask.
-            MASKED=not self.shard_heads,
-            BLOCK_R=_LOOKUP_BLOCK_R,
+            num_ctas,
         )
         return out

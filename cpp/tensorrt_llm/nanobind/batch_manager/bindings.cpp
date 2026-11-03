@@ -53,6 +53,7 @@ namespace tensorrt_llm::nanobind::batch_manager
 void initBindings(nb::module_& m)
 {
     using GenLlmReq = tb::GenericLlmRequest<runtime::ITensor::SharedPtr>;
+    using TokenIdArray = nb::ndarray<tb::LlmRequest::TokenIdType const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
     // Create and register exceptions in module scope
     static nb::object peft_exc = nb::exception<tb::PeftTaskNotCachedException>(m, "PeftTaskNotCachedException");
@@ -321,6 +322,7 @@ void initBindings(nb::module_& m)
         .def("get_unique_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getUniqueTokens, nb::const_),
             nb::arg("beam"))
         .def("get_unique_tokens", nb::overload_cast<>(&GenLlmReq::getUniqueTokens, nb::const_))
+        .def("tracks_unique_tokens", &GenLlmReq::tracksUniqueTokens)
         .def("get_encoder_unique_tokens",
             [](GenLlmReq& self)
             {
@@ -376,7 +378,7 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths,
-                std::optional<std::string> cache_salt)
+                std::optional<std::string> cache_salt, bool track_unique_tokens)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
                 {
@@ -391,14 +393,26 @@ void initBindings(nb::module_& m)
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, NanobindUtils::toVecTokens(input_tokens_handle),
-                    sampling_config, is_streaming, multimodal_hashes, multimodal_positions, multimodal_lengths,
-                    multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, draft_tokens, exclude_input_from_output, encoder_input_tokens, priority,
-                    encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
-                    return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
-                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
-                    std::move(cache_salt)};
+                // An int32 array is copied in one memcpy, at the capacity the request keeps, so the request takes the
+                // vector over; anything else goes through toVecTokens.
+                std::vector<tb::LlmRequest::TokenIdType> tokens;
+                TokenIdArray array;
+                if (nb::try_cast(input_tokens_handle, array, /*convert=*/false))
+                {
+                    tokens.reserve(tb::LlmRequest::promptTokensCapacity(array.shape(0), max_new_tokens));
+                    tokens.assign(array.data(), array.data() + array.shape(0));
+                }
+                else
+                {
+                    tokens = NanobindUtils::toVecTokens(input_tokens_handle);
+                }
+                new (self) tb::LlmRequest{request_id, max_new_tokens, std::move(tokens), sampling_config, is_streaming,
+                    multimodal_hashes, multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id,
+                    lora_weights_tensor_ptr, lora_config_tensor_ptr, kv_cache_retention_config, draft_tokens,
+                    exclude_input_from_output, encoder_input_tokens, priority, encoder_input_length,
+                    encoder_output_length, llm_request_type, input_token_extra_ids, return_perf_metrics,
+                    context_phase_params, arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets,
+                    multimodal_run_positions, multimodal_run_lengths, std::move(cache_salt), track_unique_tokens};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("multimodal_hashes") = std::nullopt,
@@ -414,7 +428,7 @@ void initBindings(nb::module_& m)
             nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,
             nb::arg("agent_hierarchy") = std::nullopt, nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
             nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt,
-            nb::arg("cache_salt") = std::nullopt)
+            nb::arg("cache_salt") = std::nullopt, nb::arg("track_unique_tokens") = true)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def(nb::init<tb::LlmRequest const&, tb::LlmRequest::RequestIdType>(), nb::arg("parent_request"),

@@ -465,13 +465,90 @@ def test_selfsampling_topk_varlen_values():
         (16, 40000, 977, 1024),  # R=9 SPLIT + per-row TSH runtime gate (tsh_en=1)
         (200, 6000, 64, 512),  # BLK=512, SPLIT=False, non-big launch mode
     ],
-    ids=["b16_tsh_split", "b200_blk512_nonsplit"],
+    ids=["b16_tsh_split", "b200_nonsplit"],
 )
 def test_selfsampling_topk_varlen_launch_modes(rows, base, step, top_k):
     """Exercise the varlen kernel's other launch modes: the SPLIT + per-row
     TSH-floor runtime gate domain (16 <= b <= 74, k <= 1024) and the
-    BLK=512 non-split wide-batch plan."""
+    non-split wide-batch plan."""
     _run_varlen_case([base + step * i for i in range(rows)], 1, 1, top_k, seed=rows)
+
+
+_WIDE_K = 512
+_WIDE_WIDTH = 262144  # n / 4 > 32768: the streaming families, as in the decode arenas
+
+
+def _wide_batch(rows, kind, seed):
+    """Rows of mixed lengths (plain, spiky or tied scores), poisoned past each row's length."""
+    gen = torch.Generator().manual_seed(seed)
+    lengths = torch.randint(_WIDE_K // 2, _WIDE_WIDTH, (rows,), generator=gen)
+    lengths[::7] = _WIDE_WIDTH
+    lengths[3::11] = _WIDE_K
+    x = torch.randn((rows, _WIDE_WIDTH), generator=gen) * 0.1
+    for r in range(rows):
+        n = int(lengths[r])
+        if kind == "spiky" and r % 3 == 0 and n > 4 * _WIDE_K:
+            pick = torch.randperm(n, generator=gen)[:300]
+            x[r, pick] = 10.0 + torch.rand(300, generator=gen)
+        elif kind == "spiky" and r % 3 == 1 and n > 16 * _WIDE_K:
+            pick = torch.randperm(n, generator=gen)[:6000]
+            x[r, pick] = 10.0 + torch.rand(6000, generator=gen)
+        elif kind == "ties" and r % 2 == 0:
+            x[r, :n] = torch.round(x[r, :n] * 16) / 16
+        x[r, n:] = 3e38
+    return x.to(_DEV), lengths.to(torch.int32).to(_DEV)
+
+
+def _check_wide(logits, lengths, out):
+    for r in range(logits.shape[0]):
+        n = int(lengths[r])
+        got = out[r][out[r] >= 0]
+        assert got.numel() == min(_WIDE_K, n), r
+        assert int(got.min()) >= 0 and int(got.max()) < n and got.unique().numel() == got.numel(), r
+        want = torch.topk(logits[r, :n], min(_WIDE_K, n)).values.sort().values
+        assert torch.equal(logits[r, got.long()].sort().values, want), r
+
+
+@pytest.mark.parametrize("rows", [192, 296])
+@pytest.mark.parametrize("kind", ["plain", "spiky", "ties"])
+def test_selfsampling_topk_varlen_wide_cta(monkeypatch, rows, kind):
+    """149..296 varlen rows run gvr_main as one 1,024-thread CTA per row and select the exact
+    Top-K, as the 512-thread plan does (eager and CUDA-graph replay)."""
+    from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as ss_dev
+
+    logits, lengths = _wide_batch(rows, kind, seed=rows)
+    blocks = []
+    compiled = ss_dev.get_compiled
+
+    def spy(tpl, *args, **kwargs):
+        blocks.append(tpl[0])
+        return compiled(tpl, *args, **kwargs)
+
+    monkeypatch.setattr(ss_dev, "get_compiled", spy)
+    wide = ss_host._WIDE_CTA_ROWS
+    for plan in ((0, 0), wide):
+        monkeypatch.setattr(ss_host, "_WIDE_CTA_ROWS", plan)
+        ss_host._VARLEN_CACHE.clear()
+        blocks.clear()
+        out = torch.full((rows, _WIDE_K), -7, dtype=torch.int32, device=_DEV)
+        ss_host.run_varlen(
+            logits, lengths, out, next_n=1, compress_ratio=1, max_seq_len=_WIDE_WIDTH
+        )
+        torch.cuda.synchronize()
+        assert blocks == ([1024] if plan == wide else [512]), (plan, blocks)
+        _check_wide(logits, lengths, out)
+    graph = torch.cuda.CUDAGraph()
+    out = torch.empty((rows, _WIDE_K), dtype=torch.int32, device=_DEV)
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(
+            logits, lengths, out, next_n=1, compress_ratio=1, max_seq_len=_WIDE_WIDTH
+        )
+    fresh, _ = _wide_batch(rows, kind, seed=rows + 1)
+    logits.copy_(fresh)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_wide(logits, lengths, out)
+    ss_host._VARLEN_CACHE.clear()
 
 
 def test_selfsampling_topk_varlen_zero_kv_slot():

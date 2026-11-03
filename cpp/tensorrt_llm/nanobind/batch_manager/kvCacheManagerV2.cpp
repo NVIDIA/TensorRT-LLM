@@ -1745,11 +1745,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
-        .def(nb::init<size_t, std::optional<size_t>, bool>(), nb::arg("quota"), nb::arg("max_quota") = nb::none(),
-            nb::arg("allow_remote_numa_fallback") = true)
+        .def(nb::init<size_t, std::optional<size_t>, bool, std::optional<int>>(), nb::arg("quota"),
+            nb::arg("max_quota") = nb::none(), nb::arg("allow_remote_numa_fallback") = true,
+            nb::arg("numa_node") = nb::none())
         .def_rw("quota", &kv::HostCacheTierConfig::quota)
         .def_rw("max_quota", &kv::HostCacheTierConfig::maxQuota)
         .def_rw("allow_remote_numa_fallback", &kv::HostCacheTierConfig::allowRemoteNumaFallback)
+        .def_rw("numa_node", &kv::HostCacheTierConfig::numaNode)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
@@ -2189,6 +2191,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
+        .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion)
         .def_prop_ro(
             "batch_row",
             [](kv::KvCache const& self) -> std::optional<int>

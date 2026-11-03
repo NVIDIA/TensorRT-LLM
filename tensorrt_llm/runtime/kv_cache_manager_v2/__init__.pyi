@@ -267,6 +267,7 @@ class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
     allow_remote_numa_fallback: bool = True
+    numa_node: int | None = None
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -777,6 +778,9 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
     @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.

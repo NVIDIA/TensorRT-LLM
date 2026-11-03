@@ -1735,6 +1735,11 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
     return _VARLEN_CACHE
 
 
+# Varlen decode batches of this many rows whose plan is the non-split gvr_main with 512-thread CTAs
+# (two per SM) run it as one 1,024-thread CTA per row: twice the loads in flight per row, so the
+# batch's longest rows finish sooner. Same exact Top-K.
+_WIDE_CTA_ROWS = (149, 296)
+
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
 # launcher depends only on the row tier, k, the envelope bucket, the dtype and (16-bit
@@ -2996,6 +3001,10 @@ def _varlen_launcher(
                 n4 = n_route >> 2
                 if 2048 < n4 <= 3072 or (num_rows <= 6 * num_sms and 1536 < n4 <= 2048):
                     tpl = (256, 4, 4, tpl[3], 2, False, False)
+            wide_min, wide_max = _WIDE_CTA_ROWS
+            if wide_min <= num_rows <= wide_max and tpl[0] < 1024 and not tpl[5]:
+                kpt = 1 if k <= 1024 else (2 if k <= 2048 else (4 if k <= 4096 else 8))
+                tpl = (1024, tpl[1], 1, tpl[3], kpt, tpl[5], tpl[6])
             main_options.update(
                 det=det,
                 fused_k=k,

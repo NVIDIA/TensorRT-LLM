@@ -21,6 +21,8 @@ executed-batch and lifecycle transcripts, which do not exist yet.
 
 import inspect
 import queue
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -58,6 +60,7 @@ _COLLECTIVE_COORDINATOR_CALLS = {
     "poll_progress_when_idle",  # ctx transfer status consensus
     "align_gen_admission_across_cp",  # cp_allgather of the admitted gen-init ids
     "receive_gen_init",  # async receive polls gen status consensus
+    "start_deferred_gen_receives",  # async receive polls gen status consensus
     "reap_context_sends",  # ctx transfer status consensus
     "handle_timeouts_synced",  # tp_allgather_int64 under ADP
 }
@@ -114,7 +117,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
 
     executor = object.__new__(PyExecutor)
     executor._disagg_coordinator = _recording_coordinator(calls)
-    executor._flush_pending_transfer_responses = lambda: calls.append(
+    executor._flush_pending_transfer_responses = lambda **kwargs: calls.append(
         ("flush_pending_transfer_responses",)
     )
     executor.kv_cache_transceiver = Mock()
@@ -140,12 +143,15 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor.drafter = None
     executor.capturable_guided_decoder = None
     executor.model_engine = None
+    executor._overlap_loop_stream = nullcontext
     executor.previous_batch = None
     executor.active_requests = []
     executor.canceled_req_ids = []
     executor.waiting_queue = []
     executor.inflight_req_ids = set()
     executor.is_shutdown = False
+    executor._intake_window = threading.Event()
+    executor._intake_window_started = 0.0
 
     def fetch_new_requests():
         if fetch_new_requests.called:
@@ -167,7 +173,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
         "_pad_empty_attention_dp_batch",
         "_terminate_requests",
         "_pause_requests",
-        "_revert_gen_alloc",
+        "_revert_unexecuted_alloc",
         "_finalize_adp_dummy_allocation",
         "_wait_for_model_engine_input_copy",
         "_enqueue_responses",
@@ -220,12 +226,14 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
 
 _SCHEDULE_HEAD = [
     ("handle_errors_synced",),
+    ("start_deferred_gen_receives",),
     ("prepare_context_schedulable", []),
     ("poll_gen_transfers",),
     ("check_transfer_timeouts",),
     ("admit", []),
     ("align_gen_admission_across_cp", []),
-    ("receive_gen_init", []),
+    # No step is in flight in an idle iteration, so no receive is deferred.
+    ("receive_gen_init", [], "defer=False"),
     ("poll_progress_when_idle",),
 ]
 # Non-PP loops flush at loop exit; the PP loop does not.
@@ -261,6 +269,7 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     PyExecutor._executor_loop_overlap(executor)
 
     idle_pass = _SCHEDULE_HEAD + [
+        ("start_deferred_gen_receives", "wait_all=False"),
         ("flush_pending_transfer_responses",),
         ("handle_timeouts_synced",),
         ("check_transfer_timeouts", "only_with_context_sends=True"),
@@ -365,7 +374,13 @@ def test_overlap_kv_events_keep_adp_collectives_aligned(
             executor.resource_manager.update_resources.assert_not_called()
 
         collective_names = _COLLECTIVE_SENSITIVE | {"enqueue_responses", "kv_event_allgather"}
-        transcript = [call for call in iteration_calls if call[0] in collective_names]
+        # receive_gen_init's defer follows the rank's step in flight; with nothing admitted
+        # it makes no collective call either way.
+        transcript = [
+            tuple(arg for arg in call if not str(arg).startswith("defer="))
+            for call in iteration_calls
+            if call[0] in collective_names
+        ]
         assert transcript[-4:] == [
             ("flush_pending_transfer_responses",),
             ("enqueue_responses",),

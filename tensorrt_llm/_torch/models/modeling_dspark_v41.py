@@ -22,6 +22,7 @@ draft expert bank, and the checkpoint's 32-by-32 FP8 dense scale granularity.
 """
 
 import copy
+import math
 import re
 from typing import TYPE_CHECKING
 
@@ -83,11 +84,163 @@ def _validate_quantized_pairs(weights: dict[str, torch.Tensor]) -> None:
         )
 
 
+# MegaMoE serves NVFP4 experts only: a draft on MEGAMOE_CUTEDSL re-encodes the checkpoint's MXFP4
+# routed experts (E2M1 codes, one E8M0 scale per 32 elements) as NVFP4 at load. The weights stay exact: an
+# E8M0 scale is a power of two and E4M3 holds every power of two from 2**-9 to 2**8, so with one
+# weight_scale_2 per operand at 2**(e_max - 135) each block keeps its value while the operand's
+# non-zero blocks span at most 17 binades. The static NVFP4 activation scales, which the checkpoint
+# has only for the target, are bounds from the model rather than calibration data: the MoE input is
+# an RMSNorm output, |x| <= sqrt(hidden) * max|norm weight|; the FC2 input is the clamped SwiGLU
+# times a routing weight, |a| <= limit * silu(limit) * routed_scaling_factor.
+_E2M1_MAX = 6.0
+_E4M3_MAX = 448.0
+# E4M3 holds 2**d exactly for d in [-9, 8]; an operand's largest block scale becomes 2**8.
+_TOP_EXP = 8
+_MIN_EXP = -9
+_DRAFT_EXPERT_KEY = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+
+
+def _draft_experts_as_nvfp4(draft_moe_backend: str | None) -> bool:
+    """Whether the draft's MXFP4 routed experts load as NVFP4 (an explicit MegaMoE draft)."""
+    return draft_moe_backend == "MEGAMOE_CUTEDSL"
+
+
+def _materialize(value) -> torch.Tensor:
+    return value if isinstance(value, torch.Tensor) else value[:]
+
+
+def _exponents(scale: torch.Tensor) -> torch.Tensor:
+    return scale.contiguous().view(torch.uint8).to(torch.int32)
+
+
+def _nonzero_blocks(weight: torch.Tensor) -> torch.Tensor:
+    """Blocks of 32 codes (16 bytes) holding at least one non-zero E2M1 magnitude."""
+    packed = weight.contiguous().view(torch.uint8)
+    rows, nbytes = packed.shape
+    return ((packed & 0x77) != 0).reshape(rows, nbytes // 16, 16).any(dim=-1)
+
+
+def _operand_exponent_range(weights: list, exponents: list) -> tuple:
+    """(min, max) E8M0 exponent of an operand's blocks, over the non-zero ones if all do not fit."""
+    lo = min(int(e.min()) for e in exponents)
+    hi = max(int(e.max()) for e in exponents)
+    if hi - lo <= _TOP_EXP - _MIN_EXP:
+        return lo, hi
+    live = [e[_nonzero_blocks(w)] for w, e in zip(weights, exponents)]
+    live = [e for e in live if e.numel()]
+    if not live:
+        return 127, 127
+    return min(int(e.min()) for e in live), max(int(e.max()) for e in live)
+
+
+def _pow2_to_e4m3(exp: torch.Tensor) -> torch.Tensor:
+    """E4M3 bytes of 2**exp for integer exp in [-9, 8] (subnormal below -6)."""
+    normal = torch.bitwise_left_shift((exp + 7).clamp(min=0), 3)
+    subnormal = torch.bitwise_left_shift(torch.ones_like(exp), (exp + 9).clamp(min=0, max=2))
+    return torch.where(exp >= -6, normal, subnormal).to(torch.uint8)
+
+
+def _mxfp4_to_nvfp4(weight: torch.Tensor, exponents: torch.Tensor, e_max: int) -> tuple:
+    """[N, K/2] MXFP4 codes, [N, K/32] E8M0 exponents -> NVFP4 codes, [N, K/16] E4M3 scales."""
+    exp = exponents - e_max + _TOP_EXP
+    if bool((exp < _MIN_EXP).any()) and bool((exp[_nonzero_blocks(weight)] < _MIN_EXP).any()):
+        raise ValueError(
+            "MXFP4 block exponents span more binades than E4M3 holds; "
+            "the NVFP4 re-encoding would not be exact"
+        )
+    # Blocks of zero codes keep their value under any scale.
+    exp = exp.clamp(min=_MIN_EXP, max=_TOP_EXP)
+    scale = _pow2_to_e4m3(exp).repeat_interleave(2, dim=-1).view(torch.float8_e4m3fn)
+    return weight.contiguous().view(torch.uint8), scale
+
+
+def _draft_activation_amax(
+    norm_weight: torch.Tensor,
+    hidden_size: int,
+    swiglu_limit: float,
+    routed_scaling_factor: float,
+) -> tuple:
+    """Bounds of the MoE input (FC1) and the routing-weighted SwiGLU output (FC2)."""
+    fc1_amax = math.sqrt(hidden_size) * float(norm_weight.float().abs().max())
+    silu_limit = swiglu_limit / (1.0 + math.exp(-swiglu_limit))
+    fc2_amax = swiglu_limit * silu_limit * routed_scaling_factor
+    return fc1_amax, fc2_amax
+
+
+def convert_draft_experts_to_nvfp4(
+    stage_weights: dict,
+    hidden_size: int,
+    swiglu_limit: float,
+    routed_scaling_factor: float,
+) -> dict:
+    """Replace the MXFP4 ``layers.<s>.ffn.experts.<e>.w{1,2,3}.{weight,scale}`` entries of a draft
+    weight map by NVFP4 ``weight`` / ``weight_scale`` / ``weight_scale_2`` / ``input_scale``."""
+    if swiglu_limit is None:
+        raise ValueError("NVFP4 DSpark draft experts need a SwiGLU limit to bound the FC2 input")
+    groups: dict = {}
+    out = {}
+    for name, value in stage_weights.items():
+        match = _DRAFT_EXPERT_KEY.match(name)
+        if match is None:
+            out[name] = value
+            continue
+        stage, expert, proj, kind = (
+            int(match.group(1)),
+            int(match.group(2)),
+            match.group(3),
+            match.group(4),
+        )
+        groups.setdefault((stage, expert), {}).setdefault(proj, {})[kind] = value
+    amax = {}
+    for stage in sorted({stage for stage, _ in groups}):
+        amax[stage] = _draft_activation_amax(
+            _materialize(stage_weights[f"layers.{stage}.ffn_norm.weight"]),
+            hidden_size,
+            swiglu_limit,
+            routed_scaling_factor,
+        )
+    max_span = 0
+    for (stage, expert), projs in sorted(groups.items()):
+        if set(projs) != {"w1", "w2", "w3"} or any(
+            set(p) != {"weight", "scale"} for p in projs.values()
+        ):
+            raise ValueError(
+                f"draft stage {stage} expert {expert}: incomplete MXFP4 expert tensors"
+            )
+        weights = {p: _materialize(kv["weight"]) for p, kv in projs.items()}
+        exponents = {p: _exponents(_materialize(kv["scale"])) for p, kv in projs.items()}
+        # The gate and up projections are fused into FC1, so they share one weight_scale_2.
+        for operand, operand_amax in ((("w1", "w3"), amax[stage][0]), (("w2",), amax[stage][1])):
+            lo, hi = _operand_exponent_range(
+                [weights[p] for p in operand], [exponents[p] for p in operand]
+            )
+            max_span = max(max_span, hi - lo)
+            weight_scale_2 = torch.tensor(2.0 ** (hi - 127 - _TOP_EXP), dtype=torch.float32)
+            input_scale = torch.tensor(operand_amax / (_E4M3_MAX * _E2M1_MAX), dtype=torch.float32)
+            for p in operand:
+                codes, scale = _mxfp4_to_nvfp4(weights[p], exponents[p], hi)
+                prefix = f"layers.{stage}.ffn.experts.{expert}.{p}"
+                out[f"{prefix}.weight"] = codes
+                out[f"{prefix}.weight_scale"] = scale
+                out[f"{prefix}.weight_scale_2"] = weight_scale_2.clone()
+                out[f"{prefix}.input_scale"] = input_scale.clone()
+    if groups:
+        bounds = ", ".join(f"{s}: {a1:.2f} / {a2:.2f}" for s, (a1, a2) in sorted(amax.items()))
+        logger.info(
+            f"DSpark: {len(groups)} draft experts re-encoded MXFP4 -> NVFP4 (largest E8M0 span "
+            f"{max_span} of {_TOP_EXP - _MIN_EXP}); static FC1 / FC2 activation amax by stage "
+            f"{bounds}"
+        )
+    return out
+
+
 def remap_dspark_v41_draft_keys(
     weights: dict[str, torch.Tensor],
     num_stages: int,
     kv_lora_rank: int,
     quantization_config: dict | None = None,
+    pretrained_config=None,
+    nvfp4_experts: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Load every draft stage using the target's checked V4.1 quantization layout.
 
@@ -115,6 +268,13 @@ def remap_dspark_v41_draft_keys(
     if missing:
         raise ValueError(f"V4.1 DSpark checkpoint is missing draft stages {missing}")
     _validate_quantized_pairs(stage_weights)
+    if nvfp4_experts:
+        stage_weights = convert_draft_experts_to_nvfp4(
+            stage_weights,
+            pretrained_config.hidden_size,
+            getattr(pretrained_config, "swiglu_limit", None),
+            pretrained_config.routed_scaling_factor,
+        )
     remapped = _remap_deepseek_v41_checkpoint_keys(
         stage_weights,
         num_hidden_layers=num_stages,
@@ -220,10 +380,11 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
             draft_moe_backend=draft_moe_backend,
         )
         self._attn_params["q_b_norm_enabled"] = False
+        self.nvfp4_experts = _draft_experts_as_nvfp4(draft_moe_backend)
 
     @staticmethod
     def _draft_quant_config_dict(
-        model_config: ModelConfig, base: int, num_stages: int
+        model_config: ModelConfig, base: int, num_stages: int, draft_moe_backend: str | None = None
     ) -> dict[str, QuantConfig] | None:
         quant_configs = DSv4DSparkDraftModel._draft_quant_config_dict(
             model_config, base, num_stages
@@ -241,7 +402,12 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
             if tensor_info is None:
                 continue
             dtype = tensor_info.get("dtype")
-            if dtype == "I8" and len(tensor_info.get("shape", [])) == 2:
+            mxfp4 = dtype == "I8" and len(tensor_info.get("shape", [])) == 2
+            if mxfp4 and _draft_experts_as_nvfp4(draft_moe_backend):
+                # remap_dspark_v41_draft_keys re-encodes these MXFP4 experts as NVFP4.
+                quant_algo = QuantAlgo.NVFP4
+                group_size = 16
+            elif mxfp4:
                 quant_algo = ModelConfig.get_mxfp4_quant_algo(model_config.moe_backend)
                 group_size = 32
             elif dtype == "U8":
@@ -283,6 +449,8 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
             self.num_stages,
             self.config.kv_lora_rank,
             getattr(self.config, "quantization_config", None),
+            pretrained_config=self.config,
+            nvfp4_experts=self.dspark_model.nvfp4_experts,
         )
         last = self.dspark_model.mtp_layers[-1]
         required = [
