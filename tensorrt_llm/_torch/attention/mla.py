@@ -63,6 +63,7 @@ from .backends import (
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.utils import create_attention
+from .kernels.mla_kv_fp8 import mla_kv_to_fp8
 from .rotary_embedding import RotaryEmbedding
 
 
@@ -235,6 +236,10 @@ def fp8_block_scaling_bmm_out(
 
 
 class MLA(nn.Module):
+    # Whether the cached-KV context paths hand the attention op FP8 Q / K / V;
+    # resolved once in create_weights().
+    _fp8_cached_kv_context: bool = False
+
     def __init__(
         self,
         *,
@@ -742,6 +747,7 @@ class MLA(nn.Module):
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
         self._fused_q_fp8_ctx_ok = False
+        self._fp8_cached_kv_context = False
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
@@ -834,6 +840,7 @@ class MLA(nn.Module):
         self._locality_domain_v_b_proj_shards = None
         self._weights_transformed = False
         self._init_fused_q_fp8_context()
+        self._fp8_cached_kv_context = self._supports_fp8_cached_kv_context()
 
     def apply_rope(
         self,
@@ -1336,22 +1343,27 @@ class MLA(nn.Module):
         assert full_compressed_kv.is_contiguous()
         assert full_k_pe.is_contiguous()
 
-        # compute full_k_nope and full_v from full_compressed_kv
-        full_kv = self._project_context_kv(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
+        q_fp8 = None
+        if self._fp8_cached_kv_context:
+            q_fp8 = self._quantize_q_fp8(q)
+            full_k, full_v = self._expand_kv_to_fp8(full_compressed_kv, full_k_pe)
+        else:
+            # compute full_k_nope and full_v from full_compressed_kv
+            full_kv = self._project_context_kv(full_compressed_kv)
+            full_k_nope, full_v = full_kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
 
-        full_k_nope = full_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-        )
-        full_k = full_k.view(-1, self.num_context_heads * self.qk_head_dim)
+            full_k_nope = full_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
+            full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            full_k = maybe_compiled_cat(
+                (full_k_nope, full_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
+            )
+            full_k = full_k.view(-1, self.num_context_heads * self.qk_head_dim)
 
         # release pytorch activation memory
         full_compressed_kv = None
@@ -1371,6 +1383,7 @@ class MLA(nn.Module):
                 latent_cache=None,
                 out_scale=self.out_scale,
                 output=output,
+                **self._fp8_q_forward_args(q_fp8),
             ),
         )
 
@@ -1522,6 +1535,8 @@ class MLA(nn.Module):
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        # With FP8 attention inputs, Q is quantized once for every partition.
+        q_fp8 = self._quantize_q_fp8(q) if self._fp8_cached_kv_context else None
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
@@ -1569,23 +1584,28 @@ class MLA(nn.Module):
                 out_dtype=q.dtype,
             )
 
-            # up proj to uncompressed kv
-            # [tokens, 2, h, kv_dim], without rope_dim
-            chunked_kv = self._project_context_kv(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [
-                    self.num_context_heads * self.qk_nope_head_dim,
-                    self.num_context_heads * self.v_head_dim,
-                ],
-                -1,
-            )
+            if self._fp8_cached_kv_context:
+                chunked_k, chunked_v = self._expand_kv_to_fp8(chunked_compressed_kv, chunked_k_pe)
+            else:
+                # up proj to uncompressed kv
+                # [tokens, 2, h, kv_dim], without rope_dim
+                chunked_kv = self._project_context_kv(chunked_compressed_kv)
+                chunked_k_nope, chunked_v = chunked_kv.split(
+                    [
+                        self.num_context_heads * self.qk_nope_head_dim,
+                        self.num_context_heads * self.v_head_dim,
+                    ],
+                    -1,
+                )
 
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_context_heads * self.qk_head_dim)
+                chunked_k_nope = chunked_k_nope.view(
+                    -1, self.num_context_heads, self.qk_nope_head_dim
+                )
+                chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
+                chunked_k = maybe_compiled_cat(
+                    (chunked_k_nope, chunked_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
+                )
+                chunked_k = chunked_k.view(-1, self.num_context_heads * self.qk_head_dim)
 
             # release pytorch activation memory
             chunked_compressed_kv = None
@@ -1614,6 +1634,7 @@ class MLA(nn.Module):
                     softmax_stats_tensor=self.temp_softmax_stats_tensor,
                     chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
                     output=temp_attn_output,
+                    **self._fp8_q_forward_args(q_fp8),
                 ),
             )
             # merge attn result
@@ -1628,24 +1649,26 @@ class MLA(nn.Module):
             )
 
         # deal with the uncached kv
-        kv = self._project_context_kv(compressed_kv)
         _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
             [self.kv_lora_rank, self.qk_rope_head_dim], -1
         )
         # final round of attention
+        if self._fp8_cached_kv_context:
+            k, v = self._expand_kv_to_fp8(compressed_kv, k_pe)
+        else:
+            kv = self._project_context_kv(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
 
-        k_nope, v = kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
-
-        k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
-        k = k.view(-1, self.num_context_heads * self.qk_head_dim)
+            k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+            k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
+            k = k.view(-1, self.num_context_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
@@ -1668,6 +1691,7 @@ class MLA(nn.Module):
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
                 output=temp_attn_output,
+                **self._fp8_q_forward_args(q_fp8),
             ),
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
@@ -1771,15 +1795,25 @@ class MLA(nn.Module):
             # (block-reuse without chunked_prefill) recompiles per shape and
             # may stall inside inductor's compile worker.
             if trtllm_attention.has_cached_kv_for_mla_context_warmup(attn_metadata):
-                self.cached_warmup_forward_context_with_cached_kv(
-                    self.num_context_heads,
-                    self.qk_nope_head_dim,
-                    self.qk_rope_head_dim,
-                    self.kv_lora_rank,
-                    self.v_head_dim,
-                    q.dtype,
-                    q.device,
-                )
+                if self._fp8_cached_kv_context:
+                    self.cached_warmup_expand_kv_to_fp8(
+                        self.num_context_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                        q.device,
+                    )
+                else:
+                    self.cached_warmup_forward_context_with_cached_kv(
+                        self.num_context_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                        q.dtype,
+                        q.device,
+                    )
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
@@ -2142,6 +2176,77 @@ class MLA(nn.Module):
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         return output
+
+    def _supports_fp8_cached_kv_context(self) -> bool:
+        """Whether cached-KV context attention can hand the attention op FP8 Q / K / V.
+
+        The op's FP8 context MLA FMHA (``TrtllmAttention.has_fp8_context_mla``)
+        otherwise copies its BF16 Q, K and V to FP8 on every call, i.e. once per
+        cached-KV partition, after a BF16 concat of k_nope and k_pe. Requires
+        dense attention without Helix CP, the 128 / 64 / 128 head dimensions of
+        the op's FP8 copy kernel, and a unit KV quantization scale, since the
+        FP8 Q / K / V written here are plain conversions (checked once, here).
+        """
+        mha = self.mha
+        if not (
+            isinstance(mha, TrtllmAttention)
+            and mha.has_fp8_context_mla
+            and mha.sparse_params is None
+            and not self.mapping.has_cp_helix()
+            and (self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim) == (128, 64, 128)
+        ):
+            return False
+        scale = mha.kv_scale_orig_quant
+        return isinstance(scale, torch.Tensor) and bool(torch.all(scale == 1.0).item())
+
+    def _quantize_q_fp8(self, q: torch.Tensor) -> torch.Tensor:
+        """Q in FP8 as the attention op's context copy quantizes it (unit scale,
+        which :meth:`_supports_fp8_cached_kv_context` requires)."""
+        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            q, self.mha.kv_scale_orig_quant
+        )[0]
+
+    def _fp8_q_forward_args(self, q_fp8: Optional[torch.Tensor]) -> dict:
+        """Attention-op arguments that hand it ``q_fp8`` as the already-quantized FP8 Q."""
+        if q_fp8 is None:
+            return {}
+        return {"quant_q_buffer": q_fp8, "quant_scale_qkv": self.mha.kv_scale_orig_quant}
+
+    def _expand_kv_to_fp8(
+        self, compressed_kv: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj, then FP8 K ``[T, H * qk_head_dim]`` and V ``[T, H * v_head_dim]`` in one
+        pass, the bytes the attention op's context copy writes for the BF16 K and V."""
+        return mla_kv_to_fp8(
+            self._project_context_kv(compressed_kv),
+            k_pe.view(-1, self.qk_rope_head_dim),
+            self.num_context_heads,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
+
+    @staticmethod
+    @functools.cache
+    def cached_warmup_expand_kv_to_fp8(
+        num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank, v_head_dim, device
+    ):
+        """Compile the FP8 K / V kernel before the first cached-KV context step.
+
+        k_pe is contiguous for loaded chunks and a ``latent_cache`` view for the
+        current tokens; both specialize alike.
+        """
+        num_tokens = 2
+        kv = torch.zeros(
+            num_tokens,
+            num_heads * (qk_nope_head_dim + v_head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        latent = torch.zeros(
+            num_tokens, kv_lora_rank + qk_rope_head_dim, dtype=torch.bfloat16, device=device
+        )
+        for k_pe in (latent[:, kv_lora_rank:].contiguous(), latent[:, kv_lora_rank:]):
+            mla_kv_to_fp8(kv, k_pe, num_heads, qk_nope_head_dim, v_head_dim)
 
     def _init_fused_q_fp8_context(self) -> None:
         """Resolve the static half of the context-phase fused FP8-Q gate (see

@@ -606,3 +606,178 @@ def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
     finally:
         mixer.helix_exchange_event = None
     assert torch.equal(side, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="needs the FP8 context MLA FMHA of SM100 / SM103 / SM107",
+)
+@pytest.mark.parametrize(
+    "cached,new,chunk_size,buffer_batch",
+    [
+        ([256], [128], 64, 1),
+        ([256, 200], [128, 184], 64, 1),
+        ([1000, 3000, 37], [100, 64, 300], 512, 2),
+        ([256, 200], [128, 184], None, None),
+    ],
+    ids=["one_request", "two_requests", "three_requests_1024_key_slices", "cached_kv"],
+)
+def test_k3_mla_fp8_cached_kv_context_matches_bf16_inputs(
+    cached, new, chunk_size, buffer_batch, monkeypatch
+) -> None:
+    """With an FP8 KV cache the cached-KV context paths hand the attention op FP8 Q / K / V;
+    the layer output is bit-identical to handing it BF16 Q / K / V, through the chunked-prefill
+    loop (partitions within and across requests) and the plain cached-KV path."""
+    torch.manual_seed(13)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    config = KimiLinearConfig(
+        vocab_size=128,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        attn_res_block_size=1,
+        torch_dtype=torch.bfloat16,
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [1], "num_heads": 32},
+        num_attention_heads=96,
+        num_key_value_heads=96,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rms_norm_eps=1e-6,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=4096,
+    )
+    config._attn_implementation = "eager"
+    reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+    weights = _checkpoint_weights(reference, fp8=True)
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=mapping,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        quant_config_dict={
+            f"model.layers.0.self_attn.{name}": QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+            )
+            for name in weights
+        },
+    )
+    with torch.device("cuda"):
+        model = KimiLinearForCausalLM(model_config).eval()
+    projections = {
+        f"{name}.{suffix}": value
+        for name, pair in weights.items()
+        for suffix, value in pair.items()
+    }
+    projections.update(
+        {name: value for name, value in reference.named_parameters() if value.ndim == 1}
+    )
+    load_mla_checkpoint(model, projections, "")
+    runtime = model.model.layers[0].self_attn
+    for module in runtime.modules():
+        if callable(getattr(module, "post_load_weights", None)):
+            module.post_load_weights()
+    mla = runtime.mixer
+    assert mla._fp8_cached_kv_context
+    # The FP8 Q / K / V are unscaled conversions, so a non-unit KV quantization scale keeps
+    # the op's own (scaled) copy.
+    unit_scale = mla.mha.kv_scale_orig_quant
+    mla.mha.kv_scale_orig_quant = torch.full_like(unit_scale, 0.5)
+    try:
+        assert not mla._supports_fp8_cached_kv_context()
+    finally:
+        mla.mha.kv_scale_orig_quant = unit_scale
+    del reference
+
+    batch = len(cached)
+    total = [c + n for c, n in zip(cached, new)]
+    scenario = SimpleNamespace(
+        ctx_len=max(total),
+        batch=batch,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.float8_e4m3fn,
+    )
+    manager, _ = setup_kv_and_metadata(
+        scenario,
+        mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    hidden = [
+        torch.randn(t, config.hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator)
+        for t in total
+    ]
+
+    def context_metadata(seq_lens, cached_lens, runtime_features=None):
+        kwargs = {} if runtime_features is None else {"runtime_features": runtime_features}
+        metadata = get_attention_backend("TRTLLM").Metadata(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            request_ids=list(range(batch)),
+            max_num_requests=batch,
+            num_contexts=batch,
+            prompt_lens=list(seq_lens),
+            max_num_tokens=sum(seq_lens),
+            kv_cache_manager=manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+            mapping=mapping,
+            enable_context_mla_with_cached_kv=True,
+            **kwargs,
+        )
+        metadata.prepare()
+        return metadata
+
+    # Record the dtypes of what reaches the attention op.
+    op_inputs = []
+    mha_forward = mla.mha.forward
+
+    def recording_forward(q, k, v, metadata, forward_args, **kwargs):
+        fp8_q = forward_args.quant_q_buffer is not None and forward_args.quant_scale_qkv is not None
+        op_inputs.append((k.dtype, v.dtype, fp8_q))
+        return mha_forward(q, k, v, metadata, forward_args=forward_args, **kwargs)
+
+    monkeypatch.setattr(mla.mha, "forward", recording_forward)
+    outputs, op_calls = {}, {}
+    try:
+        # The first chunk fills the FP8 cache with the first cached[i] tokens of each request.
+        first = context_metadata(cached, [0] * batch)
+        extra_attrs = {
+            "attention_metadata": weakref.ref(first),
+            "mla_layers": {mla.layer_idx_str: weakref.ref(mla)},
+        }
+        with model_extra_attrs(extra_attrs):
+            runtime(torch.cat([hidden[i][: cached[i]] for i in range(batch)]), first)
+        second_input = torch.cat([hidden[i][cached[i] :] for i in range(batch)])
+        features = (
+            None
+            if chunk_size is None
+            else AttentionRuntimeFeatures(
+                chunked_prefill=True,
+                chunk_size=chunk_size,
+                chunked_prefill_buffer_batch_size=buffer_batch,
+            )
+        )
+        for fp8_inputs in (False, True):
+            mla._fp8_cached_kv_context = fp8_inputs
+            op_inputs.clear()
+            second = context_metadata(new, cached, features)
+            extra_attrs["attention_metadata"] = weakref.ref(second)
+            with model_extra_attrs(extra_attrs):
+                outputs[fp8_inputs] = runtime(second_input, second).clone()
+            torch.cuda.synchronize()
+            op_calls[fp8_inputs] = list(op_inputs)
+    finally:
+        manager.shutdown()
+
+    partitions = 1
+    if chunk_size is not None:
+        partitions += math.ceil(sum(cached) / (chunk_size * buffer_batch))
+    assert op_calls[False] == [(torch.bfloat16, torch.bfloat16, False)] * partitions
+    assert op_calls[True] == [(torch.float8_e4m3fn, torch.float8_e4m3fn, True)] * partitions
+    assert outputs[False].abs().sum() > 0
+    assert torch.equal(outputs[True].view(torch.int16), outputs[False].view(torch.int16))
