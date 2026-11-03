@@ -219,3 +219,9 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_nvfp4_kv_bf16_state_long_context:
   # 2.5% below ref_al, as for mtp3_long_context.
   min_al: 6.69
 
+# Read by TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context
+# (test_qwen4_exp.py), over the pass keys of the tp1 target's mtp3_long_context at tep4: three
+# drafts with IndexShare on, bf16 KV.
+ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
+  ref_al: null
+  min_al: null

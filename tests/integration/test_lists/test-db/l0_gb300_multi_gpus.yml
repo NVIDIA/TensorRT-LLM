@@ -33,6 +33,13 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
   - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_gsm8k
   - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_eagle3_gsm8k_and_acceptance
+  # qwen4_exp default target, post-merge: three drafts over NVFP4 KV at tp4 with the
+  # breakable prefill graph and over FP8 KV at dep4 (MTP under attention DP), both with block
+  # reuse and chunked prefill; and dep2 context and generation engines on one node. tep4 runs
+  # pre-merge (l0_gb300); mmmu runs in QA (llm_function_core).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2 TIMEOUT (90)
   # qwen4_exp tp1 target, post-merge: its AgentX engines (NVFP4 KV, MTP2 with rejection
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.
