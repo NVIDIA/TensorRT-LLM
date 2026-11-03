@@ -218,9 +218,12 @@ These options provide control over TensorRT LLM's behavior and are set within th
   kv_cache_config:
     enable_block_reuse: true
     use_kv_cache_manager_v2: true
+    avg_seq_len: 32768  # your workload's average total sequence length
     mamba_state_config:
       additional_snapshot_offsets_from_end: [1, 576]
   ```
+
+  Exact end offsets need `MambaHybridCacheManagerV2` (the default for hybrid Mamba models) and `max_beam_width: 1`. Set `avg_seq_len` (or `pool_ratio`) so V2 sizes the attention KV and Mamba state pools for your workload; without it, V2 warns and assumes half of `max_seq_len`.
 
   On NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 (one DGX Spark), `[1]` alone made follow-up turns reuse the cached prompt instead of re-reading it, and `[1, 576]` cut time to first token on a 100K-token prompt with a cached prefix from 31-33 s to 18.6 s. Check the per-request `num_reused_blocks` metric to confirm reuse on your workload.
 
