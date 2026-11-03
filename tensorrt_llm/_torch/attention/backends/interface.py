@@ -362,7 +362,8 @@ class AttentionMetadata:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
+        high_layers = getattr(self.kv_cache_manager,
+                              "mixed_precision_high_layers", None)
         return isinstance(high_layers, dict) and bool(high_layers)
 
     def prepare_mixed_precision_kv(self, layout: str,
@@ -372,11 +373,29 @@ class AttentionMetadata:
             self.mixed_precision_staging, self.kv_cache_manager, "mixed",
             layout, tokens_per_block)
         draft = self.draft_kv_cache_manager
-        high_layers = getattr(draft, "high_layers", None)
-        if isinstance(high_layers, dict) and high_layers:
+        draft_high_layers = getattr(draft, "mixed_precision_high_layers", None)
+        # A draft view runs on the draft manager itself and has no draft of its own.
+        if (draft is not self.kv_cache_manager
+                and isinstance(draft_high_layers, dict) and draft_high_layers):
             self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
                 self.draft_mixed_precision_staging, draft, "draft_mixed",
                 layout, tokens_per_block)
+
+    def sync_draft_mixed_precision_staging(
+            self) -> "MixedPrecisionKVStaging | None":
+        """Give the draft staging copy the target's lengths at the start of a draft forward.
+
+        A mixed-precision MTP draft manager holds the same tokens as the target manager,
+        and overlap-scheduler corrections may have changed the target's lengths on the
+        device since prepare().
+
+        Returns:
+            The draft staging copy; None without a separate mixed-precision draft manager.
+        """
+        draft = self.draft_mixed_precision_staging
+        if draft is not None:
+            draft.lengths.copy_(self.mixed_precision_staging.lengths)
+        return draft
 
     def _refresh_mixed_precision_kv(
             self, view: "MixedPrecisionKVStaging | None",
@@ -424,7 +443,7 @@ class AttentionMetadata:
         staging = self.mixed_precision_staging
         if (staging is None or layer_idx not in staging.pools
                 or staging.manager is not self.kv_cache_manager):
-            # A layer without a twin, or of a manager not swapped in: no staging.
+            # No staging for a layer without a mixed-precision high pool, or of a manager not in use.
             return None
         return staging
 

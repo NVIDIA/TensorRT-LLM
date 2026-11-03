@@ -943,20 +943,17 @@ def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
     if draft_kv_config.pool_ratio is None:
         return
     if draft_kv_config.mixed_precision_kv is not None or retained_window:
-        # The MTP draft manager has its own pool plus a retained-token pool;
-        # the target's ratios describe the target's pools.
+        # An MTP draft manager with mixed-precision KV, or with the cold-page
+        # window, has its own pool plus a mixed-precision high pool, so the
+        # target's pool_ratio does not fit it.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
-            "target KV cache only; the MTP draft KV cache with retained-token "
-            "layers sizes its pools automatically.")
+            "target KV cache only; the MTP draft KV cache with mixed-precision "
+            "high layers sizes its pools automatically.")
         draft_kv_config.pool_ratio = None
     elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
           and len(draft_kv_config.pool_ratio) != 1):
-        # pool_ratio describes one manager's layer-group layout. The
-        # target hybrid manager may have separate recurrent-state and
-        # attention layer groups, while a non-VSWA draft manager has one
-        # attention layer group. Reusing the target's ratios fails its arity
-        # check.
+        # pool_ratio describes one manager's layer groups: the target's ratios do not fit the draft.
         logger.info(
             "Normalizing the separate one-model draft KV cache pool_ratio "
             f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
@@ -2402,8 +2399,8 @@ class KvCacheCreator:
         update = {"max_attention_window": max_attention_window}
         if (kv_cache_config.mixed_precision_kv is not None and
                 not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
-            # A drafter with its own architecture keeps a plain cache; MTP layers go
-            # mixed like the target. The pool dtype follows the model's KV quant algo.
+            # MTP layers use mixed-precision KV like the target; a drafter with
+            # its own architecture uses the "auto" KV dtype instead.
             update["dtype"] = "auto"
         return kv_cache_config.model_copy(update=update)
 
@@ -3749,6 +3746,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -3807,6 +3807,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):
