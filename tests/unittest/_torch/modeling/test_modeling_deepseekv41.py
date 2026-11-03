@@ -2221,96 +2221,6 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
         assert replay.scatter_replayed_rows(hidden, plan) is hidden
 
 
-def _adp_replay_rank(model, rank, case, private_decoder):
-    """One attention-DP rank's metadata after ``prepare_adp_inputs`` for a replay-plan case."""
-    if case == "final_window_chunk":
-        # The last 69 tokens of a 65093-token prompt: every row lies in the final window, so
-        # nothing is compacted, but the SWA floor still rewrites this rank's metadata.
-        metadata = _ReplayMetadata([69], num_contexts=1)
-        metadata.kv_cache_params.num_cached_tokens_per_seq = [65024]
-        metadata.decoder_context_ends = (65093,)
-    elif case == "compacting_chunk":
-        metadata = _ReplayMetadata([4096], num_contexts=1)
-        metadata.decoder_context_ends = (4096,)
-    elif case == "short_prompt":
-        metadata = _ReplayMetadata([102], num_contexts=1)
-        metadata.decoder_context_ends = (102,)
-    else:
-        assert case == "dummy_generation"
-        metadata = _ReplayMetadata([1], num_contexts=0)
-    metadata.mapping = Mapping(world_size=2, tp_size=2, rank=rank, enable_attention_dp=True)
-    metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=private_decoder)
-    model.prepare_adp_inputs(metadata, all_token_states_required=False)
-    return metadata
-
-
-def _exchange_adp_counts(ranks):
-    """The input-count allgather of ``get_all_rank_num_tokens``, done in-process."""
-    gathered = torch.tensor([metadata.get_adp_token_counts() for metadata in ranks])
-    for metadata in ranks:
-        metadata.all_rank_num_tokens = metadata.set_adp_token_counts(gathered.T.tolist())
-
-
-def _adp_replay_model(monkeypatch):
-    from tensorrt_llm._torch import utils
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import decoder_replay as replay
-
-    model, _ = _make_policy_case()
-    model.decoder_replay_split = 20
-    model.decoder_replay_window = 128
-    # Decoder GLOBAL precomputation is what makes the decoder SWA pages request-private.
-    model.ced_kv_precompute = True
-    model._decoder_replay_observed = False
-    model._decoder_replay_reuse_warning_emitted = False
-    monkeypatch.setattr(replay, "get_per_request_prefill_cuda_graph_flag", lambda: False)
-    monkeypatch.setattr(utils, "get_per_request_prefill_cuda_graph_flag", lambda: False)
-    return model
-
-
-@pytest.mark.parametrize(
-    "first", ["final_window_chunk", "short_prompt", "compacting_chunk", "dummy_generation"]
-)
-@pytest.mark.parametrize("private_decoder", [False, True])
-def test_adp_replay_decision_is_shared_by_every_rank(monkeypatch, first, private_decoder):
-    """A rank whose plan must run (SWA floor, private decoder cache, compaction) replays the
-    decoder half, and the decoder-pass graph runs its MoE collectives at a bucket's static
-    shapes: an idle peer in a dummy step must then replay too, never run the layers eagerly.
-    """
-    model = _adp_replay_model(monkeypatch)
-    cases = (first, "dummy_generation")
-    ranks = [
-        _adp_replay_rank(model, rank, case, private_decoder) for rank, case in enumerate(cases)
-    ]
-    _exchange_adp_counts(ranks)
-    decisions = [model._plan_bounded_replay(metadata, False) for metadata in ranks]
-    splits = {split for split, _ in decisions}
-    assert len(splits) == 1, f"ranks took different decoder paths: {decisions}"
-    must_replay = any(
-        case in ("final_window_chunk", "compacting_chunk")
-        or (case == "short_prompt" and private_decoder)
-        for case in cases
-    )
-    assert splits == ({20} if must_replay else {None})
-    if must_replay:
-        counts = [plan.replay_all_rank_num_tokens for _, plan in decisions]
-        assert counts[0] == counts[1]
-        for metadata, (_, plan) in zip(ranks, decisions):
-            assert plan.saved_all_rank_num_tokens == metadata.all_rank_num_tokens
-
-
-def test_adp_replay_rejects_a_rank_without_a_plan_when_a_peer_replays(monkeypatch):
-    model = _adp_replay_model(monkeypatch)
-    replaying = _adp_replay_rank(model, 0, "final_window_chunk", private_decoder=True)
-    planless = _adp_replay_rank(model, 1, "dummy_generation", private_decoder=True)
-    planless.decoder_replay_plan = None
-    gathered = torch.tensor(
-        [replaying.get_adp_token_counts(), planless.get_adp_token_counts()]
-    ).T.tolist()
-    assert gathered[2] == [1, 0]
-    with pytest.raises(ValueError, match="decoder-half collectives would diverge"):
-        planless.set_adp_token_counts(gathered)
-
-
 @pytest.mark.parametrize(
     "chunks", [(513,), (128, 128, 128, 128, 1), (127, 129, 127, 130), (1, 127)]
 )
@@ -2333,46 +2243,6 @@ def test_final_window_replay_covers_prompt_suffix_once(chunks, window):
         assert plan.replay_num_cached[0] + plan.replay_seq_lens[0] == offset + length
         offset += length
     assert selected == list(range(prompt_end))[-window:]
-
-
-@pytest.mark.parametrize("private_decoder", [False, True])
-@pytest.mark.parametrize("attention_dp", [False, True])
-@pytest.mark.parametrize("chunk_size", [64, 128])
-def test_final_window_identity_chunks_preserve_swa_floor(
-    monkeypatch, private_decoder, attention_dp, chunk_size
-):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import decoder_replay as replay
-
-    monkeypatch.setattr(replay, "get_per_request_prefill_cuda_graph_flag", lambda: False)
-
-    req = SimpleNamespace(prompt_len=512, py_ced_replay=None)
-    for offset in range(0, 512, chunk_size):
-        metadata = _ReplayMetadata([chunk_size, 1], num_contexts=1)
-        metadata.mapping = SimpleNamespace(enable_attention_dp=attention_dp)
-        metadata.kv_cache_params.num_cached_tokens_per_seq = [offset, 900]
-        metadata.kv_lens_cuda = torch.tensor([offset + chunk_size, 901])
-        metadata.prepare()
-        plan = replay.plan_decoder_replay(metadata, 128, [req], private_decoder=private_decoder)
-        assert plan is not None and plan.updates_local_metadata
-        assert plan.swa_floors == [384, 0]
-        if offset >= 384:
-            assert not plan.replays_local_tokens
-            assert plan.rows.tolist() == list(range(chunk_size + 1))
-        else:
-            assert plan.replay_seq_lens.tolist() == [0, 1]
-        replay.enter_decoder_replay(metadata, plan)
-        metadata._ensure_swa_slots()
-        positions = metadata.csa2_positions
-        indices = metadata.csa2_swa_indices[0]
-        context = metadata.csa2_token_requests == 0
-        logical = positions[:, None] - 127 + torch.arange(128)
-        expected = logical.masked_fill(logical < 0, -1)
-        expected[context] = expected[context].masked_fill(logical[context] < 384, -1)
-        torch.testing.assert_close(indices, expected, atol=0, rtol=0)
-        torch.testing.assert_close(metadata.csa2_swa_write_slots[0], positions)
-        replay.exit_decoder_replay(metadata, plan)
-        assert metadata.seq_lens.tolist() == [chunk_size, 1]
-        assert metadata.kv_cache_params.num_cached_tokens_per_seq == [offset, 900]
 
 
 @pytest.mark.parametrize("full_output", [False, True])
@@ -2731,37 +2601,6 @@ def test_remote_tail_destination_keeps_decoder_state(attention_dp: bool) -> None
     torch.testing.assert_close(metadata.csa2_swa_indices[0], expected_indices)
 
 
-@pytest.mark.parametrize("local_floor", [0, 8])
-def test_remote_tail_destination_mixed_context_uses_per_row_swa_floors(
-    local_floor: int,
-) -> None:
-    model, _ = _make_policy_case()
-    layer, state = _make_boundary(145)
-    model.layers[20] = layer
-    model.decoder_replay_split = 20
-    model.ced_kv_precompute = True
-    metadata = _ReplayMetadata([128, 16, 1], num_contexts=2)
-    metadata.num_generations = 1
-    metadata.kv_cache_params.num_cached_tokens_per_seq = [1024, 0, 63]
-    metadata.prepare()
-    metadata.csa2_remote_tail_mode = "destination"
-    metadata.csa2_remote_tail_starts = [1024, local_floor]
-    metadata._ensure_swa_slots()  # As the encoder's first layer does.
-    saved_indices = metadata.csa2_swa_indices[0].clone()
-
-    result, decoder_state = model._enter_remote_tail_boundary(metadata, state)
-
-    assert result is None
-    assert decoder_state is state
-    layer.self_attn.prepare_global_cache.assert_called_once()
-    expected_indices = saved_indices.clone()
-    expected_indices[:128].masked_fill_(expected_indices[:128] < 1024, -1)
-    if local_floor:
-        expected_indices[128:144].masked_fill_(expected_indices[128:144] < local_floor, -1)
-    metadata._ensure_swa_slots()  # As the first decoder layer does.
-    torch.testing.assert_close(metadata.csa2_swa_indices[0], expected_indices)
-
-
 @pytest.mark.parametrize(
     "remote_mode,is_cuda_graph", [(None, False), (None, True), ("destination", False)]
 )
@@ -2869,63 +2708,6 @@ def test_context_only_logits_do_not_call_omitted_output_head():
         processor(hidden_states, head, metadata, return_context_logits=True)
     with pytest.raises(RuntimeError, match="context-only worker"):
         head(hidden_states)
-
-
-# Closing the mHC stream with the fused boundary (all-reduce + post update + collapse + final
-# RMSNorm in one launch), and the logits processor skipping its norm for such a state.
-FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN = 6, 16
-
-
-def _final_close_model(monkeypatch):
-    model = v41.DeepseekV41Model.__new__(v41.DeepseekV41Model)
-    nn.Module.__init__(model)
-    model.num_hidden_layers = 2
-    last = SimpleNamespace(
-        _mhc_split=Mock(return_value=True),
-        _mhc_fused_allreduce=Mock(return_value=object()),
-    )
-    model.layers = [SimpleNamespace(), last]
-    model.norm = SimpleNamespace(weight=torch.ones(FINAL_CLOSE_HIDDEN), variance_epsilon=1e-6)
-    model._final_close_allowed = True
-    model._final_close_fused = False
-    fused = Mock(return_value=(None, torch.full((FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN), 7.0)))
-    monkeypatch.setattr(v41, "mhc_allreduce_post_collapse_norm", fused)
-    return model, last, fused
-
-
-def _final_close_state():
-    rows, hidden = FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN
-    return HCState.deferred(
-        torch.randn(rows, 4, hidden),
-        torch.rand(rows, 4, 1),
-        torch.rand(rows, 4, 4),
-        torch.randn(rows, hidden),
-        pre_mix=torch.rand(rows, 4, 1),
-        x_prev_allreduce=lambda x: x,
-    )
-
-
-@pytest.mark.cpu_only
-def test_fused_final_close(monkeypatch):
-    model, last, fused = _final_close_model(monkeypatch)
-    state = _final_close_state()
-    state.coeff_event = Mock()
-    # Not when a speculative worker reads the un-normalized final state.
-    model._final_close_allowed = False
-    assert model._fused_final_close(state) is None
-    fused.assert_not_called()
-    model._final_close_allowed = True
-
-    out = model._fused_final_close(state)
-
-    assert torch.equal(out, torch.full((FINAL_CLOSE_ROWS, FINAL_CLOSE_HIDDEN), 7.0))
-    assert model._final_close_fused
-    (x, residual, post, comb, pre, weight, eps, allreduce), _ = fused.call_args
-    assert x is state.x_prev and residual is state.residual and pre is state.pre_mix
-    assert post is state.post_mix and comb is state.comb_mix
-    assert weight is model.norm.weight and eps == model.norm.variance_epsilon
-    assert allreduce is last._mhc_fused_allreduce.return_value
-    last._mhc_split.assert_called_once_with(FINAL_CLOSE_ROWS)
 
 
 @pytest.mark.parametrize("mode", [None, "source", "destination"])

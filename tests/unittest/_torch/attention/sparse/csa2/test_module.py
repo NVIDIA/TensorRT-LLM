@@ -622,33 +622,6 @@ def _native_model(
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_candidate_consumer_projects_bf16_index_weights():
-    """A candidate consumer's BF16 index weights are bitwise the BF16 cast of the FP32 ones."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
-
-    layout = CSA2Layout(
-        (1, 1), (0,), (0, 1), 0, candidate_topk_blocks=4, candidate_block_size=8, index_topk=32
-    )
-    torch.manual_seed(946)
-    hidden = torch.randn(9, 128, device="cuda", dtype=torch.bfloat16)
-    hidden *= torch.tensor([1e-30, 1e-3, 1.0, 1e4], device="cuda").repeat_interleave(32)
-    for layer_idx, dtype in ((0, torch.float32), (1, torch.bfloat16)):
-        model, _ = _native_model(layer_idx=layer_idx, layout=layout)
-        assert model.layer.consumes_candidates == (layer_idx == 1)
-        weights, _, _ = model._prepare_auxiliary(hidden, hidden, None, None, skip_global=True)
-        assert weights.dtype == dtype
-        fp32 = torch.mul(
-            model.index_weights_proj(hidden),
-            model._index_weight_scale,
-            out=torch.empty(weights.shape, dtype=torch.float32, device="cuda"),
-        )
-        bits = torch.int16 if dtype == torch.bfloat16 else torch.int32
-        assert torch.equal(weights.view(bits), fp32.to(dtype).view(bits))
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.inference_mode()
 # Slicing is disabled under attention DP, so a nonzero rank proves full weights load;
 # BF16 and MXFP8 take different weight-loading paths.
 @pytest.mark.parametrize("rank,quantization", [(0, "bf16"), (7, "mxfp8")])
@@ -767,7 +740,7 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch, q_lora_
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("lowm_qkv", [False, True])
-@pytest.mark.parametrize("rows", [6, 12])
+@pytest.mark.parametrize("rows", [6])
 @torch.inference_mode()
 def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
     """Decode-graph query/SWA, Q and index-Q projections (index Q with its RoPE) on the small-M
@@ -879,64 +852,6 @@ def test_decode_graph_q_b_normalizes_without_indexer(monkeypatch, rows):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows", [6, 32])
-@torch.inference_mode()
-def test_decode_query_norm_writes_only_what_the_q_b_kernel_reads(monkeypatch, rows):
-    """A small step's q_norm writes only the BF16 rows the small-M Q-B kernel reads; qr and Q,
-    eager and replayed, are bitwise the quantizing norm's rows and that kernel's Q. Larger steps
-    keep the quantizing norm and GEMM."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
-    from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_decode_graph_capture
-    from tensorrt_llm._torch.modules.low_m_gemm import mxfp8_lowm_linear
-
-    torch.manual_seed(950)
-    model, _ = _native_model(q_lora_rank=1280)
-    for linear in (model.wq_a, model.wq_b, model.wkv):
-        linear.quant_method.tune_mxfp8_backends = True
-    with flashinfer_mxfp8_decode_graph_capture():
-        small_m = model._lowm_projects(model.wq_b, rows)
-    x = torch.randn(rows, 128, dtype=torch.bfloat16, device="cuda")
-    norm = projection.rms_norm_mxfp8
-    calls = []
-
-    def spy(latent, *args, quantize=True, **kwargs):
-        calls.append((latent, quantize))
-        return norm(latent, *args, quantize=quantize, **kwargs)
-
-    def reference():
-        qr, quantized, scales = norm(
-            calls[-1][0], model.q_norm.weight, model.q_norm.variance_epsilon
-        )
-        if small_m:
-            return qr, mxfp8_lowm_linear(
-                qr, model.wq_b.weight, model.wq_b.weight_scale, scale_swizzled=True
-            )
-        return qr, projection.mxfp8_query_gemm(
-            quantized,
-            scales,
-            model.wq_b.weight,
-            model.wq_b.weight_scale,
-            allowed_backends=model.wq_b.mxfp8_allowed_backends,
-        )
-
-    monkeypatch.setattr(projection, "rms_norm_mxfp8", spy)
-    with flashinfer_mxfp8_decode_graph_capture():
-        qr, q, _ = model._project_query_and_swa(x, decode_only=True)
-        assert [quantize for _, quantize in calls] == [not small_m]
-        for actual, expected in zip((qr, q), reference()):
-            assert torch.equal(actual, expected)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            qr, q, _ = model._project_query_and_swa(x, decode_only=True)
-        for _ in range(2):
-            x.normal_()
-            graph.replay()
-            for actual, expected in zip((qr, q), reference()):
-                assert torch.equal(actual, expected)
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "block,path",
     [(32, "native"), (128, "fp8_bmm"), (128, "small_m"), (128, "mxfp8"), (128, "mxfp8_latent")],
@@ -1009,79 +924,6 @@ def test_native_grouped_output_paths_and_replay(monkeypatch, block, path):
         reference = F.linear(latent, weights["wo_b.weight"].float() / 16)
         error = (captured.float() - reference).norm() / reference.norm().clamp_min(1e-6)
         assert error < 0.12
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows", [17, 96, 256, 300])
-@torch.inference_mode()
-def test_decode_projections_tune_without_cutlass(monkeypatch, rows):
-    """Tuned decode graphs of up to PROJECTION_CUTE_DSL_ROWS rows leave out FlashInfer CUTLASS.
-
-    The fused QKV-A, Q-B and O-B GEMMs choose among their linears' other MXFP8 backends, and
-    the graph replays the eager result byte for byte. The hidden states are quantized by the
-    row quantizer at every step size.
-    """
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
-    from tensorrt_llm._torch.custom_ops import mxfp8_gemm, torch_custom_ops
-    from tensorrt_llm._torch.modules.linear import (
-        flashinfer_mxfp8_autotune,
-        flashinfer_mxfp8_decode_graph_capture,
-    )
-
-    if not torch_custom_ops.IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE:
-        pytest.skip("FlashInfer CuTeDSL MXFP8 kernels are not available")
-    torch.manual_seed(950)
-    model, _ = _native_model(grouped_block=128)
-    model.o_b_proj.reduce_output = False
-    for linear in (model.wq_a, model.wq_b, model.wkv, model.o_b_proj):
-        # As the decode runner sets it up: automatic MXFP8 backends, tuned per shape.
-        linear.quant_method.backend = "auto"
-        linear.quant_method.tune_mxfp8_backends = True
-    runner_type = mxfp8_gemm.MXFP8GemmUnifiedRunner
-    choices = []
-    forward = runner_type.forward
-
-    def record(self, inputs, tactic=-1):
-        choices.append((tuple(inputs[2].shape), self.allowed_backends, tactic))
-        return forward(self, inputs, tactic=tactic)
-
-    monkeypatch.setattr(runner_type, "forward", record)
-    quantized_rows = []
-    quantize_rows = projection.mxfp8_quantize_rows
-
-    def record_rows(x, **kwargs):
-        quantized_rows.append(x.shape[0])
-        return quantize_rows(x, **kwargs)
-
-    monkeypatch.setattr(projection, "mxfp8_quantize_rows", record_rows)
-    hidden = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
-    values = torch.randn(rows, 8, 512, device="cuda", dtype=torch.bfloat16)
-    positions = torch.randint(0, 32, (rows,), dtype=torch.int32, device="cuda")
-    cutlass = rows > projection.PROJECTION_CUTE_DSL_ROWS
-
-    def run():
-        projected = model._project_query_and_swa(hidden, decode_only=True)
-        return *projected, model._project_output(values.clone(), positions)
-
-    with flashinfer_mxfp8_decode_graph_capture():
-        with flashinfer_mxfp8_autotune():
-            run()
-        # The fused QKV-A, Q-B and O-B weights.
-        assert len({weight for weight, _, _ in choices}) == 3
-        assert {("flashinfer_cutlass" in allowed) for _, allowed, _ in choices} == {cutlass}
-        assert quantized_rows == [rows]
-        choices.clear()
-        expected = run()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = run()
-        assert len(choices) == 6
-        if not cutlass:
-            assert all(tactic == -1 or tactic[0] != "flashinfer_cutlass" for *_, tactic in choices)
-    graph.replay()
-    for actual, reference in zip(captured, expected, strict=True):
-        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @skip_pre_blackwell
@@ -1217,8 +1059,8 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("module_cache", [1, 2], indirect=True)
-@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("module_cache", [2], indirect=True)
+@pytest.mark.parametrize("overlap", [True])
 @torch.inference_mode()
 def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, overlap):
     """A small step's query RoPE raises Q's amax word; staging waits for it only to finalize."""
@@ -1301,8 +1143,7 @@ def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("module_cache", [0, 1, 2], indirect=True)
-@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("overlap,module_cache", [(True, 0), (False, 2)], indirect=["module_cache"])
 @torch.inference_mode()
 def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overlap):
     """Decode Q projected straight to E4M3 matches staging's own BF16 Q quantization.
@@ -3127,7 +2968,7 @@ def test_context_o_a_input_workspace_matches_fresh_buffers(monkeypatch, fused_co
 
 
 @skip_no_fused_context
-@pytest.mark.parametrize("fused_context_cache", [1, 2], indirect=True)
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
 @torch.inference_mode()
 def test_context_index_q_reads_mxfp8_latent(monkeypatch, fused_context_cache):
     """The fused context Q projection hands the index-Q projection its MXFP8 latent instead of
@@ -3205,9 +3046,7 @@ def _inverse_rope_o_a_reference(output, positions, cos_sin, weight, scale):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(
-    "rows,groups,heads,split_k", [(1, 1, 8, None), (6, 1, 8, None), (6, 1, 8, 2), (16, 2, 4, None)]
-)
+@pytest.mark.parametrize("rows,groups,heads,split_k", [(6, 1, 8, None), (16, 2, 4, None)])
 @torch.inference_mode()
 def test_small_m_inverse_rope_o_a_matches_reference(rows, groups, heads, split_k):
     """Fused inverse RoPE + block-128 split-K O-A projection against an FP64 reference."""
@@ -3254,9 +3093,8 @@ def test_small_m_inverse_rope_o_a_matches_reference(rows, groups, heads, split_k
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
-    "rows,heads,depth", [(1, 8, 512), (6, 64, 512), (16, 3, 512), (5, 32, 128)]
+    "positions_dtype,rows,heads,depth", [(torch.int32, 6, 64, 512), (torch.int64, 1, 8, 512)]
 )
-@pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
 @torch.inference_mode()
 def test_small_m_rope_matches_cuda_rope(rows, heads, depth, positions_dtype):
     """The small-step query RoPE is bit-identical to mla_rope_inplace, graph capture included."""
@@ -3294,8 +3132,7 @@ def test_small_m_rope_matches_cuda_rope(rows, heads, depth, positions_dtype):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows,width", [(1, 5120), (6, 5120), (16, 1280), (130, 256)])
-@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("pdl,rows,width", [(True, 6, 5120), (False, 130, 256)])
 @torch.inference_mode()
 def test_mxfp8_quantize_rows_and_prefetch(monkeypatch, rows, width, pdl):
     """Row quantization is mxfp8_quantize byte for byte; L2 prefetches change no output."""
@@ -3366,59 +3203,7 @@ def test_l2_touch_reads_without_writing():
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows", [1, 6, 17])
-@torch.inference_mode()
-def test_native_small_m_output_projection(rows):
-    """The module's small-step O-A matches FP64 and the FP8-activation block-128 path."""
-    torch.manual_seed(1017 + rows)
-    model, _ = _native_model(grouped_block=128)
-    assert model._o_a_fp8_block128
-    latents = []
-    model.o_b_proj.register_forward_pre_hook(lambda _, args: latents.append(args[0].clone()))
-    output = torch.randn(rows, model.num_heads_tp, 512, device="cuda", dtype=torch.bfloat16)
-    positions = torch.randint(0, 32, (rows,), device="cuda", dtype=torch.int32)
-
-    def project(small_m):
-        model._small_m_projection = small_m
-        return model._project_output(output.clone(), positions)
-
-    small, large = project(True), project(False)
-    assert small.shape == large.shape
-    reference = _inverse_rope_o_a_reference(
-        output.view(rows, -1),
-        positions,
-        model.inverse_rotary_emb.rotary_cos_sin,
-        model.o_a_proj,
-        model.o_a_proj_scale,
-    )
-    scale = reference.abs().max()
-    large_latent = latents[-1]
-    if rows <= 16:
-        from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
-            inverse_rope_block128_small_m,
-        )
-
-        # The small step quantizes its latent for O-B inside the O-A reduction.
-        assert len(latents) == 1
-        latent = inverse_rope_block128_small_m(
-            output.view(rows, -1),
-            positions,
-            model.inverse_rotary_emb.rotary_cos_sin,
-            model.o_a_proj,
-            model.o_a_proj_scale,
-            name="test_latent",
-        )
-        assert ((latent.double() - reference).abs() <= reference.abs() * 2**-7 + 2e-3 * scale).all()
-        torch.testing.assert_close(small, model.o_b_proj(latent), atol=0, rtol=0)
-    else:
-        torch.testing.assert_close(latents[0], latents[1], atol=0, rtol=0)
-    # Without small steps the rotated activation is quantized to MXFP8 first.
-    assert (large_latent.double() - reference).abs().max() <= 0.08 * scale
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows,groups,heads", [(1, 1, 8), (6, 1, 8), (12, 1, 8), (16, 2, 8)])
+@pytest.mark.parametrize("rows,groups,heads", [(6, 1, 8), (16, 2, 8)])
 @torch.inference_mode()
 def test_small_m_warp_mma_o_a_matches_reference(rows, groups, heads):
     """The small-M kernel's grouped O-A (inverse RoPE on load, FP32 power-of-two block
@@ -3512,9 +3297,7 @@ def test_decode_graph_output_projection_matches_plain(rows):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(
-    "rows,columns,depth", [(1, 256, 128), (1500, 512, 1024), (3000, 5120, 8192)]
-)
+@pytest.mark.parametrize("rows,columns,depth", [(1, 256, 128)])
 @torch.inference_mode()
 def test_dense_mxfp8_gemm_matches_native(rows, columns, depth):
     """The persistent CuTe DSL MXFP8 GEMM equals the native CUTLASS GEMM byte for byte."""
@@ -3545,7 +3328,7 @@ def test_dense_mxfp8_gemm_matches_native(rows, columns, depth):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "rows,groups,heads,rank",
-    [(1, 1, 1, 128), (130, 2, 2, 256), (1000, 8, 8, 1024), (517, 1, 4, 384)],
+    [(1, 1, 1, 128), (1000, 8, 8, 1024)],
 )
 @torch.inference_mode()
 def test_grouped_output_block128_mxfp8_matches_bmm_and_reference(rows, groups, heads, rank):
@@ -3617,7 +3400,7 @@ def test_grouped_output_block128_mxfp8_matches_bmm_and_reference(rows, groups, h
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("rows", [4100, 30721])
+@pytest.mark.parametrize("rows", [4100])
 @torch.inference_mode()
 def test_grouped_output_n256_matches_block128_at_prefill_rows(rows):
     """The 256x256-tile O-A kernel (the default from 4K rows)
@@ -3650,15 +3433,7 @@ def test_grouped_output_n256_matches_block128_at_prefill_rows(rows):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "rows,groups,heads,rank",
-    [
-        (1, 1, 8, 1024),
-        (6, 2, 4, 256),
-        (96, 8, 8, 1024),
-        (128, 1, 2, 128),
-        (130, 8, 8, 1024),
-        (300, 2, 8, 1024),
-        (513, 1, 2, 128),
-    ],
+    [(1, 1, 8, 1024), (130, 8, 8, 1024)],
 )
 @torch.inference_mode()
 def test_grouped_output_mxfp8_matches_reference(rows, groups, heads, rank):

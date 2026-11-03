@@ -162,7 +162,30 @@ l0_b200:
   - unittest/_torch/speculative/hw_agnostic/test_dspark_noncausal_window.py
   - unittest/_torch/speculative/hw_agnostic/test_kimi_k3_dspark_semantics.py
   - unittest/disaggregated/test_csa2_kv_transfer.py
+  # DS-V4.1 bounded replay, snapshots and decoder-global state on random-weight models.
   - unittest/_torch/modeling/test_deepseek_v41_ced.py
+  - unittest/_torch/modeling/test_deepseek_v41_encoder_replay.py
+  - unittest/_torch/modeling/test_deepseek_v41_snapshots.py
+  - unittest/_torch/modeling/test_deepseek_v41_decoder_global.py
+  # DSpark draft step, acceptance, argmax chain and sampling buffers vs. their eager paths.
+  - unittest/_torch/speculative/test_dspark_draft_step.py
+  - unittest/_torch/speculative/test_dspark_fused_accept.py
+  - unittest/_torch/speculative/test_dspark_tp1_argmax.py
+  - unittest/_torch/speculative/test_dspark_compact_argmax.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_wkv_projection.py
+  - unittest/_torch/speculative/test_spec_sampling_param_cache.py
+  - unittest/_torch/speculative/test_spec_store_scatter.py
+  - unittest/_torch/speculative/test_verify_logits_dtype.py
+  # Fused DS-V4 routing and activation quantization for the TRTLLM and MegaMoE backends.
+  - unittest/_torch/moe/test_dsv4_route_quant.py
+  - unittest/_torch/moe/test_megamoe_stage_inputs.py
+  - unittest/_torch/moe/test_moe_module.py::test_dsv4_fused_route_quant_matches_separate_launches
+  - unittest/_torch/moe/test_moe_module.py::test_dspark_draft_fused_route_quant_matches_separate_launches
+  - unittest/_torch/modules/test_gated_mlp.py::test_fp8_block_scale_mlp_small_m_matches_deep_gemm
+  - unittest/_torch/modules/test_embedding_vocab_slice.py
+  - unittest/_torch/distributed/test_ll_allgather.py
+  - unittest/_torch/kernels/test_deep_gemm_jit_cache.py
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_deferred_gen_receive
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)

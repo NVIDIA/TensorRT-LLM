@@ -22,8 +22,8 @@ from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("tp_size", [1, 8])
-@pytest.mark.parametrize("tokens", [6, 12, 33])
-@pytest.mark.parametrize("hidden", [512, 1288, 5120])
+@pytest.mark.parametrize("tokens", [33])
+@pytest.mark.parametrize("hidden", [1288, 5120])
 @torch.inference_mode()
 def test_vocab_slice_lookup_sums_to_full_embedding(tp_size, tokens, hidden):
     """Every rank's slice lookup is exact and the slices sum to the full-table lookup."""

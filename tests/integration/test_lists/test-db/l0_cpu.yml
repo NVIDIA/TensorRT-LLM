@@ -1,6 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 version: 0.0.1
 l0_cpu:
 - condition:
@@ -203,7 +200,6 @@ l0_cpu:
   - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
-  - unittest/_torch/test_custom_config_registration.py -k "deepseek_v41"
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py

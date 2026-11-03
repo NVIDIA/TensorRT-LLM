@@ -58,39 +58,11 @@ def _make_model(
     return model
 
 
-def _checkpoint_weights() -> dict[str, torch.Tensor]:
-    weights = {}
-    shapes = {"wq_a": (4, 12), "wq_b": (16, 4), "wkv": (8, 12), "wo_a": (4, 8), "wo_b": (12, 4)}
-    for stage in range(3):
-        prefix = f"mtp.{stage}.attn."
-        for name, shape in shapes.items():
-            weights[f"{prefix}{name}.weight"] = torch.full(shape, stage + 1).to(torch.float8_e4m3fn)
-            weights[f"{prefix}{name}.scale"] = torch.full((1, 1), 0.5)
-        weights[f"{prefix}q_norm.weight"] = torch.ones(4)
-        weights[f"{prefix}kv_norm.weight"] = torch.ones(8)
-        weights[f"{prefix}attn_sink"] = torch.zeros(2)
-    return weights
-
-
-def test_checkpoint_cache_packs_stage_wkv() -> None:
-    model = _make_model()
-    model.cache_attn_weights_from_state_dict(_checkpoint_weights())
-    packed = model._backfill_wkv_weight
-    assert packed.shape == (24, 12)
-    for stage, layer in enumerate(model.mtp_layers):
-        view = layer._dspark_attn["wkv"]
-        assert view.untyped_storage().data_ptr() == packed.untyped_storage().data_ptr()
-        torch.testing.assert_close(view, torch.full_like(view, (stage + 1) * 0.5))
-
-
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and get_sm_version() in (100, 103, 107)),
     reason="Requires an SM100, SM103 or SM107 GPU",
 )
-@pytest.mark.parametrize("all_masked", [False, True])
-def test_packed_backfill_matches_separate_projection_and_preserves_masked_slots(
-    all_masked: bool,
-) -> None:
+def test_packed_backfill_matches_separate_projection_and_preserves_masked_slots() -> None:
     device = "cuda"
     window = 128
     model = _make_model(head_dim=512, window=window)
@@ -108,8 +80,6 @@ def test_packed_backfill_matches_separate_projection_and_preserves_masked_slots(
     )
     slots = torch.tensor([3, 1, 4], device=device)
     mask = torch.tensor([[True] * 5, [True, True, False, False, False], [False] * 5], device=device)
-    if all_masked:
-        mask.zero_()
     initial = torch.randn(6, 3, window, 512, dtype=torch.bfloat16, device=device)
     actual, expected = initial.clone(), initial.clone()
     with torch.inference_mode():

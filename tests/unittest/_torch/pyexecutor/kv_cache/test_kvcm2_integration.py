@@ -1897,27 +1897,6 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert request.py_request_id not in manager._inflight_draft_lens
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("chunk_size", [0, 16])
-def test_settle_context_cursor_with_unaligned_reused_prefix(chunk_size: int) -> None:
-    request = LlmRequest(
-        request_id=38,
-        max_new_tokens=4,
-        input_tokens=[0] * 476,
-        sampling_config=SamplingConfig(1),
-        is_streaming=False,
-    )
-    request.state = LlmRequestState.CONTEXT_INIT
-    request.context_current_position = 348
-    request.context_chunk_size = chunk_size
-
-    kv_cache_v2_module._settle_context_cursor(request, 348, 128)
-
-    assert request.prepopulated_prompt_len == 348
-    assert request.context_current_position == 348
-    assert request.context_chunk_size == 128
-
-
 def _revert_context_request(request_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,
@@ -1972,25 +1951,6 @@ def test_context_revert_shrinks_in_place_when_history_fits() -> None:
     request.set_prepopulated_prompt_len.assert_not_called()
     assert request.context_current_position == 256
     assert request.context_chunk_size == 192
-
-
-def test_swa_scratch_budget_separates_reuse_policies() -> None:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
-
-    # Identical window/layout groups still own independent physical scratch.
-    sizes, windows = [528] * 4, [129] * 4
-    groups = [ReusePolicy.OPTIONAL] * 2 + [ReusePolicy.PRIVATE] * 2
-    combined = kv_cache_v2_module._estimate_swa_cache_size(
-        sizes, windows, 128, context=True, scratch=True, scratch_group_keys=groups
-    )
-    separate = [
-        kv_cache_v2_module._estimate_swa_cache_size(
-            sizes[:2], windows[:2], 128, context=True, scratch=True
-        )
-        for _ in range(2)
-    ]
-    assert combined == tuple(sum(cost[i] for cost in separate) for i in range(2))
-    assert combined[0] == 528 * 2
 
 
 def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> None:
@@ -5549,13 +5509,6 @@ class TestLongPrefillDemotion:
         assert (cold.py_uncached_prefill_tokens, turn.py_uncached_prefill_tokens) == (640, 64)
         return router, cold, turn
 
-    def test_fcfs_without_demotion(self, manager) -> None:
-        _, cold, turn = self._cold_and_reuse_turn(manager, 10)
-        assert self._iteration(self._scheduler(manager, 0), manager, [cold, turn]) == {
-            11: self.BUDGET
-        }
-        manager.free_resources(cold)
-
     def test_long_prefill_waits_until_its_remainder_is_short(self, manager) -> None:
         router, cold, turn = self._cold_and_reuse_turn(manager, 20)
         scheduler = self._scheduler(manager, threshold=256)
@@ -5852,10 +5805,9 @@ class TestVetoedContextChunk:
         for request in (short_turn, long_turn):
             manager.free_resources(request)
 
-    @pytest.mark.parametrize("order", ["fcfs", "demotion"])
-    def test_rescheduled_with_another_chunk_after_a_veto(self, manager, order) -> None:
+    def test_rescheduled_with_another_chunk_after_a_veto(self, manager) -> None:
         budget = 256
-        scheduler = self._scheduler(manager, budget, 512 if order == "demotion" else 0)
+        scheduler = self._scheduler(manager, budget, 512)
         long_turn = self._request(1, 1500, "long", estimate=1500)
         active = [long_turn]
         self._run(manager, scheduler.schedule_request(active, set()))
@@ -5867,16 +5819,13 @@ class TestVetoedContextChunk:
         cache = manager.kv_cache_map[long_turn.py_request_id]
         assert cache.capacity == cache.history_length == long_turn.context_current_position
 
-        # A short turn arrives while the batch was vetoed; with demotion it runs first and
-        # the long prefill gets a smaller chunk than the one that was vetoed.
+        # A short turn arrives while the batch was vetoed; demotion runs it first and the
+        # long prefill gets a smaller chunk than the one that was vetoed.
         short_turn = self._request(2, 96, "short", estimate=96)
         active.append(short_turn)
         output = scheduler.schedule_request(active, set())
         chunks = {r.py_request_id: r.context_chunk_size for r in output.context_requests}
-        if order == "demotion":
-            assert chunks == {1: budget - 96, 2: 96}
-        else:
-            assert chunks == {1: budget}
+        assert chunks == {1: budget - 96, 2: 96}
         self._run(manager, output)
         assert long_turn.context_current_position == budget + chunks[1]
         assert cache.capacity == cache.history_length

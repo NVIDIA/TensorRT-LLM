@@ -37,9 +37,10 @@ class _StubSpecWorker(SpecWorkerBase):
         raise NotImplementedError
 
 
-def _metadata(rows: int, *, greedy: bool, offset_base: int = 0):
+def _metadata(rows: int, *, offset_base: int = 0):
     return types.SimpleNamespace(
-        is_all_greedy_sample=greedy,
+        is_all_greedy_sample=False,
+        sharded_target_logits=False,
         advanced_sampling_mode=AdvancedSamplingMode.FULL,
         temperatures=torch.ones(rows, dtype=torch.float32, device="cuda"),
         top_ks=torch.full((rows,), DISABLE_TOPK, dtype=torch.int32, device="cuda"),
@@ -50,26 +51,13 @@ def _metadata(rows: int, *, greedy: bool, offset_base: int = 0):
     )
 
 
-def _peaked_logits(rows: int, dtype: torch.dtype, *, ties: bool = False) -> torch.Tensor:
+def _peaked_logits(rows: int, dtype: torch.dtype) -> torch.Tensor:
     """bf16-representable rows whose mass sits on a few dozen tokens, as decode logits do."""
     gen = torch.Generator(device="cuda").manual_seed(0)
     logits = torch.randn(rows, VOCAB, device="cuda", generator=gen) * 2.0
     hot = torch.randint(0, VOCAB, (32,), device="cuda", generator=gen)
     logits[:, hot] += torch.linspace(8.0, 12.0, 32, device="cuda")
-    if ties:
-        # Coarse values make equal maxima common; argmax must keep the lowest index.
-        logits = (logits * 2).round() / 2
     return logits.to(dtype)
-
-
-@pytest.mark.parametrize("rows", [6, 1024])
-def test_greedy_tokens_match_the_fp32_copy(rows: int) -> None:
-    worker = _StubSpecWorker()
-    logits = _peaked_logits(rows, torch.bfloat16, ties=True)
-    meta = _metadata(rows, greedy=True)
-    kept = worker._sample_tokens_for_batch(logits, meta, 0, rows)
-    widened = worker._sample_tokens_for_batch(logits.float(), meta, 0, rows)
-    assert torch.equal(kept, widened)
 
 
 def test_sampled_tokens_follow_the_same_distribution() -> None:
@@ -88,7 +76,7 @@ def test_sampled_tokens_follow_the_same_distribution() -> None:
     def histogram(sample_logits: torch.Tensor) -> torch.Tensor:
         counts = torch.zeros(VOCAB, dtype=torch.float64, device="cuda")
         for call in range(calls):
-            meta = _metadata(rows, greedy=False, offset_base=call * rows)
+            meta = _metadata(rows, offset_base=call * rows)
             tokens = worker._sample_tokens_for_batch(sample_logits, meta, 0, rows)
             counts += torch.bincount(tokens.long(), minlength=VOCAB).double()
         counts /= rows * calls

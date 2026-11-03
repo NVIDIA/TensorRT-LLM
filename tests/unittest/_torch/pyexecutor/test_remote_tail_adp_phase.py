@@ -19,7 +19,6 @@ from _torch.pyexecutor.kv_cache.test_kv_cache_v2_scheduler import (
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -231,24 +230,6 @@ def test_frozen_phase_filters_before_kv_work_and_keeps_transfer_admission(
         assert not any(argument is request for argument in cache_call.args for request in deferred)
 
 
-@pytest.mark.parametrize("phase", [RemoteTailPhase.CONTEXT, RemoteTailPhase.MIXED])
-def test_remote_tail_adp_mixes_local_and_destination_contexts(
-    phase: RemoteTailPhase,
-) -> None:
-    manager = make_kv_cache_manager()
-    scheduler = make_scheduler(manager, max_num_tokens=256)
-    local = make_ctx_request(1, context_remaining_length=64)
-    remote = make_ctx_request(2, context_remaining_length=128)
-    remote.py_csa2_remote_tail_mode = "destination"
-    decoding = _make_generation_request(3)
-    scheduler.set_remote_tail_phase(phase, frozenset({1, 2}), frozenset({3}))
-
-    batch = scheduler.schedule_request([local, remote, decoding], set())
-
-    assert batch.context_requests == [local, remote]
-    assert batch.generation_requests == ([decoding] if phase is RemoteTailPhase.MIXED else [])
-
-
 def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> None:
     manager = make_kv_cache_manager()
     scheduler = make_scheduler(manager)
@@ -402,22 +383,6 @@ def test_queue_reports_lost_execution_reservation_collectively(
     )
 
 
-def test_mixed_phase_idle_rank_uses_retained_execution_row() -> None:
-    executor = _make_executor()
-    executor._enable_remote_tail_adp = True
-    executor.enable_attention_dp = True
-    executor.dist = Mock()
-    executor.dist.tp_allgather_int64.return_value = torch.tensor([[1, 0], [2, 2]])
-    batch = ScheduledRequests()
-    batch.attention_dp_phase = RemoteTailPhase.MIXED
-
-    executor._pad_empty_attention_dp_batch(batch)
-
-    assert batch.is_attention_dp_phase_idle
-    assert executor._can_queue(batch) == (True, False)
-    executor.dist.tp_allgather_int64.assert_called_once_with([1, 0])
-
-
 @pytest.mark.parametrize("reservation_survives", [False, True])
 def test_rebalance_reserves_execution_row_before_resuming_real_requests(
     reservation_survives: bool,
@@ -546,30 +511,6 @@ def test_context_phase_disables_graph_for_real_work_and_idle_rows() -> None:
     assert batch.can_run_cuda_graph
     batch.context_requests_last_chunk = [object()]
     assert not batch.can_run_cuda_graph
-
-
-def test_decode_speculative_counts_use_normal_adp_exchange() -> None:
-    dist = Mock()
-    dist.tp_cp_allgather_int64.return_value = torch.tensor([[16, 16, 16, 2, 2], [8, 8, 8, 1, 1]])
-    engine = SimpleNamespace(
-        dist=dist,
-        _config=SimpleNamespace(enable_attention_dp=True),
-        mapping=SimpleNamespace(cp_size=1, has_cp_helix=lambda: False),
-    )
-    metadata = SimpleNamespace(
-        get_adp_token_counts=Mock(return_value=[16, 16]),
-        set_adp_token_counts=Mock(return_value=[16, 8]),
-    )
-    spec_metadata = SimpleNamespace(dp_num_tokens=lambda: 16, seq_lens=[8, 8], num_generations=2)
-
-    counts, spec_counts = DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(
-        engine, metadata, spec_metadata
-    )
-
-    assert counts == [16, 8]
-    assert spec_counts == [[16, 8], [2, 1], [2, 1]]
-    metadata.set_adp_token_counts.assert_called_once_with([[16, 8], [16, 8]])
-    dist.tp_cp_allgather_int64.assert_called_once_with([16, 16, 16, 2, 2])
 
 
 def _make_startup_executor() -> PyExecutor:

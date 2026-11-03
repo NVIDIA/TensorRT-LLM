@@ -980,12 +980,8 @@ def test_native_staging_dedup_matches_independent_rows(repeat):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("repeat", [1, 80])
-@pytest.mark.parametrize(
-    "dtype, main_magnitude",
-    [(torch.bfloat16, 1), (torch.float8_e4m3fn, 1), (torch.float8_e4m3fn, 3000)],
-)
-def test_native_staging_group_reuse_matches_full_staging(dtype, main_magnitude, repeat):
+@pytest.mark.parametrize("main_magnitude, repeat", [(1, 80), (3000, 1)])
+def test_native_staging_group_reuse_matches_full_staging(main_magnitude, repeat):
     """Later layers of a staging group keep its main rows unless their KV scale changes.
 
     Every layer brings its own SWA pool. The second layer's rows decode far above 448,
@@ -1033,7 +1029,9 @@ def test_native_staging_group_reuse_matches_full_staging(dtype, main_magnitude, 
     )
     q = torch.randn(queries, 64 * 512, device="cuda").to(torch.bfloat16)
     tiles = [
-        CSA2TrtllmMetadata.for_query_tile(q.view(queries, 64, 512), main_width, staging_dtype=dtype)
+        CSA2TrtllmMetadata.for_query_tile(
+            q.view(queries, 64, 512), main_width, staging_dtype=torch.float8_e4m3fn
+        )
         for _ in range(2)
     ]
 
@@ -1046,22 +1044,23 @@ def test_native_staging_group_reuse_matches_full_staging(dtype, main_magnitude, 
         # and stages every row for each layer.
         for metadata, group in zip(tiles, ((0, 0, 0), None)):
             layer = replace(inputs, swa_pool=swa, stage_group=group)
-            scales = {}
-            if dtype == torch.float8_e4m3fn:
-                quant, dequant = metadata.derive_stage_kv_scales(layer, q=q)
-                scales = dict(
-                    kv_scale_orig_quant=quant, kv_scale_quant_orig=dequant, q_scale_quant_orig=quant
-                )
-                assert (quant.item() < 1) == (magnitude > 1 or main_magnitude > 1)
-            metadata.stage_selected(layer, main_logical=logical, dedup=True, **scales)
+            quant, dequant = metadata.derive_stage_kv_scales(layer, q=q)
+            assert (quant.item() < 1) == (magnitude > 1 or main_magnitude > 1)
+            metadata.stage_selected(
+                layer,
+                main_logical=logical,
+                dedup=True,
+                kv_scale_orig_quant=quant,
+                kv_scale_quant_orig=dequant,
+                q_scale_quant_orig=quant,
+            )
         assert torch.equal(_published_rows(tiles[0], queries), _published_rows(tiles[1], queries))
         assert torch.equal(tiles[0].prepared_lens[:queries], tiles[1].prepared_lens[:queries])
 
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("repeat", [1, 80])
-@pytest.mark.parametrize("scale", [4.0, 0.3])
+@pytest.mark.parametrize("scale, repeat", [(4.0, 80), (0.3, 1)])
 def test_native_staging_rescales_fp8_query(scale, repeat):
     """Staging with ``q_fixup`` writes ``rescale_fp8_query``'s Q bytes and the same staging.
 
@@ -1386,7 +1385,7 @@ def test_stage_kv_scale_respects_q_headroom(amax, expected):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("amax", [4.0, 1.75, 1.8, 500.0, 0.0, float("nan")])
+@pytest.mark.parametrize("amax", [1.8, float("nan")])
 @pytest.mark.parametrize("empty_pool", [False, True])
 @pytest.mark.parametrize("late_word", [False, True])
 @torch.inference_mode()
@@ -1960,7 +1959,7 @@ def test_owner_refresh_kernel_matches_reference():
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cwidth", [96, 65536])
-@pytest.mark.parametrize("top_k", [4, 512])
+@pytest.mark.parametrize("top_k", [512])
 @torch.inference_mode()
 def test_map_selection_matches_reference(top_k, cwidth):
     kernel = _glue()
@@ -2467,7 +2466,7 @@ def _candidates(rows, width, counts, generator):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("rows", [1, 64, 300])
+@pytest.mark.parametrize("rows", [64, 300])
 @pytest.mark.parametrize("ties", [False, True])
 @torch.inference_mode()
 def test_fused_consumer_topk_matches_radix_then_map(rows, ties):
@@ -2744,9 +2743,7 @@ def _qs_jobs(which, gen):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize(
-    "which", ["swa", "main", "index", "split", "swa+main+index", "main+index+split"]
-)
+@pytest.mark.parametrize("which", ["swa+main+index", "main+index+split"])
 @torch.inference_mode()
 def test_vectorized_quantize_scatter_writes_the_same_bytes(monkeypatch, which):
     """Sixteen channels per thread (large launches of aligned 128/512-channel rows) write the

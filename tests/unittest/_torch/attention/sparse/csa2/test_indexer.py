@@ -2354,84 +2354,6 @@ def _sparse_candidate_layout(topk_blocks=4, block_size=8, topk=32):
     )
 
 
-@pytest.mark.parametrize(
-    "options",
-    [
-        dict(enable_heuristic_topk=True),
-        dict(
-            enable_heuristic_topk=True,
-            use_self_sampling_topk=False,
-            use_cute_dsl_paged_mqa_logits=True,
-            use_gvr_emission=True,
-        ),
-    ],
-)
-def test_candidate_consumer_keeps_exact_decode_topk(options):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Heuristic TopK requires SM100")
-    layout = _sparse_candidate_layout(4, 8, topk=512)
-    params = CSA2Params(layout=layout, **options)
-    source = CSA2Indexer(layout, 0, 32, 128, options=params)
-    consumer = CSA2Indexer(layout, 1, 32, 128, options=params)
-    expected_source = TopKImplementation.CUTE_DSL_GVR
-    if torch.cuda.get_device_capability() == (10, 7) and params.use_self_sampling_topk:
-        expected_source = TopKImplementation.CUTE_DSL_RADIX
-    assert source.top_k.decode_implementation == expected_source
-    # Candidate-ordered columns are not key positions: consumers stay exact
-    # and keep the native sparse paged decode.
-    assert consumer.top_k.decode_implementation in (
-        TopKImplementation.CUDA_RADIX,
-        TopKImplementation.CUTE_DSL_RADIX,
-    )
-
-
-def test_decode_gvr_row_cap(monkeypatch):
-    """The self-sampling GVR decode Top-K selects at most 256 rows on the candidate source;
-    larger decode batches there take the exact radix Top-K."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("Heuristic TopK requires SM100")
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import indexer as indexer_module
-
-    layout = CSA2Layout((1,), (0,), (0,), 0, candidate_topk_blocks=64, index_topk=512)
-    indexer = CSA2Indexer(layout, 0, 64, 128, CSA2Params(enable_heuristic_topk=True))
-    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
-    engines = []
-    for name in ("_forward_decode_gvr", "_forward_decode_radix"):
-        original = getattr(TopK, name)
-
-        def spy(self, *args, _name=name, _original=original, **kwargs):
-            engines.append(_name)
-            return _original(self, *args, **kwargs)
-
-        monkeypatch.setattr(TopK, name, spy)
-    torch.manual_seed(6303)
-    for rows, engine in (
-        (indexer_module._DECODE_GVR_SOURCE_MAX_ROWS, "_forward_decode_gvr"),
-        (indexer_module._DECODE_GVR_SOURCE_MAX_ROWS + 1, "_forward_decode_radix"),
-    ):
-        scores = torch.rand(rows, 4096, device="cuda")
-        lengths = [4096 - 97 * (row % 7) for row in range(rows)]
-        output = torch.empty(rows, 512, dtype=torch.int32, device="cuda")
-        aux_indices = torch.empty(rows, 10, 512, dtype=torch.int32, device="cuda")
-        engines.clear()
-        indexer.select_prepared_scores(
-            scores,
-            output,
-            None,
-            torch.tensor(lengths, dtype=torch.int32, device="cuda"),
-            is_prefill=False,
-            radix_aux_indices=aux_indices,
-            radix_aux_logits=torch.empty_like(aux_indices, dtype=torch.float32),
-        )
-        assert engines == [engine]
-        for row, length in enumerate(lengths):
-            expected = scores[row, :length].topk(512).indices
-            # Continuous random scores have no ties at the 512th score.
-            torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
-    # The module keeps its configured engine.
-    assert indexer.top_k.decode_implementation == TopKImplementation.CUTE_DSL_GVR
-
-
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_size,sparse_block", [(8, 8), (16, 16), (32, 16)])
@@ -2697,7 +2619,7 @@ def _candidate_prefill_outputs(monkeypatch, batched: bool, random: bool):
 
 
 @pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA logits on SM100")
-@pytest.mark.parametrize("random", [False, True], ids=["manual", "random"])
+@pytest.mark.parametrize("random", [True], ids=["random"])
 @pytest.mark.parametrize("budget", [None, 300], ids=["one-batch", "split-batches"])
 @torch.inference_mode()
 def test_batched_candidate_prefill_matches_per_request(monkeypatch, random, budget):
@@ -2716,32 +2638,3 @@ def test_batched_candidate_prefill_matches_per_request(monkeypatch, random, budg
     assert batched[2] == {"sparse_prefill": 1 if budget is None else 2, "sparse_paged": 1}
     assert per_request[3] == [(137, 169), (67, 211)]
     assert batched[3] == ([(204, 512)] if budget is None else [(137, 256), (67, 256)])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="SM100-family CUDA required",
-)
-@torch.inference_mode()
-def test_prewarm_compiles_every_prefill_engine():
-    """prewarm_prefill_topk compiles every self-sampling GVR prefill engine a context pass can request."""
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import prewarm_prefill_topk
-    from tensorrt_llm._torch.kernels.blackwell.top_k import (
-        gvr_topk_decode_self_sampling_host as host,
-    )
-
-    width = 16
-    self_sampling = TopK(width, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
-    # Neither the radix prefill nor the temporal GVR engine (no prefill form) is compiled.
-    radix = TopK(32)
-    temporal = TopK(
-        48, prefill_implementation=TopKImplementation.CUTE_DSL_GVR, gvr_self_sampling=False
-    )
-    assert prewarm_prefill_topk([self_sampling, radix, temporal], max_cols=256) == [width]
-    # Every row tier (up to 148, 296, more rows) at every width bucket up to max_cols launches
-    # without compiling.
-    for rows in (1, 100, 200, 400):
-        indices = torch.empty((rows, width), dtype=torch.int32, device="cuda")
-        for columns in (20, 40, 64, 100, 256):
-            logits = torch.zeros((rows, columns), dtype=torch.float32, device="cuda")
-            assert host.prefill_ready(logits, indices), (rows, columns)

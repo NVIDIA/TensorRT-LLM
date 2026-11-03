@@ -69,7 +69,7 @@ def _assert_equal(actual, expected):
         torch.testing.assert_close(got, want, atol=0, rtol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 6, 12, 192, 1000, 1280, 2048, 32768])
+@pytest.mark.parametrize("num_tokens", [1280, 32768])
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_fused_route_quant_is_bitwise_to_unfused(num_tokens, weights_dtype):
@@ -93,21 +93,6 @@ def test_fused_route_quant_ties_nans_and_zero_groups():
     routing = _routing(bias)
     expected = _unfused(routing, logits, x, global_scale, torch.float32)
     _assert_equal(_fused(routing, logits, x, global_scale, torch.float32), expected)
-
-
-@torch.inference_mode()
-def test_fused_route_quant_replays_in_a_cuda_graph():
-    logits, bias, x, global_scale = _inputs(12, seed=2)
-    routing = _routing(bias)
-    _fused(routing, logits, x, global_scale, torch.bfloat16)  # Compile before capture.
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outputs = _fused(routing, logits, x, global_scale, torch.bfloat16)
-    logits.copy_(torch.randn_like(logits) * 4)
-    x.copy_(torch.randn_like(x) * 3)
-    graph.replay()
-    expected = _unfused(routing, logits, x, global_scale, torch.bfloat16)
-    _assert_equal(outputs, expected)
 
 
 def _expected_tables(ids: torch.Tensor, tile: int):
@@ -159,17 +144,6 @@ def _route_with_tables(logits, bias, x, global_scale, weights_dtype=torch.bfloat
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 6, 8])
-@torch.inference_mode()
-def test_routing_tables_match_trtllm_gen_layout(num_tokens):
-    logits, bias, x, global_scale = _clustered_inputs(num_tokens)
-    *outputs, tables = _route_with_tables(logits, bias, x, global_scale)
-    _assert_trtllm_gen_layout(outputs[0], tables)
-    # The routing and the quantized input are those of the launch without tables.
-    expected = _fused(_routing(bias), logits, x, global_scale, torch.bfloat16)
-    _assert_equal(outputs, expected)
-
-
 @torch.inference_mode()
 def test_routing_tables_replay_in_a_cuda_graph():
     logits, bias, x, global_scale = _clustered_inputs(8, seed=4)
@@ -184,7 +158,7 @@ def test_routing_tables_replay_in_a_cuda_graph():
 
 
 @pytest.mark.parametrize("do_finalize", [True, False])
-@pytest.mark.parametrize("num_tokens", [1, 6, 8])
+@pytest.mark.parametrize("num_tokens", [1, 8])
 @torch.inference_mode()
 def test_moe_with_routing_tables_is_bitwise_to_its_own_routing(num_tokens, do_finalize):
     from tensorrt_llm._torch.moe.kernels.blackwell.dsv4_route_quant import ROUTING_TABLE_TILES

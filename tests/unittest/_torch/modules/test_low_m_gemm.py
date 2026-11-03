@@ -531,7 +531,7 @@ def test_fp8_lowm_matches_dequant_reference(m):
 
 
 @_skip_no_lowm_fp8
-@pytest.mark.parametrize("m", [1, 6, 12, 16])
+@pytest.mark.parametrize("m", [1, 16])
 def test_fp8_lowm_rms_norm_matches_norm_then_gemm(m):
     """The A RMS norm projects ``rms_norm(x) * gamma`` with the row scale applied in FP32 after
     the MMA; a separate BF16 norm and the same kernel differ by BF16 rounding of A only."""

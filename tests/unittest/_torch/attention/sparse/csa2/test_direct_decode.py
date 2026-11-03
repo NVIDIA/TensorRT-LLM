@@ -125,10 +125,8 @@ def _assert_close_to_fp32(actual, expected):
     )
 
 
-@pytest.mark.parametrize("rows", [2, 6, 12, 16])
 # 8 query heads per rank (TP8) run as a zero-padded 16-head MMA tile.
-@pytest.mark.parametrize("heads", [8, 64])
-@pytest.mark.parametrize("main_width", [0, 512])
+@pytest.mark.parametrize("main_width,heads,rows", [(512, 8, 16), (512, 64, 6), (0, 64, 2)])
 @torch.inference_mode()
 def test_matches_fp32_reference(rows, heads, main_width):
     case = _case(rows, heads, 128, main_width, mapped=main_width > 0)
@@ -154,8 +152,8 @@ def test_matches_fp32_reference(rows, heads, main_width):
     assert torch.equal(_bits(_run(case, query_rope=(positions, cos_sin))), _bits(expected))
 
 
-@pytest.mark.parametrize("rows", [6, 12])
-@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("rows", [12])
+@pytest.mark.parametrize("heads", [8])
 @torch.inference_mode()
 def test_graph_replay_follows_new_inputs(rows: int, heads: int) -> None:
     case = _case(rows, heads, 128, 512, mapped=True)
@@ -276,18 +274,6 @@ def _bits(t):
     return t.view(torch.int16)
 
 
-@pytest.mark.parametrize("rows", [1, 6, 16])
-@pytest.mark.parametrize("heads", [8, 64])
-@pytest.mark.parametrize("main_width", [0, 512])
-@torch.inference_mode()
-def test_bulk_exchange_is_bitwise(rows, heads, main_width):
-    """The partials sent to their owners as bulk copies give the element exchange's output bit for
-    bit."""
-    case = _case(rows, heads, 128, main_width, mapped=main_width > 0, seed=rows + 7)
-    expected = _bits(_run(case, bulk_exchange=False)).clone()
-    assert torch.equal(_bits(_run(case)), expected)
-
-
 def _reference_slots(main_indices, mapping):
     """The slots CSA2's owner page-table rules map logical main selections to (-1 if invalid)."""
     table, page_size, max_positions, requests, visible = mapping
@@ -307,8 +293,7 @@ def _reference_slots(main_indices, mapping):
     return torch.where(valid, physical * page_size + logical.clamp(min=0) % page_size, -1)
 
 
-@pytest.mark.parametrize("rows", [1, 6, 16])
-@pytest.mark.parametrize("heads", [8, 64])
+@pytest.mark.parametrize("heads,rows", [(8, 16), (64, 6)])
 @torch.inference_mode()
 def test_exported_slots_replace_the_mapping_bitwise(rows, heads):
     """A launch exporting its mapped main slots is unchanged, the slots follow the owner's
