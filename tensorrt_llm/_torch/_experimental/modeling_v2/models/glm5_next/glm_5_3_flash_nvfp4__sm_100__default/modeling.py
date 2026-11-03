@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
 
 from . import weights as _weights
+from .kernels import drafting_rows, embed_rms_norm_columns
 
 # A/B escape hatch (read once at import): run the speculative step on the stock MTP-Eagle worker instead of
 # ``Glm5NextMtpStep``, with the same drafter. Measures the in-model step against the worker it replaces.
@@ -2594,6 +2595,29 @@ class Glm5NextMTP(nn.Module):
         )
         self.self_attn.mtp_index_share = self.index_share
 
+    def _embed_norm(
+        self, embed_tokens: nn.Module, input_ids: torch.Tensor, col_start: int, col_end: int
+    ) -> torch.Tensor:
+        """``enorm(embed_tokens(input_ids))[:, col_start:col_end]``: one kernel when the embedding holds the whole
+        vocabulary (the target's is not vocab-parallel) and ``enorm`` is a plain RMSNorm, else the modules."""
+        weight = getattr(embed_tokens, "weight", None)
+        if (
+            weight is not None
+            and getattr(embed_tokens, "tp_size", 1) == 1
+            and not self.enorm.use_gemma
+            and self.enorm.nvfp4_scale is None
+            and input_ids.dim() == 1
+        ):
+            return embed_rms_norm_columns(
+                input_ids,
+                weight,
+                self.enorm.weight,
+                self.enorm.variance_epsilon,
+                col_start,
+                col_end,
+            )
+        return self.enorm(embed_tokens(input_ids))[:, col_start:col_end]
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2625,12 +2649,12 @@ class Glm5NextMTP(nn.Module):
             hi = lo + width
             parts = []
             if lo < hidden:
-                parts.append(self.enorm(embed_tokens(input_ids))[:, lo : min(hi, hidden)])
+                parts.append(self._embed_norm(embed_tokens, input_ids, lo, min(hi, hidden)))
             if hi > hidden:
                 parts.append(self.hnorm(hidden_states)[:, max(lo - hidden, 0) : hi - hidden])
             hidden_states = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
         else:
-            inputs_embeds = self.enorm(embed_tokens(input_ids))
+            inputs_embeds = self._embed_norm(embed_tokens, input_ids, 0, hidden_states.shape[-1])
             hidden_states = torch.cat([inputs_embeds, self.hnorm(hidden_states)], dim=-1)
         hidden_states = self.eh_proj(hidden_states)
 
@@ -2999,31 +3023,38 @@ class Glm5NextMtpStep:
 
         # Step 0 runs on the target's own rows: a context request's prompt shifted left by one, its last row the
         # token that follows the chunk; a generation request's K+1 accepted-token columns.
-        context_ids = self._context_input_ids(
-            input_ids, num_ctx_tokens, spec_metadata, accepted_tokens, num_contexts
-        )
-        gen_ids = accepted_tokens[num_contexts:, : draft_len + 1].flatten()
-        step_ids = torch.cat([context_ids, gen_ids], dim=0)
         step_positions = position_ids.squeeze(0)
         step_hidden = hidden_states
         # The row each request drafts from on step 0: a context request's last token, a generation request's last
         # accepted one.
-        last_rows = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        gen_rows = (
-            spec_metadata.batch_indices_cuda[:num_gens].long() * (draft_len + 1)
-            + num_accepted_tokens[num_contexts:]
-            - 1
-            + num_ctx_tokens
-        )
-        step0_rows = torch.cat([last_rows[:num_contexts], gen_rows], dim=0)
+        if num_contexts == 0 and accepted_tokens.is_contiguous():
+            # Generation only (every captured step): the verify rows are the accepted-token columns as they are.
+            step_ids = accepted_tokens[:, : draft_len + 1].reshape(-1)
+            gen_rows = drafting_rows(
+                spec_metadata.batch_indices_cuda[:num_gens], num_accepted_tokens, draft_len + 1
+            )
+            step0_rows = gen_rows
+            context_rows = gen_rows[:0]
+            share_gen_rows = gen_rows
+        else:
+            context_ids = self._context_input_ids(
+                input_ids, num_ctx_tokens, spec_metadata, accepted_tokens, num_contexts
+            )
+            gen_ids = accepted_tokens[num_contexts:, : draft_len + 1].flatten()
+            step_ids = torch.cat([context_ids, gen_ids], dim=0)
+            last_rows = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            gen_rows = (
+                spec_metadata.batch_indices_cuda[:num_gens].long() * (draft_len + 1)
+                + num_accepted_tokens[num_contexts:]
+                - 1
+                + num_ctx_tokens
+            )
+            step0_rows = torch.cat([last_rows[:num_contexts], gen_rows], dim=0)
+            context_rows = last_rows[:num_contexts]
+            share_gen_rows = gen_rows - num_ctx_tokens
         share = getattr(mtp_layer, "index_share", None) if draft_len > 1 else None
         if share is not None:
-            share.begin(
-                attn_metadata.max_num_requests,
-                num_contexts,
-                last_rows[:num_contexts],
-                gen_rows - num_ctx_tokens,
-            )
+            share.begin(attn_metadata.max_num_requests, num_contexts, context_rows, share_gen_rows)
         try:
             return self._draft_steps(
                 draft_model, mtp_layer, spec_metadata, attn_metadata, share, step_ids, step_positions,
