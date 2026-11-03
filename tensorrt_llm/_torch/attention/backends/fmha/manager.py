@@ -527,7 +527,7 @@ class FmhaManager:
                     and self._serves_context_phase(fmha, q, k, v, metadata, forward_args)
                 ):
                     combined_fmha = CombinedFmha(attn)
-                    combined_fmha.set_fmha_impls(fmha, generation_fmha)
+                    combined_fmha.set_fmha_impls(fmha, generation_fmha, whole_batch_context=True)
                     return combined_fmha
                 return fmha
 
