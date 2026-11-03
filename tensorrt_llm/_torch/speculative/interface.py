@@ -2880,10 +2880,12 @@ class SpecWorkerBase(nn.Module, ABC):
                                                  batch_size,
                                                  runtime_draft_len + 1,
                                                  packed_verify=True)
-            # The target distribution the acceptance test divides by. It must be
-            # filtered exactly as the draft probs were (see advanced_sample_draft),
-            # which is why both use the same backend selection on the same mode --
-            # a mismatch here corrupts acceptance silently rather than raising.
+            # The target distribution of the acceptance ratio p / q: the
+            # request's own filters, computed by the same backend selection on
+            # the same mode as the stored draft probs q (see
+            # advanced_sample_draft; with draft_temperature_only q carries the
+            # temperature alone). A backend mismatch corrupts acceptance
+            # silently rather than raising.
             target_probs_flat = self._compute_probs_from_logits(
                 spec_metadata.advanced_sampling_mode, gen_logits, temperatures,
                 spec_metadata.top_ks[gen_start:gen_end],

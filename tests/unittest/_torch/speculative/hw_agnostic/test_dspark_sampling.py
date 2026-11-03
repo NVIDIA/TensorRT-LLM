@@ -318,9 +318,14 @@ def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_con
     assert (meta.draft_probs[others] == 7.0).all()  # context and spare slots untouched
 
 
+@pytest.mark.parametrize("sampler", ["ancestral", "block"])
 @pytest.mark.parametrize("temperature_only", [False, True])
 @pytest.mark.cpu_only
-def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only: bool) -> None:
+def test_sampled_drafts_use_the_draft_sampling_parameters(
+    temperature_only: bool, sampler: str
+) -> None:
+    """The ancestral hook and the shared block sampler both draw with the request's filters,
+    or with its temperature alone under draft_temperature_only."""
     generator = torch.Generator().manual_seed(5)
     worker = _worker()
     drafter = _drafter(generator)
@@ -329,20 +334,31 @@ def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only: bo
     meta = _metadata(B, top_k=20, top_p=0.95, min_p=0.05, temperature_only=temperature_only)
     calls = []
 
-    _sample_with(_cpu_sampler(generator, calls), worker, drafter, base, anchors, meta)
+    if sampler == "ancestral":
+        _sample_with(_cpu_sampler(generator, calls), worker, drafter, base, anchors, meta)
+        rows = B
+    else:
+        with patch.object(
+            SpecWorkerBase,
+            "_sample_from_logits_with_probs",
+            staticmethod(_cpu_sampler(generator, calls)),
+        ):
+            worker.advanced_sample_draft_block(base, meta, 0, B)
+        rows = B * K  # one launch over the flattened block
 
-    assert len(calls) == K
+    assert len(calls) == (K if sampler == "ancestral" else 1)
     for step, call in enumerate(calls):
         if temperature_only:
             assert (call["top_ks"] == INT32_MAX).all()
             assert (call["top_ps"] == 1.0).all() and (call["min_ps"] == 0.0).all()
         else:
             assert (call["top_ks"] == 20).all()
-            torch.testing.assert_close(call["top_ps"], torch.full((B,), 0.95))
-            torch.testing.assert_close(call["min_ps"], torch.full((B,), 0.05))
-        # Each position draws from its own draft slot of the request's window.
-        expected_offset = meta.request_offsets + meta.rng_draft_slot(step) * _RNG_SLOT_SPAN
-        assert torch.equal(call["offset"], expected_offset)
+            torch.testing.assert_close(call["top_ps"], torch.full((rows,), 0.95))
+            torch.testing.assert_close(call["min_ps"], torch.full((rows,), 0.05))
+        if sampler == "ancestral":
+            # Each position draws from its own draft slot of the request's window.
+            expected_offset = meta.request_offsets + meta.rng_draft_slot(step) * _RNG_SLOT_SPAN
+            assert torch.equal(call["offset"], expected_offset)
 
 
 @pytest.mark.cpu_only

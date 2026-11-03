@@ -25,8 +25,10 @@ import pytest
 
 from tensorrt_llm._torch.models.modeling_dflash import dspark_layer_window_size
 from tensorrt_llm._torch.pyexecutor.config_utils import (
+    MINIMAX_DSPARK_DRAFT_ARCH,
     build_minimax_dspark_draft_config,
     get_layer_attention_window,
+    is_mla_dspark_drafter,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi.llm_args import (
@@ -169,6 +171,12 @@ class TestWindowResolution:
         }
         assert dflash_context_attention_window(SimpleNamespace(**config)) == 512
         assert _window(tmp_path, config) is None
+        # The MiniMax drafter is dispatched by architecture before the attention
+        # shape is read, so MLA-shaped fields on it select neither the MLA block
+        # decode nor a full re-prefill.
+        assert is_mla_dspark_drafter(SimpleNamespace(**config))
+        minimax = SimpleNamespace(**{**config, "architectures": [MINIMAX_DSPARK_DRAFT_ARCH]})
+        assert not is_mla_dspark_drafter(minimax)
 
     @pytest.mark.parametrize(
         "fields, expected",
