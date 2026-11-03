@@ -240,7 +240,7 @@ Outcomes:
   `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
   → `scope=visualgenonly`;
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
-  a matched block lives in `l0_perf` or `*perf_sanity*`.
+  a matched block lives in `*perf_sanity*`.
 - VG source touched, any outward-facing path under
   `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=None`
   (fallback).

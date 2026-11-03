@@ -51,8 +51,8 @@ def _write_defs_file(tmp_path: Path, relative_path: str, content: str) -> None:
 def _make_perf_rule(tmp_path: Path) -> CbtsTestsDefRule:
     test_db_dir = tmp_path / "test-db"
     test_db_dir.mkdir()
-    (test_db_dir / "l0_perf.yml").write_text(
-        "l0_perf:\n- tests:\n  - perf/test_perf.py::test_perf[case]\n",
+    (test_db_dir / "l0_h100.yml").write_text(
+        "l0_h100:\n- tests:\n  - perf/test_perf.py::test_perf[case]\n",
         encoding="utf-8",
     )
     (test_db_dir / "l0_b200.yml").write_text(
@@ -70,7 +70,7 @@ def _make_perf_rule(tmp_path: Path) -> CbtsTestsDefRule:
         encoding="utf-8",
     )
     stages = {
-        "H100_PCIe-PyTorch-Perf-1": Stage("H100_PCIe-PyTorch-Perf-1", "l0_perf", "x86_64", 1, 1),
+        "DGX_H100-PyTorch-1": Stage("DGX_H100-PyTorch-1", "l0_h100", "x86_64", 1, 1),
         "DGX_B200-PyTorch-1": Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
         "GB200-4_GPUs-PyTorch-PerfSanity-1": Stage(
             "GB200-4_GPUs-PyTorch-PerfSanity-1",
@@ -165,8 +165,8 @@ def test_pytorch_model_config_only_selects_test_perf_consumers(tmp_path: Path) -
     )
 
     assert result is not None
-    assert result.affected_stages == {"H100_PCIe-PyTorch-Perf-1"}
-    assert set(result.block_filters) == {("l0_perf", 0)}
+    assert result.affected_stages == {"DGX_H100-PyTorch-1"}
+    assert set(result.block_filters) == {("l0_h100", 0)}
     assert result.perfsanity_relevant is False
 
 
@@ -201,12 +201,12 @@ def test_conftest_import_keeps_directory_fallback(tmp_path: Path) -> None:
     assert result.affected_stages == {
         "DGX_B200-PyTorch-1",
         "GB200-4_GPUs-PyTorch-PerfSanity-1",
-        "H100_PCIe-PyTorch-Perf-1",
+        "DGX_H100-PyTorch-1",
     }
     assert set(result.block_filters) == {
         ("l0_b200", 0),
         ("l0_gb200_multi_gpus_perf_sanity", 0),
-        ("l0_perf", 0),
+        ("l0_h100", 0),
     }
 
 
@@ -229,12 +229,12 @@ def test_uncovered_import_consumers_keep_directory_fallback(tmp_path: Path) -> N
     assert result.affected_stages == {
         "DGX_B200-PyTorch-1",
         "GB200-4_GPUs-PyTorch-PerfSanity-1",
-        "H100_PCIe-PyTorch-Perf-1",
+        "DGX_H100-PyTorch-1",
     }
     assert set(result.block_filters) == {
         ("l0_b200", 0),
         ("l0_gb200_multi_gpus_perf_sanity", 0),
-        ("l0_perf", 0),
+        ("l0_h100", 0),
     }
 
 
