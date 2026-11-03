@@ -19,6 +19,14 @@ from typing import Callable
 
 import pytest
 import torch
+from _torch.speculative.hw_agnostic.rejection_stats_utils import (
+    chi_square,
+    complete_and_count,
+    exact_sequence_probs,
+    prefix_ids,
+    random_prefix_table,
+    token_level_verify,
+)
 
 from tensorrt_llm._torch.speculative.block_verification import (
     block_acceptance_thresholds,
@@ -107,38 +115,6 @@ def _vllm_block_reference(
     )
 
 
-def _token_level_reference(
-    draft_tokens: torch.Tensor,
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    uniforms: torch.Tensor,
-    resample_uniforms: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Token-level rejection sampling (Leviathan et al., 2023), one request at a time."""
-    batch, num_drafts = draft_tokens.shape
-    accepted_tokens = torch.full((batch, num_drafts + 1), -1, dtype=torch.int64)
-    num_accepted = torch.empty(batch, dtype=torch.int64)
-    for b in range(batch):
-        length = num_drafts
-        for j in range(num_drafts):
-            token = int(draft_tokens[b, j])
-            p, q = float(target_probs[b, j, token]), float(draft_probs[b, j, token])
-            if float(uniforms[b, j]) <= p / q:
-                accepted_tokens[b, j] = token
-                continue
-            length = j
-            break
-        if length == num_drafts:
-            weights = target_probs[b, num_drafts]
-        else:
-            weights = (target_probs[b, length] - draft_probs[b, length]).clamp_min(0)
-        accepted_tokens[b, length] = sample_from_weights(
-            weights[None].double(), resample_uniforms[b : b + 1]
-        )[0]
-        num_accepted[b] = length + 1
-    return accepted_tokens, num_accepted
-
-
 def _random_case(
     generator: torch.Generator,
     batch: int,
@@ -205,40 +181,11 @@ def test_block_verify_matches_vllm_given_identical_uniforms(num_drafts: int) -> 
 
 
 @pytest.mark.cpu_only
-def test_residual_distribution_matches_vllm() -> None:
-    """The emitted token's distribution, not just one draw from it, is vLLM's."""
-    generator = torch.Generator().manual_seed(7)
-    batch, num_drafts, vocab = 24, 4, 16
-    target_logits, draft_logits, draft_probs, draft_tokens, target_probs = _random_case(
-        generator, batch, num_drafts, vocab
-    )
-    uniforms = torch.rand(batch, num_drafts, generator=generator, dtype=torch.float64)
-    resample_draws = 4096
-    for b in range(batch):
-        ref_length, _, ref_resample = _vllm_block_reference(
-            target_logits[b], draft_logits[b], 1.0, draft_tokens[b], uniforms[b]
-        )
-        # Every draw of the emitted token with this request's acceptance uniforms.
-        grid = (torch.arange(resample_draws, dtype=torch.float64) + 0.5) / resample_draws
-        tokens, num_accepted = block_verify(
-            draft_tokens[b : b + 1].expand(resample_draws, -1),
-            draft_probs[b : b + 1].expand(resample_draws, -1, -1),
-            target_probs[b : b + 1].expand(resample_draws, -1, -1),
-            uniforms[b : b + 1].expand(resample_draws, -1),
-            grid,
-        )
-        if (num_accepted != ref_length + 1).any():
-            continue  # boundary case, covered by the test above
-        emitted = tokens[:, ref_length].long()
-        histogram = torch.bincount(emitted, minlength=vocab).double() / resample_draws
-        torch.testing.assert_close(histogram, ref_resample, atol=2.0 / resample_draws, rtol=0)
-
-
-@pytest.mark.cpu_only
-def test_sample_emitted_hook_receives_the_residual() -> None:
-    """A caller-supplied sampler sees exactly the residual vLLM resamples from."""
+def test_residual_matches_vllm_through_the_hook_and_the_inverse_cdf() -> None:
+    """The emitted token's distribution is vLLM's residual, both as handed to a
+    caller-supplied sampler and as drawn by the default inverse-CDF sampler."""
     generator = torch.Generator().manual_seed(8)
-    batch, num_drafts, vocab = 64, 4, 16
+    batch, num_drafts, vocab, draws = 32, 4, 16, 4096
     target_logits, draft_logits, draft_probs, draft_tokens, target_probs = _random_case(
         generator, batch, num_drafts, vocab
     )
@@ -253,6 +200,13 @@ def test_sample_emitted_hook_receives_the_residual() -> None:
         draft_tokens, draft_probs, target_probs, uniforms, sample_emitted=sampler
     )
     weights = seen["weights"].double()
+    # Every request repeated over an even grid of resample uniforms.
+    grid = (torch.arange(draws, dtype=torch.float64) + 0.5) / draws
+    inputs = (draft_tokens, draft_probs, target_probs, uniforms)
+    grid_tokens, _ = block_verify(
+        *(t.repeat_interleave(draws, 0) for t in inputs), grid.repeat(batch)
+    )
+    grid_tokens = grid_tokens.view(batch, draws, -1)
     for b in range(batch):
         ref_length, ref_thresholds, ref_resample = _vllm_block_reference(
             target_logits[b], draft_logits[b], 1.0, draft_tokens[b], uniforms[b]
@@ -262,6 +216,9 @@ def test_sample_emitted_hook_receives_the_residual() -> None:
         assert int(num_accepted[b]) == ref_length + 1
         torch.testing.assert_close(weights[b] / weights[b].sum(), ref_resample, atol=1e-5, rtol=0)
         assert int(tokens[b, ref_length]) == int(weights[b].argmax())
+        emitted = grid_tokens[b, :, ref_length].long()
+        histogram = torch.bincount(emitted, minlength=vocab).double() / draws
+        torch.testing.assert_close(histogram, ref_resample, atol=2.0 / draws, rtol=0)
 
 
 # One draft: block verification is token-level verification
@@ -278,7 +235,7 @@ def test_single_draft_block_equals_token_level() -> None:
     block_tokens, block_accepted = block_verify(
         draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms
     )
-    token_tokens, token_accepted = _token_level_reference(
+    token_tokens, token_accepted = token_level_verify(
         draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms
     )
     p_x = target_probs[:, 0].gather(-1, draft_tokens).squeeze(-1).double()
@@ -297,85 +254,35 @@ _VOCAB = 3
 _BLOCK = 3  # drafts per block; the verified sequences have _BLOCK + 1 tokens
 
 
-class _PrefixModel:
-    """A distribution over the next token for every prefix of length 0.._BLOCK."""
-
-    def __init__(
-        self, generator: torch.Generator, zero_frac: float = 0.0, sharpness: float = 1.0
-    ) -> None:
-        num_prefixes = sum(_VOCAB**length for length in range(_BLOCK + 1))
-        logits = sharpness * torch.randn(num_prefixes, _VOCAB, generator=generator)
-        zero = torch.rand(num_prefixes, _VOCAB, generator=generator) < zero_frac
-        zero[:, 0] = False
-        self.table = torch.softmax(logits.masked_fill(zero, float("-inf")).double(), -1)
-
-    @staticmethod
-    def prefix_ids(tokens: torch.Tensor) -> torch.Tensor:
-        """[N, m] prefixes -> row ids (prefixes of each length laid out base-_VOCAB)."""
-        length = tokens.shape[1]
-        base = sum(_VOCAB**m for m in range(length))
-        ids = torch.zeros(tokens.shape[0], dtype=torch.int64)
-        for m in range(length):
-            ids = ids * _VOCAB + tokens[:, m]
-        return ids + base
-
-    def probs(self, tokens: torch.Tensor) -> torch.Tensor:
-        return self.table[self.prefix_ids(tokens)]
-
-    def sequence_probs(self) -> torch.Tensor:
-        """Exact probability of every length-(_BLOCK + 1) sequence, in base-_VOCAB order."""
-        grid = torch.cartesian_prod(*[torch.arange(_VOCAB)] * (_BLOCK + 1))
-        prob = torch.ones(grid.shape[0], dtype=torch.float64)
-        for m in range(_BLOCK + 1):
-            prob = prob * self.probs(grid[:, :m]).gather(-1, grid[:, m : m + 1]).squeeze(-1)
-        return prob
-
-
 def _verify_and_complete(
     verify: Callable[..., tuple[torch.Tensor, torch.Tensor]],
-    target: "_PrefixModel",
-    draft: "_PrefixModel",
+    target: torch.Tensor,
+    draft: torch.Tensor,
     num_samples: int,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Draft ancestrally, verify, then sample the target up to _BLOCK + 1 tokens."""
+    """Draft ancestrally from the ``draft`` table, verify, then complete from ``target``."""
     drafts = torch.empty(num_samples, 0, dtype=torch.int64)
     draft_rows = []
     for _ in range(_BLOCK):
-        q = draft.probs(drafts)
+        q = draft[prefix_ids(drafts, _VOCAB)]
         draft_rows.append(q)
         drafts = torch.cat([drafts, torch.multinomial(q, 1, generator=generator)], dim=1)
-    target_rows = [target.probs(drafts[:, :j]) for j in range(_BLOCK + 1)]
+    target_rows = [target[prefix_ids(drafts[:, :j], _VOCAB)] for j in range(_BLOCK + 1)]
     draft_probs = torch.stack(draft_rows, dim=1).float()
     target_probs = torch.stack(target_rows, dim=1).float()
     uniforms = torch.rand(num_samples, _BLOCK, generator=generator, dtype=torch.float64)
     resample_uniforms = torch.rand(num_samples, generator=generator, dtype=torch.float64)
     tokens, num_accepted = verify(drafts, draft_probs, target_probs, uniforms, resample_uniforms)
-
-    sequences = torch.zeros(num_samples, _BLOCK + 1, dtype=torch.int64)
-    emitted = num_accepted.long()
-    for m in range(_BLOCK + 1):
-        continued = torch.multinomial(target.probs(sequences[:, :m]), 1, generator=generator)
-        sequences[:, m] = torch.where(m < emitted, tokens[:, m].long(), continued.squeeze(-1))
-    ids = torch.zeros(num_samples, dtype=torch.int64)
-    for m in range(_BLOCK + 1):
-        ids = ids * _VOCAB + sequences[:, m]
-    return torch.bincount(ids, minlength=_VOCAB ** (_BLOCK + 1)), emitted
+    return complete_and_count(target, tokens, num_accepted, generator), num_accepted.long()
 
 
-def _chi_square_ok(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, float]:
-    """Pearson statistic over cells with expected count >= 5 (the rest pooled) vs its 1e-4 critical value."""
-    total = counts.sum().item()
-    expected = probs * total
-    big = expected >= 5
-    observed = torch.cat([counts[big].double(), counts[~big].double().sum().view(1)])
-    expected = torch.cat([expected[big], expected[~big].sum().view(1)])
-    keep = expected > 0
-    stat = (((observed - expected) ** 2)[keep] / expected[keep]).sum().item()
-    dof = int(keep.sum()) - 1
-    z = 3.719  # one-sided 1e-4 normal quantile; Wilson-Hilferty approximation below
-    critical = dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
-    return stat, critical
+def _tables(
+    generator: torch.Generator, zero_frac: float = 0.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A sharper target table (optionally with zero-mass entries) and a draft table."""
+    target = random_prefix_table(generator, _VOCAB, _BLOCK, sharpness=1.5, zero_frac=zero_frac)
+    return target, random_prefix_table(generator, _VOCAB, _BLOCK)
 
 
 @pytest.mark.parametrize("verify_name", ["block", "token"])
@@ -383,27 +290,24 @@ def _chi_square_ok(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, fl
 @pytest.mark.cpu_only
 def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
     generator = torch.Generator().manual_seed(11 if zero_frac else 12)
-    target = _PrefixModel(generator, zero_frac=zero_frac, sharpness=1.5)
-    draft = _PrefixModel(generator, sharpness=1.0)
-    verify = block_verify if verify_name == "block" else _token_level_reference
-    num_samples = 200_000 if verify_name == "block" else 20_000
-    counts, _ = _verify_and_complete(verify, target, draft, num_samples, generator)
+    target, draft = _tables(generator, zero_frac)
+    verify = block_verify if verify_name == "block" else token_level_verify
+    counts, _ = _verify_and_complete(verify, target, draft, 200_000, generator)
 
-    exact = target.sequence_probs()
+    exact = exact_sequence_probs(target, _BLOCK + 1)
     assert counts[exact == 0].sum() == 0, "emitted a sequence the target cannot produce"
-    stat, critical = _chi_square_ok(counts, exact)
+    stat, critical = chi_square(counts, exact)
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
 
 
 @pytest.mark.cpu_only
 def test_block_accepts_at_least_as_much_as_token_level() -> None:
     generator = torch.Generator().manual_seed(5)
-    target = _PrefixModel(generator, sharpness=1.5)
-    draft = _PrefixModel(generator, sharpness=1.0)
+    target, draft = _tables(generator)
     num_samples = 20_000
     _, block_emitted = _verify_and_complete(block_verify, target, draft, num_samples, generator)
     _, token_emitted = _verify_and_complete(
-        _token_level_reference, target, draft, num_samples, generator
+        token_level_verify, target, draft, num_samples, generator
     )
     block_mean = block_emitted.double().mean().item()
     token_mean = token_emitted.double().mean().item()
@@ -415,8 +319,7 @@ def test_block_accepts_at_least_as_much_as_token_level() -> None:
 def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() -> None:
     """Guard for the test itself: storing a q the drafts were not drawn from must fail it."""
     generator = torch.Generator().manual_seed(3)
-    target = _PrefixModel(generator, sharpness=1.5)
-    draft = _PrefixModel(generator, sharpness=1.0)
+    target, draft = _tables(generator)
 
     def verify_with_wrong_q(
         drafts: torch.Tensor,
@@ -429,7 +332,7 @@ def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() ->
         return block_verify(drafts, wrong, target_probs, uniforms, resample_uniforms)
 
     counts, _ = _verify_and_complete(verify_with_wrong_q, target, draft, 200_000, generator)
-    stat, critical = _chi_square_ok(counts, target.sequence_probs())
+    stat, critical = chi_square(counts, exact_sequence_probs(target, _BLOCK + 1))
     assert stat > critical
 
 

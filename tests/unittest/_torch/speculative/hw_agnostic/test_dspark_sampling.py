@@ -14,13 +14,20 @@
 # limitations under the License.
 """Ancestral DSpark draft sampling: conditioning, stored proposals, sampling parameters, losslessness, CUDA graphs."""
 
-import math
 import types
 from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import pytest
 import torch
+from _torch.speculative.hw_agnostic.rejection_stats_utils import (
+    chi_square,
+    complete_and_count,
+    exact_sequence_probs,
+    prefix_ids,
+    random_prefix_table,
+    token_level_verify,
+)
 
 from tensorrt_llm._torch.models.modeling_dspark import _DSparkHeadMixin
 from tensorrt_llm._torch.models.modeling_speculative import (
@@ -366,93 +373,6 @@ def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
 _TOY_VOCAB = 4
 
 
-def _target_table(generator: torch.Generator) -> torch.Tensor:
-    """Target next-token distributions for every prefix of length 0..K (base-V ids)."""
-    num_prefixes = sum(_TOY_VOCAB**m for m in range(K + 1))
-    logits = 1.5 * torch.randn(num_prefixes, _TOY_VOCAB, generator=generator)
-    return torch.softmax(logits.double(), -1)
-
-
-def _prefix_ids(tokens: torch.Tensor) -> torch.Tensor:
-    length = tokens.shape[1]
-    ids = torch.zeros(tokens.shape[0], dtype=torch.int64)
-    for m in range(length):
-        ids = ids * _TOY_VOCAB + tokens[:, m]
-    return ids + sum(_TOY_VOCAB**m for m in range(length))
-
-
-def _complete_and_count(
-    table: torch.Tensor,
-    accepted_tokens: torch.Tensor,
-    num_accepted: torch.Tensor,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Emitted tokens, completed by sampling the target, as base-V sequence ids."""
-    num = accepted_tokens.shape[0]
-    sequences = torch.zeros(num, K + 1, dtype=torch.int64)
-    for m in range(K + 1):
-        cont = torch.multinomial(table[_prefix_ids(sequences[:, :m])], 1, generator=generator)
-        keep = m < num_accepted.long()
-        sequences[:, m] = torch.where(keep, accepted_tokens[:, m].long(), cont.squeeze(-1))
-    ids = torch.zeros(num, dtype=torch.int64)
-    for m in range(K + 1):
-        ids = ids * _TOY_VOCAB + sequences[:, m]
-    return torch.bincount(ids, minlength=_TOY_VOCAB ** (K + 1))
-
-
-def _exact_sequence_probs(table: torch.Tensor) -> torch.Tensor:
-    grid = torch.cartesian_prod(*[torch.arange(_TOY_VOCAB)] * (K + 1))
-    prob = torch.ones(grid.shape[0], dtype=torch.float64)
-    for m in range(K + 1):
-        prob = prob * table[_prefix_ids(grid[:, :m])].gather(-1, grid[:, m : m + 1]).squeeze(-1)
-    return prob
-
-
-def _chi_square(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, float]:
-    total = counts.sum().item()
-    expected = probs * total
-    big = expected >= 5
-    observed = torch.cat([counts[big].double(), counts[~big].double().sum().view(1)])
-    expected = torch.cat([expected[big], expected[~big].sum().view(1)])
-    keep = expected > 0
-    stat = (((observed - expected) ** 2)[keep] / expected[keep]).sum().item()
-    dof = int(keep.sum()) - 1
-    z = 3.719  # 1e-4 one-sided; Wilson-Hilferty approximation of the critical value
-    return stat, dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
-
-
-def _token_level(
-    draft_tokens: torch.Tensor,
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    uniforms: torch.Tensor,
-    resample_uniforms: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Token-level rejection sampling with the same uniforms layout as block_verify."""
-    num, num_drafts = draft_tokens.shape
-    tokens_x = draft_tokens.long().unsqueeze(-1)
-    ratio = (
-        target_probs[:, :num_drafts].gather(-1, tokens_x).squeeze(-1).double()
-        / draft_probs.gather(-1, tokens_x).squeeze(-1).double()
-    )
-    passed = (uniforms <= ratio).long().cumprod(-1)
-    length = passed.sum(-1)
-    rows = torch.arange(num)
-    p_row = target_probs[rows, length]
-    q_row = draft_probs[rows, length.clamp(max=num_drafts - 1)]
-    weights = torch.where((length == num_drafts)[:, None], p_row, (p_row - q_row).clamp_min(0))
-    cdf = weights.double().cumsum(-1)
-    emitted = torch.searchsorted(cdf, resample_uniforms[:, None] * cdf[:, -1:], right=True).squeeze(
-        -1
-    )
-    out = torch.full((num, num_drafts + 1), -1, dtype=torch.int64)
-    slots = torch.arange(num_drafts + 1)
-    drafts = torch.cat([draft_tokens.long(), torch.zeros(num, 1, dtype=torch.int64)], 1)
-    out = torch.where(slots < length[:, None], drafts, out)
-    out = torch.where(slots == length[:, None], emitted.clamp(max=_TOY_VOCAB - 1)[:, None], out)
-    return out, length + 1
-
-
 @pytest.mark.parametrize("verify", ["block", "token"])
 @pytest.mark.cpu_only
 def test_sampled_drafts_verify_losslessly(verify: str) -> None:
@@ -466,19 +386,19 @@ def test_sampled_drafts_verify_losslessly(verify: str) -> None:
 
     drafts, _ = _sample_with(_cpu_sampler(generator), worker, drafter, base, anchors, meta)
     draft_probs = meta.draft_probs[meta.batch_slot_ids]
-    table = _target_table(generator)
+    table = random_prefix_table(generator, _TOY_VOCAB, K, sharpness=1.5)
     target_probs = torch.stack(
-        [table[_prefix_ids(drafts[:, :j].long())] for j in range(K + 1)], dim=1
+        [table[prefix_ids(drafts[:, :j].long(), _TOY_VOCAB)] for j in range(K + 1)], dim=1
     ).float()
     uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
     resample_uniforms = torch.rand(num, generator=generator, dtype=torch.float64)
-    run = block_verify if verify == "block" else _token_level
+    run = block_verify if verify == "block" else token_level_verify
     accepted_tokens, num_accepted = run(
         drafts, draft_probs, target_probs, uniforms, resample_uniforms
     )
 
-    counts = _complete_and_count(table, accepted_tokens, num_accepted, generator)
-    stat, critical = _chi_square(counts, _exact_sequence_probs(table))
+    counts = complete_and_count(table, accepted_tokens, num_accepted, generator)
+    stat, critical = chi_square(counts, exact_sequence_probs(table, K + 1))
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
 
 
@@ -707,5 +627,5 @@ def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
     )
     assert (accepted == position + 1).all()
     histogram = torch.bincount(out[:, position].long().cpu(), minlength=vocab).double()
-    stat, critical = _chi_square(histogram, expected.double())
+    stat, critical = chi_square(histogram, expected.double())
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
