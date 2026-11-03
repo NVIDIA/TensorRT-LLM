@@ -80,6 +80,8 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_warmup_placement import \
+    on_executor_restart as moe_warmup_placement_restart
+from ..moe.fused_moe.moe_warmup_placement import \
     on_executor_step as moe_warmup_placement_step
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
@@ -685,9 +687,6 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
-    # Whether a speculative model runs the overlap loop on the execution stream
-    # (_overlap_loop_stream); read once at construction.
-    _speculative_loop_on_execution_stream = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
 
@@ -833,8 +832,6 @@ class PyExecutor:
         hooks = runtime_hooks_of(model_engine.model)
         self._execution_stream_loop_armed = hooks.loop_on_execution_stream
         self._executor_events = hooks.executor_events
-        self._speculative_loop_on_execution_stream = (model_engine.spec_config
-                                                      is not None)
         self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
         self._enable_scheduler_aware_adp_dummy = enable_scheduler_aware_adp_dummy
         self._enable_non_overlap_adp_forward_intent = enable_non_overlap_adp_forward_intent
@@ -1680,6 +1677,8 @@ class PyExecutor:
                 "Cannot rebind an executor after an execution failure")
         self._resources_released = False
         try:
+            # The step counter restarts at 0, and so does the placement schedule.
+            moe_warmup_placement_restart()
             self._initialize_execution(resources)
         except BaseException:
             self.shutdown()
@@ -7346,15 +7345,6 @@ class PyExecutor:
             finally:
                 self._loop_on_execution_stream = False
 
-    def _overlap_loop_stream(self):
-        """The overlap loop's stream: ``execution_stream`` when speculative.
-
-        The sampler and input preparation then need no cross-stream waits.
-        """
-        if self._speculative_loop_on_execution_stream:
-            return torch.cuda.stream(self.execution_stream)
-        return nullcontext()
-
     def _executor_loop_overlap(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -7362,7 +7352,7 @@ class PyExecutor:
         if self._executor_events is not None:
             self._executor_events.before_overlap_loop()
         with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
-                self.hang_detector, self._overlap_loop_stream():
+                self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             previous_tensors_device = None
@@ -10343,9 +10333,10 @@ class PyExecutor:
             forward_completion="clear",
         )
         ExpertStatistic.set_iter(self.iter_counter)
-        # Warmup expert placement: counters on / a placement round / freeze, on every rank at
-        # the same step, before this forward is enqueued.
-        moe_warmup_placement_step(self.iter_counter)
+        if not self.is_warmup:
+            # Warmup expert placement: counters on / a placement round / freeze, on every rank
+            # at the same step, before this forward is enqueued.
+            moe_warmup_placement_step(self.iter_counter)
         # Router Replay (R3): the capturer is owned by the model engine (None
         # when the feature is off or for engines that do not support it).
         route_capture = self.model_engine.route_capture

@@ -29,6 +29,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttention
+from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputBuffers,
     DecoderInputPreparer,
@@ -672,7 +673,8 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             "previous_pos_id_offsets_cuda",
             "previous_kv_lens_offsets_cuda",
         )
-        self.assertTrue(preparer._spec_overlap_staging)
+        # The staging runs for models that opt in (RuntimeHooks.stage_decode_inputs).
+        preparer._host_uploader = HostUploader()
         results = []
         for staging in (True, False):
             preparer._spec_overlap_staging = staging

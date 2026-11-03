@@ -495,7 +495,15 @@ def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch):
 
 @pytest.mark.parametrize(
     "capture_window,replay_tokens",
-    [(128, None), (128, "129"), (256, "300"), (128, "128"), (256, "140"), (128, "bad")],
+    [
+        (128, None),
+        (256, None),
+        (128, "129"),
+        (256, "300"),
+        (128, "128"),
+        (256, "140"),
+        (128, "bad"),
+    ],
 )
 def test_dspark_verification_retains_all_generation_rows(
     monkeypatch, capture_window, replay_tokens
@@ -528,7 +536,8 @@ def test_dspark_verification_retains_all_generation_rows(
     metadata = _ReplayMetadata([513, 6], num_contexts=1)
     split, plan = model._plan_bounded_replay(metadata, False)
     assert split == 20
-    window = int(replay_tokens or 140)
+    # Unset, the replay window covers a wider embedded draft window by one token.
+    window = int(replay_tokens) if replay_tokens else max(140, capture_window + 1)
     assert model.decoder_replay_window == window
     assert plan.replay_seq_lens.tolist() == [window, 6]
     assert plan.rows.tolist() == list(range(513 - window, 519))

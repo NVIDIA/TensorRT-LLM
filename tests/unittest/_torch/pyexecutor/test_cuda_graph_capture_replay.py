@@ -741,6 +741,7 @@ class TestStagedReplayInputs:
         )
         batch_size = 4
         runner = create_mock_cuda_graph_runner(batch_size, max_num_tokens=batch_size)
+        runner.config.stage_decode_inputs = True
         key = KeyType(batch_size=batch_size, draft_len=0)
         num_tokens = runner._get_num_tokens_for_key(key)
         attn_metadata = SimpleNamespace(num_ctx_tokens=0)

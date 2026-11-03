@@ -16,6 +16,7 @@ spans trays.
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass
 
 import torch
@@ -41,7 +42,8 @@ def mhc_split_enabled(num_tokens: int, hidden_size: int, mult: int) -> bool:
         return False
     if mult != 4 or hidden_size % 256 or hidden_size // 8 > 1024:
         return False
-    return 0 < num_tokens <= 64
+    # FORCE_DETERMINISTIC keeps every boundary size on mhc_fused_hc's pinned tactic.
+    return 0 < num_tokens <= 64 and os.getenv("FORCE_DETERMINISTIC", "0") != "1"
 
 
 @functools.lru_cache(maxsize=None)

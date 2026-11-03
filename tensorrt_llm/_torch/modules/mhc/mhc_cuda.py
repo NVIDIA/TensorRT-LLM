@@ -1272,6 +1272,9 @@ def mhc_fused_hc(
     that stream (as a pass graph's warm runs do), else keeps the backends above. The barriers
     carry the launch's grid id, so a captured launch re-initializes them on every replay.
 
+    With ``FORCE_DETERMINISTIC=1`` every boundary runs one fixed FMA tactic instead, whose result
+    for a token does not depend on its batch.
+
     Returns:
         residual_cur:      [B, n, hidden] bf16 (new residual, input to the next post_mapping)
         post_mix_cur:      [B, n]         fp32
@@ -1281,8 +1284,10 @@ def mhc_fused_hc(
     ``mxfp8`` appends ``layer_input_cur`` as ``torch.ops.trtllm.mxfp8_quantize(layer_input_cur,
     True)`` returns it when ``mega_mhc`` ran and writes swizzled scales, else None.
     """
+    force_deterministic = os.getenv("FORCE_DETERMINISTIC", "0") == "1"
     if (
-        pre_mix_ext is not None
+        not force_deterministic
+        and pre_mix_ext is not None
         and norm_weight is not None
         and n == 4
         and hidden_size % 1024 == 0
@@ -1360,7 +1365,7 @@ def mhc_fused_hc(
         outputs = residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, pre_mix_out
         return (*outputs, layer_input_mxfp8) if mxfp8 else outputs
 
-    if deterministic:
+    if deterministic and not force_deterministic:
         residual_cur = mhc_post_mapping_cuda(
             residual_prev, x_prev, post_mix_prev.reshape(-1, n), comb_mix_prev.reshape(-1, n, n), n
         )
@@ -1397,7 +1402,7 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+    if force_deterministic:
         # This fixed FMA tactic has no cross-CTA floating-point atomics and
         # uses the same reduction order for context and generation shapes.
         # Bypass tuning so a cached tactic cannot change the reduction order.

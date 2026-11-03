@@ -716,9 +716,11 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
-def test_cute_dsl_indexer_topk_decode_mixed_lengths_wide_buffer():
-    """More rows than SMs in a buffer past the cluster threshold: short rows (single-CTA launch) and long rows
-    (cluster launch) each select their exact top-k."""
+@pytest.mark.parametrize("wide_fp32_rows", [False, True])
+def test_cute_dsl_indexer_topk_decode_mixed_lengths_wide_buffer(wide_fp32_rows):
+    """With split_long_rows, more rows than SMs in a buffer past the cluster threshold: short rows (single-CTA
+    launch, with or without the wide FP32-row configuration) and long rows (cluster launch) each select their
+    exact top-k."""
     num_sms = torch.cuda.get_device_properties().multi_processor_count
     rows, width, k = 2 * num_sms, 524288, 2048
     gen = torch.Generator().manual_seed(0)
@@ -735,7 +737,15 @@ def test_cute_dsl_indexer_topk_decode_mixed_lengths_wide_buffer():
     cols = torch.arange(width, device="cuda")
     logits.masked_fill_(cols[None, :] >= lengths.cuda()[:, None], float("-inf"))
     out = torch.empty(rows, k, dtype=torch.int32, device="cuda")
-    torch.ops.trtllm.cute_dsl_indexer_topk_decode(logits, lengths.to(torch.int32).cuda(), out, k, 1)
+    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        logits,
+        lengths.to(torch.int32).cuda(),
+        out,
+        k,
+        1,
+        wide_fp32_rows=wide_fp32_rows,
+        split_long_rows=True,
+    )
 
     ref = torch.topk(logits, k, dim=1).values
     picked = torch.where(out >= 0, logits.gather(1, out.long().clamp_min(0)), float("-inf"))

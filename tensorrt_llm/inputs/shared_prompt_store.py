@@ -17,8 +17,9 @@
 The serving frontends of one server receive a conversation's turns in any order, so
 a cache of earlier prompts helps only when every frontend process can read it. Each
 value is a file in one directory, preferably on a node-local tmpfs. Writers hold a
-file lock, keep a running byte total, and evict the least recently used entries
-before a write would exceed the cap.
+file lock while they write and keep a running total of the space the entries take,
+in whole file system blocks. A writer that takes the total over the cap then evicts
+the least recently used entries without holding that lock.
 """
 
 import fcntl
@@ -27,7 +28,9 @@ import os
 import stat
 import struct
 import threading
-from typing import Optional
+import time
+from contextlib import contextmanager
+from typing import Iterator, Optional
 
 from ..logger import logger
 
@@ -35,7 +38,10 @@ _MAGIC = b"TSPS"
 # magic, key digest, value length, value digest
 _HEADER = struct.Struct("<4s16sQ16s")
 _SUFFIX = ".entry"
+_TMP_SUFFIX = ".tmp"
 _EVICT_TO = 0.9  # of the cap, so one eviction scan serves several writes
+# A writer renames its temporary file within milliseconds; an older one lost its writer.
+_STALE_TMP_NS = 60 * 10**9  # 60 s
 
 
 def _digest(data: bytes) -> bytes:
@@ -71,8 +77,12 @@ class SharedPromptStore:
                 "writable by group or others"
             )
         self._dir_fd = dir_fd
-        # Create the lock file now, so a directory that cannot be written fails at startup.
-        os.close(self._open("lock", os.O_WRONLY | os.O_CREAT))
+        # A file takes whole blocks: pages on a tmpfs.
+        self._block = max(1, os.fstatvfs(dir_fd).f_frsize)
+        # Create the lock files now, so a directory that cannot be written fails at startup.
+        for name in ("lock", "evict"):
+            os.close(self._open(name, os.O_WRONLY | os.O_CREAT))
+        self._scan()  # deletes the temporary files of writers killed before their rename
 
     def __del__(self) -> None:
         dir_fd = getattr(self, "_dir_fd", None)
@@ -81,6 +91,17 @@ class SharedPromptStore:
 
     def _open(self, name: str, flags: int) -> int:
         return os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=self._dir_fd)
+
+    @contextmanager
+    def _locked(self, name: str, operation: int = fcntl.LOCK_EX) -> Iterator[None]:
+        """Hold the cross-process lock ``name``; with LOCK_NB a held lock raises BlockingIOError."""
+        with os.fdopen(self._open(name, os.O_WRONLY | os.O_CREAT), "w") as lock:
+            fcntl.flock(lock, operation)
+            yield
+
+    def _cost(self, size: int) -> int:
+        """The space a file of ``size`` bytes takes."""
+        return -(-size // self._block) * self._block
 
     @staticmethod
     def _name(key: bytes) -> str:
@@ -122,66 +143,104 @@ class SharedPromptStore:
             pass
 
     def put(self, key: bytes, value: bytes) -> None:
-        """Store ``value`` under ``key``, evicting least recently used entries to fit the cap."""
+        """Store ``value`` under ``key``, then evict least recently used entries if over the cap."""
         data = _HEADER.pack(_MAGIC, _digest(key), len(value), _digest(value)) + value
-        if len(data) > self._max_bytes:
+        cost = self._cost(len(data))
+        if cost > self._max_bytes:
             return
         name = self._name(key)
-        tmp = f"{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp = f"{name}.{os.getpid()}.{threading.get_ident()}{_TMP_SUFFIX}"
         try:
-            with self._mutex, os.fdopen(self._open("lock", os.O_WRONLY | os.O_CREAT), "w") as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+            with self._mutex, self._locked("lock"):
                 try:
-                    replaced = os.stat(name, dir_fd=self._dir_fd, follow_symlinks=False).st_size
+                    size = os.stat(name, dir_fd=self._dir_fd, follow_symlinks=False).st_size
+                    replaced = self._cost(size)
                 except OSError:
                     replaced = 0
-                total = self._load_total() - replaced
-                if total + len(data) > self._max_bytes:
-                    total = self._evict(len(data), name)
+                total = self._load_total() - replaced + cost
                 flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
                 with os.fdopen(self._open(tmp, flags), "wb") as entry:
                     entry.write(data)
                 os.replace(tmp, name, src_dir_fd=self._dir_fd, dst_dir_fd=self._dir_fd)
-                with os.fdopen(self._open("total", flags), "w") as total_file:
-                    total_file.write(str(total + len(data)))
+                self._store_total(total)
         except OSError as error:
             logger.debug(f"Shared prompt store: write to {self._dir} failed: {error}")
             try:
                 os.unlink(tmp, dir_fd=self._dir_fd)
             except OSError:
                 pass
+            return
+        if total > self._max_bytes:
+            self._evict()
 
     def _load_total(self) -> int:
-        """Under the lock: bytes of all entries, recounted when the running total is unreadable."""
+        """Under the lock: space of all entries, recounted when the running total is unreadable."""
         try:
             with os.fdopen(self._open("total", os.O_RDONLY)) as total_file:
                 return int(total_file.read())
         except (OSError, ValueError):
-            return sum(size for _, size, _ in self._entries())
+            return sum(cost for _, cost, _ in self._scan())
 
-    def _entries(self) -> list[tuple[int, int, str]]:
+    def _store_total(self, total: int) -> None:
+        """Under the lock: record the running total."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        with os.fdopen(self._open("total", flags), "w") as total_file:
+            total_file.write(str(total))
+
+    def _scan(self) -> list[tuple[int, int, str]]:
+        """(mtime, space, name) of every entry; deletes temporary files their writers left."""
         entries = []
-        with os.scandir(self._dir_fd) as listing:
-            for item in listing:
-                if item.name.endswith(_SUFFIX):
+        stale = time.time_ns() - _STALE_TMP_NS
+        # A fresh descriptor: reading a tmpfs directory through an older one can miss newer files.
+        scan_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=self._dir_fd)
+        try:
+            with os.scandir(scan_fd) as listing:
+                for item in listing:
                     try:
-                        info = item.stat(follow_symlinks=False)
+                        if item.name.endswith(_SUFFIX):
+                            info = item.stat(follow_symlinks=False)
+                            entries.append((info.st_mtime_ns, self._cost(info.st_size), item.name))
+                        elif (
+                            item.name.endswith(_TMP_SUFFIX)
+                            and item.stat(follow_symlinks=False).st_mtime_ns < stale
+                        ):
+                            os.unlink(item.name, dir_fd=self._dir_fd)
                     except OSError:
                         continue
-                    entries.append((info.st_mtime_ns, info.st_size, item.name))
+        finally:
+            os.close(scan_fd)
         return entries
 
-    def _evict(self, incoming: int, replaced: str) -> int:
-        """Under the lock: drop the oldest entries until ``incoming`` more bytes fit."""
-        entries = sorted(entry for entry in self._entries() if entry[2] != replaced)
-        total = sum(size for _, size, _ in entries)
-        target = max(0, int(_EVICT_TO * self._max_bytes) - incoming)
-        for _, size, name in entries:
-            if total <= target:
-                break
-            try:
-                os.unlink(name, dir_fd=self._dir_fd)
-            except OSError:
-                continue
-            total -= size
-        return total
+    def _evict(self) -> None:
+        """Drop the least recently used entries until the total is back under the cap.
+
+        Runs without the write lock, so writers never wait on its scan, and in one process
+        at a time: a writer that finds another process evicting leaves the work to it.
+        """
+        try:
+            with self._locked("evict", fcntl.LOCK_EX | fcntl.LOCK_NB):
+                while True:
+                    with self._mutex, self._locked("lock"):
+                        start = self._load_total()
+                    if start <= self._max_bytes:
+                        return
+                    entries = sorted(self._scan())
+                    total = sum(cost for _, cost, _ in entries)
+                    target = int(_EVICT_TO * self._max_bytes)
+                    for _, cost, name in entries:
+                        if total <= target:
+                            break
+                        try:
+                            os.unlink(name, dir_fd=self._dir_fd)
+                        except OSError:
+                            continue
+                        total -= cost
+                    with self._mutex, self._locked("lock"):
+                        # Entries written since ``start`` are in the running total, not the scan.
+                        self._store_total(total + self._load_total() - start)
+                    if total > target:
+                        return  # the remaining entries cannot be removed
+        except BlockingIOError:
+            return
+        except OSError as error:
+            logger.debug(f"Shared prompt store: eviction in {self._dir} failed: {error}")

@@ -13,12 +13,20 @@ import struct
 import threading
 import time
 import weakref
+from typing import Callable, TypeVar
 
 from tensorrt_llm.logger import logger
 
 # A node-share name that stays bound this long without being served has no live owner.
 _UNSERVED_TIMEOUT_S = 30
+# A joiner gives up on an owner that has not published, or not finished, the content after this
+# long: well past the allocation, page-cache eviction and load an owner may legitimately be in.
+_OWNER_TIMEOUT_S = 30 * 60  # 30 min
+# How often a joiner says it is still waiting for its owner.
+_WAIT_LOG_INTERVAL_S = 60  # 1 min
 _READY = b"ready"
+
+_T = TypeVar("_T")
 
 
 def _peer_uid(connection: socket.socket) -> int:
@@ -126,9 +134,11 @@ class NodeShare:
     def join(self, claim_after_s: float = 0.0) -> tuple[list[int], dict] | None:
         """Claim the name (None), not before ``claim_after_s``, or wait for its owner's descriptors and
         metadata, claiming it again if that owner goes away first; the caller closes the descriptors
-        and then calls ``wait_ready``, which the owner answers only once the content is complete."""
+        and then calls ``wait_ready``, which the owner answers only once the content is complete.
+        Raises ``TimeoutError`` if an owner does not publish within ``_OWNER_TIMEOUT_S``."""
         claim_at = time.monotonic() + claim_after_s
         deadline = claim_at + _UNSERVED_TIMEOUT_S
+        next_log = time.monotonic()
         while True:
             if time.monotonic() >= claim_at and self._claim():
                 return None
@@ -138,14 +148,23 @@ class NodeShare:
                     client.connect("\0" + self.name)
                 except ConnectionRefusedError:
                     # Unclaimed yet, or bound but not listening: an owner starting up or shutting down.
-                    if time.monotonic() > deadline:
+                    now = time.monotonic()
+                    if now > deadline:
                         raise RuntimeError(f"node share {self.name} is held but never served")
+                    if now < claim_at and now >= next_log:
+                        logger.info(
+                            f"Node share {self.name}: no owner yet; waiting up to "
+                            f"{claim_at - now:.0f} s for one before claiming it"
+                        )
+                        next_log = now + _WAIT_LOG_INTERVAL_S
                     time.sleep(0.1)
                     continue
                 if _peer_uid(client) != os.getuid():
                     raise PermissionError(f"node share {self.name} is held by another user")
                 try:
-                    payload, fds, _, _ = socket.recv_fds(client, 1 << 16, 1)
+                    payload, fds, _, _ = self._wait_for_owner(
+                        client, lambda: socket.recv_fds(client, 1 << 16, 1), "publish it"
+                    )
                 except ConnectionResetError:
                     payload, fds = b"", []
                 if payload:
@@ -164,15 +183,41 @@ class NodeShare:
             deadline = time.monotonic() + _UNSERVED_TIMEOUT_S
 
     def wait_ready(self) -> bool:
-        """Joiner: block until the owner marks the content ready (True) or goes away first (False)."""
+        """Joiner: block until the owner marks the content ready (True) or goes away first (False);
+        raises ``TimeoutError`` if it does neither within ``_OWNER_TIMEOUT_S``."""
         connection, self._connection = self._connection, None
         if connection is None:
             return False
         with connection:
             try:
-                return connection.recv(len(_READY)) == _READY
+                answer = self._wait_for_owner(
+                    connection, lambda: connection.recv(len(_READY)), "finish it"
+                )
+            except TimeoutError:
+                raise
             except OSError:
                 return False
+        return answer == _READY
+
+    def _wait_for_owner(
+        self, connection: socket.socket, receive: Callable[[], _T], what: str
+    ) -> _T:
+        """``receive()`` on ``connection``, logging while the owner is silent; raises
+        ``TimeoutError`` once it has been silent for ``_OWNER_TIMEOUT_S``."""
+        start = time.monotonic()
+        connection.settimeout(_WAIT_LOG_INTERVAL_S)
+        while True:
+            try:
+                return receive()
+            except TimeoutError:
+                waited = time.monotonic() - start
+                if waited >= _OWNER_TIMEOUT_S:
+                    raise TimeoutError(
+                        f"node share {self.name}: its owner did not {what} within {waited:.0f} s"
+                    ) from None
+                logger.info(
+                    f"Node share {self.name}: waited {waited:.0f} s for its owner to {what}"
+                )
 
     def _claim(self) -> bool:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)

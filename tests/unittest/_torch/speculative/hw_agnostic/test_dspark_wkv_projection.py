@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import DSv4DSparkDraftModel
 from tensorrt_llm._utils import get_sm_version
 
@@ -62,7 +63,13 @@ def _make_model(
     not (torch.cuda.is_available() and get_sm_version() in (100, 103, 107)),
     reason="Requires an SM100, SM103 or SM107 GPU",
 )
-def test_packed_backfill_matches_separate_projection_and_preserves_masked_slots() -> None:
+# The PyTorch reference serves GPUs without the CuTe DSL kernel.
+@pytest.mark.parametrize("fused", (True, False), ids=("cute_dsl", "reference"))
+def test_packed_backfill_matches_separate_projection_and_preserves_masked_slots(
+    monkeypatch, fused
+) -> None:
+    if not fused:
+        monkeypatch.setattr(modeling_dspark, "_get_dspark_arch_str", lambda: None)
     device = "cuda"
     window = 128
     model = _make_model(head_dim=512, window=window)

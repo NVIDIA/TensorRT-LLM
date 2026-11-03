@@ -50,6 +50,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -96,6 +97,7 @@ from ..moe.fused_moe import (
 from ..moe.fused_moe.mega_moe import MegaMoECuteDsl
 from ..moe.fused_moe.moe_scheduler import FusedCommMoEScheduler, MoEForwardHooks
 from ..peft.lora.layer import LoraLayer
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import SpecMetadata, get_num_extra_kv_tokens
 from ..utils import (
     AuxStreamType,
@@ -1714,22 +1716,50 @@ def full_tp_shared_expert_forward(
     return mxfp8_lowm_linear(swiglu(gate_up, swiglu_limit=swiglu_limit), w2, s2)
 
 
-def fuse_megamoe_shared_experts(layers) -> None:
-    """Hand each layer's shared expert to a MegaMoE CuteDSL backend that runs it inside its kernel.
+def fuse_megamoe_shared_experts(layers, *, required: Optional[bool] = None) -> Optional[bool]:
+    """Hand the layers' shared experts to their MegaMoE CuteDSL backends, all of them or none.
 
-    Call it for every such MoE of a process (target and draft) before the Linear transforms.
+    A launch bucket's workspace cannot switch between the fused and the unfused kernel inside a
+    CUDA graph, so pass every such MoE of a process (target, MTP and draft) before the Linear
+    transforms; ``required`` is an earlier call's decision for MoEs sharing those workspaces.
+    Returns the decision, or None when no layer asks for fusion.
     """
+    mlps = []
     for layer in layers:
         # Other backends' fused shared experts need routing this model does not do.
         mlp = getattr(layer, "mlp", None)
-        shared_experts = getattr(mlp, "shared_experts", None)
         if (
-            shared_experts is not None
+            getattr(mlp, "shared_experts", None) is not None
             and isinstance(getattr(mlp.experts, "backend", None), MegaMoECuteDsl)
             and mlp.experts.num_fused_shared_expert > 0
-            and mlp.experts.fuse_shared_expert(shared_experts)
         ):
-            mlp.shared_experts = None
+            mlps.append(mlp)
+    if not mlps:
+        return None
+    unfusable = [
+        mlp.experts.layer_idx
+        for mlp in mlps
+        if not mlp.experts.backend.can_fuse_shared_expert(mlp.shared_experts)
+    ]
+    if required and unfusable:
+        raise ValueError(
+            f"megamoe_fuse_shared_expert: the shared experts of MoE layers {unfusable} are not "
+            "fusable FP8 block-scale MLPs, but MegaMoE layers sharing their workspaces already "
+            "fused theirs; turn megamoe_fuse_shared_expert off."
+        )
+    if required is False or unfusable:
+        if unfusable:
+            logger.warning(
+                f"megamoe_fuse_shared_expert: the shared experts of MoE layers {unfusable} are not "
+                "fusable FP8 block-scale MLPs, so every layer keeps its shared expert separate."
+            )
+        for mlp in mlps:
+            mlp.experts.backend.decline_shared_expert()
+        return False
+    for mlp in mlps:
+        mlp.experts.fuse_shared_expert(mlp.shared_experts)
+        mlp.shared_experts = None
+    return True
 
 
 class DeepseekV4MoE(nn.Module):
@@ -3480,6 +3510,13 @@ class DeepseekV4Model(DecoderModel):
         return hc_state.residual.flatten(1)
 
 
+# The step-loop hooks validated on DeepSeek-V4 and V4.1.
+_DEEPSEEK_V4_RUNTIME_HOOKS = RuntimeHooks(stage_decode_inputs=True, prioritize_decode_graphs=True)
+_DEEPSEEK_V4_SPEC_RUNTIME_HOOKS = RuntimeHooks(
+    stage_decode_inputs=True, prioritize_decode_graphs=True, loop_on_execution_stream=True
+)
+
+
 @register_auto_model("DeepseekV4ForCausalLM")
 class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, PretrainedConfig]):
     # Subclass hooks, so a variant can swap the model / logits path without
@@ -3487,6 +3524,14 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     model_cls = DeepseekV4Model
     logits_processor_cls = DeepseekV4LogitsProcessor
     weight_loader_cls = DeepseekV4WeightLoader
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Staged decode inputs and priority decode graphs; speculative decoding also runs
+        the overlap loop on the execution stream."""
+        if self.spec_config is not None:
+            return _DEEPSEEK_V4_SPEC_RUNTIME_HOOKS
+        return _DEEPSEEK_V4_RUNTIME_HOOKS
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -3558,6 +3603,10 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             model=self.model_cls(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config=model_config,
         )
+        # FP8 block-scale projections race the small-M kernel against the quantized GEMM.
+        for module in self.modules():
+            if isinstance(module, Linear):
+                module.use_fp8_small_m_gemm = True
         self.logits_processor = self.logits_processor_cls(
             model_config, self.model.hc_head, self.model.norm
         )
@@ -3718,4 +3767,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
                     and next_layer.enable_fused_hc
                     and next_layer.engram is None
                 )
-        fuse_megamoe_shared_experts(layers)
+        # The MTP and draft layers share the target's MegaMoE launch workspaces. A DSpark draft
+        # decided for its stages at its own load, which comes first; the target follows it.
+        draft = getattr(self, "draft_model", None)
+        draft_layers = getattr(draft, "mtp_layers", None) or []
+        dspark = getattr(draft, "dspark_model", None)
+        fuse_megamoe_shared_experts(
+            [*layers, *draft_layers],
+            required=getattr(dspark, "megamoe_shared_expert_fusion", None),
+        )

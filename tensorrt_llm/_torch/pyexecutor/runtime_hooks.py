@@ -244,6 +244,11 @@ class RuntimeHooks:
     # counts join the step-input pack, and the spec sampler keeps its slot ids in
     # a device buffer it re-uploads only when they change.
     spec_small_h2d: bool = False
+    # Stage a decode step's inputs in fewer launches: attention metadata through a
+    # private copy stream; a graph replay's ids, positions and speculative inputs in one launch each.
+    stage_decode_inputs: bool = False
+    # Capture the decode CUDA graphs (at most 256 tokens per step) on a high-priority stream.
+    prioritize_decode_graphs: bool = False
     # Speculative step-input staging folded into the forward (see SpecStepFold).
     spec_step_fold: Optional[SpecStepFold] = None
     # Copy the one-model speculative sampler's per-slot store to the host on the sampler's D2H side

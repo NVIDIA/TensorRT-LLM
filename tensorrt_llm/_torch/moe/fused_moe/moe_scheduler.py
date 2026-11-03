@@ -55,6 +55,7 @@ from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
@@ -67,6 +68,7 @@ from .impl_contract import (
     PreroutedRouting,
 )
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
+from .routing import DeepSeekV4MoeRoutingMethod
 
 __all__ = [
     "MoEScheduler",
@@ -109,6 +111,21 @@ def _record_routes(
         ExpertStatistic.set_layer(moe.layer_idx)
         ExpertStatistic.maybe_add_info(num_slots, routes)
     return get_calibrator().maybe_collect_or_replay_slots(num_slots, routes)
+
+
+def _record_backend_slots(moe: "ConfigurableMoE", expert_ids: torch.Tensor) -> torch.Tensor:
+    """Record the slots of a backend that maps ``expert_ids`` to slots itself (``maps_expert_slots``).
+
+    Returns the expert IDs the backend runs: ``expert_ids``, or the experts of replayed slots.
+    """
+    if ExpertStatistic.get() is None and get_calibrator().mode not in (
+        CalibratorMode.COLLECT,
+        CalibratorMode.REPLAY,
+    ):
+        return expert_ids
+    slots = moe.backend.slots_of_experts(expert_ids)
+    recorded = _record_routes(moe, slots, moe.num_slots)
+    return expert_ids if recorded is slots else moe.backend.experts_of_slots(recorded)
 
 
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
@@ -171,22 +188,21 @@ class MoEScheduler(ABC):
         route_counters=None,
     ) -> Optional[MoEFusedRouteQuant]:
         """The backend's one-launch routing and input quantization (only the routing for an input
-        that arrives quantized), unless a routing aux, a router weight on the input or a dynamic
-        balancer needs the separate launches. A backend that ``counts_routes`` also adds the picks
-        to the warmup placement's ``route_counters``."""
+        that arrives quantized), unless a routing aux, a router weight on the input, a dynamic
+        balancer or a cleared ``fused_route_quant_enabled`` needs the separate launches. A backend
+        that ``counts_routes`` also adds the picks to the warmup placement's ``route_counters``."""
         moe = self.moe
         if (
             routing_aux is not None
             or moe.apply_router_weight_on_input
             or moe._using_dynamic_load_balancer()
+            or not moe.backend.fused_route_quant_enabled
         ):
             return None
         if isinstance(x, Fp4QuantizedTensor):
             if route_counters is not None:
                 return None
             return moe.backend.try_fused_route(x, router_logits)
-        if not moe.backend.fused_route_quant_enabled:
-            return None
         if route_counters is not None and getattr(moe.backend, "counts_routes", False):
             return moe.backend.try_fused_route_quant(
                 x, router_logits, route_counters=route_counters
@@ -246,6 +262,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
     separate MoE communication timing from rank skew or load-imbalance
     artifacts when analyzing traces.
     """
+
+    def __init__(self, moe: "ConfigurableMoE") -> None:
+        super().__init__(moe)
+        # The EP2 pull combine, which also adds the shared expert's output, is measured on the
+        # DeepSeek-V4 MoE only. Every rank builds the same layers, so the collective setup lines up.
+        comm = getattr(moe, "comm", None)
+        if isinstance(comm, NVLinkOneSided) and isinstance(
+            getattr(moe, "routing_method", None), DeepSeekV4MoeRoutingMethod
+        ):
+            comm.enable_pull_combine()
 
     def forward(
         self,
@@ -1808,7 +1834,8 @@ class FusedCommMoEScheduler(MoEScheduler):
                     moe._load_balancer_count_warmup(
                         token_selected_experts, router_logits_chunk_real, row_offset
                     )
-            if moe.layer_load_balancer and not getattr(moe.backend, "maps_expert_slots", False):
+            maps_expert_slots = getattr(moe.backend, "maps_expert_slots", False)
+            if moe.layer_load_balancer and not maps_expert_slots:
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel
                 # for an external stats gather. The base helper runs its own
@@ -1820,11 +1847,13 @@ class FusedCommMoEScheduler(MoEScheduler):
                     ignore_allreduce=False,
                 )
                 token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+                token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
+            elif maps_expert_slots:
+                # A static placement the backend applies itself (into the launch bucket when the
+                # routing launch wrote it): it takes expert IDs, recorded as the slots they go to.
+                token_selected_slots = _record_backend_slots(moe, token_selected_experts)
             else:
-                # No balancer, or a static one-copy placement the backend applies itself (into the
-                # launch bucket when the routing launch wrote it).
-                token_selected_slots = token_selected_experts
-            token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
+                token_selected_slots = _record_routes(moe, token_selected_experts, moe.num_slots)
             replica_plan = None
 
         # ----- quantize / prepare -----

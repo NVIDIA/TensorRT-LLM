@@ -50,7 +50,12 @@ its copies.
 Row passes: a layer registers under the row space of its MoE input (``"main"``: the step's tokens).
 A drafter whose MoE routes its own rows registers under its pass with ``rows_per_request`` (a DSpark
 draft stage: its block rows per generation request), which ``set_live_rows`` bounds and masks like
-the main pass. Such a layer is learned from the default contiguous placement, in the same rounds.
+the main pass. Such a layer is learned from the default contiguous placement, in the same rounds. A
+``"main"`` layer past the target's decoder layers (an MTP draft layer, whose draft steps feed other
+rows than the main pass) keeps its configured placement.
+
+Only backends that implement ``on_expert_placement_changed`` (MegaMoE) are re-placed: another
+backend may keep expert-indexed state outside the per-slot tensors this controller moves.
 """
 
 from __future__ import annotations
@@ -60,13 +65,24 @@ import dataclasses
 import math
 import time
 import weakref
-from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from mpi4py.MPI import Intracomm
+    from torch.distributed import ProcessGroup
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+    from tensorrt_llm.llmapi.llm_args import MoeWarmupPlacementConfig
+
+    from .interface import MoE
+    from .moe_load_balancer import SingleLayerMoeLoadBalancer
 
 _LOG = "[MoePlace]"
 # Rows per forward and pass that the min_pos row mask covers; later rows never count.
@@ -75,11 +91,13 @@ _MASK_ROWS = 16384
 _STAGING_BYTES = 256 << 20
 # CTAs of the slot-exchange communicator: NCCL keeps P2P buffers per channel and peer outside torch.
 _EXCHANGE_CTAS = 2
+# A round halves the counters once one reaches this, so an int32 counter of a long run never wraps.
+_COUNTER_HALVING_AT = 1 << 30
 
-# Backends whose expert-indexed state is exactly the per-slot tensors below plus the balancer's
-# table. A backend that keeps another expert -> slot table implements
-# ``on_expert_placement_changed(global_assignments)``; any other backend is refused.
-_VERIFIED_BACKENDS = frozenset({"CuteDslFusedMoE", "CutlassFusedMoE"})
+# A copy's weight from its expected load (``_replica_inputs``).
+_Weight = Callable[[np.ndarray], np.ndarray]
+# planner="cost": (us per active expert, us per routed pick, rows per forward of each row pass).
+_CostInputs = Tuple[float, float, Dict[int, float]]
 
 # Per-slot parameters (leading dim = local slots) a migration moves: what the NVFP4 quantization
 # methods register per expert, the per-expert activation constants, plus MegaMoE's packed weights.
@@ -126,7 +144,9 @@ class WarmupPlacementSettings:
     min_round_gain: float = 0.0
 
     @classmethod
-    def from_config(cls, config) -> Optional["WarmupPlacementSettings"]:
+    def from_config(
+        cls, config: Optional[MoeWarmupPlacementConfig]
+    ) -> Optional[WarmupPlacementSettings]:
         return None if config is None else cls(**config.model_dump())
 
 
@@ -274,7 +294,9 @@ def copy_transfers(
     return out
 
 
-def _replica_inputs(load: np.ndarray, top_k: int, cost, row_space: int):
+def _replica_inputs(
+    load: np.ndarray, top_k: int, cost: Optional[_CostInputs], row_space: int
+) -> Tuple[np.ndarray, _Weight]:
     """(per-expert expected load, weight of a copy's share) of a layer with copies: with the cost
     planner the expected picks per forward and the modelled cost, else the counted picks."""
     load = np.asarray(load, dtype=np.float64)
@@ -286,7 +308,9 @@ def _replica_inputs(load: np.ndarray, top_k: int, cost, row_space: int):
     return lam, (lambda x: a * -np.expm1(-np.asarray(x)) + b * np.asarray(x))
 
 
-def _replica_excess(lam: np.ndarray, slot_expert: Sequence[int], slots_per_rank: int, weight):
+def _replica_excess(
+    lam: np.ndarray, slot_expert: Sequence[int], slots_per_rank: int, weight: _Weight
+) -> float:
     se = np.asarray(slot_expert, dtype=np.int64)
     copies = np.bincount(se, minlength=lam.size)
     w = weight(lam[se] / np.maximum(copies[se], 1))
@@ -297,7 +321,7 @@ def _replica_excess(lam: np.ndarray, slot_expert: Sequence[int], slots_per_rank:
     return float((rl.max() - mean) / mean) if mean > 0 else 0.0
 
 
-def target_copies(lam: np.ndarray, weight, ep_size: int, total_slots: int) -> np.ndarray:
+def target_copies(lam: np.ndarray, weight: _Weight, ep_size: int, total_slots: int) -> np.ndarray:
     """Copies per expert of a layer with extra slots: the expert with the heaviest copy gets one more
     while that lowers max(mean rank load, heaviest copy); the slots left over hold second copies of
     the coldest experts, which are rarely active. Deterministic."""
@@ -332,7 +356,7 @@ def plan_layer_copy_moves(
     lam: np.ndarray,
     slot_expert: Sequence[int],
     slots_per_rank: int,
-    weight,
+    weight: _Weight,
     max_moves: int,
 ) -> Tuple[List[int], int]:
     """Churn-bounded re-choice of the copies of a layer with extra slots -> (slot -> expert list,
@@ -542,8 +566,8 @@ class _Layer:
     num_experts: int
     top_k: int
     slots_per_rank: int
-    moe: "weakref.ReferenceType"
-    balancer: object  # SingleLayerMoeLoadBalancer
+    moe: weakref.ReferenceType
+    balancer: SingleLayerMoeLoadBalancer
     assign: List[int]  # global slot -> expert
     row_space: int = 0
     slot_tensors: Optional[List[torch.Tensor]] = None
@@ -560,18 +584,24 @@ class WarmupPlacementController:
 
     Collectives of a round run in the same order on every rank: counter allreduce, live-row
     allreduce (``planner="cost"``), plan broadcast, prepare vote, checksum allreduce (first round),
-    slot transfers, failure count. A rank-local error before the vote skips the round everywhere;
-    after the vote errors are fatal."""
+    slot transfers, failure count, counter peak. The round's device buffers are reserved before the
+    vote, and a rank-local error before it skips the round everywhere; after the vote errors are
+    fatal.
+
+    ``num_target_layers``: the target model's decoder layers, or None when unknown; a ``"main"``
+    layer at or past it is a draft (MTP) layer."""
 
     def __init__(
         self,
         settings: WarmupPlacementSettings,
         ep_rank: int,
         ep_size: int,
-    ):
+        num_target_layers: Optional[int] = None,
+    ) -> None:
         self.settings = settings
         self.ep_rank = ep_rank
         self.ep_size = ep_size
+        self.num_target_layers = num_target_layers
         self.layers: List[_Layer] = []
         self.migrations_done = 0
         self.frozen = False
@@ -584,8 +614,11 @@ class WarmupPlacementController:
         self._mask_slot = 0
         self._mask_overflow_logged = False
         self._step = -1
-        self._comm = None  # MPI communicator over the EP group, comm rank == EP rank
-        self._group = None  # few-CTA NCCL group over the EP group, for the slot transfers
+        # MPI communicator over the EP group, comm rank == EP rank
+        self._comm: Optional[Intracomm] = None
+        # Few-CTA NCCL group over the EP group, for the slot transfers
+        self._group: Optional[ProcessGroup] = None
+        # The round's device memory, reserved before its vote: transfer rows and checksum scratch
         self._staging: Optional[torch.Tensor] = None
         self._expert_checksums: Optional[np.ndarray] = None
         self._counting_since: Optional[int] = None
@@ -599,8 +632,8 @@ class WarmupPlacementController:
     # ------------------------------------------------------------------ registration
     def register_layer(
         self,
-        moe,
-        balancer,
+        moe: MoE,
+        balancer: SingleLayerMoeLoadBalancer,
         num_experts: int,
         top_k: int,
         slots_per_rank: int,
@@ -609,12 +642,25 @@ class WarmupPlacementController:
         rows_per_request: Optional[int] = None,
     ) -> Optional[int]:
         """Track a static balancer layer; returns its counter index, or None for a layer whose
-        assignment neither holds every expert once nor covers every expert with extra slots, which
-        keeps its configured placement. ``row_space`` names the row space of the layer's MoE input
-        (``"main"``: the step's tokens); another pass gives its MoE rows per generation request in
-        ``rows_per_request`` and starts from the default placement."""
+        assignment neither holds every expert once nor covers every expert with extra slots, or a
+        draft layer under ``"main"``, which keeps its configured placement. ``row_space`` names the
+        row space of the layer's MoE input (``"main"``: the step's tokens); another pass gives its
+        MoE rows per generation request in ``rows_per_request`` and starts from the default
+        placement."""
         if self._finalized:
             raise RuntimeError(f"{_LOG} layers must register before the model is finalized")
+        layer_idx = getattr(moe, "layer_idx", None)
+        if (
+            row_space == "main"
+            and self.num_target_layers is not None
+            and layer_idx is not None
+            and layer_idx >= self.num_target_layers
+        ):
+            logger.info(
+                f"{_LOG} draft layer {layer_idx} keeps its configured placement: its draft steps "
+                f"route other rows than the main pass"
+            )
+            return None
         one_copy = slots_per_rank * self.ep_size == num_experts and sorted(
             initial_assignments
         ) == list(range(num_experts))
@@ -649,13 +695,44 @@ class WarmupPlacementController:
     def finalize(self) -> None:
         """Allocate the counters and communicators once every layer registered (after the model
         moved to the GPU). Collective over the world: every rank runs it at model load."""
+        from mpi4py import MPI
+
+        from tensorrt_llm._utils import mpi_world_size
+
         if self._finalized:
             return
         self._finalized = True
+        # Checked before any collective: a rank of another pipeline stage may hold no MoE layer.
+        world = mpi_world_size()
+        if world != self.ep_size:
+            raise ValueError(
+                f"{_LOG} needs pure expert parallelism over the MPI world (world {world} == EP "
+                f"{self.ep_size}) for its slot exchange"
+            )
         if not self.layers:
             logger.warning(f"{_LOG} no static one-copy balancer layer registered; nothing to place")
             self.frozen = True
             return
+        self._comm = self._make_ep_comm()
+        local = np.array([int(_follows_placement(layer)) for layer in self.layers], dtype=np.int32)
+        supported = np.empty_like(local)
+        self._comm.Allreduce(local, supported, op=MPI.MIN)
+        refused = sorted(
+            {_backend_name(layer) for layer in self.layers if not supported[layer.index]}
+        )
+        if not supported.any():
+            raise ValueError(
+                f"{_LOG} re-places experts only on MoE backends that implement "
+                f"on_expert_placement_changed (MEGAMOE_CUTEDSL); the MoE layers run {refused}"
+            )
+        if refused:
+            for layer in self.layers:
+                if not supported[layer.index]:
+                    layer.movable = False
+            logger.warning(
+                f"{_LOG} {int((supported == 0).sum())} layers on {refused} keep their configured "
+                f"placement: these backends do not implement on_expert_placement_changed"
+            )
         # Rows padded to 16 bytes, so a kernel may assume aligned counter rows.
         emax = -(-max(layer.num_experts for layer in self.layers) // 4) * 4
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -676,7 +753,6 @@ class WarmupPlacementController:
                     )
                     for _ in range(4)
                 ]
-        self._comm = self._make_ep_comm()
         self._group = self._make_exchange_group()
         s = self.settings
         deadline = "" if s.deadline_step is None else f", a last round at step {s.deadline_step}"
@@ -687,13 +763,13 @@ class WarmupPlacementController:
             f"{s.max_migrations} time(s){deadline}"
         )
 
-    def _make_ep_comm(self):
+    def _make_ep_comm(self) -> Intracomm:
         from tensorrt_llm._utils import mpi_comm
 
-        # The world is the EP group (``_make_exchange_group`` requires pure EP).
+        # The world is the EP group (``finalize`` requires pure EP).
         return mpi_comm()
 
-    def _make_exchange_group(self):
+    def _make_exchange_group(self) -> ProcessGroup:
         import torch.distributed as dist
 
         from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
@@ -742,7 +818,7 @@ class WarmupPlacementController:
         """Whether the per-step live-row inputs are still needed."""
         return self._finalized and self._counting()
 
-    def set_live_rows(self, requests, draft_len: int) -> None:
+    def set_live_rows(self, requests: ScheduledRequests, draft_len: int) -> None:
         """Every pass's live-row bound and, with ``min_pos``, row mask for the next forward. Main
         pass: context rows, then ``1 + draft_len`` rows per generation request (``real_rows_of``'s
         order). Another pass: its ``rows_per_request`` per live generation request, in the same
@@ -814,6 +890,22 @@ class WarmupPlacementController:
             if action == LAST and not self.frozen:
                 self._freeze(step)
 
+    def reset_schedule(self) -> None:
+        """Restart the schedule and the counters at executor step 0 (the executor rebound its
+        resources); the placement and the rounds done stay."""
+        if not self._finalized or self.frozen:
+            return
+        self._flag.fill_(0)
+        self._hist.zero_()
+        for bound in self._bounds:
+            bound.fill_(-1)
+        self._counting_since = None
+        self._next_check = self.settings.start_step + self.settings.interval_steps
+        self._rows_at_last_round = 0
+        for rows in self._live_rows.values():
+            rows.clear()
+        self._step = -1
+
     # ------------------------------------------------------------------ one round
     def _round(self, step: int, last: bool = False) -> None:
         """One round; ``last`` (the deadline) runs on any rows counted since the previous one."""
@@ -827,18 +919,19 @@ class WarmupPlacementController:
         first = self.layers[0]
         rows = int(glob[0, : first.num_experts].sum()) // max(1, first.top_k)
         fresh = rows - self._rows_at_last_round
-        if last and fresh == 0:
+        if last and fresh <= 0:
             logger.warning(
                 f"{_LOG} deadline step {step}: no live row past min_pos {self.settings.min_pos} "
                 f"was counted since the last of {self.migrations_done} round(s); the placement "
                 f"stays as it is"
             )
             return
-        if not last and fresh < self.settings.min_rows:
+        # A round on no new rows waits too: it would only spend one of the max_migrations rounds.
+        min_rows = max(1, self.settings.min_rows)
+        if not last and fresh < min_rows:
             logger.info(
                 f"{_LOG} step {step}: {fresh} live rows past min_pos {self.settings.min_pos} "
-                f"counted since the last round (< {self.settings.min_rows}); deferred to the next "
-                f"boundary"
+                f"counted since the last round (< {min_rows}); deferred to the next boundary"
             )
             return
         self._check_movable(step)
@@ -847,10 +940,11 @@ class WarmupPlacementController:
         if self.ep_rank == 0:
             plan, before, after = [], 0.0, 0.0
             for layer in self.layers:
-                if not layer.movable:
+                load = glob[layer.index, : layer.num_experts].astype(np.float64)
+                if not layer.movable or not load.any():
+                    # Without counts every expert ties, and the copies would go to the lowest ids.
                     plan.append(None)
                     continue
-                load = glob[layer.index, : layer.num_experts].astype(np.float64)
                 spr = layer.slots_per_rank
                 if layer.replicated:
                     lam, weight = _replica_inputs(load, layer.top_k, cost, layer.row_space)
@@ -893,7 +987,7 @@ class WarmupPlacementController:
                 plan = None
         plan = self._comm.bcast(plan, root=0)
         if plan is None:
-            self._decay_counters(rows, glob)
+            self._decay_counters(rows, glob, local)
             logger.info(
                 f"{_LOG} step {step}: the plan gains less than {self.settings.min_round_gain} "
                 f"points; the placement stays, {(time.perf_counter() - t0) * 1e3:.0f} ms{note}"
@@ -907,7 +1001,7 @@ class WarmupPlacementController:
         if applied is None:
             return  # skipped on every rank: the next boundary or the deadline tries again
         moved, nbytes = applied
-        self._decay_counters(rows, glob)
+        self._decay_counters(rows, glob, local)
         self.migrations_done += 1
         logger.info(
             f"{_LOG} round {self.migrations_done}/{self.settings.max_migrations} at step {step}"
@@ -919,20 +1013,27 @@ class WarmupPlacementController:
         if self.migrations_done >= self.settings.max_migrations:
             self._freeze(step)
 
-    def _decay_counters(self, rows: int, glob: np.ndarray) -> None:
+    def _decay_counters(self, rows: int, glob: np.ndarray, local: np.ndarray) -> None:
         """Every counter keeps ``decay`` of its value, so later rounds follow recent traffic; the
-        next round's fresh rows count from here."""
+        next round's fresh rows count from here. A counter near the int32 limit on any rank halves
+        them all (the planners use only their ratios). Collective on the EP group."""
+        from mpi4py import MPI
+
         first = self.layers[0]
+        decay = self.settings.decay
+        peak = self._comm.allreduce(int(local.max(initial=0)), op=MPI.MAX)
+        if peak * decay >= _COUNTER_HALVING_AT:
+            decay = min(decay, 0.5)
         self._rows_at_last_round = rows
-        if self.settings.decay < 1.0:
-            self._hist.copy_(torch.floor(self._hist.double() * self.settings.decay).to(torch.int32))
-            kept = np.floor(glob[0, : first.num_experts] * self.settings.decay).sum()
+        if decay < 1.0:
+            self._hist.copy_(torch.floor(self._hist.double() * decay).to(torch.int32))
+            kept = np.floor(glob[0, : first.num_experts] * decay).sum()
             self._rows_at_last_round = int(kept) // max(1, first.top_k)
 
     def _max_swaps(self, layer: _Layer) -> int:
         return int(self.settings.max_moved_fraction * len(layer.assign)) // 2
 
-    def _cost_inputs(self, step: int, glob: np.ndarray) -> Tuple[float, float, Dict[int, float]]:
+    def _cost_inputs(self, step: int, glob: np.ndarray) -> _CostInputs:
         """planner="cost": (a, b, rows per forward over the EP group for each row pass): the mean
         live rows of each rank's last counted forwards, summed over the ranks; without any, the
         counted rows per counted step. Collective on the EP group."""
@@ -968,24 +1069,24 @@ class WarmupPlacementController:
         placement; the other layers are still learned."""
         from mpi4py import MPI
 
-        if all(layer.movable is not None for layer in self.layers):
+        pending = [layer for layer in self.layers if layer.movable is None]
+        if not pending:
             return
-        local = np.ones(len(self.layers), dtype=np.int32)
+        local = np.ones(len(pending), dtype=np.int32)
         reasons = {}
-        for layer in self.layers:
+        for i, layer in enumerate(pending):
             try:
                 if layer.slot_tensors is None:
                     layer.slot_tensors, layer.slot_bytes = _resolve_slot_tensors(layer)
-                _check_backend(layer)
             except (RuntimeError, ValueError) as e:
-                local[layer.index] = 0
-                reasons[layer.index] = e
+                local[i] = 0
+                reasons[i] = e
         glob = np.empty_like(local)
         self._comm.Allreduce(local, glob, op=MPI.MIN)
-        for layer in self.layers:
-            layer.movable = bool(glob[layer.index])
+        for i, layer in enumerate(pending):
+            layer.movable = bool(glob[i])
             if not layer.movable:
-                why = reasons.get(layer.index, "another EP rank cannot move its per-slot state")
+                why = reasons.get(i, "another EP rank cannot move its per-slot state")
                 logger.error(f"{_LOG} step {step}: layer {layer.index} keeps its placement: {why}")
 
     def apply_plan(
@@ -1014,8 +1115,8 @@ class WarmupPlacementController:
             self._expert_checksums = self._gather_checksums()
         received = self._migrate(plan)
         torch.cuda.synchronize()
-        self._staging = None
         bad = self._verify(received)
+        self._staging = None
         if self._comm.allreduce(bad, op=MPI.SUM):
             raise RuntimeError(
                 f"{_LOG} step {step}: slots on EP rank {self.ep_rank} hold the wrong expert after "
@@ -1042,18 +1143,28 @@ class WarmupPlacementController:
         cap = max(1, _STAGING_BYTES // max(1, layer.slot_bytes))
         return transfer_groups(transfers, layer.slots_per_rank, cap)
 
-    def _prepare_local(self, plan) -> None:
+    def _prepare_local(self, plan: Sequence[Optional[List[int]]]) -> None:
+        """Reserve the round's device buffers before its vote, so a rank without the memory skips
+        the round on every rank: per transfer group this rank's incoming and outgoing slot rows,
+        and the scratch to checksum a slot of every layer this rank checksums."""
+        me = self.ep_rank
+        first = self._expert_checksums is None  # the first round checksums every movable slot
         need = 0
         for layer, new in zip(self.layers, plan):
-            if new is None:
+            if not layer.movable:
                 continue
-            for group in self._layer_groups(layer, new):
-                incoming = sum(1 for _, d in group if d // layer.slots_per_rank == self.ep_rank)
-                need = max(need, incoming * layer.slot_bytes)
-        # Allocated before the vote, so a rank without the memory skips the round on every rank.
+            spr = layer.slots_per_rank
+            groups = [] if new is None else self._layer_groups(layer, new)
+            for group in groups:
+                rows = sum(1 for s, d in group if d // spr == me or s // spr == me)
+                need = max(need, rows * layer.slot_bytes)
+            if first or any(d // spr == me for group in groups for _, d in group):
+                for t in layer.slot_tensors:
+                    nb, nw = _slot_words(t)
+                    need = max(need, 8 * nw + nb)
         self._staging = torch.empty(need, dtype=torch.uint8, device="cuda") if need else None
 
-    def _migrate(self, plan) -> List[List[int]]:
+    def _migrate(self, plan: Sequence[Optional[List[int]]]) -> List[List[int]]:
         """Per layer, the local slots that received an expert."""
         received = []
         for layer, new in zip(self.layers, plan):
@@ -1076,23 +1187,25 @@ class WarmupPlacementController:
 
     def _migrate_group(self, layer: _Layer, transfers: List[Tuple[int, int]]) -> None:
         """Move one group of whole cycles: every incoming slot of this rank is staged before any
-        slot of the group is overwritten, so the group's sources are intact while it moves."""
+        slot of the group is overwritten, so the group's sources are intact while it moves. The
+        outgoing slots are packed into the staging rows after the incoming ones."""
         import torch.distributed as dist
 
         spr, me, nbytes = layer.slots_per_rank, self.ep_rank, layer.slot_bytes
         incoming = sorted([(s, d) for s, d in transfers if d // spr == me], key=lambda x: x[1])
         row = {d: i for i, (_, d) in enumerate(incoming)}
         staging = self._staging
-        ops, sends = [], []
+        ops = []
+        out_row = len(incoming)
         # Both sides of a pair post its messages in destination-slot order, so they match.
         for s, d in sorted(transfers, key=lambda x: x[1]):
             src, dst = s // spr, d // spr
             if src == me and dst == me:
                 _pack_slot(layer, s - me * spr, _row(staging, row[d], nbytes))
             elif src == me:
-                buf = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+                buf = _row(staging, out_row, nbytes)
+                out_row += 1
                 _pack_slot(layer, s - me * spr, buf)
-                sends.append(buf)
                 ops.append(dist.P2POp(dist.isend, buf, dst, self._group))
             elif dst == me:
                 ops.append(dist.P2POp(dist.irecv, _row(staging, row[d], nbytes), src, self._group))
@@ -1132,7 +1245,7 @@ class WarmupPlacementController:
             first: Dict[int, int] = {}
             for slot, expert in enumerate(layer.assign):
                 first.setdefault(expert, slot)
-            sums[layer.index] = _slot_checksums(layer)
+            sums[layer.index] = _slot_checksums(layer, self._staging)
             for j, cs in sums[layer.index].items():
                 if first[layer.assign[start + j]] == start + j:
                     local[layer.index, layer.assign[start + j]] = cs
@@ -1151,8 +1264,10 @@ class WarmupPlacementController:
         """Checksum every local slot that received an expert against that expert's checksum."""
         bad = 0
         for layer, slots in zip(self.layers, received):
+            if not slots:
+                continue
             start = self.ep_rank * layer.slots_per_rank
-            for j, cs in _slot_checksums(layer, slots).items():
+            for j, cs in _slot_checksums(layer, self._staging, slots).items():
                 if cs != self._expert_checksums[layer.index, layer.assign[start + j]]:
                     bad += 1
         return bad
@@ -1164,18 +1279,18 @@ def _excess(load: np.ndarray, slot_expert: Sequence[int], slots_per_rank: int) -
     return float((rl.max() - mean) / mean) if mean > 0 else 0.0
 
 
-def _context_rows(req) -> int:
+def _context_rows(req: LlmRequest) -> int:
     from tensorrt_llm._torch.pyexecutor.ced_replay import encoder_replay_tokens
 
     return int(getattr(req, "context_chunk_size", 0) or 0) + encoder_replay_tokens(req)
 
 
-def _generated_tokens(req) -> int:
+def _generated_tokens(req: LlmRequest) -> int:
     """Tokens a generation request has produced so far (its position in the response)."""
     return int(req.max_beam_num_tokens) - int(req.orig_prompt_len)
 
 
-def _moe_and_backend(moe) -> List[object]:
+def _moe_and_backend(moe: torch.nn.Module) -> List[torch.nn.Module]:
     mods = [moe]
     backend = getattr(moe, "backend", None)
     if backend is not None and backend is not moe:
@@ -1183,20 +1298,19 @@ def _moe_and_backend(moe) -> List[object]:
     return mods
 
 
-def _weights_owner(moe):
+def _weights_owner(moe: torch.nn.Module) -> torch.nn.Module:
     backend = getattr(moe, "backend", None)
     return backend if backend is not None else moe
 
 
-def _check_backend(layer: _Layer) -> None:
-    owner = _weights_owner(layer.moe())
-    if hasattr(owner, "on_expert_placement_changed"):
-        return
-    if type(owner).__name__ not in _VERIFIED_BACKENDS:
-        raise RuntimeError(
-            f"{_LOG} backend {type(owner).__name__} may keep expert state this controller cannot "
-            f"update (no on_expert_placement_changed); refusing to migrate"
-        )
+def _follows_placement(layer: _Layer) -> bool:
+    """Whether the layer's backend opts into re-placement by implementing
+    ``on_expert_placement_changed``; another may keep expert state this controller does not move."""
+    return hasattr(_weights_owner(layer.moe()), "on_expert_placement_changed")
+
+
+def _backend_name(layer: _Layer) -> str:
+    return type(_weights_owner(layer.moe())).__name__
 
 
 def _resolve_slot_tensors(layer: _Layer) -> Tuple[List[torch.Tensor], int]:
@@ -1252,24 +1366,48 @@ def _unpack_slot(layer: _Layer, local_slot: int, buf: torch.Tensor) -> None:
         off += dst.numel()
 
 
-def _slot_checksums(layer: _Layer, slots: Optional[Sequence[int]] = None) -> Dict[int, int]:
+def _slot_words(t: torch.Tensor) -> Tuple[int, int]:
+    """(bytes, checksum words) of one slot of ``t``: int32 words, or its bytes when their count is
+    not a multiple of four."""
+    nb = t[0].numel() * t.element_size()
+    return nb, nb // 4 if nb % 4 == 0 else nb
+
+
+def _slot_runs(idx: Sequence[int], limit: int) -> List[Tuple[int, int]]:
+    """[first, end) runs of consecutive sorted slot indices, each at most ``limit`` slots long."""
+    runs: List[Tuple[int, int]] = []
+    for j in idx:
+        if runs and runs[-1][1] == j and j - runs[-1][0] < limit:
+            runs[-1] = (runs[-1][0], j + 1)
+        else:
+            runs.append((j, j + 1))
+    return runs
+
+
+def _slot_checksums(
+    layer: _Layer, scratch: torch.Tensor, slots: Optional[Sequence[int]] = None
+) -> Dict[int, int]:
     """Checksums of local slots (all, or ``slots``): per tensor the int64 sum of the slot's int32
     words plus a strided partial sum, combined over tensors. Detects a slot holding another expert,
-    stale data or a partial copy, in bounded temporaries and one host read per layer."""
+    stale data or a partial copy; works in ``scratch`` (uint8, ``8 * words + bytes`` of a slot at
+    least) and reads the host once per layer."""
     idx = list(range(layer.slots_per_rank)) if slots is None else sorted(set(slots))
     if not idx:
         return {}
     out = torch.zeros(layer.slots_per_rank, dtype=torch.int64, device="cuda")
-    chunk = max(1, (128 << 20) // max(1, layer.slot_bytes))
     for n, t in enumerate(layer.slot_tensors):
-        flat_all = t.reshape(t.shape[0], -1).view(torch.uint8)
-        for c in range(0, len(idx), chunk):
-            sel = torch.tensor(idx[c : c + chunk], device="cuda")
-            flat = flat_all.index_select(0, sel)
-            words = flat.view(torch.int32) if flat.shape[1] % 4 == 0 else flat.to(torch.int32)
-            total = words.sum(dim=1, dtype=torch.int64)
-            part = words[:, ::97].sum(dim=1, dtype=torch.int64)
-            out[sel] = out[sel] * 1000003 + total * 7919 + part + n
+        rows = t.reshape(t.shape[0], -1).view(torch.uint8)
+        nb, nw = _slot_words(t)
+        for a, b in _slot_runs(idx, max(1, scratch.numel() // (8 * nw + nb))):
+            k = b - a
+            # The widened words come first, so the raw bytes after them start 8-byte aligned.
+            wide = scratch[: 8 * k * nw].view(torch.int64).view(k, nw)
+            raw = scratch[8 * k * nw : 8 * k * nw + k * nb].view(k, nb)
+            raw.copy_(rows[a:b])
+            wide.copy_(raw.view(torch.int32) if nb % 4 == 0 else raw)
+            total = wide.sum(dim=1)
+            part = wide[:, ::97].sum(dim=1)
+            out[a:b] = out[a:b] * 1000003 + total * 7919 + part + n
     host = out.cpu().tolist()
     return {j: host[j] for j in idx}
 
@@ -1284,9 +1422,15 @@ def register_controller(controller: WarmupPlacementController) -> None:
 
 
 def on_executor_step(step: int) -> None:
-    """Before every executor forward, on every rank, with the executor's step counter."""
+    """Before every executor forward but warmup's, on every rank, with the executor's step counter."""
     for c in list(_controllers):
         c.on_step(step)
+
+
+def on_executor_restart() -> None:
+    """The executor's step counter restarts from 0 (it rebound its resources)."""
+    for c in list(_controllers):
+        c.reset_schedule()
 
 
 def active() -> bool:
@@ -1294,14 +1438,14 @@ def active() -> bool:
     return any(c.active for c in list(_controllers))
 
 
-def set_live_rows(requests, draft_len: int) -> None:
+def set_live_rows(requests: ScheduledRequests, draft_len: int) -> None:
     """The live-row bounds (and ``min_pos`` row masks) of the next forward for every controller."""
     for c in list(_controllers):
         if c.active:
             c.set_live_rows(requests, draft_len)
 
 
-def real_rows_of(requests, draft_len: int) -> int:
+def real_rows_of(requests: ScheduledRequests, draft_len: int) -> int:
     """Live MoE input rows of a scheduled batch: context chunks and generation tokens (1 +
     ``draft_len``) of the non-dummy requests. Attention-DP dummies and CUDA-graph padding requests
     follow the live ones in the token order."""

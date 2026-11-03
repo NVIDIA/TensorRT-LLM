@@ -335,12 +335,15 @@ def _shared_cache_frontend(cache_dir: str, max_bytes: int, requests, results) ->
     not (_V41_CHECKPOINT / "tokenizer.json").is_file(),
     reason=f"DeepSeek-V4.1 tokenizer not present at {_V41_CHECKPOINT}",
 )
-@pytest.mark.parametrize("max_bytes", [64 << 20, 8192], ids=["large", "evicting"])
-def test_prompt_token_cache_shared_by_processes(tmp_path, max_bytes: int) -> None:
+@pytest.mark.parametrize("cap_blocks", [None, 2], ids=["large", "evicting"])
+def test_prompt_token_cache_shared_by_processes(tmp_path, cap_blocks: int | None) -> None:
     """prompt_token_cache_config: frontend processes sharing one directory give every
     multi-turn prompt the ids of a full encode, reusing turns other processes stored."""
     import multiprocessing
     import random
+
+    # The store counts whole file-system blocks, so the evicting cap is two blocks.
+    max_bytes = 64 << 20 if cap_blocks is None else cap_blocks * os.statvfs(tmp_path).f_frsize
 
     from tensorrt_llm.tokenizer.deepseek_v41 import encode_messages
 
@@ -398,7 +401,7 @@ def test_prompt_token_cache_shared_by_processes(tmp_path, max_bytes: int) -> Non
     assert store.get(b"key") == b"value"
     next((tmp_path / "moved").glob("*.entry")).chmod(0o664)
     assert store.get(b"key") is None
-    if max_bytes > 8192:
+    if cap_blocks is None:
         # Each turn stored its prompt; every later turn reused the previous turn's entry,
         # written by another process, and demoted it.
         assert len(entries) == len(schedule)

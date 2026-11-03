@@ -1128,7 +1128,8 @@ def _uva_device_view(host_tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _host_numa_table(shape: Tuple[int, ...], dtype: torch.dtype) -> Optional[torch.Tensor]:
-    """Prefer host-NUMA VMM, with a registered host mapping if its node is full."""
+    """Prefer host-NUMA VMM, with a registered host mapping if its node is full; None (the
+    default pinned allocator) if VMM is unavailable or fails otherwise."""
     device = torch.cuda.current_device()
     numa_node = host_numa_node(device)
     if numa_node is None:
@@ -1147,6 +1148,9 @@ def _host_numa_table(shape: Tuple[int, ...], dtype: torch.dtype) -> Optional[tor
             "policy. Pages may span NUMA nodes; lookup performance may be lower."
         )
         host = HostRegisteredMem(nbytes, device)
+    except RuntimeError as error:
+        logger.warning(f"Engram: {error}; retrying with the default pinned allocator")
+        return None
     return _host_bytes(host, nbytes).view(dtype).view(shape)
 
 
@@ -1185,11 +1189,14 @@ def _join_off_home(share: NodeShare) -> tuple[list[int], dict] | None:
 
 
 def _shared_table_home_node(own: Optional[int], tp_rank: int, tp_size: int) -> Optional[int]:
-    """Host NUMA node a node-shared table belongs on: the owner's own (``own``) if the split has a
-    shard per GPU, else the ``tp_rank``-th GPU host node (modulo), as workers on several may share it."""
+    """Host NUMA node a node-shared table belongs on: the owner's own (``own``) if the split has one
+    shard, which has nothing to spread, or a shard per GPU, else the ``tp_rank``-th GPU host node
+    (modulo), as workers on several may share it."""
+    if own is None or tp_size == 1:
+        return own
     gpu_nodes = node_gpu_numa_nodes()
     homes = sorted({node for node in gpu_nodes if node >= 0})
-    if own is None or len(homes) < 2 or tp_size >= len(gpu_nodes):
+    if len(homes) < 2 or tp_size >= len(gpu_nodes):
         return own
     return homes[tp_rank % len(homes)]
 
@@ -1200,7 +1207,7 @@ def _shareable_host_mem(nbytes: int, device: int) -> Union[HostNumaMem, HostRegi
     if numa_node is not None:
         try:
             return host_numa_mem(nbytes, device, numa_node, shareable=True)
-        except HostNumaOutOfMemoryError as error:
+        except (HostNumaOutOfMemoryError, RuntimeError) as error:
             logger.warning(
                 f"Engram: {error}; sharing CUDA-registered host memory under the process NUMA "
                 "policy instead. Pages may span NUMA nodes; lookup performance may be lower."
@@ -1749,9 +1756,10 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         """Map the node's copy of this table, or allocate, serve and fill it if this process is
         elected its owner; False, after one warning, if this process must load a private copy.
 
-        The owner serves the memory before it fills it, and importers wait for it only in
-        ``post_load_weights``: a rank of a multi-rank worker never waits on another worker's table
-        while its own peers may still need it in a collective of the weight load.
+        The owner serves the memory before it fills it, so in ``load_weights`` an importer waits
+        only for an owner to be elected and to allocate, and for the content in
+        ``post_load_weights``: a rank of a multi-rank worker never waits on another worker's
+        weight load while its own peers may still need it in a collective of the weight load.
         """
         share = NodeShare(self._share_name)
         device = torch.cuda.current_device()
@@ -1806,28 +1814,36 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
     def wait_shared_ready(self) -> None:
         """Importer of a node-shared table: wait until its owner marks the table ready and check
         it against this process's checkpoint; elect again if the owner left first, and load a
-        private copy if the rows differ or this process cannot share."""
+        private copy if the rows differ, the owner is too late or this process cannot share."""
         while self._share_source is not None:
             weights, self._share_source = self._share_source, None
-            if self._share.wait_ready():
-                if self._rows_match((self.weight.data, self.scale.data), weights):
-                    logger.info(
-                        f"Engram: mapped node-shared table ({self._share_spec}); "
-                        "checkpoint rows match"
-                    )
-                    return
+            try:
+                ready = self._share.wait_ready()
+            except TimeoutError as error:
                 logger.warning(
-                    f"Engram: cannot share table ({self._share_spec}): its rows differ from this "
-                    "process's checkpoint; loading a private copy"
+                    f"Engram: cannot share table ({self._share_spec}): {error}; loading a private "
+                    "copy"
                 )
             else:
-                logger.info(
-                    f"Engram: the owner of node-shared table ({self._share_spec}) left before "
-                    "filling it; electing again"
-                )
-                self._release_shared()
-                if self._load_node_shared(weights):
-                    continue
+                if ready:
+                    if self._rows_match((self.weight.data, self.scale.data), weights):
+                        logger.info(
+                            f"Engram: mapped node-shared table ({self._share_spec}); "
+                            "checkpoint rows match"
+                        )
+                        return
+                    logger.warning(
+                        f"Engram: cannot share table ({self._share_spec}): its rows differ from "
+                        "this process's checkpoint; loading a private copy"
+                    )
+                else:
+                    logger.info(
+                        f"Engram: the owner of node-shared table ({self._share_spec}) left before "
+                        "filling it; electing again"
+                    )
+                    self._release_shared()
+                    if self._load_node_shared(weights):
+                        continue
             self._release_shared()
             self._materialize_pinned()
             self._load_rows(weights)

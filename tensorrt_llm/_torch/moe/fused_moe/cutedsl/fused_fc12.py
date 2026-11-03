@@ -55,7 +55,7 @@ from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
-from ..routing import BaseMoeRoutingMethod
+from ..routing import BaseMoeRoutingMethod, DeepSeekV4MoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
 from .kernel_inputs import (
     NvFp4WeightView,
@@ -381,6 +381,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             # The inner kernel cache keys on the epilogue; the outer AutoTuner
             # unique_id must too, or SwiGLU and SiTU layers share a tactic.
             workload_identity=self._epilogue_identity(),
+            # The spread tuning profile is measured on DeepSeek-V4 only.
+            spread_tuning_tokens=isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod),
         )
         inputs = [x, token_selected_experts, token_final_scales, x_sf, moe_output, weight_view]
         _, best_tactic = tuner.choose_one(

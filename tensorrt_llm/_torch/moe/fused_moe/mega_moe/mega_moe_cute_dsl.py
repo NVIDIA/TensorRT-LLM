@@ -144,6 +144,13 @@ __all__ = [
 _DEEPSEEK_V4_ARCHITECTURES = ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
 
 
+def _warn_shared_expert_fusion_ignored(reason: str) -> None:
+    logger.warning_once(
+        f"moe_config.megamoe_fuse_shared_expert is ignored: {reason}",
+        key="megamoe_fuse_shared_expert_ignored",
+    )
+
+
 class MegaMoeCuteDslUnavailable(RuntimeError):
     """Raised when the active environment cannot import the symbols required by
     the active MegaMoE kernel (cu13 Cutlass DSL + cute_nvgpu MMA
@@ -682,14 +689,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
 
         # The FP8 shared expert runs inside the fused kernel once fuse_shared_expert succeeds.
-        self.num_fused_shared_expert = (
-            type(self).fused_shared_expert_count(model_config)
-            if combine_format == "bf16"
+        self.num_fused_shared_expert = type(self).fused_shared_expert_count(model_config)
+        if self.num_fused_shared_expert and not (
+            combine_format == "bf16"
             and self.activation_type is ActivationType.Swiglu
             and self.act_alpha is None
             and self.act_beta is None
-            else 0
-        )
+        ):
+            _warn_shared_expert_fusion_ignored("needs the bf16 combine and a plain SwiGLU")
+            self.num_fused_shared_expert = 0
         self._shared_expert: Optional[dict] = None
         # (launch bucket, live tokens) of the last MXFP8 quantization of the shared expert's input.
         self._shared_quantized: Optional[Tuple[int, int]] = None
@@ -726,8 +734,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
         self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
         # Expert -> slot table of a static placement (built in create_weights), with copies a
-        # ``replica_slot_table``.
+        # ``replica_slot_table``, and its slot -> expert assignments.
         self._slot_of_expert: Optional[torch.Tensor] = None
+        self._expert_of_slot: Optional[torch.Tensor] = None
         self._replicated = False
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
@@ -945,15 +954,32 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             return 0
         # Only DeepseekV4MoE hands its shared expert over and keeps it when the fusion is refused.
         architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
-        if not any(architecture in _DEEPSEEK_V4_ARCHITECTURES for architecture in architectures):
-            return 0
-        if get_sm_version() not in (100, 103):
-            return 0
         mapping = model_config.mapping
-        if not mapping.enable_attention_dp or mapping.moe_tp_size != 1:
-            return 0
         n_shared_experts = getattr(model_config.pretrained_config, "n_shared_experts", 0) or 0
-        return 1 if n_shared_experts == 1 else 0
+        if not any(architecture in _DEEPSEEK_V4_ARCHITECTURES for architecture in architectures):
+            reason = "not a DeepSeek-V4 model"
+        elif get_sm_version() not in (100, 103):
+            reason = "needs SM100/SM103"
+        elif not mapping.enable_attention_dp or mapping.moe_tp_size != 1:
+            reason = "needs attention DP with moe_tensor_parallel_size 1"
+        elif n_shared_experts != 1:
+            reason = "needs exactly one shared expert"
+        else:
+            return 1
+        _warn_shared_expert_fusion_ignored(reason)
+        return 0
+
+    def can_fuse_shared_expert(self, shared_experts) -> bool:
+        """Whether ``fuse_shared_expert`` would take over this MLP (builds and drops its weights)."""
+        return (
+            self.num_fused_shared_expert > 0
+            and self._shared_expert is None
+            and build_shared_expert_weights(shared_experts, self.hidden_size) is not None
+        )
+
+    def decline_shared_expert(self) -> None:
+        """Keep the shared expert separate: ``fuse_shared_expert`` refuses it from now on."""
+        self.num_fused_shared_expert = 0
 
     def fuse_shared_expert(self, shared_experts) -> bool:
         """Take over a gated FP8 block-scale MLP; returns whether the fused kernel now runs it."""
@@ -1084,6 +1110,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self.quant_method.create_weights(self)
         # A static one-copy placement is applied by the routing launch, which writes slots.
         self._slot_of_expert = self._make_slot_table()
+        if self._slot_of_expert is not None:
+            with torch.inference_mode(False):
+                self._expert_of_slot = torch.tensor(
+                    list(self.initial_global_assignments),
+                    dtype=torch.int32,
+                    device=self._slot_of_expert.device,
+                )
         # Step 4.
         self._weights_created = True
 
@@ -1280,6 +1313,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         weights and the balancer's table, with the device idle."""
         with torch.inference_mode():
             self._slot_of_expert.copy_(self._routing_table(global_assignments))
+            self._expert_of_slot.copy_(torch.tensor(global_assignments, dtype=torch.int32))
+
+    def slots_of_experts(self, expert_ids: torch.Tensor) -> torch.Tensor:
+        """The slots the static placement routes ``expert_ids`` [rows, top_k] to, as the launch does."""
+        if self._replicated:
+            return _replica_slots(self._slot_of_expert, expert_ids, int(self.num_experts))
+        return torch.index_select(self._slot_of_expert, 0, expert_ids.reshape(-1)).view(
+            expert_ids.shape
+        )
+
+    def experts_of_slots(self, slot_ids: torch.Tensor) -> torch.Tensor:
+        """The experts the static placement holds in ``slot_ids``."""
+        return torch.index_select(self._expert_of_slot, 0, slot_ids.reshape(-1)).view(
+            slot_ids.shape
+        )
 
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
         """Bundle the MegaMoE-format weight tensors registered by the
@@ -2181,14 +2229,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         if replica_plan is None and (topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()):
             topk_idx = topk_idx.to(torch.int32).contiguous()
-        slot_of_expert = self._slot_of_expert
-        if slot_of_expert is not None and not inputs_staged:
-            if self._replicated:
-                topk_idx = _replica_slots(slot_of_expert, topk_idx, int(self.num_experts))
-            else:
-                topk_idx = torch.index_select(slot_of_expert, 0, topk_idx.reshape(-1)).view(
-                    topk_idx.shape
-                )
+        if self._slot_of_expert is not None and not inputs_staged:
+            topk_idx = self.slots_of_experts(topk_idx)
         use_direct_inputs = (
             not inputs_staged
             and self.ep_size > 1

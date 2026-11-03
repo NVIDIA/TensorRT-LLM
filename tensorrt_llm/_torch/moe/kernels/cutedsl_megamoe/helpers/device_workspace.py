@@ -197,14 +197,16 @@ class DeviceWorkspace:
                     self._tail_leading[buffer_space] = cursor
             self._total[buffer_space] = round_up(cursor, 16)
         if self._tail_parity:
-            # Second copy of the shared tail-reset block right after the first one; everything else moves up.
+            # Second copy of the shared tail-reset block right after the first one; everything else moves up, by a
+            # multiple of the largest alignment it declares.
             block = self._tail_leading["shared"]
             if block > 0:
-                for region in self._registered["shared"]:
-                    if region.reset != "tail_reset":
-                        self._offset[region.name] += block
-                self._zero_leading["shared"] += block
-                self._total["shared"] += block
+                moved = [region for region in self._registered["shared"] if region.reset != "tail_reset"]
+                shift = round_up(block, max((region.byte_alignment for region in moved), default=16))
+                for region in moved:
+                    self._offset[region.name] += shift
+                self._zero_leading["shared"] += shift
+                self._total["shared"] += shift
         self._finalized = True
 
     def regions(self, buffer_space: BufferSpace) -> Tuple[DeviceRegion, ...]:

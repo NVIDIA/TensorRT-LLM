@@ -4,6 +4,7 @@
 # Multi-Head Hyper-Connection (mHC) module
 # Based on: "Hyper-Connections" (https://arxiv.org/abs/2409.19606)
 import functools
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -287,6 +288,9 @@ class mHC(nn.Module):
         like ``mhc_fused_hc``; see ``mhc_boundary.mhc_boundary`` for ``mxfp8``.
         """
         if self._boundary_weight is None or norm_weight is None:
+            return None
+        # FORCE_DETERMINISTIC keeps every boundary size on mhc_fused_hc's pinned tactic.
+        if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
             return None
         kernel = _boundary_kernel(residual.device, self.hidden_size)
         tokens = residual.shape[0]

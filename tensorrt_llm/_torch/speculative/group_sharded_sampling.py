@@ -45,6 +45,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..distributed.peer_buffers import PeerBuffers, PeerTransport
 from ..pyexecutor.sampler.ops.vanilla import GREEDY_TEMPERATURE_THRESHOLD
+from .sharded_sampling import prefer_argmax
 
 # Logit columns per chunk of a row's slice, and int32 words per program of the row push.
 _BLOCK = 4096
@@ -52,16 +53,6 @@ _PUSH_WORDS = 4096
 _NO_INDEX = 2147483647
 # Keys of a chunk's argmax: column of a NaN, column + _FIRST_MAX of a maximum.
 _FIRST_MAX = tl.constexpr(1 << 29)
-
-
-@triton.jit
-def _prefer_argmax(a, a_index, b, b_index):
-    """``torch.argmax`` order: NaN first, then the larger value, ties to the smaller index."""
-    a_nan = a != a
-    b_nan = b != b
-    prefer_a = (a_nan & ~b_nan) | (a_nan & b_nan & (a_index < b_index))
-    prefer_a = prefer_a | (~a_nan & ~b_nan & ((a > b) | ((a == b) & (a_index < b_index))))
-    return tl.where(prefer_a, a, b), tl.where(prefer_a, a_index, b_index)
 
 
 @triton.jit
@@ -247,7 +238,7 @@ def _slice_stats_kernel(
             word0 = top.to(tl.int32, bitcast=True)
             word1 = mass.to(tl.int32, bitcast=True)
         else:
-            best, idx = tl.reduce((pa, tl.where(live, pb, NO_INDEX)), 0, _prefer_argmax)
+            best, idx = tl.reduce((pa, tl.where(live, pb, NO_INDEX)), 0, prefer_argmax)
             word0 = best.to(tl.int32, bitcast=True)
             word1 = idx
         tag = (tl.load(calls_ptr) & 0x7FFFFFFF) << 32
@@ -361,7 +352,7 @@ def _select_kernel(
     else:
         if owner == rank:
             values = lo0.to(tl.float32, bitcast=True)
-            _, token = tl.reduce((values, lo1), 0, _prefer_argmax)
+            _, token = tl.reduce((values, lo1), 0, prefer_argmax)
             tl.store(out_ptr + own_row, token.to(tl.int64))
 
 

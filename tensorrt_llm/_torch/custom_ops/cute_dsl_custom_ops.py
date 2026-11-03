@@ -6932,7 +6932,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      large_occupancy,
                      overflow_policy,
                      cache_smem_values=False,
-                     max_row_len=0):
+                     max_row_len=0,
+                     wide_fp32_rows=False):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
@@ -6945,6 +6946,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 overflow_policy,
                 cache_smem_values,
                 max_row_len,
+                wide_fp32_rows,
             )
             if key in cls.kernel_cache:
                 return
@@ -6997,6 +6999,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 overflow_policy=overflow_policy,
                 cache_smem_values=cache_smem_values,
                 max_row_len=max_row_len,
+                wide_fp32_rows=wide_fp32_rows,
             )
             compiled_kernel = cute.compile(
                 filtered_topk_func,
@@ -7025,9 +7028,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             output_indices: Optional[torch.Tensor] = None,
             cache_smem_values: bool = False,
             max_row_len: int = 0,
+            wide_fp32_rows: bool = False,
         ):
             """Execute filtered top-k selection on input logits; rows longer than a nonzero ``max_row_len`` are
-            left untouched."""
+            left untouched. ``wide_fp32_rows`` opts into the wide FP32-row kernel configuration."""
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
             num_rows, num_cols = input_values.shape
@@ -7047,6 +7051,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 overflow_policy,
                 cache_smem_values,
                 max_row_len,
+                wide_fp32_rows,
             )
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
@@ -8450,6 +8455,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
         radix_filter_single_pass_multi_cta: bool = True,
+        wide_fp32_rows: bool = False,
+        split_long_rows: bool = False,
     ) -> None:
         """Unified CuTE DSL decode Top-K. Writes results directly into the
         pre-allocated ``output_indices`` buffer.
@@ -8520,6 +8527,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             radix_filter_single_pass_multi_cta: Mode-1 (default True) -- the
                 adaptive best-performance path; see the mode list above. Set
                 False to select mode 2 or 3.
+            wide_fp32_rows: Caller opt-in for the single-CTA kernel's wide
+                FP32-row configuration (rows of at least 32K columns: a key
+                cache, and 1024 threads x 2 CTAs/SM above one SM wave).
+            split_long_rows: Caller opt-in for mode 1 with REREAD: when more
+                rows than SMs put the buffer on a 2-CTA cluster, only rows with
+                at least 256K valid columns take it; shorter rows take a second,
+                single-CTA launch.
         """
         # Validate inputs
         if top_k <= 0 or top_k > 16384:
@@ -8569,12 +8583,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 cluster_size = _R.auto_cluster_size_truncate(
                     num_tokens, num_rows, _is_fp32)
-            # The cluster size above follows the buffer width. With more rows
-            # than SMs, rows shorter than the cluster threshold instead take the
-            # single-CTA kernel at its higher occupancy, as in a buffer of their
-            # own width: two launches, each skipping the other's rows.
+            # The cluster size above follows the buffer width. With
+            # split_long_rows and more rows than SMs, rows shorter than the
+            # cluster threshold instead take the single-CTA kernel at its higher
+            # occupancy, as in a buffer of their own width: two launches, each
+            # skipping the other's rows.
             split_len = 0
-            if (cluster_size >= 2 and overflow_policy == "REREAD"
+            if (split_long_rows and cluster_size >= 2
+                    and overflow_policy == "REREAD"
                     and num_rows > _get_num_sms()):
                 split_len = _RADIX_LARGE_BATCH_CLUSTER_MIN_COLS - 1
             if split_len:
@@ -8589,6 +8605,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output_indices=output_indices,
                     cache_smem_values=cache_smem_values,
                     max_row_len=split_len,
+                    wide_fp32_rows=wide_fp32_rows,
                 )
             if cluster_size >= 2:
                 CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
@@ -8615,6 +8632,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     overflow_policy=overflow_policy,
                     output_indices=output_indices,
                     cache_smem_values=cache_smem_values,
+                    wide_fp32_rows=wide_fp32_rows,
                 )
         elif single_pass_multi_cta:
             # --- heuristic for single-CTA vs single-pass multi-CTA ---
@@ -8699,6 +8717,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     overflow_policy=overflow_policy,
                     output_indices=output_indices,
                     cache_smem_values=cache_smem_values,
+                    wide_fp32_rows=wide_fp32_rows,
                 )
         else:
             # --- 2-pass multi-CTA dispatch ---
@@ -8746,6 +8765,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     overflow_policy=overflow_policy,
                     output_indices=output_indices,
                     cache_smem_values=cache_smem_values,
+                    wide_fp32_rows=wide_fp32_rows,
                 )
 
     @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
@@ -8762,6 +8782,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
         radix_filter_single_pass_multi_cta: bool = True,
+        wide_fp32_rows: bool = False,
+        split_long_rows: bool = False,
     ) -> None:
         return None
 
