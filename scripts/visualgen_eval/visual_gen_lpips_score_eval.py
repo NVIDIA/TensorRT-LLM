@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import os
 import pathlib
@@ -68,9 +69,22 @@ import torch
 import yaml
 from PIL import Image
 
-from tensorrt_llm.evaluate.visual_gen.lpips import make_lpips_model as _make_lpips_model
-from tensorrt_llm.evaluate.visual_gen.lpips import score_images as _score_images
-from tensorrt_llm.evaluate.visual_gen.lpips import score_video_files as _score_video_files
+# Load the shared scorer without importing tensorrt_llm.__init__: scoring
+# existing media must also work in environments without the native runtime.
+_scoring_path = (
+    pathlib.Path(__file__).resolve().parents[2] / "tensorrt_llm/evaluate/visual_gen/lpips.py"
+)
+_scoring_spec = importlib.util.spec_from_file_location("_visual_gen_lpips_scoring", _scoring_path)
+_scoring = importlib.util.module_from_spec(_scoring_spec)
+_scoring_spec.loader.exec_module(_scoring)
+
+_make_lpips_model = _scoring.make_lpips_model
+_score_images = _scoring.score_images
+_score_video_files = _scoring.score_video_files
+_to_lpips_tensor = _scoring._to_lpips_tensor
+_decode_video_to_lpips_batch = _scoring._decode_video_to_lpips_batch
+_validate_paired_video_shapes = _scoring._validate_paired_video_shapes
+
 
 MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "flux1": ("FLUX.1-dev", "black-forest-labs/FLUX.1-dev"),
