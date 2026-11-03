@@ -610,7 +610,9 @@ class KimiK3MLAAttention(MLA):
         the moment the all-to-all is enqueued, on the SMs the exchange leaves
         idle; it only depends on the module input.
         """
-        if not (attn_metadata.num_generations > 0 and self._gate_on_aux_stream()):
+        if attn_metadata is None or not (
+            attn_metadata.num_generations > 0 and self._gate_on_aux_stream()
+        ):
             return self._gate(hidden_states)
         return self._join_gate(self._fork_gate(hidden_states, self.helix_exchange_event))
 
