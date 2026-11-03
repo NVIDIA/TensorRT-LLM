@@ -782,6 +782,150 @@ def test_gvr_v2_prefill_routes_to_selfsampling_runner(monkeypatch) -> None:
     assert kwargs == {}
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_gvr_v2_prefill_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
+    """Aligned FP32, BF16 and FP16 prefill scores reach the self-sampling runner as the caller's
+    tensor, without a copy or a cast."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(8, prefill_implementation=TopKImplementation.CUTE_DSL_GVR)
+    # the row stride must be a multiple of 16 bytes; the logical width may be odd
+    scores = (
+        torch.randn(3, 16, dtype=dtype)[:, :13] if padded_rows else torch.randn(3, 16, dtype=dtype)
+    )
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores, out_width=8)
+
+    runner.assert_called_once()
+    args, kwargs = runner.call_args
+    assert args[0] is scores and args[1] is row_starts and args[2] is row_ends
+    assert args[3] is output
+    assert kwargs == {}
+    radix.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["aligned", "row_stride", "inner_stride", "base"])
+def test_gvr_v2_prefill_deterministic_16bit_widens_to_fp32(monkeypatch, layout, dtype) -> None:
+    """Deterministic prefill widens 16-bit scores, aligned or not, to an aligned FP32 copy for
+    the FP32-only deterministic engine and forwards the deterministic options."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    top_k = TopK(
+        2,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_deterministic=True,
+        gvr_sorting="ascending",
+    )
+    if layout == "aligned":
+        scores = torch.randn(3, 16, dtype=dtype)[:, :13]
+    elif layout == "row_stride":
+        scores = torch.randn(3, 12, dtype=dtype)
+    elif layout == "inner_stride":
+        scores = torch.randn(3, 32, dtype=dtype)[:, ::2]
+    else:
+        scores = torch.randn(3, 16, dtype=dtype)[:, 1:13]
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores)
+
+    radix.assert_not_called()
+    args, kwargs = runner.call_args
+    widened = args[0]
+    assert widened.dtype == torch.float32
+    assert widened.shape == scores.shape
+    assert widened.stride(1) == 1 and widened.stride(0) % 4 == 0
+    assert widened.data_ptr() % 16 == 0
+    assert torch.equal(widened, scores.float())
+    assert args[1] is row_starts and args[2] is row_ends and args[3] is output
+    assert kwargs == {"deterministic": True, "sorting": "ascending"}
+
+
+def test_gvr_v2_prefill_deterministic_16bit_capture_checks_fp32_engine(monkeypatch) -> None:
+    """Under capture, the readiness check of a deterministic 16-bit prefill looks up the FP32
+    engine that runs the widened scores (the one warmup compiles)."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+    monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    top_k = TopK(2, prefill_implementation=TopKImplementation.CUTE_DSL_GVR, gvr_deterministic=True)
+
+    _, _, output = _prefill_call(top_k, torch.randn(3, 8, dtype=torch.bfloat16))
+
+    (ready_scores, ready_output), ready_kwargs = fake.selfsampling_topk_prefill_ready.call_args
+    assert ready_scores.dtype == torch.float32 and ready_output is output
+    assert ready_kwargs == {"deterministic": True}
+    assert runner.call_args.args[0] is ready_scores
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "row_stride",
+        "inner_stride",
+        "base",
+        "short_rows",
+        "small_k",
+        "temporal",
+        "capture_uncompiled",
+    ],
+)
+def test_gvr_v2_prefill_16bit_radix_fallbacks_widen_to_fp32(monkeypatch, reason, dtype) -> None:
+    """16-bit prefill scores that do not run the engine (a layout that breaks the 16-byte loads,
+    rows no wider than K, K < 8, temporal GVR, an engine not compiled under capture) take the
+    CUDA radix prefill, which reads an exact FP32 copy."""
+    runner = _install_fake_prefill_runner(monkeypatch)
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    if reason == "capture_uncompiled":
+        fake = sys.modules["tensorrt_llm._torch.kernels.blackwell.top_k"]
+        fake.selfsampling_topk_prefill_ready = Mock(return_value=False)
+        monkeypatch.setattr(TopK, "_prefill_capturing", staticmethod(lambda scores: True))
+    k = 4 if reason == "small_k" else 8
+    top_k = TopK(
+        k,
+        prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
+        gvr_self_sampling=reason != "temporal",
+    )
+    if reason == "row_stride":
+        scores = torch.randn(2, 12, dtype=dtype)
+    elif reason == "inner_stride":
+        scores = torch.randn(2, 32, dtype=dtype)[:, ::2]
+    elif reason == "base":
+        scores = torch.randn(2, 32, dtype=dtype)[:, 1:17]
+    elif reason == "short_rows":
+        scores = torch.randn(2, 8, dtype=dtype)
+    else:
+        scores = torch.randn(2, 16, dtype=dtype)
+
+    row_starts, row_ends, output = _prefill_call(top_k, scores, out_width=k)
+
+    runner.assert_not_called()
+    radix.assert_called_once()
+    widened, *rest = radix.call_args.args
+    assert widened.dtype == torch.float32 and torch.equal(widened, scores.float())
+    assert rest[0] is row_starts and rest[1] is row_ends and rest[2] is output and rest[3] == k
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_cuda_radix_prefill_reads_fp32_scores(monkeypatch, dtype) -> None:
+    """The CUDA radix prefill kernel reads FP32 only: FP32 scores pass through, 16-bit scores
+    arrive as an exact FP32 copy."""
+    radix = Mock()
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_prefill", radix)
+    scores = torch.randn(3, 8, dtype=dtype)
+
+    _prefill_call(TopK(2), scores)
+
+    passed = radix.call_args.args[0]
+    if dtype == torch.float32:
+        assert passed is scores
+    else:
+        assert passed.dtype == torch.float32 and torch.equal(passed, scores.float())
+
+
 def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
     runner = _install_fake_prefill_runner(monkeypatch)
     radix = Mock()
@@ -791,7 +935,7 @@ def test_gvr_v2_prefill_format_gate_falls_back_to_radix(monkeypatch) -> None:
         prefill_implementation=TopKImplementation.CUTE_DSL_GVR,
         compress_ratio=4,
     )
-    scores = torch.randn(3, 8, dtype=torch.bfloat16)  # dtype gate miss
+    scores = torch.randn(3, 8, dtype=torch.float64)  # dtype gate miss
     row_starts, row_ends, output = _prefill_call(top_k, scores)
 
     runner.assert_not_called()

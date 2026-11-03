@@ -1914,12 +1914,13 @@ def test_prefill_packed_misaligned_ks(top_k, lead, dtype):
 
 
 @_PREFILL_DTYPES
+@pytest.mark.parametrize("rows", [4, 300], ids=lambda r: f"r{r}")
 @pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
-def test_prefill_short_rows(top_k, dtype):
-    """nv in {0, 1, k-1, k, k+1}: identity 0..nv-1 + trailing -1 (radix short
-    contract); nv==0 (ks==ke) -> all -1."""
-    for nv in (0, 1, top_k - 1, top_k, top_k + 1):
-        rows = 4
+def test_prefill_short_rows(top_k, rows, dtype):
+    """nv in {0, 1, k-1, k, k+1..k+3}: identity 0..nv-1 + trailing -1 (radix short
+    contract) up to nv == k; nv==0 (ks==ke) -> all -1. 300 rows run the BLK=256
+    engine (16-bit: v16 staging)."""
+    for nv in (0, 1, top_k - 1, top_k, top_k + 1, top_k + 2, top_k + 3):
         ncols = max(nv, 1) + 8
         ks = [0] * rows
         ke = [nv] * rows
@@ -1933,13 +1934,14 @@ def test_prefill_short_rows(top_k, dtype):
 
 
 @_PREFILL_DTYPES
+@pytest.mark.parametrize("rows", [16, 300], ids=lambda r: f"r{r}")
 @pytest.mark.parametrize("dist", ["equal", "twoval", "subnormal", "zero_band"], ids=lambda d: d)
 @pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
-def test_prefill_ties_degenerate(top_k, dist, dtype):
+def test_prefill_ties_degenerate(top_k, dist, rows, dtype):
     """All-equal (whole tie class) and two-valued (massive ties) rows drive the
     degenerate A/B narrowing paths; the fp16 subnormal and zero bands put the
-    K-th among tiny codes (plain small normals in fp32/bf16); tie-aware acceptance."""
-    rows = 16
+    K-th among tiny codes (plain small normals in fp32/bf16); tie-aware acceptance.
+    300 rows run the BLK=256 engine (16-bit: v16 staging)."""
     n = 4096
     ks = [0] * rows
     ke = [n] * rows
@@ -1958,16 +1960,17 @@ def test_prefill_ties_degenerate(top_k, dist, dtype):
     + [(dtype, lead) for dtype in (torch.bfloat16, torch.float16) for lead in (1, 3, 5, 7)],
     ids=lambda v: f"lead{v}" if isinstance(v, int) else _DTYPE_IDS[v],
 )
+@pytest.mark.parametrize("rows", [5, 300], ids=lambda r: f"r{r}")
 @pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
-def test_prefill_neginf_tie_class(top_k, lead, dtype):
+def test_prefill_neginf_tie_class(top_k, rows, lead, dtype):
     """nv > k with fewer than k finite values -> the k-th boundary is in the
     -inf tie class (degen B), crossed with misaligned lead. A -inf-valued mask
-    would be emitted here as a negative index (== -lead); assert none leaks."""
+    would be emitted here as a negative index (== -lead); assert none leaks.
+    300 rows run the BLK=256 engine (16-bit: v16 staging)."""
     n_finite = top_k - 100
     nv = top_k + 400
     ks1 = ((37 + 7) // 8) * 8 + lead
     ncols = ks1 + nv
-    rows = 5
     gen = torch.Generator(device=_DEV).manual_seed(top_k * 10 + lead)
     stride = ((ncols + 256 + 255) // 256) * 256
     full = torch.full((rows, stride), float("-inf"), dtype=torch.float32, device=_DEV)
@@ -2019,6 +2022,25 @@ def test_prefill_slab_over_gridy_limit():
     _check_prefill_exact(lg[idx], out[idx].contiguous(), rs[idx], re[idx], k)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=lambda d: _DTYPE_IDS[d])
+def test_prefill_16bit_slab_tail_on_another_tier(dtype):
+    """A 16-bit call of 32768 + 200 rows runs a BLK=256 v16 slab and a 200-row BLK=512
+    tail slab; rows of both slabs are exact."""
+    k = 512
+    rows = 32768 + 200
+    n = 2048
+    assert ss_host._prefill_tier(32768, n, k) == 2 and ss_host._prefill_tier(200, n, k) == 1
+    stride = ((n + 256 + 255) // 256) * 256
+    lg = torch.randn((rows, stride), dtype=torch.float32, device=_DEV).to(dtype)[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    re = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_prefill(lg, rs, re, out)
+    torch.cuda.synchronize()
+    idx = torch.tensor([0, 1, 32767, 32768, 32900, rows - 1], device=_DEV)
+    _check_prefill_exact(lg[idx], out[idx].contiguous(), rs[idx], re[idx], k)
+
+
 def test_prefill_engine_key_distinct_from_decode():
     """The prefill compile shares the DSv3.2 decode varlen tuple (next_n=1,
     cr_shift=0) but has a distinct prologue, so the compile keys must differ."""
@@ -2059,6 +2081,12 @@ def test_prefill_guards():
         ss_host.run_prefill(lg16, rs, re, out16)
         torch.cuda.synchronize()
         _check_prefill_exact(lg16, out16, rs, re, k)
+        # 16-bit prefill needs K >= 8: a shorter window would run entirely in the tail loop,
+        # which does not mask the lanes before a misaligned window start
+        with pytest.raises(RuntimeError, match="index_topk >= 8"):
+            ss_host.run_prefill(
+                lg16, rs, re, torch.full((3, 4), -7, dtype=torch.int32, device=_DEV)
+            )
     with pytest.raises(RuntimeError, match="row_starts"):
         ss_host.run_prefill(lg, rs.to(torch.int64), re, out)
     with pytest.raises(RuntimeError, match="row_starts/row_ends length"):
@@ -2118,21 +2146,28 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
     # per bucket where a <= 148-row launch keeps the BLK=1024 plan at either
     # bucket edge, plus the bucket-free tier-1 and tier-2 keys — and nothing else
     # (buckets <= k belong to identity-only launches other tests make directly;
-    # production never requests them: scores.shape[1] <= top_k takes the radix path)
+    # production never requests them: scores.shape[1] <= top_k takes the radix path).
+    # Every row stride here fits 16-bit indices, so the 16-bit tier-2 key is the v16 one.
     lo = ss_host._prefill_bucket(k + 1)
-    want = {ss_host._prefill_cache_key(1, k, 0, tag), ss_host._prefill_cache_key(2, k, 0, tag)}
+    want = {
+        ss_host._prefill_cache_key(1, k, 0, tag),
+        ss_host._prefill_cache_key(2, k, 0, tag, v16=dtype is not torch.float32),
+    }
     bk = lo
     while bk <= 32768:
         for n_env in (bk // 2 + 1, bk):
             if ss_host._prefill_tier(1, n_env, k) == 0:
                 want.add(ss_host._prefill_cache_key(0, k, bk, tag))
         bk <<= 1
-    # deterministic prefill keys carry a fifth element; an earlier deterministic
-    # test in the same process must not enter the comparison
+    # deterministic prefill keys carry a fifth element (True); an earlier
+    # deterministic test in the same process must not enter the comparison
     have = {
         kk
         for kk in ss_host._PREFILL_CACHE
-        if len(kk) == 4 and kk[1] == k and kk[3] == tag and (kk[0] != 0 or kk[2] >= lo)
+        if (len(kk) == 4 or kk[4] == "v16")
+        and kk[1] == k
+        and kk[3] == tag
+        and (kk[0] != 0 or kk[2] >= lo)
     }
     assert have == want, (have, want)
     # the capture-time readiness query agrees with the cache: warmed shape
@@ -2141,18 +2176,56 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
     assert not ss_host.prefill_ready(lg[:1], torch.empty((1, 4), dtype=torch.int32, device=_DEV))
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=lambda d: _DTYPE_IDS[d])
+def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
+    """16-bit launches of more than 296 rows (the BLK=256 tier-2 engine) stage code16|idx16
+    words when the row stride fits 16-bit indices and keep the 32-bit staging above 65536.
+    Warmup with an envelope whose rows can have a wider stride (65400 columns) compiles both
+    engines; each launch below then looks up exactly the engine of its row stride and compiles
+    nothing. Windows mix short and long rows, and the wide case selects past column 65535."""
+    k = 1024  # leaves test_prefill_warmup_idempotent_and_no_rejit's k=512 key set intact
+    rows = 300
+    tag = _DTYPE_IDS[dtype]
+    ss_host.warmup_prefill(k, 65400, num_rows_list=(297,), dtype=dtype)
+    for v16 in (True, False):
+        assert ss_host._prefill_cache_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
+    looked = []
+
+    class _Recording(dict):
+        def get(self, key, default=None):
+            looked.append(key)
+            return super().get(key, default)
+
+    monkeypatch.setattr(ss_host, "_PREFILL_CACHE", _Recording(ss_host._PREFILL_CACHE))
+    for ncols in (8192, 70000):
+        ks = [0] * rows
+        ke = [(r * 977) % ncols + 1 for r in range(rows)]
+        ke[-1] = ncols
+        lg, rs, re = _make_prefill_case(rows, ncols, ks, ke, top_k=k, seed=ncols, dtype=dtype)
+        assert (lg.stride(0) <= 65536) == (ncols == 8192)
+        out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
+        assert ss_host.prefill_ready(lg, out)
+        looked.clear()
+        ss_host.run_prefill(lg, rs, re, out)
+        # one lookup and no launcher build: the warmed engine of this row stride ran
+        assert looked == [ss_host._prefill_cache_key(2, k, 0, tag, v16=ncols == 8192)], looked
+        torch.cuda.synchronize()
+        _check_prefill_exact(lg, out, rs, re, k)
+
+
 @_PREFILL_DTYPES
-def test_prefill_capture_no_host_sync(dtype):
+@pytest.mark.parametrize("rows", [64, 300], ids=lambda r: f"r{r}")
+def test_prefill_capture_no_host_sync(rows, dtype):
     """After warmup, a run_prefill call captures under a CUDA graph (proves no
-    .item()/.max() host read)."""
+    .item()/.max() host read); 300 rows capture the BLK=256 engine (16-bit: v16)."""
     k = 512
     n = 8192
     ss_host.warmup_prefill(k, max(n, 32768), dtype=dtype)
     stride = ((n + 256 + 255) // 256) * 256
-    lg = torch.randn((64, stride), dtype=torch.float32, device=_DEV).to(dtype)[:, :n]
-    rs = torch.zeros((64,), dtype=torch.int32, device=_DEV)
-    re = torch.full((64,), n, dtype=torch.int32, device=_DEV)
-    out = torch.full((64, k), -7, dtype=torch.int32, device=_DEV)
+    lg = torch.randn((rows, stride), dtype=torch.float32, device=_DEV).to(dtype)[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    re = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_prefill(lg, rs, re, out, max_row_len=n)  # compile outside capture
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()

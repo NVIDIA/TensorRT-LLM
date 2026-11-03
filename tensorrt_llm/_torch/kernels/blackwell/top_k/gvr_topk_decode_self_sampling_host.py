@@ -1736,8 +1736,9 @@ def _varlen_cache_for(dtype: torch.dtype) -> dict:
 
 # ---- prefill launcher cache ------------------------------------------------
 # Prefill forces R==1 (route_streaming gives R>1 only for b<=74). The compiled
-# launcher depends only on the row tier, k, the envelope bucket and the dtype — never on the
-# exact row count or npad — so the cache stays bounded on a long-running server.
+# launcher depends only on the row tier, k, the envelope bucket, the dtype and (16-bit
+# tier 2) whether npad fits 16-bit indices — never on the exact row count or npad — so
+# the cache stays bounded on a long-running server.
 _PREFILL_CACHE = {}
 _PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
 _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
@@ -1750,6 +1751,12 @@ _PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
 # (above that the BLK=1024 plan samples too and is the better slab).
 _PREFILL_T1_MARGIN = 256
 _PREFILL_T1_MAX = 16384
+# 16-bit tier-2 (BLK=256) engines stage code16 << 16 | idx16 words (GvrMainKernel v16)
+# when the row stride fits 16-bit indices; wider rows keep the 32-bit staging.
+_PREFILL_V16_MAX_NPAD = 65536
+# Row stride slack over the column count that warmup_prefill assumes when it has no
+# row_stride (DeepGEMM prefill rows add 256 columns and a 1 KiB alignment).
+_PREFILL_ROW_PAD = 1024
 
 
 def _prefill_scpb_tier1(k: int) -> int:
@@ -1769,25 +1776,41 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
-def _prefill_cache_key(tier: int, k: int, n_bucket: int, dtype_tag: str = "f32", det: bool = False):
+def _prefill_v16(tier: int, dtype: torch.dtype, npad: int) -> bool:
+    return dtype in _DTYPES_16BIT and tier == 2 and npad <= _PREFILL_V16_MAX_NPAD
+
+
+def _prefill_cache_key(
+    tier: int, k: int, n_bucket: int, dtype_tag: str = "f32", det: bool = False, v16: bool = False
+):
     # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
     # to one key so warmup covers them with a single launch.
-    return (tier, k, n_bucket if tier == 0 else 0, dtype_tag) + ((True,) if det else ())
+    return (
+        (tier, k, n_bucket if tier == 0 else 0, dtype_tag)
+        + ((True,) if det else ())
+        + (("v16",) if v16 else ())
+    )
 
 
 def _prefill_launcher(
-    tier: int, k: int, n_bucket: int, dtype: torch.dtype = torch.float32, det: bool = False
+    tier: int,
+    k: int,
+    n_bucket: int,
+    dtype: torch.dtype = torch.float32,
+    det: bool = False,
+    v16: bool = False,
 ) -> tuple:
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
     upper bounds; npad is filled per call in ``run_prefill``. The 16-bit dtypes
     (bfloat16, float16) take the 16-bit streaming plan (halved per-thread vector
     batch, 16-byte x8 loads) and the 16-bit r_const == 1 tuning scalars of
-    ``_varlen_launcher`` without its decode-only BF16 aim_base rungs."""
+    ``_varlen_launcher`` without its decode-only BF16 aim_base rungs; ``v16``
+    (``_prefill_v16``) adds the code16|idx16 staging to their BLK=256 engine."""
     low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
-    key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det)
+    key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det, v16)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1803,6 +1826,8 @@ def _prefill_launcher(
     if rt["R"] != 1:
         raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
     tpl = tuple(plan["tpl"])
+    if v16 and (not low or int(tpl[0]) >= 512 or tpl[5]):
+        raise RuntimeError(f"v16 staging needs a 16-bit BLK=256 non-split plan, got {tpl}")
     dev = _device()
     fn = dev.get_compiled(
         tpl[:6] + (False,) + (1, 0, 1),
@@ -1811,6 +1836,7 @@ def _prefill_launcher(
         det=det,
         fused_k=k,
         **({"dtype": _DTYPE_TAG[dtype]} if low else {}),
+        **({"v16": True} if v16 else {}),
     )
     big = tier == 0
     if low:
@@ -3950,7 +3976,7 @@ def run_prefill(
     ``logits[r, ks:ke]`` (compressed columns) into the local frame (column - ks)
     with a -1 pad; ``nv <= k`` rows get the identity, as ``indexer_topk_prefill``.
     Logits are float32 (row stride a multiple of 4) or 16-bit (bfloat16 / float16,
-    row stride a multiple of 8), 16-byte aligned base, unit inner stride. No device reads,
+    row stride a multiple of 8, index_topk >= 8), 16-byte aligned base, unit inner stride. No device reads,
     never compiles under capture; trusts 0 <= ks <= ke <= shape[1].
     ``deterministic`` / ``sorting`` as in ``run_varlen`` (float32 only)."""
     det = _check_det_args(deterministic, sorting)
@@ -3990,6 +4016,10 @@ def run_prefill(
     k = indices.shape[1]
     if k < 4 or (k & 3):
         raise RuntimeError(f"index_topk must be a multiple of 4 and >= 4, got {k}")
+    if logits.dtype in _DTYPES_16BIT and k < 8:
+        # a 16-bit window shorter than one 8-element vector past its lead runs in the tail
+        # loop, which does not mask the lead lanes
+        raise RuntimeError(f"16-bit prefill requires index_topk >= 8, got {k}")
     if indices.data_ptr() & 15:
         raise RuntimeError("indices base must be 16-byte aligned")
     if logits.stride(1) != 1:
@@ -4025,14 +4055,15 @@ def run_prefill(
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
         tier = _prefill_tier(r1 - r0, n_env, k)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, dtype_tag, det))
+        v16 = _prefill_v16(tier, logits.dtype, npad)
+        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket, dtype_tag, det, v16))
         if lc is None:
             if _is_capturing():
                 raise RuntimeError(
                     "prefill launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _prefill_launcher(tier, k, n_bucket, logits.dtype, det)
+            lc = _prefill_launcher(tier, k, n_bucket, logits.dtype, det, v16)
         _, fn, (scap, cmp_), tail = lc
         # varlen main ABI: pre_idx slot = row_ends, kv_lens slot = row_starts;
         # only npad / k / SCAP_ / CMP_ matter (R=1), the other scalars are dead.
@@ -4067,7 +4098,8 @@ def prefill_ready(
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
-        key = _prefill_cache_key(tier, k, n_bucket, dtype_tag, bool(deterministic))
+        v16 = _prefill_v16(tier, logits.dtype, npad)
+        key = _prefill_cache_key(tier, k, n_bucket, dtype_tag, bool(deterministic), v16)
         if key not in _PREFILL_CACHE:
             return False
     return True
@@ -4313,7 +4345,9 @@ def warmup_prefill(
     the tier-0 arm per pow2 envelope bucket where a <= 148-row launch keeps it
     (``_prefill_tier`` is evaluated at both edges of every bucket), tiers 1/2
     one launch each. ``max_cols`` is the compressed max column count;
-    ``dtype`` selects the fp32, bf16 or fp16 engines; idempotent per done-key."""
+    ``dtype`` selects the fp32, bf16 or fp16 engines (16-bit: the tier-2 engine
+    with v16 staging and, when rows of ``max_cols`` columns can have a row stride
+    above 65536, without it); idempotent per done-key."""
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"warmup_prefill supports float32, bfloat16 or float16, got {dtype}")
     elems16 = 16 // dtype.itemsize
@@ -4331,15 +4365,28 @@ def warmup_prefill(
         b <<= 1
     if not buckets:
         buckets = [hi]
-    keys = {}  # cache_key -> (tier, bucket, envelope) representative for the launch
+    keys = {}  # cache_key -> (tier, bucket, envelope, row stride) representative for the launch
     for rows in num_rows_list:
         for bk in buckets:
+            stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
+            if stride < bk or stride % elems16:
+                stride = (max(stride, bk) + 256 + 255) // 256 * 256
+            strides = [stride]
+            if (
+                dtype in _DTYPES_16BIT
+                and row_stride is None
+                and stride <= _PREFILL_V16_MAX_NPAD < max_cols + _PREFILL_ROW_PAD
+            ):
+                # rows whose stride exceeds 16-bit indices keep the 32-bit staging engine
+                strides.append(_PREFILL_V16_MAX_NPAD + 256)
             for n_env in (bk // 2 + 1, bk):  # the tier can change inside a bucket
                 tier = _prefill_tier(int(rows), n_env, k)
-                keys.setdefault(
-                    _prefill_cache_key(tier, k, bk, _DTYPE_TAG[dtype], deterministic),
-                    (tier, bk, n_env),
-                )
+                for s in strides:
+                    v16 = _prefill_v16(tier, dtype, s)
+                    keys.setdefault(
+                        _prefill_cache_key(tier, k, bk, _DTYPE_TAG[dtype], deterministic, v16),
+                        (tier, bk, n_env, s),
+                    )
     done_key = (
         dev,
         k,
@@ -4352,11 +4399,8 @@ def warmup_prefill(
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
-    for tier, bk, n_env in keys.values():
+    for tier, bk, n_env, stride in keys.values():
         rows = _PREFILL_TIER_ROWS[tier]
-        stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
-        if stride < bk or stride % elems16:
-            stride = (max(stride, bk) + 256 + 255) // 256 * 256
         logits = torch.zeros((rows, stride), dtype=dtype, device=dev)
         ks = torch.zeros((rows,), dtype=torch.int32, device=dev)
         ke = torch.full((rows,), n_env, dtype=torch.int32, device=dev)
