@@ -3348,6 +3348,32 @@ def _mlp_activation(mlp: GatedMLP, x: torch.Tensor) -> Optional[torch.Tensor]:
     return mlp._apply_activation(mlp.gate_up_proj(x))
 
 
+def _helix_tail_attn_out(
+    tail,
+    ctx_out: torch.Tensor,
+    stats: torch.Tensor,
+    w_uv: torch.Tensor,
+    zero_kv: Optional[torch.Tensor],
+    num_heads: int,
+) -> torch.Tensor:
+    """``[T, num_heads, v]`` o_proj rows of this rank's heads from every head's latent partials
+    ``ctx_out`` (``[..., heads * cp, latent]``) and their softmax ``stats``: V up-projection,
+    exchange and combine in one ``K3HelixTail`` launch (``_helix_post_process`` after the
+    up-projection, to BF16 rounding)."""
+    all_heads, v_dim, latent_dim = w_uv.shape
+    num_tokens = ctx_out.numel() // (all_heads * latent_dim)
+    out = torch.empty((num_tokens, num_heads, v_dim), dtype=torch.bfloat16, device=ctx_out.device)
+    tail(
+        ctx_out.reshape(num_tokens, all_heads * latent_dim),
+        stats.reshape(num_tokens, all_heads, 2),
+        w_uv,
+        zero_kv,
+        fold=None,
+        out=out.view(num_tokens, num_heads * v_dim),
+    )
+    return out
+
+
 class _PendingDown(NamedTuple):
     """A drafter MLP whose down projection runs at the all-reduce site that consumes it."""
 
@@ -3771,6 +3797,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # (draft_qhead); the folded weights, built with the fused KV buffers.
     _fused_mla_qhead: bool = False
     _qb_folded: Optional[List[torch.Tensor]] = None
+    # Every head's V up-projection per layer ([heads * cp, v, latent]) for the fused Helix tail.
+    _helix_tail_w_uv: Optional[List[torch.Tensor]] = None
     # Side stream of the step's split-KV plan, joined before the first decode.
     _side_stream: Optional[torch.cuda.Stream] = None
     # Scratch row indices of the fused block store, per (tokens, device).
@@ -4220,6 +4248,34 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         return out if stats is None else (out, stats)
 
+    def _drafter_helix_tail(self, num_tokens: int):
+        """The target's ``K3HelixTail`` on this drafter's helix mapping for ``num_tokens``
+        tokens, with every head's V up-projection gathered once (eagerly, on every rank); None
+        where the tail does not fit or its operands do not exist yet inside a graph capture."""
+        from ..modules.kimi_k3_mla.helix_tail import K3HelixTail
+
+        mapping = self._helix_mapping
+        all_heads = self._num_heads * mapping.cp_size
+        if num_tokens > K3HelixTail.max_tokens(
+            mapping, all_heads, self.kv_lora_rank, self.v_head_dim
+        ):
+            return None
+        capturing = torch.cuda.is_current_stream_capturing()
+        tail = K3HelixTail._cache.get(mapping)
+        if self._helix_tail_w_uv is None or tail is None:
+            if capturing:
+                return None
+            self._helix_tail_w_uv = [
+                allgather(
+                    layer.self_attn._v_b_proj.to(torch.bfloat16).contiguous(),
+                    layer.self_attn.mapping,
+                    dim=0,
+                ).contiguous()
+                for layer in self.model.layers
+            ]
+            tail = K3HelixTail.get(mapping)
+        return tail
+
     @staticmethod
     def _reduce_partial(all_reduce, partial, residual, norm):
         """``norm(all_reduce(partial) + residual)`` and the new residual, where ``partial`` is
@@ -4621,8 +4677,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             }[variant],
             key="mla_dspark_block_decode_variant",
         )
-        # Helix: the tokens this rank holds no key of, for every layer.
+        # Helix: the tokens this rank holds no key of, for every layer, and the target's
+        # fused Helix tail (V up-projection, exchange and combine in one launch) where it fits.
         helix_zero_kv = None if shard is None else fixup.kv_bounds_i32 == 0
+        helix_tail = None
+        if shard is not None and variant == "cute_dsl":
+            helix_tail = self._drafter_helix_tail(batch * block_size)
         # Over an FP8 pool the folded q_b and draft_qhead build the FP8 query and
         # store the block latents (drafter rounding).
         fp8_pool = paged and ctx_kv_cache[0].dtype == torch.float8_e4m3fn
@@ -4689,6 +4749,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             blk_latent = attn.kv_a_proj_with_mqa(hs_normed)
             blk_kv = None
             fp8_query = None
+            attn_out = None
             if layer_idx == 0:
                 if plan_stream is not None:
                     torch.cuda.current_stream().wait_stream(plan_stream)
@@ -4800,15 +4861,25 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                         block_size,
                         capacity,
                     )
-                ctx_out = _helix_post_process(
-                    # [tokens, heads * latent], the layout the target's MLA hands over.
-                    ctx_out.view(batch * block_size, attn_heads * latent_dim),
-                    stats,
-                    self._helix_mapping,
-                    num_heads,
-                    latent_dim,
-                    zero_kv_mask=helix_zero_kv,
-                ).view(batch, block_size, num_heads, latent_dim)
+                if helix_tail is not None:
+                    attn_out = _helix_tail_attn_out(
+                        helix_tail,
+                        ctx_out,
+                        stats,
+                        self._helix_tail_w_uv[layer_idx],
+                        helix_zero_kv,
+                        num_heads,
+                    )
+                else:
+                    ctx_out = _helix_post_process(
+                        # [tokens, heads * latent], the layout the target's MLA hands over.
+                        ctx_out.view(batch * block_size, attn_heads * latent_dim),
+                        stats,
+                        self._helix_mapping,
+                        num_heads,
+                        latent_dim,
+                        zero_kv_mask=helix_zero_kv,
+                    ).view(batch, block_size, num_heads, latent_dim)
             elif blk_kv is None:
                 # The fused kernel already stored the block latents.
                 ctx_out = self._cute_dsl_block_decode(
@@ -4836,18 +4907,19 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 scores = scores.masked_fill(~key_valid.view(batch, 1, 1, -1), float("-inf"))
                 probs = torch.softmax(scores, dim=-1).to(kv_full.dtype)
                 ctx_out = torch.einsum("bsht,btc->bshc", probs, kv_full[..., :latent_dim])
-            # V un-absorb: one batched GEMM over heads written straight into the
-            # [tokens, heads, v] rows o_proj reads, so no reshape copy.
-            attn_out = torch.empty(
-                (batch * block_size, num_heads, self.v_head_dim),
-                dtype=ctx_out.dtype,
-                device=ctx_out.device,
-            )
-            torch.ops.trtllm.bmm_out(
-                ctx_out.reshape(batch * block_size, num_heads, -1).transpose(0, 1),
-                attn._v_b_proj.to(ctx_out.dtype).transpose(1, 2),
-                attn_out.transpose(0, 1),
-            )
+            if attn_out is None:
+                # V un-absorb: one batched GEMM over heads written straight into the
+                # [tokens, heads, v] rows o_proj reads, so no reshape copy.
+                attn_out = torch.empty(
+                    (batch * block_size, num_heads, self.v_head_dim),
+                    dtype=ctx_out.dtype,
+                    device=ctx_out.device,
+                )
+                torch.ops.trtllm.bmm_out(
+                    ctx_out.reshape(batch * block_size, num_heads, -1).transpose(0, 1),
+                    attn._v_b_proj.to(ctx_out.dtype).transpose(1, 2),
+                    attn_out.transpose(0, 1),
+                )
 
             res_flat = residual.reshape(-1, residual.shape[-1])
             # With the TP fusions, o_proj and down_proj reduce their outputs;
