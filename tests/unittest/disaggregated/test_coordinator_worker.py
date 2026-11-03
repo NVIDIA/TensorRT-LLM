@@ -67,6 +67,7 @@ from tensorrt_llm.serve.openai_protocol import (
 from tensorrt_llm.serve.router import (
     KV_CACHE_HASH_ALGO_V1,
     KV_CACHE_HASH_ALGO_V2,
+    ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     LoadBalancingRouter,
@@ -294,7 +295,13 @@ async def test_coordinator_publishes_worker_render_fingerprints_to_the_frontend(
 
 @pytest.mark.asyncio
 async def test_coordinator_expires_stale_reservation():
-    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    config = _make_config(
+        [],
+        ["gen:8000"],
+        "round_robin",
+        "conversation",
+        gen_router_args={"new_conversation_min_match_blocks": 0},
+    )
     coordinator = DisaggCoordinatorService(
         config,
         _client_factory,
@@ -554,6 +561,26 @@ def test_prefix_token_cache_retokenizes_extended_text():
     assert tokenizer.calls == ["ab", "abc"]
 
 
+def test_router_tokenization_cache_reuses_cached_prompt_prefix():
+    class CharTokenizer:
+        is_fast = True
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            return {
+                "input_ids": [ord(c) for c in text],
+                "offset_mapping": [(i, i + 1) for i in range(len(text))],
+            }
+
+    tokenizer = CharTokenizer()
+    block_hashing = SharedBlockHashMixin()
+    block_hashing._init_block_hashing(enable_tokenization_cache=True)
+    previous = "system prompt and tools. " * 400
+    for prompt in (previous, previous + "<|im_start|>user\nmore"):
+        ids = block_hashing._encode_with_prefix_cache(prompt, 1, tokenizer)
+        assert ids == [ord(c) for c in prompt]
+    assert block_hashing._prefix_token_cache(tokenizer).hits == 1
+
+
 def test_stateless_router_places_locally_in_worker():
     """Verify stateless round-robin placement remains local.
 
@@ -801,6 +828,99 @@ def test_conversation_coordinator_sticky_by_conv_id():
             assert all(s == first for s in repeats), (
                 f"conv-A must be sticky, got first={first} repeats={repeats}"
             )
+
+
+_NEW_CONV_ROUTER_ARGS = {"tokens_per_block": 16, "new_conversation_min_match_blocks": 16}
+_SHARED_PREFIX = list(range(1000, 1256))  # 16 blocks of 16 tokens
+
+
+def _ctx_conv_request(conv_id, tokens, request_id):
+    return CompletionRequest(
+        model="m",
+        prompt=list(tokens),
+        conversation_params=ConversationParams(conversation_id=conv_id),
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only", disagg_request_id=request_id
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_select_without_placement_reserves_nothing():
+    config = _make_config(
+        ["ctx0:8000", "ctx1:8000"],
+        ["gen:8000"],
+        "conversation",
+        "round_robin",
+        ctx_router_args=dict(_NEW_CONV_ROUTER_ARGS),
+    )
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+    router = coordinator.ctx_router
+
+    server, info, req_id = await coordinator.select("context", "t::sa:a", 7, None)
+    assert server is None and req_id == 7
+    assert info == {ROUTING_CONTENT_REQUIRED: True}
+    assert coordinator._reservation_tasks == {}
+    assert sum(router._server_content_load.values()) == 0
+
+    request = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 40, 7)
+    server, _, _ = await coordinator.select("context", router.content_routing_key(request), 7, None)
+    assert server in ("ctx0:8000", "ctx1:8000")
+    assert ("context", 7) in coordinator._reservation_tasks
+    await coordinator.finish("context", 7)
+    assert coordinator._reservation_tasks == {}
+
+
+def test_conversation_coordinator_places_new_conversation_by_content():
+    """Delegated routing places a new sibling conversation by content.
+
+    The sibling follows the earlier conversation, and only requests of new
+    conversation_ids are hashed on the worker.
+    """
+    with _FakeWorker() as ctx0, _FakeWorker() as ctx1, _FakeWorker() as gen0:
+        config = _make_config(
+            [ctx0.url, ctx1.url],
+            [gen0.url],
+            "conversation",
+            "round_robin",
+            ctx_router_args=dict(_NEW_CONV_ROUTER_ARGS),
+        )
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url))
+
+            async def drive():
+                remote = CoordinatorClient(coord.url, config)
+                await remote.start()
+                router = remote.ctx_router
+                assert isinstance(router, CoordinatorDelegatingRouter)
+                hashed = []
+                original = router._local.content_routing_key
+
+                def counting(request):
+                    hashed.append(request.conversation_params.conversation_id)
+                    return original(request)
+
+                router._local.content_routing_key = counting
+                sibling_a = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 40, 1)
+                other = _ctx_conv_request("t2", list(range(5000, 5300)), 2)
+                sibling_b = _ctx_conv_request("t::sa:b", _SHARED_PREFIX + [2] * 40, 3)
+                turn_2 = _ctx_conv_request("t::sa:a", _SHARED_PREFIX + [1] * 80, 4)
+                servers = {}
+                for request in (sibling_a, other, sibling_b, turn_2):
+                    # All stay in flight, so least-loaded avoids busy servers.
+                    servers[request.disaggregated_params.disagg_request_id] = (
+                        await router.get_next_server(request)
+                    )[0]
+                for request in (sibling_a, other, sibling_b, turn_2):
+                    await router.finish_request(request)
+                await remote.stop()
+                return servers, hashed
+
+            servers, hashed = asyncio.run(drive())
+            assert servers[2] != servers[1]
+            assert servers[3] == servers[1]
+            assert servers[4] == servers[1]
+            assert hashed == ["t::sa:a", "t2", "t::sa:b"]
 
 
 def test_worker_generates_disagg_request_id_before_generation_routing():

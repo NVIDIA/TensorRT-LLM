@@ -82,6 +82,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
+                                                NamespacedFunctionToolParam,
                                                 OpenAIBaseModel,
                                                 OutputTokensDetails,
                                                 ReasoningAssistantMessage,
@@ -664,7 +665,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -679,6 +680,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -689,7 +691,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -1299,21 +1301,24 @@ def _get_chat_completion_function_tools(
     if tools is None:
         return function_tools
 
+    def definition(name: str, description: Optional[str],
+                   parameters: Optional[Any]) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=name,
+            description=description,
+            # A tool with no schema still has to present an object schema,
+            # or the chat template renders a call the model cannot fill in.
+            parameters=parameters if parameters is not None else {
+                "type": "object",
+                "properties": {},
+            },
+        )
+
     def as_function(name: str, description: Optional[str],
                     parameters: Optional[Any]) -> ChatCompletionToolsParam:
-        return ChatCompletionToolsParam(
-            type="function",
-            function=FunctionDefinition(
-                name=name,
-                description=description,
-                # A tool with no schema still has to present an object schema,
-                # or the chat template renders a call the model cannot fill in.
-                parameters=parameters if parameters is not None else {
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
-        )
+        return ChatCompletionToolsParam(type="function",
+                                        function=definition(
+                                            name, description, parameters))
 
     def custom_parameters() -> dict[str, Any]:
         # A custom tool takes one freeform string rather than JSON arguments -
@@ -1348,7 +1353,9 @@ def _get_chat_completion_function_tools(
             # Skipping it drops every tool inside, which is most of an agentic
             # client's toolset: the model then has nothing to call, announces
             # an action and does nothing. Names are qualified with the
-            # namespace so two namespaces can define the same tool name.
+            # namespace so two namespaces can define the same tool name. The
+            # declaration is kept beside the flattened function, for a model
+            # whose renderer shows namespaces itself.
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
                 if not inner_name:
@@ -1363,11 +1370,18 @@ def _get_chat_completion_function_tools(
                     inner_parameters = custom_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
+                inner_description = getattr(inner, "description", None)
                 function_tools.append(
-                    as_function(
-                        f"{tool.name}.{inner_name}",
-                        getattr(inner, "description", None) or tool.description,
-                        inner_parameters,
+                    NamespacedFunctionToolParam(
+                        function=definition(
+                            f"{tool.name}.{inner_name}",
+                            inner_description or tool.description,
+                            inner_parameters,
+                        ),
+                        namespace=tool.name,
+                        namespace_description=tool.description,
+                        declared_name=inner_name,
+                        declared_description=inner_description,
                     ))
         elif tool_type in ("custom", ):
             function_tools.append(
@@ -1383,15 +1397,14 @@ def _get_chat_completion_function_tools(
             # chat template cannot describe anything else, and the call is
             # intercepted server-side rather than returned to the client.
             #
-            # A request that reaches here still carrying web_search should
-            # already have been refused by the endpoint - see
-            # web_search_rejection_reason and its caller in openai_server.py -
-            # because answering without the search the client asked for is a
-            # wrong answer the client cannot detect. This branch is the
-            # fallback for any other caller of this function: drop the tool
-            # rather than describe it, since nothing on this path executes the
-            # call yet and the model would emit one the client has no
-            # implementation for ("unsupported call: web_search").
+            # Unless TRTLLM_WEB_SEARCH_UNAVAILABLE=reject makes the endpoint
+            # refuse it (see web_search_rejection_reason and its caller in
+            # openai_server.py), a request whose web_search the server cannot
+            # honour is served, and this is where the tool is dropped for a
+            # chat-template model; other callers of this function drop it the
+            # same way. It is dropped rather than described because nothing on
+            # this path executes the call yet, and the model would emit one the
+            # client has no implementation for ("unsupported call: web_search").
             #
             # Warn once per process rather than per request: what it reports is
             # a server-configuration fact, not a property of the request, so
@@ -1626,11 +1639,17 @@ def reasoning_chat_template_kwargs(request) -> dict:
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
     reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort",
-                     None) if reasoning is not None else None
+    if reasoning is None:
+        return kwargs
+    effort = getattr(reasoning, "effort", None)
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+        return kwargs
     if isinstance(effort, str) and effort:
         kwargs.setdefault("reasoning_effort", effort)
-        kwargs.setdefault("thinking", True)
+    # A `reasoning` object asks a reasoning model to reason; without an
+    # effort it reasons at the model's default effort.
+    kwargs.setdefault("thinking", True)
     return kwargs
 
 
@@ -1879,7 +1898,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot reports the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -1912,7 +1933,7 @@ def _create_output_content(
                         content=[
                             Content(text=reasoning_text, type="reasoning_text")
                         ],
-                        status=None,
+                        status="completed",
                     ))
                 stored_reasoning = reasoning_text
 
@@ -1939,8 +1960,12 @@ def _create_output_content(
             tool_calls_item = list(streamed_tool_calls)
         else:
             tool_resolution = _tool_resolution(tools)
+            # As streamed: the stream delivers every call it announces as
+            # completed.
             tool_calls_item = [
-                _tool_call_output_item(call, tool_resolution) for call in calls
+                _tool_call_output_item(call,
+                                       tool_resolution,
+                                       status="completed") for call in calls
             ]
         output_items.extend(tool_calls_item)
 

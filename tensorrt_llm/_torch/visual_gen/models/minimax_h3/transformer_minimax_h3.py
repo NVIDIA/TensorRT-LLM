@@ -343,6 +343,7 @@ class MiniMaxH3AdaLayerNormModulation(nn.Module):
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
+            tensor_parallel_mode=None,
             reduce_output=False,
         )
 
@@ -382,6 +383,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
             quant_config=model_config.quant_config,
             skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             force_dynamic_quantization=model_config.force_dynamic_quantization,
+            tensor_parallel_mode=None,
             reduce_output=False,
         )
 
@@ -662,11 +664,6 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
-        if model_config.mapping.tp_size != 1:
-            raise NotImplementedError(
-                "MiniMax-H3 initial support is TP=1 only. AdaLN tensor-parallel "
-                "sharding requires a model-specific gather contract."
-            )
         self._attn_backend = getattr(model_config.attention, "backend", "VANILLA")
         # Only VANILLA supports arbitrary padding between packed modalities.
         self._supports_key_padding_mask = self._attn_backend in ("VANILLA", "FA4")
@@ -773,6 +770,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "quant_config": model_config.quant_config,
             "skip_create_weights_in_init": model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": model_config.force_dynamic_quantization,
+            "tensor_parallel_mode": None,
             "reduce_output": False,
         }
         bf16_linear_kwargs = {
@@ -781,6 +779,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             "quant_config": model_config.quant_config,
             "skip_create_weights_in_init": model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": model_config.force_dynamic_quantization,
+            "tensor_parallel_mode": None,
             "reduce_output": False,
         }
 

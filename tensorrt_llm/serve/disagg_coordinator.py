@@ -63,6 +63,7 @@ from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.render.fingerprint import fingerprint_summary
 from tensorrt_llm.serve.router import (
+    ROUTING_CONTENT_REQUIRED,
     CoordinatorDelegatingRouter,
     KvCacheAwareRouter,
     Router,
@@ -142,10 +143,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._config = config
         self._client_factory = client_factory
         self._metadata_config = metadata_config
-        # The coordinator owns routing state, so it builds the owner routers here
-        # (is_delegating_client=False): one shared namespace-aware core + a single
-        # ZMQ ingest server. Sole place owner routers are created (fleet workers
-        # hold only a CoordinatorClient's delegating surfaces).
+        # The coordinator owns routing state, so it builds the owner routers here:
+        # one shared namespace-aware core + a single ZMQ ingest server. Sole place
+        # owner routers are created (fleet workers hold only a CoordinatorClient's
+        # delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router, self._gen_router = build_disagg_routers(
@@ -157,7 +158,6 @@ class DisaggCoordinatorService(DisaggCoordinator):
             self._metadata_server,
             server_preparation_func,
             disagg_node_id=config.node_id,
-            is_delegating_client=False,
         )
         # The coordinator owns the disagg cluster storage (auto-scaling backend):
         # it drives the DisaggClusterManager below and, when the storage is an
@@ -223,7 +223,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def select(
         self, role: str, routing_key, req_id, exclude_server: Optional[str]
-    ) -> Tuple[str, dict, Optional[str]]:
+    ) -> Tuple[Optional[str], dict, Optional[str]]:
         _t0 = time.monotonic()
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
@@ -236,15 +236,22 @@ class DisaggCoordinatorService(DisaggCoordinator):
             server, info, request_id = await router.get_next_server_by_key(
                 routing_key, req_id=req_id, exclude_server=exclude_server
             )
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, router)
-            )
+            # A router that placed nothing asks for more routing input; the
+            # worker repeats the select with it, so nothing is reserved.
+            if server is not None:
+                self._reservation_tasks[reservation_key] = asyncio.create_task(
+                    self._expire_reservation(reservation_key, router)
+                )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
         return server, self._compact_route_info(info), request_id
 
     @staticmethod
     def _compact_route_info(info: dict) -> dict:
-        compact = {key: info[key] for key in ("match_length", "num_tokens") if key in info}
+        compact = {
+            key: info[key]
+            for key in ("match_length", "num_tokens", ROUTING_CONTENT_REQUIRED)
+            if key in info
+        }
         disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
         if disaggregated_params is not None:
             compact["server_info"] = {"disaggregated_params": disaggregated_params}
@@ -556,7 +563,6 @@ class CoordinatorClient(DisaggCoordinator):
             metadata_config,
             create_metadata_server(metadata_config),
             disagg_node_id=config.node_id,
-            is_delegating_client=True,
         )
         self._ctx_router = self._maybe_delegate(ctx_router, "context")
         self._gen_router = self._maybe_delegate(gen_router, "generation")

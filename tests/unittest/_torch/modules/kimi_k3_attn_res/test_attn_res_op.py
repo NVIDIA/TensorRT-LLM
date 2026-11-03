@@ -126,6 +126,7 @@ def _make_snapshot_test_layer(layer_idx: int) -> kimi_modeling.KimiLinearDecoder
     layer.linear_attn = attention
     layer.self_attn = attention
     layer.is_moe = False
+    layer.token_sliced = False
     layer.mlp = _AddConstant(2.0)
     layer._mlp_allreduce = None
     return layer

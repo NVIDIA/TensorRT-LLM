@@ -33,6 +33,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3DraftKVCacheView,
     MiniMaxM3KVCacheManagerV2,
+    default_sparse_layer_ids,
     derive_shared_draft_layout,
     extend_attention_op_pools_for_shared_draft_layers,
     shared_draft_layer_count,
@@ -42,7 +43,13 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _DEVICE_PAGE_TABLE_ENV,
+    KVCacheManagerV2,
+    Role,
+    _BasePageTableMaterializer,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
@@ -51,7 +58,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MiniMaxM3SparseAttentionConfig,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, PageIndexMode
 
 DRAFT_LOCAL_LAYER = 60
 _CACHE_MANAGER_MODULE = "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager"
@@ -60,11 +67,16 @@ DRAFT_K_ADDR = 0x7000_0000
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+@pytest.mark.parametrize("setting", ["0", "1"])
 def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
     monkeypatch: pytest.MonkeyPatch,
+    setting: str,
 ) -> None:
     """Exercise real pool allocation, the draft page table and the resolved cache views."""
     torch.cuda.init()
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native host-reading kernel requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=16 << 20,
@@ -120,7 +132,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
 
         # One device copy converts the draft layer's slot ids to P128 pages.
-        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=True)
+        copy_idx = torch.tensor([0, 1], dtype=torch.int32, pin_memory=prefer_pinned())
         monkeypatch.setattr(
             manager,
             "index_mapper",
@@ -128,12 +140,15 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         )
         device_copy = Mock(wraps=m3_cache_manager.copy_batch_block_offsets_to_device)
         monkeypatch.setattr(m3_cache_manager, "copy_batch_block_offsets_to_device", device_copy)
+        monkeypatch.setattr(kv_cache_manager_v2, "copy_batch_block_offsets_to_device", device_copy)
         draft_output = torch.full(
             (1, 2, 2, draft.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda"
         )
         draft.copy_batch_block_offsets(draft_output, [101, 102], 1, 0, 2)
         torch.cuda.synchronize()
         device_copy.assert_called_once()
+        source, _, indices, scales, offsets, _ = device_copy.call_args.args
+        assert all(t.is_cuda == (setting == "1") for t in (source, indices, scales, offsets))
         converter = manager.impl.get_page_index_converter(4, Role.KEY)
         for row, slot in enumerate((2, 5)):
             expected_k = converter([slot] * draft.max_blocks_per_seq, PageIndexMode.SHARED)
@@ -232,6 +247,7 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     manager.dtype = DataType.FP8
     manager.num_attention_op_pools = 2
     manager._draft_op_pools = ((1, 0),)
+    manager.num_pools = 1
     manager._draft_index_scales = torch.tensor([SCALE], dtype=torch.int32)
     manager._draft_kv_offsets = torch.tensor([1], dtype=torch.int32)
     manager.host_kv_cache_block_offsets = torch.zeros((1, 4, 2, 8), dtype=torch.int32)
@@ -265,6 +281,77 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     hybrid.num_attention_op_pools = 0
     hybrid.copy_batch_block_offsets(dst, [7], 1, 0, 1)
     assert calls == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("setting", ["0", "1"], ids=["native", "forced_cc"])
+def test_shared_draft_page_tables_use_real_materialization(
+    monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    """Exercise base and virtual pool launches without allocating a model's KV cache."""
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native expansion requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
+    pin = setting == "0"
+    host = torch.arange(32, dtype=torch.int32).reshape(1, 4, 8)
+    table = torch.full((1, 4, 2, 8), 777, dtype=torch.int32, pin_memory=pin)
+    table[:, :, 0] = host
+    table[0, 2, 0, -1] = BAD_PAGE_INDEX
+    stream = torch.cuda.current_stream()
+
+    def prepare_base(self, index_mapper_capacity: int) -> None:
+        # Only storage setup is stubbed. Both initialization of the draft
+        # materializers and all row gathers, H2D copies and kernels are real.
+        self.num_pools = 1
+        self._use_per_layer_page_tables = False
+        self.host_kv_cache_block_offsets = table
+        self._stream = stream
+        self.index_scales = torch.tensor([3], dtype=torch.int32, pin_memory=pin)
+        self.kv_offset = torch.tensor([1], dtype=torch.int32, pin_memory=pin)
+        self._page_table_materializer = _BasePageTableMaterializer(
+            table, stream, self.index_scales, self.kv_offset
+        )
+        self.kv_cache_pool_pointers = torch.tensor([[0, 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.tensor([[0, 0], [0, 1], [0, 2]], dtype=torch.int32)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", prepare_base)
+    monkeypatch.setattr(
+        MiniMaxM3KVCacheManagerV2,
+        "_kv_slot_geometry",
+        lambda self, layer: (0, None, 4, 5 + 2 * layer, None),
+    )
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._shared_draft_layer_ids = [1, 2]
+    manager.dtype = DataType.FP8
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2}
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheType.SELF
+    manager._prepare_page_table_tensor(4)
+    assert manager._draft_op_pools == ((1, 0), (2, 0))
+    assert len(manager._draft_page_table_materializers) == (2 if setting == "1" else 0)
+
+    # Reorder and shrink the batch between launches; retained staging must
+    # reread the live source instead of reusing the preceding batch's rows.
+    for request_ids in ([2, 0], [1]):
+        copy_idx = torch.tensor(request_ids, dtype=torch.int32, pin_memory=pin)
+        manager.index_mapper = SimpleNamespace(
+            get_copy_index=lambda ids, nc, bw, replicate_beam_zero=False: copy_idx
+        )
+        output = torch.full((3, 4, 2, 8), -12345, dtype=torch.int32, device="cuda")
+        manager.copy_batch_block_offsets(output, request_ids, 1, 0, len(request_ids))
+        stream.synchronize()
+        actual = output.cpu()
+        pages = table[0, request_ids, 0]
+        for pool, scale in enumerate((3, 7, 9)):
+            keys = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale)
+            values = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale + 1)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 0], keys)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 1], values)
+        assert torch.all(actual[:, len(request_ids) :] == -12345)
+        table[:, :, 0, 0] += 10
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
@@ -383,6 +470,94 @@ def test_shared_draft_layer_count_follows_the_base_manager():
     assert shared_draft_layer_count(eagle3, None) == 1
     assert shared_draft_layer_count(eagle3, [True] * 60) == 0
     assert shared_draft_layer_count(None, None) == 0
+
+
+def _text_config(sparse_attention_freq):
+    return SimpleNamespace(
+        num_hidden_layers=len(sparse_attention_freq),
+        sparse_attention_config={"sparse_attention_freq": list(sparse_attention_freq)},
+    )
+
+
+def test_default_sparse_layers_follow_the_text_config():
+    # The model reads its dense/sparse split from the config; so does the cache.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5) == [0, 2, 3]
+    assert default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 5) == [3, 4]
+    # Without a config spanning the target layers, layers 0..2 stay dense.
+    assert default_sparse_layer_ids(None, 5) == [3, 4]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), None) == []
+
+
+def test_default_sparse_layers_log_a_fallback_that_ignores_the_config(monkeypatch):
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager as cache_manager
+
+    log = Mock()
+    monkeypatch.setattr(cache_manager, "logger", log)
+    # A config whose split is not the default, on a manager with a different layer count.
+    assert default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 6) == [3, 4, 5]
+    assert log.info.call_count == 1
+    # The default split, a matching layer count, or no config: nothing to report.
+    default_sparse_layer_ids(_text_config([0, 0, 0, 1, 1]), 6)
+    default_sparse_layer_ids(_text_config([1, 0, 1, 1, 0]), 5)
+    default_sparse_layer_ids(None, 6)
+    assert log.info.call_count == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("implementation", ["msa", "triton"])
+def test_index_k_cache_follows_the_config_sparse_layers(
+    monkeypatch: pytest.MonkeyPatch, implementation: str
+) -> None:
+    """Every layer the config makes sparse gets an index-K buffer and view, and only those."""
+    resolved = []
+    registered = {}
+
+    def fake_base_init(self, *args, **kwargs):
+        self.is_disagg = False
+        self.dtype = DataType.BF16
+        # Five target layers and the shared Eagle3 layer appended after them.
+        self.layer_offsets = {layer: layer for layer in range(6)}
+        # The base _build_base_config registers the extra pool buffers here.
+        registered.update(self._extra_buffers_per_layer(tokens_per_block=32))
+
+    def fake_get_index_k_buffer(self, layer_idx, **kwargs):
+        resolved.append(layer_idx)
+        return torch.empty(0)
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
+    monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
+    monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
+    mode = SimpleNamespace(
+        is_mtp_eagle_one_model=lambda: False,
+        is_mtp_vanilla=lambda: False,
+        is_eagle3_one_model=lambda: True,
+    )
+
+    manager = MiniMaxM3KVCacheManagerV2(
+        num_layers=5,
+        spec_config=SimpleNamespace(spec_dec_mode=mode, _num_draft_hidden_layers=None),
+        sparse_attention_config=SimpleNamespace(
+            implementation=implementation, indexer_kv_dtype="bf16"
+        ),
+        pretrained_config=_text_config([1, 0, 1, 1, 0]),
+    )
+
+    assert manager._shared_draft_layer_ids == [5]
+    assert manager.sparse_layer_ids == [0, 2, 3]
+    assert manager.disable_index_value_layer_ids == {0, 2, 3}
+    assert sorted(registered) == [0, 2, 3]
+    for buffers in registered.values():
+        assert [buffer.role for buffer in buffers] == [Role.INDEX_KEY]
+    assert resolved == [0, 2, 3]
+    for layer in (0, 2, 3):
+        assert manager.get_index_k_buffer(layer) is not None
+    for layer in (1, 4, 5):
+        assert manager.get_index_k_buffer(layer) is None
+    # The Triton path runs the dense target layers on the native attention op.
+    expected_dense_native = (1, 4) if implementation == "triton" else ()
+    assert manager._dense_native_layer_ids == expected_dense_native
 
 
 @pytest.mark.cpu_only
@@ -585,6 +760,7 @@ def test_dense_layers_get_virtual_pools_without_speculation(monkeypatch):
     """Dense target layers need the same stride correction as draft layers."""
 
     def fake_base_prepare(self, index_mapper_capacity):
+        self._page_table_materializer = SimpleNamespace(uses_device_expansion=False)
         self._use_per_layer_page_tables = False
         self.kv_cache_pool_pointers = torch.tensor([[0x6000_0000, 0]], dtype=torch.int64)
         self.kv_cache_pool_mapping = torch.tensor([[0, i] for i in range(4)], dtype=torch.int32)

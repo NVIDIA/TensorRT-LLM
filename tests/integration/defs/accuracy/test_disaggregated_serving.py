@@ -2426,7 +2426,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
-        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
+        # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -2698,7 +2698,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "agent_bounce_buffer_enable": True,
                 "kv_cache_bounce_size_mb": 512,
                 # Relax the admission gates for this short CI workload.
                 # The production defaults remain 1024 descriptors / 16 KiB.

@@ -179,6 +179,7 @@ else:
     package_data = [
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
+        'libs/libth_modeling_v2_*.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -269,8 +270,13 @@ def warn_on_build_skew(precompiled_location: str) -> None:
     import subprocess
 
     NATIVE_BUILD_INPUTS = [
-        "cpp/", "3rdparty/", "setup.py", "scripts/build_wheel.py",
-        "requirements.txt"
+        "cpp/",
+        "3rdparty/",
+        "setup.py",
+        "scripts/build_wheel.py",
+        "requirements.txt",
+        # modeling_v2 families keep their native code with their Python code.
+        ":(glob)tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/**"
     ]
 
     def head_of(checkout: str) -> str | None:
@@ -721,6 +727,7 @@ setup(
     scripts=[
         'tensorrt_llm/llmapi/trtllm-llmapi-launch',
         'tensorrt_llm/llmapi/_llmapi_process_guard.py',
+        'tensorrt_llm/llmapi/_llmapi_mpi_stop.py',
         'tensorrt_llm/serve/render/trtllm-render',
     ],
     extras_require={
