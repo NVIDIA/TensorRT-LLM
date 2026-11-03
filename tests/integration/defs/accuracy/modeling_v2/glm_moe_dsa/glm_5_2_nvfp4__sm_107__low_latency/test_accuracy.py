@@ -629,7 +629,11 @@ _HIGH_THROUGHPUT_POINTS = (
 )
 # Populated from full-corpus stock runs of the matching ADP configurations.
 # A synthetic acceptance setting from a throughput run is not an AL reference.
-_HIGH_THROUGHPUT_AL_REFERENCE: dict[tuple[int, int], float] = {}
+_HIGH_THROUGHPUT_AL_REFERENCE: dict[tuple[int, int], float] = {
+    (7, 7): 5.115047055091467,
+    (10, 5): 4.536646695433521,
+    (20, 5): 4.557026604068858,
+}
 _HIGH_THROUGHPUT_ENV = {
     **_RANK_ENV,
     "TLLM_METRICS_ALL_RANKS": "1",
