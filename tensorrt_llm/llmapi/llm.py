@@ -1620,6 +1620,19 @@ class BaseLLM:
                     f"max_num_tokens ({max_num_tokens})")
         self._check_one_model_speculative_sampling(sampling_params)
 
+        guided = sampling_params.guided_decoding
+        if guided is not None and (guided.json_object
+                                   or guided.json is not None
+                                   or guided.regex is not None
+                                   or guided.grammar is not None
+                                   or guided.structural_tag is not None):
+            if getattr(self.args, 'guided_decoding_backend', None) is None:
+                raise ValueError(
+                    "Request includes a guided-decoding constraint, but the "
+                    "LLM was started without a guided_decoding_backend. Pass "
+                    "guided_decoding_backend='xgrammar' or 'llguidance' to "
+                    "LLM().")
+
         if sampling_params.return_routed_experts and not (
                 self.args.backend == "pytorch"
                 and getattr(self.args, "enable_return_routed_experts", False)):

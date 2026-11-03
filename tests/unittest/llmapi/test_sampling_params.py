@@ -552,3 +552,61 @@ def test_thinking_budget_text_generation_caps_reasoning_tokens(thinking_token_bu
     assert tokenizer.decode(generated_ids) == tokenizer.decode(
         [start_id, *expected_reasoning_ids, end_id, answer_id]
     )
+
+
+# -- Guided-decoding backend validation -------------------------------------------
+
+
+from tensorrt_llm.sampling_params import GuidedDecodingParams
+
+
+def test_check_arguments_rejects_guided_decoding_without_backend():
+    """Active guided-decoding constraint must be rejected when no backend is configured."""
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams(
+        guided_decoding=GuidedDecodingParams(json={"type": "object"}),
+    )
+    with pytest.raises(ValueError, match="guided_decoding_backend"):
+        llm._check_arguments(prompt_len=1, sampling_params=sampling_params,
+                             is_gen_only=False)
+
+
+@pytest.mark.parametrize("constraint", [
+    GuidedDecodingParams(json={"type": "string"}),
+    GuidedDecodingParams(regex=r"\d+"),
+    GuidedDecodingParams(grammar="root ::= 'hello'"),
+    GuidedDecodingParams(json_object=True),
+])
+def test_check_arguments_rejects_all_guided_constraint_types(constraint):
+    """Every constraint type triggers the backend check."""
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams(guided_decoding=constraint)
+    with pytest.raises(ValueError, match="guided_decoding_backend"):
+        llm._check_arguments(prompt_len=1, sampling_params=sampling_params,
+                             is_gen_only=False)
+
+
+def test_check_arguments_accepts_guided_decoding_with_backend():
+    """Requests are accepted when a backend is configured."""
+    llm = _TestLLM(guided_decoding_backend="xgrammar")
+    sampling_params = SamplingParams(
+        guided_decoding=GuidedDecodingParams(json={"type": "object"}),
+    )
+    llm._check_arguments(prompt_len=1, sampling_params=sampling_params,
+                         is_gen_only=False)
+
+
+def test_check_arguments_accepts_no_guided_decoding():
+    """Normal requests without guided decoding pass regardless of backend."""
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams()
+    llm._check_arguments(prompt_len=1, sampling_params=sampling_params,
+                         is_gen_only=False)
+
+
+def test_check_arguments_accepts_empty_guided_decoding_params():
+    """An empty GuidedDecodingParams() is a no-op and should not be rejected."""
+    llm = _TestLLM(guided_decoding_backend=None)
+    sampling_params = SamplingParams(guided_decoding=GuidedDecodingParams())
+    llm._check_arguments(prompt_len=1, sampling_params=sampling_params,
+                         is_gen_only=False)
