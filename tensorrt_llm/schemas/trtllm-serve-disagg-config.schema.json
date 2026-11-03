@@ -1312,34 +1312,6 @@
     },
     "DeepSeekSparseAttentionConfig": {
       "additionalProperties": false,
-      "allOf": [
-        {
-          "else": {
-            "properties": {
-              "use_cute_dsl_paged_mqa_logits": {
-                "default": true
-              }
-            }
-          },
-          "if": {
-            "properties": {
-              "enable_kv_cache_offload": {
-                "const": true
-              }
-            },
-            "required": [
-              "enable_kv_cache_offload"
-            ]
-          },
-          "then": {
-            "properties": {
-              "use_cute_dsl_paged_mqa_logits": {
-                "default": false
-              }
-            }
-          }
-        }
-      ],
       "description": "Configuration for DeepSeek Sparse Attention.",
       "properties": {
         "algorithm": {
@@ -1480,7 +1452,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Defaults to False with KV cache offload enabled and True otherwise; an explicit value overrides this default. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1508,34 +1481,6 @@
     },
     "DeepSeekV4SparseAttentionConfig": {
       "additionalProperties": false,
-      "allOf": [
-        {
-          "else": {
-            "properties": {
-              "use_cute_dsl_paged_mqa_logits": {
-                "default": true
-              }
-            }
-          },
-          "if": {
-            "properties": {
-              "enable_kv_cache_offload": {
-                "const": true
-              }
-            },
-            "required": [
-              "enable_kv_cache_offload"
-            ]
-          },
-          "then": {
-            "properties": {
-              "use_cute_dsl_paged_mqa_logits": {
-                "default": false
-              }
-            }
-          }
-        }
-      ],
       "description": "Configuration for DeepSeek-V4 Sparse Attention.",
       "properties": {
         "algorithm": {
@@ -1684,7 +1629,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Defaults to False with KV cache offload enabled and True otherwise; an explicit value overrides this default. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },

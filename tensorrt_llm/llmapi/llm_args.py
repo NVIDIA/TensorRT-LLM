@@ -1383,9 +1383,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         default=True,
         description=
         "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family "
-        "GPUs instead of C++ DeepGEMM. Defaults to False with KV cache "
-        "offload enabled and True otherwise; an explicit value overrides "
-        "this default. Falls back to DeepGEMM off the SM100 "
+        "GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 "
         "family or when the cutlass-dsl package is missing.")
     q_split_threshold: int = Field(
         default=8192,
@@ -1467,7 +1465,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
 
     @model_validator(mode="after")
     def _validate_kv_cache_offload(self):
-        """Validate offload sizing and resolve the default indexer backend.
+        """Reject offload sizing without offload and a non-positive top-k.
 
         ``index_topk`` may still be None here; the checkpoint fills it later.
         """
@@ -1475,8 +1473,6 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             if self.index_topk is not None and self.index_topk <= 0:
                 raise ValueError(
                     "KV cache offload requires a positive index_topk.")
-            if "use_cute_dsl_paged_mqa_logits" not in self.model_fields_set:
-                self.use_cute_dsl_paged_mqa_logits = False
         elif self.kv_cache_offload_config != SparseKvCacheOffloadConfig():
             raise ValueError("kv_cache_offload_config requires "
                              "enable_kv_cache_offload=True.")
