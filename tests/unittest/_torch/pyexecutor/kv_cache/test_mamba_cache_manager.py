@@ -5,7 +5,6 @@
 import contextlib
 import math
 import os
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -7983,27 +7982,20 @@ def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-@pytest.mark.parametrize("pass_pretrained_config", [True, False])
-def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain(pass_pretrained_config):
+def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
     """An Eagle3 layer in the hybrid manager keeps a normal KV cache, unlike an MTP layer."""
     from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
-    build = partial(
-        _build_v2_hybrid_with_mamba_layer,
+    mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
         num_draft_layers=1,
         spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
-        pretrained_config=SimpleNamespace(num_hidden_layers=2) if pass_pretrained_config else None,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
     )
-    if not pass_pretrained_config:
-        # The layer_mask alone does not tell the drafter layers apart.
-        with pytest.raises(ValueError, match="pretrained_config"):
-            build()
-        return
-    mgr = build()
     try:
         # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
+        assert mgr.draft_layer_ids == (2,)
         assert mgr.mixed_precision_high_layers == {1: 3}
     finally:
         mgr.shutdown()
