@@ -1524,11 +1524,48 @@ def test_mla_dspark_fused_rope_is_bitwise(context_kv_fp8):
     base = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
     ctx_base, _ = drafter.precompute_context_kv(projected, positions)
     drafter._fused_mla_rope = True
+    # The folded query head (FP8 pool) rounds differently; it has its own test.
+    drafter._qb_folded = None
     fused = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
     ctx_fused, _ = drafter.precompute_context_kv(projected, positions)
 
     assert torch.equal(fused.view(torch.int32), base.view(torch.int32))
     assert torch.equal(ctx_fused.view(torch.int16), ctx_base.view(torch.int16))
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_fp8_query_head_agrees_to_drafter_rounding():
+    """Over an FP8 pool, q_a_layernorm folded into q_b plus draft_qhead (query
+    RoPE, absorption, block latent store, FP8 query in one launch) gives the
+    block decode of the separate launches up to drafter rounding."""
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    if not drafter._fused_mla_qhead:
+        pytest.skip("the folded MLA query head does not fit here")
+    g = torch.Generator().manual_seed(7)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    qhead = _run_mla_block_decode(drafter, requests, paged=True, fp8=True)
+    assert drafter._qb_folded is not None
+    folded, drafter._qb_folded = drafter._qb_folded, None
+    separate = _run_mla_block_decode(drafter, requests, paged=True, fp8=True)
+    drafter._qb_folded = folded
+
+    rel_l2 = ((qhead - separate).norm() / separate.norm()).item()
+    assert rel_l2 < 2e-2, rel_l2
 
 
 @needs_cuda

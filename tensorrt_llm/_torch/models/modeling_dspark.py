@@ -112,6 +112,7 @@ from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
 from ..speculative.dflash_attention import DRAFT_FP8_KV_SCALE, HelixDraftShard, to_draft_fp8
+from ..speculative.dspark_mla_qhead import draft_qhead, fold_rmsnorm_weight
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
     DraftBlockPlacement,
@@ -3686,6 +3687,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # The fused MLA RoPE kernels fit: the context latents of every layer in one
     # launch, and per layer the query RoPE plus the block latent norm/RoPE/store.
     _fused_mla_rope: bool = False
+    # q_a_layernorm can fold into the q_b weight (a plain RMSNorm, an unquantized
+    # q_b): over an FP8 pool one kernel then does the rest of the query
+    # (draft_qhead); the folded weights, built with the fused KV buffers.
+    _fused_mla_qhead: bool = False
+    _qb_folded: Optional[List[torch.Tensor]] = None
     # Side stream of the step's split-KV plan, joined before the first decode.
     _side_stream: Optional[torch.cuda.Stream] = None
     # Scratch row indices of the fused block store, per (tokens, device).
@@ -3765,6 +3771,20 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             and self.kv_lora_rank % 32 == 0
             and (self.qk_rope_head_dim // 2) % 32 == 0
             and attn0.kv_a_layernorm.weight.dtype == torch.bfloat16
+        )
+        self._fused_mla_qhead = (
+            self._fused_mla_rope
+            and not context_kv_only
+            and type(attn0.q_a_layernorm) is RMSNorm
+            and not attn0.q_a_layernorm.use_gemma
+            and not attn0.q_b_proj.has_bias
+            and attn0.q_b_proj.dtype == torch.bfloat16
+            and (
+                attn0.q_b_proj.quant_config is None
+                or not attn0.q_b_proj.quant_config.layer_quant_mode.has_any_quant(
+                    exclude_kv_cache=True
+                )
+            )
         )
         if (
             self.context_kv_fp8
@@ -4020,7 +4040,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         return self._mla_split_plan[:batch]
 
-    def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
+    def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size, fp8_query=None):
         """One cute-dsl MLA decode over context AND block, no fixup.
 
         The trtllm-gen path splits the work: its q_len semantics are causal, so
@@ -4036,19 +4056,22 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         on the first call.
 
         An FP8 pool (``context_kv_dtype="fp8"``) is read by the FP8 decode with
-        the query quantized the same way (``to_draft_fp8``); the output stays in
-        the query's dtype.
+        the query quantized the same way (``to_draft_fp8``), or ``fp8_query``
+        when the caller built it (``query`` is then None); the output is BF16
+        then, else in the query's dtype.
         """
         import cutlass
 
         from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-        batch, _, num_heads, _ = query.shape
-        device = query.device
+        batch, _, num_heads, _ = (query if fp8_query is None else fp8_query).shape
+        device = layer_cache.device
+        out_dtype = torch.bfloat16 if query is None else query.dtype
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
         page_size = pool.shape[1]
         d_latent = self.kv_lora_rank
         fp8 = pool.dtype == torch.float8_e4m3fn
+        assert fp8_query is None or fp8
         self._assert_cute_dsl_can_implement(
             batch, block_size, page_size, pool.dtype if fp8 else query.dtype, num_heads
         )
@@ -4056,7 +4079,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470),
         # kept by a 576-wide row sliced at 512. detach() because from_dlpack refuses
         # grad-requiring tensors, which the pool write adds outside inference_mode.
-        if not fp8:
+        if fp8_query is not None:
+            kernel_query = fp8_query
+        elif not fp8:
             kernel_query = query.detach()
         elif query.is_contiguous():
             kernel_query = draft_fp8_cast(query.detach())
@@ -4067,7 +4092,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
         c_rope = pool.detach()[..., d_latent:].permute(1, 2, 0)
 
-        out = torch.empty(batch, block_size, num_heads, d_latent, dtype=query.dtype, device=device)
+        out = torch.empty(batch, block_size, num_heads, d_latent, dtype=out_dtype, device=device)
         # Helix: (max, sum) per query token and head, for _helix_post_process.
         stats = (
             None
@@ -4321,6 +4346,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
             a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
             a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
+        if self._fused_mla_qhead:
+            self._qb_folded = [
+                fold_rmsnorm_weight(a.q_b_proj.weight.detach(), a.q_a_layernorm.weight.detach())
+                for a in layers_attn
+            ]
 
         logger.debug(
             f"MLA DSpark: fused latent projection built for {self._num_attn_layers} layers "
@@ -4490,6 +4520,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
         # Helix: the tokens this rank holds no key of, for every layer.
         helix_zero_kv = None if shard is None else fixup.kv_bounds_i32 == 0
+        # Over an FP8 pool the folded q_b and draft_qhead build the FP8 query and
+        # store the block latents (drafter rounding).
+        fp8_pool = paged and ctx_kv_cache[0].dtype == torch.float8_e4m3fn
+        qb_folded = self._qb_folded if fused_rope and fp8_pool else None
         # Eager path only: dense key mask over the gathered context.
         if not use_kernel:
             if paged:
@@ -4524,28 +4558,65 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
 
-            q = attn.q_b_proj(attn.q_a_layernorm(attn.q_a_proj(hs_normed)))
+            q_a = attn.q_a_proj(hs_normed)
+            if qb_folded is not None:
+                # q_b of the un-normalized q_a; draft_qhead applies the inverse RMS.
+                folded = qb_folded[layer_idx]
+                q = None
+                if self._low_m_gemm is not None:
+                    q = self._low_m_gemm.apply(attn.q_b_proj, q_a, folded, None)
+                if q is None:
+                    q = F.linear(q_a, folded)
+            else:
+                q = attn.q_b_proj(attn.q_a_layernorm(q_a))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             # Assemble the query in one buffer to avoid concatenating a
-            # non-contiguous RoPE slice.
-            query = torch.empty(
-                (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
-                dtype=q.dtype,
-                device=q.device,
+            # non-contiguous RoPE slice (draft_qhead writes its own FP8 query).
+            query_shape = (batch, block_size, num_heads, self.kv_lora_rank + self.qk_rope_head_dim)
+            query = (
+                None
+                if qb_folded is not None
+                else torch.empty(query_shape, dtype=q.dtype, device=q.device)
             )
             # The block's own latent comes from the draft hidden; the context's
             # from the projected target hidden (precompute_context_kv). That
             # dual-source split is the DFlash contract, not an MLA detail.
             blk_latent = attn.kv_a_proj_with_mqa(hs_normed)
             blk_kv = None
+            fp8_query = None
             if layer_idx == 0:
                 if plan_stream is not None:
                     torch.cuda.current_stream().wait_stream(plan_stream)
                 if ctx_stored is not None:
                     torch.cuda.current_stream().wait_event(ctx_stored)
-            if fused_rope:
-                self._fused_block_rope(q, query, blk_latent, attn, layer_idx, ctx_kv_cache,
-                                       fixup, flat_positions, freqs_real)  # fmt: skip
+            if qb_folded is not None:
+                fp8_query = draft_qhead(
+                    q_a,
+                    blk_latent,
+                    q.view(batch * block_size, num_heads, q.shape[-1]),
+                    attn.q_a_layernorm.variance_epsilon,
+                    attn._k_b_proj.to(q.dtype),
+                    attn.kv_a_layernorm.weight,
+                    attn.kv_a_layernorm.variance_epsilon,
+                    flat_positions,
+                    freqs_real,
+                    ctx_kv_cache[layer_idx][:, 0, 0],
+                    fixup.pages.reshape(-1),
+                    fixup.offsets.reshape(-1),
+                    rows_mask=fixup.owned,
+                ).view(query_shape)
+            elif fused_rope:
+                self._fused_block_rope(
+                    q,
+                    query,
+                    blk_latent,
+                    attn,
+                    layer_idx,
+                    ctx_kv_cache,
+                    fixup,
+                    flat_positions,
+                    freqs_real,
+                )
             else:
                 # Rotate the trailing rope slice of every head straight into the
                 # destination's rope columns. No norm and no weight here --
@@ -4578,29 +4649,42 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     blk_freqs,
                     norm_dim=latent_dim,
                 )
-            q_nope = q[..., : self.qk_nope_head_dim]
-            # Absorb the nope half into latent space so the block attends the
-            # stored latent directly (MQA), instead of expanding it per head.
-            # [h, b*s, nope] x [h, nope, kv_lora_rank] straight into the latent
-            # half. view(), never reshape(): both of these are strided views and
-            # reshape would silently stage a copy that bmm_out then writes into
-            # and throws away, whereas view() raises.
-            torch.ops.trtllm.bmm_out(
-                q_nope.view(batch * block_size, num_heads, self.qk_nope_head_dim).transpose(0, 1),
-                attn._k_b_proj.to(q.dtype),
-                query[..., : self.kv_lora_rank]
-                .view(batch * block_size, num_heads, self.kv_lora_rank)
-                .transpose(0, 1),
-            )
+            if fp8_query is None:
+                q_nope = q[..., : self.qk_nope_head_dim]
+                # Absorb the nope half into latent space so the block attends the
+                # stored latent directly (MQA), instead of expanding it per head.
+                # [h, b*s, nope] x [h, nope, kv_lora_rank] straight into the latent
+                # half. view(), never reshape(): both of these are strided views and
+                # reshape would silently stage a copy that bmm_out then writes into
+                # and throws away, whereas view() raises.
+                torch.ops.trtllm.bmm_out(
+                    q_nope.view(batch * block_size, num_heads, self.qk_nope_head_dim).transpose(
+                        0, 1
+                    ),
+                    attn._k_b_proj.to(q.dtype),
+                    query[..., : self.kv_lora_rank]
+                    .view(batch * block_size, num_heads, self.kv_lora_rank)
+                    .transpose(0, 1),
+                )
 
             if shard is not None:
                 # Every rank holds part of each request's context: attend with
                 # every head over the rank's pages, then merge the partials into
                 # this rank's heads by their softmax stats.
-                all_heads_query = allgather(query, attn.mapping, dim=2)
+                all_heads_query = all_heads_fp8 = None
+                if fp8_query is None:
+                    all_heads_query = allgather(query, attn.mapping, dim=2)
+                else:
+                    all_heads_fp8 = allgather(
+                        fp8_query.view(torch.uint8), attn.mapping, dim=2
+                    ).view(torch.float8_e4m3fn)
                 if blk_kv is None:
                     ctx_out, stats = self._cute_dsl_block_decode(
-                        all_heads_query, ctx_kv_cache[layer_idx], fixup, block_size
+                        all_heads_query,
+                        ctx_kv_cache[layer_idx],
+                        fixup,
+                        block_size,
+                        fp8_query=all_heads_fp8,
                     )
                 else:
                     ctx_out, stats = self._mla_paged_attention(
@@ -4623,7 +4707,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             elif blk_kv is None:
                 # The fused kernel already stored the block latents.
                 ctx_out = self._cute_dsl_block_decode(
-                    query, ctx_kv_cache[layer_idx], fixup, block_size
+                    query, ctx_kv_cache[layer_idx], fixup, block_size, fp8_query=fp8_query
                 )
             elif use_kernel:
                 ctx_out = self._mla_paged_attention(

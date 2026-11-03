@@ -190,3 +190,91 @@ def test_draft_fp8_cast_matches_to_draft_fp8():
     out = draft_fp8_cast(x)
     torch.cuda.synchronize()
     assert torch.equal(out.view(torch.uint8), to_draft_fp8(x).view(torch.uint8))
+
+
+def _fp8_neighbours(got: torch.Tensor, ref: torch.Tensor, max_frac: float) -> None:
+    """Every FP8 code of ``got`` equal to or a neighbour of ``ref``'s; few differ."""
+    got, ref = got.float(), ref.float()
+    spacing = torch.maximum(got.abs(), ref.abs()).clamp_min(2.0**-6) * 2.0**-3
+    assert bool(((got - ref).abs() <= spacing).all())
+    frac = float((got != ref).float().mean())
+    assert frac <= max_frac, frac
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["all_rows", "owned_rows"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
+def test_draft_qhead_matches_the_unfused_ops(num_tokens, masked):
+    """``draft_qhead`` against q_a_layernorm + q_b + the fused block RoPE + the
+    masked scatter + the absorption + the FP8 cast: the query no further from
+    FP64 than theirs, the pool rows equal or one FP8 code apart."""
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import dspark_mla_block_rope
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+    from tensorrt_llm._torch.speculative.dspark_mla_qhead import draft_qhead, fold_rmsnorm_weight
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import scatter_rows_to_pool
+
+    torch.manual_seed(num_tokens + 100 * masked)
+    heads, q_lora, eps = 64, 1536, 1e-6
+    q_a = torch.randn(num_tokens, q_lora, device="cuda").bfloat16()
+    kv = (torch.randn(num_tokens, HEAD_DIM, device="cuda") * 2).bfloat16()
+    w_qa = (torch.rand(q_lora, device="cuda") + 0.5).bfloat16()
+    w_qb = (torch.randn(heads * (NOPE + ROPE), q_lora, device="cuda") * 0.03).bfloat16()
+    w_kv = (torch.rand(KV_LORA, device="cuda") + 0.5).bfloat16()
+    w_uk = (torch.randn(heads, NOPE, KV_LORA, device="cuda") * 0.1).bfloat16()
+    positions = torch.arange(num_tokens, device="cuda", dtype=torch.int64) + 1000
+    angles = torch.rand(2048, ROPE // 2, device="cuda") * 6.28
+    freqs = torch.stack([angles.cos(), angles.sin()], dim=-1).contiguous()
+    pages_n, page_size = 40, 16
+    pool = (torch.randn(pages_n, page_size, HEAD_DIM, device="cuda") * 3).to(torch.float8_e4m3fn)
+    slots = torch.randperm(pages_n * page_size, device="cuda")[:num_tokens]
+    pages, offsets = slots // page_size, slots % page_size
+    mask = None
+    if masked:
+        mask = torch.rand(num_tokens, 1, device="cuda") < 0.5
+        mask[0] = True
+
+    qf = q_a.float()
+    q_a_n = (qf * torch.rsqrt(qf.pow(2).mean(-1, keepdim=True) + eps) * w_qa.float()).bfloat16()
+    q_ref = (q_a_n.float() @ w_qb.float().t()).bfloat16().view(num_tokens, heads, NOPE + ROPE)
+    query = torch.empty(num_tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty(num_tokens, 1, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    rows = torch.arange(num_tokens, device="cuda")
+    dspark_mla_block_rope(
+        q_ref, query, kv, w_kv, positions, freqs, scratch, rows, torch.zeros_like(rows), eps
+    )
+    ref_pool = pool.clone()
+    scatter_rows_to_pool(scratch.view(num_tokens, -1), ref_pool, pages, offsets, rows_mask=mask)
+    ref = query.clone()
+    torch.ops.trtllm.bmm_out(
+        q_ref[..., :NOPE].transpose(0, 1), w_uk, ref[..., :KV_LORA].transpose(0, 1)
+    )
+    ref8 = to_draft_fp8(ref)
+
+    folded = fold_rmsnorm_weight(w_qb, w_qa)
+    q_raw = (qf @ folded.float().t()).bfloat16().view(num_tokens, heads, NOPE + ROPE)
+    got_pool = pool.clone()
+    got = draft_qhead(
+        q_a, kv, q_raw, eps, w_uk, w_kv, eps, positions, freqs, got_pool, pages, offsets, mask
+    )
+    qd = q_a.double()
+    q_true = (
+        (qd * torch.rsqrt(qd.pow(2).mean(-1, keepdim=True) + eps) * w_qa.double())
+        @ w_qb.double().t()
+    ).view(num_tokens, heads, NOPE + ROPE)
+    lat_true = torch.einsum("thk,hkd->thd", q_true[..., :NOPE], w_uk.double())
+    re, im = q_true[..., NOPE::2], q_true[..., NOPE + 1 :: 2]
+    cos = freqs[positions][:, None, :, 0].double()
+    sin = freqs[positions][:, None, :, 1].double()
+    rope_true = torch.stack([re * cos - im * sin, im * cos + re * sin], dim=-1).flatten(-2)
+    truth = torch.cat([lat_true, rope_true], dim=-1)
+
+    def rel_err(x):
+        return float((x.double() - truth).norm() / truth.norm())
+
+    assert rel_err(got) <= 1.15 * rel_err(ref8) + 1e-3, (rel_err(got), rel_err(ref8))
+    written = torch.zeros(pages_n, page_size, dtype=torch.bool, device="cuda")
+    keep = (
+        torch.ones(num_tokens, dtype=torch.bool, device="cuda") if mask is None else mask.view(-1)
+    )
+    written[pages[keep], offsets[keep]] = True
+    assert torch.equal(got_pool[~written].view(torch.uint8), pool[~written].view(torch.uint8))
+    _fp8_neighbours(got_pool[written], ref_pool[written], max_frac=0.02)
