@@ -43,6 +43,7 @@ __all__ = [
     "RankTopology",
     "ShardDesc",
     "Tensor",
+    "axis_to_dict",
     "content_shard",
     "grid_place",
     "head_major",
@@ -982,15 +983,17 @@ def replica_ranks(
     return tuple(out)
 
 
-def _axis_to_dict(axis: Axis) -> dict:
-    return {
-        "name": axis.name,
-        "extent": axis.extent,
-        "stride": axis.stride,
-        "split": list(axis.split),
-        "held": axis.held,
-        "cyclic": axis.cyclic,
-    }
+def axis_to_dict(axis: Axis, *, sparse: bool = False) -> dict:
+    """Every field of ``axis`` as plain values, which ``Axis(**d)`` reads back; with ``sparse``,
+    only the fields not at their defaults, so that a field added later leaves the document of every
+    axis not using it unchanged (the lender's ``layout_id``)."""
+    out = {}
+    for f in dataclasses.fields(Axis):
+        value = getattr(axis, f.name)
+        if sparse and f.default is not dataclasses.MISSING and value == f.default:
+            continue
+        out[f.name] = list(value) if isinstance(value, tuple) else value
+    return out
 
 
 def layout_to_dict(layout: PageLayout) -> dict:
@@ -1022,7 +1025,7 @@ def layout_to_dict(layout: PageLayout) -> dict:
                 "size": b.size,
                 "tensors": [
                     {
-                        "axes": [_axis_to_dict(a) for a in t.axes],
+                        "axes": [axis_to_dict(a) for a in t.axes],
                         "offset": t.offset,
                         "name": t.name,
                         "dtype": t.dtype,
@@ -1071,17 +1074,7 @@ def layout_from_dict(data: Mapping) -> PageLayout:
                 size=b["size"],
                 tensors=tuple(
                     Tensor(
-                        tuple(
-                            Axis(
-                                a["name"],
-                                a["extent"],
-                                a["stride"],
-                                tuple(a["split"]),
-                                a["held"],
-                                a["cyclic"],
-                            )
-                            for a in t["axes"]
-                        ),
+                        tuple(Axis(**a) for a in t["axes"]),
                         t["offset"],
                         t["name"],
                         t.get("dtype"),

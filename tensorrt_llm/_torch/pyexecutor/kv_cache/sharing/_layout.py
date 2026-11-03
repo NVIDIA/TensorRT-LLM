@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 import numpy as np
 
-from ..page_layout import BufferDesc, PageLayout, replicated
+from ..page_layout import BufferDesc, PageLayout, axis_to_dict, replicated
 from ..page_table import DevicePool, ManagerLayout  # noqa: F401  DevicePool: the lender's pools
 
 if TYPE_CHECKING:
@@ -90,17 +90,8 @@ def _tensors_document(buffer: BufferDesc) -> list[dict] | None:
         return None
     out = []
     for tensor in buffer.tensors:
-        axes = []
-        for axis in tensor.axes:
-            doc = {"name": axis.name, "extent": int(axis.extent), "stride": int(axis.stride)}
-            if axis.split:
-                doc["split"] = list(axis.split)
-            if axis.held is not None:
-                doc["held"] = int(axis.held)
-            if axis.cyclic:
-                doc["cyclic"] = True
-            axes.append(doc)
-        doc = {"axes": axes}
+        # Every field of every axis, so a field ``Axis`` gains is hashed without a change here.
+        doc = {"axes": [axis_to_dict(axis, sparse=True) for axis in tensor.axes]}
         if tensor.name:
             doc["name"] = tensor.name
         if tensor.offset:

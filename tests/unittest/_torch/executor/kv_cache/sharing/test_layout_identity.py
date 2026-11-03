@@ -286,6 +286,31 @@ def test_named_keys_at_their_defaults_are_left_out_and_others_are_written():
 
 
 @pytest.mark.cpu_only
+def test_layout_id_hashes_every_axis_field():
+    """The lender hashes each axis as ``page_layout.axis_to_dict`` writes it, so a field ``Axis``
+    gains reaches ``layout_id`` with no change to the lender: every field, each set away from its
+    default by one of these buffers, appears in the hashed document. A new field is set here too.
+    """
+    layout = make_layout(layers=((0,), (1,)))
+    key, scale, other = layout.buffers
+    cyclic = Tensor((Axis("head", 4, 5, ("tp",), cyclic=True), Axis("byte", 5, 1)))
+    buffers = (
+        dataclasses.replace(key, tensors=head_major(50, 5, 10)),  # split, held
+        dataclasses.replace(scale, tensors=(cyclic,)),
+        other,
+    )
+    document = layout_document(dataclasses.replace(layout, buffers=buffers))
+    hashed = {
+        field
+        for buffer in document["buffers"]
+        for tensor in buffer.get("tensors", ())
+        for axis in tensor["axes"]
+        for field in axis
+    }
+    assert hashed == {f.name for f in dataclasses.fields(Axis)}
+
+
+@pytest.mark.cpu_only
 def test_enums_encode_by_name_and_a_whole_buffer_is_its_default_tensor():
     whole = _replace_buffers(make_layout(), tensors=replicated(20))
     assert whole == make_layout() and layout_id(whole) == layout_id(make_layout())
@@ -2786,6 +2811,7 @@ def test_the_layout_types_keep_their_module_fields_and_members():
             *(t.__name__ for t in LAYOUT_TYPES),
             "GRID_DIMENSIONS",
             "Progression",
+            "axis_to_dict",
             "content_shard",
             "grid_place",
             "head_major",
