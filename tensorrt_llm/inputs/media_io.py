@@ -1118,8 +1118,11 @@ def open_allowed_local_media(url: str) -> int:
     The file is opened once, without following a symlink in its final
     component, and the regular-file and size checks run on the open descriptor.
     An entry swapped for a symlink, FIFO or device after the path was resolved
-    is therefore refused instead of opened. The caller owns the descriptor and
-    closes it. Blocking; call it on an executor.
+    is therefore refused instead of opened. Where ``/proc/self/fd`` reports the
+    location of an open file, that location is checked against the directory
+    as well, so a directory on the path swapped for a symlink after resolution
+    is refused too. The caller owns the descriptor and closes it. Blocking;
+    call it on an executor.
     """
     refused = ValueError(
         "Local media paths are not accepted by this server. Send the media as "
@@ -1158,6 +1161,14 @@ def open_allowed_local_media(url: str) -> int:
         if not S_ISREG(stat.st_mode):
             raise ValueError(f"Local media path is not a regular file: {url!r}")
         _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
+        # The containment check above looked at the path; this one looks at
+        # the file that was opened. O_NOFOLLOW guards only the last component,
+        # so a directory on the path that became a symlink in between was
+        # followed, and the open file then lies outside the root.
+        if _DESCRIPTOR_DIR == "/proc/self/fd":
+            opened = os.readlink(f"{_DESCRIPTOR_DIR}/{fd}")
+            if not os.path.isabs(opened) or os.path.commonpath([root, opened]) != root:
+                raise refused
     except OSError as exc:
         os.close(fd)
         raise ValueError(f"Local media file could not be read: {url!r}") from exc
