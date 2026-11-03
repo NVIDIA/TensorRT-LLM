@@ -26,13 +26,14 @@ produces the same values:
 * :func:`store_context_latents` -- the masked store of the context latents of
   every drafter layer into its page pool.
 * :func:`scatter_rows_to_pool` -- rows into a paged pool at given pages and
-  offsets.
+  offsets, optionally only the rows a mask selects.
+* :func:`draft_fp8_cast` -- ``to_draft_fp8`` of a contiguous tensor.
 
 Launch shapes depend only on host batch sizes, so all of them are CUDA-graph
 capturable.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 import triton
@@ -498,13 +499,17 @@ def _scatter_rows_kernel(
     stride_dst_off,
     pages_ptr,
     offsets_ptr,
+    rows_mask_ptr,
     width,
     BLOCK_D: tl.constexpr,
     POOL_FP8: tl.constexpr,
+    HAS_ROWS_MASK: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_D)
     mask = offs < width
+    if HAS_ROWS_MASK:
+        mask = mask & (tl.load(rows_mask_ptr + row) != 0)
     page = tl.load(pages_ptr + row)
     off = tl.load(offsets_ptr + row)
     vals = tl.load(src_ptr + row.to(tl.int64) * stride_src + offs, mask=mask)
@@ -519,11 +524,13 @@ def scatter_rows_to_pool(
     pool: torch.Tensor,
     pages: torch.Tensor,
     offsets: torch.Tensor,
+    rows_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """``pool[pages[i], offsets[i]] = src[i]`` for a ``[pages, page_size, D]`` pool view.
 
     The same writes as the eager advanced-index assignment; an FP8 E4M3 pool
-    stores ``to_draft_fp8(src[i])``.
+    stores ``to_draft_fp8(src[i])``. Rows where ``rows_mask`` (bool or integer
+    ``[rows]``) is 0 write nothing, so their slots keep their values.
     """
     rows, width = src.shape
     if rows == 0:
@@ -531,6 +538,11 @@ def scatter_rows_to_pool(
     assert src.stride(-1) == 1 and pool.stride(-1) == 1 and pool.shape[-1] == width
     pool_fp8 = pool.dtype == torch.float8_e4m3fn
     assert pool_fp8 or pool.dtype == src.dtype
+    if rows_mask is not None:
+        rows_mask = rows_mask.reshape(-1)
+        assert rows_mask.numel() == rows and rows_mask.is_contiguous()
+        if rows_mask.dtype == torch.bool:
+            rows_mask = rows_mask.view(torch.uint8)
     _scatter_rows_kernel[(rows,)](
         src,
         src.stride(0),
@@ -539,8 +551,32 @@ def scatter_rows_to_pool(
         pool.stride(1),
         pages,
         offsets,
+        pages if rows_mask is None else rows_mask,
         width,
         BLOCK_D=triton.next_power_of_2(width),
         POOL_FP8=pool_fp8,
+        HAS_ROWS_MASK=rows_mask is not None,
         num_warps=4,
     )
+
+
+@triton.jit
+def _draft_fp8_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    v = tl.load(src_ptr + offs, mask=mask).to(tl.float32)
+    # clamp(-448, 448) keeping NaN (min / max would drop it), then round to nearest even.
+    clamped = tl.minimum(tl.maximum(v, -448.0), 448.0)
+    v = tl.where(v != v, v, clamped)
+    tl.store(dst_ptr + offs, v.to(tl.float8e4nv), mask=mask)
+
+
+def draft_fp8_cast(x: torch.Tensor) -> torch.Tensor:
+    """``to_draft_fp8(x)`` (saturated E4M3 at unit scale) of a contiguous tensor, one launch."""
+    assert x.is_contiguous() and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+    out = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    numel = x.numel()
+    if numel:
+        block = 4096
+        _draft_fp8_kernel[(triton.cdiv(numel, block),)](x, out, numel, BLOCK=block, num_warps=4)
+    return out

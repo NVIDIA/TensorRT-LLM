@@ -151,3 +151,42 @@ def test_scatter_rows_saturates_into_an_fp8_pool():
     torch.cuda.synchronize()
     assert torch.equal(pool.view(torch.uint8), reference)
     assert pool[pages[0], offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_masked_scatter_keeps_other_ranks_slots(fp8):
+    """A helix rank's store: rows it does not own leave their slot as it was, what the
+    gather / where / index_put round trip wrote back."""
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import scatter_rows_to_pool
+
+    rows, num_pages, page = 14, 6, 32
+    gen = torch.Generator(device="cuda").manual_seed(9)
+    src = (torch.randn(rows, HEAD_DIM, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:rows]
+    pages, offsets = flat // page, flat % page
+    owned = (torch.rand(rows, 1, device="cuda", generator=gen) < 0.5).view(-1, 1)
+    pool = (torch.randn(num_pages, page, HEAD_DIM, device="cuda", generator=gen) * 2).to(
+        torch.bfloat16
+    )
+    if fp8:
+        pool = to_draft_fp8(pool)
+    expected = pool.view(torch.uint8).clone()
+    stored = to_draft_fp8(src) if fp8 else src
+    rewritten = torch.where(owned, stored.view(torch.uint8), expected[pages, offsets])
+    expected[pages, offsets] = rewritten
+    scatter_rows_to_pool(src, pool, pages, offsets, rows_mask=owned)
+    torch.cuda.synchronize()
+    assert torch.equal(pool.view(torch.uint8), expected)
+
+
+def test_draft_fp8_cast_matches_to_draft_fp8():
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import draft_fp8_cast
+
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    x = (torch.randn(3, 7, 4, HEAD_DIM, device="cuda", generator=gen) * 200).to(torch.bfloat16)
+    x.view(-1)[:4] = torch.tensor([449.0, 1e4, -1e4, 1e-6], device="cuda").to(x.dtype)
+    out = draft_fp8_cast(x)
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.uint8), to_draft_fp8(x).view(torch.uint8))

@@ -113,7 +113,11 @@ from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
 from ..speculative.dflash_attention import DRAFT_FP8_KV_SCALE, HelixDraftShard, to_draft_fp8
 from ..speculative.interface import SpeculativeDecodingMode
-from ..speculative.spec_tail_kernels import DraftBlockPlacement, scatter_rows_to_pool
+from ..speculative.spec_tail_kernels import (
+    DraftBlockPlacement,
+    draft_fp8_cast,
+    scatter_rows_to_pool,
+)
 from ..speculative.vocab_parallel import markov_chain_logits
 from ..utils import AuxStreamType, swizzle_sf, unswizzle_sf
 from .modeling_deepseekv4 import (
@@ -4037,7 +4041,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470),
         # kept by a 576-wide row sliced at 512. detach() because from_dlpack refuses
         # grad-requiring tensors, which the pool write adds outside inference_mode.
-        kernel_query = to_draft_fp8(query.detach()) if fp8 else query.detach()
+        if not fp8:
+            kernel_query = query.detach()
+        elif query.is_contiguous():
+            kernel_query = draft_fp8_cast(query.detach())
+        else:
+            kernel_query = to_draft_fp8(query.detach())
         q_latent = kernel_query[..., :d_latent].permute(2, 3, 1, 0)
         q_rope = kernel_query[..., d_latent:].permute(2, 3, 1, 0)
         c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
@@ -4091,13 +4100,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         """Query rope half into ``query`` and the block latents normed, rotated and
         stored at ``fixup``'s positions, one launch (``dspark_mla_block_rope``).
 
-        A BF16 pool is written directly; an FP8 pool gets BF16 scratch rows that
-        one scatter stores as ``to_draft_fp8``.
+        A BF16 pool is written directly. An FP8 pool or a helix-sharded one gets
+        BF16 scratch rows that one scatter stores (as ``to_draft_fp8``; under
+        helix only the rows this rank's pages hold, ``fixup.owned``).
         """
         num_tokens, num_heads = q.shape[0] * q.shape[1], q.shape[2]
         pool = ctx_kv_cache[layer_idx][:, 0, 0]
         pages, offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
-        direct = pool.dtype == blk_latent.dtype
+        direct = pool.dtype == blk_latent.dtype and fixup.owned is None
         if direct:
             dst, dst_pages, dst_offsets = pool, pages, offsets
         else:
@@ -4118,7 +4128,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             attn.kv_a_layernorm.variance_epsilon,
         )
         if not direct:
-            scatter_rows_to_pool(dst.view(num_tokens, -1), pool, pages, offsets)
+            scatter_rows_to_pool(
+                dst.view(num_tokens, -1), pool, pages, offsets, rows_mask=fixup.owned
+            )
 
     def _block_scratch_index(self, num_tokens: int, device):
         """Pages ``arange(num_tokens)`` and offsets 0 of ``[num_tokens, 1, D]`` scratch rows."""
@@ -4384,9 +4396,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         shard = self.ctx_helix_shard
         # Per layer, one kernel rotates the query's rope half and normalizes,
         # rotates and stores the block latents (the RoPE table read by position);
-        # bitwise the separate launches. Other ranks' slots of a helix-sharded
-        # cache must keep their values, so that takes the separate launches.
-        fused_rope = self._fused_mla_rope and variant == "cute_dsl" and shard is None
+        # bitwise the separate launches.
+        fused_rope = self._fused_mla_rope and variant == "cute_dsl"
         if fused_rope:
             blk_freqs = None
             freqs_real = self._mla_freqs_real(device)
@@ -4444,6 +4455,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             }[variant],
             key="mla_dspark_block_decode_variant",
         )
+        # Helix: the tokens this rank holds no key of, for every layer.
+        helix_zero_kv = None if shard is None else fixup.kv_bounds_i32 == 0
         # Eager path only: dense key mask over the gathered context.
         if not use_kernel:
             if paged:
@@ -4546,14 +4559,20 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 # Every rank holds part of each request's context: attend with
                 # every head over the rank's pages, then merge the partials into
                 # this rank's heads by their softmax stats.
-                ctx_out, stats = self._mla_paged_attention(
-                    allgather(query, attn.mapping, dim=2),
-                    blk_kv,
-                    ctx_kv_cache[layer_idx],
-                    fixup,
-                    block_size,
-                    capacity,
-                )
+                all_heads_query = allgather(query, attn.mapping, dim=2)
+                if blk_kv is None:
+                    ctx_out, stats = self._cute_dsl_block_decode(
+                        all_heads_query, ctx_kv_cache[layer_idx], fixup, block_size
+                    )
+                else:
+                    ctx_out, stats = self._mla_paged_attention(
+                        all_heads_query,
+                        blk_kv,
+                        ctx_kv_cache[layer_idx],
+                        fixup,
+                        block_size,
+                        capacity,
+                    )
                 ctx_out = _helix_post_process(
                     # [tokens, heads * latent], the layout the target's MLA hands over.
                     ctx_out.view(batch * block_size, attn_heads * latent_dim),
@@ -4561,7 +4580,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     self._helix_mapping,
                     num_heads,
                     latent_dim,
-                    zero_kv_mask=fixup.kv_bounds_i32 == 0,
+                    zero_kv_mask=helix_zero_kv,
                 ).view(batch, block_size, num_heads, latent_dim)
             elif blk_kv is None:
                 # The fused kernel already stored the block latents.
