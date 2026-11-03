@@ -12,8 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The VisualGen 422 renderer shared by the route-level (``RequestValidationError``)
-and handler-level (``ValidationError``) entry points. Private module."""
+"""The VisualGen 422 renderer.
+
+Shared by the route-level (``RequestValidationError``) and handler-level
+(``ValidationError``) entry points. Private module.
+"""
 
 from http import HTTPStatus
 from typing import Callable, Union

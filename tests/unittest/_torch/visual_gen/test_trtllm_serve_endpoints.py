@@ -37,10 +37,10 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.serve.api.visual_gen.metrics import SERVER_TIMING_HEADER
 from tensorrt_llm.serve.api.visual_gen.protocol import VideoJob
-from tensorrt_llm.serve.openai_server import _normalize_image_output
-from tensorrt_llm.serve.visual_gen_metrics import SERVER_TIMING_HEADER
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE
+from tensorrt_llm.serve.api.visual_gen.serving_images import _normalize_image_output
+from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE
 from tensorrt_llm.visual_gen.output import VisualGenMetrics, VisualGenOutput
 from tensorrt_llm.visual_gen.params import prepare_reference_slots, validate_visual_gen_params
 
@@ -749,7 +749,7 @@ def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, m
 def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
     """The stamp has one-second resolution, so two servers that start together
     would otherwise share a directory and interleave their media."""
-    from tensorrt_llm.serve.openai_server import _new_media_dir
+    from tensorrt_llm.serve.api.visual_gen.media import _new_media_dir
 
     with patch("tensorrt_llm.serve.openai_server.datetime") as clock:
         clock.now.return_value = datetime(2026, 9, 15, 7, 12, 38)
@@ -2746,7 +2746,7 @@ class TestVisualGenValidationErrorRendering:
         whose ``loc`` entries carry FastAPI's leading ``body`` segment."""
         from fastapi.exceptions import RequestValidationError
 
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
         from tensorrt_llm.serve.openai_server import OpenAIServer
 
         pydantic_exc = self._pydantic_unknown_field_error()
@@ -2766,7 +2766,7 @@ class TestVisualGenValidationErrorRendering:
         """With no error entries the message falls back to ``str(exc)``."""
         from fastapi.exceptions import RequestValidationError
 
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
         from tensorrt_llm.serve.openai_server import OpenAIServer
 
         exc = RequestValidationError([])
@@ -2783,7 +2783,7 @@ class TestVisualGenValidationErrorRendering:
 
         from fastapi.responses import Response
 
-        from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+        from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
 
         calls = []
         sentinel = Response(status_code=422)
@@ -3594,13 +3594,13 @@ class TestTensorOnlyFormatRule:
         }
 
     def test_no_specs_is_a_noop(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         assert _resolve_tensor_only_format("auto", {"action_mode": "policy"}, None) == "auto"
         assert _resolve_tensor_only_format("auto", None, self._specs(a=True)) == "auto"
 
     def test_only_a_declared_param_triggers(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True, stg_scale=False)
         # a non-declaring param must not force a tensor payload
@@ -3610,13 +3610,13 @@ class TestTensorOnlyFormatRule:
         )
 
     def test_null_value_does_not_trigger(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True)
         assert _resolve_tensor_only_format("auto", {"action_mode": None}, specs) == "auto"
 
     def test_encoder_format_raises_naming_the_parameter(self):
-        from tensorrt_llm.serve.openai_video_routes import _resolve_tensor_only_format
+        from tensorrt_llm.serve.api.visual_gen.serving_videos import _resolve_tensor_only_format
 
         specs = self._specs(action_mode=True)
         with pytest.raises(ValueError, match="action_mode"):

@@ -28,7 +28,7 @@ from tensorrt_llm.serve.api.visual_gen.protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.serve.visual_gen_utils import (
+from tensorrt_llm.serve.api.visual_gen.utils import (
     _merge_extra_params,
     _warn_if_set_with_no_semantic,
     parse_visual_gen_params,

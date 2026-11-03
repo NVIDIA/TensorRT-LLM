@@ -1,14 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Video-generation route handlers for the OpenAI-compatible server.
-
-Extracted from ``openai_server.py`` as a small mixin to keep that file
-under the project's per-file line budget. ``OpenAIServer`` consumes this
-mixin via subclassing; the handlers reach back into the server via
-``self`` (e.g. ``self.generator``, ``self.media_storage_path``,
-``self.create_error_response``, ``self.video_gen_tasks``), so behavior
-is strictly unchanged from the inlined version.
-"""
 
 from __future__ import annotations
 
@@ -30,21 +21,19 @@ from pydantic import ValidationError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
-from tensorrt_llm.serve._visual_gen_errors import render_visual_gen_validation_error
+from tensorrt_llm.serve.api.visual_gen.errors import render_visual_gen_validation_error
+from tensorrt_llm.serve.api.visual_gen.metrics import (
+    build_visual_gen_server_timings,
+    build_visual_gen_timing_headers,
+)
 from tensorrt_llm.serve.api.visual_gen.protocol import (
     VideoGenerationRequest,
     VideoJob,
     VideoJobList,
 )
-from tensorrt_llm.serve.visual_gen_metrics import (
-    build_visual_gen_server_timings,
-    build_visual_gen_timing_headers,
-)
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE, parse_visual_gen_params
 
 if TYPE_CHECKING:
-    # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
-    # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen.params import VisualGenParams
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
@@ -61,6 +50,7 @@ def _video_content_type(suffix: str) -> str:
 # File suffixes the GET /v1/videos/{id}/content and DELETE
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
+
 
 # Reference fields whose multipart text form is a JSON object, not a scalar.
 _REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
@@ -134,15 +124,7 @@ def _path_json_video_response(
     return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
-class _VideoRoutesMixin:
-    """Mixin providing the eight video-generation endpoints.
-
-    Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
-    ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
-    their own initializer.
-    """
-
+class VideoServing:
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
 
