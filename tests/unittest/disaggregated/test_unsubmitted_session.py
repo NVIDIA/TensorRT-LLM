@@ -218,7 +218,15 @@ def test_worker_orders_session_ack_after_piece_reports(
         task.mark_physical_operation_in_doubt(0)
         empty = np.empty(0, dtype=np.int64)
         meta = transfer_mod.WriteMeta(
-            task, 1, "gen", 0, "tcp://gen:1234", 401, empty, empty, empty,
+            task,
+            1,
+            "gen",
+            0,
+            "tcp://gen:1234",
+            401,
+            empty,
+            empty,
+            empty,
             kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
         )
         initial = transfer_mod._make_kv_result_msg(
