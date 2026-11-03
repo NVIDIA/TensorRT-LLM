@@ -48,7 +48,7 @@ are left out of the plan (``dispatch.WINDOWED_CONTEXT_ARENA_PATHS``); over a
 windowed arena (``TRTLLM_DFLASH_WINDOWED_CTX_ARENA``) the paths that write the
 arena by column (``dispatch.FULL_CONTEXT_ARENA_PATHS``: the context-K/V fork and
 the verify fold) stay where the composition serves the window compaction too
-(sm103 tep4), and are left out otherwise. The installers
+(sm103 tep4 and tep8), and are left out otherwise. The installers
 ask the plan per fast path (``Plan.enabled``); each paragraph below names one
 fast path of ``dispatch.FAST_PATHS``. Their installers live under
 ``kernels/<fast path>/`` and their launches under ``ops/<category>/``.
@@ -178,7 +178,7 @@ Hops and boundaries:
   forks no prefetch of the pool weight. After the weights load,
   ``verify_direct_publish`` checks the kernel the published o_proj captures; a
   step that raises while armed resets the transport.
-* ``multi_request_post_attention_hop`` (sm103 tep4 only) arms the same joins on decode
+* ``multi_request_post_attention_hop`` (sm103 tep4 and tep8) arms the same joins on decode
   steps of 9..1024 rows (two to 128 requests at K = 7) with ``ops/allreduce/post_attn_hop_wide``:
   the o_proj partial skips the built-in MNNVL all-reduce and one kernel reduces it, joins
   it into the residual and applies the pre-FFN norm on the cluster boundary's 9..32-row
@@ -382,9 +382,9 @@ decode steps' head logits stay BF16 and are sampled by
 ``ops/spec/head_sampler.py``; ``lm_head_inbox`` also lets the LM-head GEMM
 write into a multicast inbox that the sampler gathers from (and fires the
 context-K/V fork's head fork point right after that GEMM); ``wide_split_sampler``
-(tep4 on sm_103 only) widens the head to decode steps of 129..1024 rows, which the
+(tep4 and tep8) widens the head to decode steps of 129..1024 rows, which the
 sampler takes on the shipped sampler's 512-thread block (``target_head.widen``);
-``vocab_parallel_head`` (tep4) samples and argmaxes decode steps of
+``vocab_parallel_head`` (tep4 and tep8) samples and argmaxes decode steps of
 16 rows or more from each rank's own vocabulary shard, without the logits all-gather.
 """
 
@@ -853,8 +853,8 @@ _TEP4_ONLY_PATHS = frozenset(
         "half_window_experts",
     }
 )
-#: The fast paths validated at a tep4 rank's shape on sm103, which no TEP8 composition
-#: serves: the multi-request
+#: The fast paths validated at a tep4 rank's shape, which ``_TEP8_PATHS`` leaves out
+#: (sm103 TEP8 adds ``_SM103_TEP8_MULTI_REQUEST_PATHS`` of them): the multi-request
 #: decode prep append, the windowed drafter arena compaction, the router GEMM of
 #: multi-request calls, the multi-request decode FMHA, the full-attention
 #: decode FMHA over an over-subscribed KV split, the MoE output all-reduce of 129..1024-row
@@ -896,6 +896,33 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
 )
 #: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones.
 _TEP8_PATHS = _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
+#: The paths of ``_SM103_TEP4_ONLY_PATHS`` that sm103 TEP8 serves on top of ``_TEP8_PATHS``:
+#: those whose kernels take a TP8 rank -- any head count (the multi-request decode prep
+#: append), 2 KV heads of 8 query heads each (``multi_request_split_kv.RANK_KV_HEADS``), no
+#: rank shape (the router GEMM over the replicated router, the drafter arena compaction,
+#: the split sampler on the gathered row) or eight ranks over two trays' fabric
+#: (``post_attn_hop_wide``, ``head_sampler.VocabParallelWorkspace``). They act on decode
+#: steps of two or more requests (16 rows and up at K = 7), which every other TEP8 decode
+#: path leaves to the built-in modules: the decode prep append of every layer and the
+#: decode FMHA of the full-attention layers, the router logits of 9..512-row calls, the
+#: post-attention hop of 9..1024-row steps on its own transports, the verify head on
+#: each rank's vocabulary shard from 16 rows and the split verify sampler on
+#: 129..1024-row steps. The windowed drafter arena's compaction keeps the context-K/V
+#: fork and the verify fold in the plan over the windowed arena (``dispatch.compose``).
+#: Left out: ``decode_kv_splits`` (its split acts only on the decode FMHA calls
+#: ``multi_request_split_kv`` declines and on mixed steps), ``wide_persistent_experts``
+#: (no sm103 composition serves its wide build yet) and the paths written for one tray.
+_SM103_TEP8_MULTI_REQUEST_PATHS = frozenset(
+    {
+        "multi_request_prep_append",
+        "multi_request_split_kv",
+        "router_gemm",
+        "multi_request_post_attention_hop",
+        "vocab_parallel_head",
+        "wide_split_sampler",
+        "drafter_window_compact",
+    }
+)
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
 _TEP4_BITWISE_PATHS = frozenset(
@@ -980,7 +1007,8 @@ _PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
 #: (``dispatch.compose``) decides which served levers a deployment is built with.
 TARGET_PATHS = {
     (103, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
+        served=_TEP8_PATHS | _SM103_TEP8_MULTI_REQUEST_PATHS | _PREFETCH_LEVERS,
+        topology=_dispatch.TWO_TRAYS_OF_4,
     ),
     (103, 4): _dispatch.TargetPaths(
         served=_SM103_TEP4_PATHS,
