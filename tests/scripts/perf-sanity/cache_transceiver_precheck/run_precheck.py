@@ -179,10 +179,12 @@ def unpack_msg(raw, key):
 
 def params_to_wire(p):
     """ContextPhaseParams -> JSON-safe dict (fields per executor/result.py)."""
+    # Empty DataTransceiverState: no comm state, no cache state, and not arbitrary.
+    opaque_state = p.opaque_state or bytes([0, 0, 0])
     return {
         "first_gen_tokens": list(p.first_gen_tokens or []),
         "req_id": p.req_id,
-        "opaque_state": base64.b64encode(p.opaque_state or b"").decode(),
+        "opaque_state": base64.b64encode(opaque_state).decode(),
         "draft_tokens": list(p.draft_tokens) if p.draft_tokens is not None else None,
         "ctx_dp_rank": p.ctx_dp_rank,
         "ctx_info_endpoint": p.disagg_info_endpoint,
