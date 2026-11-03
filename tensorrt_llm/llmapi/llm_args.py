@@ -2018,6 +2018,8 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
             return self
         if "auxiliary_sms" not in self.model_fields_set:
             self.auxiliary_sms = _HALO_R_DEFAULT_AUXILIARY_SMS
+            # The resolved default stays unset, like HALO-Q's field default.
+            self.model_fields_set.discard("auxiliary_sms")
         if self.auxiliary_sms < _HALO_R_MIN_AUXILIARY_SMS:
             raise ValueError(
                 f"`planner: halo_r` requires `auxiliary_sms` >= "

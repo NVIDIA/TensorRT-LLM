@@ -441,9 +441,19 @@ class TestMoeConfigPerLayerDynamicEplb:
         config = MoeConfig(load_balancer=values)
         assert direct.auxiliary_sms == default
         assert config.load_balancer.auxiliary_sms == default
-        if planner != "halo_r":
-            # HALO-Q leaves the field default alone: an unset value stays unset.
-            assert "auxiliary_sms" not in direct.model_fields_set
+        # Either planner's default leaves the field unset.
+        assert "auxiliary_sms" not in direct.model_fields_set
+
+    def test_resolved_halo_r_default_follows_a_new_planner(self) -> None:
+        values = self._per_layer_dynamic()
+        values["planner"] = "halo_r"
+        resolved = MoePerLayerDynamicLoadBalancerConfig(**values)
+        assert resolved.auxiliary_sms == 16
+
+        dumped = resolved.model_dump(exclude_unset=True)
+        dumped["planner"] = "halo_q"
+
+        assert MoePerLayerDynamicLoadBalancerConfig(**dumped).auxiliary_sms == 4
 
     def test_halo_r_yaml_defaults_to_sixteen_auxiliary_sms(
             self, tmp_path: Path) -> None:
