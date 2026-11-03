@@ -857,12 +857,11 @@ KVCacheManagerConfig makeDeclaredReuseConfig(int alignment = 1, ReusePolicy seco
                 .allocationUnit = AllocationUnit::kFixed,
                 .reusePolicy = ReusePolicy::PRIVATE,
                 .reuseAlignment = 101}};
-    config.layers
-        = { AttentionLayerConfig{.layerId = 0,
-            .buffers = {BufferConfig{.role = "key", .size = 4096, .allocationGroupId = AllocationGroupId{10}},
-                BufferConfig{.role = "first", .size = 8192, .allocationGroupId = AllocationGroupId{20}},
-                BufferConfig{.role = "second", .size = 16384, .allocationGroupId = AllocationGroupId{30}},
-                BufferConfig{.role = "private", .size = 2048, .allocationGroupId = AllocationGroupId{40}}}};
+    config.layers = {AttentionLayerConfig{.layerId = 0,
+        .buffers = {BufferConfig{.role = "key", .size = 4096, .allocationGroupId = AllocationGroupId{10}},
+            BufferConfig{.role = "first", .size = 8192, .allocationGroupId = AllocationGroupId{20}},
+            BufferConfig{.role = "second", .size = 16384, .allocationGroupId = AllocationGroupId{30}},
+            BufferConfig{.role = "private", .size = 2048, .allocationGroupId = AllocationGroupId{40}}}}};
     return config;
 }
 
