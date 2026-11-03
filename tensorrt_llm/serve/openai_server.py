@@ -2291,13 +2291,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
-            # sees the full prompt. The extension decides from the request; a
-            # server-level chat template may end differently, so report
-            # unadjusted usage when one is configured.
-            excluded_tokens = extension.prompt_tokens_excluded_from_usage(
-                request)
-            if excluded_tokens and self.chat_template is None:
-                postproc_args.num_prompt_tokens_offset = excluded_tokens
+            # sees the full prompt.
+            postproc_args.num_prompt_tokens_offset = (
+                render_resources.prompt_tokens_excluded_from_usage(
+                    add_generation_prompt=request.add_generation_prompt,
+                    pre_tokenized=request.prompt_token_ids is not None
+                    or request.prompt_token_ids_b64 is not None,
+                    request_chat_template=request.chat_template,
+                ))
             if dynamic_tool_params:
                 # The tool parser must see dynamic tools to recognize their
                 # calls in the model output.
@@ -3329,29 +3330,26 @@ class OpenAIServer(_VideoRoutesMixin):
         """Trailing rendered prompt tokens the usage of ``request`` leaves out.
 
         Off the Harmony path this route renders its input as the chat route
-        renders a chat request with a generation prompt and no request-level
-        template, so the model's serving extension decides for that chat
-        request and both routes report the same prompt usage for the same
-        prompt (kimi_k3 leaves out its generation channel opener). As on the
-        chat route, a server-level chat template may end the prompt
-        differently, so such prompts are reported unadjusted.
+        renders a request with a generation prompt and no request-level
+        template, and asks the same question about it, so both routes report
+        the same prompt usage for the same prompt (kimi_k3 leaves out its
+        generation channel opener).
         """
-        if self.use_harmony or self.chat_template is not None:
+        if self.use_harmony:
             return 0
         # A generation-only handoff runs the prompt the context worker relayed
-        # instead of rendering one: to the extension, a pre-tokenized request.
+        # instead of rendering one.
         params = request.disaggregated_params
-        relayed = params is not None and params.request_type == "generation_only"
-        rendered_as = ChatCompletionRequest.model_construct(
-            model=request.model,
-            messages=[],
+        relayed = (params is not None
+                   and params.request_type == "generation_only"
+                   and (request.prompt_token_ids is not None
+                        or request.prompt_token_ids_b64 is not None))
+        render_resources = RenderResources.from_server(self)
+        return render_resources.prompt_tokens_excluded_from_usage(
             add_generation_prompt=True,
-            prompt_token_ids=request.prompt_token_ids if relayed else None,
-            prompt_token_ids_b64=request.prompt_token_ids_b64
-            if relayed else None,
+            pre_tokenized=relayed,
+            request_chat_template=None,
         )
-        extension = RenderResources.from_server(self).extension
-        return extension.prompt_tokens_excluded_from_usage(rendered_as)
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:

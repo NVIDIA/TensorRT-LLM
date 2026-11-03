@@ -20,7 +20,9 @@ window a conversation has spent and to decide when to compact; without it a
 long session keeps appending turns until it overflows the context window.
 """
 
+import base64
 import json
+import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -304,10 +306,10 @@ async def _render(*, conversation, add_generation_prompt, **kwargs):
 class _FinishedGeneration:
     """What the engine hands back for a request: finished, one output, one step."""
 
-    def __init__(self, prompt_token_ids, disaggregated_params=None):
+    def __init__(self, prompt_token_ids, disaggregated_params=None, cached_tokens=_CACHED_TOKENS):
         self.id = 1
         self.prompt_token_ids = prompt_token_ids
-        self.cached_tokens = _CACHED_TOKENS
+        self.cached_tokens = cached_tokens
         self.outputs = [
             CompletionOutput(
                 index=0,
@@ -336,8 +338,20 @@ class _FinishedGeneration:
         return self._steps.pop()
 
 
-def _serve(tmp_path, model_type, *, tokenizer=None, chat_template=None):
-    """Chat and Responses routes of one server; returns (client, prompts sent to the engine)."""
+def _serve(
+    tmp_path,
+    model_type,
+    *,
+    tokenizer=None,
+    chat_template=None,
+    cached_tokens=_CACHED_TOKENS,
+    allow_request_chat_template=False,
+):
+    """Chat, Messages and Responses routes of one server.
+
+    Returns (client, prompts sent to the engine). ``cached_tokens`` is the engine's count of
+    reused prompt tokens, or a function of the prompt token ids that gives it.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -353,17 +367,20 @@ def _serve(tmp_path, model_type, *, tokenizer=None, chat_template=None):
         else:
             ids = list(inputs)
         prompts.append(ids)
-        return _FinishedGeneration(ids, disaggregated_params)
+        cached = cached_tokens(ids) if callable(cached_tokens) else cached_tokens
+        return _FinishedGeneration(ids, disaggregated_params, cached_tokens=cached)
 
     model_config = type("ModelConfig", (), {"model_type": model_type, "vocab_size": 1024})()
     server = make_stub_openai_server(
         tmp_path, "test-model", model_config, generate_async, tokenizer=tokenizer
     )
     server.chat_template = chat_template
+    server.allow_request_chat_template = allow_request_chat_template
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
     app = FastAPI()
     app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
     app.add_api_route("/v1/responses", server.openai_responses, methods=["POST"])
     return TestClient(app), prompts
 
@@ -514,8 +531,149 @@ def test_a_relayed_prompt_without_context_usage_is_counted_as_chat_counts_it(ser
     assert responses[0] == chat[0] == 5
 
 
+_RECORDING = "usage-facts-model"
+
+
+@pytest.fixture
+def asked(monkeypatch):
+    """Rendering facts the serving extension of ``_RECORDING`` is asked about, in order."""
+    from tensorrt_llm.serve import serving_extensions
+
+    recorded = []
+
+    class RecordingExtension(serving_extensions.ServingExtension):
+        def prompt_tokens_excluded_from_usage(self, **facts):
+            recorded.append(facts)
+            return 3
+
+    serving_extensions.load_builtin_extensions()
+    monkeypatch.setitem(serving_extensions._BY_MODEL_TYPE, _RECORDING, RecordingExtension())
+    return recorded
+
+
+@pytest.mark.parametrize(
+    "relayed",
+    [
+        {},
+        {"prompt_token_ids": [5, 4, 3, 2, 1]},
+        {"prompt_token_ids_b64": base64.b64encode(struct.pack("<5i", 5, 4, 3, 2, 1)).decode()},
+    ],
+    ids=["rendered", "relayed_ids", "relayed_b64"],
+)
+def test_both_routes_ask_the_extension_the_same_question(serve, asked, relayed):
+    """Both routes hand the extension how the prompt is rendered, and the same facts for it."""
+    client, _ = serve(_RECORDING)
+    fields = {}
+    if relayed:
+        fields = {**relayed, "disaggregated_params": {"request_type": "generation_only"}}
+
+    _chat_usage(client, False, **fields)
+    _responses_usage(client, False, store=False, **fields)
+
+    facts = {
+        "add_generation_prompt": True,
+        "pre_tokenized": bool(relayed),
+        "request_chat_template": None,
+    }
+    assert asked == [facts, facts]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"chat_template": "{{ messages }}"}, {"add_generation_prompt": False}],
+    ids=["request_chat_template", "no_generation_prompt"],
+)
+def test_chat_puts_how_its_request_renders_to_the_extension(serve, asked, fields):
+    client, _ = serve(_RECORDING, allow_request_chat_template=True)
+
+    _chat_usage(client, False, **fields)
+
+    assert asked == [
+        {
+            "add_generation_prompt": fields.get("add_generation_prompt", True),
+            "pre_tokenized": False,
+            "request_chat_template": fields.get("chat_template"),
+        }
+    ]
+
+
+def test_neither_route_asks_the_extension_under_a_server_chat_template(serve, asked):
+    client, _ = serve(_RECORDING, chat_template="{{ messages }}")
+
+    _chat_usage(client, False)
+    _responses_usage(client, False)
+
+    assert asked == []
+
+
+def _messages_usage(client):
+    """(input_tokens, cache_read_input_tokens) of an Anthropic Messages request for ``_QUESTION``."""
+    body = {
+        "model": "test-model",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": _QUESTION}],
+    }
+    response = client.post("/v1/messages", json=body)
+    assert response.status_code == 200, response.text
+    usage = response.json()["usage"]
+    return usage["input_tokens"], usage.get("cache_read_input_tokens") or 0
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
-def test_a_postprocessing_worker_counts_the_prompt_as_chat_completions_does(stream):
+def test_cached_tokens_never_exceed_the_reported_prompt(serve, stream):
+    """An identical retry reuses all but the last prompt token: more than the reported prompt.
+
+    Clients take the uncached input as prompt minus cached tokens, so every route caps the
+    cached count at the prompt count it reports.
+    """
+    client, prompts = serve("kimi_k3", cached_tokens=lambda prompt: len(prompt) - 1)
+
+    chat = _chat_usage(client, stream)
+    responses = _responses_usage(client, stream)
+
+    prompt_tokens = len(prompts[0]) - 3
+    assert chat == responses == (prompt_tokens, prompt_tokens + len(_ANSWER_TOKENS), prompt_tokens)
+
+
+def test_messages_counts_no_more_input_than_chat_completions(serve):
+    """Messages input is the uncached plus the cached tokens: chat's prompt count, not more."""
+    client, prompts = serve("kimi_k3", cached_tokens=lambda prompt: len(prompt) - 1)
+
+    input_tokens, cache_read_input_tokens = _messages_usage(client)
+
+    assert (input_tokens, cache_read_input_tokens) == (0, len(prompts[0]) - 3)
+
+
+def test_every_continuous_chat_usage_caps_the_cached_tokens(serve):
+    client, prompts = serve("kimi_k3", cached_tokens=lambda prompt: len(prompt) - 1)
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": _QUESTION}],
+        "stream": True,
+        "stream_options": {"include_usage": True, "continuous_usage_stats": True},
+    }
+
+    response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    usages = [chunk["usage"] for chunk in _sse_data(response.text) if chunk.get("usage")]
+    prompt_tokens = len(prompts[0]) - 3
+    # The role chunk, the content chunk and the final usage chunk.
+    assert len(usages) == 3
+    for usage in usages:
+        assert usage["prompt_tokens"] == prompt_tokens
+        assert usage["prompt_tokens_details"]["cached_tokens"] == prompt_tokens
+
+
+@pytest.mark.parametrize(
+    ("cached_tokens", "reported_cached_tokens"),
+    [(_CACHED_TOKENS, _CACHED_TOKENS), (19, 17)],
+    ids=["cached_within_the_reported_prompt", "cached_beyond_the_reported_prompt"],
+)
+@pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+def test_a_postprocessing_worker_counts_the_prompt_as_chat_completions_does(
+    stream, cached_tokens, reported_cached_tokens
+):
     """On a postprocessing worker the executor records the prompt length; the offset applies there."""
     request = ResponsesRequest(model="m", input=_QUESTION, stream=stream)
     sampling_params = request.to_sampling_params()
@@ -534,24 +692,25 @@ def test_a_postprocessing_worker_counts_the_prompt_as_chat_completions_does(stre
         role="assistant", model="m", stream_options=StreamOptions(include_usage=True), **counts
     )
 
+    def result():
+        return _FinishedGeneration([], cached_tokens=cached_tokens)
+
     if stream:
         (completed,) = [
             event
             for event in _sse_data(
-                "".join(
-                    responses_api_streaming_post_processor(_FinishedGeneration([]), responses_args)
-                )
+                "".join(responses_api_streaming_post_processor(result(), responses_args))
             )
             if event["type"] == "response.completed"
         ]
         usage = completed["response"]["usage"]
-        chat_usage = _sse_data(
-            "".join(chat_stream_post_processor(_FinishedGeneration([]), chat_args))
-        )[-1]["usage"]
+        chat_usage = _sse_data("".join(chat_stream_post_processor(result(), chat_args)))[-1][
+            "usage"
+        ]
     else:
-        usage = responses_api_post_processor(_FinishedGeneration([]), responses_args).usage
+        usage = responses_api_post_processor(result(), responses_args).usage
         usage = usage.model_dump()
-        chat_usage = chat_response_post_processor(_FinishedGeneration([]), chat_args).usage
+        chat_usage = chat_response_post_processor(result(), chat_args).usage
         chat_usage = chat_usage.model_dump()
 
     assert usage["input_tokens"] == chat_usage["prompt_tokens"] == 17
@@ -559,7 +718,7 @@ def test_a_postprocessing_worker_counts_the_prompt_as_chat_completions_does(stre
     assert (
         usage["input_tokens_details"]["cached_tokens"]
         == chat_usage["prompt_tokens_details"]["cached_tokens"]
-        == _CACHED_TOKENS
+        == reported_cached_tokens
     )
 
 

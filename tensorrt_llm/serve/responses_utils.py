@@ -2184,6 +2184,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,
