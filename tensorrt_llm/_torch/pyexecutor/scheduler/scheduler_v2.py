@@ -2182,7 +2182,14 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
             if not self._is_recompute_pause_candidate(victim, inflight_request_ids):
                 continue
-            if not self.kv_cache_manager.is_request_active(victim.py_request_id):
+            # A suspended request keeps its pages on GPU once the lower tier is
+            # full, and otherwise holds lower-tier pages whose release lets
+            # other suspended pages move down, so with a tier it is a victim
+            # that frees room either way.
+            if (
+                not self.kv_cache_manager.has_cache_tier_below_gpu
+                and not self.kv_cache_manager.is_request_active(victim.py_request_id)
+            ):
                 continue
 
             if not self._preempt_or_defer(victim, recompute_paused):

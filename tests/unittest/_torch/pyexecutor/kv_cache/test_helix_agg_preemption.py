@@ -646,6 +646,76 @@ def test_prefill_only_pressure_recompute_pauses_with_host_tier() -> None:
     assert first_recompute_paused == (2,)
 
 
+# Request 2 fills most of the pool and decodes while the older request 1 is
+# still mid-prefill; request 1's later chunks need more pages than the
+# four-page host tier can take from request 2.
+HOST_FULL_PRESSURE = Scenario(
+    prompt_lens={1: 448, 2: 352},
+    max_new_tokens={1: 8, 2: 64},
+    max_num_tokens=128,
+    chunk_unit=TOKENS_PER_BLOCK,
+)
+
+
+def _decode_behind_a_partial_prefill(ranks: list) -> list:
+    """Leave request 1 one chunk into its prefill and request 2, behind it,
+    decoding in an almost full pool on every rank.
+
+    FCFS chunking gives the whole token budget to the oldest prompt, so request
+    2 would not finish its prefill first; leaving request 1 out of the active
+    list while request 2 prefills is what lets it.
+    """
+    scenario = HOST_FULL_PRESSURE
+    requests = [{i: _make_request(i, scenario) for i in scenario.prompt_lens} for _ in ranks]
+    for request_id, num_steps in ((1, 1), (2, 3)):
+        for _ in range(num_steps):
+            decisions = [
+                _step(cp_rank, manager, scheduler, [rank_requests[request_id]], scenario)
+                for cp_rank, ((manager, scheduler), rank_requests) in enumerate(
+                    zip(ranks, requests)
+                )
+            ]
+            assert all(d == decisions[0] for d in decisions), decisions
+    for (manager, _), rank_requests in zip(ranks, requests):
+        assert manager.impl.get_storage_statistics(GPU_LEVEL)[0].free == 0
+        assert rank_requests[1].state == LlmRequestState.CONTEXT_INIT
+        assert rank_requests[2].state == LlmRequestState.GENERATION_IN_PROGRESS
+    return [[rank_requests[1], rank_requests[2]] for rank_requests in requests]
+
+
+def test_full_host_tier_recompute_pauses_a_suspended_request_holding_gpu_pages() -> None:
+    """Request 2 suspends itself, and request 1's chunks move its pages to the
+    host tier until that is full. The rest of request 2's pages stay on GPU, so
+    request 1 can continue only once the context path recompute-pauses request
+    2, which every rank does, and both finish.
+
+    The starting state is built directly; how often serving reaches it needs a
+    multi-GPU run.
+    """
+    scenario = HOST_FULL_PRESSURE
+    ranks = [
+        _make_rank(cp_rank, scenario, host_cache_size=HOST_TIER_BYTES) for cp_rank in range(CP_SIZE)
+    ]
+    active = _decode_behind_a_partial_prefill(ranks)
+
+    suspended: set[int] = set()
+    recompute_paused_after_suspend: list[int] = []
+    for _ in range(MAX_ITERATIONS):
+        if not any(active):
+            break
+        decisions = [
+            _step(cp_rank, manager, scheduler, rank_active, scenario)
+            for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
+        ]
+        assert all(d == decisions[0] for d in decisions), decisions
+        _, _, paused, recompute_paused = decisions[0]
+        recompute_paused_after_suspend.extend(r for r in recompute_paused if r in suspended)
+        suspended.update(paused)
+
+    assert not any(active), "requests did not finish"
+    assert recompute_paused_after_suspend == [2]
+
+
 # Kimi K3 keeps a fixed-size KDA recurrent state per request next to its
 # attention KV. These shapes match K3's per-rank KDA state (6 heads, K = V = 128,
 # conv width 4), so a state slot is ~2.25 MiB and the state pool is small.
