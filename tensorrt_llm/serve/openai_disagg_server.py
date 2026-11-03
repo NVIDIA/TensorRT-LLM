@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable, Optional
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -197,7 +198,12 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class _ResponsesStreamingResponse(ClosingStreamingResponse):
-    """Cancel the pipeline even when a disconnect precedes body iteration."""
+    """Release the pipeline however the response ends, body iterated or not.
+
+    A pipeline still running is cancelled, and the stream of one that has
+    answered is closed: the body may stop, or never start, before it has read
+    that stream to its end.
+    """
 
     def __init__(self, pipeline: asyncio.Future,
                  content: AsyncIterator[str]) -> None:
@@ -208,7 +214,27 @@ class _ResponsesStreamingResponse(ClosingStreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._pipeline.cancel()
+            pipeline = self._pipeline
+            pipeline.cancel()
+            if (pipeline.done() and not pipeline.cancelled()
+                    and pipeline.exception() is None
+                    and isinstance(pipeline.result(), StreamingResponse)):
+                with anyio.CancelScope(shield=True):
+                    await pipeline.result().body_iterator.aclose()
+
+
+def _guard_relayed_responses_stream(answer: Response) -> Response:
+    """``answer``, with a stream that fails early ending in an ``error`` event.
+
+    The stream is the generation worker's own, response.created included, so
+    there is no response of this server's to report as failed.
+    """
+    if not isinstance(answer, StreamingResponse):
+        return answer
+    return StreamingResponse(
+        content=guard_responses_stream(answer.body_iterator,
+                                       stream_error_event),
+        media_type="text/event-stream")
 
 
 def _error_response_message(response: Response) -> str:
@@ -478,14 +504,10 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
-                    stream = response_or_generator
-                    if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
-                        stream = guard_responses_stream(stream,
-                                                        stream_error_event)
+                    # openai_responses ends a Responses stream that fails early
+                    # with error events; other protocols end on a sentinel.
                     return StreamingResponse(
-                        content=stream,
+                        content=response_or_generator,
                         media_type="text/event-stream")
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
@@ -520,7 +542,7 @@ class OpenAIDisaggServer:
             pipeline.cancel()
             raise
         if pipeline.done():
-            return pipeline.result()
+            return _guard_relayed_responses_stream(pipeline.result())
         try:
             processor = ResponsesStreamingProcessor(
                 request=request,
@@ -530,7 +552,7 @@ class OpenAIDisaggServer:
         except ValueError:
             # The opening is built from the request alone; a request it cannot
             # be built from is answered when its pipeline answers.
-            return await pipeline
+            return _guard_relayed_responses_stream(await pipeline)
         # keep_responses_stream_alive repeats the opening's response.in_progress
         # whenever the stream is silent, as it is while the pipeline runs.
         return _ResponsesStreamingResponse(
@@ -550,8 +572,9 @@ class OpenAIDisaggServer:
         so that every keepalive the client gets repeats ``opening``'s
         response.in_progress. The status line is already out, so a pipeline
         that fails ends the stream with error and response.failed, which carry
-        the message of its error response. A stream abandoned before the
-        pipeline answers, as when the client disconnects, cancels the pipeline.
+        the message of its error response, and so does a pipeline's stream that
+        fails before its terminal event. A stream abandoned before the pipeline
+        answers, as when the client disconnects, cancels the pipeline.
         """
         try:
             for frame in opening:
@@ -570,10 +593,21 @@ class OpenAIDisaggServer:
                     STREAM_TERMINATION_UPSTREAM_ERROR, failure, len(opening)):
                 yield frame
             return
-        frames = relay_after_opening(answer.body_iterator, len(opening))
+        # The guard reads the worker's stream as it comes, so it knows whether
+        # the terminal event went out; its events are numbered on with the
+        # worker's by relay_after_opening.
+        frames = relay_after_opening(
+            guard_responses_stream(answer.body_iterator,
+                                   processor.get_stream_failed_events),
+            len(opening))
         try:
             async for frame in frames:
                 yield frame
+        except Exception:  # noqa: BLE001 - the guard has reported it
+            # The guard has logged the failure and sent error and
+            # response.failed, unless the terminal event had gone out: either
+            # way the response is over, and so is the stream.
+            return
         finally:
             await frames.aclose()
 
