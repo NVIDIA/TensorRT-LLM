@@ -1926,18 +1926,6 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self._validate_speculative_config(spec_config)
         self.is_disagg = is_disagg
-        # Both diagnostics below are off unless their environment variable is
-        # set; with neither set nothing here changes any allocation, any page
-        # content or any reported count.
-        self._guard_page_fill, self._guard_page_value = _read_guard_page_setting()
-        self.max_admissible_sequences, self._index_mapper_capacity = _compute_index_mapper_capacity(
-            max_batch_size,
-            mapping,
-            is_disagg=is_disagg,
-            disable_overlap_scheduler=disable_overlap_scheduler,
-            num_reserved_index_slots=num_reserved_index_slots,
-            has_guard_page=self._guard_page_value is not None,
-        )
         self.kv_connector_manager = kv_connector_manager
         codec_config = getattr(cold_page_codec_provider, "config", None)
         self._has_lossy_cold_page_codec = (
@@ -2291,6 +2279,19 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
 
+        # Both diagnostics below are off unless their environment variable is
+        # set; with neither set nothing here changes any allocation, any page
+        # content or any reported count. The IndexMapper capacity bounds the
+        # living KV caches, which the quota and the cache config below read.
+        self._guard_page_fill, self._guard_page_value = _read_guard_page_setting()
+        self.max_admissible_sequences, self._index_mapper_capacity = _compute_index_mapper_capacity(
+            max_batch_size,
+            mapping,
+            is_disagg=is_disagg,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            num_reserved_index_slots=num_reserved_index_slots,
+            has_guard_page=self._guard_page_value is not None,
+        )
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
         if (
