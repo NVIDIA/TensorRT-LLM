@@ -58,9 +58,10 @@ _CLICK_TO_LLM_ARG = {
 )
 @click.option(
     "--model",
-    required=True,
+    required=False,
     type=str,
-    help="Model name or Hugging Face checkpoint path.",
+    help=
+    "Model name or Hugging Face checkpoint path. Optional when scoring existing videos.",
 )
 @click.option("--tokenizer",
               type=str,
@@ -150,7 +151,7 @@ _CLICK_TO_LLM_ARG = {
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
 @click.pass_context
-def main(ctx, model: str, tokenizer: Optional[str],
+def main(ctx, model: Optional[str], tokenizer: Optional[str],
          custom_tokenizer: Optional[str], log_level: str, backend: str,
          max_beam_width: int, max_batch_size: int, max_num_tokens: int,
          max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
@@ -168,6 +169,11 @@ def main(ctx, model: str, tokenizer: Optional[str],
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
+
+    if model is None and ctx.invoked_subcommand != "video_generation_eval":
+        raise click.MissingParameter(ctx=ctx,
+                                     param_hint="--model",
+                                     param_type="option")
 
     if ctx.invoked_subcommand in (_IMAGE_GENERATION_EVAL_COMMAND,
                                   "video_generation_eval"):
