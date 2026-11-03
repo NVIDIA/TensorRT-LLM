@@ -3601,8 +3601,8 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     Three execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
-        dtype and run F.linear. Slow but correct -- used to seed M1 tests and
-        as a portable fallback.
+        dtype once after loading and run F.linear on it, at 2 more bytes per
+        parameter. Used to seed M1 tests and as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales

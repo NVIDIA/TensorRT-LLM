@@ -55,9 +55,13 @@ def check_marlin_capabilities(cls: type, p: MoEProblem, d: MoEDeployment) -> MoE
             f"{cls.__name__} W4A16 requires bfloat16 activations, got {p.dtype_act}",
         )
 
-    # ``_apply_activation`` reads the constants for SwigluBias only. Expert bias
-    # (the rest of the gpt-oss package) is turned down by
-    # ``capabilities.supports_expert_bias``.
+    if p.bias:
+        return _reject(
+            MoERejectReason.ACTIVATION_UNSUPPORTED,
+            f"{cls.__name__} has no expert bias; MiniMax-style SwigluBias without bias is eligible",
+        )
+
+    # ``_apply_activation`` reads the constants for SwigluBias only.
     if p.activation_constants and p.activation_type is not ActivationType.SwigluBias:
         return _reject(
             MoERejectReason.ACTIVATION_UNSUPPORTED,

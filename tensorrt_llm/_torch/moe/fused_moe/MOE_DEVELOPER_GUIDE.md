@@ -839,7 +839,9 @@ and still reject the format it arrives with. The gpt-oss package (per-expert
 bias plus filled `alpha` / `beta` / `limit`, summarized as
 `MoEProblem.swiglu_gptoss_style`) is declined by every specialized backend whose
 `kinds` omit `SwigluBias` (the CuteDSL grouped-GEMM leaves, the B12x leaves,
-`DeepGemmFusedMoE`, `TrtllmCutedslDenseGemmNvfp4Impl`, the Marlin leaves). The
+`DeepGemmFusedMoE`, `TrtllmCutedslDenseGemmNvfp4Impl`). The Marlin leaves run
+`SwigluBias` with scalar constants in `_apply_activation` and turn down the
+expert bias, so they serve MiniMax-M3 and not gpt-oss. The
 TRTLLM-Gen and CUTLASS leaves admit it per format through
 `supports_gptoss_style` (on CUTLASS: unquantized, MXFP8, NVFP4 and the three
 MXFP4 formats). The kernel takes the three constants for every format; what

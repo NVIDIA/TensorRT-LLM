@@ -675,6 +675,26 @@ def test_mxfp8_reference_path_caches_dequantized_weight(monkeypatch):
         lin._mxfp8_dequant_weight.float(), dequant_mxfp8_weight(w_e4m3_new, scale_new, 32).cuda()
     )
 
+    # A bucketed refit refreshes it once the finalize walk runs.
+    w_e4m3_new, scale_new = quant_bf16_to_mxfp8(torch.randn(out_f, in_f, dtype=torch.bfloat16), 32)
+    lin.load_weights([{"weight": w_e4m3_new}], allow_partial_loading=True)
+    lin.load_weights([{"weight_scale_inv": scale_new}], allow_partial_loading=True)
+    lin.process_weights_after_loading()
+    assert lin._mxfp8_dequant_weight.data_ptr() == address
+    assert torch.equal(
+        lin._mxfp8_dequant_weight.float(), dequant_mxfp8_weight(w_e4m3_new, scale_new, 32).cuda()
+    )
+
+    # Paths that share transformed weights only run the derived-state walk.
+    w_e4m3_new, scale_new = quant_bf16_to_mxfp8(torch.randn(out_f, in_f, dtype=torch.bfloat16), 32)
+    lin.weight.data.copy_(w_e4m3_new.cuda())
+    lin.weight_scale.data.copy_(scale_new.cuda())
+    lin.cache_derived_state()
+    assert lin._mxfp8_dequant_weight.data_ptr() == address
+    assert torch.equal(
+        lin._mxfp8_dequant_weight.float(), dequant_mxfp8_weight(w_e4m3_new, scale_new, 32).cuda()
+    )
+
 
 def _mxfp8_cutlass_op_available():
     if not torch.cuda.is_available():

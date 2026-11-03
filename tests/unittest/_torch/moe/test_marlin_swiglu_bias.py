@@ -90,6 +90,16 @@ def test_marlin_turns_down_a_clamp_it_would_not_apply() -> None:
         impl_class_for(report)
 
 
+@pytest.mark.cpu_only
+def test_marlin_turns_down_expert_bias() -> None:
+    """The gpt-oss package is SwigluBias plus an expert bias, which Marlin has no slot for."""
+    activation = SwigluBiasActivation(gate_sigmoid_scale=ALPHA, linear_offset=BETA, clamp=LIMIT)
+    with override_moe_environment(MoEEnvironment(sm=90)):
+        report = resolve_moe_impl(_marlin_config(), activation=activation, bias=True)
+    with pytest.raises(ValueError, match="MarlinCudaNvfp4Impl=activation_unsupported"):
+        impl_class_for(report)
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(
     not (torch.cuda.is_available() and is_nvfp4_marlin_supported_sm()),
