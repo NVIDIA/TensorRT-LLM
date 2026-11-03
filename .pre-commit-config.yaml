@@ -418,6 +418,10 @@ common-files: &common_files |
         tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/_base/serving.py |
+        tensorrt_llm/serve/api/openai/embeddings/serving.py |
+        tensorrt_llm/serve/api/openai/mm_encoder/serving.py |
+        tensorrt_llm/serve/api/openai/tokenize/serving.py |
         tensorrt_llm/serve/api/visual_gen/protocol.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
@@ -1158,6 +1162,10 @@ legacy-files: &legacy_files |
         tensorrt_llm/scheduling_params.py |
         tensorrt_llm/serve/__init__.py |
         tensorrt_llm/serve/_base/msgspec_route.py |
+        tensorrt_llm/serve/_base/serving.py |
+        tensorrt_llm/serve/api/openai/embeddings/serving.py |
+        tensorrt_llm/serve/api/openai/mm_encoder/serving.py |
+        tensorrt_llm/serve/api/openai/tokenize/serving.py |
         tensorrt_llm/serve/api/visual_gen/protocol.py |
         tensorrt_llm/serve/chat_utils.py |
         tensorrt_llm/serve/cluster_storage.py |
