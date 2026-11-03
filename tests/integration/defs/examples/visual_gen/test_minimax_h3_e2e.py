@@ -490,8 +490,18 @@ def test_minimax_h3_public_visual_gen_api_smoke() -> None:
         ("t2va", None, "heun"),
         ("fl2va", None, "heun"),
         ("ref2va", None, "heun"),
+        ("t2va", "FP8_BLOCK_SCALES", "heun"),
     ],
-    ids=["t2va", "fl2va", "t2va-fp8-blockwise", "ref2va", "t2va-heun", "fl2va-heun", "ref2va-heun"],
+    ids=[
+        "t2va",
+        "fl2va",
+        "t2va-fp8-blockwise",
+        "ref2va",
+        "t2va-heun",
+        "fl2va-heun",
+        "ref2va-heun",
+        "t2va-fp8-blockwise-heun",
+    ],
 )
 def test_minimax_h3_diffusers_lpips_and_audio_reference(
     task: str,
