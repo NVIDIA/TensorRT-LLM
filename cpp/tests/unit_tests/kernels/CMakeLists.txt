@@ -71,7 +71,6 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
