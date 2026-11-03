@@ -2066,6 +2066,7 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
 def test_profiling_failure_releases_resources_and_restores_response_state():
     creator = object.__new__(KvCacheCreator)
+    creator._is_kv_cache_manager_v2 = False
     creator._mapping = SimpleNamespace(cp_config={})
     creator._kv_cache_config = SimpleNamespace(free_gpu_memory_fraction=0.9)
     creator._skip_est = False
