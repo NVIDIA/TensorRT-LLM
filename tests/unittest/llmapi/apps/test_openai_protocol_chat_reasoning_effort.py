@@ -25,13 +25,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
-from openai_harmony import ReasoningEffort
+from openai_harmony import ReasoningEffort, Role
 from pydantic import ValidationError
 
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.harmony_adapter import maybe_transform_reasoning_effort
-from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
-from tensorrt_llm.serve.responses_utils import _get_system_message
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
+from tensorrt_llm.serve.responses_utils import _construct_harmony_messages
 
 from .openai_server_stub import make_stub_openai_server
 
@@ -180,8 +180,15 @@ def test_harmony_chat_prompt_gets_the_mapped_level(effort, level):
     assert adapter.reasoning_effort is level
 
 
-@pytest.mark.parametrize("effort, same_as", [("minimal", "low"), ("xhigh", "high")])
-def test_responses_harmony_system_message_maps_like_chat(effort, same_as):
-    assert _get_system_message(reasoning_effort=effort) == _get_system_message(
-        reasoning_effort=same_as
+@pytest.mark.parametrize(
+    "effort, level", [("minimal", ReasoningEffort.LOW), ("xhigh", ReasoningEffort.HIGH)]
+)
+def test_responses_harmony_system_message_gets_the_mapped_level(effort, level):
+    request = ResponsesRequest.model_validate(
+        {"model": "m", "input": "hi", "reasoning": {"effort": effort}}
     )
+
+    system_message = _construct_harmony_messages(request, prev_response=None)[0]
+
+    assert system_message.author.role == Role.SYSTEM
+    assert system_message.content[0].reasoning_effort is level
