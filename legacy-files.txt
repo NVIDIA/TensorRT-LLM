@@ -270,7 +270,6 @@ tensorrt_llm/_torch/pyexecutor/handle_logits.py
 tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py
 tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py
 tensorrt_llm/_torch/pyexecutor/llm_request.py
-tensorrt_llm/_torch/pyexecutor/model_engine.py
 tensorrt_llm/_torch/pyexecutor/model_loader.py
 tensorrt_llm/_torch/pyexecutor/py_executor.py
 tensorrt_llm/_torch/pyexecutor/py_executor_creator.py
@@ -519,12 +518,11 @@ tests/unittest/_torch/attention/test_rotary_embedding.py
 tests/unittest/_torch/attention/test_vanilla_attention.py
 tests/unittest/_torch/compilation/test_add_norm.py
 tests/unittest/_torch/debugger/test_debugger_addon.py
-tests/unittest/_torch/executor/test_chunked_logits.py
-tests/unittest/_torch/executor/test_executor_request_queue.py
-tests/unittest/_torch/executor/test_overlap_scheduler.py
-tests/unittest/_torch/executor/test_pytorch_model_engine.py
-tests/unittest/_torch/executor/test_resource_manager.py
-tests/unittest/_torch/executor/test_router_dealer_ipc.py
+tests/unittest/_torch/pyexecutor/test_chunked_logits.py
+tests/unittest/_torch/pyexecutor/test_executor_request_queue.py
+tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py
+tests/unittest/_torch/pyexecutor/test_resource_manager.py
+tests/unittest/_torch/pyexecutor/test_router_dealer_ipc.py
 tests/unittest/_torch/helpers.py
 tests/unittest/_torch/misc/test_autotuner.py
 tests/unittest/_torch/misc/test_share_tensor.py

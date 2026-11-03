@@ -9,7 +9,7 @@ targets (``_native``). Three things rest on that staying true: ``off`` loading
 nothing, a target never depending on a sibling, and CBTS testing a
 family-only change with that family's tests alone
 (``jenkins/scripts/cbts/cbts/rules/modeling_v2.py``). The tests here guard the
-rules that keep it true; none imports a target or needs a GPU.
+rules that keep it true for per-family libraries. None imports a target or needs a GPU.
 
 The paths are the source checkout's, found from this file: these are claims
 about the tree a PR changes, C++ included, not about an installed wheel.
@@ -303,6 +303,10 @@ def test_native_code_loads_only_when_routing_picks_its_target():
             assert _is_docstring_or_future(node), (
                 f"{init.relative_to(_REPO)}:{node.lineno} -- a family package holds a docstring only"
             )
+    for init in sorted(_MODELS.glob("*/ops/__init__.py")):
+        assert all(_is_docstring_or_future(node) for node in ast.parse(init.read_text()).body), (
+            f"{init.relative_to(_REPO)}: importing unrelated ops must not load a native library"
+        )
     for routing in sorted(_MODELS.glob("*/routing.py")):
         for node in ast.parse(routing.read_text()).body:
             assert not (isinstance(node, ast.ImportFrom) and node.level == 1), (
@@ -367,7 +371,7 @@ def test_cmake_and_python_agree_on_names_and_architectures(tmp_path):
     architecture coverage in Python; the build computes them in modeling_v2.cmake."""
     names = ["gpt_oss", "minimax_m3", "r1_0528_nvfp4__sm_10x__default"]
     script = tmp_path / "probe.cmake"
-    lines = [f'include("{_CMAKE_MODULE}")']
+    lines = ["cmake_minimum_required(VERSION 3.18)", f'include("{_CMAKE_MODULE}")']
     for name in names:
         lines += [
             f'_modeling_v2_ident(i "{name}")',

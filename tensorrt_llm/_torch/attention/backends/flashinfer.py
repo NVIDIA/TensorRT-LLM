@@ -1356,15 +1356,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             max_query_tokens_per_sequence = cast(int,
                                                  q_and_kv_seqlens.max().item())
 
-            if flashinfer_backend == "cudnn":
-                # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
-                key_value_indptr = key_value_indptr.clone(
-                )  # unalias query_output_indptr
-                query_output_indptr[1:].mul_(num_query_output_heads *
-                                             attention_head_dim)
-                key_value_indptr[1:].mul_(num_key_value_heads *
-                                          attention_head_dim)
-
         if (multi_item_params := plan_params.multi_item_params) is not None:
             if flashinfer_backend not in ["fa2", "fa3"]:
                 raise ValueError(
