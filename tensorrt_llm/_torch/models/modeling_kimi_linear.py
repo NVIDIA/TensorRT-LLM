@@ -1770,6 +1770,10 @@ class KimiK3MoERuntime(nn.Module):
     # and this layer's operands on this rank, built after loading where the front applies.
     _moe_front_ws = None
     _moe_front_plan = None
+    # enable_min_latency on the column-parallel tail: latent_up's UE8M0 block exponents for the
+    # one-kernel MoE tail (``kimi_k3_moe_tail``); None where it does not apply.
+    _min_latency: bool = False
+    _moe_tail_wexp: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -1795,6 +1799,8 @@ class KimiK3MoERuntime(nn.Module):
         """
         super().__init__()
         self.layer_idx = layer_idx
+        # Lossy decode kernels at <= 8 rows (``_prepare_min_latency_tail``).
+        self._min_latency = model_config.enable_min_latency
         self.hidden_size = cfg.hidden_size
         self.num_experts = cfg.num_experts
         self.top_k = cfg.num_experts_per_token
@@ -2046,7 +2052,7 @@ class KimiK3MoERuntime(nn.Module):
         return one_shot
 
     def _column_parallel_tail(
-        self, routed_latent: torch.Tensor, shared_partial: torch.Tensor
+        self, routed_latent: torch.Tensor, shared_partial: torch.Tensor, tail_targets=None
     ) -> Tuple[Union[torch.Tensor, MnnvlPendingResult], Optional[torch.Tensor]]:
         """The MoE tail split by latent_up's output rows (``runs_column_parallel_tail``).
 
@@ -2061,6 +2067,10 @@ class KimiK3MoERuntime(nn.Module):
         """
         up = self.routed_expert_up_proj
         shared_ar = self.shared_experts.down_proj.all_reduce
+        if tail_targets is not None:
+            # enable_min_latency: the routed experts pushed their latent rows; one kernel finishes
+            # the latent all-reduce and stores this rank's columns into the all-gather call.
+            return self._moe_tail(routed_latent, shared_partial, *tail_targets), None
         latent, latent_scale = self.routed_experts.all_reduce(
             routed_latent,
             all_reduce_params=AllReduceParams(
@@ -2078,6 +2088,33 @@ class KimiK3MoERuntime(nn.Module):
         shared_ar.push_input(target, shared_partial)
         shared_ar.push_input(target, columns, columns=self.latent_up_rows[0])
         return shared_ar.finish_push(target), None
+
+    def _moe_tail(self, routed_latent: torch.Tensor, shared_partial: torch.Tensor, ag, latent):
+        """The one-kernel MoE tail (``kimi_k3_moe_tail``) on the latent all-reduce the routed
+        experts pushed into, then the shared partial's push; returns the pending all-gather
+        call."""
+        from ..kernels.blackwell import kimi_k3_moe_tail
+
+        num_tokens = routed_latent.shape[0]
+        shared_ar = self.shared_experts.down_proj.all_reduce
+        lat_view, ag_view = latent.view, ag.view
+        kimi_k3_moe_tail.run_moe_tail(
+            m=num_tokens,
+            world=lat_view.world,
+            lat_uc=lat_view.uc_local,
+            lat_flags=lat_view.flags,
+            weight=self.routed_expert_up_proj.weight,
+            wexp=self._moe_tail_wexp,
+            gamma=self.routed_expert_norm.weight,
+            eps=float(self.routed_expert_norm.variance_epsilon),
+            ag_base=ag_view.mc_base,
+            ag_flags=ag_view.flags,
+            c0=self.latent_up_rows[0],
+            rows=self.latent_up_rows[1],
+            ag_follows=lat_view.flags.data_ptr() == ag_view.flags.data_ptr(),
+        )
+        shared_ar.push_input(ag, shared_partial.reshape(num_tokens, self.hidden_size).contiguous())
+        return shared_ar.finish_push(ag)
 
     def _latent_up_takes_mxfp8(self, routed_latent: torch.Tensor) -> bool:
         """Whether the routed latent all-reduce hands latent_up the MXFP8 form of the normalized
@@ -2101,6 +2138,68 @@ class KimiK3MoERuntime(nn.Module):
 
     def cache_derived_state(self) -> None:
         self._prepare_moe_front()
+        self._prepare_min_latency_tail()
+
+    def _prepare_min_latency_tail(self) -> None:
+        """``enable_min_latency`` (lossy): on the column-parallel tail of at most 8 rows the MoE tail
+        is one kernel fed by the routed experts' pushed latent rows (``kimi_k3_moe_tail``). Builds
+        its operands on this rank."""
+        self._moe_tail_wexp = None
+        if not self._min_latency or self.latent_up_rows is None:
+            return
+        from ..kernels.blackwell import kimi_k3_moe_tail
+
+        up = self.routed_expert_up_proj
+        world = self.routed_experts.all_reduce.mapping.tp_size
+        if (
+            isinstance(up, _Fp8BlockScaleWeightReadLinear)
+            and tuple(up.weight.shape) == (kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT)
+            and kimi_k3_moe_tail.can_run(1, world, self.latent_up_rows[1])
+        ):
+            up.transform_weights()
+            up._prepare_low_m_gemm()
+            if up._low_m_weight_scale is not None:
+                wexp = kimi_k3_moe_tail.block_exponents(
+                    up._low_m_weight_scale, kimi_k3_moe_tail.HIDDEN, kimi_k3_moe_tail.LATENT
+                )
+                if 1 <= int(wexp.min().item()) and int(wexp.max().item()) <= 254:
+                    self._moe_tail_wexp = wexp
+
+    def _min_latency_tail_applies(self, num_tokens: int) -> bool:
+        """Whether this column-parallel tail forward runs the one-kernel MoE tail."""
+        from ..kernels.blackwell import kimi_k3_moe_tail
+
+        return (
+            self._moe_tail_wexp is not None
+            and isinstance(self.routed_experts.backend, MoEImplBase)
+            and kimi_k3_moe_tail.can_run(
+                num_tokens, self.routed_experts.all_reduce.mapping.tp_size, self.latent_up_rows[1]
+            )
+        )
+
+    def _min_latency_tail_targets(self, num_tokens: int):
+        """``(all-gather call, latent all-reduce)`` push targets of a one-kernel MoE tail, with the
+        routed experts asked to push their output into the latent all-reduce, or None."""
+        from ..kernels.blackwell import kimi_k3_moe_tail
+
+        if not self._min_latency_tail_applies(num_tokens):
+            return None
+        shared_ar = self.shared_experts.down_proj.all_reduce
+        # The all-gather call first: it may grow a workspace both calls share.
+        ag = shared_ar.push_target(num_tokens, self.hidden_size, all_gather=True)
+        latent = self.routed_experts.all_reduce.push_target(
+            num_tokens, self.moe_hidden_size, consumer_finishes=True
+        )
+        if (
+            ag is None
+            or latent is None
+            or not latent.one_shot
+            or latent.view.world != ag.view.world
+            or not kimi_k3_moe_tail.can_run(num_tokens, latent.view.world, self.latent_up_rows[1])
+            or not self.routed_experts.backend.push_output_into(latent.view, num_tokens)
+        ):
+            return None
+        return ag, latent
 
     def _moe_front_unsupported(self) -> Optional[str]:
         """Why this layer cannot run the sharded decode front (``kimi_k3_moe_front``), or
@@ -2595,6 +2694,10 @@ class KimiK3MoERuntime(nn.Module):
         shared output is None (see :meth:`_column_parallel_tail`).
         """
         cp_tail = column_parallel_tail and self.runs_column_parallel_tail(hidden_states.shape[0])
+        # enable_min_latency: the one-kernel tail (the routed experts then push their output).
+        tail_targets = None
+        if cp_tail and self._min_latency:
+            tail_targets = self._min_latency_tail_targets(hidden_states.shape[0])
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -2756,7 +2859,7 @@ class KimiK3MoERuntime(nn.Module):
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if cp_tail:
-            return self._column_parallel_tail(routed_out, shared_out)
+            return self._column_parallel_tail(routed_out, shared_out, tail_targets)
         if self._reduce_routed_output and self._latent_up_takes_mxfp8(routed_out):
             # The MNNVL all-reduce also quantizes the normalized latent the way latent_up's
             # low-M GEMM would (RMS_NORM_QUANT_MXFP8), which then skips its quantization.

@@ -346,6 +346,15 @@ class MoEImplBase(
         """
         return None
 
+    def push_output_into(self, view: object, num_tokens: int) -> bool:
+        """Ask the next ``run_moe`` (of ``num_tokens`` tokens, before any other) to also push its
+        output rows into slot ``(token, view.rank)`` of the one-shot MNNVL all-reduce on ``view``
+        (a ``distributed.ops.LamportWorkspaceView``) for a consumer that finishes it; returns
+        whether it will. Declining (False) is the default; overriding this is how a backend
+        opts in.
+        """
+        return False
+
     def try_route_with_sort(
         self, router_logits: "torch.Tensor"
     ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":

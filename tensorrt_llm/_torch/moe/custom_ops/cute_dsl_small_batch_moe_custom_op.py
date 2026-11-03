@@ -126,10 +126,15 @@ class _SmallBatchMoeRunner:
         die_major: bool,
         published_routing: bool,
         expert_offset: int,
+        push_mc: int,
+        push_flags: torch.Tensor | None,
+        push_rank: int,
+        push_world: int,
     ) -> None:
         import cutlass
         import cutlass.cute as cute
         from cuda.bindings import driver as cuda
+        from cutlass import Int32, Int64
 
         from ..kernels.rubin.rubin_small_batch_fused_moe import (
             MAX_SLICES,
@@ -160,6 +165,9 @@ class _SmallBatchMoeRunner:
         assert m // 128 <= _MAX_TILES and counters.numel() >= counter_words(m // 128)
         assert expanded_idx_to_permuted_idx.numel() == orig_m * top_k
         n_tok = n_tok_for(orig_m)
+        if push_world:
+            # the push follows the slice combine
+            deterministic_combine = True
         if num_ctas <= 0:
             num_ctas = _persistent_ctas(x.device.index, n_tok)
         h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=x.device)
@@ -217,6 +225,7 @@ class _SmallBatchMoeRunner:
             die_major,
             sm_domain_words,
             published_routing,
+            push_world,
             TRTLLM_ENABLE_PDL,
         )
         compiled = cls.kernel_cache.get(key)
@@ -240,12 +249,33 @@ class _SmallBatchMoeRunner:
                 die_major=die_major,
                 sm_domain_words=sm_domain_words,
                 published_routing=published_routing,
+                output_push_world=push_world,
             )
             compiled = cute.compile(
-                kernel.wrapper, *ptrs, orig_m, m, num_local, expert_offset, num_ctas, stream
+                kernel.wrapper,
+                *ptrs,
+                orig_m,
+                m,
+                num_local,
+                expert_offset,
+                Int64(push_mc),
+                Int64(push_flags.data_ptr() if push_flags is not None else 0),
+                Int32(push_rank),
+                num_ctas,
+                stream,
             )
             cls.kernel_cache[key] = compiled
-        compiled(*ptrs, orig_m, m, num_local, expert_offset, stream)
+        compiled(
+            *ptrs,
+            orig_m,
+            m,
+            num_local,
+            expert_offset,
+            Int64(push_mc),
+            Int64(push_flags.data_ptr() if push_flags is not None else 0),
+            Int32(push_rank),
+            stream,
+        )
 
 
 @torch.library.custom_op(
@@ -280,6 +310,10 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     die_major: bool = False,
     published_routing: bool = False,
     expert_offset: int = 0,
+    push_mc: int = 0,
+    push_flags: torch.Tensor | None = None,
+    push_rank: int = 0,
+    push_world: int = 0,
 ) -> None:
     """Routed NVFP4 SiTU MoE of at most 32 tokens: writes the sum of this rank's experts'
     weighted down-projections into every element of ``output`` [tokens, hidden].
@@ -296,6 +330,9 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     (``token_indexed``): instead of the tables, ``expanded_idx_to_permuted_idx`` holds the top-k
     ids, which a routing kernel publishes into :func:`small_batch_moe_route_word` of ``counters``
     (the other table arguments are not read); ``expert_offset``: this rank's first expert.
+    ``push_world`` > 0: also push the output rows into slot ``(token, push_rank)`` of the
+    one-shot MNNVL all-reduce over ``push_world`` ranks whose multicast base is ``push_mc`` and
+    state ``push_flags`` (its consumer finishes it); runs the slice combine.
     """
     if die_major:
         fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale = (
@@ -329,6 +366,10 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
         die_major,
         published_routing,
         expert_offset,
+        push_mc,
+        push_flags,
+        push_rank,
+        push_world,
     )
 
 
@@ -360,5 +401,9 @@ def _(
     die_major=False,
     published_routing=False,
     expert_offset=0,
+    push_mc=0,
+    push_flags=None,
+    push_rank=0,
+    push_world=0,
 ) -> None:
     return None

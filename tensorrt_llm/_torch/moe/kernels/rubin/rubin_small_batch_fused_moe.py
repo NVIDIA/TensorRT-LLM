@@ -68,6 +68,10 @@ tables, and writes every element of the routed output.
   local experts in ascending order are the tiles, ``moe_sort``'s tile order at <= 32 tokens) and
   start the weight stream without waiting for the routing grid; the token warp and the epilogue
   wait for it before they read the tokens or write the output. Same tables, same arithmetic.
+* Output push (``output_push_world``, slice combine): the task that combines an m-tile also
+  stores its BF16 rows into slot ``(token, rank)`` of every rank's current buffer of a one-shot
+  MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for a consumer
+  that finishes that all-reduce (the Kimi-K3 one-kernel MoE tail).
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
   released right after it (every consumer of the output waits for the whole grid).
 """
@@ -84,6 +88,7 @@ from cutlass._mlir.dialects import llvm, math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ....kernels.blackwell import mnnvl_pushed_allreduce as pushed_ar
 from .utils import fmin, griddepcontrol_launch_dependents, griddepcontrol_wait
 
 #: L2 eviction hint for the streamed expert weights (CacheHintSm90::EVICT_FIRST).
@@ -422,6 +427,21 @@ def _red_shared_or(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _bf16x2_bits(lo, hi, *, loc=None, ip=None):
+    """Two FP32 values rounded to BF16 (nearest even), ``lo`` in the low half."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _bit(n, *, loc=None, ip=None):
     """``1 << n`` for ``0 <= n < 32``."""
     return Int32(
@@ -553,6 +573,8 @@ class RubinSmallBatchFusedMoeKernel:
     :param sm_domain_words: :func:`pack_sm_domain_words` of the device (with ``die_major``).
     :param published_routing: Tables built in the kernel from the top-k the routing kernel
         publishes (token-indexed layout only).
+    :param output_push_world: Also push the output rows into a one-shot all-reduce over that many
+        ranks (slice combine only; 0: off).
     """
 
     @staticmethod
@@ -594,8 +616,11 @@ class RubinSmallBatchFusedMoeKernel:
         die_major: bool = False,
         sm_domain_words: tuple = (),
         published_routing: bool = False,
+        output_push_world: int = 0,
     ):
         assert self.supports(n_tok, n1, k1), (n_tok, n1, k1)
+        assert not output_push_world or deterministic_combine, "the push follows the slice combine"
+        self.output_push_world = output_push_world
         assert not published_routing or token_indexed, "published routing is token-indexed"
         self.published_routing = published_routing
         assert not die_major or sm_domain_words, "die-major claiming needs the SM table"
@@ -721,6 +746,9 @@ class RubinSmallBatchFusedMoeKernel:
         ws_ptr: cute.Pointer,
         orig_m: Int32,
         expert_offset: Int32,
+        push_mc: Int64,
+        push_flags: Int64,
+        push_rank: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -850,6 +878,9 @@ class RubinSmallBatchFusedMoeKernel:
             ws_ptr,
             orig_m,
             expert_offset,
+            push_mc,
+            push_flags,
+            push_rank,
             a_layout,
             b_layout,
             sfa_layout,
@@ -961,6 +992,9 @@ class RubinSmallBatchFusedMoeKernel:
         ws_ptr: cute.Pointer,
         orig_m: Int32,
         expert_offset: Int32,
+        push_mc: Int64,
+        push_flags: Int64,
+        push_rank: Int32,
         a_layout: cute.ComposedLayout,
         b_layout: cute.ComposedLayout,
         sfa_layout: cute.Layout,
@@ -1138,6 +1172,7 @@ class RubinSmallBatchFusedMoeKernel:
                 ns,
                 et,
                 wg,
+                (push_mc, push_flags, push_rank),
             )
             cute.arch.sync_warp()
             with cute.arch.elect_one():
@@ -1906,6 +1941,7 @@ class RubinSmallBatchFusedMoeKernel:
         ns: Int32,
         et: Int32,
         wg: Int32,
+        push,
     ):
         """Every epilogue warp walks the CTA's units. FC1 units (warpgroup 0): the accumulator
         into a token-major staging buffer, SiTU and NVFP4 quantization of 16 outputs of one row
@@ -2179,6 +2215,7 @@ class RubinSmallBatchFusedMoeKernel:
                             orig_m,
                             et,
                             wg,
+                            push,
                         )
             e += 1
             u, _g = self._q_read(st, e)
@@ -2201,6 +2238,7 @@ class RubinSmallBatchFusedMoeKernel:
         orig_m,
         et,
         wg,
+        push,
     ):
         """Slice combine: the task's partial (rows of the tokens it touched, each thread its
         channel) and the m-tile's arrival; the last of the m-tile's ``ns`` tasks sums the slices in
@@ -2260,8 +2298,36 @@ class RubinSmallBatchFusedMoeKernel:
                         out_base + Int64(tk) * out_row_bytes + (c * _MMA_M + et) * 2,
                         racc[tk],
                     )
+            if cutlass.const_expr(self.output_push_world > 0):
+                self._push_rows(racc, push, c, orig_m, et)
             if et == 0:
                 _st_relaxed_u32(ctr + Int64(CTR_MTILE_BASE + c) * 4, 0)
+
+    @cute.jit
+    def _push_rows(self, racc, push, c, orig_m: Int32, et: Int32):
+        """Output push: lane groups of eight gather their eight channels of every token (BF16)
+        and the group's first lane stores them into the token's slot of the all-reduce."""
+        push_mc, push_flags, push_rank = push
+        cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+        lane = cute.arch.lane_idx()
+        group = lane - (lane & 7)
+        for tk in cutlass.range_constexpr(self.n_tok):
+            vals = [cute.arch.shuffle_sync(racc[tk], group + i) for i in range(8)]
+            if (lane & 7) == 0 and tk < orig_m:
+                words = [_bf16x2_bits(vals[2 * i], vals[2 * i + 1]) for i in range(4)]
+                dst = pushed_ar.push_slot(
+                    push_mc,
+                    push_mc,
+                    cur,
+                    nbytes,
+                    Int32(tk),
+                    push_rank,
+                    c * _MMA_M + et,
+                    self.output_push_world,
+                    self.n2,
+                    True,
+                )
+                pushed_ar.push_v4(dst, words[0], words[1], words[2], words[3], True)
 
     # ------------------------------------------------------------------ wrapper
     @cute.jit
@@ -2291,6 +2357,9 @@ class RubinSmallBatchFusedMoeKernel:
         m: Int32,
         num_local: Int32,
         expert_offset: Int32,
+        push_mc: Int64,
+        push_flags: Int64,
+        push_rank: Int32,
         num_ctas: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -2350,6 +2419,9 @@ class RubinSmallBatchFusedMoeKernel:
             ws_ptr,
             orig_m,
             expert_offset,
+            push_mc,
+            push_flags,
+            push_rank,
             num_ctas,
             stream,
         )

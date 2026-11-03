@@ -110,6 +110,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     _supports_non_divisible_ep: bool = True
     # Set by allow_die_major_weights (a model's opt-in at construction).
     _die_major_allowed: bool = False
+    # The all-reduce the next small-batch call pushes its output into (``push_output_into``).
+    _pending_output_push = None
 
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "nvfp4"),
@@ -259,6 +261,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self._small_batch_counters: torch.Tensor | None = None
         # Set by post_load_weights.
         self.weights_die_major = False
+        # The all-reduce the next small-batch call pushes its output into (push_output_into).
+        self._pending_output_push = None
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -326,6 +330,14 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._place_weights_die_major()
         if self.small_batch_max_tokens and self._small_batch_counters is None:
             self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
+
+    def push_output_into(self, view: object, num_tokens: int) -> bool:
+        """The small-batch kernel pushes its output rows (slice combine) where it serves
+        ``num_tokens`` tokens."""
+        if not 1 <= num_tokens <= self.small_batch_max_tokens:
+            return False
+        self._pending_output_push = view
+        return True
 
     def published_routing_word(self, num_tokens: int) -> torch.Tensor | None:
         """The small-batch kernel's routing word where it serves ``num_tokens`` tokens in the
@@ -529,6 +541,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         sort_tables: MoESortTables | None = None,
     ) -> torch.Tensor:
         """The small-batch kernel; it writes every element of ``moe_output``."""
+        push, self._pending_output_push = self._pending_output_push, None
         published = sort_tables is not None and sort_tables.published
         if published:
             # the kernel builds the tables from the published ids; nothing reads these
@@ -578,6 +591,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             die_major=self.weights_die_major,
             published_routing=published,
             expert_offset=weight_view.slot_start,
+            push_mc=push.mc_base if push is not None else 0,
+            push_flags=push.flags if push is not None else None,
+            push_rank=push.rank if push is not None else 0,
+            push_world=push.world if push is not None else 0,
         )
         return moe_output
 
