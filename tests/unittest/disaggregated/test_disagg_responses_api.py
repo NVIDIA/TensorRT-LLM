@@ -541,6 +541,21 @@ def test_client_prompt_ids_are_dropped_before_dispatch(fields):
     assert (sent[0].prompt_token_ids, sent[0].prompt_token_ids_b64) == (None, None)
 
 
+@pytest.mark.parametrize(
+    "fields", [{}, {"request_id": "resp_set_by_the_client"}], ids=["generated", "client_set"]
+)
+def test_every_worker_is_sent_the_request_id(fields):
+    """A worker names its response after request_id, so it goes out even when generated here.
+
+    A stream this server opens itself names that id, and the workers must answer under it.
+    """
+    request = ResponsesRequest(model="m", input="hi", **fields)
+    # The context request is a copy of the request, as the service makes it.
+    for forwarded in (request, request.model_copy(update={"stream": False})):
+        body = msgspec.msgpack.decode(_encode_request_body(forwarded))
+        assert body["request_id"] == request.request_id
+
+
 def test_a_generation_first_worker_ignores_client_prompt_ids():
     final = _responses_response(finish_reason="stop", status="completed")
     service = _gen_first_service(ctx_response=_responses_response(), gen_response=final)
@@ -1094,9 +1109,23 @@ async def test_responses_stream_with_a_fast_context_failure_is_an_http_error(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
-@pytest.mark.parametrize("status, worker_message", _CONTEXT_FAILURES)
+@pytest.mark.parametrize(
+    "status, worker_message, error_code, failed_code",
+    [
+        # An over-length rejection keeps its code in both events: clients act on it,
+        # as an agent compacts its history and retries.
+        pytest.param(
+            400,
+            _OVER_LENGTH,
+            "context_length_exceeded",
+            "context_length_exceeded",
+            id="over_length_400",
+        ),
+        pytest.param(503, "no capacity left", "upstream_error", "server_error", id="503"),
+    ],
+)
 async def test_responses_stream_with_a_late_context_failure_ends_with_response_failed(
-    monkeypatch, schedule_style, status, worker_message
+    monkeypatch, schedule_style, status, worker_message, error_code, failed_code
 ):
     _short_waits(monkeypatch)
     kept_alive = asyncio.Event()
@@ -1129,11 +1158,11 @@ async def test_responses_stream_with_a_late_context_failure_ends_with_response_f
     error_response = json.loads(_body(not_streamed))
     message = error_response.get("detail") or error_response["message"]
     assert worker_message in message
-    assert (events[-2][1]["code"], events[-2][1]["message"]) == ("upstream_error", message)
+    assert (events[-2][1]["code"], events[-2][1]["message"]) == (error_code, message)
     failed = events[-1][1]["response"]
     assert failed["id"] == events[0][1]["response"]["id"]
     assert failed["status"] == "failed"
-    assert (failed["error"]["code"], failed["error"]["message"]) == ("server_error", message)
+    assert (failed["error"]["code"], failed["error"]["message"]) == (failed_code, message)
 
 
 @pytest.mark.asyncio

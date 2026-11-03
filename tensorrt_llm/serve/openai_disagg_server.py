@@ -69,6 +69,7 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
     STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
     ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
     get_steady_clock_now_in_seconds, guard_responses_stream,
@@ -237,13 +238,20 @@ def _guard_relayed_responses_stream(answer: Response) -> Response:
         media_type="text/event-stream")
 
 
-def _error_response_message(response: Response) -> str:
-    """The message of an error response, for a stream to report it."""
+def _error_response_failure(response: Response) -> tuple[str, str]:
+    """The cause and message a stream reports an error response with.
+
+    An over-length rejection keeps its code, context_length_exceeded, which
+    clients act on; any other error response is an upstream error.
+    """
     try:
         payload = json.loads(response.body)
-        return str(payload.get("message") or payload.get("detail") or payload)
+        message = str(payload.get("message") or payload.get("detail") or payload)
     except (json.JSONDecodeError, AttributeError, TypeError):
-        return "Internal server error"
+        return STREAM_TERMINATION_UPSTREAM_ERROR, "Internal server error"
+    if payload.get("code") == CONTEXT_LENGTH_EXCEEDED_CODE:
+        return STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, message
+    return STREAM_TERMINATION_UPSTREAM_ERROR, message
 
 
 def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
@@ -529,10 +537,6 @@ class OpenAIDisaggServer:
         responses = self._wrap_entry_point(self._service.openai_responses)
         if not request.stream:
             return await responses(request, raw_request)
-        # The workers name their response after request_id, which is forwarded
-        # only if set. Assigning it marks it set, so that the workers answer
-        # under the id that an opening sent from here names.
-        request.request_id = request.request_id
         pipeline = asyncio.ensure_future(responses(request, raw_request))
         try:
             await asyncio.wait((pipeline, ),
@@ -544,6 +548,8 @@ class OpenAIDisaggServer:
         if pipeline.done():
             return _guard_relayed_responses_stream(pipeline.result())
         try:
+            # The opening names request.request_id, the id every worker is sent
+            # (_encode_request_body) and answers under.
             processor = ResponsesStreamingProcessor(
                 request=request,
                 sampling_params=request.to_sampling_params(),
@@ -572,9 +578,11 @@ class OpenAIDisaggServer:
         so that every keepalive the client gets repeats ``opening``'s
         response.in_progress. The status line is already out, so a pipeline
         that fails ends the stream with error and response.failed, which carry
-        the message of its error response, and so does a pipeline's stream that
-        fails before its terminal event. A stream abandoned before the pipeline
-        answers, as when the client disconnects, cancels the pipeline.
+        the message of its error response, and for an over-length rejection
+        its code, context_length_exceeded (_error_response_failure); so does a
+        pipeline's stream that fails before its terminal event. A stream
+        abandoned before the pipeline answers, as when the client disconnects,
+        cancels the pipeline.
         """
         try:
             for frame in opening:
@@ -582,15 +590,16 @@ class OpenAIDisaggServer:
             try:
                 answer = await pipeline
             except HTTPException as e:
-                failure = str(e.detail)
+                failure = (STREAM_TERMINATION_UPSTREAM_ERROR, str(e.detail))
             else:
                 failure = (None if isinstance(answer, StreamingResponse) else
-                           _error_response_message(answer))
+                           _error_response_failure(answer))
         finally:
             pipeline.cancel()
         if failure is not None:
+            cause, detail = failure
             for frame in processor.get_stream_failed_events(
-                    STREAM_TERMINATION_UPSTREAM_ERROR, failure, len(opening)):
+                    cause, detail, len(opening)):
                 yield frame
             return
         # The guard reads the worker's stream as it comes, so it knows whether
