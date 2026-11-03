@@ -3706,6 +3706,16 @@ uint64_t StorageManager::hotPoolBindingVersion() const noexcept
     return static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage).bindingVersion();
 }
 
+std::optional<StorageManager::GpuArenaExtent> StorageManager::hotArenaExtent() const
+{
+    if (!mGpuArena)
+        return std::nullopt;
+    auto const& arena = static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage);
+    // The arena alone: fixed pool groups live in allocations of their own beside it (and are registered as such),
+    // so the level's byte count (roundedNumBytes) would reach past what the arena maps.
+    return GpuArenaExtent{arena.arenaBase(), arena.arenaBytes(), arena.hasBoundPools()};
+}
+
 TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const
 {
     return levelWindows(kHotLevel);

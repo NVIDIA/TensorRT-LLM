@@ -323,6 +323,28 @@ TEST_F(ArenaFixedGroupTest, ElasticWindowsTileTheArenaAndFollowTheTarget)
     EXPECT_TRUE(aEnd <= bBegin || bEnd <= aBegin);
 }
 
+TEST_F(ArenaFixedGroupTest, GpuArenaExtentCoversOnlyTheArena)
+{
+    // Disaggregated serving registers the extent once with NIXL, and fixed groups separately: the extent must not
+    // reach past what the arena maps into the fixed groups' own allocations.
+    mManager = std::make_shared<KvCacheManager>(makeSparseCoRebaConfig());
+    auto const extent = mManager->getGpuArenaExtent();
+    ASSERT_TRUE(extent.has_value());
+    auto const [base, bytes, hasBoundPools] = *extent;
+    EXPECT_FALSE(hasBoundPools);
+    auto inArena = [&, base = base, bytes = bytes](LayerId layer)
+    {
+        auto const addr = mManager->getMemPoolBaseAddress(layer, "key", PageIndexMode::PER_LAYER);
+        return base <= addr && addr < base + bytes;
+    };
+    EXPECT_TRUE(inArena(kSwaA));
+    EXPECT_TRUE(inArena(kSwaB));
+    EXPECT_FALSE(inArena(kDense));
+    EXPECT_FALSE(inArena(kSparse));
+    // The level's quota also pays for the fixed group's device pool.
+    EXPECT_LT(bytes, mManager->getQuota(kHotLevel));
+}
+
 TEST_F(ArenaFixedGroupTest, OnlyFixedGroupsFallsBackToTheVmmStorage)
 {
     // One pool group, holding the sparse pool: nothing to rebalance, so the arena is not built.

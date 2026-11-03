@@ -64,6 +64,10 @@ class _Xcvr:
     def kv_pool_layout_shared_with_peers(self):
         return self.shared
 
+    def kv_pool_layout_fixed(self):
+        # VMM pools (the path these stubs cover): a resize remaps the pools' tails.
+        return False
+
     def kv_pool_rebalance_veto_reason(self, allow_cross_node=False):
         return "a peer holds this rank's pool layout" if self.shared else None
 
@@ -96,7 +100,18 @@ def _executor(xcvr, peers_states=()):
         if xcvr is not None and xcvr.sessions:
             xcvr.sessions -= 1
 
-    s.disagg = types.SimpleNamespace(reap_context_sends=reap)
+    s.unpublished_gen_receives = 0
+    s.gen_polls = 0
+
+    def poll_gen():
+        s.gen_polls += 1
+        s.unpublished_gen_receives = max(0, s.unpublished_gen_receives - 1)
+
+    s.disagg = types.SimpleNamespace(
+        reap_context_sends=reap,
+        has_unpublished_gen_receives=lambda: s.unpublished_gen_receives > 0,
+        poll_gen_transfers=poll_gen,
+    )
     s._flush_pending_transfer_responses = lambda: setattr(s, "flushes", s.flushes + 1)
     s._note_disagg_drain_outcome = lambda skipped: PE._note_disagg_drain_outcome(s, skipped)
     s._in_disagg_rebalance_backoff = lambda: PE._in_disagg_rebalance_backoff(s)
@@ -117,6 +132,15 @@ def test_drain_without_transceiver_or_sends():
 def test_drain_reaps_inflight_sends():
     s = _executor(_Xcvr(sessions=3))
     assert _drain(s) and s.reaps == 3 and s.flushes == 3
+
+
+def test_drain_waits_for_unpublished_gen_receives():
+    """Generation side (copy-based rebalancing): an admitted request whose receive has not started
+    still counts as in flight, and every pass advances receives.
+    """
+    s = _executor(_Xcvr())
+    s.unpublished_gen_receives = 2
+    assert _drain(s) and s.gen_polls == 2 and s.unpublished_gen_receives == 0
 
 
 @pytest.mark.parametrize(
@@ -276,7 +300,9 @@ def test_peer_registrar_notes_cross_node_peer():
 def test_transceiver_veto_reason(registered, cross_node, allow, expected):
     x = object.__new__(KvCacheTransceiverV2)
     x._transfer_worker = types.SimpleNamespace(
-        has_registered_with_peers=registered, has_cross_node_peer=cross_node
+        has_registered_with_peers=registered,
+        has_cross_node_peer=cross_node,
+        kv_pool_layout_fixed=False,
     )
     reason = x.kv_pool_rebalance_veto_reason(allow_cross_node=allow)
     assert (reason is None) if expected is None else (expected in reason)
@@ -366,3 +392,18 @@ def test_rebalance_integrity(mode, tmp_path):
         assert procs["ctx"].returncode not in (0, None), detail
         assert "NIXL_ERR_NOT_FOUND" in ctx_log, detail
         assert "registered up to" in ctx_log, detail
+
+
+@pytest.mark.parametrize("registered, cross_node", [(True, False), (False, True), (True, True)])
+def test_fixed_layout_is_not_vetoed(registered, cross_node):
+    """Copy-based rebalancing: the arena is registered once and never remapped, so a peer holding this
+    rank's layout (generation side) and a peer on another node are no reason to stop rebalancing.
+    """
+    x = object.__new__(KvCacheTransceiverV2)
+    x._transfer_worker = types.SimpleNamespace(
+        has_registered_with_peers=registered,
+        has_cross_node_peer=cross_node,
+        kv_pool_layout_fixed=True,
+    )
+    assert not x.kv_pool_layout_shared_with_peers()
+    assert x.kv_pool_rebalance_veto_reason() is None
