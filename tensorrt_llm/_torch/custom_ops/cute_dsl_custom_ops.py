@@ -12454,6 +12454,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
+        # The FP8 split-KV reduction runs _REDUCE_ROWS_PER_CTA output rows per
+        # block where it has at least _REDUCE_MIN_ROWS_PER_SLOT rows per
+        # resident decode block; one row per block otherwise.
+        _REDUCE_ROWS_PER_CTA = 4
+        _REDUCE_MIN_ROWS_PER_SLOT = 8
 
         def __init__(
             self,
@@ -12513,6 +12518,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cached = int(max_active_clusters) * cls._CLUSTER_SHAPE_MNK[0]
                 cls._cute_dsl_max_active_blocks = cached
             return cached
+
+        @classmethod
+        def reduce_rows_per_cta(cls, num_heads: int, seq_len_q: int,
+                                batch_size: int) -> int:
+            """Output rows per block of the FP8 split-KV reduction; the
+            arithmetic of every row does not depend on it."""
+            rows = num_heads * seq_len_q * batch_size
+            slots = cls._get_max_active_blocks()
+            if rows >= cls._REDUCE_MIN_ROWS_PER_SLOT * slots:
+                return cls._REDUCE_ROWS_PER_CTA
+            return 1
 
         @classmethod
         def get_num_q_tiles(cls, num_heads: int, seq_len_q: int) -> int:
@@ -13056,6 +13072,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if not use_workspace:
                 block_split_kvs = None
             is_var_split_kv = block_split_kvs is not None
+            reduce_rows = (self.reduce_rows_per_cta(self.num_heads, seq_len_q,
+                                                    batch_size)
+                           if has_fp8_input and use_workspace else 1)
             # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -13065,6 +13084,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
                 kv_bounds is not None,
                 is_var_split_kv,
+                reduce_rows,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
                 # A compile outside the tuning window stalls the serving loop
@@ -13096,6 +13116,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     reducer_max_splits=(MLA_DECODE_MAX_SPLITS
                                         if is_var_split_kv else 32),
                     emit_softmax_stats=self.emit_softmax_stats,
+                    **({
+                        "reduce_rows_per_cta": reduce_rows
+                    } if reduce_rows != 1 else {}),
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
                     q_latent,
