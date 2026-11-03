@@ -1278,11 +1278,15 @@ def kda_mtp_decode_impl(
             g_cache=g_cache,
         ),
     )
-    if fused_fb and kernel != "v2":
-        raise ValueError(
-            "the fused forget gate needs the v2 kernel (packed rows, fused output norm, bf16 "
-            "output, 3xTF32, vector-aligned operands, one wave of tiles; see v2_verify_applies)"
-        )
+    if fused_fb:
+        # Only kda_decode_mtp_v2_kernel has the fused forget gate; it also runs the multi-wave
+        # grids the two-CTA kernel would otherwise take (callers avoid those, v2_verify_applies).
+        if kernel == "v1" or quantize_output:
+            raise ValueError(
+                "the fused forget gate needs the v2 kernel contract (packed rows, fused output "
+                "norm, bf16 output, 3xTF32, vector-aligned operands)"
+            )
+        kernel = "v2"
     # Only kda_decode_mtp_v2_kernel has the PDL prologue; the other kernels launch plainly.
     use_pdl = bool(use_pdl) and kernel == "v2"
     if kernel != "v1":
