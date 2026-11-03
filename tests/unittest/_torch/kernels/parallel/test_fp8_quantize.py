@@ -131,6 +131,19 @@ def test_fp8_quantize_1x128_vectorized_matches_elementwise(use_ue8m0):
     assert torch.equal(written(scale_a), written(scale_b))
 
 
+@pytest.mark.skipif(getSMVersion() < 89,
+                    reason="fp8_quantize_1x128 requires SM89 or newer")
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+@pytest.mark.parametrize("m,k", [(37, 576), (64, 256)])
+def test_fp8_quantize_1x128_fake_matches_real(m, k, use_ue8m0):
+    # The scale layout is architecture dependent (2D on the SM100 family, a 1D
+    # padded buffer elsewhere); the fake used by torch.compile must agree.
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    torch.library.opcheck(torch.ops.trtllm.fp8_quantize_1x128.default,
+                          (x, use_ue8m0),
+                          test_utils=("test_schema", "test_faketensor"))
+
+
 def mxfp8_quantize_check_accuracy(a, b, atol, rtol, percent):
     if torch.any(torch.isnan(a)):
         raise Exception("NaN in a")
