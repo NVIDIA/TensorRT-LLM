@@ -55,6 +55,10 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
                           create_mla_static_tile_scheduler_params,
                           get_variable_query_tile_info)
 
+# Split-KV partials the reduction kernel loads per round before it accumulates
+# them; the sum order is that of one split at a time, so the output is the same.
+REDUCE_UNROLL = 8
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../.."))
@@ -2234,7 +2238,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 rO = cute.make_rmem_tensor(cute.make_layout(fragment_elements),
                                            self.o_dtype)
                 rAccO.fill(0.0)
-                for i in range(local_split_kv):
+                # Load REDUCE_UNROLL splits' partials, then accumulate them in
+                # split order: a round's loads are in flight together, and
+                # every row still sums its splits one after the other.
+                rBuf = cute.make_rmem_tensor(
+                    cute.make_layout((REDUCE_UNROLL, elements_per_thread)),
+                    self.acc_dtype)
+                full = local_split_kv // REDUCE_UNROLL * REDUCE_UNROLL
+                for i0 in cutlass.range(0, full, REDUCE_UNROLL, unroll=1):
+                    for u in cutlass.range_constexpr(REDUCE_UNROLL):
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rBuf[u, j] = gAccO[i0 + u, element_idx]
+                    for u in cutlass.range_constexpr(REDUCE_UNROLL):
+                        scale = smem_lse_scale[i0 + u]
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            rAccO[j] += rBuf[u, j] * scale
+                for i in cutlass.range(full, local_split_kv, 1, unroll=1):
                     for j in cutlass.range_constexpr(elements_per_thread):
                         element_idx = (
                             d_tile_idx * self.reducer_d_tile + tidx +
