@@ -334,6 +334,29 @@ def test_timeout_check_flags_both_directions(clock) -> None:
     assert not fresh.py_kv_transfer_timed_out
 
 
+def test_timeout_check_leaves_receives_to_a_transceiver_that_cancels_them(clock) -> None:
+    """KvCacheTransceiverV2 under gen sync cancels timed-out receives itself, so
+    they are not flagged. Context sends still are: a multi-rank context worker
+    reports the same capability."""
+    h = _Harness(kv_transfer_timeout_ms=1000, cancels_timed_out_gen_receives=True)
+    ctx = _Request(1)
+    h.send(ctx)
+    gen = _Request(
+        2,
+        is_context_only_request=False,
+        is_disagg_generation_transmission_in_progress=True,
+        py_kv_transfer_start_time=clock["t"],
+    )
+    h.active.append(gen)
+    clock["t"] += 2.0
+
+    h.coordinator.check_transfer_timeouts()
+
+    assert ctx.py_kv_transfer_timed_out
+    assert not gen.py_kv_transfer_timed_out
+    assert "cancel_request:2" not in h.transceiver.call_log
+
+
 def test_post_batch_timeout_check_is_gated_on_an_inflight_context_send(clock) -> None:
     """The post-batch call sites keep their historical gate: with no context
     send in flight they do not flag anything, generation included."""

@@ -243,10 +243,10 @@ class GenTransferStatus(NamedTuple):
     completed_request_ids: List[int]
     # Requests whose KV receive failed during this call.
     error_request_ids: List[int]
-    # Requests whose receive session was cancelled (locally via
-    # ``cancel_request`` or by a remote CANCEL message). Their sessions are
-    # closed; the caller decides the final request state, distinguishing
-    # user cancellation from remote-initiated cancellation.
+    # Requests whose receive session was cancelled (by ``cancel_request``, by
+    # a transfer timeout on this rank or a gen sync peer, or by a remote
+    # CANCEL message). Their sessions are closed; the caller decides the final
+    # request state, distinguishing a user cancel from a failed transfer.
     cancelled_requests: List[LlmRequest]
 
 
@@ -261,7 +261,8 @@ class KvCacheTransceiver(ABC):
     ``check_gen_transfer_status`` participate in intra-instance consensus
     collectives so that all ranks agree on per-request outcomes. Every rank
     of an instance must call them the same number of times with the same
-    arguments per iteration; divergence can deadlock the instance.
+    arguments per iteration; divergence can deadlock the instance. The ranks
+    that settle each receive together form the gen sync group.
 
     Request ids in results are the ids the transceiver tracks: the request's
     disaggregated unique id when its disaggregated params carry one,
@@ -297,6 +298,19 @@ class KvCacheTransceiver(ABC):
     def consumes_transfer_buffer(self) -> bool:
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""
         return True
+
+    @property
+    def cancels_timed_out_gen_receives(self) -> bool:
+        """Whether the transceiver itself cancels async receives past ``kv_transfer_timeout_ms``.
+
+        When True, ``check_gen_transfer_status`` cancels this rank's session
+        once it outlives the timeout, and once every rank of the gen sync group
+        has ended its session, all of them report the request in
+        ``cancelled_requests`` in the same call. Callers must then not flag or
+        fail such a receive on their own timeout check, which would retire it
+        on one rank alone.
+        """
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest) -> None:
@@ -411,7 +425,9 @@ class KvCacheTransceiver(ABC):
 
         Returns True when the transfers are cancelled and it is safe to
         release the request's KV resources; False when a task is mid-write
-        and the caller must retry on a later iteration.
+        and the caller must retry on a later iteration. With a gen sync group,
+        call it only for an event every rank of the group handles in the same
+        iteration, such as a client cancel.
         """
         raise NotImplementedError
 
