@@ -188,7 +188,7 @@ Planning and copying start right after routing, where the [peak-rate model](#can
 - **MAIN waits only for the plan,** on the device and without holding an SM, then launches MegaMoE; dispatch never waits for the copy, and there is no steady-state host wait.
 - **Only helper tiles wait for weights.** MegaMoE claims tiles in slot order, home slots first, so dispatch overlaps the home tiles, and combine overlaps the later home and helper tiles. After its writes drain, each rank's replication kernel multicasts the invocation's READY counter $\gamma$ to every rank, even with nothing to copy, and each MegaMoE CTA waits at the READY gate before its first helper tile until every rank has reached $\gamma$.
 
-To first order, the copy is exposed only if it outlasts the shared expert and the home tiles; a copy issued inside MegaMoE, as described for MegaFlux, would miss the shared-expert window. **The overlap rests on scheduling, not on a hardware guarantee:** the fused kernel's CTAs must get SMs while MAIN runs input quantization and the shared expert. MAIN starts MegaMoE only after every one of these CTAs has finished its share of HALO-Q, so the copy already holds its `auxiliary_sms` SMs when persistent MegaMoE CTAs start waiting at the READY gate. Input quantization and DeepSeek-V4's fused shared-expert kernel leave these SMs free, in response to [measured interference](#sami-broadcast-on-gb200); this post does not evaluate the effect of this SM budget.
+To first order, the copy is exposed only if it outlasts the shared expert and the home tiles; a copy issued inside MegaMoE, as described for MegaFlux, would miss the shared-expert window. **The overlap rests on scheduling, not on a hardware guarantee:** the fused kernel's CTAs must get SMs while MAIN runs input quantization and the shared expert. MAIN starts MegaMoE only after every one of these CTAs has finished its share of HALO-Q, so the copy already holds its `auxiliary_sms` SMs when persistent MegaMoE CTAs start waiting at the READY gate. Input quantization and, on the SM100 family, DeepSeek-V4's fused shared-expert kernel leave these SMs free, in response to [measured interference](#sami-broadcast-on-gb200); this post does not evaluate the effect of this SM budget.
 
 ## Performance Evaluation
 
@@ -299,7 +299,7 @@ Pass the file with `--config` to `trtllm-bench` (with `--tp 8 --ep 8`) or `trtll
 
 - **`num_slots`** $=E+P\cdot S$: each rank keeps its $H=E/P$ home experts and gets $S$ helper slots. At EP8, 416 gives DeepSeek-V4-Pro $S=4$, and 408 gives $S=3$.
 - **`helper_slot_mode`**: the default, `per_layer_resident`, gives every MoE layer its own helper slots (about 6.4 GiB per GPU for DeepSeek-V4-Pro with $S=3$, per the guide) and skips a broadcast when every member of its group already holds the expert in the assigned helper slot. `shared_banks` alternates all layers between two banks and copies every helper expert in every forward pass; for DeepSeek-V4-Pro at $S=4$, it cuts helper storage per GPU from 9.07 GB for 61 per-layer sets to about 297 MB (both computed).
-- **`auxiliary_sms`** (default 4, range 1–8, below the GPU's SM count) is the number of SMs, one CTA each, of the kernel that runs HALO-Q and then the copy. Input quantization and DeepSeek-V4's fused shared-expert kernel leave these SMs free, so raising the value takes SMs from that work.
+- **`auxiliary_sms`** (default 4, range 1–8, below the GPU's SM count) is the number of SMs, one CTA each, of the kernel that runs HALO-Q and then the copy. Input quantization and, on the SM100 family, DeepSeek-V4's fused shared-expert kernel leave these SMs free, so raising the value takes SMs from that work.
 
 ### Requirements and Constraints
 
@@ -309,7 +309,7 @@ Pass the file with `--config` to `trtllm-bench` (with `--tp 8 --ep 8`) or `trtll
 | :--- | :--- |
 | Backend | `MEGAMOE_CUTEDSL` only; `AUTO` resolves to it, and other explicit backends are rejected. |
 | Model | An architecture in `moe_model_arch_list` with NVFP4 MoE weights, at most 384 routed experts, and an expert count divisible by the EP size; results here cover DeepSeek-V4-Pro only. |
-| GPUs | Blackwell SM100 or SM103 (evaluated on GB200 and GB300), all EP ranks in one multicast-capable NVLink domain, and CUDA 13.1 or later for the TMA multicast copy. |
+| GPUs | Blackwell SM100 or SM103, evaluated on GB200 and GB300 (the [per-layer dynamic EPLB guide](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) lists every supported GPU), all EP ranks in one multicast-capable NVLink domain, and CUDA 13.1 or later for the TMA multicast copy. |
 | Parallelism | Attention DP with pure EP (no MoE tensor or pipeline parallelism), an even EP size from 2 to 32, and no MoE smart router; unsupported setups raise an error. |
 | CUDA graphs | Not supported: a non-null `cuda_graph_config` is replaced with `null`, with a warning, and any `prefill_cuda_graph_backend` other than `DISABLED` is rejected. |
 | Launch queues | `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA initializes: the LLM API behind `trtllm-bench` and `trtllm-serve` sets it; a process that initializes CUDA before creating its `LLM` instance, or that does not use the LLM API, such as the layer-wise benchmarks, must export it. |
