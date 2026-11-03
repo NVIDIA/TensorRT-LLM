@@ -210,6 +210,7 @@ def _coverage_decline_category(reason: str) -> str:
         ("no residual", "no_residual"),
         ("non-core-Python residual file", "non_core_python"),
         ("non-Python residual file", "non_python"),
+        ("shared test infrastructure change", "shared_test_infrastructure"),
         ("zero-touch residual file", "zero_touch"),
         ("no usable diff", "no_usable_diff"),
         ("import-executed change", "import_executed"),

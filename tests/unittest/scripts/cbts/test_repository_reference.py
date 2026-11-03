@@ -252,3 +252,33 @@ def test_repository_reference_index_marks_dynamic_importers_incomplete(tmp_path:
     assert not importers.complete
     assert not importers.paths
     assert importers.limitation == "dynamic import may target perf/helper.py"
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    [
+        "from cbts.owner import VALUE\n",
+        "import cbts.owner as owner\nprint(owner.VALUE)\n",
+        "from cbts import owner\nprint(owner.VALUE)\n",
+        'from importlib import import_module\nowner = import_module("cbts.owner")\n',
+        "from jenkins.scripts.cbts.cbts.owner import VALUE\n",
+    ],
+)
+def test_repository_reference_index_matches_cbts_import_root(
+    reference_root: Path, consumer: str
+) -> None:
+    """Both supported CBTS spellings retain references to changed bindings."""
+    defining = "jenkins/scripts/cbts/cbts/owner.py"
+    owner = reference_root / defining
+    owner.parent.mkdir(parents=True)
+    owner.write_text("VALUE = 2\n")
+    test = reference_root / "tests/unittest/scripts/cbts/test_consumer.py"
+    test.parent.mkdir(parents=True)
+    test.write_text(consumer)
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        defining, {"VALUE"}
+    )
+
+    assert references == {"VALUE": {"tests/unittest/scripts/cbts/test_consumer.py"}}

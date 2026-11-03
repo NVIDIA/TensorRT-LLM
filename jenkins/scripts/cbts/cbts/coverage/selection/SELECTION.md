@@ -54,15 +54,23 @@ of:
 | Gate | Condition |
 |---|---|
 | Non-Python file | `path` is not a `.py`; the selector requires Python source to map changed lines to qualnames |
+| Shared pytest state | changed symbols reach non-function/unknown-scope fixtures, session/collection hooks, cached helpers, unresolved decorators, or explicit persistent-state mutations; local and imported dependencies are followed |
 | File without attributed coverage | `file_has_touch_rows(cf)` is false — absent, uninstrumented, or recorded only under the empty test context, so "who touches it" is unknown rather than empty |
 | **Unbounded import-executed change** | a changed line lands on a class body, signature / decorator, or unsupported module statement; the conservative exceptions are below |
 | No usable patch | the forge API omitted the diff (binary / rename / oversized), so the changed scope is unknown |
 | Unparsable source | the AST walk failed, so lines cannot be mapped to qualnames |
 | Closure change with no wider row set | see the next section |
 
-There is no repository-directory allowlist: `tests/`, `examples/`, `scripts/`, and other
-Python paths use the same coverage and impact checks as `tensorrt_llm/`. CI requests diffs
-for all Python files. Repository-relative DB keys retain their full path, so
+Python paths in `examples/`, `scripts/`, and other repository directories use the same
+coverage and impact checks as `tensorrt_llm/`, including `conftest.py` and test helpers.
+AST checks distinguish ordinary helper/function-fixture body edits from changes that reach
+shared fixtures, session/collection hooks, or cached/stateful helpers. Only the latter decline,
+because execution rows omit cached consumers (COLLECTION.md §5.4). Fixture scope is resolved
+from its decorator; nonliteral/unknown scopes and unrecognized decorators decline. Local dependencies,
+fixture parameters, and repository-visible imported helpers propagate this restriction.
+Unrelated shared fixtures in the same file do not block ordinary helper edits.
+Coverage explicitly requests diffs for all Python files, as DocsRule already does.
+Repository-relative DB keys retain their full path, so
 `examples/tensorrt_llm/x.py` cannot borrow coverage from `tensorrt_llm/x.py`.
 Existing Tier-1 forced fallbacks, missing/tainted test capture, and the residual patch
 compatibility check still apply. File-level records do not waive the import-time or
