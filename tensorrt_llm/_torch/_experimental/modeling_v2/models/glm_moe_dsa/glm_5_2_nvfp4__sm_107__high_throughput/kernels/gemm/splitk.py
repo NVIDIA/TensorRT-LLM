@@ -2156,7 +2156,7 @@ def _bmm_publish(
 
 
 def _from_dlpack_dynamic(tensor, leading_dim: int, assumed_align: int = 32):
-    return from_dlpack(tensor, assumed_align=assumed_align).mark_layout_dynamic(
+    return from_dlpack(tensor.detach(), assumed_align=assumed_align).mark_layout_dynamic(
         leading_dim=leading_dim
     )
 
