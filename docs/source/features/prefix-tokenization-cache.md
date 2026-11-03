@@ -114,6 +114,20 @@ Multiple frontends help when a single Python frontend cannot keep up, typically
 at high request rates with short prompts. That is not the workload this cache
 targets.
 
+If you need several frontends, set
+`TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION=1` to tokenize each
+conversation in one frontend. A chat request's conversation id (the same id
+attention DP routes by, from `conversation_params.conversation_id` or headers
+such as `X-Correlation-ID`) is hashed to an owner frontend, and the frontend the
+request arrived at sends the prompt text to the owner over a local Unix socket
+and gets back the token ids; the request itself stays where it arrived. A
+request without a conversation id, or whose owner does not answer, is
+tokenized locally. The switch is off by default and has no effect with a
+single frontend or with the cache disabled. On the trace above with 8
+frontends, it brought the p90 frontend time at one session from about 165 ms
+to about 58 ms, against 44 ms with a single frontend (both measured with the
+divergent splice).
+
 ## Measured effect
 
 An A/B on GLM-5.2 (GB300, disaggregated, matched pair, 3600 s, ~29.6k requests

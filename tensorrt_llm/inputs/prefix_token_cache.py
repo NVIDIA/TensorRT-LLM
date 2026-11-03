@@ -32,12 +32,14 @@ are documented in ``docs/source/features/prefix-tokenization-cache.md``.
 from __future__ import annotations
 
 import bisect
+import contextlib
 import os
 import threading
 from array import array
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import ClassVar, Mapping, NamedTuple, Protocol, Sequence
+from typing import Callable, ClassVar, Iterator, Mapping, NamedTuple, Protocol, Sequence
 
 from ..logger import logger
 
@@ -45,6 +47,7 @@ __all__ = [
     "PrefixTokenCache",
     "PrefixTokenCacheConfig",
     "create_prefix_token_cache",
+    "tokenization_routing_key",
 ]
 
 # Log the hit rate every this many cache-eligible requests, so an operator can
@@ -56,6 +59,23 @@ LOG_EVERY_REQUESTS = 1000
 # candidate is only compared in full when the incoming text has that probe at the
 # same position.
 PROBE_CHARS = 256
+
+# The conversation the prompt being tokenized belongs to, if the caller knows it.
+_ROUTING_KEY: ContextVar[str | None] = ContextVar("tokenization_routing_key", default=None)
+
+
+@contextlib.contextmanager
+def tokenization_routing_key(key: str | None) -> Iterator[None]:
+    """Tag the prompts tokenized in this block with conversation ``key``.
+
+    A cache with a ``route`` hands such prompts to the process that caches that
+    conversation.
+    """
+    token = _ROUTING_KEY.set(key)
+    try:
+        yield
+    finally:
+        _ROUTING_KEY.reset(token)
 
 
 class OffsetTokenizer(Protocol):
@@ -166,11 +186,24 @@ class PrefixTokenCache:
         self.resync_failures = 0
         # Hits on a cached prompt the new one diverges from (also in ``hits``).
         self.divergent_hits = 0
+        # Tokenizes a prompt tagged with a routing key in the process that
+        # owns that conversation, or returns None to tokenize it here. Set by
+        # multi-frontend serving.
+        self.route: Callable[[str, str], list[int] | None] | None = None
+        # Prompts another process tokenized through ``route``.
+        self.routed = 0
 
     def encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         """Return the token ids of ``text`` without special tokens."""
         if self.disabled or len(text) < self._config.min_chars:
             return self._tokenize(tokenizer, text)[0]
+        key = _ROUTING_KEY.get()
+        if self.route is not None and key is not None:
+            ids = self.route(key, text)
+            if ids is not None:
+                with self._lock:
+                    self.routed += 1
+                return ids
         try:
             return self._encode(tokenizer, text)
         except Exception as e:
@@ -186,7 +219,7 @@ class PrefixTokenCache:
         rate = self.hits / total if total else 0.0
         return (
             f"{self.hits}/{total} hits ({rate:.1%}, {self.divergent_hits} divergent), "
-            f"{self.resync_failures} resync fallbacks, "
+            f"{self.resync_failures} resync fallbacks, {self.routed} routed, "
             f"{len(self._entries)} entries, {self._total_chars} cached chars"
         )
 

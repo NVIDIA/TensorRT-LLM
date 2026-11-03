@@ -1,0 +1,108 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Each conversation is tokenized by the frontend that owns it.
+
+Two frontends are simulated in one process: each has its own cache and serves it
+on its own socket, as two trtllm-serve frontend processes do.
+"""
+
+from typing import Any
+
+import pytest
+
+from tensorrt_llm.inputs.prefix_token_cache import (
+    PrefixTokenCache,
+    PrefixTokenCacheConfig,
+    tokenization_routing_key,
+)
+from tensorrt_llm.serve.tokenization_owners import TokenizationOwners, owner_of
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _CharTokenizer:
+    is_fast = True
+
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "input_ids": [ord(c) for c in text],
+            "offset_mapping": [(i, i + 1) for i in range(len(text))],
+        }
+
+
+def _cache() -> PrefixTokenCache:
+    return PrefixTokenCache(
+        PrefixTokenCacheConfig(
+            max_entries=64, overlap=4, resync=2, min_chars=64, checkpoint_tokens=8
+        )
+    )
+
+
+def _turns(n: int = 6) -> list[str]:
+    text, out = "system preamble " * 8, []
+    for i in range(n):
+        text += f"turn {i} says something new. "
+        out.append(text)
+    return out
+
+
+def _key_owned_by(owner: int, num_frontends: int) -> str:
+    return next(
+        key
+        for key in (f"conversation-{i}" for i in range(100))
+        if owner_of(key, num_frontends) == owner
+    )
+
+
+def test_a_conversation_is_tokenized_by_its_owner_wherever_its_turns_arrive(tmp_path) -> None:
+    tokenizer = _CharTokenizer()
+    caches = [_cache(), _cache()]
+    owners = [
+        TokenizationOwners(str(tmp_path), frontend_id, 2, cache, tokenizer)
+        for frontend_id, cache in enumerate(caches)
+    ]
+    try:
+        key = _key_owned_by(1, 2)
+        turns = _turns()
+        # Turns alternate between the frontends, as SO_REUSEPORT spreads them.
+        for i, prompt in enumerate(turns):
+            with tokenization_routing_key(key):
+                assert caches[i % 2].encode(tokenizer, prompt) == [ord(c) for c in prompt]
+
+        assert caches[0].routed == len(turns) // 2
+        assert caches[0].hits + caches[0].misses == 0
+        # The owner saw every turn, so every turn after the first hit.
+        assert caches[1].hits == len(turns) - 1
+
+        # A prompt without a conversation stays where it arrived.
+        caches[0].encode(tokenizer, turns[0])
+        assert caches[0].misses == 1
+    finally:
+        for owner in owners:
+            owner.close()
+
+
+def test_a_prompt_is_tokenized_locally_when_its_owner_is_unreachable(tmp_path) -> None:
+    tokenizer, cache = _CharTokenizer(), _cache()
+    # Frontend 1 never starts.
+    owners = TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer)
+    try:
+        prompt = _turns(1)[0]
+        with tokenization_routing_key(_key_owned_by(1, 2)):
+            assert cache.encode(tokenizer, prompt) == [ord(c) for c in prompt]
+        assert cache.routed == 0
+        assert cache.misses == 1
+    finally:
+        owners.close()
