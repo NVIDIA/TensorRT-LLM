@@ -74,6 +74,11 @@ def test_allocation_lifetime_fields_survive_copy_and_descriptor_equality():
     assert desc == kv.KVCacheDesc(32, 16, active_allocation_groups=[])
     desc.active_allocation_groups = None
     assert desc == kv.KVCacheDesc(32, 16)
+    buffer = kv.BufferConfig(role="state", size=16, allocation_group_id=17)
+    buffer.allocation_group_id = None
+    assert buffer.allocation_group_id is None
+    buffer.allocation_group_id = 17
+    assert buffer.allocation_group_id == 17
 
 
 @requires_cuda

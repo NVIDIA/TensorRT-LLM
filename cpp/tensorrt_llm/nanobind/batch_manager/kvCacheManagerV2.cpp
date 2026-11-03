@@ -1864,7 +1864,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::BufferConfig& buffer, std::optional<int> value) {
                 buffer.allocationGroupId
                     = value.has_value() ? std::optional{kv::AllocationGroupId{*value}} : std::nullopt;
-            }) DEF_COPY(kv::BufferConfig);
+            },
+            nb::for_setter(nb::arg("value").none())) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
@@ -1924,7 +1925,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KVCacheDesc& desc, std::optional<std::vector<int>> groups) {
                 desc.activeAllocationGroups
                     = groups.has_value() ? std::optional{allocationGroupIds(*groups)} : std::nullopt;
-            })
+            },
+            nb::for_setter(nb::arg("groups").none()))
         .def("__eq__",
             [](kv::KVCacheDesc const& self, nb::handle other)
             {
