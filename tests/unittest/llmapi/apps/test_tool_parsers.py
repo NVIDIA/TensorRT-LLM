@@ -5419,11 +5419,16 @@ class TestGemma4StreamingMatchesWholeParse:
                 assert normal in sendable, label
 
     def test_arguments_go_out_once_the_call_closes(self, sample_tools):
-        """In token-sized increments the name goes out first, then the JSON."""
+        """In token-sized increments the name goes out first, then the JSON.
+
+        A second call is named only after the JSON of the first one went out.
+        """
         parser = Gemma4ToolParser()
         chunks = [
             BOT_TOKEN, f"{CALL_PREFIX}get_weather{{", "location:", STRING_DELIM,
-            "NYC", STRING_DELIM, "}", EOT_TOKEN
+            "NYC", STRING_DELIM, "}", EOT_TOKEN, BOT_TOKEN,
+            f"{CALL_PREFIX}search_web{{", "query:", STRING_DELIM, "AI",
+            STRING_DELIM, "}", EOT_TOKEN
         ]
 
         steps = [[
@@ -5432,7 +5437,9 @@ class TestGemma4StreamingMatchesWholeParse:
         ] for chunk in chunks]
 
         assert steps == [[], [(0, "get_weather", "")], [], [], [], [], [],
-                         [(0, None, '{"location": "NYC"}')]]
+                         [(0, None, '{"location": "NYC"}')], [],
+                         [(1, "search_web", "")], [], [], [], [], [],
+                         [(1, None, '{"query": "AI"}')]]
 
     def test_finish_reports_the_calls_the_last_increment_left(
             self, sample_tools):
