@@ -1562,8 +1562,8 @@ class _Fp8BlockScaleWeightReadLinear(
         )
 
     def _prequantized_push_target(self, num_rows: int):
-        """:meth:`_push_target` of :meth:`forward_prequantized`, in the low-M kernel's range."""
-        if self._output_all_reduce is None or not 1 <= num_rows <= self._low_m.kernel_max_m:
+        """:meth:`_push_target` of :meth:`forward_prequantized`, where it runs the low-M GEMM."""
+        if self._output_all_reduce is None or not self.takes_prequantized_input(num_rows):
             return None
         if not _low_m_gemm_push_applies(num_rows, self.out_features, self.in_features):
             return None
@@ -1698,7 +1698,7 @@ class _Fp8BlockScaleWeightReadLinear(
         """Project an FP8 activation a fused producer already quantized.
 
         Runs the low-M GEMM where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
-        other row count where :attr:`supports_prequantized_input`. In the low-M kernel's range
+        other row count where :attr:`supports_prequantized_input`. Where it runs the low-M GEMM
         a projection built with ``output_all_reduce`` pushes from the GEMM like :meth:`forward`;
         otherwise up to ``in_place_max_rows`` rows a copy kernel pushes the output. Up to
         ``in_place_max_rows`` rows the all-reduce is left pending for its consumer.

@@ -4508,15 +4508,17 @@ def run_low_m_gemm_prequantized_all_reduce_push(
     """:func:`run_low_m_gemm_prequantized` with the all-reduce push epilogue on the current
     stream: the rows go into the Lamport slots of the next all-reduce on ``view`` as with
     :func:`run_low_m_gemm_all_reduce_push`, which this matches bitwise on the BF16 activation
-    that ``(xq, xs)`` quantizes. ``M`` within the low-M kernel's range
-    (``1 <= M <= kernel_max_m_for(N, K)``) where :func:`all_reduce_push_applies`."""
+    that ``(xq, xs)`` quantizes. ``M`` where :func:`all_reduce_push_applies`: in the low-M
+    kernel's range the prequantized kernel, above it the mid-M kernel at its default tactic
+    (``xs`` then holds R128c4 scales of ``ceil(M / 128)`` blocks, as the mid-M GEMM reads them)."""
     m, k = xq.shape
     n = w.shape[0]
-    if not (m <= kernel_max_m_for(n, k) and all_reduce_push_applies(m, n, k)):
+    if not all_reduce_push_applies(m, n, k):
         raise ValueError(f"no prequantized all-reduce push for M={m}, N={n}, K={k}")
     pushed_ar.check_transport(view, m, n, one_shot)
-    tactic = default_prequantized_tactic(m, n, k)
-    _compiled_mid_push_kernel(n, k, tactic, use_pdl, view.world, one_shot, True)(
+    mid = m > low_m_max_for(n, k)
+    tactic = default_mid_tactic(m, n, k) if mid else default_prequantized_tactic(m, n, k)
+    _compiled_mid_push_kernel(n, k, tactic, use_pdl, view.world, one_shot, not mid)(
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
         _gmem_ptr(cutlass.Uint8, xs),

@@ -262,6 +262,14 @@ def _run_rank(world_size):
                             x, w, w_scale, target.view, target.one_shot, gate=g
                         )
                         bad += _differ(ref, _result(allreduce.finish_push(target)))
+                    if g is None:
+                        # The same push on the MXFP8 operand of ``x`` (low-M and mid-M kernels).
+                        xq, xs = _mxfp8_operand(x)
+                        target = allreduce.push_target(m, n)
+                        low_m.run_low_m_gemm_prequantized_all_reduce_push(
+                            xq, xs, w, w_scale, target.view, target.one_shot
+                        )
+                        bad += _differ(ref, _result(allreduce.finish_push(target)))
 
         # One CUDA graph with pushed and C++ calls on the workspace, replayed with new inputs.
         n, k, m = 7168, 768, 14

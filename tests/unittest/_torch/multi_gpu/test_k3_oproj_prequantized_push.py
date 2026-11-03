@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """An o_proj that owns its MNNVL all-reduce, fed the MXFP8 form of ``bf16(x * gate)`` (the operand
 the Kimi-K3 Helix tail stores): ``forward_prequantized`` pushes from the GEMM like ``forward_gated``
-does, left pending for its consumer up to ``in_place_max_rows`` rows, and is bitwise
-``forward_gated(x, gate)``, eagerly and in a CUDA graph replayed with new inputs."""
+does (low-M and mid-M kernels), left pending for its consumer up to ``in_place_max_rows`` rows, and
+is bitwise ``forward_gated(x, gate)``, eagerly and in a CUDA graph replayed with new inputs."""
 
 import os
 import pickle
@@ -93,7 +93,7 @@ def _run_rank(world_size):
                     w, w_scale, HIDDEN, allreduce, in_place_max_rows
                 )
                 o_proj.post_load_weights()
-                for m in (1, 8, 14, 32, 64):
+                for m in (1, 8, 14, 32, 64, 65, 96, 128):
                     if not o_proj.takes_prequantized_input(m):
                         continue
                     x, gate = _input(m, k, 9 * m, rank), _gate(m, k, 13 * m, rank)
