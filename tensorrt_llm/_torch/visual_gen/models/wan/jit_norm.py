@@ -92,6 +92,16 @@ def _map_args(geo: FrameGeometry | None) -> tuple[int, int, int]:
     return (geo.frame, geo.cols, geo.offset) if geo is not None else (0, 0, 0)
 
 
+@functools.cache
+def _kernel_api():
+    """The kernel module and the stream accessor, imported on first use (this module imports
+    without the CuTe DSL)."""
+    from .kernels import norm as norm_kernel
+    from .kernels.common import current_stream
+
+    return norm_kernel, current_stream
+
+
 @functools.lru_cache(maxsize=None)
 def _sm_count(device: int) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
@@ -168,8 +178,9 @@ def _addr(t: torch.Tensor | None) -> int:
 
 def _halo_args(push: HaloPush | None, channels: int) -> dict:
     """The kernel's halo-push arguments: per side (``_l`` / ``_r``) the destination's address,
-    positions per frame, vectors between components and positions between line positions;
-    then the axis. All zero without a push or a neighbour on that side."""
+    positions per frame, vectors between components, positions between line positions and
+    whether the side is present; then the axis. All zero without a push or a neighbour on that
+    side."""
     sides = (None, None) if push is None else (push.left, push.right)
     args = {"halo_axis": 0 if push is None else push.axis}
     for name, side in zip(("l", "r"), sides):
@@ -188,6 +199,7 @@ def _halo_args(push: HaloPush | None, channels: int) -> dict:
         args[f"halo_frame_{name}"] = frame
         args[f"halo_comp_{name}"] = comp
         args[f"halo_step_{name}"] = step
+        args[f"has_{name}"] = int(ptr != 0)
     return args
 
 
@@ -220,9 +232,7 @@ def _launch(
     in_geo: FrameGeometry | None = None,
     out_geo: FrameGeometry | None = None,
 ) -> None:
-    from .kernels import norm as norm_kernel
-    from .kernels.common import current_stream
-
+    norm_kernel, current_stream = _kernel_api()
     out_positions = (height + pad_h) * (width + pad_w) if variant.padded else positions
     if out_positions <= 0:
         return

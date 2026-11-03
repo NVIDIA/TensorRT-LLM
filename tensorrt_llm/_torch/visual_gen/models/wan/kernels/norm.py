@@ -1152,8 +1152,7 @@ _ARGS = (
     ("scale", Float32),
     ("eps", Float32),
 )
-# Host value of each argument type at launch (TVM-FFI takes raw addresses and Python scalars).
-_HOST_VALUE = {_PTR: lambda v: v, Int64: int, Int32: int, Float32: float}
+_ARG_NAMES = tuple(name for name, _ in _ARGS)
 
 
 def _check_arg_order() -> None:
@@ -1216,14 +1215,10 @@ def _compile(device: int, variant: Variant, has_sum: bool):
 def launch(
     variant: Variant, device: int, has_sum: bool, steps: int, sm_count: int, args: dict, stream
 ) -> None:
-    """Launch the variant (compiled on first use per device) on ``stream`` with the addresses
-    and scalars of ``jit_norm._launch`` (a null address for an operand the variant does not
-    read); ``steps`` thread blocks cover the output positions, the persistent grid is capped
-    at the resident blocks of ``sm_count`` SMs."""
+    """Launch the variant (compiled on first use per device) on ``stream`` with ``args``, the
+    value of every :data:`_ARGS` entry by name: an address as a Python int (0 for an operand
+    the variant does not read), the scalars as Python ints and floats. ``steps`` thread
+    blocks cover the output positions, the persistent grid is capped at the resident blocks
+    of ``sm_count`` SMs."""
     fn, blocks_per_sm = _compile(device, variant, has_sum)
-    args = dict(args, has_l=int(bool(args["halo_l"])), has_r=int(bool(args["halo_r"])))
-    fn(
-        *(_HOST_VALUE[kind](args[name]) for name, kind in _ARGS),
-        int(min(steps, sm_count * blocks_per_sm)),
-        stream,
-    )
+    fn(*[args[name] for name in _ARG_NAMES], min(steps, sm_count * blocks_per_sm), stream)
