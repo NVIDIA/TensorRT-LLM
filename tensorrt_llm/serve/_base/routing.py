@@ -77,6 +77,17 @@ class RouterSpec:
 # order: a router that registers GET /metrics must come before the Prometheus mount.
 ROUTERS: tuple[RouterSpec, ...] = (
     RouterSpec("tensorrt_llm.serve.api.ops.system.api_router", roles=ALL_ROLE_GROUPS),
+    RouterSpec(
+        "tensorrt_llm.serve.api.openai.embeddings.api_router",
+        roles=frozenset({RoleGroup.EMBEDDING}),
+    ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.openai.mm_encoder.api_router",
+        roles=frozenset({RoleGroup.MM_ENCODER}),
+    ),
+    RouterSpec(
+        "tensorrt_llm.serve.api.openai.tokenize.api_router", roles=frozenset({RoleGroup.LLM})
+    ),
 )
 
 

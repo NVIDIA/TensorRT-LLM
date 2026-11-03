@@ -724,6 +724,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self._init_visual_gen()
         else:
             self._init_llm(chat_template)
+            # Built once and injected into serving objects.
+            self._render_resources = RenderResources.from_server(self)
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -857,10 +859,6 @@ class OpenAIServer(_VideoRoutesMixin):
         # health API exists.
         self.app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
-        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
-        # Runs before the role dispatch for now. It moves after the dispatch
-        # once the serving objects attach_router checks for are built per
-        # role.
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -870,16 +868,50 @@ class OpenAIServer(_VideoRoutesMixin):
             assert isinstance(
                 self.generator, MultimodalEncoder
             ), "generator must be a MultimodalEncoder for multimodal encoder"
+            from tensorrt_llm.serve.api.openai.mm_encoder import \
+                api_router as mm_encoder_router
+            from tensorrt_llm.serve.api.openai.mm_encoder.serving import \
+                MMEncoderServing
+            setattr(
+                self.app.state, mm_encoder_router.APP_STATE_KEY,
+                MMEncoderServing(
+                    render_resources=self._render_resources,
+                    multimodal_server_config=self.multimodal_server_config,
+                    allow_request_chat_template=self.
+                    allow_request_chat_template,
+                    **self._generate_serving_kwargs()))
             self.register_mm_encoder_routes()
         elif self.server_role is ServerRole.EMBEDDING:
             assert getattr(self.generator.args, "encode_only", False), (
                 "generator must be an encode_only=True LLM for the embedding "
                 "server")
-            self._init_embedding_batcher()
-            self.register_embedding_routes()
+            from tensorrt_llm.serve.api.openai.embeddings import \
+                api_router as embeddings_router
+            from tensorrt_llm.serve.api.openai.embeddings.serving import \
+                EmbeddingServing
+            embedding_serving = EmbeddingServing(
+                model=self.model,
+                generator=self.generator,
+                embedding_max_queue_delay=self._embedding_max_queue_delay,
+                embedding_max_queue_size=self._embedding_max_queue_size)
+            # The lifespan starts and stops the batcher and the health probe
+            # reports it; both read it here.
+            self.embedding_batcher = embedding_serving.embedding_batcher
+            setattr(self.app.state, embeddings_router.APP_STATE_KEY,
+                    embedding_serving)
         else:
+            from tensorrt_llm.serve.api.openai.tokenize import \
+                api_router as tokenize_router
+            from tensorrt_llm.serve.api.openai.tokenize.serving import \
+                TokenizeServing
+            setattr(self.app.state, tokenize_router.APP_STATE_KEY,
+                    TokenizeServing(model=self.model, tokenizer=self.tokenizer))
             self._register_launcher_forwarding_routes()
             self.register_routes()
+
+        # Attach routers after the role switch: every attach_router checks
+        # that its serving objects are on app.state.
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
 
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
@@ -1116,6 +1148,13 @@ class OpenAIServer(_VideoRoutesMixin):
             status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
         )
 
+    def _generate_serving_kwargs(self) -> Dict[str, Any]:
+        """Constructor arguments of every GenerateBaseServing, read once."""
+        return dict(model=self.model,
+                    generator=self.generator,
+                    tokenizer=self.tokenizer,
+                    model_config=self.model_config)
+
     def _check_health(self) -> bool:
         # An embedding server's requests flow through the batcher worker; if it
         # has exited the engine is up but every /v1/embeddings request hangs, so
@@ -1230,9 +1269,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
-        self.app.add_api_route("/_internal/tokenize",
-                               self.tokenize,
-                               methods=["POST"])
 
         # Profiling endpoints (PyTorch backend only)
         self.app.add_api_route("/start_profile",
@@ -1281,9 +1317,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
-        self.app.add_api_route("/v1/chat/completions",
-                               self.openai_mm_encoder,
-                               methods=["POST"])
 
     async def _require_rl_control_auth(self, raw_request: Request) -> None:
         body = await raw_request.body()
