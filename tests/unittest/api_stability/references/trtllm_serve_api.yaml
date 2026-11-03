@@ -55,6 +55,12 @@
 models:
   CompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       model:
         kind: openai
         type: str
@@ -508,6 +514,12 @@ models:
 
   ChatCompletionRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       messages:
         kind: openai
         type: List[ChatCompletionMessageParam]
@@ -583,6 +595,12 @@ models:
       seed:
         kind: openai
         type: Optional[int]
+        default: null
+        status: stable
+        required: false
+      service_tier:
+        kind: openai
+        type: Optional[Literal['auto', 'default', 'flex', 'scale', 'priority', 'fast']]
         default: null
         status: stable
         required: false
@@ -669,6 +687,12 @@ models:
         type: Optional[int]
         default: 0
         status: beta
+        required: false
+      client_metadata:
+        kind: extension
+        type: Optional[Dict[str, str]]
+        default: null
+        status: prototype
         required: false
       best_of:
         kind: extension
@@ -1045,6 +1069,12 @@ models:
 
   ResponsesRequest:
     fields:
+      kv_hints:
+        kind: extension
+        type: Optional[KvHintsEnvelope]
+        default: null
+        status: prototype
+        required: false
       background:
         kind: openai
         type: Optional[bool]

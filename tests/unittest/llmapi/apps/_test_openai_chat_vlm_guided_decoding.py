@@ -72,7 +72,10 @@ def temp_extra_llm_api_options_file():
 def server(temp_extra_llm_api_options_file: str):
     model_path = get_model_path(_MODEL_NAME)
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
-    with RemoteOpenAIServer(model_path, cli_args=args) as remote_server:
+    # The tests send _IMAGE_URL, a local path under the test data root.
+    env = os.environ.copy()
+    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = os.path.dirname(_IMAGE_URL)
+    with RemoteOpenAIServer(model_path, cli_args=args, env=env) as remote_server:
         yield remote_server
 
 

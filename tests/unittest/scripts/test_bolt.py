@@ -30,8 +30,10 @@ import importlib.util
 import shutil
 import stat
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -42,7 +44,8 @@ BOLT_DIR = REPO_ROOT / "scripts" / "bolt"
 def _load(name: str):
     spec = importlib.util.spec_from_file_location(name, BOLT_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with patch.object(sys, "path", sys.path.copy()):
+        spec.loader.exec_module(module)
     return module
 
 

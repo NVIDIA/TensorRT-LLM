@@ -50,6 +50,7 @@ from tensorrt_llm.inputs.multimodal import (
 from tensorrt_llm.logger import logger
 
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
     _store_chunked_prefill_embeddings,
     find_input_mm_embeds,
@@ -687,6 +688,15 @@ class MultimodalModelMixin:
     def language_model(self) -> torch.nn.Module:
         """Return the inner language model that receives prepared inputs."""
         raise NotImplementedError
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """Return the inner language model's step-loop hooks."""
+        try:
+            language_model = self.language_model
+        except NotImplementedError:
+            return DEFAULT_RUNTIME_HOOKS
+        return runtime_hooks_of(language_model)
 
     @property
     def vocab_size_padded(self) -> int:

@@ -270,12 +270,6 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise NotImplementedError(
                 "TeaCache and Cache-DiT are not quality-validated for MiniMax-H3."
             )
-        if getattr(pipeline_config.cpu_offload_config, "enable", False):
-            raise NotImplementedError(
-                "MiniMax-H3 does not implement CPU offloading; the pipeline never "
-                "enters the offload context, so staged components would be used "
-                "directly on the wrong device."
-            )
         if pipeline_config.cuda_graph.enable:
             raise NotImplementedError(
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
@@ -289,6 +283,20 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.processor = None
         self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
+        return (("text_encoder",), ("transformer",), ("vae",), ("audio_vae",))
+
+    def extra_offload_component_names(self) -> set[str]:
+        # Non-participating ranks receive embeddings instead of loading Qwen.
+        return {PipelineComponent.TEXT_ENCODER.value}
+
+    def offload_pipeline_components(self) -> dict[str, torch.nn.Module]:
+        return {
+            name: component
+            for name in ("text_encoder", "transformer", "vae", "audio_vae")
+            if (component := getattr(self, name, None)) is not None
+        }
 
     def _check_sleep_world_size(self) -> None:
         config = self.pipeline_config
@@ -495,6 +503,7 @@ class MiniMaxH3Pipeline(BasePipeline):
     ) -> None:
         del kwargs
         skip_components = skip_components or []
+        offloaded = self.offloader.requested_components()
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -517,7 +526,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                         checkpoint_dir,
                         subfolder=PipelineComponent.TEXT_ENCODER,
                         torch_dtype=torch.bfloat16,
-                    ).to(device)
+                    ).to("cpu" if "text_encoder" in offloaded else device)
                     self.text_encoder.eval()
             else:
                 self.text_encoder = None
@@ -539,7 +548,7 @@ class MiniMaxH3Pipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.AUDIO_VAE,
                 torch_dtype=torch.float32,
-            ).to(device)
+            ).to("cpu" if "audio_vae" in offloaded else device)
             self.audio_vae.eval()
         if not _component_skipped(skip_components, PipelineComponent.SCHEDULER):
             self.scheduler = MiniMaxH3Scheduler.from_pretrained(
@@ -906,7 +915,8 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "text-only prompts; set text_encoder_tp_size=1 for requests "
                     "with Qwen3-VL vision inputs."
                 )
-            return self.text_encoder.encode(input_ids).to(device=self.device, dtype=self.dtype)
+            with self.offloader.context_if_requested("text_encoder"):
+                return self.text_encoder.encode(input_ids).to(device=self.device, dtype=self.dtype)
 
         num_layers = self.text_encoder.config.text_config.num_hidden_layers
         if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
@@ -927,14 +937,15 @@ class MiniMaxH3Pipeline(BasePipeline):
             else value.to(self.device)
             for name, value in vision_inputs.items()
         }
-        outputs = self.text_encoder.model(
-            input_ids=input_ids,
-            attention_mask=torch.ones_like(input_ids),
-            mm_token_type_ids=mm_token_type_ids,
-            use_cache=False,
-            output_hidden_states=True,
-            **vision_kwargs,
-        )
+        with self.offloader.context_if_requested("text_encoder"):
+            outputs = self.text_encoder.model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                mm_token_type_ids=mm_token_type_ids,
+                use_cache=False,
+                output_hidden_states=True,
+                **vision_kwargs,
+            )
         return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
             device=self.device, dtype=self.dtype
         )
@@ -964,7 +975,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
         pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
-        posterior = self.vae.encode(pixels).latent_dist
+        with self.offloader.context_if_requested("vae"):
+            posterior = self.vae.encode(pixels).latent_dist
         encode_generator = torch.Generator().manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
         latents = posterior.sample(generator=encode_generator).to(torch.float16).float().cpu()
         return (latents - latents_mean) / latents_std
@@ -1051,10 +1063,13 @@ class MiniMaxH3Pipeline(BasePipeline):
             device=self.device,
         ).view(1, -1, 1, 1, 1)
         latents = latents * latents_std + latents_mean
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=self.device.type == "cuda",
+        with (
+            self.offloader.context_if_requested("vae"),
+            torch.autocast(
+                device_type=self.device.type,
+                dtype=torch.float16,
+                enabled=self.device.type == "cuda",
+            ),
         ):
             video = self.vae.decode(latents, return_dict=False)[0]
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
@@ -1076,10 +1091,11 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.audio_vae.config.latents_std,
             device=self.device,
         ).view(1, -1, 1)
-        audio = self.audio_vae.decode(
-            latents * latents_std + latents_mean,
-            return_dict=False,
-        )[0]
+        with self.offloader.context_if_requested("audio_vae"):
+            audio = self.audio_vae.decode(
+                latents * latents_std + latents_mean,
+                return_dict=False,
+            )[0]
         return audio.float().permute(1, 0, 2)
 
     @torch.inference_mode()
@@ -1222,10 +1238,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 self.audio_scheduler.timesteps,
             )
         ]
-        static_context = self.transformer.prepare_static_context(
-            prompt_embeds,
-            position_ids,
-        )
+        with self.offloader.context_if_requested("transformer"):
+            static_context = self.transformer.prepare_static_context(
+                prompt_embeds,
+                position_ids,
+            )
         condition_rows = layout.num_condition_video_rows
         condition_prefix = latents[:condition_rows][None]
         audio_condition_rows = layout.num_condition_audio_rows
@@ -1278,15 +1295,16 @@ class MiniMaxH3Pipeline(BasePipeline):
             return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 
         timer.mark_denoise_start()
-        generated_latents, extra_latents = self.denoise(
-            latents=latents[condition_rows:][None],
-            scheduler=self.scheduler,
-            prompt_embeds=prompt_embeds,
-            guidance_scale=1.0,
-            forward_fn=forward_fn,
-            extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
-            extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
-        )
+        with self.offloader.context_if_requested("transformer"):
+            generated_latents, extra_latents = self.denoise(
+                latents=latents[condition_rows:][None],
+                scheduler=self.scheduler,
+                prompt_embeds=prompt_embeds,
+                guidance_scale=1.0,
+                forward_fn=forward_fn,
+                extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
+                extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
+            )
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()

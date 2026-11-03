@@ -38,6 +38,7 @@ from defs.model_express.mx_harness import (
     load_payload,
     log_tail,
     mx_metadata_ports,
+    probe_worker_args,
     report_timings,
     require_mx_environment,
     resolve_model_path,
@@ -148,6 +149,28 @@ _MX_CASES = (
         id="phi3-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_5_MODEL",
+            default_model_subdir="Qwen3.5-9B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3_5-tp1",
+            tp_size=1,
+            probe="image",
+        ),
+        id="qwen3_5-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_5_MODEL",
+            default_model_subdir="Qwen3.5-9B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3_5-tp2",
+            tp_size=2,
+            probe="image",
+        ),
+        id="qwen3_5-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
 )
 
 
@@ -179,6 +202,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     donor_gpu_ids = gpu_ids[: case.tp_size]
     receiver_gpu_ids = gpu_ids[case.tp_size :]
     donor_port, receiver_port = mx_metadata_ports(case.tp_size)
+    probe_args = probe_worker_args(case)
 
     try:
         # Leave donor GPUs untouched in case MPI worker teardown trails the baseline process.
@@ -188,6 +212,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 model_path=donor_snapshot,
                 tp_size=case.tp_size,
                 output_path=layout.output("baseline"),
+                extra_args=probe_args,
             ),
             worker_environment(
                 receiver_gpu_ids, layout.transfer_logs("baseline"), layout.manifest_dir
@@ -206,6 +231,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 ready_file=layout.donor_ready,
                 stop_file=layout.donor_stop,
                 max_serve_seconds=timeout_s + 120,
+                extra_args=probe_args,
             ),
             environment=worker_environment(
                 donor_gpu_ids,
@@ -225,6 +251,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                     tp_size=case.tp_size,
                     output_path=layout.output("receiver"),
                     mx_url=mx_url,
+                    extra_args=probe_args,
                 ),
                 worker_environment(
                     receiver_gpu_ids,
