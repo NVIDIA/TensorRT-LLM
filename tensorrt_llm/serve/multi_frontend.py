@@ -85,6 +85,8 @@ class MultiFrontendServing:
     launcher_uds: str
     is_launcher: bool
     launcher_pid: Optional[int] = None  # attached frontends: their parent
+    frontend_id: int = 0  # the launcher is frontend 0
+    num_frontends: int = 1
 
     @property
     def is_attached(self) -> bool:

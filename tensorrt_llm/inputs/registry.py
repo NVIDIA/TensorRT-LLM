@@ -136,6 +136,7 @@ class DefaultInputProcessor(InputProcessor):
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
+        self._prefix_token_cache_tokenizer = tokenizer
         # None when disabled or the tokenizer cannot support the cache.
         self._prefix_token_cache = (create_prefix_token_cache(tokenizer)
                                     if enable_tokenization_cache else None)
@@ -151,6 +152,15 @@ class DefaultInputProcessor(InputProcessor):
             truncate_prompt_tokens=sampling_params.truncate_prompt_tokens,
             prefix_token_cache=self._prefix_token_cache)
         return token_ids, None
+
+
+def prefix_token_cache_of(
+        input_processor: Any) -> Optional[Tuple[PrefixTokenCache, Any]]:
+    """The prefix-tokenization cache of ``input_processor`` and its tokenizer, if enabled."""
+    cache = getattr(input_processor, "_prefix_token_cache", None)
+    if cache is None:
+        return None
+    return cache, input_processor._prefix_token_cache_tokenizer
 
 
 class BaseMultimodalInputProcessor(ABC):
