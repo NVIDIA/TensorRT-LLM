@@ -326,49 +326,14 @@ def wino_norm_silu(
     touches the logical positions only (and, with ``inputs_geometry.push``, stores the border
     lines into the neighbours' buffers as well). ``inputs``: a preallocated destination for
     ``D`` (``[order + 2, T/order, input positions, C]``, contiguous) instead of a fresh one."""
-    if (x is None) == (m is None):
-        raise ValueError("exactly one of x and m")
-    for name, t in (
-        ("x", x),
-        ("residual", residual),
-        ("cache", cache),
-        ("gamma", gamma),
-        ("bias", bias),
-        ("in_bias", in_bias),
-    ):
-        if t is not None and t.dtype is not torch.bfloat16:
-            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
-    if order not in (2, 4) or (order == 4 and not fp16_inputs):
-        raise ValueError("order must be 2 or 4; order 4 needs fp16 Winograd inputs")
-    if frames < order or frames % order:
-        raise ValueError("frames must be a positive multiple of order")
+    _check_wino_operands(x, m, residual, in_bias, cache, gamma, bias, frames, order, fp16_inputs)
     comps = order + 2
     winograd_dtype = torch.float16 if fp16_inputs else torch.bfloat16
-    if products_geometry is not None and products_geometry.identity:
-        products_geometry = None
-    if inputs_geometry is not None and inputs_geometry.identity:
-        inputs_geometry = None
-    if products_geometry is not None and x is not None:
-        raise ValueError("products_geometry applies to the products")
+    products_geometry, inputs_geometry, positions, height, width = _wino_layout(
+        x, m, products_geometry, inputs_geometry
+    )
     src = x if x is not None else m[0]
     channels = src.shape[-1]
-    if products_geometry is not None:
-        positions = products_geometry.height * products_geometry.width
-        if m[0].shape[1] != products_geometry.frame:
-            raise ValueError("the products do not match products_geometry")
-    else:
-        positions = src.shape[1]
-    height, width = (
-        (inputs_geometry.height, inputs_geometry.width)
-        if inputs_geometry is not None
-        else (products_geometry.height, products_geometry.width)
-        if products_geometry is not None
-        else (0, 0)
-    )
-    if height and width and height * width != positions:
-        raise ValueError("the geometries must agree on the logical frame")
-    if channels % _VEC:
-        raise ValueError("channels must be a multiple of 8")
     device = src.device.index
     opts = dict(device=src.device, dtype=torch.bfloat16)
     want_sum = residual is not None or in_bias is not None or x is None
@@ -376,18 +341,7 @@ def wino_norm_silu(
     y_tail = torch.empty((2, positions, channels), **opts)
     input_positions = inputs_geometry.frame if inputs_geometry is not None else positions
     d_shape = (comps, frames // order, input_positions, channels)
-    if inputs is None:
-        d = torch.empty(d_shape, device=src.device, dtype=winograd_dtype)
-    else:
-        if (
-            tuple(inputs.shape) != d_shape
-            or inputs.dtype != winograd_dtype
-            or not inputs.is_contiguous()
-        ):
-            raise ValueError(
-                f"inputs must be a contiguous {winograd_dtype} tensor of shape {d_shape}"
-            )
-        d = inputs
+    d = _winograd_inputs_buffer(inputs, d_shape, winograd_dtype, src.device)
     cache_frames = cache.shape[0] if cache is not None and cache.numel() else 0
     m_ptr, m_stride = 0, 0
     if m is not None:
@@ -441,6 +395,86 @@ def wino_norm_silu(
         out_geo=inputs_geometry,
     )
     return out_sum, y_tail, d
+
+
+def _check_wino_operands(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    residual: torch.Tensor | None,
+    in_bias: torch.Tensor | None,
+    cache: torch.Tensor | None,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    frames: int,
+    order: int,
+    fp16_inputs: bool,
+) -> None:
+    """The operand rules of :func:`wino_norm_silu`: exactly one of ``x`` / ``m``, bf16 rows,
+    order 2 or 4 (4 with fp16 Winograd inputs), whole groups of ``order`` frames."""
+    if (x is None) == (m is None):
+        raise ValueError("exactly one of x and m")
+    for name, t in (
+        ("x", x),
+        ("residual", residual),
+        ("cache", cache),
+        ("gamma", gamma),
+        ("bias", bias),
+        ("in_bias", in_bias),
+    ):
+        if t is not None and t.dtype is not torch.bfloat16:
+            raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
+    if order not in (2, 4) or (order == 4 and not fp16_inputs):
+        raise ValueError("order must be 2 or 4; order 4 needs fp16 Winograd inputs")
+    if frames < order or frames % order:
+        raise ValueError("frames must be a positive multiple of order")
+
+
+def _wino_layout(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    products_geometry: FrameGeometry | None,
+    inputs_geometry: FrameGeometry | None,
+) -> tuple[FrameGeometry | None, FrameGeometry | None, int, int, int]:
+    """The frame layout of :func:`wino_norm_silu`: the geometries (identity ones dropped), the
+    logical positions per frame and the logical ``(height, width)`` (zeros without a
+    geometry)."""
+    if products_geometry is not None and products_geometry.identity:
+        products_geometry = None
+    if inputs_geometry is not None and inputs_geometry.identity:
+        inputs_geometry = None
+    if products_geometry is not None and x is not None:
+        raise ValueError("products_geometry applies to the products")
+    src = x if x is not None else m[0]
+    if products_geometry is not None:
+        positions = products_geometry.height * products_geometry.width
+        if m[0].shape[1] != products_geometry.frame:
+            raise ValueError("the products do not match products_geometry")
+    else:
+        positions = src.shape[1]
+    height, width = (
+        (inputs_geometry.height, inputs_geometry.width)
+        if inputs_geometry is not None
+        else (products_geometry.height, products_geometry.width)
+        if products_geometry is not None
+        else (0, 0)
+    )
+    if height and width and height * width != positions:
+        raise ValueError("the geometries must agree on the logical frame")
+    if src.shape[-1] % _VEC:
+        raise ValueError("channels must be a multiple of 8")
+    return products_geometry, inputs_geometry, positions, height, width
+
+
+def _winograd_inputs_buffer(
+    inputs: torch.Tensor | None, d_shape: tuple, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """The Winograd-input destination: ``inputs`` when given (it must be exactly
+    ``d_shape``, ``dtype`` and contiguous), else a new tensor."""
+    if inputs is None:
+        return torch.empty(d_shape, device=device, dtype=dtype)
+    if tuple(inputs.shape) != d_shape or inputs.dtype != dtype or not inputs.is_contiguous():
+        raise ValueError(f"inputs must be a contiguous {dtype} tensor of shape {d_shape}")
+    return inputs
 
 
 def rms_norm_silu_rows(

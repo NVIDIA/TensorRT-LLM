@@ -261,8 +261,22 @@ TOP_KERNELS = 15  # kernels kept in each timing record, largest first
 def _time_cupti(
     run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: bool
 ) -> dict[str, Any]:
-    from cupti import cupti
+    """Time ``iters`` replays of ``run_fn`` with CUPTI.
 
+    Replays run as a CUDA graph when ``run_fn`` captures, with L2 flushed before each; the
+    record holds the per-iteration kernel span, busy time and wall time.
+    """
+    graph, replay = _warm_up(run_fn, warmup, use_graph)
+    launches, kernels, windows = _record_iterations(replay, iters)
+    per_iter = _kernels_per_iteration(launches, kernels, windows)
+    return _timing_summary(per_iter, windows, iters, graph is not None)
+
+
+def _warm_up(run_fn: Callable[[], Any], warmup: int, use_graph: bool):
+    """One eager run, the graph capture when asked, then ``warmup`` timed-path replays.
+
+    Returns ``(graph or None, the replay callable)``.
+    """
     with torch.inference_mode():
         run_fn()
     torch.cuda.synchronize()
@@ -275,6 +289,17 @@ def _time_cupti(
             _flush_l2()
             replay()
         torch.cuda.synchronize()
+    return graph, replay
+
+
+def _record_iterations(replay: Callable[[], Any], iters: int):
+    """CUPTI activity records of ``iters`` replays: ``(launches, kernels, windows)``.
+
+    A launch is ``(start, end, correlation)``, a kernel / memcpy / memset ``(start, end,
+    correlation, name or None)`` and a window the ``(t0, t1)`` CUPTI timestamps around one
+    replay. ``cupti.finalize`` is not called here: once per process, at exit.
+    """
+    from cupti import cupti
 
     launches: list[tuple[int, int, int]] = []
     kernels: list[tuple[int, int, int, str | None]] = []
@@ -318,8 +343,20 @@ def _time_cupti(
     cupti.activity_flush_all(0)
     for kind in kinds:
         cupti.activity_disable(kind)
-    # No cupti.finalize() here: once per process, at exit.
+    return launches, kernels, windows
 
+
+def _kernels_per_iteration(
+    launches: list[tuple[int, int, int]],
+    kernels: list[tuple[int, int, int, str | None]],
+    windows: list[tuple[int, int]],
+) -> list[list[tuple[int, int, int, str | None]]]:
+    """The kernel records of each timed window.
+
+    Those whose launch (runtime or driver call) falls in the window, matched by correlation
+    id; when that finds none, the kernels that start and end in the window by timestamp (the
+    same clock as the CUPTI records).
+    """
     corr_to_kernels: dict[int, list[tuple[int, int, int, str | None]]] = {}
     for k in kernels:
         corr_to_kernels.setdefault(k[2], []).append(k)
@@ -328,12 +365,7 @@ def _time_cupti(
     kernels_by_start = sorted(kernels, key=lambda k: k[0])
     kernel_starts = [k[0] for k in kernels_by_start]
 
-    span_us: list[float] = []
-    busy_us: list[float] = []
-    wall_us: list[float] = []
-    n_kernels: list[int] = []
-    category_ns: dict[str, int] = {}
-    kernel_ns: dict[str, int] = {}
+    per_iter = []
     for idx, (t0, t1) in enumerate(windows):
         li = bisect.bisect_left(launch_starts, t0)
         ri = bisect.bisect_right(launch_starts, t1)
@@ -342,12 +374,44 @@ def _time_cupti(
         for cid in corr_ids:
             iter_kernels.extend(corr_to_kernels.get(cid, []))
         if not iter_kernels:
-            # Fall back to the timestamp window (same clock as the CUPTI records).
             ki = bisect.bisect_left(kernel_starts, t0)
             kj = bisect.bisect_right(kernel_starts, t1)
             iter_kernels = [k for k in kernels_by_start[ki:kj] if k[1] <= t1]
         if not iter_kernels:
             raise RuntimeError(f"CUPTI recorded no kernels for iteration {idx}")
+        per_iter.append(iter_kernels)
+    return per_iter
+
+
+def _stats(values: list[float]) -> dict[str, float]:
+    ordered = sorted(values)
+    p90 = ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
+    return {
+        "median_us": statistics.median(values),
+        "p90_us": p90,
+        "min_us": ordered[0],
+        "max_us": ordered[-1],
+    }
+
+
+def _timing_summary(
+    per_iter: list[list[tuple[int, int, int, str | None]]],
+    windows: list[tuple[int, int]],
+    iters: int,
+    graph: bool,
+) -> dict[str, Any]:
+    """The timing record of the recorded iterations.
+
+    Span (first kernel start to last kernel end), busy (sum of kernel times) and wall
+    statistics, kernel count, and per-category and top per-kernel time per iteration.
+    """
+    span_us: list[float] = []
+    busy_us: list[float] = []
+    wall_us: list[float] = []
+    n_kernels: list[int] = []
+    category_ns: dict[str, int] = {}
+    kernel_ns: dict[str, int] = {}
+    for iter_kernels, (t0, t1) in zip(per_iter, windows):
         min_start = min(k[0] for k in iter_kernels)
         max_end = max(k[1] for k in iter_kernels)
         span_us.append((max_end - min_start) / 1e3)
@@ -360,19 +424,9 @@ def _time_cupti(
             short = (k[3] or "<memcpy/memset>")[:160]
             kernel_ns[short] = kernel_ns.get(short, 0) + d
 
-    def _stats(values: list[float]) -> dict[str, float]:
-        ordered = sorted(values)
-        p90 = ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
-        return {
-            "median_us": statistics.median(values),
-            "p90_us": p90,
-            "min_us": ordered[0],
-            "max_us": ordered[-1],
-        }
-
     top = sorted(kernel_ns.items(), key=lambda kv: -kv[1])[:TOP_KERNELS]
     return {
-        "graph": graph is not None,
+        "graph": graph,
         "iters": iters,
         "span": _stats(span_us),
         "busy": _stats(busy_us),
@@ -620,42 +674,74 @@ def _run_backend(
         torch.distributed.barrier()
     out_cpu: torch.Tensor | None = None
     if not args.skip_accuracy:
-        torch.cuda.reset_peak_memory_stats()
-        with torch.inference_mode():
-            out = run_fn()
-        torch.cuda.synchronize()
-        row["peak_alloc_gb"] = torch.cuda.max_memory_allocated() / 2**30
-        row["output_shape"] = list(out.shape)
-        out_cpu = out.float().cpu()
-        if reference is not None:
-            row["vs_ref_fp32"] = _metrics(out_cpu, reference)
-        if backend != "native" and native_out is not None:
-            row["vs_native"] = _metrics(out_cpu, native_out)
-        del out
+        out_cpu = _accuracy_pass(row, run_fn, backend, reference, native_out)
 
     row["timing"] = _time_cupti(run_fn, args.warmup, args.iters, use_graph=not args.no_graph)
     if args.span_diffs and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
-        frames = [1, 1 + decode_chunk, 1 + 2 * decode_chunk]
-        timed = [
-            _clip_span(model, inp, n, decode_chunk, args.warmup, args.iters, not args.no_graph)
-            for n in frames
-        ]
-        spans = [t for t, _ in timed]
-        row["span_diffs"] = {
-            "chunk_latent_frames": decode_chunk,
-            "latent_frames": frames,
-            "span_ms": spans,
-            "graph": [g for _, g in timed],
-            "diff_ms": [spans[1] - spans[0], spans[2] - spans[1]],
-        }
-        print(
-            "    whole-clip decode spans for "
-            + ", ".join(f"{n} latent frames: {t:.2f} ms" for n, t in zip(frames, spans))
-            + f"; differences {spans[1] - spans[0]:.2f} / {spans[2] - spans[1]:.2f} ms",
-            flush=True,
-        )
+        row["span_diffs"] = _span_diffs(model, inp, decode_chunk, args)
     row["setup_s"] = time.time() - t_start
+    _print_row(backend, row)
+    del model, run_fn
+    torch.cuda.empty_cache()
+    return row, out_cpu
 
+
+def _accuracy_pass(
+    row: dict[str, Any],
+    run_fn: Callable[[], Any],
+    backend: str,
+    reference: torch.Tensor | None,
+    native_out: torch.Tensor | None,
+) -> torch.Tensor:
+    """One untimed run; returns the output on the CPU.
+
+    Peak memory, output shape and the errors against the fp32 reference and the native
+    output go into ``row``.
+    """
+    torch.cuda.reset_peak_memory_stats()
+    with torch.inference_mode():
+        out = run_fn()
+    torch.cuda.synchronize()
+    row["peak_alloc_gb"] = torch.cuda.max_memory_allocated() / 2**30
+    row["output_shape"] = list(out.shape)
+    out_cpu = out.float().cpu()
+    if reference is not None:
+        row["vs_ref_fp32"] = _metrics(out_cpu, reference)
+    if backend != "native" and native_out is not None:
+        row["vs_native"] = _metrics(out_cpu, native_out)
+    return out_cpu
+
+
+def _span_diffs(
+    model: torch.nn.Module, inp: torch.Tensor, decode_chunk: int, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Whole-clip decode spans of 1, 1 + chunk and 1 + 2 chunks latent frames.
+
+    Their differences are the steady-state cost of one chunk; printed and returned as a
+    record.
+    """
+    frames = [1, 1 + decode_chunk, 1 + 2 * decode_chunk]
+    timed = [
+        _clip_span(model, inp, n, decode_chunk, args.warmup, args.iters, not args.no_graph)
+        for n in frames
+    ]
+    spans = [t for t, _ in timed]
+    print(
+        "    whole-clip decode spans for "
+        + ", ".join(f"{n} latent frames: {t:.2f} ms" for n, t in zip(frames, spans))
+        + f"; differences {spans[1] - spans[0]:.2f} / {spans[2] - spans[1]:.2f} ms",
+        flush=True,
+    )
+    return {
+        "chunk_latent_frames": decode_chunk,
+        "latent_frames": frames,
+        "span_ms": spans,
+        "graph": [g for _, g in timed],
+        "diff_ms": [spans[1] - spans[0], spans[2] - spans[1]],
+    }
+
+
+def _print_row(backend: str, row: dict[str, Any]) -> None:
     t = row["timing"]
     acc = row.get("vs_ref_fp32", {})
     print(
@@ -667,9 +753,6 @@ def _run_backend(
         + (f"rel_l2 {acc['rel_l2']:.3e} max_abs {acc['max_abs']:.3e}" if acc else ""),
         flush=True,
     )
-    del model, run_fn
-    torch.cuda.empty_cache()
-    return row, out_cpu
 
 
 def main() -> None:
@@ -677,10 +760,7 @@ def main() -> None:
     global TOP_KERNELS
     TOP_KERNELS = args.top_kernels
 
-    if args.world_size > 1 and "RANK" not in os.environ:
-        _relaunch_under_torchrun(args.world_size)
-    dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
-
+    quiet, parallel = _setup_process(args)
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     dtype = getattr(torch, args.dtype)
     backends = args.backends.split(",")
@@ -690,20 +770,83 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    repo = Path(__file__).resolve().parents[2]
+    gpu_full, gpu_short = _gpu_signature()
+    meta = _run_meta(args, winovae_opts, repo, gpu_full, gpu_short)
+    print(json.dumps(meta, indent=1))
+
+    state_dict = _load_state_dict(args)
+    if args.checkpoint:
+        meta["checkpoint"] = args.checkpoint
+    use_reference = _use_reference(args, meta)
+    results: list[dict[str, Any]] = []
+    for shape_name in shapes:
+        results += _run_shape(
+            args,
+            shape_name,
+            ops,
+            backends,
+            state_dict,
+            dtype,
+            winovae_opts,
+            parallel,
+            use_reference,
+        )
+
+    if not quiet:
+        _write_results(out_dir, args, gpu_short, meta, results)
+    if parallel is not None:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
+
+
+def _setup_process(args: argparse.Namespace):
+    """Set up the process: torchrun relaunch, process group, CUPTI finalize, quiet ranks.
+
+    Relaunches under torchrun for several ranks, joins the process group, finalizes CUPTI
+    once at exit and silences ranks other than 0 (they compute but do not report). Returns
+    ``(quiet, the parallel wrapper or None)``.
+    """
+    if args.world_size > 1 and "RANK" not in os.environ:
+        _relaunch_under_torchrun(args.world_size)
+    dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
+
     def _finalize():
         from cupti import cupti
 
         cupti.finalize()
 
     atexit.register(_finalize)
-
-    repo = Path(__file__).resolve().parents[2]
-    gpu_full, gpu_short = _gpu_signature()
-    quiet = dist_rank != 0  # ranks other than 0 compute but do not report
+    quiet = dist_rank != 0
     if quiet:
         sys.stdout = open(os.devnull, "w")
+    return quiet, parallel
 
-    meta = {
+
+def _use_reference(args: argparse.Namespace, meta: dict[str, Any]) -> bool:
+    """Whether the fp32 reference runs.
+
+    Real inputs (recorded in ``meta``) require it, since their decode input is its encoding.
+    """
+    use_reference = not args.skip_accuracy and args.ref_dtype != "none"
+    if args.video or args.image:
+        if not use_reference:
+            raise ValueError(
+                "real inputs need the fp32 reference (their decode input is its encoding)"
+            )
+        meta["video"], meta["image"] = args.video, args.image
+    return use_reference
+
+
+def _run_meta(
+    args: argparse.Namespace,
+    winovae_opts: dict[str, Any],
+    repo: Path,
+    gpu_full: str,
+    gpu_short: str,
+) -> dict[str, Any]:
+    """The run's provenance record (written as ``meta`` in the result JSON)."""
+    return {
         "label": args.label,
         "timestamp": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "git_sha": _git_sha(repo),
@@ -722,65 +865,71 @@ def main() -> None:
         "graph_requested": not args.no_graph,
         "argv": sys.argv[1:],
     }
-    print(json.dumps(meta, indent=1))
 
-    state_dict = _load_state_dict(args)
-    if args.checkpoint:
-        meta["checkpoint"] = args.checkpoint
-    use_reference = not args.skip_accuracy and args.ref_dtype != "none"
-    if args.video or args.image:
-        if not use_reference:
-            raise ValueError(
-                "real inputs need the fp32 reference (their decode input is its encoding)"
-            )
-        meta["video"], meta["image"] = args.video, args.image
-    results: list[dict[str, Any]] = []
 
-    for shape_name in shapes:
-        inputs = _build_inputs(args, shape_name, state_dict, dtype)
-        decode_chunk = args.decode_chunk or SHAPE_DECODE_CHUNK.get(shape_name, 1)
-        for op in ops:
-            if op not in inputs:
-                raise ValueError(op)
-            inp = inputs[op]
-            print(
-                f"\n=== {shape_name} {op} input={tuple(inp.shape)} chunk={decode_chunk} ===",
-                flush=True,
-            )
-            reference = (
-                _fp32_reference(state_dict, op, inp, decode_chunk) if use_reference else None
-            )
-            native_out: torch.Tensor | None = None
-            for backend in backends:
-                row, out_cpu = _run_backend(
-                    backend,
-                    args=args,
-                    state_dict=state_dict,
-                    dtype=dtype,
-                    winovae_opts=winovae_opts,
-                    parallel=parallel,
-                    shape_name=shape_name,
-                    op=op,
-                    inp=inp,
-                    decode_chunk=decode_chunk,
-                    reference=reference,
-                    native_out=native_out,
-                )
-                if backend == "native":
-                    native_out = out_cpu
-                results.append(row)
-            del reference, native_out
-        del inputs
-        torch.cuda.empty_cache()
+def _run_shape(
+    args: argparse.Namespace,
+    shape_name: str,
+    ops: list[str],
+    backends: list[str],
+    state_dict: dict[str, torch.Tensor],
+    dtype,
+    winovae_opts: dict[str, Any],
+    parallel,
+    use_reference: bool,
+) -> list[dict[str, Any]]:
+    """Every op of one shape on every backend; returns the result rows.
 
-    if not quiet:
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_path = out_dir / f"run_{stamp}_{args.label}_{gpu_short}_ws{args.world_size}.json"
-        out_path.write_text(json.dumps({"meta": meta, "results": results}, indent=1))
-        print(f"\nwrote {out_path}")
-    if parallel is not None:
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+    The native output, when native runs first, is the others' comparison point.
+    """
+    rows: list[dict[str, Any]] = []
+    inputs = _build_inputs(args, shape_name, state_dict, dtype)
+    decode_chunk = args.decode_chunk or SHAPE_DECODE_CHUNK.get(shape_name, 1)
+    for op in ops:
+        if op not in inputs:
+            raise ValueError(op)
+        inp = inputs[op]
+        print(
+            f"\n=== {shape_name} {op} input={tuple(inp.shape)} chunk={decode_chunk} ===",
+            flush=True,
+        )
+        reference = _fp32_reference(state_dict, op, inp, decode_chunk) if use_reference else None
+        native_out: torch.Tensor | None = None
+        for backend in backends:
+            row, out_cpu = _run_backend(
+                backend,
+                args=args,
+                state_dict=state_dict,
+                dtype=dtype,
+                winovae_opts=winovae_opts,
+                parallel=parallel,
+                shape_name=shape_name,
+                op=op,
+                inp=inp,
+                decode_chunk=decode_chunk,
+                reference=reference,
+                native_out=native_out,
+            )
+            if backend == "native":
+                native_out = out_cpu
+            rows.append(row)
+        del reference, native_out
+    del inputs
+    torch.cuda.empty_cache()
+    return rows
+
+
+def _write_results(
+    out_dir: Path,
+    args: argparse.Namespace,
+    gpu_short: str,
+    meta: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> None:
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = out_dir / f"run_{stamp}_{args.label}_{gpu_short}_ws{args.world_size}.json"
+    out_path.write_text(json.dumps({"meta": meta, "results": results}, indent=1))
+    print(f"\nwrote {out_path}")
 
 
 if __name__ == "__main__":

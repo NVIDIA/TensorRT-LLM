@@ -1514,31 +1514,10 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
             silu=False,
         )
         normed_rows = frames_view(normed).reshape(frames * positions, channels)
-        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
         if self.shard is None:
-            qkv = torch.addmm(self.to_qkv.bias, normed_rows, w_qkv.t())  # bias in the GEMM epilogue
-            qkv = qkv.view(frames, 1, positions, 3 * channels)
-            q, k, v = qkv.chunk(3, dim=-1)
+            q, k, v = self._qkv(normed_rows, frames, positions)
         else:
-            # Attention spans the whole frame: keys and values from every rank's rows (their
-            # order does not matter), queries from ours.
-            q = torch.addmm(self.to_qkv.bias[:channels], normed_rows, w_qkv[:channels].t()).view(
-                frames, 1, positions, channels
-            )
-            all_rows = self.shard.gather_rows(normed_rows)
-            kv = torch.addmm(self.to_qkv.bias[channels:], all_rows, w_qkv[channels:].t())
-            if self.shard.uneven:
-                # Rank-major rows of unequal counts: per rank [T, P_r, 2C], joined along P.
-                counts = self.shard.row_counts(normed_rows.shape[0])
-                per_rank = [
-                    part.view(frames, n // frames, 2 * channels)
-                    for part, n in zip(kv.split(counts), counts)
-                ]
-                kv = torch.cat(per_rank, dim=1).unsqueeze(1)
-            else:
-                kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
-                kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
-            k, v = kv.chunk(2, dim=-1)
+            q, k, v = self._qkv_sharded(normed_rows, frames, positions)
         attn = F.scaled_dot_product_attention(q, k, v)  # [T, 1, HW, C]
         attn_rows = attn.reshape(frames * positions, channels)
         w_proj = self.proj.weight.reshape(channels, channels)
@@ -1546,6 +1525,43 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
         proj = frames_to_video(proj_rows.view(frames, positions, channels), height, width)
         # x + residual (+ the proj bias) is added by the consumer's norm kernel.
         return DeferredSum(proj, residual=residual, bias=self.proj.bias)
+
+    def _qkv(
+        self, normed_rows: torch.Tensor, frames: int, positions: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q, K, V ``[T, 1, HW, C]`` of whole frames from the normalized rows ``[T*HW, C]``:
+        one GEMM, the bias in its epilogue."""
+        channels = normed_rows.shape[1]
+        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
+        qkv = torch.addmm(self.to_qkv.bias, normed_rows, w_qkv.t())
+        qkv = qkv.view(frames, 1, positions, 3 * channels)
+        return qkv.chunk(3, dim=-1)
+
+    def _qkv_sharded(
+        self, normed_rows: torch.Tensor, frames: int, positions: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q of this rank's rows and K, V of the whole frame: attention spans the frame, so
+        the keys and values come from every rank's rows (their order does not matter)."""
+        channels = normed_rows.shape[1]
+        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
+        q = torch.addmm(self.to_qkv.bias[:channels], normed_rows, w_qkv[:channels].t()).view(
+            frames, 1, positions, channels
+        )
+        all_rows = self.shard.gather_rows(normed_rows)
+        kv = torch.addmm(self.to_qkv.bias[channels:], all_rows, w_qkv[channels:].t())
+        if self.shard.uneven:
+            # Rank-major rows of unequal counts: per rank [T, P_r, 2C], joined along P.
+            counts = self.shard.row_counts(normed_rows.shape[0])
+            per_rank = [
+                part.view(frames, n // frames, 2 * channels)
+                for part, n in zip(kv.split(counts), counts)
+            ]
+            kv = torch.cat(per_rank, dim=1).unsqueeze(1)
+        else:
+            kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
+            kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
+        k, v = kv.chunk(2, dim=-1)
+        return q, k, v
 
 
 def _run_resnets(
