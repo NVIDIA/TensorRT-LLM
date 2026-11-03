@@ -16,12 +16,11 @@
 
 #include "kimi_k3_vl/csrc/mnnvlAllGatherKernels.h"
 #include "kimi_k3_vl/csrc/mnnvlAllreduceAttnRes.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/mnnvlAllreduceKernels.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -39,10 +38,12 @@ std::vector<torch::Tensor> mnnvlAllReduceAttnRes(torch::Tensor const& input,
     torch::Tensor const& res_weight, torch::Tensor const& rms_weight, torch::Tensor const& output_rms_weight,
     double rms_eps, double output_rms_eps, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
 {
-    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcast_mem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlAllReduceAttnRes] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllReduceAttnRes] MNNVL workspace handles are not attached.");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcast_mem->getUnicastPtr(mcast_mem->getRank()),
+        "[mnnvlAllReduceAttnRes] comm_buffer must start at the local unicast allocation base.");
     auto const checkBf16 = [](torch::Tensor const& tensor, char const* name)
     {
         TORCH_CHECK(tensor.is_cuda() && tensor.scalar_type() == torch::kBFloat16 && tensor.is_contiguous(),
@@ -111,13 +112,14 @@ namespace
 
 TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::AllGatherSplitParams makeAllGatherSplitParams(torch::Tensor const& input,
     int64_t bf16_columns, int64_t world_size, torch::Tensor& comm_buffer, torch::Tensor& buffer_flags,
-    torch::Tensor& bf16Out, torch::Tensor& fp32Out)
+    torch::Tensor& bf16Out, torch::Tensor& fp32Out, tensorrt_llm::runtime::DeviceMemoryOwner const& mcast_mem)
 {
     namespace k3Mnnvl = TRTLLM_MV2_NS::kernels::kimiK3Mnnvl;
-    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlAllGatherSplit] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlAllGatherSplit] MNNVL workspace handles are not attached.");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcast_mem->getUnicastPtr(mcast_mem->getRank()),
+        "[mnnvlAllGatherSplit] comm_buffer must start at the local unicast allocation base.");
     TORCH_CHECK(input.is_cuda() && input.scalar_type() == torch::kFloat32 && input.is_contiguous() && input.dim() == 2,
         "[mnnvlAllGatherSplit] input must be a contiguous [num_tokens, columns] fp32 CUDA tensor");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(input.const_data_ptr()) % 16 == 0,
@@ -157,10 +159,11 @@ TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::AllGatherSplitParams makeAllGatherSplitPara
 std::vector<torch::Tensor> mnnvlAllGatherSplit(torch::Tensor const& input, int64_t bf16_columns, int64_t world_size,
     torch::Tensor& comm_buffer, torch::Tensor& buffer_flags)
 {
+    auto mcast_mem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     torch::Tensor bf16Out;
     torch::Tensor fp32Out;
-    auto const params
-        = makeAllGatherSplitParams(input, bf16_columns, world_size, comm_buffer, buffer_flags, bf16Out, fp32Out);
+    auto const params = makeAllGatherSplitParams(
+        input, bf16_columns, world_size, comm_buffer, buffer_flags, bf16Out, fp32Out, mcast_mem);
     TRTLLM_MV2_NS::kernels::kimiK3Mnnvl::mnnvlAllGatherSplitOp(params);
     return {bf16Out, fp32Out};
 }
