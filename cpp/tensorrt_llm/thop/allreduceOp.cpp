@@ -2227,7 +2227,7 @@ bool hasMnnvlNormOutput(AllReduceFusionOp fusionOp)
 std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::optional<torch::Tensor> const& gamma,
     torch::optional<torch::Tensor> const& residual_in, torch::optional<double> epsilon, torch::Tensor& comm_buffer,
     torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
-    bool fp8_payload)
+    bool fp8_payload, int64_t one_shot_max_bytes)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(
@@ -2403,7 +2403,11 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         return 64 * 1024 * 8 * 2;
     }();
 
-    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
+    // A negative one_shot_max_bytes takes the global threshold; a call site with a workspace of its own declares
+    // its own limit (the workspace holds every rank's rows of its one-shot sizes).
+    size_t const oneShotMaxBytes
+        = one_shot_max_bytes < 0 ? kOneShotSizeThreshold : static_cast<size_t>(one_shot_max_bytes);
+    if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= oneShotMaxBytes)
     {
         tensorrt_llm::kernels::mnnvl::oneshotAllreduceFusionOp(allreduce_params);
     }
@@ -2533,7 +2537,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         // CUDA graphs). Ordering comes from the input/output data deps.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
         "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
-        "Tensor? scale=None, int fusion_op=0, bool fp8_payload=False) -> "
+        "Tensor? scale=None, int fusion_op=0, bool fp8_payload=False, int one_shot_max_bytes=-1) -> "
         "Tensor[]");
     m.def(
         "allreduce("

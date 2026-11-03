@@ -127,7 +127,7 @@ from ..distributed import (
     MnnvlWorkspaceResult,
     allgather,
 )
-from ..distributed.ops import mnnvl_allreduce_transport
+from ..distributed.ops import MnnvlOwnWorkspace, mnnvl_allreduce_transport
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
@@ -141,7 +141,7 @@ from ..modules.linear import (
     load_weight_shard,
 )
 from ..modules.linear import Linear as TrtllmLinear
-from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel_deferred_join
 from ..modules.projection_capabilities import (
     GatedEpilogueProjection,
     OutputAllReduceProjection,
@@ -213,6 +213,10 @@ _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS = 16
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
 # the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
 _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
+# The routed latent all-reduce (+ RMSNorm) of the K3 MoE tail on an MNNVL workspace of its own:
+# it no longer orders against the shared expert's all-reduce, and runs one-shot up to 9 MiB of all
+# ranks' input (164 rows of the 3584-wide latent at 8 ranks), above the global threshold.
+_LATENT_ALL_REDUCE_WORKSPACE = MnnvlOwnWorkspace("kimi_k3_routed_latent", 9 << 20)
 
 
 @contextmanager
@@ -1999,6 +2003,9 @@ class KimiK3MoERuntime(nn.Module):
     # ``(first row, rows)`` of latent_up's output this rank computes in the column-parallel tail
     # (None: no column-parallel tail; set in __init__).
     latent_up_rows: Optional[Tuple[int, int]] = None
+    # The routed latent all-reduce on its own MNNVL workspace (``_LATENT_ALL_REDUCE_WORKSPACE``) for
+    # the sizes it runs one-shot (``_latent_all_reduce``); None: the routed experts' all-reduce.
+    _own_latent_all_reduce: Optional[AllReduce] = None
     # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's workspace
     # and this layer's operands on this rank, built after loading where the front applies.
     _moe_front_ws = None
@@ -2252,11 +2259,45 @@ class KimiK3MoERuntime(nn.Module):
                 first = mapping.tp_rank * (blocks // world) + min(mapping.tp_rank, blocks % world)
                 count = blocks // world + (mapping.tp_rank < blocks % world)
                 self.latent_up_rows = (first * 128, count * 128)
+        # Built on every rank of the routed all-reduce group at the same point (the workspace is
+        # collective); MNNVL only, where the routed all-reduce runs MNNVL.
+        routed_ar = self.routed_experts.all_reduce
+        if (
+            self._reduce_routed_output
+            and not self._defer_shared_allreduce
+            and routed_ar.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM)
+        ):
+            own = AllReduce(
+                routed_ar.mapping,
+                strategy=AllReduceStrategy.MNNVL,
+                dtype=dtype,
+                mnnvl_own_workspace=_LATENT_ALL_REDUCE_WORKSPACE,
+            )
+            if own.mnnvl_runs_fusion(AllReduceFusionOp.RMS_NORM):
+                self._own_latent_all_reduce = own
         # Stock fused RMSNorm (flashinfer kernel; the no-flashinfer
         # fallback is the same fp32-variance eager math as KimiK3RMSNorm).
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+
+    def _latent_all_reduce(self, num_tokens: int) -> AllReduce:
+        """The all-reduce of a ``num_tokens``-row routed latent: on its own workspace where that
+        runs one-shot (the size rule of ``_LATENT_ALL_REDUCE_WORKSPACE``), else the routed
+        experts' all-reduce (on the group's shared workspace)."""
+        own = self._own_latent_all_reduce
+        if (
+            own is not None
+            and mnnvl_allreduce_transport(
+                num_tokens,
+                self.moe_hidden_size,
+                own.mapping.tp_size,
+                torch.bfloat16,
+                _LATENT_ALL_REDUCE_WORKSPACE.one_shot_max_bytes,
+            )[0]
+        ):
+            return own
+        return self.routed_experts.all_reduce
 
     def runs_column_parallel_tail(self, num_tokens: int) -> bool:
         """Whether a forward of ``num_tokens`` rows can run the column-parallel tail: latent_up
@@ -2309,7 +2350,7 @@ class KimiK3MoERuntime(nn.Module):
             # enable_min_latency: the routed experts pushed their latent rows; one kernel finishes
             # the latent all-reduce and stores this rank's columns into the all-gather call.
             return self._moe_tail(routed_latent, shared_partial, *tail_targets), None
-        latent, latent_scale = self.routed_experts.all_reduce(
+        latent, latent_scale = self._latent_all_reduce(routed_latent.shape[0])(
             routed_latent,
             all_reduce_params=AllReduceParams(
                 fusion_op=AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
@@ -2441,7 +2482,7 @@ class KimiK3MoERuntime(nn.Module):
         shared_ar = self.shared_experts.down_proj.all_reduce
         # The all-gather call first: it may grow a workspace both calls share.
         ag = shared_ar.push_target(num_tokens, self.hidden_size, all_gather=True)
-        latent = self.routed_experts.all_reduce.push_target(
+        latent = self._latent_all_reduce(num_tokens).push_target(
             num_tokens, self.moe_hidden_size, consumer_finishes=True
         )
         if (
@@ -3042,7 +3083,9 @@ class KimiK3MoERuntime(nn.Module):
                 router_logits = self.gate.compute_logits(hidden_states)
             if plan is not None and plan.shared_first:
                 shared_partial = self._issue_shared_gemms(identity)
-        moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
+        moe_all_reduce = (
+            self._latent_all_reduce(hidden_states.shape[0]) if self._reduce_routed_output else None
+        )
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
             and do_multi_stream()
@@ -3133,6 +3176,8 @@ class KimiK3MoERuntime(nn.Module):
                 forked_shared.append(_shared_output())
                 self.moe_shared_event.record()
 
+        # The join of the shared expert's stream where it follows the latent tail.
+        shared_join = None
         if fork_at_head:
             routed_out = _routed_output()
             self.moe_shared_event.wait()
@@ -3148,7 +3193,7 @@ class KimiK3MoERuntime(nn.Module):
                 self.moe_shared_event.record()
             self.moe_shared_event.wait()
         else:
-            routed_out, shared_out = maybe_execute_in_parallel(
+            routed_out, shared_out, shared_join = maybe_execute_in_parallel_deferred_join(
                 _routed_output,
                 _shared_output,
                 self.moe_main_event,
@@ -3156,6 +3201,15 @@ class KimiK3MoERuntime(nn.Module):
                 self.shared_expert_stream,
                 disable_on_compile=True,
             )
+            if shared_join is not None and (
+                cp_tail
+                or moe_all_reduce is None
+                or moe_all_reduce is not self._own_latent_all_reduce
+            ):
+                shared_join.wait()
+                shared_join = None
+            # Else the latent all-reduce, on its own workspace, and latent_up are issued before the
+            # main stream joins the shared expert's stream, whose output only the caller reads.
         if self._defer_shared_allreduce and not overlap_shared_allreduce:
             shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if cp_tail:
@@ -3186,6 +3240,8 @@ class KimiK3MoERuntime(nn.Module):
                 ),
             )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
+        if shared_join is not None:
+            shared_join.wait()
         return routed_out, shared_out
 
 

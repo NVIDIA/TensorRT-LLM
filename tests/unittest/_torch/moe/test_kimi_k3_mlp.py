@@ -472,6 +472,127 @@ def test_kimi_k3_shared_allreduce_ordering(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("num_tokens", [2, 165], ids=["own_workspace", "shared_workspace"])
+def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    """The routed latent all-reduce runs on its own MNNVL workspace where that is one-shot (up to
+    164 rows of the 3584-wide latent at 8 ranks), issued with latent_up before the main stream
+    joins the shared expert's stream; above that it runs after the join on the routed experts'
+    all-reduce."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    calls = []
+    current_stream = "main"
+    aux_stream = object()
+
+    class _Event:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self) -> None:
+            calls.append((f"{self.name}_record", current_stream))
+
+        def wait(self) -> None:
+            calls.append((f"{self.name}_wait", current_stream))
+
+    @contextmanager
+    def use_stream(stream: object) -> Iterator[None]:
+        nonlocal current_stream
+        assert stream is aux_stream
+        previous_stream, current_stream = current_stream, "aux"
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class _AllReduce:
+        def __init__(self, name: str, tp_size: int = 8) -> None:
+            self.name = name
+            self.mapping = SimpleNamespace(tp_size=tp_size)
+
+        def __call__(self, value: torch.Tensor, all_reduce_params=None) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value
+
+    class _Routed:
+        all_reduce = _AllReduce("shared_ws_latent_ar")
+
+        def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+            calls.append(("routed_moe", current_stream))
+            return value
+
+    class _Projection(nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+            self.weight = torch.ones(4)
+            self.variance_epsilon = 1e-6
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value
+
+    class _Shared(nn.Module):
+        def forward(self, value: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:
+            calls.append(("shared", current_stream))
+            return value
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
+    runtime.routed_experts = _Routed()
+    runtime.routed_expert_down_proj = _Projection("routed_down")
+    runtime.routed_expert_norm = _Projection("routed_norm")
+    runtime.routed_expert_up_proj = _Projection("routed_up")
+    runtime.shared_experts = _Shared()
+    runtime.moe_hidden_size = 3584
+    runtime._reduce_routed_output = True
+    runtime._defer_shared_allreduce = False
+    runtime._own_latent_all_reduce = _AllReduce("own_ws_latent_ar")
+    runtime.shared_expert_stream = aux_stream
+    runtime.moe_main_event = _Event("fork")
+    runtime.moe_shared_event = _Event("shared_done")
+    runtime.moe_routed_event = None
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        modeling_kimi_linear, "maybe_execute_in_parallel_deferred_join", _deferred_join_stand_in
+    )
+
+    with with_multi_stream(True):
+        runtime.forward_parts(torch.ones(num_tokens, 4))
+    join = calls.index(("shared_done_wait", "main"))
+    assert calls.index(("shared", "aux")) < calls.index(("shared_done_record", "aux"))
+    if num_tokens == 2:
+        assert ("shared_ws_latent_ar", "main") not in calls
+        assert calls.index(("own_ws_latent_ar", "main")) < calls.index(("routed_up", "main")) < join
+    else:
+        assert ("own_ws_latent_ar", "main") not in calls
+        assert (
+            join < calls.index(("shared_ws_latent_ar", "main")) < calls.index(("routed_up", "main"))
+        )
+
+
+def _deferred_join_stand_in(fn0, fn1, event0, event1, aux_stream, disable_on_compile=False):
+    """``maybe_execute_in_parallel_deferred_join`` on the stand-in events and streams."""
+    event0.record()
+    result0 = fn0()
+    with torch.cuda.stream(aux_stream):
+        event0.wait()
+        result1 = fn1()
+        event1.record()
+    return result0, result1, event1
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("multi_stream", [True, False], ids=["forked", "serial"])
 def test_kimi_k3_latent_down_projection_overlaps_routing(
     monkeypatch: pytest.MonkeyPatch, multi_stream: bool
