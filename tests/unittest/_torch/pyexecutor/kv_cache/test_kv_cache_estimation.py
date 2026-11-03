@@ -38,10 +38,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheManagerV2,
     Role,
-    _get_generation_kv_capacity,
-    _get_kv_alloc_extra_tokens,
     _compute_auto_host_tier_quota,
     _get_available_memory_for_auto_host_tier,
+    _get_generation_kv_capacity,
+    _get_kv_alloc_extra_tokens,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -2317,6 +2317,7 @@ def test_unified_layout_uses_model_provided_geometry(attention_dp: bool) -> None
 
 def test_profiling_failure_releases_resources_and_restores_response_state():
     creator = object.__new__(KvCacheCreator)
+    creator._is_kv_cache_manager_v2 = False
     creator._mapping = SimpleNamespace(cp_config={})
     creator._kv_cache_config = SimpleNamespace(free_gpu_memory_fraction=0.9)
     creator._skip_est = False
