@@ -184,11 +184,12 @@ _DEP16 = dict(world_size=16, tp_size=16, moe_ep_size=16, moe_tp_size=1, enable_a
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize("draft_len", [None, 5, 7])
-def test_glm52_high_throughput_matches(_on_sm107, mode, draft_len):
+@pytest.mark.parametrize("world_size", [4, 16])
+def test_glm52_high_throughput_matches(_on_sm107, mode, draft_len, world_size):
     config = _model_config(
         _glm52_config(index_n_heads=32),
         spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,
-        **_DEP16,
+        **dict(_DEP16, world_size=world_size, tp_size=world_size, moe_ep_size=world_size),
     )
     config.moe_backend = "MEGAMOE_CUTEDSL"
     args = _llm_args(mode, kv_cache_config=KvCacheConfig(dtype="nvfp4"))
@@ -200,11 +201,19 @@ def test_glm52_high_throughput_matches(_on_sm107, mode, draft_len):
     [
         (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32),
         (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32),
+        (dict(world_size=8, tp_size=8, moe_ep_size=8), "nvfp4", "MEGAMOE_CUTEDSL", 32),
         (dict(), "fp8", "MEGAMOE_CUTEDSL", 32),
         (dict(), "nvfp4", "CUTLASS", 32),
         (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64),
     ],
-    ids=["no-attention-dp", "no-expert-parallel", "fp8-kv", "other-backend", "other-index-heads"],
+    ids=[
+        "no-attention-dp",
+        "no-expert-parallel",
+        "dep8",
+        "fp8-kv",
+        "other-backend",
+        "other-index-heads",
+    ],
 )
 def test_glm52_high_throughput_near_misses(
     _on_sm107, mapping_overrides, kv_dtype, backend, index_n_heads

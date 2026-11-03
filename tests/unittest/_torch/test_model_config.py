@@ -266,6 +266,29 @@ def test_validate_and_set_kv_cache_quant_auto_keeps_quant_config_dict():
         assert layer_quant_config.kv_cache_quant_algo is None
 
 
+@pytest.mark.parametrize("target_support", [None, False, True])
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
+def test_validate_and_set_kv_cache_quant_respects_selected_target(
+    monkeypatch: pytest.MonkeyPatch, target_support: bool | None, requested_dtype: str
+) -> None:
+    _mock_sm107(monkeypatch)
+    model_config = _make_mixed_precision_model_config()
+    if target_support is not None:
+        model_config.modeling_v2_target = type(
+            "Target", (), {"supports_nvfp4_kv_cache": target_support}
+        )
+    if requested_dtype == "auto":
+        model_config.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        for quant in model_config.quant_config_dict.values():
+            quant.kv_cache_quant_algo = QuantAlgo.NVFP4
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+    expected = QuantAlgo.NVFP4 if target_support else QuantAlgo.FP8
+    assert model_config.quant_config.kv_cache_quant_algo == expected
+    assert all(
+        quant.kv_cache_quant_algo == expected for quant in model_config.quant_config_dict.values()
+    )
+
+
 @pytest.mark.parametrize("implementation", [None, "triton", "msa"])
 @pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
 def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_config_dict(
