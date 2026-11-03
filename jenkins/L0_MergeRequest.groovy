@@ -933,7 +933,7 @@ def launchReleaseCheck(pipeline, globalVars)
 
 def launchTestListCheck(pipeline, globalVars)
 {
-    def key = "Check Test List"
+    def key = "Check-Test-List"
     def image = globalVars["LLM_DOCKER_IMAGE"]
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${key}] Run") {
@@ -2557,22 +2557,27 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 launchReleaseCheck(this, globalVars)
             }
         },
-        "Check Test List": {
+        "Check-Test-List": {
             script {
                 if (testFilter[INFRA_DRY_RUN]) {
                     echo "Skipping Check Test List for the infrastructure dry run."
+                    jUtils.markStageSkippedForConditional(STAGE_NAME)
                     return
                 } else if (GEN_POST_MERGE_BUILDS_ONLY) {
                     echo "Skipping Check Test List (GenPostMergeBuilds mode: builds only)"
+                    jUtils.markStageSkippedForConditional(STAGE_NAME)
                     return
                 } else if (runMode == "nightly_release") {
                     echo "Skipping Check Test List for nightly_release."
+                    jUtils.markStageSkippedForConditional(STAGE_NAME)
                     return
                 } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "Skipping Check Test List for Docs-only changes."
+                    jUtils.markStageSkippedForConditional(STAGE_NAME)
                     return
                 } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                     echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                    jUtils.markStageSkippedForConditional(STAGE_NAME)
                     return
                 }
                 launchTestListCheck(this, globalVars)
@@ -3235,7 +3240,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         stages += dockerBuildJob
     }
 
-    def alwaysFailFastStages = ["Release-Check", "Check Test List"] as Set
+    def alwaysFailFastStages = ["Release-Check", "Check-Test-List"] as Set
     parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
@@ -3342,16 +3347,20 @@ pipeline {
                                     }
                                 }
                             },
-                            "Check Test List": {
-                                stage("Check Test List") {
+                            "Check-Test-List": {
+                                stage("Check-Test-List") {
                                     if (testFilter[INFRA_DRY_RUN]) {
                                         echo "Skipping Check Test List for the infrastructure dry run."
+                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                                     } else if (runMode == "nightly_release") {
                                         echo "Skipping Check Test List for nightly_release."
+                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                                     } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                                         echo "Skipping Check Test List for Docs-only changes."
+                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                                     } else if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                                         echo "Skipping Check Test List for BuildDockerImageSanityTest."
+                                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                                     } else {
                                         launchTestListCheck(this, globalVars)
                                     }
