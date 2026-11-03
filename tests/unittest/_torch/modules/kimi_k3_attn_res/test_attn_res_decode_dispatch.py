@@ -107,6 +107,78 @@ def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
             mkl._read_persistent_attn_res()
 
 
+def test_fused_max_tokens_env(monkeypatch):
+    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default 64 (the decode
+    kernel's range); anything else fails loudly."""
+    monkeypatch.delenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
+    assert mkl._read_fused_attn_res_max_tokens() == 64 == _max_tokens()
+    monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "1")
+    assert mkl._read_fused_attn_res_max_tokens() == 1
+    for bad in ("0", "-3", "1.5", "all"):
+        monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, bad)
+        with pytest.raises(ValueError):
+            mkl._read_fused_attn_res_max_tokens()
+
+
+def _kernel_for(m: int, num_candidates: int = 5):
+    return mkl._attn_res_kernel(_rows(m, HIDDEN), num_candidates)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_selector_token_ceiling(monkeypatch, persistent: bool):
+    """Up to the ceiling the decode kernel takes the mix; above it the persistent kernel with
+    ``KIMI_K3_ATTN_RES_TOPOLOGY=1``, else unfused. A ceiling of 1 leaves only single-token mixes
+    on the decode kernel, and only they defer a MoE residual update."""
+    K = mkl._AttnResKernel
+    above = K.PERSISTENT if persistent else K.UNFUSED
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
+    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.DECODE, K.DECODE, above]
+    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
+    assert [_kernel_for(m) for m in (1, 2, 64)] == [K.DECODE, above, above]
+    assert mkl._defers_moe_residual(_rows(1, HIDDEN), 5)
+    assert not mkl._defers_moe_residual(_rows(2, HIDDEN), 5)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+def test_selector_falls_back_to_cpp_per_token_ops(monkeypatch, persistent: bool):
+    """Without the decode kernel on the device (no CuTe DSL, or SM107 without the Rubin helpers)
+    the mixes up to the ceiling run on the C++ per-token ops, which have no MoE fold: no MoE
+    layer defers its residual update."""
+    K = mkl._AttnResKernel
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
+    above = K.PERSISTENT if persistent else K.UNFUSED
+    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.PER_TOKEN, K.PER_TOKEN, above]
+    assert _kernel_for(8, num_candidates=12) is K.PER_TOKEN
+    assert not mkl._defers_moe_residual(_rows(8, HIDDEN), 5)
+
+
+@pytest.mark.parametrize("m", [1, 16])
+@torch.no_grad()
+def test_cpp_per_token_fallback_matches_cpp_ops(monkeypatch, m: int):
+    """The fallback runs the C++ ops themselves (bitwise), and a decoder layer pair then returns
+    the materialized residual."""
+    monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
+    proj, norm, out_norm = _modules(m)
+    prefix, addend, block = _rows(m, HIDDEN), _rows(m, HIDDEN), _rows(4, m, HIDDEN)
+    w = (proj.weight.reshape(-1), norm.weight, out_norm.weight, EPS, EPS)
+    block4 = block.view(4, m, 1, HIDDEN)
+    out = mkl._apply_attn_res_and_rmsnorm(prefix, block, proj, norm, out_norm)
+    ref = torch.ops.trtllm.attn_res_rmsnorm_fwd(prefix.view(m, 1, HIDDEN), block4, *w)
+    assert torch.equal(out, ref.view(m, HIDDEN))
+    upd, add_out = mkl._apply_attn_res_add_and_rmsnorm(prefix, addend, block, proj, norm, out_norm)
+    ref_upd, ref_out = torch.ops.trtllm.attn_res_add_rmsnorm_fwd(
+        prefix.view(m, 1, HIDDEN), addend.view(m, 1, HIDDEN), block4, *w
+    )
+    assert torch.equal(upd, ref_upd.view(m, HIDDEN))
+    assert torch.equal(add_out, ref_out.view(m, HIDDEN))
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    h, snaps = _rows(m, HIDDEN), 3
+    for layer in layers:
+        h, snaps = layer(h, _rows(8, m, HIDDEN), snaps, None)
+    assert isinstance(h, torch.Tensor)
+
+
 class _PlainKdaMixer:
     """Stands in for the KDA mixer without an MXFP8 input."""
 
