@@ -21,6 +21,8 @@ def _clean_env(monkeypatch):
     for name in (dp.DECODE_PATH_ENV, dp.MIN_KV_4X_ENV, "TRTLLM_FP4_MLA_TWOSTREAM", "TRTLLM_FP4_MLA_TWOSTREAM_R2",
                  host_4x.MIN_PAIRS_ENV, host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV):
         monkeypatch.delenv(name, raising=False)
+    # the measured table was taken with the internal 2x kernel; pin that calibration (the main tree defaults to 1.2)
+    monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE", "1.0")
 
 
 def test_knob_off_is_2x():
@@ -93,6 +95,13 @@ def test_min_kv_knob(monkeypatch):
     assert _choose(128, 4, 8192).path == dp.PATH_TWO_STREAM
     monkeypatch.setenv(dp.MIN_KV_4X_ENV, "40000")
     assert _choose(128, 4, 30080).path == dp.PATH_2X
+
+
+def test_main_tree_2x_calibration_keeps_plain_4x_at_b128(monkeypatch):
+    monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE", "1.2")
+    s = _choose(128, 4, 30080)
+    assert s.path == dp.PATH_4X and s.r2 == 0
+    assert _choose(48, 4, 30080).path == dp.PATH_TWO_STREAM
 
 
 def test_kv_regime_ceiling():

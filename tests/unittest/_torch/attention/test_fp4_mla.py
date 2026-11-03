@@ -3174,7 +3174,11 @@ def test_fp4_mla_attention_decode_cutedsl_twostream_auto_b128(monkeypatch) -> No
         packed_queries=True,
         enable_4x=True,
         # the test page table is short: lift the split-mode KV floor so the multi-wave call enters the 4x envelope
-        env={host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0", "TRTLLM_FP4_MLA_TWOSTREAM": "1"},
+        env={
+            host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0",
+            "TRTLLM_FP4_MLA_TWOSTREAM": "1",
+            "TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE": "1.0",  # the split that was measured with the internal 2x kernel
+        },
     )
     assert ("4x", 115) in calls and ("2x", 13) in calls, calls
 

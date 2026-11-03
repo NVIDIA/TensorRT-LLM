@@ -20,6 +20,7 @@ variables read at call time:
 ``TRTLLM_FP4_MLA_TWOSTREAM_R2``       force the number of 2x requests (0 = force the plain 4x path).
 ``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` minimum modelled gain over the plain 4x path (default 0.08 = 8 %).
 ``TRTLLM_FP4_MLA_TWOSTREAM_MAX_R2``   cap on r2 (default 36 = the largest share that still leaves the 4x arm the longer one at q4).
+``TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE`` relative cost of this tree's 2x packed kernel (see ``DEFAULT_T2_SCALE``).
 """
 
 from __future__ import annotations
@@ -40,6 +41,13 @@ KV_TILE = 256
 # 128-row m-tile and the request's KV.  Fixed costs are prologue/epilogue, slopes are per 256-key tile.
 T4_FIXED_US, T4_TILE_US = 13.0, 0.64
 T2_FIXED_US, T2_TILE_US = 10.0, 0.62
+# Relative speed of the 2x packed kernel this tree ships against the kernel the model was fitted on (the internal
+# rubin-advance mufu16 build). The GitHub-main packed path measured 15-25 % slower at B >= 48 on 2026-11-02 (B96/q4/30K
+# 477 vs 392 us, B128/q4/30K 593 vs 520; the 4x kernel is identical), which makes the 2x arm the critical path of a
+# B128 split there (r2 10-13 all ~490 us = plain 4x). TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE overrides; set it back to 1.0
+# once the packed path is restored.
+TWOSTREAM_T2_SCALE_ENV = "TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE"
+DEFAULT_T2_SCALE = 1.2
 # When both arms run, each slows the other (power-capped clock + memory-system contention).  Measured through the
 # production two-stream path: the 4x arm's waves stretch by ~5 % at B128/q4 (2x arm busy for ~75 % of the call) and
 # ~3 % at B96/q4 (busy ~45 %), so the 4x factor scales with the fraction of the call during which the 2x arm runs;
@@ -110,10 +118,20 @@ def lanes_2x(sm_count: int, lanes_4x: int = LANES_4X) -> int:
     return max(0, (sm_count - 4 * lanes_4x) // 2)
 
 
+def t2_scale() -> float:
+    value = os.getenv(TWOSTREAM_T2_SCALE_ENV)
+    if value is None or value.strip() == "":
+        return DEFAULT_T2_SCALE
+    try:
+        return max(0.1, float(value))
+    except ValueError:
+        return DEFAULT_T2_SCALE
+
+
 def item_costs_us(kv_tiles: int) -> tuple[float, float]:
     """(4x item, 2x item) modelled duration for a request of ``kv_tiles`` 256-key tiles."""
     tiles = max(1, int(kv_tiles))
-    return T4_FIXED_US + T4_TILE_US * tiles, T2_FIXED_US + T2_TILE_US * tiles
+    return T4_FIXED_US + T4_TILE_US * tiles, (T2_FIXED_US + T2_TILE_US * tiles) * t2_scale()
 
 
 def plain_4x_us(num_requests: int, rows_per_request: int, kv_tiles: int, *, lanes_4x: int = LANES_4X) -> tuple[float, int]:
@@ -165,7 +183,10 @@ def plan_two_stream(
 ) -> TwoStreamPlan:
     """Pick how many of the LAST requests go to the 2x packed kernel (memoized on the inputs and the env knobs: a
     decode step calls this once per layer).  See :func:`_plan_two_stream`."""
-    knobs = tuple(os.getenv(name) for name in (TWOSTREAM_ENV, TWOSTREAM_R2_ENV, TWOSTREAM_MIN_GAIN_ENV, TWOSTREAM_MAX_R2_ENV))
+    knobs = tuple(
+        os.getenv(name)
+        for name in (TWOSTREAM_ENV, TWOSTREAM_R2_ENV, TWOSTREAM_MIN_GAIN_ENV, TWOSTREAM_MAX_R2_ENV, TWOSTREAM_T2_SCALE_ENV)
+    )
     return _plan_two_stream_cached(int(num_requests), int(rows_per_request), int(max_kv_len), int(sm_count), int(lanes_4x), knobs)
 
 
