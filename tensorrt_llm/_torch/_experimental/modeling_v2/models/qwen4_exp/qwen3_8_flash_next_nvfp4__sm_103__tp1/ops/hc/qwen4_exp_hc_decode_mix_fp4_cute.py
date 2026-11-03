@@ -32,8 +32,10 @@ import cutlass.cute as cute
 import torch
 import torch.nn.functional as F
 from cutlass import const_expr
+from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
@@ -48,6 +50,24 @@ BLOCK_H = 16
 #: Threads sharing one up-weight row.
 GROUP = 8
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
+
+
+@dsl_user_op
+def _lds_v4f(addr, *, loc=None, ip=None):
+    """16 bytes of this CTA's shared memory as 4 fp32 (one `LDS.128`)."""
+    ty = T.f32()
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([ty] * 4),
+        [cutlass.Int32(addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return [cutlass.Float32(llvm.extractvalue(ty, res, [i], loc=loc, ip=ip)) for i in range(4)]
 
 
 class _MixKernel:
@@ -140,7 +160,9 @@ class _MixKernel:
 
         # 2. Grouped RMS, logits, low (shared), injection weights. Every producer value this
         # thread needs is requested before the first is used (a partial column clamped into
-        # range for the threads past it), so the CTA pays one L2 round trip.
+        # range for the threads past it), so the CTA pays one L2 round trip: the logit is
+        # formed on every thread (only its store is predicated), so the partials' loads have
+        # a use outside any branch and are not sunk behind the sums of squares' divisions.
         cols: cutlass.Constexpr = rank + (streams if self.inject_out else 0)  # partial columns read
         pcol = cutlass.min(tidx, cols - 1)
         pv = [mPart[t, pcol] for t in range(streams)]
@@ -149,29 +171,33 @@ class _MixKernel:
         rstd = cute.make_rmem_tensor(cute.make_layout((streams,), stride=(1,)), cutlass.Float32)
         for t in cutlass.range_constexpr(streams):
             rstd[t] = cute.math.rsqrt(ssv[t] / hidden + eps)
+        # This row's stream's rstd by selects (a dynamic register index would go to local memory).
+        rstd_s = rstd[0]
+        for t in cutlass.range_constexpr(1, streams):
+            if s == t:
+                rstd_s = rstd[t]
         smem = cutlass.utils.SmemAllocator()
-        # `low` in rows of VEC with one pad word, so the 8 threads of a row (stride VEC + 1
-        # words) read 8 different banks.
+        # `low` flat with 16 bytes of pad every 32 values: the 8 lanes of a row read 16-byte
+        # vectors of 8 different 8-value rows, in 8 different bank groups.
         low = smem.allocate_tensor(
-            cutlass.Float32,
-            cute.make_layout((rank // VEC, VEC), stride=(VEC + 1, 1)),
-            byte_alignment=16,
+            cutlass.Float32, cute.make_layout((rank + rank // 8,), stride=(1,)), byte_alignment=16
         )
+        low_a = cutlass.Int32(low.iterator.toint())
         vals = smem.allocate_tensor(
             cutlass.Float32,
             cute.make_layout((streams, BLOCK_H), stride=(BLOCK_H, 1)),
             byte_alignment=16,
         )
-        if tidx < cols:
-            logit = cutlass.Float32(0.0)
-            for t in cutlass.range_constexpr(streams):
-                logit = pv[t] * rstd[t] + logit
-            z = logit * (1.0 / streams)
-            sig = 1.0 / (1.0 + cute.math.exp(-z))
-            if tidx < rank:
-                low[tidx // VEC, tidx % VEC] = z * sig
-            else:
-                if const_expr(self.inject_out):
+        logit = cutlass.Float32(0.0)
+        for t in cutlass.range_constexpr(streams):
+            logit = pv[t] * rstd[t] + logit
+        z = logit * (1.0 / streams)
+        sig = 1.0 / (1.0 + cute.math.exp(-z))
+        if tidx < rank:
+            low[tidx + (tidx // 32) * 4] = z * sig
+        else:
+            if const_expr(self.inject_out):
+                if tidx < cols:
                     if bidx == 0:
                         mInj[0, tidx - rank] = (2.0 * sig).to(cutlass.BFloat16)
         cute.arch.sync_threads()
@@ -180,15 +206,17 @@ class _MixKernel:
         # element, stream mean.
         sums = [cutlass.Float32(0.0), cutlass.Float32(0.0)]
         for kt in cutlass.range_constexpr(k_tiles):
+            lrow = kt * GROUP + q
+            lv = _lds_v4f(low_a + (lrow * VEC + (lrow // 4) * 4) * 4) + _lds_v4f(
+                low_a + (lrow * VEC + (lrow // 4) * 4) * 4 + 16
+            )
             for e in cutlass.range_constexpr(VEC):
-                sums[e % 2] = (
-                    u_reg[kt, e].to(cutlass.Float32) * low[kt * GROUP + q, e] + sums[e % 2]
-                )
+                sums[e % 2] = u_reg[kt, e].to(cutlass.Float32) * lv[e] + sums[e % 2]
         dot = sums[0] + sums[1]
         dot = cute.arch.warp_reduction(dot, lambda a, b: a + b, threads_in_group=GROUP)
         if q == 0:
             gate = 1.0 / (1.0 + cute.math.exp(-dot))
-            vals[s, i] = gate * (x * rstd[s] * gam)
+            vals[s, i] = gate * (x * rstd_s * gam)
         cute.arch.sync_threads()
         if warp == 0:
             m = cutlass.Float32(0.0)

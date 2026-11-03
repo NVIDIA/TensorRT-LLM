@@ -13,11 +13,9 @@ import triton.language as tl
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
-# surface; its split-K buckets and row-count PDL policy are reached as Python.
-from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
-    _qsa_pdl_enabled,
-    _qsa_splitk_launch_config,
-)
+# surface; its row-count PDL policy is reached as Python. The split-K buckets are this
+# entry's own: an NVFP4 tile needs 16 tokens where the bf16 one takes 64.
+from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.
 _LOG2_E = tl.constexpr(1.4426950408889634)
@@ -49,6 +47,9 @@ _CHECKPOINT = dict(
     slot_pages=2,
     layer=0,
 )
+
+#: The prefill kernel's (BLOCK_N, warps): on GB300 8192 context rows 6.5 ms, 4096 rows 2.9 ms.
+_PREFILL_TILE = (32, 2)
 
 _SPLIT_K = ("splitk", "merge")
 _PREFILL = ("prefill",)
@@ -86,93 +87,195 @@ def _e2m1_to_f32(code):
 
 
 @triton.jit
-def _load_keys(
-    k_cache,
-    k_scale_cache,
-    pages,
-    kv_head,
-    tokens,
-    valid,
-    dims,
-    k_global,
-    k_stride_page,
-    k_stride_head,
-    k_stride_token,
-    ks_stride_page,
-    ks_stride_head,
-    SCALE_GROUPS: tl.constexpr,
-):
-    """K for the selected tokens as an fp32 [HEAD_DIM, BLOCK_N] tile: e2m1 x scale x global."""
-    packed = tl.load(
-        k_cache
-        + pages[None, :] * k_stride_page
-        + kv_head * k_stride_head
-        + tokens[None, :] * k_stride_token
-        + dims[:, None] // 2,
-        mask=valid[None, :],
-        other=0,
-    ).to(tl.int32)
-    codes = (packed >> ((dims[:, None] % 2) * 4)) & 0xF
-    scales = (
-        tl.load(
-            k_scale_cache
-            + pages[None, :] * ks_stride_page
-            + kv_head * ks_stride_head
-            + tokens[None, :] * SCALE_GROUPS
-            + dims[:, None] // 16,
-            mask=valid[None, :],
-            other=0,
-        )
-        .to(tl.float8e4nv, bitcast=True)
-        .to(tl.float32)
+def _nvfp4_halves(packed, scales):
+    """`[N, D/2]` packed e2m1 bytes (low nibble the even element) and one e4m3 scale per byte
+    -> the even and the odd elements as two `[N, D/2]` f16 tensors, each `e2m1 * scale`:
+    `cvt.rn.f16x2.e2m1x2` and `cvt.rn.f16x2.e4m3x2`, then one f16x2 multiply, exact (two by
+    four significant bits, inside f16's range)."""
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b8 b0, b1, b2, b3, s0, s1, s2, s3;
+        .reg .b16 t0, t1, t2, t3;
+        .reg .b32 h0, h1, h2, h3, c0, c1, c2, c3;
+        mov.b32 {b0, b1, b2, b3}, $4;
+        mov.b32 {s0, s1, s2, s3}, $5;
+        mov.b16 t0, {s0, s0};
+        mov.b16 t1, {s1, s1};
+        mov.b16 t2, {s2, s2};
+        mov.b16 t3, {s3, s3};
+        cvt.rn.f16x2.e4m3x2 c0, t0;
+        cvt.rn.f16x2.e4m3x2 c1, t1;
+        cvt.rn.f16x2.e4m3x2 c2, t2;
+        cvt.rn.f16x2.e4m3x2 c3, t3;
+        cvt.rn.f16x2.e2m1x2 h0, b0;
+        cvt.rn.f16x2.e2m1x2 h1, b1;
+        cvt.rn.f16x2.e2m1x2 h2, b2;
+        cvt.rn.f16x2.e2m1x2 h3, b3;
+        mul.rn.f16x2 h0, h0, c0;
+        mul.rn.f16x2 h1, h1, c1;
+        mul.rn.f16x2 h2, h2, c2;
+        mul.rn.f16x2 h3, h3, c3;
+        prmt.b32 $0, h0, h1, 0x5410;
+        prmt.b32 $1, h2, h3, 0x5410;
+        prmt.b32 $2, h0, h1, 0x7632;
+        prmt.b32 $3, h2, h3, 0x7632;
+        }
+        """,
+        constraints="=r,=r,=r,=r,r,r",
+        args=[packed, scales],
+        dtype=(tl.float16, tl.float16),
+        is_pure=True,
+        pack=4,
     )
-    return _e2m1_to_f32(codes) * scales * k_global
 
 
 @triton.jit
-def _load_values(
-    v_cache,
-    v_scale_cache,
+def _load_halves(
+    cache,
+    scale_rows,
     pages,
     kv_head,
     tokens,
     valid,
-    dims,
-    v_global,
+    stride_page,
+    stride_head,
+    stride_token,
+    SCALE_STEP: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """A tile's even and odd elements of one role plane. `scale_rows` points at each token's
+    first scale; its D/16 scales lie SCALE_STEP apart (K's token-major rows: 1; V's
+    four-token groups `[tpb/4, D/16, 4]`: 4). Each byte and each scale is read once."""
+    HALF: tl.constexpr = HEAD_DIM // 2
+    GROUPS: tl.constexpr = HEAD_DIM // 16
+    packed = tl.load(
+        cache
+        + pages[:, None] * stride_page
+        + kv_head * stride_head
+        + tokens[:, None] * stride_token
+        + tl.arange(0, HALF)[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    scales = tl.load(
+        scale_rows[:, None] + tl.arange(0, GROUPS)[None, :] * SCALE_STEP,
+        mask=valid[:, None],
+        other=0,
+    )
+    scales = tl.reshape(tl.broadcast_to(scales[:, :, None], [BLOCK_N, GROUPS, 8]), [BLOCK_N, HALF])
+    return _nvfp4_halves(packed, scales)
+
+
+@triton.jit
+def _attend_tile(
+    q_even,
+    q_odd,
+    running_max,
+    running_sum,
+    acc_even,
+    acc_odd,
+    columns,
+    row,
+    safe_request,
+    valid_request,
+    kv_head,
+    score_scale,
+    selected_tokens,
+    selected_stride_row,
+    block_table,
+    block_table_stride_request,
+    page_table_width,
+    num_cache_pages,
+    k_cache,
+    v_cache,
+    k_scale_cache,
+    v_scale_cache,
+    k_stride_page,
+    k_stride_head,
+    k_stride_token,
     v_stride_page,
     v_stride_head,
     v_stride_token,
+    ks_stride_page,
+    ks_stride_head,
     vs_stride_page,
     vs_stride_head,
-    SCALE_GROUPS: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
-    """V for the selected tokens as an fp32 [BLOCK_N, HEAD_DIM] tile; V's scales sit in
-    four-token groups, `[tpb / 4, D / 16, 4]` per head page."""
-    packed = tl.load(
-        v_cache
-        + pages[:, None] * v_stride_page
-        + kv_head * v_stride_head
-        + tokens[:, None] * v_stride_token
-        + dims[None, :] // 2,
-        mask=valid[:, None],
-        other=0,
-    ).to(tl.int32)
-    codes = (packed >> ((dims[None, :] % 2) * 4)) & 0xF
-    scales = (
-        tl.load(
-            v_scale_cache
-            + pages[:, None] * vs_stride_page
-            + kv_head * vs_stride_head
-            + (tokens[:, None] // 4) * (4 * SCALE_GROUPS)
-            + (dims[None, :] // 16) * 4
-            + tokens[:, None] % 4,
-            mask=valid[:, None],
-            other=0,
-        )
-        .to(tl.float8e4nv, bitcast=True)
-        .to(tl.float32)
+    """One online-softmax step over the selected columns `columns` of `row`: the even and odd
+    halves of K against q's, scores in the log2 domain, P rounded to f16 against V's halves."""
+    GROUPS: tl.constexpr = HEAD_DIM // 16
+    logical_tokens = tl.load(
+        selected_tokens + row * selected_stride_row + columns, mask=columns < TOPK, other=-1
     )
-    return _e2m1_to_f32(codes) * scales * v_global
+    safe_tokens = tl.maximum(logical_tokens, 0)
+    logical_pages = safe_tokens // TOKENS_PER_BLOCK
+    tokens = safe_tokens % TOKENS_PER_BLOCK
+    valid = (
+        valid_request
+        & (columns < TOPK)
+        & (logical_tokens >= 0)
+        & (logical_pages < page_table_width)
+    )
+    pages = tl.load(
+        block_table
+        + safe_request * block_table_stride_request
+        + tl.minimum(logical_pages, page_table_width - 1),
+        mask=valid,
+        other=-1,
+    ).to(tl.int64)
+    valid &= (pages >= 0) & (pages < num_cache_pages)
+    pages = tl.maximum(pages, 0)
+
+    k_even, k_odd = _load_halves(
+        k_cache,
+        k_scale_cache + pages * ks_stride_page + kv_head * ks_stride_head + tokens * GROUPS,
+        pages,
+        kv_head,
+        tokens,
+        valid,
+        k_stride_page,
+        k_stride_head,
+        k_stride_token,
+        1,
+        BLOCK_N,
+        HEAD_DIM,
+    )
+    scores = tl.dot(q_even, tl.trans(k_even))
+    scores = tl.dot(q_odd, tl.trans(k_odd), scores)
+    scores = tl.where(valid[None, :], scores * score_scale, -float("inf"))
+    next_max = tl.maximum(running_max, tl.max(scores, axis=1))
+    correction = tl.math.exp2(running_max - next_max)
+    probabilities = tl.where(valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0)
+
+    v_even, v_odd = _load_halves(
+        v_cache,
+        v_scale_cache
+        + pages * vs_stride_page
+        + kv_head * vs_stride_head
+        + (tokens // 4) * (4 * GROUPS)
+        + tokens % 4,
+        pages,
+        kv_head,
+        tokens,
+        valid,
+        v_stride_page,
+        v_stride_head,
+        v_stride_token,
+        4,
+        BLOCK_N,
+        HEAD_DIM,
+    )
+    weights = probabilities.to(tl.float16)
+    acc_even = tl.dot(weights, v_even, acc_even * correction[:, None])
+    acc_odd = tl.dot(weights, v_odd, acc_odd * correction[:, None])
+    running_sum = running_sum * correction + tl.sum(probabilities, axis=1)
+    return next_max, running_sum, acc_even, acc_odd
 
 
 @triton.jit
@@ -222,114 +325,84 @@ def _nvfp4_sparse_gqa_prefill_kernel(
     request = tl.load(request_indices + row).to(tl.int64)
     valid_request = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    k_global = tl.load(kv_scale_quant_orig + 1)
+    # The global scales scale the scores and the normalized output, not each element.
+    score_scale = softmax_scale * _LOG2_E * tl.load(kv_scale_quant_orig + 1)
     v_global = tl.load(kv_scale_quant_orig + 2)
 
+    HALF: tl.constexpr = HEAD_DIM // 2
     head_offsets = tl.arange(0, BLOCK_M)
-    dim_offsets = tl.arange(0, HEAD_DIM)
+    half_offsets = tl.arange(0, HALF)
+    token_offsets = tl.arange(0, BLOCK_N)
     query_heads = kv_head * GROUP_SIZE + head_offsets
-    query_values = tl.load(
-        q + row * q_stride_row + query_heads[:, None] * q_stride_head + dim_offsets[None, :],
-        mask=(head_offsets < GROUP_SIZE)[:, None],
-        other=0.0,
+    head_mask = (head_offsets < GROUP_SIZE)[:, None]
+    # q's even and odd elements as f16, so both MMA operands are f16 (q is bf16 within
+    # f16's range after its norm; an NVFP4 value times its scale is exact in f16).
+    q_even_ptr = (
+        q + row * q_stride_row + query_heads[:, None] * q_stride_head + 2 * half_offsets[None, :]
     )
+    q_even = tl.load(q_even_ptr, mask=head_mask, other=0.0).to(tl.float16)
+    q_odd = tl.load(q_even_ptr + 1, mask=head_mask, other=0.0).to(tl.float16)
 
     running_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
     running_sum = tl.zeros([BLOCK_M], tl.float32)
-    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
-    token_offsets = tl.arange(0, BLOCK_N)
+    acc_even = tl.zeros([BLOCK_M, HALF], tl.float32)
+    acc_odd = tl.zeros([BLOCK_M, HALF], tl.float32)
     visible_tokens = tl.load(query_positions + row).to(tl.int64) + 1
     selected_blocks = tl.minimum(visible_tokens // COMPRESS_RATIO, BLOCK_TOPK)
     valid_tokens = selected_blocks * COMPRESS_RATIO + visible_tokens % COMPRESS_RATIO
     valid_tiles = tl.cdiv(tl.minimum(valid_tokens, TOPK), BLOCK_N)
-
     for tile in tl.range(0, valid_tiles, num_stages=2):
-        selected_columns = tile * BLOCK_N + token_offsets
-        logical_tokens = tl.load(
-            selected_tokens + row * selected_stride_row + selected_columns,
-            mask=selected_columns < TOPK,
-            other=-1,
-        )
-        safe_tokens = tl.maximum(logical_tokens, 0)
-        logical_pages = safe_tokens // TOKENS_PER_BLOCK
-        token_in_page = safe_tokens % TOKENS_PER_BLOCK
-        valid = (
-            valid_request
-            & (selected_columns < TOPK)
-            & (logical_tokens >= 0)
-            & (logical_pages < page_table_width)
-        )
-        physical_pages = tl.load(
-            block_table
-            + safe_request * block_table_stride_request
-            + tl.minimum(logical_pages, page_table_width - 1),
-            mask=valid,
-            other=-1,
-        ).to(tl.int64)
-        valid &= (physical_pages >= 0) & (physical_pages < num_cache_pages)
-        safe_pages = tl.maximum(physical_pages, 0)
-
-        keys = _load_keys(
-            k_cache,
-            k_scale_cache,
-            safe_pages,
+        columns = tile * BLOCK_N + token_offsets
+        running_max, running_sum, acc_even, acc_odd = _attend_tile(
+            q_even,
+            q_odd,
+            running_max,
+            running_sum,
+            acc_even,
+            acc_odd,
+            columns,
+            row,
+            safe_request,
+            valid_request,
             kv_head,
-            token_in_page,
-            valid,
-            dim_offsets,
-            k_global,
+            score_scale,
+            selected_tokens,
+            selected_stride_row,
+            block_table,
+            block_table_stride_request,
+            page_table_width,
+            num_cache_pages,
+            k_cache,
+            v_cache,
+            k_scale_cache,
+            v_scale_cache,
             k_stride_page,
             k_stride_head,
             k_stride_token,
-            ks_stride_page,
-            ks_stride_head,
-            HEAD_DIM // 16,
-        ).to(query_values.dtype)
-        values = _load_values(
-            v_cache,
-            v_scale_cache,
-            safe_pages,
-            kv_head,
-            token_in_page,
-            valid,
-            dim_offsets,
-            v_global,
             v_stride_page,
             v_stride_head,
             v_stride_token,
+            ks_stride_page,
+            ks_stride_head,
             vs_stride_page,
             vs_stride_head,
-            HEAD_DIM // 16,
-        ).to(query_values.dtype)
-        scores = tl.dot(query_values, keys) * softmax_scale * _LOG2_E
-        scores = tl.where(valid[None, :], scores, -float("inf"))
-        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        correction = tl.math.exp2(running_max - next_max)
-        probabilities = tl.where(
-            valid[None, :],
-            tl.math.exp2(scores - next_max[:, None]),
-            0.0,
+            TOKENS_PER_BLOCK,
+            TOPK,
+            BLOCK_N,
+            HEAD_DIM,
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            accumulator * correction[:, None],
-        )
-        running_sum = running_sum * correction + tl.sum(probabilities, axis=1)
-        running_max = next_max
 
-    normalized = tl.where(
-        running_sum[:, None] > 0,
-        accumulator / tl.maximum(running_sum[:, None], 1.0e-20),
-        0.0,
-    )
-    tl.store(
+    denominator = tl.maximum(running_sum[:, None], 1.0e-20)
+    has_values = running_sum[:, None] > 0
+    out_ptr = (
         output
         + row * output_stride_row
         + query_heads[:, None] * output_stride_head
-        + dim_offsets[None, :],
-        normalized,
-        mask=(head_offsets < GROUP_SIZE)[:, None],
+        + 2 * half_offsets[None, :]
+    )
+    tl.store(out_ptr, tl.where(has_values, acc_even / denominator, 0.0) * v_global, mask=head_mask)
+    tl.store(
+        out_ptr + 1, tl.where(has_values, acc_odd / denominator, 0.0) * v_global, mask=head_mask
     )
 
 
@@ -387,135 +460,100 @@ def _nvfp4_sparse_gqa_splitk_kernel(
     request = tl.load(request_indices + row).to(tl.int64)
     valid_request = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    k_global = tl.load(kv_scale_quant_orig + 1)
+    # The global scales scale the scores and the normalized output, not each element.
+    score_scale = softmax_scale * _LOG2_E * tl.load(kv_scale_quant_orig + 1)
     v_global = tl.load(kv_scale_quant_orig + 2)
 
+    HALF: tl.constexpr = HEAD_DIM // 2
     head_offsets = tl.arange(0, BLOCK_M)
-    dim_offsets = tl.arange(0, HEAD_DIM)
+    half_offsets = tl.arange(0, HALF)
     token_offsets = tl.arange(0, BLOCK_N)
     query_heads = kv_head * GROUP_SIZE + head_offsets
-    query_values = tl.load(
-        q + row * q_stride_row + query_heads[:, None] * q_stride_head + dim_offsets[None, :],
-        mask=(head_offsets < GROUP_SIZE)[:, None],
-        other=0.0,
+    head_mask = (head_offsets < GROUP_SIZE)[:, None]
+    # q's even and odd elements as f16, so both MMA operands are f16 (q is bf16 within
+    # f16's range after its norm; an NVFP4 value times its scale is exact in f16).
+    q_even_ptr = (
+        q + row * q_stride_row + query_heads[:, None] * q_stride_head + 2 * half_offsets[None, :]
     )
+    q_even = tl.load(q_even_ptr, mask=head_mask, other=0.0).to(tl.float16)
+    q_odd = tl.load(q_even_ptr + 1, mask=head_mask, other=0.0).to(tl.float16)
 
     running_max = tl.full([BLOCK_M], -float("inf"), tl.float32)
     running_sum = tl.zeros([BLOCK_M], tl.float32)
-    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    acc_even = tl.zeros([BLOCK_M, HALF], tl.float32)
+    acc_odd = tl.zeros([BLOCK_M, HALF], tl.float32)
     split_tile_start = split * NUM_TILES // NUM_SPLITS
     split_tile_end = (split + 1) * NUM_TILES // NUM_SPLITS
-
     for tile in range(split_tile_start, split_tile_end):
-        selected_columns = tile * BLOCK_N + token_offsets
-        logical_tokens = tl.load(
-            selected_tokens + row * selected_stride_row + selected_columns,
-            mask=selected_columns < TOPK,
-            other=-1,
-        )
-        safe_tokens = tl.maximum(logical_tokens, 0)
-        logical_pages = safe_tokens // TOKENS_PER_BLOCK
-        token_in_page = safe_tokens % TOKENS_PER_BLOCK
-        valid = (
-            valid_request
-            & (selected_columns < TOPK)
-            & (logical_tokens >= 0)
-            & (logical_pages < page_table_width)
-        )
-        physical_pages = tl.load(
-            block_table
-            + safe_request * block_table_stride_request
-            + tl.minimum(logical_pages, page_table_width - 1),
-            mask=valid,
-            other=-1,
-        ).to(tl.int64)
-        valid &= (physical_pages >= 0) & (physical_pages < num_cache_pages)
-        safe_pages = tl.maximum(physical_pages, 0)
-
-        keys = _load_keys(
-            k_cache,
-            k_scale_cache,
-            safe_pages,
+        columns = tile * BLOCK_N + token_offsets
+        running_max, running_sum, acc_even, acc_odd = _attend_tile(
+            q_even,
+            q_odd,
+            running_max,
+            running_sum,
+            acc_even,
+            acc_odd,
+            columns,
+            row,
+            safe_request,
+            valid_request,
             kv_head,
-            token_in_page,
-            valid,
-            dim_offsets,
-            k_global,
+            score_scale,
+            selected_tokens,
+            selected_stride_row,
+            block_table,
+            block_table_stride_request,
+            page_table_width,
+            num_cache_pages,
+            k_cache,
+            v_cache,
+            k_scale_cache,
+            v_scale_cache,
             k_stride_page,
             k_stride_head,
             k_stride_token,
-            ks_stride_page,
-            ks_stride_head,
-            HEAD_DIM // 16,
-        ).to(query_values.dtype)
-        values = _load_values(
-            v_cache,
-            v_scale_cache,
-            safe_pages,
-            kv_head,
-            token_in_page,
-            valid,
-            dim_offsets,
-            v_global,
             v_stride_page,
             v_stride_head,
             v_stride_token,
+            ks_stride_page,
+            ks_stride_head,
             vs_stride_page,
             vs_stride_head,
-            HEAD_DIM // 16,
-        ).to(query_values.dtype)
-        scores = tl.dot(query_values, keys)
-        scores *= softmax_scale * _LOG2_E
-        scores = tl.where(valid[None, :], scores, -float("inf"))
-        next_max = tl.maximum(running_max, tl.max(scores, axis=1))
-        correction = tl.math.exp2(running_max - next_max)
-        probabilities = tl.where(
-            valid[None, :],
-            tl.math.exp2(scores - next_max[:, None]),
-            0.0,
+            TOKENS_PER_BLOCK,
+            TOPK,
+            BLOCK_N,
+            HEAD_DIM,
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            accumulator * correction[:, None],
-        )
-        running_sum = running_sum * correction + tl.sum(probabilities, axis=1)
-        running_max = next_max
 
     has_values = running_sum > 0
-    normalized = tl.where(
-        has_values[:, None],
-        accumulator / tl.maximum(running_sum[:, None], 1.0e-20),
-        0.0,
-    )
-    output_mask = (head_offsets < GROUP_SIZE)[:, None]
+    denominator = tl.maximum(running_sum[:, None], 1.0e-20)
+    even = tl.where(has_values[:, None], acc_even / denominator, 0.0) * v_global
+    odd = tl.where(has_values[:, None], acc_odd / denominator, 0.0) * v_global
     if NUM_SPLITS == 1:
-        tl.store(
+        out_ptr = (
             output
             + row * output_stride_row
             + query_heads[:, None] * output_stride_head
-            + dim_offsets[None, :],
-            normalized,
-            mask=output_mask,
+            + 2 * half_offsets[None, :]
         )
     else:
+        out_ptr = (
+            partial_output
+            + ((split * num_rows + row) * NUM_QUERY_HEADS + query_heads[:, None]) * HEAD_DIM
+            + 2 * half_offsets[None, :]
+        )
         partial_lse_values = tl.where(
             has_values,
             running_max + tl.math.log2(tl.maximum(running_sum, 1.0e-20)),
             -float("inf"),
         )
         tl.store(
-            partial_output
-            + ((split * num_rows + row) * NUM_QUERY_HEADS + query_heads[:, None]) * HEAD_DIM
-            + dim_offsets[None, :],
-            normalized,
-            mask=output_mask,
-        )
-        tl.store(
             partial_lse + (split * num_rows + row) * NUM_QUERY_HEADS + query_heads,
             partial_lse_values,
             mask=head_offsets < GROUP_SIZE,
         )
+    tl.store(out_ptr, even, mask=head_mask)
+    tl.store(out_ptr + 1, odd, mask=head_mask)
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -561,6 +599,35 @@ def _nvfp4_merge_splitk_kernel(
     merged = tl.sum(partials * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
     tl.store(output + row * output_stride_row + head * output_stride_head + dim_offsets, merged)
+
+
+def _splitk_launch_config(
+    rows: int, num_kv_heads: int, selected_width: int
+) -> tuple[int, int, int]:
+    """(BLOCK_N, splits, warps) by programs = rows x Hkv, the fastest of a sweep on GB300 at
+    2051 selected tokens a row (1 row 12.6 us, 128 rows 160 us, 512 rows 560 us)."""
+    base_programs = rows * num_kv_heads
+    if base_programs <= 4:
+        block_n, target_splits, num_warps = 32, 64, 4
+    elif base_programs <= 16:
+        block_n, target_splits, num_warps = 32, 16, 4
+    elif base_programs <= 32:
+        block_n, target_splits, num_warps = 32, 8, 4
+    elif base_programs <= 64:
+        block_n, target_splits, num_warps = 32, 4, 4
+    elif base_programs <= 128:
+        block_n, target_splits, num_warps = 64, 4, 2
+    elif base_programs <= 256:
+        block_n, target_splits, num_warps = 32, 8, 2
+    elif base_programs <= 512:
+        block_n, target_splits, num_warps = 32, 4, 2
+    elif base_programs <= 1024:
+        block_n, target_splits, num_warps = 32, 2, 2
+    else:
+        block_n, target_splits, num_warps = 32, 1, 2
+    num_tiles = triton.cdiv(selected_width, block_n)
+    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+    return block_n, min(max_useful_splits, target_splits), num_warps
 
 
 def _sparse_gqa_nvfp4(
@@ -711,14 +778,14 @@ def _sparse_gqa_nvfp4(
             BLOCK_TOPK=token_topk // compress_ratio,
             COMPRESS_RATIO=compress_ratio,
             BLOCK_M=block_m,
-            BLOCK_N=64,
+            BLOCK_N=_PREFILL_TILE[0],
             HEAD_DIM=head_dim,
-            num_warps=2,
+            num_warps=_PREFILL_TILE[1],
             num_stages=2,
         )
         return output
 
-    block_n, num_splits, num_warps = _qsa_splitk_launch_config(
+    block_n, num_splits, num_warps = _splitk_launch_config(
         rows, num_kv_heads, selected_tokens.shape[1]
     )
     num_tiles = triton.cdiv(selected_tokens.shape[1], block_n)
@@ -819,19 +886,19 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
 
         t      = selected_tokens[r, j]                       # logical position
         page   = block_table[request_indices[r], t // tokens_per_block]
-        K[t]   = bf16(e2m1(k_cache) * e4m3(k_scale_cache) * kv_scale_quant_orig[1])
-        V[t]   = bf16(e2m1(v_cache) * e4m3(v_scale_cache) * kv_scale_quant_orig[2])
-        s_j    = (q[r, h] . K[t]) * softmax_scale
-        out[r, h] = sum_j softmax(s)_j * V[t]
+        K[t]   = e2m1(k_cache) * e4m3(k_scale_cache)            # exact in f16
+        V[t]   = e2m1(v_cache) * e4m3(v_scale_cache)
+        s_j    = (q[r, h] . K[t]) * softmax_scale * kv_scale_quant_orig[1]
+        out[r, h] = kv_scale_quant_orig[2] * sum_j softmax(s)_j * V[t]
 
     The pool layout is the attention op's own NVFP4 append: e2m1 nibbles per
     head page `[tpb, D/2]` (low nibble = even element), K's e4m3 scales
     token-major `[tpb, D/16]`, V's in four-token groups `[tpb/4, D/16, 4]`.
-    Each value is dequantized in fp32 and rounded once to `q`'s dtype; at unit
-    second-level scales every NVFP4 value is exact in bf16, so a call is the
-    bf16 sparse GQA over the bf16 values the pool holds. After the dequantize the
-    kernels are QSA's bf16 sparse GQA kernels operation for operation: the same
-    tiles, online softmax and split-K merge.
+    The kernels decode each byte with `cvt.rn.f16x2.e2m1x2` and scale it in f16,
+    which is exact, and run the scores and P.V on f16 MMAs with fp32
+    accumulation (q converted to f16, P rounded to f16 before P.V), with the
+    online softmax and split-K merge of QSA's bf16 kernels. The second-level
+    scales scale the scores and the normalized output, not each element.
 
     A negative index, a page past the table's width, a negative or out-of-pool
     table entry, and a request index outside the table's rows contribute
@@ -883,16 +950,24 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     prefill pair on every step, the decode forward never does; both pass `q` as
     the 24-head slice of the packed QKV row (row stride 7168).
 
-    Launch shapes at Hkv 2 (programs = rows x 2), as on the bf16 entry: split-K
-    64-way up to 2 rows, 32-way up to 15 (16-token tiles), 8-way up to 128 and
-    4-way up to 256 (64-token tiles), each followed by the merge; past 256 rows
-    the prefill kernel when the pair is passed, else one split and no merge.
-    The decode site reaches 256 rows at max_draft_len 7 (32 requests x 8).
+    Launch shapes at Hkv 2 (programs = rows x 2): split-K at 32-token tiles
+    64-way up to 2 rows, 16-way up to 8, 8-way up to 16 and 4-way up to 32
+    (4 warps); 64-token tiles 4-way up to 64 rows; 32-token tiles 8-way up to
+    128, 4-way up to 256 and 2-way up to 512 rows (2 warps); each followed by
+    the merge. Past 256 rows the prefill kernel (32-token tiles, 2 warps) when the pair
+    is passed; past 512 rows otherwise one split and no merge. The decode site
+    reaches 256 rows at max_draft_len 7 (32 requests x 8).
+
+    Each byte is decoded once, into the even and the odd halves of the head
+    dimension, which the kernels keep apart: q's halves against K's on two MMAs,
+    P against V's halves into two accumulators, the output stored back
+    interleaved. On GB300 at 2051 selected tokens a row: 1 row 12.6 us, 128 rows
+    160 us, against 10.4 / 108 us for QSA's bf16 kernel over the same values.
 
     Equivalence: the test also runs QSA's bf16 sparse GQA over a bf16 pool
-    holding the dequantized values; on every cell but the captured one the two
-    outputs agree within the test's band. They are not bitwise equal: the
-    dequantizing load changes the compiled kernel around the same arithmetic.
+    holding the dequantized values; on every cell the two outputs agree within
+    the test's band. They are not bitwise equal: P is rounded to f16 here and to
+    bf16 there, and the second-level scales act on the scores and the output.
 
     CUDA graphs: the decode site captures at G requests x 1..8 rows over the
     [32, 260] table; a replay after new operands are written in place is
@@ -912,6 +987,9 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
       - The pool holds what the attention op's NVFP4 append writes; the
         `qsa_paged_kv_store_nvfp4` entry writes the same bits.
       - `D` a power of two >= 32; `Hq % Hkv == 0`; `tokens_per_block % 4 == 0`.
+      - `q` within f16's range: the kernels convert it (the target's q follows its
+        RMS norm).
+      - An SM 100-family GPU: the byte decode is `cvt.rn.f16x2.e2m1x2`.
 
     The callable rejects loudly (ValueError) every operand whose dtype, shape or
     layout it cannot read (the test pins the half-passed prefill pair); `rows ==
