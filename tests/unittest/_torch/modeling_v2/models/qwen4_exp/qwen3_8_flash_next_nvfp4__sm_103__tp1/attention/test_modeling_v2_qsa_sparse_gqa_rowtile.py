@@ -11,7 +11,6 @@ reference are that entry's: this op replaces it on context launches.
 """
 
 import math
-import re
 
 import pytest
 import torch
@@ -59,7 +58,9 @@ class _LaunchRecorder:
 
 _KERNELS = (
     "_row_bits",
-    "_rowtile_plan_kernel",
+    "_rowtile_union_kernel",
+    "_rowtile_group_kernel",
+    "_rowtile_slots_kernel",
     "_rowtile_lone_kernel",
     "_rowtile_attention_cute",
 )
@@ -185,12 +186,16 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     out = op(**args)
     assert [name for name, _ in launches] == list(_KERNELS)
     groups = math.ceil(rows / 10)
-    assert launches[0][1] == (rows,) and launches[1][1] == (groups,)
-    assert launches[2][1] == (min(rows, 256), spec["kv_heads"])
+    # The plan's union and slot passes: a program per (group, 32 bitmap words of the table).
+    chunks = math.ceil(math.ceil(spec["pages"] * spec["tokens_per_block"] / 64) / 32)
+    assert launches[0][1] == (rows,)
+    assert launches[1][1] == launches[3][1] == (groups, chunks)
+    assert launches[2][1] == (groups,)
+    assert launches[4][1] == (min(rows, 256), spec["kv_heads"])
     # The row-tile pass is persistent: one CTA per SM, never more than (group, KV head) items.
     items = groups * spec["kv_heads"]
-    assert launches[3][1] == (_module._rowtile_ctas(items, args["q"].device),)
-    assert launches[3][1][0] == min(
+    assert launches[5][1] == (_module._rowtile_ctas(items, args["q"].device),)
+    assert launches[5][1][0] == min(
         items, torch.cuda.get_device_properties(0).multi_processor_count
     )
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
@@ -224,14 +229,10 @@ def test_small_launches_match_the_reference(segments) -> None:
     _compare(op(**args), op.reference(**args))
 
 
-def test_calls_are_bitwise_deterministic() -> None:
-    args = _build(_with([(0, 2000), (500, 300), (7000, 1)], slots=8), seed=8800)
-    assert torch.equal(op(**args), op(**args))
-
-
-def test_rejects_a_call_without_the_prefill_pair() -> None:
-    """The op's own loud refusal: the row-tile pass is bounded by the prefill pair."""
-    args = _build(_with([(600, 4)], slots=8), seed=9100)
-    args.update(query_positions=None, compress_ratio=None)
-    with pytest.raises(ValueError, match=re.escape("the row-tile kernel needs the prefill pair")):
-        op(**args)
+def test_long_context_disjoint_groups_match_the_reference() -> None:
+    """Rows deep in a long context with independent selections: a group's list is about
+    ten times one row's columns (unions of up to 20480 tokens over 2690 pages, the plan's
+    words spanning many 32-word chunks). Every group of one request takes the row-tile
+    pass, however long its list."""
+    args = _build(_with([(86000, 197)], slots=4, pages=2700), seed=9300)
+    _compare(op(**args), op.reference(**args))

@@ -3,10 +3,10 @@
 """QSA sparse GQA for context batches: several query rows per program, K/V read once per tile.
 
 The first launch turns each row's selection (the columns the prefill bound
-lets it read) into a bitmap over logical token positions. A plan launch forms,
-per group of consecutive rows of one request, the union of its rows' resident
-selected tokens as a packed list of physical cache slots, and each row's
-bitmap re-indexed onto that list. The row-tile launch is persistent: one
+lets it read) into a bitmap over logical token positions. Three plan launches
+form, per group of consecutive rows of one request, the union of its rows'
+resident selected tokens as a packed list of physical cache slots, and each
+row's bitmap re-indexed onto that list. The row-tile launch is persistent: one
 program per SM takes (group, KV head) items longest first and walks each packed
 list in 64-slot tiles, each tile's K/V loaded once for every row and head of the
 group, each row masked to its own bits. A group whose rows span requests
@@ -28,10 +28,12 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
+    qsa_paged_sparse_gqa as _per_row_entry,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
-from .qsa_paged_sparse_gqa import qsa_paged_sparse_gqa as _per_row_entry
 from .qsa_rowtile_attention_cute import BLOCK_M, BLOCK_N
 from .qsa_rowtile_attention_cute import eligible as _cute_eligible
 from .qsa_rowtile_attention_cute import num_ctas as _rowtile_ctas
@@ -43,11 +45,8 @@ _INTEGER_DTYPES = (torch.int32, torch.int64)
 _BOUND_TILE = 64
 # Programs of the lone-row pass per KV head; each walks the lone list with this stride.
 _LONE_PROGRAMS = 256  # capacity: fixed: a launch width; the lone list may be any length
-# Bitmap words the plan pass unions and packs per loop step.
-_PLAN_WORDS = 16  # capacity: fixed: a loop step; the plan loops over every word
-# A one-request group takes the row-tile pass when its list's 64-slot tiles, each costing
-# this many quarters of a per-row tile (2.5x), cost no more than its rows' own columns.
-_SHARED_TILE_COST = 10
+# Bitmap words one program of the plan's union and slot passes covers (a grid dimension).
+_CHUNK_WORDS = 32  # capacity: fixed: a launch tile; the grid covers every word
 _PLAN_WARPS = 4
 _LONE_WARPS = 2
 _LONE_STAGES = 2
@@ -259,25 +258,25 @@ def _compress_bits(x, m):
 
 
 @triton.jit
-def _rowtile_plan_kernel(
-    request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
-    lone_rows, lone_count, rows,
-    bits_stride_row, block_table_stride_request, block_table_stride_page, slots_stride_group,
-    NUM_REQUESTS, NUM_CACHE_PAGES,
-    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
-    BLOCK_N: tl.constexpr, SHARED_TILE_COST: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, PLAN_WORDS: tl.constexpr,
-):  # fmt: skip
-    """Per group of rows of one request: list the union of its rows' resident
-    selected tokens, in logical order, as physical cache slots
-    (`page * tokens_per_block + offset`) in `slots[group]`, and write each
-    row's bitmap re-indexed onto that list into `packed_bits[row]` (bit `j`
-    set when the row selects the list's `j`-th token). `group_plan[group]` is
-    (tiles of the list for the row-tile pass, or -1; list length). A group the
-    row-tile pass does not take -- rows of several requests, or a list whose
-    tiles cost more than the rows' own columns -- appends its rows to the lone
-    list instead."""
-    group = tl.program_id(0).to(tl.int64)
+def _popc64(x):
+    """Set bits of each uint64 of `x`, as int32."""
+    return tl.inline_asm_elementwise(
+        "popc.b64 $0, $1;", "=r,l", [x], dtype=tl.int32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _bits_below(n):
+    """uint64 with the low `n` bits set, `0 <= n <= 64`."""
+    ones = (n * 0 - 1).to(tl.int64).to(tl.uint64, bitcast=True)
+    return tl.where(n >= 64, ones, ~(ones << tl.minimum(n, 63).to(tl.uint64)))
+
+
+@triton.jit
+def _group_rows(group, request_indices, row_info, rows, NUM_REQUESTS,
+                ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr):  # fmt: skip
+    """A group's members, which of them exist, whether they are of one request (and which),
+    and the bitmap words its union spans (0 for a group of several requests)."""
     offsets = tl.arange(0, ROWS_POW2)
     members = group * ROWS_PER_TILE + offsets
     live = (offsets < ROWS_PER_TILE) & (members < rows)
@@ -285,20 +284,34 @@ def _rowtile_plan_kernel(
     lowest = tl.min(tl.where(live, requests, NUM_REQUESTS), axis=0)
     highest_request = tl.max(tl.where(live, requests, -1), axis=0)
     highest_token = tl.max(tl.load(row_info + members * 2, mask=live, other=-1), axis=0)
-    columns = tl.load(row_info + members * 2 + 1, mask=live, other=0)
-    own_tiles = tl.sum(tl.cdiv(columns, BLOCK_N), axis=0)
     one_request = (lowest == highest_request) & (lowest >= 0) & (lowest < NUM_REQUESTS)
     words_needed = tl.where(one_request, (highest_token + 64) // 64, 0)
-    page_base = (
-        block_table
-        + tl.minimum(tl.maximum(lowest, 0), NUM_REQUESTS - 1) * block_table_stride_request
+    return offsets, members, live, one_request, lowest, words_needed
+
+
+@triton.jit
+def _rowtile_union_kernel(
+    request_indices, row_info, bits, block_table, union_words, chunk_counts, rows,
+    bits_stride_row, block_table_stride_request, block_table_stride_page,
+    union_stride_group, counts_stride_group,
+    NUM_REQUESTS, NUM_CACHE_PAGES,
+    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr, TOKENS_PER_BLOCK: tl.constexpr, CHUNK_WORDS: tl.constexpr,
+    WORD_PAGES: tl.constexpr,
+):  # fmt: skip
+    """Per (group, chunk of `CHUNK_WORDS` bitmap words): the union of the group's rows' bits
+    restricted to resident tokens (a mapped page inside the pool), into `union_words`, and
+    its token count into `chunk_counts`. A chunk past the group's highest token, or a group
+    of several requests, counts zero and writes no word."""
+    group = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    _, members, live, _, lowest, words_needed = _group_rows(
+        group, request_indices, row_info, rows, NUM_REQUESTS, ROWS_PER_TILE, ROWS_POW2
     )
-    word_offsets = tl.arange(0, PLAN_WORDS)
-    lanes = tl.arange(0, 64)
-    lane_bits = tl.full([64], 1, tl.uint64) << lanes.to(tl.uint64)
-    listed = tl.sum(tl.zeros([ROWS_POW2], tl.int32), axis=0)
-    for start in range(0, words_needed, PLAN_WORDS):
-        words = start + word_offsets
+    start = chunk * CHUNK_WORDS
+    count = tl.full([], 0, tl.int32)
+    if start < words_needed:
+        words = start + tl.arange(0, CHUNK_WORDS)
         in_range = words < words_needed
         row_words = tl.load(
             bits + members[:, None] * bits_stride_row + words[None, :],
@@ -306,43 +319,123 @@ def _rowtile_plan_kernel(
             other=0,
         ).to(tl.uint64, bitcast=True)  # fmt: skip
         selected = tl.reduce(row_words, 0, _or_combine)
-        chosen = ((selected[:, None] >> lanes[None, :].to(tl.uint64)) & 1) != 0
-        tokens = words[:, None].to(tl.int32) * 64 + lanes[None, :]
-        logical_pages = tokens // TOKENS_PER_BLOCK
+        # The pages a word's 64 tokens span (at most WORD_PAGES), each as the word's bits it
+        # covers; a page is looked up only where the union selects one of its tokens.
+        first_token = words.to(tl.int32) * 64
+        logical_pages = first_token[:, None] // TOKENS_PER_BLOCK + tl.arange(0, WORD_PAGES)[None, :]
+        low = tl.maximum(logical_pages * TOKENS_PER_BLOCK - first_token[:, None], 0)
+        high = tl.minimum((logical_pages + 1) * TOKENS_PER_BLOCK - first_token[:, None], 64)
+        page_bits = tl.where(low < high, _bits_below(high) & ~_bits_below(low), 0)
+        page_bits = page_bits & selected[:, None]
+        page_base = block_table + lowest * block_table_stride_request
         pages = tl.load(
             page_base + tl.minimum(logical_pages, PAGE_TABLE_WIDTH - 1) * block_table_stride_page,
-            mask=chosen & (logical_pages < PAGE_TABLE_WIDTH),
+            mask=(page_bits != 0) & (logical_pages < PAGE_TABLE_WIDTH),
             other=-1,
         )  # fmt: skip
-        kept = chosen & (pages >= 0) & (pages < NUM_CACHE_PAGES)
-        kept_count = kept.to(tl.int32)
-        count = tl.sum(kept_count, axis=1)
-        first = listed + tl.cumsum(count, axis=0) - count
-        rank = first[:, None] + tl.cumsum(kept_count, axis=1) - kept_count
-        tl.store(
-            slots + group * slots_stride_group + rank,
-            pages * TOKENS_PER_BLOCK + tokens % TOKENS_PER_BLOCK,
-            mask=kept,
+        kept = (pages >= 0) & (pages < NUM_CACHE_PAGES) & (logical_pages < PAGE_TABLE_WIDTH)
+        resident = tl.reduce(tl.where(kept, page_bits, 0), 1, _or_combine)
+        tl.store(union_words + group * union_stride_group + words,
+                 resident.to(tl.int64, bitcast=True), mask=in_range)  # fmt: skip
+        count = tl.sum(_popc64(resident), axis=0)
+    tl.store(chunk_counts + group * counts_stride_group + chunk, count)
+
+
+@triton.jit
+def _rowtile_group_kernel(
+    request_indices, row_info, chunk_counts, chunk_bases, group_plan, lone_rows, lone_count,
+    rows, counts_stride_group, num_chunks, NUM_REQUESTS,
+    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
+    BLOCK_N: tl.constexpr, CHUNKS_POW2: tl.constexpr,
+):  # fmt: skip
+    """Per group: each chunk's first list position (`chunk_bases`), and `group_plan[group]` =
+    (tiles of the list for the row-tile pass, or -1; list length). A group of several
+    requests appends its rows to the lone list instead."""
+    group = tl.program_id(0).to(tl.int64)
+    offsets, members, live, one_request, _, _ = _group_rows(
+        group, request_indices, row_info, rows, NUM_REQUESTS, ROWS_PER_TILE, ROWS_POW2
+    )
+    chunks = tl.arange(0, CHUNKS_POW2)
+    counts = tl.load(chunk_counts + group * counts_stride_group + chunks,
+                     mask=chunks < num_chunks, other=0)  # fmt: skip
+    tl.store(chunk_bases + group * counts_stride_group + chunks,
+             tl.cumsum(counts, axis=0) - counts, mask=chunks < num_chunks)  # fmt: skip
+    listed = tl.sum(counts, axis=0)
+    tl.store(group_plan + group * 2, tl.where(one_request, tl.cdiv(listed, BLOCK_N), -1))
+    tl.store(group_plan + group * 2 + 1, listed)
+    if not one_request:
+        base = tl.atomic_add(lone_count, tl.sum(live.to(tl.int32), axis=0))
+        tl.store(lone_rows + base + offsets, members.to(tl.int32), mask=live)
+
+
+@triton.jit
+def _rowtile_slots_kernel(
+    request_indices, row_info, bits, block_table, union_words, chunk_counts, chunk_bases,
+    group_plan, slots, packed_bits, rows,
+    bits_stride_row, packed_stride_row, block_table_stride_request, block_table_stride_page,
+    union_stride_group, counts_stride_group, slots_stride_group,
+    NUM_REQUESTS,
+    ROWS_PER_TILE: tl.constexpr, ROWS_POW2: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr, CHUNK_WORDS: tl.constexpr, WORD_PAGES: tl.constexpr,
+):  # fmt: skip
+    """Per (group, chunk) of a row-tile group: the chunk's listed tokens as physical cache
+    slots (`page * tokens_per_block + offset`) at their list positions in `slots[group]`,
+    and each row's bits re-indexed onto the list ORed into `packed_bits[row]` (bit `j` set
+    when the row selects the list's `j`-th token): a per-word parallel bit extract."""
+    group = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    count = tl.load(chunk_counts + group * counts_stride_group + chunk)
+    if (tl.load(group_plan + group * 2) >= 0) & (count > 0):
+        _, members, live, _, lowest, words_needed = _group_rows(
+            group, request_indices, row_info, rows, NUM_REQUESTS, ROWS_PER_TILE, ROWS_POW2
+        )
+        words = chunk * CHUNK_WORDS + tl.arange(0, CHUNK_WORDS)
+        in_range = words < words_needed
+        resident = tl.load(union_words + group * union_stride_group + words, mask=in_range,
+                           other=0).to(tl.uint64, bitcast=True)  # fmt: skip
+        word_count = _popc64(resident)
+        first = (tl.load(chunk_bases + group * counts_stride_group + chunk)
+                 + tl.cumsum(word_count, axis=0) - word_count)  # fmt: skip
+        # The pages the chunk's words span, looked up once a word (as in the union pass).
+        first_token = words.to(tl.int32) * 64
+        first_page = first_token // TOKENS_PER_BLOCK
+        word_pages = first_page[:, None] + tl.arange(0, WORD_PAGES)[None, :]
+        low = tl.maximum(word_pages * TOKENS_PER_BLOCK - first_token[:, None], 0)
+        high = tl.minimum((word_pages + 1) * TOKENS_PER_BLOCK - first_token[:, None], 64)
+        page_bits = tl.where(low < high, _bits_below(high) & ~_bits_below(low), 0)
+        pages_of_word = tl.load(
+            block_table + lowest * block_table_stride_request
+            + word_pages * block_table_stride_page,
+            mask=(page_bits & resident[:, None]) != 0,
+            other=0,
         )  # fmt: skip
-        resident = tl.reduce(tl.where(kept, lane_bits[None, :], 0), 1, _or_combine)
+        lanes = tl.arange(0, 64)
+        lanes64 = lanes.to(tl.uint64)
+        kept = ((resident[:, None] >> lanes64[None, :]) & 1) != 0
+        rank = first[:, None] + _popc64(resident[:, None] & _bits_below(lanes)[None, :])
+        tokens = first_token[:, None] + lanes[None, :]
+        which = tokens // TOKENS_PER_BLOCK - first_page[:, None]
+        pages = tl.zeros([CHUNK_WORDS, 64], tl.int32)
+        for k in tl.static_range(WORD_PAGES):
+            page_k = tl.sum(tl.where(tl.arange(0, WORD_PAGES)[None, :] == k, pages_of_word, 0), 1)
+            pages = tl.where(which == k, page_k[:, None], pages)
+        tl.store(slots + group * slots_stride_group + rank,
+                 pages * TOKENS_PER_BLOCK + tokens % TOKENS_PER_BLOCK, mask=kept)  # fmt: skip
+        row_words = tl.load(
+            bits + members[:, None] * bits_stride_row + words[None, :],
+            mask=live[:, None] & in_range[None, :],
+            other=0,
+        ).to(tl.uint64, bitcast=True)  # fmt: skip
         packed = _compress_bits(row_words, resident[None, :])
         shift = (first % 64).to(tl.uint64)
-        destination = packed_bits + members[:, None] * bits_stride_row + (first // 64)[None, :]
+        destination = packed_bits + members[:, None] * packed_stride_row + (first // 64)[None, :]
         writes = live[:, None] & in_range[None, :] & (packed != 0)
         tl.atomic_or(destination, (packed << shift[None, :]).to(tl.int64, bitcast=True),
                      mask=writes, sem="relaxed")  # fmt: skip
         # Bits past the destination word spill into the next one (never for shift 0).
         spill = (packed >> 1) >> (63 - shift[None, :])
         tl.atomic_or(destination + 1, spill.to(tl.int64, bitcast=True),
-                     mask=writes & ((first % 64) + count > 64)[None, :], sem="relaxed")  # fmt: skip
-        listed += tl.sum(count, axis=0)
-    tiles = tl.cdiv(listed, BLOCK_N)
-    shared = one_request & (tiles * SHARED_TILE_COST <= own_tiles * 4)
-    tl.store(group_plan + group * 2, tl.where(shared, tiles, -1))
-    tl.store(group_plan + group * 2 + 1, listed)
-    if not shared:
-        base = tl.atomic_add(lone_count, tl.sum(live.to(tl.int32), axis=0))
-        tl.store(lone_rows + base + offsets, members.to(tl.int32), mask=live)
+                     mask=writes & ((first % 64) + word_count > 64)[None, :], sem="relaxed")  # fmt: skip
 
 
 @triton.jit
@@ -571,21 +664,50 @@ def qsa_rowtile_sparse_gqa(
     )  # fmt: skip
     out_strides = (output.stride(0), output.stride(1), output.stride(2))
     num_groups = triton.cdiv(rows, rows_per_tile)
-    slots = torch.empty((num_groups, num_words * 64), dtype=torch.int32, device=q.device)
-    packed_bits = torch.zeros((rows, num_words), dtype=torch.int64, device=q.device)
+    # A group's list holds at most its rows' columns: the slot lists and the re-indexed
+    # bitmaps are that wide (in whole 64-slot tiles), not the table's width.
+    list_words = triton.cdiv(min(num_words * 64, rows_per_tile * selected_tokens.shape[1]), 64)
+    num_chunks = triton.cdiv(num_words, _CHUNK_WORDS)
+    slots = torch.empty((num_groups, list_words * 64), dtype=torch.int32, device=q.device)
+    packed_bits = torch.zeros((rows, list_words), dtype=torch.int64, device=q.device)
+    union_words = torch.empty((num_groups, num_words), dtype=torch.int64, device=q.device)
+    # [0]: per chunk, its resident tokens; [1]: its first list position.
+    chunk_info = torch.empty((2, num_groups, num_chunks), dtype=torch.int32, device=q.device)
     group_plan = torch.empty((num_groups, 2), dtype=torch.int32, device=q.device)
     lone_rows = torch.empty((rows,), dtype=torch.int32, device=q.device)
     # [0]: the lone list's length; [1]: the row-tile pass's work-ticket counter.
     counters = torch.zeros((2,), dtype=torch.int32, device=q.device)
     lone_count = counters[:1]
-    _rowtile_plan_kernel[(num_groups,)](
-        request_indices, row_info, bits, block_table, slots, packed_bits, group_plan,
-        lone_rows, lone_count, rows,
-        bits.stride(0), block_table.stride(0), block_table.stride(1), slots.stride(0),
+    rows_meta = dict(ROWS_PER_TILE=rows_per_tile, ROWS_POW2=rows_pow2)
+    # The pages an aligned 64-token word spans.
+    if 64 % tokens_per_block == 0:
+        word_pages = 64 // tokens_per_block
+    elif tokens_per_block % 64 == 0:
+        word_pages = 1
+    else:
+        word_pages = triton.cdiv(64, tokens_per_block) + 1
+    word_meta = dict(TOKENS_PER_BLOCK=tokens_per_block, CHUNK_WORDS=_CHUNK_WORDS,
+                     WORD_PAGES=triton.next_power_of_2(word_pages))  # fmt: skip
+    _rowtile_union_kernel[(num_groups, num_chunks)](
+        request_indices, row_info, bits, block_table, union_words, chunk_info[0], rows,
+        bits.stride(0), block_table.stride(0), block_table.stride(1),
+        union_words.stride(0), chunk_info.stride(1),
         block_table.shape[0], k_cache.shape[0],
-        ROWS_PER_TILE=rows_per_tile, ROWS_POW2=rows_pow2, BLOCK_N=BLOCK_N,
-        SHARED_TILE_COST=_SHARED_TILE_COST, PAGE_TABLE_WIDTH=table_width,
-        TOKENS_PER_BLOCK=tokens_per_block, PLAN_WORDS=_PLAN_WORDS, num_warps=_PLAN_WARPS,
+        PAGE_TABLE_WIDTH=table_width, num_warps=_PLAN_WARPS, **rows_meta, **word_meta,
+    )  # fmt: skip
+    _rowtile_group_kernel[(num_groups,)](
+        request_indices, row_info, chunk_info[0], chunk_info[1], group_plan, lone_rows,
+        lone_count, rows, chunk_info.stride(1), num_chunks, block_table.shape[0],
+        BLOCK_N=BLOCK_N, CHUNKS_POW2=triton.next_power_of_2(num_chunks),
+        num_warps=_PLAN_WARPS, **rows_meta,
+    )  # fmt: skip
+    _rowtile_slots_kernel[(num_groups, num_chunks)](
+        request_indices, row_info, bits, block_table, union_words, chunk_info[0], chunk_info[1],
+        group_plan, slots, packed_bits, rows,
+        bits.stride(0), packed_bits.stride(0), block_table.stride(0), block_table.stride(1),
+        union_words.stride(0), chunk_info.stride(1), slots.stride(0),
+        block_table.shape[0],
+        num_warps=_PLAN_WARPS, **rows_meta, **word_meta,
     )  # fmt: skip
     use_pdl = get_env_enable_pdl()
     _rowtile_lone_kernel[(min(rows, _LONE_PROGRAMS), num_kv_heads)](
@@ -653,14 +775,18 @@ class QsaSparseGqaRowtile(OpWrapper):
     contribute nothing; a row left with nothing returns zeros. Returns a
     fresh, contiguous `[rows, Hq, D]` tensor of `q.dtype`.
 
-    Four launches. A bitmap pass: one bit per selected logical token per row.
-    A plan pass per group of 10 consecutive rows of one request: the union of
-    the rows' selected tokens whose page is mapped, listed in logical order
-    as physical cache slots, and each row's bitmap re-indexed onto that list
-    (a per-word parallel bit extract). The group goes to the row-tile pass
-    when walking its list in 64-slot tiles costs at most 2.5x per-row tiles
-    less than the rows' own columns would; otherwise -- or when its rows span
-    requests -- its rows join the lone list. A lone-row pass (256 programs
+    Six launches. A bitmap pass: one bit per selected logical token per row.
+    A plan per group of 10 consecutive rows of one request, in three passes
+    over (group, 32 bitmap words) programs: the union of the rows' selected
+    tokens whose page is mapped (a page lookup per word's page, not per
+    token) and its count per chunk; a per-group scan of those counts (list
+    length and tiles); the union listed in logical order as physical cache
+    slots, and each row's bitmap re-indexed onto that list (a per-word
+    parallel bit extract ORed into place). Every group of one request goes to
+    the row-tile pass, however long its list: its list is never longer than
+    its rows' own columns combined, and a listed tile costs no more than a
+    per-row tile. A group whose rows span requests joins the lone
+    list. A lone-row pass (256 programs
     per KV head striding the list) serves listed rows over their own columns,
     as the per-row kernel does. The row-tile pass is persistent (one program
     per SM drawing (group, KV head) items from a ticket counter, the plan's
@@ -734,10 +860,12 @@ class QsaSparseGqaRowtile(OpWrapper):
     nothing in the row-tile pass's compile key depends on the row count or
     the plan.
 
-    Scratch per call: the bitmap and the re-indexed bitmap, each `rows x
-    ceil(table_width * tpb / 64)` int64 words (21 MB at 16384 rows and 320
-    pages), the slot lists, `ceil(rows / 10) x` that many words' tokens as
-    int32 (67 MB at 16384 rows), the plan and the lone list. Calls allocate,
+    Scratch per call: the bitmap, `rows x ceil(table_width * tpb / 64)` int64
+    words (21 MB at 16384 rows and 320 pages), and per group its union over
+    as many words (2 MB); the re-indexed bitmaps, `rows x ceil(10 x
+    selection width / 64)` int64 words (42 MB at 16384 rows), and the slot
+    lists, `ceil(rows / 10) x` 64 times that many int32 slots (27 MB); the
+    per-chunk counts, the plan and the lone list. Calls allocate,
     so capture in a CUDA graph is not certified; this entry serves the
     prefill path, which runs eager. Results are deterministic: the bitmap
     OR, the re-indexed bitmap OR and the lone list order do not change any

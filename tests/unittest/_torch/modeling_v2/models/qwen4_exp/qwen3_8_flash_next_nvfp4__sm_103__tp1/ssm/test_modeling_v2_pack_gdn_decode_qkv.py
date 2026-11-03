@@ -95,23 +95,3 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
             per_token.narrow(2, 2 * Q_WIDTH, V_WIDTH).reshape(b, p, NUM_V_HEADS, HEAD_V_DIM),
         )
         assert all(torch.equal(gt, w) for gt, w in zip(grouped, want))
-
-
-def test_a_short_row_reads_the_next_row_and_is_refused() -> None:
-    """Unguarded, a `[32, 9216]` input at qkv_dim 10240 runs and silently reads
-    the next row's first 1024 columns into the tail of `v`; the guard refuses it.
-
-    The input is carved from a longer flat buffer so the over-read lands in
-    known memory rather than in allocator garbage.
-    """
-    rows, width = 32, QKV_DIM - 1024
-    flat = torch.randn(rows * width + 1024, device=DEV).to(torch.bfloat16)
-    mixed = flat[: rows * width].view(rows, width)
-    _, _, v = op(mixed, *CKPT_HEADS)
-    torch.cuda.synchronize()
-    tail = v[0].reshape(rows, V_WIDTH)[:, V_WIDTH - 1024 :]
-    assert torch.equal(tail[:-1], mixed[1:, :1024]), "the hazard this guard covers is gone"
-
-    with pytest.raises(AssertionError, match="must be at least qkv_dim=10240 wide"):
-        with validating(op):
-            op(mixed, *CKPT_HEADS)

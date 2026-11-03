@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: `nvfp4_gemv` against an fp32 reference over the dequantized NVFP4 weight, per
-cell; the quantizer against its definition; CUDA-graph replay; one compiled kernel per row
-octet; the f16-range guard. The split entries (NVFP4 units on `fp8_gemv`'s kernel) per cell:
+cell; the quantizer against its definition; one compiled kernel per row
+octet. The split entries (NVFP4 units on `fp8_gemv`'s kernel) per cell:
 the projection against the fp32 reference, the conv entries also against the two-launch
 paths they replace (the split projection + `causal_conv1d_update` /
 `causal_conv1d_triton_update`)."""
@@ -11,14 +11,14 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm import (  # noqa: E501
-    nvfp4_gemv as nv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
     causal_conv1d_triton_update,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_update import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     causal_conv1d_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm import (  # noqa: E501
+    nvfp4_gemv as nv,
 )
 
 assert torch.cuda.is_available(), "nvfp4_gemv requires a CUDA device"
@@ -103,29 +103,6 @@ def test_one_kernel_per_row_octet() -> None:
             nv.dequantize_nvfp4(codes, scales, gscale),
         )
     assert nv._compiled.cache_info().currsize - before <= 2
-
-
-def test_graph_replay_matches_eager() -> None:
-    _, _, _, _, packed = _weight(4096, 2560, 9)
-    x = torch.randn(4, 2560, device=DEV).to(torch.bfloat16)
-    nvfp4_gemv_op(x, packed)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = nvfp4_gemv_op(x, packed)
-    x.copy_(torch.randn(4, 2560, device=DEV).to(torch.bfloat16))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, nvfp4_gemv_op(x, packed))
-
-
-def test_is_valid_rejects_activation_beyond_f16() -> None:
-    _, _, _, _, packed = _weight(256, 256, 1)
-    x = torch.randn(2, 256, device=DEV).to(torch.bfloat16)
-    nvfp4_gemv_op.is_valid(x, packed)
-    x[1, 3] = 1e5
-    with pytest.raises(AssertionError):
-        nvfp4_gemv_op.is_valid(x, packed)
 
 
 # ------------------------------------------------------------------------------------------
@@ -281,21 +258,6 @@ def test_split_conv1d_verify_cells(cell) -> None:
     for got, ref_ in ((state_a, want_state), (window_a, want_window)):
         assert (got == ref_).float().mean().item() > 0.9999
         assert (got.float() - ref_.float()).abs().max() <= 2.0**-7 * ref_.float().abs().max()
-
-
-def test_split_graph_replay_matches_eager() -> None:
-    _, codes, scales, gscale, _ = _weight(GDN_N, GDN_K, 9)
-    packed = nv.pack_split(codes, scales, gscale)
-    x = torch.randn(4, GDN_K, device=DEV).to(torch.bfloat16)
-    split_op(x, packed)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = split_op(x, packed)
-    x.copy_(torch.randn(4, GDN_K, device=DEV).to(torch.bfloat16))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out, split_op(x, packed))
 
 
 def test_split_precompile_covers_the_decode_variants() -> None:

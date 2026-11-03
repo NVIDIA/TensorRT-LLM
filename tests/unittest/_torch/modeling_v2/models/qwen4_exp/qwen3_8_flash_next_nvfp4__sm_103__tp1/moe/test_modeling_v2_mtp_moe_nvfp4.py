@@ -17,17 +17,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
-    modeling as m,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     fp8_block_scale_moe_runner,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (  # noqa: E501
     renorm_moe_routing_op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
+    modeling as m,
 )
 
 assert torch.cuda.is_available(), "the NVFP4 draft MoE requires a CUDA device"
@@ -73,8 +73,15 @@ def experts():
     w = {p + k: getattr(fp8, k).clone() for k in ("fc1_w", "fc1_s", "fc2_w", "fc2_s")}
     w["l0_e_isc1"] = torch.full((E,), TRUNK_AMAX[0] / 2688.0, device=DEV)
     w["l0_e_isc2"] = torch.full((E,), TRUNK_AMAX[1] / 2688.0, device=DEV)
+    # No packed FP8 draft projections: the shared expert runs its bf16 GEMMs.
     core = SimpleNamespace(
-        w=w, mtp_layer_idx=1, num_layers=1, num_experts=E, topk=K, moe_inter=INTER
+        w=w,
+        mtp_layer_idx=1,
+        num_layers=1,
+        num_experts=E,
+        topk=K,
+        moe_inter=INTER,
+        _mtp_gemv8={},
     )
     fields = m._mtp_moe_nvfp4(core)
     nvfp4 = SimpleNamespace(router=fp8.router, **fields)
@@ -140,3 +147,40 @@ def test_nvfp4_tracks_fp8(experts, rows):
     assert rel < REL_RMS_BAND, rel
     assert cos > COS_FLOOR, cos
     assert abs(ratio - 1.0) < NORM_RATIO_BAND, ratio
+
+
+@pytest.mark.parametrize("rows", [1, 64, 512])
+def test_shared_expert_overlap_preserves_serial_output(experts, rows):
+    core, _, nvfp4 = experts
+    gen = torch.Generator(device=DEV).manual_seed(42)
+    # The checkpoint's fused shared expert: gate|up rows, then the one gate-logit row.
+    sh_gu = (torch.randn(2 * INTER + 1, H, generator=gen, device=DEV) / H**0.5).to(torch.bfloat16)
+    sh_dn = (torch.randn(H, INTER, generator=gen, device=DEV) / INTER**0.5).to(torch.bfloat16)
+    weights = SimpleNamespace(
+        **vars(nvfp4),
+        sh_gu=sh_gu[: 2 * INTER].t(),
+        sh_dn=sh_dn.t(),
+        sh_gate=sh_gu[2 * INTER :].t(),
+    )
+    core._side_stream = torch.cuda.Stream()
+    x = torch.randn(rows, H, generator=gen, device=DEV).to(torch.bfloat16)
+
+    def serial():
+        routed = m._mtp_routed_nvfp4(core, weights, x)
+        up = m.flashinfer_silu_and_mul(m.cublas_mm(x, weights.sh_gu))
+        shared = m.cublas_mm(up, weights.sh_dn)
+        gate = m.cublas_mm(x, weights.sh_gate)
+        return m.fused_sigmoid_gate_mul_add(routed, gate, shared)
+
+    expected = serial().clone()
+    actual = m._mtp_moe_nvfp4_block(core, weights, x)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if rows == 64:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = m._mtp_moe_nvfp4_block(core, weights, x)
+        for _ in range(3):
+            x.normal_(generator=gen)
+            expected = serial().clone()
+            graph.replay()
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)

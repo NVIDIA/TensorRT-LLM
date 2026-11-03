@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.8-Flash-Next NVFP4, AgentX agentic trace replay, aggregated on one GB300 GPU,
+# served by the modeling_v2 TP1 target (`modeling_v2: require`). The two ends of its
+# AgentX Pareto front, one server each:
+#   con1   MTP2, every opt-in projection of the target          low-latency end
+#   con80  MTP2, max_batch_size 80, 150 GiB host KV cache tier  throughput end
+# Both: NVFP4 KV cache with per-conversation block reuse (recurrent-state snapshot two
+# tokens before each prompt's end), chunked prefill with breakable prefill CUDA graphs,
+# rejection sampling, and the corpus's 256k-token variant.
+# TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.32 is the InferenceX golden acceptance
+# length for this model (2.32) minus 1.
+metadata:
+  model_name: qwen3.8_flash_next_fp4
+  precision: fp4
+  model_dir_name: Qwen3.8-Flash-Next-NVFP4
+  supported_gpus:
+  - GB300
+  benchmark_type: agentx
+hardware:
+  gpus_per_node: 1
+server_configs:
+- name: qwen3_8_flash_next_fp4_mv2_tp1_mtp2_con1_agentx
+  model_name: qwen3.8_flash_next_fp4
+  server_env_var: >-
+    TRTLLM_ENABLE_PDL=1
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1
+    TRTLLM_MODELING_V2_DENSE_FP8=1
+    TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4=1
+    TRTLLM_MODELING_V2_MTP_MOE_NVFP4=1
+    TRTLLM_MODELING_V2_MTP_HEAD_NVFP4=1
+    TRTLLM_MODELING_V2_TARGET_HEAD_NVFP4=1
+    TRTLLM_MODELING_V2_MTP_DENSE_FP8=1
+    TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.32
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: true
+  modeling_v2: require
+  max_batch_size: 64
+  max_seq_len: 262144
+  max_num_tokens: 8192
+  enable_chunked_prefill: true
+  disable_mm_encoder: true
+  kv_cache_config:
+    dtype: nvfp4
+    free_gpu_memory_fraction: 0.85
+    mamba_ssm_cache_dtype: bfloat16
+    use_kv_cache_manager_v2: true
+    tokens_per_block: 32
+    enable_block_reuse: true
+    block_reuse_config:
+      policy: per_conversation
+      max_num_turns: 3
+    mamba_state_config:
+      periodic_snapshot_interval: 0
+      additional_snapshot_offsets_from_end: [2]
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 40, 48, 56, 64]
+  prefill_cuda_graph_backend: breakable
+  prefill_capture_num_tokens: &prefill_capture [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536,
+    1792, 2048, 2304, 2560, 2816, 3072, 4096, 6144, 8192]
+  scheduler_config:
+    capacity_scheduler_policy: GUARANTEED_NO_EVICT
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 2
+    use_rejection_sampling: true
+  moe_config:
+    backend: TRTLLM
+  client_configs:
+  - name: con1_agentx
+    concurrency: 1
+    iterations: 1
+    backend: openai
+    streaming: true
+    benchmark_client: agentx
+    dataset_file: semianalysis_cc_traces_weka_062126_256k
+    client_env_var: AGENTX_MAX_CTX=262144 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400
+- name: qwen3_8_flash_next_fp4_mv2_tp1_mtp2_con80_agentx
+  model_name: qwen3.8_flash_next_fp4
+  server_env_var: >-
+    TRTLLM_ENABLE_PDL=1
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1
+    TRTLLM_MODELING_V2_DENSE_FP8=1
+    TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4=1
+    TRTLLM_MODELING_V2_MTP_MOE_NVFP4=1
+    TRTLLM_MODELING_V2_MTP_HEAD_NVFP4=1
+    TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=1.32
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  pipeline_parallel_size: 1
+  trust_remote_code: true
+  modeling_v2: require
+  max_batch_size: 80
+  max_seq_len: 262144
+  max_num_tokens: 8192
+  enable_chunked_prefill: true
+  disable_mm_encoder: true
+  kv_cache_config:
+    dtype: nvfp4
+    free_gpu_memory_fraction: 0.85
+    mamba_ssm_cache_dtype: bfloat16
+    use_kv_cache_manager_v2: true
+    tokens_per_block: 32
+    enable_block_reuse: true
+    block_reuse_config:
+      policy: per_conversation
+      max_num_turns: 3
+    mamba_state_config:
+      periodic_snapshot_interval: 0
+      additional_snapshot_offsets_from_end: [2]
+    avg_seq_len: 40960
+    host_cache_size: 161061273600
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 32, 40, 48, 56, 64, 72, 80]
+  prefill_cuda_graph_backend: breakable
+  prefill_capture_num_tokens: *prefill_capture
+  scheduler_config:
+    capacity_scheduler_policy: GUARANTEED_NO_EVICT
+  speculative_config:
+    decoding_type: MTP
+    max_draft_len: 2
+    use_rejection_sampling: true
+  moe_config:
+    backend: TRTLLM
+  client_configs:
+  - name: con80_agentx
+    concurrency: 80
+    iterations: 1
+    backend: openai
+    streaming: true
+    benchmark_client: agentx
+    dataset_file: semianalysis_cc_traces_weka_062126_256k
+    client_env_var: AGENTX_MAX_CTX=262144 AGENTX_DURATION=3600 AGENTX_WARMUP_PER_LANE=3 AGENTX_TIMEOUT_GRACE=5400

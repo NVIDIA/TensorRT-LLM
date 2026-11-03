@@ -60,6 +60,8 @@ llm_perf_disagg:
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_8k1k_con4096_ctx1_dep4_gen1_dep16_eplb0_mtp0_ccb-NIXL] TIMEOUT (120)
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_kimi-k25-thinking-fp4_8k1k_con4_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (120)
   # GB300 Qwen3-235B
+  # GB300 Qwen3.8-Flash-Next (AgentX agentic trace replay, modeling_v2 TP1 target)
+  - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_qwen38-flash-next-fp4_agentx_con2_ctx1_tp1_gen1_tp1_eplb0_mtp2_ccb-NIXL] TIMEOUT (120)
   # GB300 wideep
   - perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb300_wideep_deepseek-r1-fp4_8k1k_ctx2_gen1_dep32_bs128_eplb288_mtp3_con1024_ccb-NIXL] TIMEOUT (120)
   # GB300 aggregated ctx_only

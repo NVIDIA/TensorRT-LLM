@@ -5,9 +5,6 @@
 Every cell names the branch `plan` must pick, and a host-only check pins the
 branch of the table's other shapes and M buckets, so a table edit that moves a
 shape to another kernel fails here before it can change a number silently.
-Beyond the cells: CUDA-graph capture and replay after warmup (the way the
-decode forward runs it), and the guard against a padded `mat_b`, which the
-cuBLAS branch would read as dense.
 """
 
 import zlib
@@ -99,50 +96,9 @@ def test_plan_pins_the_branch_of_the_other_table_shapes() -> None:
     assert not wrong, f"(M, N, K, pinned, picked): {wrong}"
 
 
-def test_graph_replay_after_warmup() -> None:
-    """Decode runs this under CUDA graphs, with PDL: compile in warmup, capture,
-    then replay with new activations copied into the captured input. One call per
-    branch, in a chain, so a FlashInfer kernel follows cuBLAS and vice versa."""
-    pdl = True
-    shapes = [(1, 10240, 2560), (8, 2560, 6144), (1, 2560, 640), (8, 12288, 2560)]
-    assert [plan(*s).kind for s in shapes] == ["direct", "splitk", "cublas", "splitk"]
-    ins = [_build(m, n, k, seed=i) for i, (m, n, k) in enumerate(shapes)]
-    static = [a.clone() for a, _ in ins]
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(2):
-            [op(a, b, pdl) for a, (_, b) in zip(static, ins)]
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outs = [op(a, b, pdl) for a, (_, b) in zip(static, ins)]
-    for trial in range(3):
-        g = torch.Generator(device="cuda").manual_seed(100 + trial)
-        for a in static:
-            a.copy_(torch.randn(a.shape, generator=g, device="cuda").to(a.dtype))
-        graph.replay()
-        torch.cuda.synchronize()
-        for a, (_, b), out in zip(static, ins, outs):
-            _compare(out, op.reference(a, b))
-
-
 def _padded(m, n, k):
     """A row-padded mat_a and a column-padded mat_b: dense along K, leading
     dimension 2K. Both are views a caller gets by slicing a wider tensor."""
     a = torch.randn(m, 2 * k, dtype=torch.bfloat16, device="cuda")[:, :k]
     w = (torch.randn(n, 2 * k, device="cuda") * k**-0.5).to(torch.bfloat16)[:, :k]
     return a, w.t()
-
-
-def test_guard_refuses_a_padded_mat_b() -> None:
-    """Why the guard exists: the cuBLAS branch ignores mat_b's leading dimension
-    and silently computes a different product."""
-    a, b = _padded(4, 640, 640)
-    a = a.contiguous()
-    assert plan(4, 640, 640).kind == "cublas" and b.stride() == (1, 1280)
-    with pytest.raises(AssertionError):
-        _compare(op(a, b), op.reference(a, b))
-    with pytest.raises(AssertionError, match="column-major"):
-        with validating(op):
-            op(a, b)

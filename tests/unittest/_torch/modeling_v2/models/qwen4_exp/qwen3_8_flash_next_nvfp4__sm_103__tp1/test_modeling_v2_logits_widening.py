@@ -74,6 +74,23 @@ def test_unwidened_logits_give_the_same_greedy_tokens(head, rows) -> None:
     assert torch.equal(greedy_argmax(narrow), torch.argmax(wide, dim=-1))
 
 
+@pytest.mark.parametrize("rows", [1, 3, 16, 17])
+def test_fp8_verify_head_reads_the_nvfp4_copy_at_decode_rows(head, rows) -> None:
+    """With an NVFP4 copy (`_TARGET_HEAD_NVFP4_ENV`) the dense FP8 verify head's decode rows
+    are `nvfp4_gemv` over it; past `_FP8_GEMV_HEAD_ROWS` they keep the per-row FP8 copy."""
+    rowwise = T._fp8_rowwise(head.weight.data)
+    nv = T.nvfp4_pack_from_bf16(head.weight.data)
+    g = torch.Generator(device="cuda").manual_seed(100 + rows)
+    hidden = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    with torch.no_grad():
+        got = T._Fp8VerifyHead(rowwise, None, nv)(hidden)
+        if rows <= T._FP8_GEMV_HEAD_ROWS:
+            want = T.nvfp4_gemv_op(hidden, nv)
+        else:
+            want = T._Fp8DraftHead(*rowwise)(hidden)
+    assert got.shape == (rows, VOCAB) and torch.equal(got, want)
+
+
 def _gate(guided=None, greedy=True, rejection=False, penalty=False, relaxed=False):
     worker = SimpleNamespace(
         guided_decoder=guided,

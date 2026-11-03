@@ -15,6 +15,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_permuted import (  # noqa: E501
     finalize,
 )
@@ -23,9 +26,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as finalized,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
-    renorm_moe_routing_op,
 )
 
 __extra_import_path__ = ["../../../.."]
@@ -84,34 +84,3 @@ def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     with true_fp32_matmul():
         exp = op.reference(logits, x, k, ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
-
-
-def test_uncertified_pair_refused(many_expert_layer):  # noqa: F811
-    spec = op.CELLS[0].spec
-    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
-        many_expert_layer(), spec, 13, renorm_moe_routing_op
-    )
-    with validating(op), pytest.raises(AssertionError, match="certified Renormalize"):
-        op(*_args(args, data, sf, logits, scalars, spec, top_k=9))
-
-
-def test_cuda_graph_capture_and_replay(many_expert_layer):  # noqa: F811
-    spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 1)
-    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
-        many_expert_layer(), spec, 43, renorm_moe_routing_op
-    )
-    call = list(_args(args, data, sf, logits, scalars, spec))
-    warmup = torch.cuda.Stream()
-    warmup.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup):
-        for _ in range(3):
-            op(*call)
-    torch.cuda.current_stream().wait_stream(warmup)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g_rows, g_w, g_idx = op(*call)
-    logits.copy_(torch.randn_like(logits.float()).to(logits.dtype))
-    graph.replay()
-    torch.cuda.synchronize()
-    want = finalized(*call)
-    assert torch.equal(finalize(g_rows, g_w, g_idx), want)

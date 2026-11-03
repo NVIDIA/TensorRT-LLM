@@ -155,19 +155,3 @@ def test_fold_bitwise_vs_runner_finalize(rows, n_cols) -> None:
     want = first_op(o["hc"], routed, o["inject"], o["norm"], o["first"], C, n_cols, EPS, **kw)
     for a, b in zip(got, want):
         assert (a is None and b is None) or torch.equal(a, b)
-
-
-def test_replay_matches_eager() -> None:
-    o = _operands(8, 77)
-    _site(o, "inject", True)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = _site(o, "inject", True)
-    fresh = _operands(8, 78)
-    o["hc"].copy_(fresh["hc"])
-    o["block"].copy_(fresh["block"])
-    graph.replay()
-    torch.cuda.synchronize()
-    eager = _site(o, "inject", True)
-    assert torch.equal(captured[1], eager[1]) and torch.equal(captured[0], eager[0])

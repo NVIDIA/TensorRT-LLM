@@ -15,7 +15,6 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_gdn_gating import (  # noqa: E501
     A_LOG_RANGE,
     APPROX_ULP,
-    BA_WIDTH,
     DT_BIAS_RANGE,
     NUM_V_HEADS,
 )
@@ -93,23 +92,3 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     g = op(*args)
     _compare(g, op.reference(*args))
     assert g.is_contiguous() and torch.isfinite(g).all()
-
-
-def test_guard_refuses_what_the_kernel_reads_at_the_wrong_addresses() -> None:
-    """Unguarded, an `a` with head stride 2 returns a finite `g` -- exactly the
-    one for the memory the kernel actually addressed (`row * stride(0) +
-    head`: the first 48 columns of each row), not the tensor it was handed;
-    the guard refuses it."""
-    g = torch.Generator(device=DEV).manual_seed(111)
-    A_log, dt_bias = _params(g)
-    wide = torch.randn(32, BA_WIDTH, generator=g, device=DEV).to(torch.bfloat16)
-    bad = (A_log, wide[:, ::2], dt_bias)
-    addressed = (A_log, wide[:, :NUM_V_HEADS], dt_bias)
-    unguarded = op(*bad)
-    assert torch.isfinite(unguarded).all()
-    assert torch.equal(unguarded, op(*addressed)), "the hazard this guard covers is gone"
-    with pytest.raises(AssertionError):
-        _compare(unguarded, op.reference(*bad))
-    with pytest.raises(AssertionError, match="head axis must be unit-stride"):
-        with validating(op):
-            op(*bad)

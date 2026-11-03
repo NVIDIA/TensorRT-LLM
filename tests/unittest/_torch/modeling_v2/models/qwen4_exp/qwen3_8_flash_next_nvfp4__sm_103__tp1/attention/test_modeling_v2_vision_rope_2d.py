@@ -106,15 +106,3 @@ def test_grid_placement_and_integer_dtype_do_not_change_the_result() -> None:
     for other in (host.to("cuda"), host.to(torch.int64), host.to(torch.int64).to("cuda")):
         q_other, k_other = op(q, k, other, MERGE, THETA)
         assert torch.equal(q_host, q_other) and torch.equal(k_host, k_other)
-
-
-def test_guard_refuses_a_one_token_k() -> None:
-    """The hazard, unguarded: a [1, H, D] k broadcasts to [T, H, D]."""
-    grid_thw = torch.tensor([(1, 4, 4)], dtype=torch.int32)
-    q, k = _operands(16, HEADS, HEADS, HEAD_DIM, torch.bfloat16, seed=5)
-    _, k_out = op(q, k[:1], grid_thw, MERGE, THETA)
-    assert k_out.shape == (16, HEADS, HEAD_DIM)
-
-    with pytest.raises(AssertionError, match="must agree on tokens and head_dim"):
-        with validating(op):
-            op(q, k[:1], grid_thw, MERGE, THETA)

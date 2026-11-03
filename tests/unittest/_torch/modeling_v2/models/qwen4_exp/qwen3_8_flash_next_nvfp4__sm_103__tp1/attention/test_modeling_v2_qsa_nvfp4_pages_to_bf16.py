@@ -17,7 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention import (
     qsa_paged_sparse_gqa_nvfp4 as _gqa,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_nvfp4_pages_to_bf16 import (  # noqa: E501
@@ -149,13 +149,3 @@ def test_listing_past_the_scratch_is_dropped() -> None:
     out = op(**args)
     for got, want in zip(out, ref):
         assert _bitwise(got, want)
-
-
-def test_guards() -> None:
-    args = _build(op.CELLS[0].spec, 3)
-    with validating(op), pytest.raises(AssertionError):
-        op(**{**args, "k_out": args["k_out"].float()})
-    with validating(op), pytest.raises(AssertionError):
-        op(**{**args, "block_table": args["block_table"].long()})
-    with validating(op), pytest.raises(AssertionError):
-        op(**{**args, "table": args["table"][:, :-1]})

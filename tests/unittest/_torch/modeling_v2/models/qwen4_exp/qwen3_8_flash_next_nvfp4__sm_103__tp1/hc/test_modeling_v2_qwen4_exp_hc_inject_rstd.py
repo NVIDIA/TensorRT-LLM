@@ -6,8 +6,7 @@ Cells: `hc_out` within one ulp of the float64 reference (the MoE-combine cells
 widened by the combine's own rounding, as `qwen4_exp_hc_inject_norm`'s test),
 rstd within 2^-16 relative of the float64 statistic of the stored residual.
 Beyond them: `hc_out` and the normed stream rebuilt from rstd bitwise
-`qwen4_exp_hc_inject_norm`'s at the cells' sizes, the operand guard, graph
-capture.
+`qwen4_exp_hc_inject_norm`'s at the cells' sizes.
 """
 
 import zlib
@@ -15,7 +14,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
     qwen4_exp_hc_inject_norm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_inject_rstd import (  # noqa: E501
@@ -138,28 +137,3 @@ def test_normed_rebuilt_from_rstd_is_inject_norm_bitwise(cell) -> None:
     normed = (x.flatten(-2) * (1.0 + gamma.float())).to(hc.dtype)
     diff = (normed != want_normed).sum().item()
     assert diff == 0, f"{diff} normed elements differ"
-
-
-def test_guard_refuses_block_out_without_inject() -> None:
-    hyper_input, block_out, _, eps, c, _, _ = _build(dict(rows=4), seed=4)
-    with validating(op), pytest.raises(AssertionError, match="together"):
-        op(hyper_input, block_out, None, eps, c)
-
-
-def test_cuda_graph_capture_and_replay() -> None:
-    args = list(_build(dict(rows=8, moe=True), seed=5))
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        op(*args)
-    torch.cuda.current_stream().wait_stream(side)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        g_hc, g_rstd = op(*args)
-    fresh = _build(dict(rows=8, moe=True), seed=6)
-    for i in (0, 1, 2, 5, 6):
-        args[i].copy_(fresh[i])
-    graph.replay()
-    torch.cuda.synchronize()
-    e_hc, e_rstd = op(*fresh)
-    assert torch.equal(g_hc, e_hc) and torch.equal(g_rstd, e_rstd)

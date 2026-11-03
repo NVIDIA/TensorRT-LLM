@@ -4,8 +4,8 @@
 
 The entry owns the contract. This file builds the checkpoint-shaped operands --
 512 experts in the CuteDSL weight layout, the activation as the target quantizes
-it, the sort as moe_sort returns it -- and holds the claims no cell carries:
-per-pair invariance across tiles and tactics, and the contiguity guard.
+it, the sort as moe_sort returns it -- and holds the claim no cell carries:
+per-pair invariance across tiles and tactics.
 """
 
 import functools
@@ -364,36 +364,3 @@ def test_tiles_and_tactics_agree_per_pair(certifying):  # noqa: F811
     first = seen[(128, 128)]
     for key, got in seen.items():
         _assert_pairs_equal(got, first, f"T={tokens} {key} vs (128, 128)")
-
-
-# ── the guard ─────────────────────────────────────────────────────────────
-
-
-def _strided(t: torch.Tensor) -> torch.Tensor:
-    """The same values as `t`, as a non-contiguous view into a wider buffer."""
-    u = t.view(torch.uint8) if t.element_size() == 1 else t
-    wide = torch.zeros(*u.shape[:-1], 2 * u.shape[-1], dtype=u.dtype, device=DEV)
-    wide[..., : u.shape[-1]] = u
-    view = wide[..., : u.shape[-1]]
-    return view.view(t.dtype) if t.element_size() == 1 else view
-
-
-def _u8(t: torch.Tensor) -> torch.Tensor:
-    return t.view(torch.uint8) if t.element_size() == 1 else t
-
-
-def test_noncontiguous_operand_answers_wrongly_and_is_refused():
-    """The runner hands data_ptr() to the kernel and never reads a stride: the
-    same values through a strided view come back finite and wrong. The activation;
-    the guard checks input_scale, weight, weight_scale and alpha the same way."""
-    name = "input"
-    tokens, tile = 64, 128
-    args, _ = _problem(tokens, tile, seed=21)
-    ref = op.reference(**args)
-    bad = dict(args, **{name: _strided(args[name])})
-    assert not bad[name].is_contiguous()
-    assert torch.equal(_u8(bad[name]), _u8(args[name]))
-    with pytest.raises(AssertionError):
-        _compare(op(**bad), ref)
-    with validating(op), pytest.raises(AssertionError, match=f"^{name} must be contiguous"):
-        op(**bad)

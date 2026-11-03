@@ -134,6 +134,141 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (
+    fused_sigmoid_mul_inplace,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.gelu_erf import (
+    gelu_erf,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.gelu_tanh import (
+    gelu_tanh,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.silu_and_mul_rows import (
+    silu_and_mul_rows,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (
+    qsa_canonical_selection,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_expand_block_indices import (
+    qsa_expand_block_indices,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_mtp_reuse_topk import (
+    qsa_mtp_reuse_topk,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_index_store import (
+    qsa_paged_index_store,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store import (
+    qsa_paged_kv_store,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (
+    qsa_paged_kv_store_nvfp4,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa import (
+    qsa_paged_sparse_gqa,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4 import (
+    qsa_paged_sparse_gqa_nvfp4,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
+    qsa_paged_sparse_gqa_nvfp4_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_prefill_compress import (
+    qsa_prefill_compress,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import (
+    plane_table as _plane_table,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_rollback_planes import (
+    qsa_rollback_gather,
+    qsa_rollback_restore,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
+    qsa_topk_expand_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_expand_decode import (
+    supports as _topk_expand_supports,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_topk_select import (
+    qsa_topk_select,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.spec_rollback_commit import (
+    spec_rollback_commit,
+    spec_rollback_stage,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (
+    qwen4_exp_hc_inject_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_lowrank_act import (
+    qwen4_exp_hc_lowrank_act,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
+    qwen4_exp_hc_up_gate_mean,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_post_inject import (
+    qwen4_exp_post_inject,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (
+    fp8_block_scale_moe_runner,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fused_sigmoid_gate_mul_add import (
+    fused_sigmoid_gate_mul_add,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.flashinfer_gemma_rmsnorm import (
+    flashinfer_gemma_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.layer_norm import (
+    layer_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.rms_norm_gated_token_major import (
+    rms_norm_gated_token_major,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (
+    ple_gate_conv_inject_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_ngram_embed import (
+    ple_ngram_embed,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.quantization.fp8_quantize_1x128 import (
+    fp8_quantize_1x128,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (
+    causal_conv1d_triton_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (
+    causal_conv1d_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.cu_seqlens_from_seq_lens import (
+    cu_seqlens_from_seq_lens,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.flashinfer_chunk_gated_delta_rule import (
+    flashinfer_chunk_gated_delta_rule,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (
+    MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_gated_norm_pdl import (
+    gdn_decode_gated_norm_pdl,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_decode_rows_gated_norm import (
+    gdn_decode_rows,
+    gdn_decode_rows_gated_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (
+    gdn_prefill_conv_post,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.vision.patch_embed_conv3d import (
+    patch_embed_conv3d,
+)
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -149,37 +284,16 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
-from .ops.activation.gelu_erf import gelu_erf
-from .ops.activation.gelu_tanh import gelu_tanh
-from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
-from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
-from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
-from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
 from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
-from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
-from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
-from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
-from .ops.attention.qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4
-from .ops.attention.qsa_paged_sparse_gqa import qsa_paged_sparse_gqa
 from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECODE_MAX_ROWS
 from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_decode
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
-from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
-from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import qsa_paged_sparse_gqa_nvfp4_decode
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import qsa_paged_sparse_gqa_nvfp4_verify
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import takes_grouped as _verify_takes_grouped
-from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
-from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
-from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
-from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
-from .ops.attention.qsa_topk_expand_decode import supports as _topk_expand_supports
-from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
-from .ops.attention.spec_rollback_commit import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.verify_step_setup import _BLOCK_S as _VERIFY_SETUP_MAX_SEQS
 from .ops.attention.verify_step_setup import verify_step_setup
 from .ops.attention.vision_rope_2d import vision_rope_2d
@@ -219,16 +333,12 @@ from .ops.hc.qwen4_exp_hc_decode_rows_tc import (
 from .ops.hc.qwen4_exp_hc_decode_tc_first import precompile as hc_tc_first_precompile
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_first_rescale_tc import qwen4_exp_hc_first_rescale_tc
-from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_inject_rstd import qwen4_exp_hc_inject_rstd
-from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
-from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4 import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (
     qwen4_exp_hc_up_gate_mean_rstd,
     qwen4_exp_hc_up_gate_mean_rstd_fp4,
 )
-from .ops.hc.qwen4_exp_post_inject import qwen4_exp_post_inject
 from .ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
 )
@@ -236,36 +346,15 @@ from .ops.moe.cute_dsl_nvfp4_grouped_gemm import cute_dsl_nvfp4_grouped_gemm
 from .ops.moe.fp4_block_scale_moe_renorm_permuted import fp4_block_scale_moe_renorm_permuted
 from .ops.moe.fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed
 from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
-from .ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
-from .ops.moe.fused_sigmoid_gate_mul_add import fused_sigmoid_gate_mul_add
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
-from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
-from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
-from .ops.norm.layer_norm import layer_norm
-from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
-from .ops.ple.ple_gate_conv_inject_norm import ple_gate_conv_inject_norm
-from .ops.ple.ple_ngram_embed import ple_ngram_embed
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
-from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
-from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update
-from .ops.ssm.causal_conv1d_update import causal_conv1d_update
-from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens
-from .ops.ssm.flashinfer_chunk_gated_delta_rule import flashinfer_chunk_gated_delta_rule
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
-from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
-    fused_recurrent_gated_delta_rule_cached_replay_update,
-)
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
 from .ops.ssm.gdn_cached_replay_cute import gdn_cached_replay_cute
-from .ops.ssm.gdn_decode_gated_norm_pdl import MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS
-from .ops.ssm.gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl
-from .ops.ssm.gdn_decode_rows_gated_norm import gdn_decode_rows, gdn_decode_rows_gated_norm
 from .ops.ssm.gdn_in_proj_conv1d_pdl import MAX_ROWS as _GDN_CONV_FUSED_MAX_ROWS
 from .ops.ssm.gdn_in_proj_conv1d_pdl import gdn_in_proj_conv1d_pdl
-from .ops.ssm.gdn_prefill_conv_post import gdn_prefill_conv_post
 from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
-from .ops.vision.patch_embed_conv3d import patch_embed_conv3d
 from .ops.vision.pos_embed_interpolate import pos_embed_interpolate
 
 # The GPU architecture this target is certified for; a direct instantiation could
@@ -618,6 +707,34 @@ def _mtp_head_nvfp4_enabled() -> bool:
     return mode == "1"
 
 
+#: Set to 1, under the dense FP8 mode, to run the target head's decode rows (up to
+#: `_FP8_GEMV_HEAD_ROWS`) on `nvfp4_gemv` over an NVFP4 copy of lm_head -- the draft head's
+#: under `_MTP_HEAD_NVFP4_ENV`, else one built at load -- instead of `fp8_gemv`, whose packed
+#: copy is then not built. Lossy: the verify logits change. More rows keep the per-row FP8
+#: copy. 0 (default): `fp8_gemv`.
+_TARGET_HEAD_NVFP4_ENV = "TRTLLM_MODELING_V2_TARGET_HEAD_NVFP4"
+
+
+def _target_head_nvfp4_enabled() -> bool:
+    mode = os.environ.get(_TARGET_HEAD_NVFP4_ENV, "0")
+    assert mode in ("0", "1"), f"{_TARGET_HEAD_NVFP4_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
+
+#: Set to 1 to run the draft layer's dense projections (`fc_e`, `fc_h`, the fused attention
+#: input, `o`, the shared expert's gate|up and down) on `fp8_gemv` over packed FP8 copies at
+#: decode rows (up to `_MTP_DENSE_FP8_MAX_ROWS`). The draft only proposes tokens, so outputs
+#: are unchanged; only the acceptance length can move. 0 (default): bf16.
+_MTP_DENSE_FP8_ENV = "TRTLLM_MODELING_V2_MTP_DENSE_FP8"
+_MTP_DENSE_FP8_MAX_ROWS = 16  # capacity: fixed: a dispatch threshold, at most fp8_gemv's MAX_ROWS
+
+
+def _mtp_dense_fp8_enabled() -> bool:
+    mode = os.environ.get(_MTP_DENSE_FP8_ENV, "0")
+    assert mode in ("0", "1"), f"{_MTP_DENSE_FP8_ENV}={mode!r}: expected 0 or 1"
+    return mode == "1"
+
+
 #: Set to 1 to give each GDN layer an NVFP4 copy of its input projection (e2m1 values, one e4m3
 #: scale per 16 hidden elements of a row, an fp32 global scale; `nvfp4_gemv.pack_split`, 23.7 MB
 #: a layer, built at load from the bf16 weight) and run its decode rows -- up to
@@ -731,6 +848,14 @@ def _mid_rows(kind: str, rows: int) -> bool:
 def _gemv_ready(x: torch.Tensor) -> bool:
     """`fp8_gemv`'s activation layout: unit column stride, rows 16-byte aligned."""
     return x.stride(1) == 1 and x.stride(0) % 8 == 0 and x.data_ptr() % 16 == 0
+
+
+def _draft_mm(x: torch.Tensor, weight_t: torch.Tensor, packed, gemm) -> torch.Tensor:
+    """A draft-layer projection: `fp8_gemv` over its packed FP8 copy (`_MTP_DENSE_FP8_ENV`)
+    at up to `_MTP_DENSE_FP8_MAX_ROWS` rows, else `gemm` over the bf16 `weight_t`."""
+    if packed is not None and x.shape[0] <= _MTP_DENSE_FP8_MAX_ROWS and _gemv_ready(x):
+        return fp8_gemv_op(x, packed)
+    return gemm(x, weight_t)
 
 
 def _dense_mm(
@@ -1784,6 +1909,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         self._mtp_fused: "_MtpFused | None" = None
+        # The draft layer's packed FP8 projection copies (`_MTP_DENSE_FP8_ENV`), by role.
+        self._mtp_gemv8: dict = {}
         # The draft head's FP8 copy of lm_head: (e4m3 [vocab, hidden], fp32 [1, vocab] row
         # scales).
         self._mtp_head_fp8: "tuple[torch.Tensor, torch.Tensor] | None" = None
@@ -1793,6 +1920,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
         # The draft head's NVFP4 copy (`_MTP_HEAD_NVFP4_ENV`), read by `nvfp4_gemv` at decode
         # rows in place of the packed FP8 copy.
         self._mtp_head_nv = None
+        # The target head's full-vocabulary NVFP4 copy (`_TARGET_HEAD_NVFP4_ENV`).
+        self._lm_head_nv = None
         # The shared expert's stream; see `_moe_block`. Made in `post_load_weights`:
         # a stream created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
@@ -1926,6 +2055,8 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             hc_tc_first_precompile(self.stream, self.hc_lowrank, self.hc_count, device)
         if self.mtp_enabled:
             self._mtp_fused = _mtp_fused_views(self)
+            if _mtp_dense_fp8_enabled() and device.type == "cuda":
+                self._mtp_gemv8 = _mtp_gemv8(self)
         # FP8 copies of the trunk's dense projections (`_DENSE_FP8_ENV`), beside the bf16
         # weights the 1-row GEMV / fused paths and the draft layer keep reading.
         self._dense8 = {}
@@ -2814,10 +2945,19 @@ def _mtp_routed_nvfp4(core: Qwen4ExpTp1ModelingV2, M: _MtpWeights, x: torch.Tens
 
 def _mtp_moe_nvfp4_block(core: Qwen4ExpTp1ModelingV2, M: _MtpWeights, x: torch.Tensor):
     """The draft layer's MoE on the NVFP4 experts (`_mtp_routed_nvfp4`) plus its bf16 shared
-    expert, combined as on the FP8 path."""
+    expert, combined as on the FP8 path. The shared expert and its gate logit run on the
+    core's side stream, concurrently with the routed path, and join it before the combine;
+    as in `_moe_block`, their allocations are consumed on the main stream after the join."""
+    main = torch.cuda.current_stream()
+    side = core._side_stream
+    side.wait_stream(main)
+    G = core._mtp_gemv8
+    with torch.cuda.stream(side):
+        gu = _draft_mm(x, M.sh_gu, G.get("sh_gu"), cublas_mm)
+        shared = _draft_mm(flashinfer_silu_and_mul(gu), M.sh_dn, G.get("sh_dn"), cublas_mm)
+        gate_logits = cublas_mm(x, M.sh_gate)
     routed = _mtp_routed_nvfp4(core, M, x)
-    shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, M.sh_gu)), M.sh_dn)
-    gate_logits = cublas_mm(x, M.sh_gate)
+    main.wait_stream(side)
     return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
 
@@ -2866,6 +3006,22 @@ def _mtp_fused_views(core: Qwen4ExpTp1ModelingV2) -> _MtpFused:
     )
 
 
+def _mtp_gemv8(core: Qwen4ExpTp1ModelingV2) -> dict:
+    """`fp8_gemv`'s packed copies of the draft layer's dense projections
+    (`_MTP_DENSE_FP8_ENV`), keyed by the role `_draft_mm` reads them in; the fused attention
+    input as `_MtpFused.attn_in` lays it out."""
+    w = core.w
+    p = f"l{core.mtp_layer_idx}_mtp_"
+    return {
+        "fc_e": pack_from_bf16(w[f"{p}fc_e"]),
+        "fc_h": pack_from_bf16(w[f"{p}fc_h"]),
+        "attn_in": pack_from_bf16(core._mtp_fused.attn_in.t().contiguous()),
+        "o": pack_from_bf16(w[f"{p}o_w"]),
+        "sh_gu": pack_from_bf16(w[f"{p}sh_gu"][: 2 * core.shared_inter]),
+        "sh_dn": pack_from_bf16(w[f"{p}sh_dn"]),
+    }
+
+
 def _select(core, scores, row_starts, row_ends, topk_indices, live_cols=None) -> None:
     """Select each row's top-`block_topk` groups into `topk_indices` with `qsa_topk_select`,
     then rewrite the row canonically, in place.
@@ -2892,6 +3048,30 @@ def _select(core, scores, row_starts, row_ends, topk_indices, live_cols=None) ->
     if live_cols is not None:
         scores = scores[:, :live_cols]
     qsa_canonical_selection(scores, row_starts, row_ends, topk_indices)
+
+
+def _select_and_expand(
+    core, scores, row_starts, visible_blocks, positions, seq_lengths, topk_indices, live_cols=None
+):
+    """Build canonical block and causal token selections for zero-start QSA windows."""
+    if _topk_expand_supports(scores):
+        return qsa_topk_expand_decode(
+            scores,
+            visible_blocks,
+            positions,
+            seq_lengths,
+            topk_indices,
+            core.compress_ratio,
+            core.token_topk,
+        )
+    _select(core, scores, row_starts, visible_blocks, topk_indices, live_cols)
+    return qsa_expand_block_indices(
+        topk_indices,
+        positions,
+        seq_lengths,
+        compress_ratio=core.compress_ratio,
+        token_topk=core.token_topk,
+    )
 
 
 def _store_kv(core, kv, k, v, request_indices, logical_positions, block_table, tokens_per_block):
@@ -4872,7 +5052,7 @@ class PrefillTarget:
         coords = torch.transpose(pos3, 0, 1)
 
         # ---- the front end --------------------------------------------------
-        e = nn.functional.embedding(input_ids, embed_tokens)
+        e = _draft_embedding(input_ids, embed_tokens)
         x_e = cublas_mm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
         # `fc_hidden` is one `[hidden, hidden]` matrix applied to each of the four
         # streams (the checkpoint's norm statistics say they are distinct streams).
@@ -5040,23 +5220,18 @@ class PrefillTarget:
                 context_rows=q_keep is None,
             )
             topk_indices = md.qsa_topk_indices[:q_rows]
-            _select(
+            selected = _select_and_expand(
                 core,
                 scores,
                 row_starts,
                 visible_blocks,
+                q_logical,
+                seq_lengths,
                 topk_indices,
                 _live_score_columns(core, md, batch),
             )
             if share:
                 self._capture_selection(md, topk_indices, visible_blocks, q_keep is not None)
-            selected = qsa_expand_block_indices(
-                topk_indices,
-                q_logical,
-                seq_lengths,
-                compress_ratio=core.compress_ratio,
-                token_topk=core.token_topk,
-            )
             q_att = q_dst if q_keep is None else q_dst[q_keep]
             if kv.k_scale is not None:
                 # `keep` holds one row per context request.
@@ -5143,6 +5318,13 @@ def _copy_positions(position_ids: torch.Tensor) -> torch.Tensor:
     )
     pos3.copy_(torch.reshape(position_ids, [_QSA_POSITION_AXES, -1]))
     return pos3
+
+
+def _draft_embedding(input_ids: torch.Tensor, embed_tokens: torch.Tensor) -> torch.Tensor:
+    """The MTP front end's token embedding, reading row 0 for negative ids. Under rejection
+    sampling the slots past a request's accepted count hold -1; their rows feed nothing the
+    step keeps (attention is causal and the next draft call rewrites their cache positions)."""
+    return nn.functional.embedding(input_ids.clamp_min(0), embed_tokens)
 
 
 class DecodeTarget:
@@ -5683,6 +5865,8 @@ class DecodeTarget:
                     # group-end row compresses, so they read every key after the wait.
                     use_pdl=fused_prologue,
                     prefetch=fused_prologue and not stage and num_tokens <= _SPARSE_DECODE_MAX_ROWS,
+                    # A verify step's rows of one request share one key gather.
+                    rows_per_request=step["predicted_tokens_per_seq"],
                 )
             if _topk_expand_supports(scores):
                 # The canonical block top-k and its expansion to tokens in one launch
@@ -6393,7 +6577,9 @@ class DecodeTarget:
             act_type=_ACT_TYPE_SWIGLU,
             gemm1_clamp_limit=None,
         )
-        shared = cublas_mm(flashinfer_silu_and_mul(cublas_mm(x, M.sh_gu)), M.sh_dn)
+        G = core._mtp_gemv8
+        gu = _draft_mm(x, M.sh_gu, G.get("sh_gu"), cublas_mm)
+        shared = _draft_mm(flashinfer_silu_and_mul(gu), M.sh_dn, G.get("sh_dn"), cublas_mm)
         gate_logits = cublas_mm(x, M.sh_gate)
         return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
@@ -6425,13 +6611,16 @@ class DecodeTarget:
         and an fp32 bottleneck (the trunk sites' numerics), so the draft's tokens may differ
         from the composed step's in the last place; the verify step decides acceptance."""
         core = self.core
-        M, F = core._mtp, core._mtp_fused
+        M, F, G = core._mtp, core._mtp_fused, core._mtp_gemv8
         gemm = _decode_projection if md.is_cuda_graph else cublas_mm
-        e = nn.functional.embedding(input_ids, embed_tokens)
-        x_e = gemm(flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps), M.fc_e)
+        e = _draft_embedding(input_ids, embed_tokens)
+        e_n = flashinfer_gemma_rmsnorm(e, M.pre_e_norm, core.eps)
+        x_e = _draft_mm(e_n, M.fc_e, G.get("fc_e"), gemm)
         h_n = self._grouped_norm(hidden_states, M.pre_h_norm)
         x_h = torch.reshape(
-            gemm(torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h),
+            _draft_mm(
+                torch.reshape(h_n, [rows * core.hc_count, core.hidden]), M.fc_h, G.get("fc_h"), gemm
+            ),
             [rows, core.stream],
         )
         x, mixed, inject = self._hc_site(
@@ -6486,7 +6675,7 @@ class DecodeTarget:
         core = self.core
         M, F = core._mtp, core._mtp_fused
         dt, dev = x.dtype, x.device
-        proj = gemm(x, F.attn_in)
+        proj = _draft_mm(x, F.attn_in, core._mtp_gemv8.get("attn_in"), gemm)
         qkv_view, gate, index_view = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
@@ -6606,6 +6795,7 @@ class DecodeTarget:
                     compress_ratio=core.compress_ratio,
                     only_visible_blocks=True,
                     context_rows=False,
+                    rows_per_request=p,
                 )
                 if _topk_expand_supports(scores):
                     selected = qsa_topk_expand_decode(
@@ -6680,7 +6870,7 @@ class DecodeTarget:
             )
         if not gated:
             fused_sigmoid_mul_inplace(out, gate)
-        return gemm(out, M.o)
+        return _draft_mm(out, M.o, core._mtp_gemv8.get("o"), gemm)
 
     def _capture_selection(self, md, topk_indices, visible_blocks, batch, p) -> None:
         """IndexShare: stash, per request, the selection of its last accepted draft-extend
@@ -7548,11 +7738,12 @@ def _fp8_rowwise(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 class _Fp8VerifyHead:
     """The target's `lm_head` under the dense FP8 mode: `_Fp8DraftHead` over the same copies --
-    decode rows up to `fp8_gemv`'s on the packed block-scaled copy, more rows (a large verify
-    step) on the per-row-scaled copy through cuBLASLt with per-token activation scales."""
+    decode rows up to `fp8_gemv`'s on the packed block-scaled copy (on `nvfp4_gemv` over the
+    NVFP4 copy `nv` under `_TARGET_HEAD_NVFP4_ENV`), more rows (a large verify step) on the
+    per-row-scaled copy through cuBLASLt with per-token activation scales."""
 
-    def __init__(self, rowwise: tuple, packed) -> None:
-        self.head = _Fp8DraftHead(*rowwise, packed)
+    def __init__(self, rowwise: tuple, packed, nv=None) -> None:
+        self.head = _Fp8DraftHead(*rowwise, packed, nv)
 
     def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.head(hidden_states)
@@ -7566,7 +7757,7 @@ class _WideningLogitsProcessor(LogitsProcessor):
     own bf16 logits: for a consumer that only takes their row argmax, which is the same
     token over bf16 as over their exact fp32 widening (same order, ties, NaN and +-0)."""
 
-    fp8_head = None  # (rowwise copy, packed copy) under the dense FP8 mode
+    fp8_head = None  # (rowwise copy, packed copy, NVFP4 copy or None) under the dense FP8 mode
     #: Set by the shell's forward each engine step: the step's draft logits feed only the
     #: greedy draft sampler's argmax (see `_spec_argmax_only`).
     draft_argmax_only = False
@@ -8093,17 +8284,35 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Tp1(
             self.model._mtp_head_fp8 = rowwise
         # The draft head's decode rows read an NVFP4 copy instead of the packed FP8 one.
         draft_nv = draft_fp8 and _mtp_head_nvfp4_enabled()
+        # Under the dense FP8 mode, the target's own decode rows too (`_TARGET_HEAD_NVFP4_ENV`).
+        target_nv = _dense_fp8_enabled() and _target_head_nvfp4_enabled()
         # One packed block-scaled copy serves the draft head's decode rows and, under the dense
         # FP8 mode, the target's own head's.
-        if (draft_fp8 and not draft_nv) or _dense_fp8_enabled():
+        if (draft_fp8 and not draft_nv) or (_dense_fp8_enabled() and not target_nv):
             self.model._lm_head_g = pack_from_bf16(self.lm_head.weight.data)
-        if _dense_fp8_enabled():
-            self.logits_processor.fp8_head = (rowwise, self.model._lm_head_g)
         if rowwise is not None and self.lm_head.weight.is_cuda:
             # Every head variant decode rows past the GEMV reach, compiled now.
             mid_rows_precompile(_head_mid(*rowwise), _FP8_GEMV_HEAD_ROWS + 1, _MID_HEAD_ROWS)
         if draft_nv:
             self._build_draft_head_nvfp4(self.lm_head.weight.data)
+        if target_nv:
+            # The full-vocabulary NVFP4 copy: the draft head's when it has one.
+            nv = self.model._mtp_head_nv
+            if nv is None:
+                nv = nvfp4_pack_from_bf16(self.lm_head.weight.data)
+                nvfp4_gemv_precompile(nv)
+            self.model._lm_head_nv = nv
+            print(
+                f"target head NVFP4 ({_TARGET_HEAD_NVFP4_ENV}=1): decode rows <= "
+                f"{_FP8_GEMV_HEAD_ROWS} on nvfp4_gemv over lm_head {tuple(nv.data.shape)}",
+                flush=True,
+            )
+        if _dense_fp8_enabled():
+            self.logits_processor.fp8_head = (
+                rowwise,
+                self.model._lm_head_g,
+                self.model._lm_head_nv,
+            )
 
     def _build_draft_head_nvfp4(self, weight: torch.Tensor) -> None:
         """The draft head's NVFP4 copy of `weight` (`_MTP_HEAD_NVFP4_ENV`), with both of

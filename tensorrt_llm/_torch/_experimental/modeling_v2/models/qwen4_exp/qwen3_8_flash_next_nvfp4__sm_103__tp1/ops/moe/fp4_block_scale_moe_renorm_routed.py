@@ -16,12 +16,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner as _pre_routed,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op as _renorm,
+)
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 from tensorrt_llm._torch.utils import last_positive_power_of_2
 from tensorrt_llm.logger import logger
-
-from .renorm_moe_routing_op import renorm_moe_routing_op as _renorm
 
 #: `RoutingMethodType::Renormalize`: NoOp preprocess, top-k, softmax over the k.
 ROUTING_RENORMALIZE = 1
@@ -139,7 +140,7 @@ def run_renorm_moe(
         hidden_states.shape[0], num_experts, top_k, hidden_states.shape[1] * 2, intermediate_size
     )
     if tactic is None:
-        return torch.ops.trtllm.fp4_block_scale_moe_runner(
+        return _pre_routed(
             routing_logits,
             None,
             hidden_states,

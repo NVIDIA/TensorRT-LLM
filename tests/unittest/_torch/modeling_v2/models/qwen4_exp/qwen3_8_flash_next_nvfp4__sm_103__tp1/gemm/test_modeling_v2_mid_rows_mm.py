@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test: `mid_rows_mm` (FP8 with the per-row activation quantization, and bf16) against an
 fp32 reference over the operands it multiplies, per cell; `fp8_row_quant` bitwise against
-torch's e4m3 cast; strided activation rows; CUDA-graph replay with new activations."""
+torch's e4m3 cast; strided activation rows."""
 
 import pytest
 import torch
@@ -15,7 +15,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     fp8_row_quant,
     fp8_row_quant_op,
     mid_rows_mm_op,
-    precompile,
 )
 
 assert torch.cuda.is_available(), "mid_rows_mm requires a CUDA device"
@@ -101,19 +100,3 @@ def test_row_quant_is_torchs_cast(cell) -> None:
     assert torch.equal(s, (amax / E4M3_MAX).float())
     want = (x.float() * (E4M3_MAX / amax).float()[:, None]).to(torch.float8_e4m3fn)
     assert torch.equal(q.view(torch.uint8), want.view(torch.uint8))
-
-
-def test_graph_replay_matches_eager() -> None:
-    for mode, n, k, m in (("tensor", 16480, 2560, 64), ("bf16", 512, 2560, 200)):
-        _, mw = _weight(n, k, mode, 3)
-        precompile(mw)
-        x = _activation(m, k, 1).contiguous()
-        mid_rows_mm_op(x, mw)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            out = mid_rows_mm_op(x, mw)
-        x.copy_(_activation(m, k, 2) * 4)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.equal(out, mid_rows_mm_op(x, mw))

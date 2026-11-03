@@ -14,9 +14,12 @@
 # limitations under the License.
 """Whole-model gates for the qwen4_exp modeling_v2 target.
 
-Every test passes ``modeling_v2="require"``: under ``"auto"`` a configuration
-that missed the target's routing would fall back to the built-in model, pass,
-and report the built-in's numbers as the target's.
+Each test runs one engine (two for the breakable-graph comparison) and checks every feature
+that engine carries, so a feature is covered without a test of its own. Every test passes
+``modeling_v2="require"``: under ``"auto"`` a configuration that missed the target's routing
+would fall back to the built-in model, pass, and report the built-in's numbers as the
+target's. The class also serves its checkpoint disaggregated, the target on both sides of
+the hop.
 """
 
 import random
@@ -50,6 +53,7 @@ from tensorrt_llm.llmapi import (
     QSASparseAttentionConfig,
     SamplingParams,
 )
+from tensorrt_llm.quantization import QuantAlgo
 
 from ...conftest import llm_models_root
 from ..accuracy_core import (
@@ -59,6 +63,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ..test_disaggregated_serving import launch_disaggregated_llm, run_accuracy_test
 from ._env import scoped_env_overrides
 
 # The target is certified on sm_103 only.
@@ -69,6 +74,32 @@ skip_not_sm103 = pytest.mark.skipif(
 # Check the target's step contract on the first forward, against metadata the
 # engine prepared; the flag has to reach the worker rank.
 _VALIDATE = {MODELING_V2_VALIDATE_ENV: "1"}
+
+# Every worker of a disaggregated test: the step-contract check, and what a worker spawning
+# its second rank over MPI needs in a container running as root (docker/Dockerfile.multi).
+_DISAGG_WORKER_ENV = {
+    **_VALIDATE,
+    "PRTE_ALLOW_RUN_AS_ROOT": "1",
+    "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+}
+
+
+def _disagg_server_config(ctx_router=None, gen_router=None) -> dict:
+    """One context and one generation server on this host, with optional router types."""
+
+    def servers(port, router):
+        config = {"num_instances": 1, "urls": [f"localhost:{port}"]}
+        if router is not None:
+            config["router"] = {"type": router}
+        return config
+
+    return {
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "context_servers": servers(8001, ctx_router),
+        "generation_servers": servers(8002, gen_router),
+    }
 
 
 def _target_core(llm: LLM):
@@ -306,6 +337,21 @@ def _synthetic_image(color: tuple, size: int = 256) -> Image.Image:
     return image
 
 
+def _mmmu(llm, model_name: str) -> None:
+    """MMMU on ``llm`` against the reference row the engine resolves."""
+    # MMMU adds <|endoftext|> to the stop token, as the built-in model's MMMU test does.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+    MMMU(model_name).evaluate(
+        llm,
+        sampling_params=sampling_params,
+        extra_evaluator_kwargs=dict(chat_template_kwargs=dict(enable_thinking=False)),
+    )
+
+
 def _media_request(tokenizer, processor, text: str, items: list[tuple[str, object]]) -> dict:
     """One request carrying ``items``, ``(modality, data)`` pairs in prompt order.
 
@@ -462,21 +508,6 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
         print(f"[AL] {label} acceptance_length = {acceptance_length:.3f}")
         assert_acceptance_length(key, acceptance_length)
 
-    def _mmmu(self, llm):
-        """MMMU on ``llm`` against the reference row the engine resolves."""
-        # MMMU adds <|endoftext|> to the stop token, as the built-in model's
-        # MMMU test does.
-        sampling_params = SamplingParams(
-            max_tokens=MMMU.MAX_OUTPUT_LEN,
-            truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
-            stop="<|endoftext|>",
-        )
-        MMMU(self.MODEL_NAME).evaluate(
-            llm,
-            sampling_params=sampling_params,
-            extra_evaluator_kwargs=dict(chat_template_kwargs=dict(enable_thinking=False)),
-        )
-
     def _video_checks(self, llm):
         """Synthetic videos through ``llm``.
 
@@ -566,7 +597,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             ) as llm,
         ):
             self._gsm8k_and_acceptance(mocker, llm, self.ACCEPTANCE_KEY, "mtp1")
-            self._mmmu(llm)
+            _mmmu(llm, self.MODEL_NAME)
             self._video_checks(llm)
 
     @skip_not_sm103
@@ -611,12 +642,12 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             )
 
     def _long_context_passkey(
-        self, monkeypatch, speculative_config, engine, index_share, lengths, key, label
+        self, monkeypatch, speculative_config, engine, index_share, lengths, key, label, mocker=None
     ):
         """`_passkeys` with the executor in this process, checking the op calls too.
 
-        The draft layer's IndexShare reuse op must run exactly when IndexShare is on, and no
-        prefill graph may replay.
+        With ``mocker``, gsm8k runs first on the same engine. The draft layer's IndexShare
+        reuse op must run exactly when IndexShare is on, and no prefill graph may replay.
         """
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
         reuse_calls = []
@@ -645,6 +676,11 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             ) as llm,
         ):
             assert _target_core(llm).mtp_index_share == index_share
+            if mocker is not None:
+                mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+                GSM8K(self.MODEL_NAME).evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS
+                )
             self._passkeys(llm, lengths, speculative_config.max_draft_len, key, label)
         assert not replays, replays
         if index_share:
@@ -653,16 +689,17 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             assert not reuse_calls, "IndexShare is off and the reuse op ran"
 
     @skip_not_sm103
-    def test_mtp3_long_context_passkey(self, monkeypatch):
-        """Pass key retrieval over 3k-6k-token prompts with three drafts and IndexShare.
+    def test_mtp3_gsm8k_and_long_context(self, mocker, monkeypatch):
+        """gsm8k, then 3k-6k-token pass keys, with three drafts and IndexShare on one engine.
 
-        The KV cache is bf16; the prompts are long enough to run the sparse attention path. The
-        gsm8k prompts never leave the dense path (they are under the indexer's 2048-token
-        budget), so the pass-key cases are the ones that run the target's QSA selection and the
-        draft layer's end to end; a pass key stated back correctly needs the right blocks
-        selected at every depth. IndexShare makes the draft loop reuse the selection of its
-        first step: the acceptance length must not fall below the floor taken from the same
-        prompts with the draft layer selecting on every step, and the reuse op must have run.
+        The KV cache is bf16, the recurrent state fp32, with block reuse and chunked prefill.
+        gsm8k reads the MTP row of references/gsm8k.yaml; its prompts stay on the dense
+        attention path (they are under the indexer's 2048-token budget). The pass keys are
+        past it, so they run the target's QSA selection and the draft layer's end to end; a
+        pass key stated back correctly needs the right blocks selected at every depth.
+        IndexShare makes the draft loop reuse the selection of its first step: the pass keys'
+        acceptance length must not fall below the floor taken from the same prompts with the
+        draft layer selecting on every step, and the reuse op must have run.
         """
         self._long_context_passkey(
             monkeypatch,
@@ -672,6 +709,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             _PASSKEY_LENGTHS,
             self.ACCEPTANCE_KEY_LONG_CONTEXT,
             "mtp3 long context",
+            mocker=mocker,
         )
 
     @skip_not_sm103
@@ -796,3 +834,107 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1(LlmapiAccuracyTestHarness):
             self.ACCEPTANCE_KEY_MTP7_LONG_CONTEXT,
             "mtp7 nvfp4 kv bf16 state long context",
         )
+
+    # The target's AgentX deployment environment on both engines: PDL, eight K/V transfer
+    # threads and every opt-in projection of the target.
+    AGENTX_ENV = {
+        "TRTLLM_ENABLE_PDL": "1",
+        "TRTLLM_KV_TRANSFER_NUM_THREADS": "8",
+        "TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD": "1",
+        "TRTLLM_MODELING_V2_DENSE_FP8": "1",
+        "TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_MOE_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_HEAD_NVFP4": "1",
+        "TRTLLM_MODELING_V2_TARGET_HEAD_NVFP4": "1",
+        "TRTLLM_MODELING_V2_MTP_DENSE_FP8": "1",
+    }
+
+    @skip_not_sm103
+    @pytest.mark.timeout(5400)
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(145000)
+    @pytest.mark.skip_less_host_memory(204800)
+    def test_disaggregated_mtp2(self, mocker):
+        """One context and one generation GPU, the engines of the target's AgentX deployment.
+
+        NVFP4 K/V, a bf16 recurrent state, MTP with two drafts, per-conversation block reuse
+        on the context engine and rejection sampling on the generation engine, over the
+        Python NIXL transceiver. Acceptance is real.
+        """
+        common_config = {
+            "modeling_v2": "require",
+            "max_seq_len": 262144,
+            "max_num_tokens": 8192,
+            "enable_chunked_prefill": True,
+            "disable_mm_encoder": True,
+            "moe_config": {"backend": "TRTLLM"},
+            "scheduler_config": {"capacity_scheduler_policy": "GUARANTEED_NO_EVICT"},
+            "cache_transceiver_config": {"backend": "NIXL", "transceiver_runtime": "PYTHON"},
+        }
+        kv_cache_config = {
+            "dtype": "nvfp4",
+            "free_gpu_memory_fraction": 0.85,
+            "mamba_ssm_cache_dtype": "bfloat16",
+            "use_kv_cache_manager_v2": True,
+            "tokens_per_block": 32,
+        }
+        # The context engine's breakable prefill graphs, up to max_num_tokens.
+        prefill_capture_num_tokens = (
+            [2**i for i in range(10)] + list(range(768, 3328, 256)) + [4096, 6144, 8192]
+        )
+        ctx_server_config = {
+            **common_config,
+            "max_batch_size": 32,
+            "kv_cache_config": {
+                **kv_cache_config,
+                "enable_block_reuse": True,
+                "block_reuse_config": {"policy": "per_conversation", "max_num_turns": 3},
+                # One recurrent-state snapshot two tokens before each prompt's end.
+                "mamba_state_config": {
+                    "periodic_snapshot_interval": 0,
+                    "additional_snapshot_offsets_from_end": [2],
+                },
+            },
+            "cuda_graph_config": {"enable_padding": True, "max_batch_size": 32},
+            "prefill_cuda_graph_backend": "breakable",
+            "prefill_capture_num_tokens": prefill_capture_num_tokens,
+            "speculative_config": {"decoding_type": "MTP", "max_draft_len": 2},
+        }
+        gen_server_config = {
+            **common_config,
+            "max_batch_size": 128,
+            "kv_cache_config": {**kv_cache_config, "enable_block_reuse": False},
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "batch_sizes": list(range(1, 17)) + list(range(24, 129, 8)),
+            },
+            "speculative_config": {
+                "decoding_type": "MTP",
+                "max_draft_len": 2,
+                "use_rejection_sampling": True,
+            },
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        with launch_disaggregated_llm(
+            _disagg_server_config(ctx_router="conversation", gen_router="load_balancing"),
+            ctx_server_config,
+            gen_server_config,
+            self.MODEL_PATH,
+            max_workers=128,
+            extra_env={**_DISAGG_WORKER_ENV, **self.AGENTX_ENV},
+            # What the target prints once it has packed the target head for decode rows.
+            assert_worker_log_contains="target head NVFP4",
+        ) as llm:
+            # The served quantization and draft the reference is keyed by; the launcher
+            # reads NVFP4 off the checkpoint's name.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+            llm.args.speculative_config = MTPDecodingConfig(max_draft_len=2)
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME,
+                ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.EXTRA_EVALUATOR_KWARGS},
+                timeout=3000,
+            )

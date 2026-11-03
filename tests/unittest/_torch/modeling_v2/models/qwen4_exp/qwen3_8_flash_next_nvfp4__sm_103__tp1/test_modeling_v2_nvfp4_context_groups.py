@@ -5,11 +5,12 @@
 The context rows read a bf16 scratch of their requests' pages (`_nvfp4_context_plan`), filled
 and attended one group of consecutive requests at a time, so it holds the largest group's
 pages rather than the step's. Under a budget of a few pages, with one request longer than
-the budget, the rows equal, bitwise, one group over the whole step -- for a prefill step's
-rows and for a mixed step's one kept row a request. The prefill requests' rows come in
-multiples of the row-tile pass's 10-row groups, so a launch per group splits none of them and
-every row takes the same pass as in the one launch (a split group's rows go to the per-row
-pass, which rounds differently).
+the budget, the rows match one group over the whole step. A prefill step's rows match
+bitwise: its requests' rows come in multiples of the row-tile pass's 10-row groups, so a
+launch per group splits none of them and every row takes the same pass as in the one launch.
+A mixed step's one kept row a request matches within two passes' band: in the one launch the
+rows of several requests share a 10-row group and take the per-row (lone) pass, while a group
+holding one request's row alone takes the row-tile pass, which rounds differently.
 """
 
 import math
@@ -21,6 +22,9 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
+
+__extra_import_path__ = ["../../.."]
+from _validating import assert_within_ulp  # noqa: E402
 
 assert torch.cuda.is_available(), "the NVFP4 context pass requires a CUDA device"
 
@@ -133,4 +137,9 @@ def test_grouped_context_pass_equals_one_group(one_row_per_request, monkeypatch)
         (ends[3], ends[4]),
     ]
     assert k_scratch.shape[0] == 47
-    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    if one_row_per_request:
+        # Each pass is within 4 ulp a row and 2 ulp RMS of the fp32 reference
+        # (test_modeling_v2_qsa_sparse_gqa_rowtile), so the two differ by at most twice that.
+        assert_within_ulp(got, want, element_ulp=8.0, rms_ulp=4.0)
+    else:
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16))

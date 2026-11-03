@@ -11,16 +11,17 @@ draft binding.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
-    modeling as m,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_canonical_selection import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_canonical_selection import (  # noqa: E501
     qsa_canonical_selection as canonical,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_mtp_reuse_topk import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_mtp_reuse_topk import (  # noqa: E501
     qsa_mtp_reuse_topk as reuse,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
+    modeling as m,
 )
 
 assert torch.cuda.is_available(), "the IndexShare plumbing runs on a CUDA device"
@@ -82,6 +83,34 @@ def test_select_is_the_canonical_row_ascending_with_padding_last():
         ids = [i for i in row if i >= 0]
         assert ids == sorted(ids) and len(set(ids)) == len(ids) == min(end, K)
         assert row == ids + [-1] * (K - len(ids)), "padding must stay last"
+
+
+@pytest.mark.parametrize("width", [2080, 65600])
+@pytest.mark.parametrize("fused", [False, True])
+def test_mtp_selection_matches_canonical_composition(width, fused, monkeypatch):
+    """Draft selection preserves tie order and expansion in fused and fallback paths."""
+    positions = torch.tensor([2043, 2047, 84000, 99999], dtype=torch.int64, device=DEV)
+    visible = ((positions + 1) // 4).to(torch.int32)
+    visible.clamp_(max=width)
+    positions = torch.minimum(positions, (visible.to(torch.int64) * 4 + 2))
+    lengths = (positions + 3).to(torch.int32)
+    starts = torch.zeros_like(visible)
+    generator = torch.Generator(device=DEV).manual_seed(85)
+    scores = torch.relu(torch.randn((4, width), generator=generator, device=DEV) - 1.8)
+    cols = torch.arange(width, device=DEV)
+    scores.masked_fill_(cols[None, :] >= visible[:, None], float("nan"))
+    expected = torch.empty((4, K), dtype=torch.int32, device=DEV)
+    core = SimpleNamespace(block_topk=K, compress_ratio=4, token_topk=2048)
+    m._select(core, scores, starts, visible, expected)
+    expected_tokens = m.qsa_expand_block_indices(
+        expected, positions, lengths, compress_ratio=4, token_topk=2048
+    )
+    if not fused:
+        monkeypatch.setattr(m, "_topk_expand_supports", lambda scores: False)
+    result = torch.full_like(expected, -7)
+    selected = m._select_and_expand(core, scores, starts, visible, positions, lengths, result)
+    assert torch.equal(result, expected)
+    assert torch.equal(selected, expected_tokens)
 
 
 def test_decode_capture_at_draft_seven_takes_row_s_times_8_plus_a_minus_1():

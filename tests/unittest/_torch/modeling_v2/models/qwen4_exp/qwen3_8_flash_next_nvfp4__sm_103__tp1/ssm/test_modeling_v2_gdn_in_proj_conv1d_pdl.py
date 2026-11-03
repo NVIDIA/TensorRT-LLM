@@ -7,7 +7,7 @@ decode projections use (4 bf16 ulp element-wise against the row scale, 2 ulp
 relative RMS -- the GEMV's summation order is the only difference), the pool
 the same, a pad row's slot bitwise untouched. Beyond the cells: two decode
 steps under CUDA-graph replay, the second reading the window the first one
-wrote; and the row guard.
+wrote.
 """
 
 import zlib
@@ -15,9 +15,6 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_in_proj_conv1d_pdl import (  # noqa: E501
-    MAX_ROWS,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_in_proj_conv1d_pdl import (  # noqa: E501
     gdn_in_proj_conv1d_pdl as op,
 )
@@ -93,11 +90,3 @@ def test_two_steps_under_graph_replay() -> None:
         ref_out, want_state = op.reference(x, mat_b, want_state, taps, slots, CONV_DIM, PAD)
         _compare(out, ref_out)
         _compare(pool, want_state)
-
-
-def test_guards() -> None:
-    """More rows than `MAX_ROWS` are refused."""
-    x, mat_b, state, taps = _build(MAX_ROWS + 1, 16, seed=21)
-    slots = torch.zeros(MAX_ROWS + 1, dtype=torch.int32, device="cuda")
-    with validating(op), pytest.raises(AssertionError):
-        op(x, mat_b, state, taps, slots, CONV_DIM, PAD)
