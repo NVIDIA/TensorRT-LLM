@@ -17,9 +17,10 @@ top-k set; here, through `_indexer_decode` with the scorer replaced by prepared 
   `gvr_deterministic_topk` the set is exactly the lower-column tie break;
 - a captured launch replays with new logits and longer KV to the eager answer.
 
-The decision (`_dec_topk_gvr_choice`) is pinned for the config on / off, the env override and
-each missing prerequisite, from the engine's real `DeepSeekSparseAttentionConfig`; the dispatch
-with recorders, including a capture whose launcher is missing (that graph keeps ours).
+The decision (`_dec_topk_gvr_choice`: ours by default, GVR with TRTLLM_GLM52_DEC_TOPK_GVR=1) is
+pinned for the config on / off, the env opt-in and each missing prerequisite, from the engine's
+real `DeepSeekSparseAttentionConfig`; the dispatch with recorders, including a capture whose
+launcher is missing (that graph keeps ours).
 """
 
 from types import SimpleNamespace
@@ -262,22 +263,22 @@ _ON = dict(enable_heuristic_topk=True, use_cute_dsl_topk=True, use_cute_dsl_page
 @pytest.mark.parametrize(
     "cfg, topk, sm, dsl, env, want",
     [
-        # The GVR sparse config: GVR, not deterministic.
-        (_ON, TOP_K, 103, True, None, False),
-        (dict(_ON, gvr_deterministic_topk=True), TOP_K, 103, True, None, True),
-        (dict(_ON, use_cute_dsl_topk=False), TOP_K, 100, True, None, False),
-        (_ON, TOP_K, 103, True, "1", False),
-        # The env override keeps ours.
+        # The GVR sparse config: ours (the cluster split on long engines) unless the env asks for GVR.
+        (_ON, TOP_K, 103, True, None, None),
         (_ON, TOP_K, 103, True, "0", None),
-        # Config off: ours.
-        ({}, TOP_K, 103, True, None, None),
-        (dict(use_cute_dsl_topk=True), TOP_K, 103, True, None, None),
+        # TRTLLM_GLM52_DEC_TOPK_GVR=1: GVR, not deterministic / deterministic.
+        (_ON, TOP_K, 103, True, "1", False),
+        (dict(_ON, gvr_deterministic_topk=True), TOP_K, 103, True, "1", True),
+        (dict(_ON, use_cute_dsl_topk=False), TOP_K, 100, True, "1", False),
+        # Config off: ours, whatever the env.
+        ({}, TOP_K, 103, True, "1", None),
+        (dict(use_cute_dsl_topk=True), TOP_K, 103, True, "1", None),
         # A missing prerequisite: the temporal engine, no CuTe DSL, another arch, another k.
-        (dict(_ON, use_self_sampling_topk=False), TOP_K, 103, True, None, None),
-        (_ON, TOP_K, 103, False, None, None),
-        (_ON, TOP_K, 90, True, None, None),
-        (_ON, TOP_K, 120, True, None, None),
-        (_ON, 1024, 103, True, None, None),
+        (dict(_ON, use_self_sampling_topk=False), TOP_K, 103, True, "1", None),
+        (_ON, TOP_K, 103, False, "1", None),
+        (_ON, TOP_K, 90, True, "1", None),
+        (_ON, TOP_K, 120, True, "1", None),
+        (_ON, 1024, 103, True, "1", None),
     ],
 )
 def test_gvr_choice(cfg, topk, sm, dsl, env, want) -> None:

@@ -1450,12 +1450,13 @@ def warmup_indexer_topk_decode(
     device_id: int | None = None,
     pdl: bool = False,
     cluster: bool = True,
+    cluster_pdl: bool | None = None,
 ) -> CompiledIndexerTopKDecode:
     """Compile and launch once before TRT-LLM CUDA graph capture starts.
 
     With ``cluster`` and ``max_num_columns > CLUSTER_MIN_COLUMNS`` the handle also
     carries the cluster-split launchers (``_CLUSTER_BY_ROWS``), each compiled and
-    launched here.
+    launched here. ``cluster_pdl`` overrides ``pdl`` for the cluster launchers only.
     """
 
     if not torch.cuda.is_available():
@@ -1478,7 +1479,9 @@ def warmup_indexer_topk_decode(
                     (
                         max_rows,
                         size,
-                        compile_indexer_topk_decode_cluster(device_id, next_n, size, pdl=pdl),
+                        compile_indexer_topk_decode_cluster(
+                            device_id, next_n, size, pdl=pdl if cluster_pdl is None else cluster_pdl
+                        ),
                     )
                     for max_rows, size in _CLUSTER_BY_ROWS
                 ),

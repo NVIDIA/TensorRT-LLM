@@ -370,13 +370,16 @@ def _dec_topk_gvr_choice(
     """The decode top-k engine of the generation rows: `gvr_deterministic_topk` where they take
     the stock engine's self-sampling GVR top-k, None where they keep ours.
 
-    GVR where the stock DSA indexer would run it on this checkpoint's layers: the engine's
+    Ours by default, under the engine's GVR config too: on long engines our decode top-k splits
+    each long row across a CTA cluster, which matches GVR at 64k-160k KV and keeps our one-CTA
+    speed at short KV, where GVR's tuning frozen from the engine width is 2-3x slower.
+    `TRTLLM_GLM52_DEC_TOPK_GVR=1` (`env`) restores the stock engine's self-sampling GVR top-k
+    where the stock DSA indexer would run it on this checkpoint's layers: the engine's
     `enable_heuristic_topk` with the self-sampling engine (`use_self_sampling_gvr`: its
     `use_self_sampling_topk`, CuTe DSL, sm_100 / sm_103, `index_topk` 2048 here, compress ratio
     1). The temporal-hint engine (`use_self_sampling_topk=False`) needs the previous step's
-    selection as caller-owned state, which this target does not keep: ours there.
-    `TRTLLM_GLM52_DEC_TOPK_GVR=0` keeps ours for A/B (`env`)."""
-    if env == "0" or params is None or not getattr(params, "enable_heuristic_topk", False):
+    selection as caller-owned state, which this target does not keep: ours there."""
+    if env != "1" or params is None or not getattr(params, "enable_heuristic_topk", False):
         return None
     if index_topk != 2048 or not use_self_sampling_gvr(
         enable_heuristic_topk=True,
@@ -713,12 +716,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # selection (`_mtp_share_*`). Only a loop of more than one draft step reads the stash.
         self.mtp_index_share = self.mtp_enabled and _engine_mtp_index_share(model_config)
         self._mtp_share_stash = self.mtp_index_share and self.max_draft_len > 1
-        # The engine's sparse config asking for the GVR decode top-k (`enable_heuristic_topk`,
-        # `_dec_topk_gvr_choice`): the generation rows' top-k then runs the stock engine's
-        # self-sampling GVR engine through its `TopK` module, as the stock DSA indexer does,
-        # instead of our one-CTA-per-row kernel; None keeps ours. TRTLLM_GLM52_DEC_TOPK_GVR=0
-        # keeps ours under that config (A/B). `_derive_first_step` keeps ours on engines no wider
-        # than `_DEC_TOPK_GVR_ABOVE` (`_dec_topk_gvr_serves`) and warms GVR's launchers.
+        # With TRTLLM_GLM52_DEC_TOPK_GVR=1 and the engine's sparse config asking for the GVR
+        # decode top-k (`enable_heuristic_topk`, `_dec_topk_gvr_choice`), the generation rows'
+        # top-k runs the stock engine's self-sampling GVR engine through its `TopK` module, as
+        # the stock DSA indexer does; otherwise (None) ours, the cluster split on long engines.
+        # `_derive_first_step` keeps ours on engines no wider than `_DEC_TOPK_GVR_ABOVE`
+        # (`_dec_topk_gvr_serves`) and warms GVR's launchers.
         gvr_det = _dec_topk_gvr_choice(
             _engine_sparse_params(model_config, 0),
             self.idx_topk,

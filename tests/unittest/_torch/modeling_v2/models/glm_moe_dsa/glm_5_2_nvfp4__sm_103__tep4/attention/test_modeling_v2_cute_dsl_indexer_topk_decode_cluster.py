@@ -154,3 +154,22 @@ def test_handle_policy() -> None:
     assert uses_cluster(wide, 24) and not uses_cluster(wide, 48)
     narrow = build(dev, max_columns=kernel.CLUSTER_MIN_COLUMNS, top_k=TOP_K, next_n=6)
     assert not uses_cluster(narrow, 6)
+
+
+@pytest.mark.parametrize("size", (8, 16))
+def test_pdl_launch_selects_the_exact_set(size) -> None:
+    """The PDL launch (TRTLLM_GLM52_DEC_TOPK_CLUSTER_PDL=1) behind a producer of the logits."""
+    next_n, lens = 6, [163840, 2600]
+    ends = _ends(lens, next_n)
+    want = _logits("outliers", ends, seed=size)
+    logits = torch.zeros_like(want)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    end_t = torch.tensor(ends, device="cuda")
+    ref = select_rows(want, torch.zeros_like(end_t), end_t, TOP_K)
+    raw = kernel.compile_indexer_topk_decode_cluster(
+        torch.cuda.current_device(), next_n, size, pdl=True
+    )
+    out = torch.full((len(ends), TOP_K), -7, dtype=torch.int32, device="cuda")
+    logits.copy_(want)
+    raw(logits, seq_lens, out, _stream())
+    _compare(out, ref, f"cluster {size} with PDL")

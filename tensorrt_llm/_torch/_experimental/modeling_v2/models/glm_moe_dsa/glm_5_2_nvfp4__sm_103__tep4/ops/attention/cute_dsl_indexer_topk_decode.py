@@ -29,7 +29,8 @@ def build(
 
     Above `CLUSTER_MIN_COLUMNS` columns the handle also carries the cluster-split
     launchers (a long row split across a cluster of CTAs), compiled and launched
-    here too; `TRTLLM_GLM52_DEC_TOPK_CLUSTER=0` keeps the one-CTA kernel only.
+    here too; `TRTLLM_GLM52_DEC_TOPK_CLUSTER=0` keeps the one-CTA kernel only, and
+    `TRTLLM_GLM52_DEC_TOPK_CLUSTER_PDL=1` launches them with Programmatic Dependent Launch.
     """
     return _kernel.warmup_indexer_topk_decode(
         max_num_columns=int(max_columns),
@@ -37,6 +38,7 @@ def build(
         next_n=int(next_n),
         device_id=int(device_id),
         cluster=os.environ.get("TRTLLM_GLM52_DEC_TOPK_CLUSTER", "1") != "0",
+        cluster_pdl=os.environ.get("TRTLLM_GLM52_DEC_TOPK_CLUSTER_PDL", "0") == "1",
     )
 
 
