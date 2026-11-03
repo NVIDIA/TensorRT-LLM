@@ -2888,11 +2888,17 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
         two_calls = ("<｜tool▁calls▁begin｜>" + weather + between + search +
                      "<｜tool▁calls▁end｜>")
         text_around_calls = "Let me check both.\n" + two_calls + "\nDone."
+        two_sections = ("<｜tool▁calls▁begin｜>" + weather +
+                        "<｜tool▁calls▁end｜><｜tool▁calls▁begin｜>" + search +
+                        "<｜tool▁calls▁end｜>")
+        text_around_two_sections = ("Let me check both.\n" + two_sections +
+                                    "\nDone.")
         return {
             "one_call": "<｜tool▁calls▁begin｜>" + weather + "<｜tool▁calls▁end｜>",
             "two_calls": two_calls,
             "text_around_calls": text_around_calls,
             "stream_ends_inside_a_marker": text_around_calls + "<｜tool▁call",
+            "text_around_two_sections": text_around_two_sections,
         }
 
     @staticmethod
@@ -2906,11 +2912,14 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
         between = _DEEPSEEK_V3_FORMATS[parser_name][2]
         text_around_calls = ("Let me check both.",
                              "Let me check both.\n" + between + "\nDone.")
+        text_around_two_sections = ("Let me check both.",
+                                    "Let me check both.\n\nDone.")
         return {
             "one_call": ("", ""),
             "two_calls": ("", between),
             "text_around_calls": text_around_calls,
             "stream_ends_inside_a_marker": text_around_calls,
+            "text_around_two_sections": text_around_two_sections,
         }
 
     @staticmethod
@@ -2967,7 +2976,7 @@ class TestDeepSeekV3StreamingMatchesWholeTextParse:
 
     @pytest.mark.parametrize("output", [
         "one_call", "two_calls", "text_around_calls",
-        "stream_ends_inside_a_marker"
+        "stream_ends_inside_a_marker", "text_around_two_sections"
     ])
     @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
     def test_streamed_calls_match_whole_text_parse(self, sample_tools,

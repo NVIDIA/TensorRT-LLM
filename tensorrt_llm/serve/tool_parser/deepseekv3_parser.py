@@ -139,13 +139,16 @@ class DeepSeekV3Parser(BaseToolParser):
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text), False
 
-        # Text before the earliest start token is content, so stream it and keep the
-        # buffer from that token onwards.
+        # Text before the earliest start token is content, so stream it without
+        # the end markers of earlier sections and keep the buffer from that
+        # token onwards.
         prefix_len = min(start_indices, default=0)
         normal_text = current_text[:prefix_len]
         if normal_text:
             current_text = current_text[prefix_len:]
             self._buffer = current_text
+        for e_token in end_tokens:
+            normal_text = normal_text.replace(e_token, "")
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
