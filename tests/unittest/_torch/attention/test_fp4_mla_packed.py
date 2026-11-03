@@ -74,12 +74,13 @@ def _plan_mod():
         ([128, 128, 128, 128], 24, 17, 32, [0, 4, 8, 12, 16]),
         # One long request among short ones: 16-tile tasks; the one task past the wave is a short tail.
         ([1, 79, 3, 176], 24, 17, 16, [0, 1, 6, 7, 18]),
-        # Full machine, longest 1.5x above the wave share: 100-tile tasks, the tails in a second wave.
-        ([128] * 15 + [200], 48, 17, 100, list(range(0, 34, 2))),
+        # Full machine, longest 1.5x above the wave share: the balanced per-slot load (136 tiles)
+        # splits only the long request, so its two tasks and the 15 others fill one wave.
+        ([128] * 15 + [200], 48, 17, 136, list(range(16)) + [17]),
         # Full machine, longest within 1.5x of the wave share: no split at all.
         ([128] * 15 + [130], 48, 17, 130, list(range(17))),
-        # Strong skew in a full machine: eleven 94-tile tasks for the long request, short tails behind.
-        ([128] * 15 + [1024], 48, 17, 94, list(range(0, 32, 2)) + [41]),
+        # Strong skew in a full machine: eleven 96-tile tasks for the long request, short tails behind.
+        ([128] * 15 + [1024], 48, 17, 96, list(range(0, 32, 2)) + [41]),
         # Strong skew in a small batch: 94-tile tasks, 11 for the long request, fill one wave.
         ([128, 128, 128, 1024], 24, 17, 94, [0, 2, 4, 6, 17]),
         # A single request fills one wave with 16 tasks; a short one is not worth splitting.
@@ -124,9 +125,10 @@ def test_plan_packed_tasks_simulates_the_waves() -> None:
     plan = reduce_mod.plan_packed_tasks
     # Skewed request lengths exercise the task-rounding overhead across waves.
     tiles = [1848, 1250, 977, 743, 586, 430, 313, 196, 106]
-    assert plan(tiles, 9 * 9, 35) == (206, [0, 9, 16, 21, 25, 28, 31, 33, 34, 35])
-    # Nine equal requests: 36 one-wave tasks spill one task; three 239-tile pieces each fit one wave.
-    assert plan([715] * 9, 9 * 9, 35) == (239, list(range(0, 28, 3)))
+    assert plan(tiles, 9 * 9, 35) == (195, [0, 10, 17, 23, 27, 31, 34, 36, 38, 39])
+    # Nine equal requests: three 239-tile pieces fit one wave, but four 206-tile pieces finish
+    # first: eight of the nine 97-tile tails share the first wave, the ninth follows one of them.
+    assert plan([715] * 9, 9 * 9, 35) == (206, list(range(0, 37, 4)))
     simulate = reduce_mod.plan_simulated_makespan
     cost = reduce_mod.PLAN_TASK_COST_TILES + reduce_mod.PLAN_SPLIT_COST_TILES
     # 36 equal 179-tile tasks on 35 slots: the last one waits for a whole task.
@@ -137,6 +139,45 @@ def test_plan_packed_tasks_simulates_the_waves() -> None:
     assert simulate([181] * 18, 179, 35) == 179 + cost
     # Requests that keep one task pay no split cost.
     assert simulate([100, 300], 300, 35) == 300 + reduce_mod.PLAN_TASK_COST_TILES
+
+
+def test_plan_load_candidates_follow_the_balanced_slot_load() -> None:
+    reduce_mod = _plan_mod()
+    # 2120 tiles + 12 per slot and per request over 17 slots: 136 tiles per slot, then its
+    # 1/2..1/4 and 4% longer variants; the even-batch closed form of the 200-tile request.
+    tiles = [128] * 15 + [200]
+    assert reduce_mod.plan_load_candidates(tiles, 17) == [136, 141, 68, 70, 45, 47, 34, 35, 199]
+    # Clamped to the minimum task length, the longest request and the runtime profile.
+    assert reduce_mod.plan_load_candidates([3, 5], 106) == [2] * reduce_mod.PLAN_LOAD_CANDIDATES
+    assert max(reduce_mod.plan_load_candidates([684] * 16, 21, max_tiles_per_task=300)) == 300
+    candidates = reduce_mod.plan_candidate_lengths(tiles, 100, 17)
+    assert len(candidates) == reduce_mod.PLAN_CANDIDATES
+    assert candidates[0] == 100 and candidates[1:3] == [200, 100]
+
+
+def test_plan_packed_tasks_takes_the_shortest_simulated_candidate() -> None:
+    import random
+
+    rng = random.Random(4321)
+    reduce_mod = _plan_mod()
+    simulate = reduce_mod.plan_simulated_makespan
+    for _ in range(500):
+        requests = rng.randint(1, 40)
+        tiles = [rng.choice([1, 3, 25, 64, 128, 300, 704, 1024, 4096]) for _ in range(requests)]
+        capacity = requests * rng.choice([2, 4, 8, 16])
+        wave_tasks = rng.choice([17, 21, 35, 53])
+        tiles_per_task, begins = reduce_mod.plan_packed_tasks(tiles, capacity, wave_tasks)
+        rule, _ = reduce_mod.plan_packed_tasks(tiles, capacity, wave_tasks, wave_plan=False)
+        feasible = [
+            candidate
+            for candidate in reduce_mod.plan_candidate_lengths(tiles, rule, wave_tasks)
+            if sum(math.ceil(t / candidate) for t in tiles)
+            <= min(capacity, reduce_mod.PLAN_SIM_MAX_TASKS)
+        ]
+        assert tiles_per_task in feasible
+        best = min(simulate(tiles, candidate, wave_tasks) for candidate in feasible)
+        assert simulate(tiles, tiles_per_task, wave_tasks) == best
+        assert begins[-1] <= capacity
 
 
 def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
@@ -165,7 +206,7 @@ def test_plan_without_wave_plan_keeps_the_rule_and_request_order() -> None:
 def test_plan_packed_tasks_honours_the_runtime_profile_cap() -> None:
     plan = _plan_mod().plan_packed_tasks
     # An even full machine would not split, but the profile only covers 512 tiles.
-    assert plan([1024] * 16, 48, 17, max_tiles_per_task=512) == (512, list(range(0, 34, 2)))
+    assert plan([1024] * 16, 48, 17, max_tiles_per_task=512) == (507, list(range(0, 49, 3)))
     # The cap never pushes a batch past its slots when it is ceil(longest / (splits - 1)).
     assert plan([1024, 3, 1024, 700], 4 * 6, 17, max_tiles_per_task=205)[1][-1] <= 24
 
@@ -209,6 +250,9 @@ _DEP16_RANK_KV_LENS = [473000, 320000, 250000, 190000, 150000, 110000, 80000, 50
         (_DEP16_RANK_KV_LENS, 9, 35, 4, False, True),
         ([183000] * 9, 9, 35, 4, False, True),
         ([103000] * 16, 6, 35, 4, False, True),
+        # Balanced per-slot load candidates: dep16 B8 MTP7 at 180K, dep16 B16 MTP5 at 175K.
+        ([180000] * 8, 8, 17, 8, False, True),
+        ([175000] * 16, 8, 21, 6, False, True),
         # TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0, off and on Helix: the rule's length, request order.
         (_DEP16_RANK_KV_LENS, 9, 35, 4, False, False),
         ([131, 20000, 600, 45000], 10, 17, 8, True, False),
