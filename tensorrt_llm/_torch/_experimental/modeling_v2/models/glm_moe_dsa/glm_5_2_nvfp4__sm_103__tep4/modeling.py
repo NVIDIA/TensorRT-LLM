@@ -307,6 +307,8 @@ _FMHA_BMM2_SCALE = (1.0,)
 _INDEXER_K_NORM_EPS = 1e-6
 # `head_dim + 4`: the fused write needs the fp8 key and its fp32 scale in one slot.
 _INDEXER_PER_TOKEN_MIN = 132
+# The context indexer projection's fp32 output row: 128 key columns, then 32 head weights.
+_IX_PROJ_COLS = 160
 # fp8_mqa_logits allocates a `[q_rows, kv_rows]` fp32 score matrix per call; prefill chunks are
 # tiled to keep it under this many elements. Context steps are not captured.
 _PREFILL_LOGITS_BUDGET = 1 << 24
@@ -460,6 +462,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         if os.environ.get("TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE", "1") == "1":
             _install_dense_topk_on_device()
         self._mixed_base = os.environ.get("TRTLLM_GLM52_MIXED_BASE", "1") == "1"
+        # TRTLLM_GLM52_CTX_HOST_DIET (default 1; 0 restores the per-call paths): host time
+        # only, same kernels and arguments. A context step reads its per-layer pool addressing
+        # from python tables built once per step (`PrefillTarget._diet_tables`); the launch
+        # wrappers read raw stream handles (`kernels/common/cuda_stream.py`); eager calls of the
+        # decode-cell GEMMs a mixed step's generation rows take (q_b, K-B, V-B) launch TVM-FFI
+        # twins of their kernels; the context rope/append and the generation sparse MLA launch a
+        # call signature their `prepare_runner` passed before without its contract walk.
+        self._ctx_host_diet = os.environ.get("TRTLLM_GLM52_CTX_HOST_DIET", "1") == "1"
 
         self.num_layers = cfg.num_hidden_layers
         self.eps = cfg.rms_norm_eps
@@ -1231,6 +1241,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             name: _projection_op.build_all(name, w_colmajor.t())
             for name, w_colmajor in proj_weights.items()
         }
+        if self._ctx_host_diet:
+            # A mixed step's generation rows take q_b's decode cells eagerly (`_project_tail`);
+            # the persistent cells among them (up to 16 rows) launch through a TVM-FFI twin of
+            # the same kernel. Captured decode graphs keep the cells' own launchers.
+            qb_w = proj_weights["q_b"].t()
+            self._proj["q_b"] = {
+                m: _projection_op.with_eager_twin(r, qb_w) if m <= _DECODE_MAX_ROWS else r
+                for m, r in self._proj["q_b"].items()
+            }
         if self.mtp_enabled:
             proj_weights["mtp_eh"] = self._mtp["eh"]
         self._proj_pre = _projection_op.build_prefill_all(
@@ -1298,6 +1317,20 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
             self._ix_pre_split_pre = None
         self._ix_qside_compiled = build_ix_q_side(dev, is_neox=self.indexer_is_neox)
+        # TRTLLM_GLM52_CTX_IX_NOSPLIT (default 1; 0 restores the split): a context step's
+        # indexer projection is not split into bf16 keys + packed head weights; the K write and
+        # the q side read their columns of the fp32 [T, 160] output in place (pitch-160
+        # launchers), the K write rounding the keys to bf16 on load as the split does. Same
+        # bytes, one launch fewer per indexer layer.
+        self._ix_nosplit = (
+            self._ix_pre_split_pre is not None
+            and os.environ.get("TRTLLM_GLM52_CTX_IX_NOSPLIT", "1") == "1"
+        )
+        self._ix_qside_compiled_p160 = (
+            build_ix_q_side(dev, is_neox=self.indexer_is_neox, wq_pitch=_IX_PROJ_COLS)
+            if self._ix_nosplit
+            else None
+        )
         self._ix_topk_pre_compiled = build_ix_topk_prefill(
             dev, top_k=self.idx_topk, max_columns=_MOE_MAX_T
         )
@@ -1321,6 +1354,17 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             torch.cuda.Stream(device=dev)
             if os.environ.get("TRTLLM_GLM52_CTX_GEN_SIDE", "1") == "1"
             else None
+        )
+        # TRTLLM_GLM52_CTX_GEN_SIDE_QUANT (default 1; 0 restores the main-stream quantize): on
+        # that stream, the generation rows' MXF8 quantize for o_proj runs right after their
+        # attention instead of on the main stream after the join, off the critical path
+        # whenever the generation side finishes first. Same kernel and bytes: the context MHA's
+        # epilogue writes the rows below `tc` and their scale bytes, the quantize the rows from
+        # `tc` and the padding scale bytes, all byte stores, so the two never write the same
+        # byte.
+        self._gen_side_quant = (
+            self._gen_stream is not None
+            and os.environ.get("TRTLLM_GLM52_CTX_GEN_SIDE_QUANT", "1") == "1"
         )
         self._build_moe(dev)
         # The peer buffers are sized for the whole token budget, so every collective shares
@@ -1689,7 +1733,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # may not be, and a layout first met inside a capture cannot compile there.
         self._ix_k_compiled = {
             contiguous: build_ix_k_cache(
-                dev, is_neox=self.indexer_is_neox, cache_contiguous=contiguous
+                dev,
+                is_neox=self.indexer_is_neox,
+                cache_contiguous=contiguous,
+                f32_input=self._ix_nosplit,
             )
             for contiguous in (False, True)
         }
@@ -2132,7 +2179,6 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         step appends are read by later steps."""
         hi, di = self.idx_heads, self.idx_dim
         dev = x.device
-        kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
         split = self._ix_pre_split.get(rows)
         pre = self._ix_pre_split_pre
         if (
@@ -2142,10 +2188,18 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             and x.is_contiguous()
         ):
             split = pre
-        if split is not None:
+        qside = self._ix_qside_compiled
+        if split is not None and split is pre and self._ix_nosplit:
+            # fp32 column views of one [rows, 160] output (`TRTLLM_GLM52_CTX_IX_NOSPLIT`).
+            kb, wq = _ix_pre_split_op.project_unsplit(x, ix.fused_bf16, pre)
+            qside = self._ix_qside_compiled_p160
+            self._count("ctx_ix_nosplit", True)
+        elif split is not None:
+            kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
             wq = torch.empty([rows, hi], dtype=torch.float32, device=dev)
             cute_dsl_indexer_pre_proj_split(x, ix.fused_bf16, kb, wq, split)
         else:
+            kb = torch.empty([rows, di], dtype=x.dtype, device=dev)
             # fp32: the only `weights` dtype fp8_mqa_logits takes.
             fused = self._project("ix_fused", x.float(), ix.fused, torch.float32)
             k_raw, wq_raw = torch.split(fused, [di, hi], -1)
@@ -2161,7 +2215,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         weights = torch.empty([rows, hi], dtype=torch.float32, device=dev)
         cute_dsl_indexer_q_side_fused(
             q, pos, self._idx_cos_sin, wq, self.idx_weight_scale, q_fp8, weights,
-            is_neox=self.indexer_is_neox, compiled=self._ix_qside_compiled,
+            is_neox=self.indexer_is_neox, compiled=qside,
         )  # fmt: skip
         return q_fp8, weights, k_pre
 
@@ -2742,12 +2796,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             start += n
         return result
 
-    def _mlp_and_close(self, attn_out, residual, i: int, rows: int, o8=None, o_pre=False):
+    def _mlp_and_close(
+        self, attn_out, residual, i: int, rows: int, o8=None, o_pre=False, main=None
+    ):
         """o_proj, the layer's MLP, and the closing collective normed for the next layer.
         `o8` is `attn_out`'s MXF8 operand when the context attention wrote it (o_proj then
         reads it instead of `attn_out`). Returns `(x, x8)`: the next layer's input and, on a
         two-shot context step, its MXF8 operand for the next layer's qkva (else None).
-        `o_pre`: the V-B GEMM wrote `attn_out`'s decode MXF8 operand (`_attn_gen`)."""
+        `o_pre`: the V-B GEMM wrote `attn_out`'s decode MXF8 operand (`_attn_gen`). `main`: the
+        stream the step runs on, when the caller already holds it (else read here)."""
         a = self._attn[i]
         partial = self._project(
             "o_proj", attn_out, a.o, w8=a.o8, pre=o8, wd8=a.o_dec8, dec_pre=o_pre
@@ -2772,7 +2829,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 o, prequant = self._reduce_norm_quant(partial, residual, a.norm2, m.g1, rows)
             began = rows <= _MOE_MAX_T
             acc = self._moe_begin_layer(rows) if began else None
-            main = torch.cuda.current_stream()
+            if main is None:
+                main = torch.cuda.current_stream()
             side = self._side_stream
             side.wait_stream(main)
             with torch.cuda.stream(side):
@@ -2974,6 +3032,37 @@ class PrefillTarget:
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         return _build_step_args(md)
 
+    @staticmethod
+    def _diet_tables(step: dict) -> None:
+        """CTX-HOST-DIET: the pool addressing every layer's context attention reads, as python
+        values built once per step into `step` -- `diet_layers[layer] = (pool index, layer in
+        pool, the pool's pointer row names the primary pool and no secondary pool)` from one
+        `tolist` of each host pool table,
+        and `diet_tpb` -- instead of indexing the host tensors per layer in every helper
+        (`_mha_takes`, twice per layer, `_attn_mha`, `_attn_ctx`). The helpers pass the same
+        values to the same kernels."""
+        mapping = step["host_kv_cache_pool_mapping"].tolist()
+        ptrs = step["host_kv_cache_pool_pointers"].tolist()
+        primary = step["primary_pool"].data_ptr()
+        step["diet_layers"] = [
+            (int(m[0]), int(m[1]), ptrs[int(m[0])][0] == primary and ptrs[int(m[0])][1] == 0)
+            for m in mapping
+        ]
+        step["diet_tpb"] = int(step["tokens_per_block"])
+        step["diet_block_offsets"] = {}
+
+    @staticmethod
+    def _diet_block_offsets(step: dict, pool_idx: int):
+        """CTX-HOST-DIET: the context requests' block-table rows of pool `pool_idx`, sliced once
+        per step and shared by every layer of that pool (a view; nothing writes it)."""
+        cache = step["diet_block_offsets"]
+        rows = cache.get(pool_idx)
+        if rows is None:
+            rows = cache[pool_idx] = step["kv_cache_block_offsets"][
+                pool_idx, : step["num_contexts"]
+            ]
+        return rows
+
     def _ctx_rope_step(self, step, tc: int) -> tuple | None:
         """The context rope kernel's per-step operands: the new-row prefix sum and the cached
         lengths, int32, from the engine's int64 prefix sums. None sends the step's context rows
@@ -3148,6 +3237,14 @@ class PrefillTarget:
         """Whether this layer's context rows can take the non-absorbed attention: its weights
         built, the step on the context rope kernel, and the layer's pool the primary pool."""
         core = self.core
+        diet = step.get("diet_layers")
+        if diet is not None:
+            return (
+                (a.kvb8 if core._mha_fp8 else a.kvb_aug) is not None
+                and ctx_rope is not None
+                and core._ctx_rope_compiled is not None
+                and diet[layer][2]
+            )
         pool_ptrs = step["host_kv_cache_pool_pointers"]
         pool_idx = int(step["host_kv_cache_pool_mapping"][layer][0])
         return (
@@ -3185,9 +3282,19 @@ class PrefillTarget:
             return False
         fp8 = q.dtype == torch.float8_e4m3fn
         pool = step["primary_pool"]
-        pool_idx, layer_in_pool = (int(v) for v in step["host_kv_cache_pool_mapping"][layer][:2])
+        diet = step.get("diet_layers")
+        if diet is not None:
+            pool_idx, layer_in_pool, _ = diet[layer]
+            tpb = step["diet_tpb"]
+            block_offsets = self._diet_block_offsets(step, pool_idx)
+        else:
+            pool_idx, layer_in_pool = (
+                int(v) for v in step["host_kv_cache_pool_mapping"][layer][:2]
+            )
+            tpb = int(step["tokens_per_block"])
+            block_offsets = step["kv_cache_block_offsets"][pool_idx, : step["num_contexts"]]
         compiled = core._ctx_rope_compiled
-        heads, tpb = core.heads, int(step["tokens_per_block"])
+        heads = core.heads
         q3 = torch.reshape(q, [tc, heads, core.qk_dim])
         in_place = latent.stride(0) in compiled.kernels_q_in_place and latent.stride(1) == 1
         lat = latent if in_place else latent.clone(memory_format=torch.contiguous_format)
@@ -3198,7 +3305,7 @@ class PrefillTarget:
             None,
             pool,
             layer_in_pool,
-            step["kv_cache_block_offsets"][pool_idx, : step["num_contexts"]],
+            block_offsets,
             *ctx_rope,
             core._rope["rotary_cos_sin"],
             tpb,
@@ -3348,14 +3455,19 @@ class PrefillTarget:
             else torch.empty([tc, heads, core.lat_dim], dtype=torch.float8_e4m3fn, device=dev)
         )
         pool = step["primary_pool"]
-        pool_ptrs = step["host_kv_cache_pool_pointers"]
-        mapping = step["host_kv_cache_pool_mapping"][layer]
-        pool_idx, layer_in_pool = int(mapping[0]), int(mapping[1])
-        on_kernel = (
-            ctx_rope is not None
-            and int(pool_ptrs[pool_idx, 0]) == pool.data_ptr()
-            and int(pool_ptrs[pool_idx, 1]) == 0
-        )
+        diet = step.get("diet_layers")
+        if diet is not None:
+            pool_idx, layer_in_pool, primary = diet[layer]
+            on_kernel = ctx_rope is not None and primary
+        else:
+            pool_ptrs = step["host_kv_cache_pool_pointers"]
+            mapping = step["host_kv_cache_pool_mapping"][layer]
+            pool_idx, layer_in_pool = int(mapping[0]), int(mapping[1])
+            on_kernel = (
+                ctx_rope is not None
+                and int(pool_ptrs[pool_idx, 0]) == pool.data_ptr()
+                and int(pool_ptrs[pool_idx, 1]) == 0
+            )
         core._count("ctx_rope", on_kernel)
         # On the rope kernel's path the attention reads only the fp8 query: K-B writes its
         # e4m3 q-base bytes straight into `quant_q[..., :kv_lora]` and the rope kernel skips
@@ -3401,7 +3513,11 @@ class PrefillTarget:
                 quant_q,
                 pool,
                 layer_in_pool,
-                step["kv_cache_block_offsets"][pool_idx, : step["num_contexts"]],
+                (
+                    self._diet_block_offsets(step, pool_idx)
+                    if diet is not None
+                    else step["kv_cache_block_offsets"][pool_idx, : step["num_contexts"]]
+                ),
                 *ctx_rope,
                 core._rope["rotary_cos_sin"],
                 step["tokens_per_block"],
@@ -3448,7 +3564,8 @@ class PrefillTarget:
         if dc is not None:
             # The pool rows this layer's selection would name, `to_global` of the dense
             # causal index: the block-table row times the stride, plus this layer's offset.
-            layer_offset = layer_in_pool * int(step["tokens_per_block"])
+            tpb = step["diet_tpb"] if diet is not None else int(step["tokens_per_block"])
+            layer_offset = layer_in_pool * tpb
             if dc.prepared is None:
                 dc.prepared = _fmha_pre_op.prepare_dense_causal(
                     core._fmha_pre_dc_compiled, quant_q, pool, lat_out, dc.ks, dc.ke,
@@ -3639,14 +3756,21 @@ class PrefillTarget:
         # outputs are bit for bit the serial ones. The absorbed context path shares K-B / V-B
         # with these rows and keeps the serial order.
         gen_side = bool(gen and tc and mha8 and ctx_last is None and core._gen_stream is not None)
+        main = step.get("diet_main") if gen_side else None
+        # With `_gen_side_quant` the generation rows' quantize into `o8` also runs there; when
+        # the context rows then do not take `o8`, it is dropped unread, as below.
+        side_quant = gen_side and o8 is not None and core._gen_side_quant
         if gen_side:
-            core._gen_stream.wait_stream(torch.cuda.current_stream())
+            core._gen_stream.wait_stream(torch.cuda.current_stream() if main is None else main)
             with torch.cuda.stream(core._gen_stream):
                 core._attn_gen(
                     a, pool_layer, q_gen, lat_gen, attn_gen, slots_gen, gen, gen_p, ctx, md,
                     gen_kind, gen_layer, False,
                 )  # fmt: skip
+                if side_quant:
+                    cute_dsl_act_quant_mxf8_rows(attn_gen, *o8, tc, compiled=core._mha_q8.rows)
             core._count("ctx_gen_side", True)
+            core._count("ctx_gen_side_quant", side_quant)
         o8_done = False
         if tc:
             o8_done = self._attn_ctx(
@@ -3659,12 +3783,13 @@ class PrefillTarget:
                 gen_kind, gen_layer, False,
             )  # fmt: skip
         if gen_side:
-            torch.cuda.current_stream().wait_stream(core._gen_stream)
+            (torch.cuda.current_stream() if main is None else main).wait_stream(core._gen_stream)
         if not o8_done:
             return None
         # The generation rows' bf16 attention into the rows after the context rows (none on a
         # pure context step: then only the padding scale rows).
-        cute_dsl_act_quant_mxf8_rows(attn_gen, *o8, tc, compiled=core._mha_q8.rows)
+        if not side_quant:
+            cute_dsl_act_quant_mxf8_rows(attn_gen, *o8, tc, compiled=core._mha_q8.rows)
         return o8
 
     def forward(
@@ -3680,6 +3805,11 @@ class PrefillTarget:
         self._check_step_contract(attn_metadata)
         md = attn_metadata
         step = self.step_args(md)
+        if core._ctx_host_diet:
+            self._diet_tables(step)
+            # The stream this forward runs on, read once: torch.cuda.current_stream() costs
+            # ~3 us per call and the layers ask for it three times each.
+            step["diet_main"] = torch.cuda.current_stream()
         h = core._embed(input_ids) if inputs_embeds is None else inputs_embeds
         rows = h.shape[0]
         # The slot mappings and window vectors are indexed by the prepared token order; a
@@ -3751,7 +3881,7 @@ class PrefillTarget:
                 md, step, x, pos, attn_out, i, i, slots_of, topk_buf, rows, tc, gen, gen_p, ctx,
                 need_q, skip_ctx, skip_gen, ctx_rope, dc, x8,
             )  # fmt: skip
-            x, x8 = core._mlp_and_close(attn_out, residual, i, rows, o8)
+            x, x8 = core._mlp_and_close(attn_out, residual, i, rows, o8, main=step.get("diet_main"))
         return x
 
     #: The row counts the MTP layer's selected rows are padded to: decode cells every op

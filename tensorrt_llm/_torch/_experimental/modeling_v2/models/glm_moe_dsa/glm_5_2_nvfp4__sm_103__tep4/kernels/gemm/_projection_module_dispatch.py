@@ -378,6 +378,10 @@ def make_build(
                     compiled_by_key[key] = compiled
                 compiled_fn = compiled
                 pinned_m = active_m
+                if instance.backend == "persistent" and active_m not in abi.pdl_enabled_m:
+                    # What a caller needs to compile the same kernel as a TVM-FFI function for
+                    # its eager calls (`cute_dsl_projection.with_eager_twin`).
+                    run_linear.persistent = (instance.schedule, abi.kernel_name_prefix)
             elif input_tensor.shape[0] != pinned_m:
                 raise ValueError(
                     f"{abi.module_name}: this build() instance is pinned to "

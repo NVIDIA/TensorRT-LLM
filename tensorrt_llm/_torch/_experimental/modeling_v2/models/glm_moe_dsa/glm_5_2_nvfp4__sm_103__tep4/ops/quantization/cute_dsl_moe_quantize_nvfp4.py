@@ -8,7 +8,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-import cutlass.torch as cutlass_torch
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
@@ -17,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
+from ...kernels.common.cuda_stream import cu_stream as _cu_stream
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
 from ...kernels.quantization import moe_frontend_quantize_nvfp4 as _decode
 from ...kernels.quantization import moe_prefill_quantize_segmented as _prefill
@@ -104,7 +104,7 @@ def build_decode(rows: int, device) -> CompiledMoeQuantize:
             as_t(fp4_out, 1),
             as_t(scale_out, 1),
             as_t(x, 1),
-            cutlass_torch.current_stream(),
+            _cu_stream(),
         )
 
     return CompiledMoeQuantize("decode", rows, launch)
@@ -140,7 +140,7 @@ def build_prefill(device) -> CompiledMoeQuantize:
         rows = int(x.shape[0])
         h = handles[_sched.propose_schedule(rows).quant_segments]
         # The unfused zero plane is in the ABI but never touched; `x` stands in for it.
-        h(x, global_scale.reshape(1), fp4_out, scale_out, x, rows, cutlass_torch.current_stream())
+        h(x, global_scale.reshape(1), fp4_out, scale_out, x, rows, _cu_stream())
 
     return CompiledMoeQuantize("prefill", None, launch)
 

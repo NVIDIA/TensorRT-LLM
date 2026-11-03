@@ -44,6 +44,8 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
+from .cuda_stream import raw_stream as _raw_stream
+
 _VEC = 8  # BF16 elements per thread
 _THREADS_PER_ROW = 16  # 128 columns per CTA tile
 _ROWS_PER_PASS = 256 // _THREADS_PER_ROW  # 16
@@ -495,7 +497,7 @@ def quantize_rows(
         k // _COLS_PER_CTA,
         x.stride(0) if rows > 0 else _VEC,
         row_tiles,
-        torch.cuda.current_stream(x.device).cuda_stream,
+        _raw_stream(x.device),
     )
 
 
@@ -556,7 +558,7 @@ def quantize(
         k // _COLS_PER_CTA,
         x.stride(0),
         padded_rows(rows) // fn.rows_per_cta,
-        torch.cuda.current_stream(x.device).cuda_stream,
+        _raw_stream(x.device),
     )
     return q, sf
 

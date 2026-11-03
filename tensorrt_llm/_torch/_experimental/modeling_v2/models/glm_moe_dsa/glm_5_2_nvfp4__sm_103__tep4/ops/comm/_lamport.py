@@ -27,6 +27,7 @@ import torch
 
 from ...kernels.comm import tp4_allgather_lamport as _ag
 from ...kernels.comm import tp4_allreduce_fused_rms as _ar
+from ...kernels.common.cuda_stream import raw_stream as _raw_stream
 
 _PING_PONG = 3
 _SIGNAL_STATE = 6
@@ -296,7 +297,7 @@ def tail(workspace: LamportWorkspace, fused: bool) -> list:
     if fused:
         out.append(cutlass.Int64(workspace.multicast_base))
     out.append(cutlass.Int64(0))
-    out.append(torch.cuda.current_stream().cuda_stream)
+    out.append(_raw_stream())
     return out
 
 

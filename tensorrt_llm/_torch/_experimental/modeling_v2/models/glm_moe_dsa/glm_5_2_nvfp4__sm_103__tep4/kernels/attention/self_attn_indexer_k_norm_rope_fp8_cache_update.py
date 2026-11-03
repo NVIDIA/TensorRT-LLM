@@ -15,6 +15,12 @@ The fused kernel writes the final K-cache bytes directly. It intentionally
 matches the backend's materialized BF16 precision boundaries before RoPE and
 before FP8 quantization, so correctness is byte-for-byte equality of the final
 cache image.
+
+``f32_input``: the keys are read straight from the context indexer projection's
+FP32 ``[T, 160]`` output (columns 0..127, row pitch 160) and rounded to BF16 on
+load (round to nearest even, as ``Tensor.copy_`` and the projection's column
+split round them), so the cache bytes equal the BF16-input launch on the split
+keys and the split launch is not needed.
 """
 
 from collections.abc import Callable
@@ -43,8 +49,11 @@ _FUSED_CAT_THREADS_PER_ROW = 16
 _SMALL_TOKEN_THRESHOLD = 1024
 _SMALL_TOKEN_ROWS_PER_BLOCK = 2
 _INDEXER_K_NORM_EPS = 1.0e-6
+#: Row pitch, in FP32 elements, of the context indexer projection's output that the
+#: ``f32_input`` variant reads: 128 key columns, then 32 head-weight columns.
+F32_INPUT_PITCH = 160
 _INDEXER_K_CACHE_UPDATE_COMPILE_CACHE: dict[
-    tuple[int, bool, bool, int, bool, bool, bool], Callable
+    tuple[int, bool, bool, int, bool, bool, bool, bool], Callable
 ] = {}
 
 
@@ -136,6 +145,12 @@ def _unpack_bf16x4(
     )
 
 
+@cute.jit
+def _load_f32_as_bf16(ptr) -> cutlass.Float32:
+    """One FP32 key element rounded to BF16 (nearest even) and widened back."""
+    return ptr.load().to(cutlass.BFloat16).to(cutlass.Float32)
+
+
 @cute.kernel
 def self_attn_indexer_k_norm_rope_fp8_cache_update(
     indexer_k: cute.Tensor,
@@ -161,6 +176,7 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
     VECTORIZED_LOADS: cutlass.Constexpr[bool],
     CACHE_CONTIGUOUS: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
+    F32_INPUT: cutlass.Constexpr[bool],
 ) -> None:
     block_row, _, _ = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
@@ -180,13 +196,21 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
         input_ptr = indexer_k.iterator
         weight_ptr = norm_weight.iterator
         bias_ptr = norm_bias.iterator
-        row_base = token_idx * _FUSED_CAT_HEAD_DIM
+        if cutlass.const_expr(F32_INPUT):
+            row_base = token_idx * F32_INPUT_PITCH
+        else:
+            row_base = token_idx * _FUSED_CAT_HEAD_DIM
 
         # Physical lane i owns dimensions 4*i..4*i+3 and
         # 64+4*i..64+4*i+3.
         base_col = lane_in_row * _FUSED_CAT_ELEMS_PER_THREAD
         second_base_col = base_col + cutlass.Int32(_FUSED_CAT_HEAD_DIM // 2)
-        if cutlass.const_expr(VECTORIZED_LOADS):
+        if cutlass.const_expr(F32_INPUT):
+            x0 = _load_f32_as_bf16(input_ptr + row_base + base_col)
+            x1 = _load_f32_as_bf16(input_ptr + row_base + base_col + cutlass.Int32(1))
+            x2 = _load_f32_as_bf16(input_ptr + row_base + base_col + cutlass.Int32(2))
+            x3 = _load_f32_as_bf16(input_ptr + row_base + base_col + cutlass.Int32(3))
+        elif cutlass.const_expr(VECTORIZED_LOADS):
             input_word_ptr = cute.recast_ptr(
                 (input_ptr + row_base + base_col).align(8),
                 dtype=cutlass.Uint64,
@@ -198,7 +222,12 @@ def self_attn_indexer_k_norm_rope_fp8_cache_update(
             x2 = (input_ptr + row_base + base_col + cutlass.Int32(2)).load().to(cutlass.Float32)
             x3 = (input_ptr + row_base + base_col + cutlass.Int32(3)).load().to(cutlass.Float32)
 
-        if cutlass.const_expr(VECTORIZED_LOADS):
+        if cutlass.const_expr(F32_INPUT):
+            y0 = _load_f32_as_bf16(input_ptr + row_base + second_base_col)
+            y1 = _load_f32_as_bf16(input_ptr + row_base + second_base_col + cutlass.Int32(1))
+            y2 = _load_f32_as_bf16(input_ptr + row_base + second_base_col + cutlass.Int32(2))
+            y3 = _load_f32_as_bf16(input_ptr + row_base + second_base_col + cutlass.Int32(3))
+        elif cutlass.const_expr(VECTORIZED_LOADS):
             input_word_ptr = cute.recast_ptr(
                 (input_ptr + row_base + second_base_col).align(8),
                 dtype=cutlass.Uint64,
@@ -611,6 +640,7 @@ def _launch_indexer_k_norm_rope_fp8_cache_update(
     VECTORIZED_LOADS: cutlass.Constexpr[bool],
     CACHE_CONTIGUOUS: cutlass.Constexpr[bool],
     USE_PDL: cutlass.Constexpr[bool],
+    F32_INPUT: cutlass.Constexpr[bool],
 ) -> None:
     cache_dim_0 = cute.size(k_cache, mode=[0])
     cache_dim_1 = cute.size(k_cache, mode=[1])
@@ -641,6 +671,7 @@ def _launch_indexer_k_norm_rope_fp8_cache_update(
         VECTORIZED_LOADS,
         CACHE_CONTIGUOUS,
         USE_PDL,
+        F32_INPUT,
     ).launch(
         grid=(cute.ceil_div(num_tokens, ROWS_PER_BLOCK), 1, 1),
         block=(
@@ -666,6 +697,7 @@ def compile_indexer_k_norm_rope_fp8_cache_update(
     vectorized_loads: bool = False,
     cache_contiguous: bool = False,
     use_pdl: bool = True,
+    f32_input: bool = False,
 ) -> Callable:
     """Compile the fused kernel for one launch specialization.
 
@@ -690,6 +722,7 @@ def compile_indexer_k_norm_rope_fp8_cache_update(
         bool(vectorized_loads),
         bool(cache_contiguous),
         bool(use_pdl),
+        bool(f32_input),
     )
     if key in _INDEXER_K_CACHE_UPDATE_COMPILE_CACHE:
         return _INDEXER_K_CACHE_UPDATE_COMPILE_CACHE[key]
@@ -705,12 +738,21 @@ def compile_indexer_k_norm_rope_fp8_cache_update(
     sym_cache_stride_1 = cute.sym_int64(symbol="indexer_k_cache_update_stride_1")
     sym_cache_stride_2 = cute.sym_int64(symbol="indexer_k_cache_update_stride_2")
 
-    fake_indexer_k = make_fake_compact_tensor(
-        cutlass.BFloat16,
-        (sym_num_tokens, _FUSED_CAT_HEAD_DIM),
-        stride_order=(1, 0),
-        assumed_align=8 if vectorized_loads else 2,
-    )
+    if f32_input:
+        # Columns 0..127 of the FP32 [T, 160] projection output (scalar loads).
+        fake_indexer_k = make_fake_tensor(
+            cutlass.Float32,
+            (sym_num_tokens, _FUSED_CAT_HEAD_DIM),
+            stride=(F32_INPUT_PITCH, 1),
+            assumed_align=4,
+        )
+    else:
+        fake_indexer_k = make_fake_compact_tensor(
+            cutlass.BFloat16,
+            (sym_num_tokens, _FUSED_CAT_HEAD_DIM),
+            stride_order=(1, 0),
+            assumed_align=8 if vectorized_loads else 2,
+        )
     fake_norm_weight = make_fake_compact_tensor(
         cutlass.Float32,
         (_FUSED_CAT_HEAD_DIM,),
@@ -771,6 +813,7 @@ def compile_indexer_k_norm_rope_fp8_cache_update(
         bool(vectorized_loads),
         bool(cache_contiguous),
         bool(use_pdl),
+        bool(f32_input),
         options="--enable-tvm-ffi",
     )
     _INDEXER_K_CACHE_UPDATE_COMPILE_CACHE[key] = compiled
@@ -880,7 +923,19 @@ def _require_indexer_k_cache_update_inputs(
     slot_mapping_fp8,
     slot_mapping_scale,
 ) -> None:
-    _require_cuda_contiguous(torch, indexer_k, "indexer_k", torch.bfloat16)
+    if indexer_k.dtype == torch.float32:
+        # The `f32_input` variant: columns 0..127 of the FP32 [T, 160] projection output.
+        if not indexer_k.is_cuda or (
+            indexer_k.ndim == 2
+            and indexer_k.shape[0] > 1
+            and tuple(indexer_k.stride()) != (F32_INPUT_PITCH, 1)
+        ):
+            raise ValueError(
+                f"an fp32 indexer_k must be a CUDA [T, {_FUSED_CAT_HEAD_DIM}] view with stride "
+                f"({F32_INPUT_PITCH}, 1), got stride {tuple(indexer_k.stride())}"
+            )
+    else:
+        _require_cuda_contiguous(torch, indexer_k, "indexer_k", torch.bfloat16)
     _require_cuda_contiguous(torch, norm_weight, "norm_weight", torch.float32)
     _require_cuda_contiguous(torch, norm_bias, "norm_bias", torch.float32)
     _require_cuda_contiguous(torch, position_ids, "position_ids", torch.int32)
@@ -1020,6 +1075,7 @@ def indexer_k_norm_rope_fp8_cache_update(
             vectorized_loads=_can_vectorize_loads(indexer_k),
             cache_contiguous=bool(k_cache.is_contiguous()),
             use_pdl=bool(use_pdl),
+            f32_input=indexer_k.dtype == torch.float32,
         )
 
     active_rows = int(indexer_k.shape[0])

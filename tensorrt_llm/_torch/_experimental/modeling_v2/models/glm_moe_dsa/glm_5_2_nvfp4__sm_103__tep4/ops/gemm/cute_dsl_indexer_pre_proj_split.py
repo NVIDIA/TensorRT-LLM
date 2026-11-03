@@ -216,3 +216,25 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
 
 cute_dsl_indexer_pre_proj_split = CuteDslIndexerPreProjSplit()
+
+
+def project_unsplit(
+    x: torch.Tensor, weight: torch.Tensor, compiled: PrefillSplitHandle
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The context-row product without the column split: one fp32 `[M, 160]` output and its
+    two column views `(keys [M, 128], head_weights [M, 32])`, row pitch 160. For consumers
+    that read them in place (the indexer K write's and q side's pitch-160 launchers, which
+    round the keys to bf16 on load as the split does). Same validity as the op's prefill
+    path; the weight must be the bf16 `[160, 6144]` operand of `build_prefill`."""
+    rows = int(x.shape[0])
+    assert 1 <= rows <= compiled.max_rows, (
+        f"the prefill handle serves 1..{compiled.max_rows} rows, got {rows}"
+    )
+    assert (
+        tuple(weight.shape) == (_KEY + _HEADS, _K)
+        and weight.is_contiguous()
+        and weight.dtype == torch.bfloat16
+    ), f"weight must be contiguous bf16 [{_KEY + _HEADS}, {_K}], got {tuple(weight.shape)}"
+    full = torch.empty([rows, _KEY + _HEADS], dtype=torch.float32, device=x.device)
+    compiled.launch(x, weight, full)
+    return full[:, :_KEY], full[:, _KEY:]

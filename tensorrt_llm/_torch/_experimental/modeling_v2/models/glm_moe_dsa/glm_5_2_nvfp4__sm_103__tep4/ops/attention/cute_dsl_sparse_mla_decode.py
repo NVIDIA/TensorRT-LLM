@@ -18,6 +18,7 @@ from ...kernels.attention import (
 from ...kernels.attention import (
     self_attn_fmha_sparse_mla_wide_h16_qk576_v512_topk2048_fp8_bf16 as _wide_kernel,
 )
+from ...kernels.common.cuda_stream import DIET as _HOST_DIET
 
 #: `sparse_attn_indices` holds global pool rows, used as they are.
 INDEX_KIND_GLOBAL = _kernel.INDEX_KIND_GLOBAL
@@ -298,6 +299,18 @@ class CuteDslSparseMlaDecode(OpWrapper):
                 f"no kernel compiled for {batch} sequences, index kind {index_kind!r}, "
                 f"{quant_q_buffer.shape[1]} heads on {quant_q_buffer.device}"
             )
+        signature = None
+        if _HOST_DIET and not torch.cuda.is_current_stream_capturing():
+            # CTX-HOST-DIET: a call signature `prepare_runner` passed before launches the same
+            # arguments without its contract walk (`run_accepted`).
+            signature = _wide_kernel.run_accepted(
+                compiled.kernels, quant_q_buffer, kv_pool_view, sparse_attn_indices, output,
+                cu_q_seqlens, sequence_length, mla_bmm1_scale, mla_bmm2_scale,
+                all_sparse_indices_valid=compiled.all_sparse_indices_valid,
+                max_sq=compiled.max_sq, index_kind=index_kind, local_layer_idx=local_layer_idx,
+            )  # fmt: skip
+            if signature is None:
+                return output
         runner = _wide_kernel.prepare_runner(
             quant_q_buffer,
             kv_pool_view,
@@ -314,6 +327,8 @@ class CuteDslSparseMlaDecode(OpWrapper):
         )
         runner.compiled = compiled.kernels[runner.specialization]
         runner()
+        if signature is not None:
+            _wide_kernel.accept(signature, runner)
         return output
 
     def reference(

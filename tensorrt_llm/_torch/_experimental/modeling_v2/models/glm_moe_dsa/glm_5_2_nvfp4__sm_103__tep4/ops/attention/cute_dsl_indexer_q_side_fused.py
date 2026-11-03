@@ -25,21 +25,26 @@ _MIN_AMAX = 1.0e-12
 
 @dataclass(frozen=True)
 class CompiledIndexerQSide:
-    """The compiled launcher and the rope mode it was compiled for."""
+    """The compiled launcher, the rope mode and the `wq` row pitch it was compiled for."""
 
     fn: Callable
     is_neox: bool
+    wq_pitch: int = _HEADS
 
 
-def build(device_id: int, *, is_neox: bool) -> CompiledIndexerQSide:
+def build(device_id: int, *, is_neox: bool, wq_pitch: int = _HEADS) -> CompiledIndexerQSide:
     """Compile the variant the target runs: ue8m0 row scales, PDL launch.
 
-    `is_neox` is a compile-time constant of the kernel. One compile, a few
-    seconds, cached per process by the kernel module; allocates nothing.
+    `is_neox` is a compile-time constant of the kernel, as is `wq_pitch`: 32 for packed
+    head weights, 160 to read them in place from the context indexer projection's fp32
+    `[T, 160]` output. One compile, a few seconds, cached per process by the kernel module;
+    allocates nothing.
     """
     with torch.cuda.device(device_id):
-        fn = _kernel.compile_indexer_q_side_fused(device_id, bool(is_neox), True, use_pdl=True)
-    return CompiledIndexerQSide(fn=fn, is_neox=bool(is_neox))
+        fn = _kernel.compile_indexer_q_side_fused(
+            device_id, bool(is_neox), True, use_pdl=True, wq_pitch=int(wq_pitch)
+        )
+    return CompiledIndexerQSide(fn=fn, is_neox=bool(is_neox), wq_pitch=int(wq_pitch))
 
 
 class CuteDslIndexerQSideFused(OpWrapper):
@@ -126,6 +131,7 @@ class CuteDslIndexerQSideFused(OpWrapper):
             use_ue8m0=True,
             compiled_fn=compiled.fn,
             use_pdl=True,
+            wq_pitch=compiled.wq_pitch,
         )
 
     def reference(

@@ -15,6 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from ...kernels.attention import (
     self_attn_prefill_mla_rope_append_fp8q_h16_kv512_rope64_bf16_fp8 as _kernel,
 )
+from ...kernels.common.cuda_stream import DIET as _HOST_DIET
 
 NUM_HEADS = _kernel.NUM_HEADS
 KV_LORA_RANK = _kernel.KV_LORA_RANK
@@ -373,24 +374,42 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
                 f"latent_cache a [T, 576] with a row stride in {sorted(compiled.kernels)}"
             )
         base = kv_pool.data_ptr() + int(layer_in_pool) * int(tokens_per_block) * LATENT_DIM
-        runner = _kernel.prepare_runner(
-            fused_q,
-            q_pe,
-            latent_cache,
-            None if quant_q_buffer is None else quant_q_buffer.view(torch.uint8),
-            base,
-            kv_cache_block_offsets,
-            cu_seqlens,
-            cached_lens,
-            rotary_cos_sin,
-            tokens_per_block=int(tokens_per_block),
-            skip_q_base=bool(skip_q_base),
-            q_in_place=bool(q_in_place),
-            q_e4m3=bool(q_e4m3),
-            merge_rope=bool(q_in_place),
-            rope_par=compiled.rope_par if q_in_place and q_e4m3 else 0,
-        )
-        dataclasses.replace(runner, compiled=kernel)()
+        quant_q_u8 = None if quant_q_buffer is None else quant_q_buffer.view(torch.uint8)
+        rope_par = compiled.rope_par if q_in_place and q_e4m3 else 0
+        signature, launched = None, False
+        if _HOST_DIET and not torch.cuda.is_current_stream_capturing():
+            # CTX-HOST-DIET: a call signature `prepare_runner` passed before launches the same
+            # arguments without its contract walk (`run_accepted`).
+            options = (
+                int(tokens_per_block), bool(skip_q_base), bool(q_in_place), bool(q_e4m3),
+                bool(q_in_place), False, rope_par,
+            )  # fmt: skip
+            signature = _kernel.run_accepted(
+                kernel, fused_q, q_pe, latent_cache, quant_q_u8, base, kv_cache_block_offsets,
+                cu_seqlens, cached_lens, rotary_cos_sin, options,
+            )  # fmt: skip
+            launched = signature is None
+        if not launched:
+            runner = _kernel.prepare_runner(
+                fused_q,
+                q_pe,
+                latent_cache,
+                quant_q_u8,
+                base,
+                kv_cache_block_offsets,
+                cu_seqlens,
+                cached_lens,
+                rotary_cos_sin,
+                tokens_per_block=int(tokens_per_block),
+                skip_q_base=bool(skip_q_base),
+                q_in_place=bool(q_in_place),
+                q_e4m3=bool(q_e4m3),
+                merge_rope=bool(q_in_place),
+                rope_par=rope_par,
+            )
+            dataclasses.replace(runner, compiled=kernel)()
+            if signature is not None:
+                _kernel.accept(signature)
         if q_in_place:
             return q_pe, latent_cache, None, kv_pool
         return fused_q, latent_cache, quant_q_buffer, kv_pool

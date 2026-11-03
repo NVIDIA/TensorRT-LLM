@@ -1292,3 +1292,152 @@ def prepare_runner(
         runtime_shape=runtime_shape,
         specialization=specialization,
     )
+
+
+# ----------------------------------------------------------------------------- CTX-HOST-DIET: steady state
+#: TRTLLM_GLM52_CTX_HOST_DIET=1: what `prepare_runner` decided for the call signatures it has passed --
+#: the specialization (split-K CTA count, GMEM reducer), the pool's row count, the device. A signature
+#: fixes every input `prepare_runner` checks or decides on except the query-row count, the pointers and
+#: the layer: batch size, index kind, max_sq, options, every dtype, stride and device, the pool's shape,
+#: which scale arrays are given. `run_accepted` replays the decision with exactly the arguments
+#: `prepare_runner` would bind, after the checks the signature leaves open. No torch tensor is held.
+#: Bounded: a full table only misses (no eviction).
+_ACCEPTED: dict[tuple, tuple[MlaFmhaSpecialization, int, int]] = {}
+ACCEPTED_CAP = 64
+#: Calls `run_accepted` sent back to `prepare_runner` (signature not accepted yet).
+accepted_misses = 0
+
+
+def _scale_signature(tensor: torch.Tensor | None):
+    return None if tensor is None else (tensor.dtype, tensor.shape, tensor.stride(), tensor.device)
+
+
+def call_signature(
+    quant_q_buffer, kv_pool_view, sparse_attn_indices, output, cu_q_seqlens, sequence_length,
+    mla_bmm1_scale, mla_bmm2_scale, options: tuple,
+) -> tuple:  # fmt: skip
+    """`options`: (all_sparse_indices_valid, max_sq, index_kind, local_layer_idx is None)."""
+    return (
+        options,
+        sequence_length.shape,
+        sequence_length.dtype,
+        sequence_length.stride(),
+        sequence_length.device,
+        quant_q_buffer.dtype,
+        quant_q_buffer.stride(),
+        quant_q_buffer.device,
+        kv_pool_view.dtype,
+        kv_pool_view.shape,
+        kv_pool_view.stride(),
+        kv_pool_view.device,
+        sparse_attn_indices.dtype,
+        sparse_attn_indices.stride(),
+        sparse_attn_indices.device,
+        output.dtype,
+        output.stride(),
+        output.device,
+        cu_q_seqlens.dtype,
+        cu_q_seqlens.stride(),
+        cu_q_seqlens.device,
+        _scale_signature(mla_bmm1_scale),
+        _scale_signature(mla_bmm2_scale),
+    )
+
+
+def run_accepted(
+    kernels, quant_q_buffer, kv_pool_view, sparse_attn_indices, output, cu_q_seqlens,
+    sequence_length, mla_bmm1_scale, mla_bmm2_scale, *, all_sparse_indices_valid: bool,
+    max_sq: int, index_kind: str, local_layer_idx: int | None,
+) -> tuple | None:  # fmt: skip
+    """Launch `kernels[specialization]` as `prepare_runner(...)` and its runner would (with the
+    runner's `compiled` replaced from `kernels`), when the call's signature was accepted (returns
+    None); else launch nothing and return the signature, for `accept`. Raises on a call
+    `prepare_runner` would reject for its row count, pointers or layer."""
+    global accepted_misses
+    options = (bool(all_sparse_indices_valid), int(max_sq), index_kind, local_layer_idx is None)
+    sig = call_signature(
+        quant_q_buffer, kv_pool_view, sparse_attn_indices, output, cu_q_seqlens, sequence_length,
+        mla_bmm1_scale, mla_bmm2_scale, options,
+    )  # fmt: skip
+    decision = _ACCEPTED.get(sig)
+    if decision is None:
+        accepted_misses += 1
+        return sig
+    specialization, pool_rows, device_index = decision
+    q_storage = _base._as_uint8_storage(quant_q_buffer, name="quant_q_buffer")
+    kv_storage = _base._as_uint8_storage(kv_pool_view, name="kv_pool_view")
+    total_q = q_storage.shape[0]
+    batch_size = sequence_length.shape[0]
+    if (
+        q_storage.shape != (total_q, NUM_HEADS, KV_STRIDE)
+        or not 0 < total_q <= batch_size * max_sq
+        or sparse_attn_indices.shape != (total_q, TOPK)
+        or cu_q_seqlens.shape != (batch_size + 1,)
+        or output.numel() != total_q * NUM_HEADS * L
+    ):
+        raise ValueError(
+            f"sparse MLA decode: {total_q} query rows over {batch_size} sequences do not fit "
+            f"q {tuple(q_storage.shape)}, indices {tuple(sparse_attn_indices.shape)}, "
+            f"cu_q {tuple(cu_q_seqlens.shape)}, output {output.numel()} elements"
+        )
+    if (
+        q_storage.data_ptr() | kv_storage.data_ptr() | sparse_attn_indices.data_ptr()
+    ) & 15 or output.data_ptr() & 15:
+        raise ValueError(
+            "quant_q_buffer, kv_pool_view, sparse_attn_indices and output must be 16-byte aligned"
+        )
+    if index_kind == INDEX_KIND_BASE_WITH_LAYER_OFFSET:
+        try:
+            layer = operator.index(local_layer_idx)
+        except TypeError as exc:
+            raise ValueError(
+                "index_kind=BASE_WITH_LAYER_OFFSET requires a nonnegative "
+                f"integral local_layer_idx, got {local_layer_idx!r}"
+            ) from exc
+        if layer < 0:
+            raise ValueError(
+                "index_kind=BASE_WITH_LAYER_OFFSET requires a nonnegative "
+                f"integral local_layer_idx, got {local_layer_idx!r}"
+            )
+        layer_offset = layer * KV_POOL_TOKENS_PER_BLOCK
+    else:
+        layer_offset = 0
+    device = quant_q_buffer.device
+    num_ctas_kv = specialization.num_ctas_kv
+    if specialization.use_gmem_reduction:
+        partial_o_workspace = torch.empty(
+            total_q, num_ctas_kv, NUM_HEADS, L, dtype=torch.bfloat16, device=device
+        )
+        partial_stats_workspace = torch.empty(
+            total_q, num_ctas_kv, NUM_HEADS, 2, dtype=torch.float32, device=device
+        )
+        completion_counters = _base._completion_counters(total_q, device)
+    else:
+        partial_o_workspace = output.reshape(-1)[:1]
+        partial_stats_workspace = sparse_attn_indices.view(torch.float32).reshape(-1)[:1]
+        completion_counters = cu_q_seqlens[:1]
+    kernels[specialization](
+        q_storage,
+        kv_storage.reshape(pool_rows, KV_STRIDE),
+        sparse_attn_indices,
+        output.reshape(total_q, NUM_HEADS, L),
+        cu_q_seqlens,
+        sequence_length,
+        partial_o_workspace,
+        partial_stats_workspace,
+        completion_counters,
+        layer_offset,
+        max_sq,
+        _base._current_stream(device_index),
+    )
+    return None
+
+
+def accept(signature: tuple, runner: PreparedMlaFmhaRunner) -> None:
+    """Record what `prepare_runner` decided for a signature it passed (see `run_accepted`)."""
+    if len(_ACCEPTED) < ACCEPTED_CAP:
+        _ACCEPTED[signature] = (
+            runner.specialization,
+            runner.runtime_shape.pool_rows,
+            runner.device_index,
+        )

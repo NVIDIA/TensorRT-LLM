@@ -5,6 +5,7 @@ decode row counts, and on the shared prefill GEMM at context row counts."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -150,6 +151,73 @@ def build_all(
         except Exception:  # noqa: BLE001 -- that row count goes to cuBLAS at the call site
             continue
     return runners
+
+
+class _EagerTwin:
+    """`launch(x, weight, out)` of a decode persistent-GEMM cell whose eager calls take the same
+    kernel compiled as a TVM-FFI function (CTX-HOST-DIET, TRTLLM_GLM52_CTX_HOST_DIET=1).
+
+    The cell's own launcher builds three DLPack cute tensors and packs the JIT executor's
+    arguments on every call: about 100 us of Python per call for a mixed step's q_b at 16
+    generation rows (cProfile, AI Hub 858232). The twin is the prefill GEMM's
+    `compile_persistent_gemm_tvm_ffi` of the cell's schedule and kernel name -- the same kernel
+    class, `bmm` entry, `can_implement` gate and dynamic layouts as the cell's
+    `compile_persistent_gemm`, so the same device code -- and a call checks what the cell's
+    launcher checks (shapes) plus device and 16-byte alignment, then hands the three `bmm`
+    torch views to one TVM-FFI call on torch's current stream. Calls inside a CUDA-graph
+    capture take the cell's own launcher, so captured decode graphs are unchanged.
+    """
+
+    def __init__(self, launch, fn, rows: int, n: int, k: int, orientation: str, device):
+        self.launch = launch
+        self.fn = fn
+        self.orientation = orientation
+        self.device = device
+        self.x_shape = (rows, k)
+        self.w_shape = (n, k)
+        self.out_shape = (rows, n)
+
+    def __call__(self, x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> object:
+        if torch.cuda.is_current_stream_capturing():
+            return self.launch(x, weight, out)
+        if (
+            x.shape != self.x_shape
+            or weight.shape != self.w_shape
+            or out.shape != self.out_shape
+            or x.device != self.device
+        ):
+            raise ValueError(
+                f"projection twin compiled for x {self.x_shape}, weight {self.w_shape}, out "
+                f"{self.out_shape} on {self.device}; got {tuple(x.shape)}, {tuple(weight.shape)}, "
+                f"{tuple(out.shape)} on {x.device}"
+            )
+        if (x.data_ptr() | weight.data_ptr() | out.data_ptr()) & 15:
+            raise ValueError("projection twin: x, weight and out must be 16-byte aligned")
+        if weight.requires_grad:
+            weight = weight.detach()
+        return self.fn(*_prefill._bmm_operand_views(x, weight, out, self.orientation))
+
+
+def with_eager_twin(runner: ProjectionRunner, weight: torch.Tensor) -> ProjectionRunner:
+    """`runner` with its eager calls on a TVM-FFI twin of its kernel (`_EagerTwin`) where it is
+    a plain persistent-GEMM cell, else `runner` itself. Call at load: one CuTe DSL compile and
+    one launch on zeros per cell."""
+    spec = getattr(runner.launch, "persistent", None)
+    if spec is None or spec[1] is None:
+        return runner
+    schedule, prefix = spec
+    dev = weight.device
+    x = torch.zeros([runner.rows, runner.k], dtype=runner.in_dtype, device=dev)
+    out = torch.empty([runner.rows, runner.n], dtype=runner.out_dtype, device=dev)
+    with torch.cuda.device(dev):
+        fn = _prefill.compile_persistent_gemm_tvm_ffi(
+            x, weight, out, schedule, kernel_name_prefix=prefix
+        )
+        twin = _EagerTwin(
+            runner.launch, fn, runner.rows, runner.n, runner.k, schedule.orientation, dev
+        )
+        twin(x, weight, out)
+    return dataclasses.replace(runner, launch=twin)
 
 
 #: The prefill GEMM's entry for each projection it can serve, by the target's name.

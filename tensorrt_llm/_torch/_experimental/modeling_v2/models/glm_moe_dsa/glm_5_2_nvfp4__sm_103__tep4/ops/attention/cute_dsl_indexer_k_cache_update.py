@@ -29,15 +29,21 @@ _ROWS_PER_BLOCK = (_kernel._SMALL_TOKEN_ROWS_PER_BLOCK, _kernel._FUSED_CAT_SCATT
 
 @dataclass(frozen=True)
 class CompiledIndexerKCacheUpdate:
-    """One launcher per (rows per CTA, vectorised input loads), and the flags they share."""
+    """One launcher per (rows per CTA, input load kind), and the flags they share. The load
+    kind is False / True (bf16 keys, scalar / 8-byte loads) or "f32" (`build(f32_input=True)`:
+    columns 0..127 of the context indexer projection's fp32 `[T, 160]` output, rounded to
+    bf16 on load)."""
 
-    fns: Mapping[tuple[int, bool], Callable]
+    fns: Mapping[tuple[int, bool | str], Callable]
     is_neox: bool
     cache_contiguous: bool
 
 
-def build(device_id: int, *, is_neox: bool, cache_contiguous: bool) -> CompiledIndexerKCacheUpdate:
-    """Compile the four launchers a step can need: 2 or 8 rows per CTA, scalar or 8-byte loads.
+def build(
+    device_id: int, *, is_neox: bool, cache_contiguous: bool, f32_input: bool = False
+) -> CompiledIndexerKCacheUpdate:
+    """Compile the four launchers a step can need: 2 or 8 rows per CTA, scalar or 8-byte loads;
+    with `f32_input` also the two fp32-key launchers.
 
     `cache_contiguous` must describe every cache view the launchers will write:
     the contiguous variant addresses a strided per-layer view as if it were
@@ -57,6 +63,15 @@ def build(device_id: int, *, is_neox: bool, cache_contiguous: bool) -> CompiledI
                     cache_contiguous=bool(cache_contiguous),
                 )
             )
+        if f32_input:
+            fns[(rows_per_block, "f32")] = _kernel.compile_indexer_k_norm_rope_fp8_cache_update(
+                device_id=device_id,
+                use_ue8m0=True,
+                is_neox=bool(is_neox),
+                rows_per_block=rows_per_block,
+                cache_contiguous=bool(cache_contiguous),
+                f32_input=True,
+            )
     return CompiledIndexerKCacheUpdate(
         fns=fns, is_neox=bool(is_neox), cache_contiguous=bool(cache_contiguous)
     )
@@ -65,7 +80,9 @@ def build(device_id: int, *, is_neox: bool, cache_contiguous: bool) -> CompiledI
 class CuteDslIndexerKCacheUpdate(OpWrapper):
     """Turn this step's pre-norm indexer keys into indexer K cache entries, in place.
 
-    For each of the first `num_tokens` rows of `indexer_k` (`[T, 128]` bf16):
+    For each of the first `num_tokens` rows of `indexer_k` (`[T, 128]` bf16, or the fp32
+    key columns of the context indexer projection's `[T, 160]` output, row pitch 160, which
+    are rounded to bf16 first):
 
     1. LayerNorm over the row (`eps = 1e-6`, fp32 `norm_weight` / `norm_bias`),
        rounded to bf16;
@@ -152,7 +169,10 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
         validate: bool = False,
     ) -> torch.Tensor:
         rows_per_block = _kernel._select_rows_per_block(int(num_tokens))
-        vectorized = _kernel._can_vectorize_loads(indexer_k)
+        if indexer_k.dtype == torch.float32:
+            vectorized = "f32"
+        else:
+            vectorized = _kernel._can_vectorize_loads(indexer_k)
         _kernel.indexer_k_norm_rope_fp8_cache_update(
             indexer_k,
             norm_weight,
@@ -195,7 +215,8 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
         """
         n = int(num_tokens)
         dev = indexer_k.device
-        x = indexer_k[:n].double()
+        # fp32 keys are the projection's output, which the bf16 path reads after the split.
+        x = indexer_k[:n].to(torch.bfloat16).double()
         mean = x.mean(dim=-1, keepdim=True)
         var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
         normed = (x - mean) * torch.rsqrt(

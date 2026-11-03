@@ -11,6 +11,7 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from ...kernels.common.cuda_stream import raw_stream as _raw_stream
 from ...kernels.norm import self_attn_qkv_a_rmsnorm as _kernel
 
 #: GLM-5.2's fused `q_a | kv_a | k_pe` projection: 2048 + 512 + 64 columns.
@@ -105,7 +106,7 @@ _STREAMS: dict[int, object] = {}
 
 def _stream(device):
     """The `CUstream` of `device`'s current torch stream, built once per stream."""
-    handle = torch.cuda.current_stream(device=device).cuda_stream
+    handle = _raw_stream(device)
     stream = _STREAMS.get(handle)
     if stream is None:
         stream = _STREAMS[handle] = _kernel.cuda.CUstream(handle)

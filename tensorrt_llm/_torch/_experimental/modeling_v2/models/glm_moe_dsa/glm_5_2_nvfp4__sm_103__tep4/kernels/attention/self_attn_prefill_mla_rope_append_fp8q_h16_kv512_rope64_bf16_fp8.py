@@ -56,6 +56,8 @@ from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
+from ..common.cuda_stream import raw_stream as _raw_stream
+
 NUM_HEADS = 16
 KV_LORA_RANK = 512
 QK_NOPE_HEAD_DIM = 192
@@ -180,7 +182,7 @@ def _device_index(tensor: torch.Tensor) -> int:
 
 
 def _current_stream(device_index: int) -> cuda.CUstream:
-    return cuda.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
+    return cuda.CUstream(_raw_stream(device_index))
 
 
 # ----------------------------------------------------------------------------- device helpers
@@ -1185,3 +1187,108 @@ def prepare_runner(
         specialization=spec,
         owners=(kv_cache_storage,) if isinstance(kv_cache_storage, torch.Tensor) else (),
     )
+
+
+# ----------------------------------------------------------------------------- CTX-HOST-DIET: steady state
+#: TRTLLM_GLM52_CTX_HOST_DIET=1: the call signatures `prepare_runner` has passed. A signature fixes every
+#: input `prepare_runner` checks or keys its specialization on except the row count, the request count
+#: and the pointers: the options, every dtype, stride (row-count independent here) and device, the
+#: tensors left None, and the rope table's shape. `run_accepted` launches a call whose signature is
+#: here with exactly the arguments `prepare_runner` would bind, after the checks the signature leaves
+#: open. No torch tensor is held. Bounded: a full table only misses (no eviction).
+_ACCEPTED: set[tuple] = set()
+ACCEPTED_CAP = 64
+#: Calls `run_accepted` sent back to `prepare_runner` (signature not accepted yet).
+accepted_misses = 0
+
+
+def call_signature(
+    fused_q, q_pe, latent_cache, quant_q_buffer, kv_cache_block_offsets, cu_seqlens, cached_lens,
+    rotary_cos_sin, options: tuple,
+) -> tuple:  # fmt: skip
+    """`options`: (tokens_per_block, skip_q_base, q_in_place, q_e4m3, merge_rope, skip_kv_copy,
+    rope_par), as `prepare_runner` takes them."""
+    return (
+        options,
+        None if fused_q is None else (fused_q.dtype, fused_q.stride(), fused_q.device),
+        q_pe.dtype,
+        q_pe.stride(),
+        q_pe.device,
+        latent_cache.dtype,
+        latent_cache.stride(),
+        latent_cache.device,
+        None
+        if quant_q_buffer is None
+        else (quant_q_buffer.dtype, quant_q_buffer.stride(), quant_q_buffer.device),
+        kv_cache_block_offsets.dtype,
+        kv_cache_block_offsets.dim(),
+        kv_cache_block_offsets.device,
+        cu_seqlens.dtype,
+        cu_seqlens.device,
+        cached_lens.dtype,
+        cached_lens.dim(),
+        cached_lens.device,
+        rotary_cos_sin.dtype,
+        rotary_cos_sin.shape,
+        rotary_cos_sin.stride(),
+        rotary_cos_sin.device,
+    )
+
+
+def run_accepted(
+    compiled, fused_q, q_pe, latent_cache, quant_q_buffer, kv_cache_storage: int,
+    kv_cache_block_offsets, cu_seqlens, cached_lens, rotary_cos_sin, options: tuple,
+) -> tuple | None:  # fmt: skip
+    """Launch `compiled` as `prepare_runner(..., **options)` and its runner would, when the call's
+    signature was accepted (returns None); else launch nothing and return the signature, for
+    `accept` once `prepare_runner` has passed the call. Raises on a call `prepare_runner` would
+    reject for its row count, request count or pointers."""
+    global accepted_misses
+    sig = call_signature(
+        fused_q, q_pe, latent_cache, quant_q_buffer, kv_cache_block_offsets, cu_seqlens,
+        cached_lens, rotary_cos_sin, options,
+    )  # fmt: skip
+    if sig not in _ACCEPTED:
+        accepted_misses += 1
+        return sig
+    t = q_pe.shape[0]
+    b = kv_cache_block_offsets.shape[0]
+    if options[2]:  # q_in_place
+        fused_q, quant_q_buffer = _q_in_place_placeholders(q_pe.device)
+    else:
+        _require(
+            fused_q.shape == (t, NUM_HEADS, HEAD_SIZE)
+            and quant_q_buffer.shape == (t, NUM_HEADS, HEAD_SIZE),
+            "fused_q / quant_q_buffer must be [T,16,576]",
+        )
+    _require(
+        q_pe.shape == (t, NUM_HEADS, ROPE_DIM) and latent_cache.shape == (t, HEAD_SIZE),
+        "q_pe must be [T,16,64] and latent_cache [T,576]",
+    )
+    _require(
+        kv_cache_block_offsets.shape[1] == 2 and kv_cache_block_offsets.is_contiguous(),
+        "block_offsets must be a contiguous [B,2,max_blocks]",
+    )
+    _require(0 < b <= MAX_REQUESTS, "num_requests must be in [1,MAX_REQUESTS]")
+    _require(cu_seqlens.numel() >= b + 1 and cached_lens.shape == (b,), "cu_seqlens / cached_lens")
+    pointer = int(kv_cache_storage)
+    _require(pointer > 0 and pointer % 16 == 0, "kv_cache_storage pointer alignment")
+    _require(
+        not (
+            (fused_q.data_ptr() | q_pe.data_ptr() | latent_cache.data_ptr()) & 15
+            or quant_q_buffer.data_ptr() & 7
+            or rotary_cos_sin.data_ptr() & 15
+        ),
+        "fused_q / q_pe / latent_cache / rotary_cos_sin 16-byte, quant_q_buffer 8-byte aligned",
+    )
+    compiled(
+        fused_q, q_pe, latent_cache, quant_q_buffer, pointer, kv_cache_block_offsets, cu_seqlens,
+        cached_lens, rotary_cos_sin.reshape(-1, ROPE_DIM, 2), _current_stream(_device_index(fused_q)),
+    )  # fmt: skip
+    return None
+
+
+def accept(signature: tuple) -> None:
+    """Record a signature `prepare_runner` has passed (see `run_accepted`)."""
+    if len(_ACCEPTED) < ACCEPTED_CAP:
+        _ACCEPTED.add(signature)

@@ -112,6 +112,7 @@ import torch
 from cutlass.experimental import primitives as prims
 
 from ..common import compat48 as _compat48
+from ..common.cuda_stream import raw_stream as _raw_stream
 
 QK_HEAD_DIM = 256
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
@@ -2726,7 +2727,7 @@ def _device_index(tensor: torch.Tensor) -> int:
 
 
 def _current_stream(device_index: int) -> cuda_driver.CUstream:
-    return cuda_driver.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
+    return cuda_driver.CUstream(_raw_stream(device_index))
 
 
 def _select_num_ctas_kv(

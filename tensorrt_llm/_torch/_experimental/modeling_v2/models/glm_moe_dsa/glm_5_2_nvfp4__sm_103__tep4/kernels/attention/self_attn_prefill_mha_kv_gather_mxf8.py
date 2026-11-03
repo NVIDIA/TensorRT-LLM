@@ -58,6 +58,8 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
 
+from ..common.cuda_stream import raw_stream as _raw_stream
+
 LAT = 576  # 512 latent + 64 rope, one pool row in e4m3 bytes
 KV_LORA = 512
 _VEC = 8  # elements per thread chunk
@@ -441,7 +443,7 @@ def gather(
         tokens_per_block,
         1 if new_dst_from_idx else 0,
         padded_rows(rows) // _ROWS_PER_CTA,
-        torch.cuda.current_stream(dev).cuda_stream,
+        _raw_stream(dev),
     )
 
 

@@ -51,6 +51,7 @@ import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
+from ..common.cuda_stream import raw_stream as _raw_stream
 from . import self_attn_prefill_projections_mxf8 as _proj
 
 _bs = _proj._bs  # the CuTe DSL dense block-scaled persistent GEMM example module
@@ -1086,6 +1087,6 @@ class Mxf8SwigluProjection:
             rows,
             GATE_UP,
             HIDDEN,
-            torch.cuda.current_stream(x.device).cuda_stream,
+            _raw_stream(x.device),
         )
         return out

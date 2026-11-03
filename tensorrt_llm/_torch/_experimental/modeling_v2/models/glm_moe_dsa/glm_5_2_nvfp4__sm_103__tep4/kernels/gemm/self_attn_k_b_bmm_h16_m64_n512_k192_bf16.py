@@ -42,6 +42,7 @@ import torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.utils import create_cute_tensor_for_fp8
 
+from ..common.cuda_stream import DIET as _HOST_DIET
 from . import _swapped_dense_gemm_pdl_chain as _swappeddensegemmpdlchain
 from . import _swapped_dense_gemm_persistent as _swappeddensegemmpersistent
 
@@ -264,6 +265,156 @@ def reject_unpredicated_store(
         )
 
 
+def _make_gemm(
+    schedule: GemmSchedule,
+    pdl_role: PersistentPdlRole | None,
+    mxf8_side: Mxf8SideOutput | None,
+):
+    """The persistent GEMM kernel object of one build: the library kernel, or its PDL-chain
+    variant (with the MXF8 side output when given)."""
+    if pdl_role is None:
+        return _GlmPersistentDenseGemmKernel(
+            cutlass.Float32,
+            schedule.use_2cta_instrs,
+            schedule.mma_tiler_mn,
+            schedule.cluster_shape_mn,
+            schedule.use_tma_store,
+            schedule.swizzle_size,
+            schedule.raster_along,
+        )
+    return make_pdl_chain_kernel(schedule, pdl_role, mxf8_side)
+
+
+def _kernel_name_prefix(
+    abi: BatchedGemmAbi,
+    pdl_role: PersistentPdlRole | None,
+    *,
+    emit_fp8_q_base: bool,
+    mxf8_side: Mxf8SideOutput | None,
+) -> str:
+    """The kernel symbol prefix of one build (serving validators read its suffixes)."""
+    kernel_name_prefix = abi.kernel_name_prefix
+    if emit_fp8_q_base:
+        kernel_name_prefix = f"{kernel_name_prefix}{FP8_Q_BASE_KERNEL_SUFFIX}"
+    if mxf8_side is not None:
+        kernel_name_prefix = f"{kernel_name_prefix}{MXF8_SIDE_KERNEL_SUFFIX}"
+    if pdl_role is not None:
+        kernel_name_prefix = f"{kernel_name_prefix}_pdl_chain"
+        if pdl_role.signal_after_wait:
+            kernel_name_prefix = f"{kernel_name_prefix}_es"
+    return kernel_name_prefix
+
+
+@dataclass(frozen=True)
+class EagerBatchedGemm:
+    """A BF16 build's kernel as a TVM-FFI function, for eager calls (CTX-HOST-DIET).
+
+    `CompiledBatchedGemm` builds three DLPack cute tensors and packs the JIT executor's
+    arguments on every call: about 100 us of Python per call for a mixed step's K-B / V-B
+    at 16 generation rows (cProfile, AI Hub 858232). This is `_compile`'s kernel for the same
+    arguments -- same kernel object (`_make_gemm`), `can_implement` gate, symbol prefix,
+    `bmm` entry and dynamic layouts (`from_dlpack(assumed_align=16)` with the same stride-1
+    modes) -- exported with `--enable-tvm-ffi`, so the same device code: a call checks the
+    row count, every shape and stride against the build's, the device and 16-byte alignment,
+    then hands the three `bmm` torch views to one TVM-FFI call on torch's current stream.
+    (`_validate_contract`'s remaining terms -- BF16, one device -- are checked too.)
+    """
+
+    heads: int
+    k: int
+    n: int
+    rows_allowed: frozenset[int]
+    input_stride: tuple[int, ...]
+    weight_stride: tuple[int, ...]
+    output_stride: tuple[int, ...]
+    device: torch.device
+    fn: Callable
+
+    def __call__(self, input_tensor: torch.Tensor, weight: torch.Tensor, output: torch.Tensor):
+        rows = input_tensor.shape[1]
+        if (
+            rows not in self.rows_allowed
+            or input_tensor.shape != (self.heads, rows, self.k)
+            or weight.shape != (self.heads, self.n, self.k)
+            or output.shape != (self.heads, rows, self.n)
+            or input_tensor.stride() != self.input_stride
+            or weight.stride() != self.weight_stride
+            or output.stride() != self.output_stride
+            or input_tensor.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or input_tensor.device != self.device
+            or weight.device != self.device
+            or output.device != self.device
+        ):
+            raise ValueError(
+                f"eager batched GEMM: rows {sorted(self.rows_allowed)}, strides "
+                f"{self.input_stride} / {self.weight_stride} / {self.output_stride} on "
+                f"{self.device}; got input {tuple(input_tensor.shape)} {input_tensor.stride()}, "
+                f"weight {tuple(weight.shape)} {weight.stride()}, output "
+                f"{tuple(output.shape)} {output.stride()} on {input_tensor.device}"
+            )
+        if (input_tensor.data_ptr() | weight.data_ptr() | output.data_ptr()) & 15:
+            raise ValueError("eager batched GEMM: operands must be 16-byte aligned")
+        if weight.requires_grad:
+            weight = weight.detach()
+        return self.fn(weight, input_tensor.transpose(1, 2), output.transpose(1, 2))
+
+
+def _compile_eager(
+    abi: BatchedGemmAbi,
+    schedule: GemmSchedule,
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    pdl_role: PersistentPdlRole | None,
+    rows_allowed: tuple[int, ...],
+) -> EagerBatchedGemm:
+    """`EagerBatchedGemm` of the BF16 build `_compile` makes for these arguments."""
+    a, b, c = (
+        from_dlpack(view, assumed_align=_ALIGNMENT_BYTES, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+        for view, leading_dim in (
+            (weight.detach(), 2),
+            (input_tensor.transpose(1, 2), 1),
+            (output.transpose(1, 2), 1),
+        )
+    )
+    mnkl = (abi.output_features, abi.active_m, abi.input_features, abi.num_heads)
+    cluster_size = schedule.cluster_shape_mn[0] * schedule.cluster_shape_mn[1]
+    max_active_clusters = _DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(cluster_size)
+    gemm = _make_gemm(schedule, pdl_role, None)
+    if not gemm.can_implement(mnkl, a.element_type, b.element_type, c.element_type, "k", "k", "m"):
+        raise ValueError(f"{abi.module_name}: persistent schedule cannot implement {mnkl}")
+    gemm.kernel.set_name_prefix(
+        _kernel_name_prefix(abi, pdl_role, emit_fp8_q_base=False, mxf8_side=None),
+        remove_cutlass_symbol=True,
+    )
+    fn = cute.compile(
+        _DENSE_GEMM.bmm,
+        gemm,
+        a,
+        b,
+        c,
+        max_active_clusters,
+        make_fake_stream(use_tvm_ffi_env_stream=True),
+        lambda x: x,
+        options="--enable-tvm-ffi",
+    )
+    return EagerBatchedGemm(
+        abi.num_heads,
+        abi.input_features,
+        abi.output_features,
+        frozenset(int(m) for m in rows_allowed),
+        tuple(input_tensor.stride()),
+        tuple(weight.stride()),
+        tuple(output.stride()),
+        input_tensor.device,
+        fn,
+    )
+
+
 def _compile(
     abi: BatchedGemmAbi,
     schedule: GemmSchedule,
@@ -303,18 +454,7 @@ def _compile(
     cluster_size = schedule.cluster_shape_mn[0] * schedule.cluster_shape_mn[1]
     dense_gemm = _DENSE_GEMM
     max_active_clusters = dense_gemm.utils.HardwareInfo().get_max_active_clusters(cluster_size)
-    if pdl_role is None:
-        gemm = _GlmPersistentDenseGemmKernel(
-            cutlass.Float32,
-            schedule.use_2cta_instrs,
-            schedule.mma_tiler_mn,
-            schedule.cluster_shape_mn,
-            schedule.use_tma_store,
-            schedule.swizzle_size,
-            schedule.raster_along,
-        )
-    else:
-        gemm = make_pdl_chain_kernel(schedule, pdl_role, mxf8_side)
+    gemm = _make_gemm(schedule, pdl_role, mxf8_side)
     if not gemm.can_implement(
         mnkl,
         a.element_type,
@@ -325,17 +465,8 @@ def _compile(
         "m",
     ):
         raise ValueError(f"{abi.module_name}: persistent schedule cannot implement {mnkl}")
-    kernel_name_prefix = abi.kernel_name_prefix
-    if emit_fp8_q_base:
-        kernel_name_prefix = f"{kernel_name_prefix}{FP8_Q_BASE_KERNEL_SUFFIX}"
-    if mxf8_side is not None:
-        kernel_name_prefix = f"{kernel_name_prefix}{MXF8_SIDE_KERNEL_SUFFIX}"
-    if pdl_role is not None:
-        kernel_name_prefix = f"{kernel_name_prefix}_pdl_chain"
-        if pdl_role.signal_after_wait:
-            kernel_name_prefix = f"{kernel_name_prefix}_es"
     gemm.kernel.set_name_prefix(
-        kernel_name_prefix,
+        _kernel_name_prefix(abi, pdl_role, emit_fp8_q_base=emit_fp8_q_base, mxf8_side=mxf8_side),
         remove_cutlass_symbol=True,
     )
     compiled_bmm = cute.compile(
@@ -386,6 +517,10 @@ def make_build(
         MXF8 into the fixed buffers it names (``Mxf8SideOutput``). Default off.
     """
     compiled_by_layout: dict[tuple[object, ...], CompiledBatchedGemm] = {}
+    # CTX-HOST-DIET: the BF16 builds' eager calls take `EagerBatchedGemm` (built beside the
+    # first compile, which the target makes at load); captured calls keep `compiled`.
+    eager_by_layout: dict[tuple[object, ...], EagerBatchedGemm] = {}
+    want_eager = _HOST_DIET and not emit_fp8_q_base and mxf8_side is None
     rows_allowed = tuple(m_rows_allowed) or (int(abi.active_m),)
     reject_unpredicated_store(
         abi.module_name, schedule, rows_allowed, emit_fp8_q_base=emit_fp8_q_base
@@ -393,13 +528,16 @@ def make_build(
 
     def build() -> CompiledBatchedGemm:
         compiled: CompiledBatchedGemm | None = None
+        eager: EagerBatchedGemm | None = None
 
         def run_bmm(
             input_tensor: torch.Tensor,
             weight: torch.Tensor,
             output: torch.Tensor,
         ) -> object:
-            nonlocal compiled
+            nonlocal compiled, eager
+            if eager is not None and not torch.cuda.is_current_stream_capturing():
+                return eager(input_tensor, weight, output)
             rows = int(input_tensor.shape[1]) if input_tensor.ndim == 3 else -1
             if rows not in rows_allowed:
                 raise ValueError(
@@ -439,6 +577,18 @@ def make_build(
                         mxf8_side=mxf8_side,
                     )
                     compiled_by_layout[key] = compiled
+                if want_eager and not torch.cuda.is_current_stream_capturing():
+                    eager = eager_by_layout.get(key)
+                    if eager is None:
+                        eager = eager_by_layout[key] = _compile_eager(
+                            dataclasses.replace(abi, active_m=rows),
+                            schedule,
+                            input_tensor,
+                            weight,
+                            output,
+                            pdl_role,
+                            rows_allowed,
+                        )
             return compiled(input_tensor, weight, output)
 
         return run_bmm

@@ -129,6 +129,8 @@ import cutlass.experimental.cuda as cuda
 import torch
 from cutlass.experimental import primitives as prims
 
+from ..common.cuda_stream import raw_stream as _raw_stream
+
 IO_DTYPE = cutlass.Float8E4M3FN
 OUT_DTYPE = cutlass.BFloat16
 ACC_DTYPE = cutlass.Float32
@@ -379,7 +381,7 @@ def _device_index(tensor: torch.Tensor) -> int:
 
 
 def _current_stream(device_index: int) -> cuda_driver.CUstream:
-    return cuda_driver.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
+    return cuda_driver.CUstream(_raw_stream(device_index))
 
 
 def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:

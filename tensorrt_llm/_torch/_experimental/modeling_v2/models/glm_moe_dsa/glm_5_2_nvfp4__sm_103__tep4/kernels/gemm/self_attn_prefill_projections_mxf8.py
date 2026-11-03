@@ -63,6 +63,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
+from ..common.cuda_stream import raw_stream as _raw_stream
 from . import dense_blockscaled_gemm_persistent as _bs
 
 _SF_VEC = 32
@@ -370,7 +371,7 @@ class Mxf8Projection:
             rows,
             n,
             k,
-            torch.cuda.current_stream(x.device).cuda_stream,
+            _raw_stream(x.device),
         )
         return out
 
@@ -448,7 +449,7 @@ class Mxf8PrequantProjection:
             rows,
             n,
             k,
-            torch.cuda.current_stream(a8.device).cuda_stream,
+            _raw_stream(a8.device),
         )
         return out
 
