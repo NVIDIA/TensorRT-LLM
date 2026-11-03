@@ -3664,13 +3664,11 @@ def dspark_context_attention_window(model_dir: str,
     """
     from tensorrt_llm._torch.model_config import hf_remote_code_lock
     from tensorrt_llm._torch.pyexecutor.config_utils import (
-        MINIMAX_DSPARK_DRAFT_ARCH, is_mla, load_pretrained_config)
+        is_mla_dspark_drafter, load_pretrained_config)
     with hf_remote_code_lock():
         config = load_pretrained_config(model_dir,
                                         trust_remote_code=trust_remote_code)
-    architectures = getattr(config, "architectures", None) or []
-    if not (architectures and architectures[0]
-            == MINIMAX_DSPARK_DRAFT_ARCH) and is_mla(config):
+    if is_mla_dspark_drafter(config):
         return None
     return dflash_context_attention_window(config)
 
