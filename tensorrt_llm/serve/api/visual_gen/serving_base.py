@@ -1,16 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""Shared state and helpers of the VisualGen serving classes."""
 
+import asyncio
 from http import HTTPStatus
-from typing import Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
 from fastapi.responses import Response
 
+from tensorrt_llm.serve._base.serving import BaseServing
 from tensorrt_llm.serve.api.visual_gen.utils import \
     local_media_path_is_disallowed
 
+if TYPE_CHECKING:
+    from tensorrt_llm._utils import AdjustedSteadyClock
+    from tensorrt_llm.visual_gen.params import VisualGenParams
+    from tensorrt_llm.visual_gen.visual_gen import VisualGen, VisualGenResult
 
-class VisualGenBaseServing:
+
+class VisualGenBaseServing(BaseServing):
+    """Shared state and helpers of the VisualGen serving classes."""
+
+    def __init__(self, *, generator: "VisualGen", model: str,
+                 media_storage_path: Path,
+                 adjusted_clock: "AdjustedSteadyClock") -> None:
+        self.generator = generator
+        self.model = model
+        self.media_storage_path = media_storage_path
+        self._adjusted_steady_clock = adjusted_clock
+
+    async def _generate(self, prompt: str,
+                        params: "VisualGenParams") -> "VisualGenResult":
+        """Submit one generation off the event loop; return its handle.
+
+        ``generate_async`` resolves and enqueues synchronously, so it runs in a
+        worker thread. Callers await the handle (``await handle.aresult()``) or
+        hand it to a background task.
+        """
+        return await asyncio.to_thread(self.generator.generate_async, prompt,
+                                       params)
 
     def _reject_disabled_path(
             self, response_format: Optional[str]) -> Optional[Response]:

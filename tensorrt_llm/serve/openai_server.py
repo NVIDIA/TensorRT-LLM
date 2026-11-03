@@ -6,6 +6,7 @@ import array
 import asyncio
 import base64
 import functools
+import importlib
 import json
 import os
 import re
@@ -78,11 +79,6 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
-from tensorrt_llm.serve.api.visual_gen.errors import \
-    render_visual_gen_validation_error
-from tensorrt_llm.serve.api.visual_gen.media import _resolve_media_dir
-from tensorrt_llm.serve.api.visual_gen.serving_videos import \
-    VideoServing as _VideoRoutesMixin
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -460,7 +456,7 @@ def resolve_spec_decode_num_spec_tokens(args: Any) -> Optional[int]:
     return getattr(spec_config, "max_draft_len", None)
 
 
-class OpenAIServer(_VideoRoutesMixin):
+class OpenAIServer:
 
     @staticmethod
     def _iteration_stats_buffer_maxlen(
@@ -781,7 +777,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 return anthropic_error_response(str(exc),
                                                 "invalid_request_error", 400)
             if self.server_role is ServerRole.VISUAL_GEN:
-                return render_visual_gen_validation_error(
+                return self._visual_gen_api.render_visual_gen_validation_error(
                     exc, self.create_error_response)
             # Non-visual-gen roles keep the shared 400 + ``{"error": ...}``
             # response shape that integration tests (e.g.
@@ -802,10 +798,6 @@ class OpenAIServer(_VideoRoutesMixin):
         # health API exists.
         self.app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
-        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
-        # Runs before the role dispatch for now. It moves after the dispatch
-        # once the serving objects attach_router checks for are built per
-        # role.
 
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
@@ -826,6 +818,10 @@ class OpenAIServer(_VideoRoutesMixin):
             self._register_launcher_forwarding_routes()
             self.register_routes()
 
+        # Attach routers after the role switch: every attach_router checks
+        # that its serving objects are on app.state.
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+
         if self._collect_perf_metrics:
             self.app.add_middleware(PerfMetricsMiddleware,
                                     expose_headers=self._expose_perf_metrics,
@@ -837,9 +833,6 @@ class OpenAIServer(_VideoRoutesMixin):
     def _init_visual_gen(self):
         self.processor = None
         self.model_config = None
-        self.media_storage_path = _resolve_media_dir()
-        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
-        self.video_gen_tasks = {}
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -1407,48 +1400,24 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def register_visual_gen_routes(self):
-        """Register routes for diffusion model serving."""
+        """Wire VisualGen serving for the VISUAL_GEN role.
+
+        The VisualGen routes come from their RouterSpec; /metrics is
+        registered here, not by a router.
+        """
+        # The only place outside serve/api/visual_gen/ that loads it, besides
+        # attach_routers through the VisualGen RouterSpec.
+        self._visual_gen_api = importlib.import_module(
+            "tensorrt_llm.serve.api.visual_gen.api_router")
+        self.media_storage_path = self._visual_gen_api.init_serving_state(
+            self.app.state,
+            generator=self.generator,
+            model=self.model,
+            adjusted_clock=self._adjusted_steady_clock)
+        logger.info(f"VisualGen media storage path: {self.media_storage_path}")
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
-
-        # Image generation endpoints (OpenAI compatible)
-        self.app.add_api_route("/v1/images/generations",
-                               self.openai_image_generation,
-                               methods=["POST"])
-        self.app.add_api_route("/v1/images/edits",
-                               self.openai_image_edit,
-                               methods=["POST"])
-        self.app.add_api_route("/v1/images/{image_id}/content",
-                               self.get_image_content,
-                               methods=["GET"])
-
-        # Video generation endpoints (Extended OpenAI API)
-        # Asynchronous video generation (returns immediately with job metadata, OpenAI API)
-        self.app.add_api_route("/v1/videos",
-                               self.openai_video_generation_async,
-                               methods=["POST"])
-        # Synchronous video generation (waits for completion, extended API)
-        self.app.add_api_route("/v1/videos/sync",
-                               self.openai_video_generation_sync,
-                               methods=["POST"])
-        # Deprecated alias of /v1/videos/sync, retained for upstream
-        # back-compat after the rename; both hit the same sync handler.
-        self.app.add_api_route("/v1/videos/generations",
-                               self.openai_video_generation_sync,
-                               methods=["POST"],
-                               deprecated=True)
-        # Video management endpoints
-        self.app.add_api_route("/v1/videos", self.list_videos, methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}",
-                               self.get_video_metadata,
-                               methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}/content",
-                               self.get_video_content,
-                               methods=["GET"])
-        self.app.add_api_route("/v1/videos/{video_id}",
-                               self.delete_video,
-                               methods=["DELETE"])
 
     async def data_transceiver_state(self) -> JSONResponse:
         """Return the serialized DataTransceiverState as base64-encoded JSON."""

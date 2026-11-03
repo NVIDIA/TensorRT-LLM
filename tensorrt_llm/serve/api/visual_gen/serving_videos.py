@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""VisualGen video endpoints: ``VideoServing`` and its module helpers."""
 
 from __future__ import annotations
 
@@ -31,11 +32,13 @@ from tensorrt_llm.serve.api.visual_gen.protocol import (
     VideoJob,
     VideoJobList,
 )
+from tensorrt_llm.serve.api.visual_gen.serving_base import VisualGenBaseServing
 from tensorrt_llm.serve.api.visual_gen.utils import VIDEO_STORE, parse_visual_gen_params
 
 if TYPE_CHECKING:
+    from tensorrt_llm._utils import AdjustedSteadyClock
     from tensorrt_llm.visual_gen.params import VisualGenParams
-    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+    from tensorrt_llm.visual_gen.visual_gen import VisualGen, VisualGenResult
 
 
 def _video_content_type(suffix: str) -> str:
@@ -124,7 +127,26 @@ def _path_json_video_response(
     return JSONResponse(content={"id": video_id, "output_path": str(path)}, headers=headers)
 
 
-class VideoServing:
+class VideoServing(VisualGenBaseServing):
+    """Video generation endpoints (sync, async jobs, listing, metadata, content, delete)."""
+
+    def __init__(
+        self,
+        *,
+        generator: VisualGen,
+        model: str,
+        media_storage_path: Path,
+        adjusted_clock: AdjustedSteadyClock,
+    ) -> None:
+        super().__init__(
+            generator=generator,
+            model=model,
+            media_storage_path=media_storage_path,
+            adjusted_clock=adjusted_clock,
+        )
+        # Background generation tasks by video id (instance state).
+        self.video_gen_tasks: dict[str, asyncio.Task] = {}
+
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
 
@@ -158,9 +180,7 @@ class VideoServing:
                 sync_video_start = time.perf_counter()
                 # Awaited, not fire-and-forget: bad media / bad params must
                 # surface as a 400 rather than a failed job.
-                handle = await asyncio.to_thread(
-                    self.generator.generate_async, request.prompt, params
-                )
+                handle = await self._generate(request.prompt, params)
                 output = await handle.aresult()
             except ValidationError as exc:
                 return render_visual_gen_validation_error(exc, self.create_error_response)
@@ -380,7 +400,7 @@ class VideoServing:
 
             # Awaited before the 202, so bad media / unknown extra_params are a
             # 400 rather than a queued job that later fails.
-            handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
+            handle = await self._generate(request.prompt, params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.

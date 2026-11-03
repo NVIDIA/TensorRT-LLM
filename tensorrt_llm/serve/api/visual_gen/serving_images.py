@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""VisualGen image endpoints: ``ImageServing`` and its module helpers."""
 
-import asyncio
 import base64
 import json
 import time
@@ -26,6 +26,7 @@ from tensorrt_llm.serve.api.visual_gen.protocol import (ImageEditRequest,
                                                         ImageGenerationRequest,
                                                         ImageGenerationResponse,
                                                         ImageObject)
+from tensorrt_llm.serve.api.visual_gen.serving_base import VisualGenBaseServing
 from tensorrt_llm.serve.api.visual_gen.utils import parse_visual_gen_params
 
 
@@ -65,12 +66,10 @@ def _image_output_size(image) -> Optional[str]:
     return f"{width}x{height}"
 
 
-class ImageServing:
+class ImageServing(VisualGenBaseServing):
+    """Image generation and editing endpoints (generation, edit, content)."""
 
     def _supports_image_edit(self) -> bool:
-        if not self._is_visual_gen:
-            return False
-
         executor = getattr(self.generator, "executor", None)
         if executor is None:
             return False
@@ -121,8 +120,7 @@ class ImageServing:
                 image_gen_start = time.perf_counter()
                 # Offload the blocking resolve/enqueue off the event loop but
                 # await it (bad params → 400 here); then await generation.
-                handle = await asyncio.to_thread(self.generator.generate_async,
-                                                 request.prompt, params)
+                handle = await self._generate(request.prompt, params)
                 output = await handle.aresult()
             except ValueError as exc:
                 logger.error(f"Image request error: {exc}")

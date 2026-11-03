@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+"""Base class of the serving classes under ``tensorrt_llm/serve/api/``."""
 
 from http import HTTPStatus
 from typing import Union
@@ -12,6 +13,12 @@ from tensorrt_llm.serve.openai_protocol import ErrorResponse
 
 
 class BaseServing:
+    """Base of every serving class.
+
+    Holds only what all serving classes share; each subclass receives its
+    dependencies as explicit constructor arguments, never by reading the
+    server object.
+    """
 
     @staticmethod
     def create_error_response(

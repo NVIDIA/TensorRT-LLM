@@ -871,6 +871,7 @@ files = [
     "tensorrt_llm/serve/_base/routing.py",
     "tensorrt_llm/serve/api/ops/system/api_router.py",
     "tensorrt_llm/serve/api/ops/system/serving.py",
+    "tensorrt_llm/serve/api/visual_gen/api_router.py",
     "tensorrt_llm/serve/api/visual_gen/errors.py",
     "tests/unittest/_torch/sampler/test_torch_sampler.py",
     "tests/unittest/_torch/sampler/test_token_ban.py",
