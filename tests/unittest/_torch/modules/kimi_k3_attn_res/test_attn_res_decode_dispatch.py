@@ -128,6 +128,9 @@ class _FakeMoE(nn.Module):
         shared = (hidden_states.float() * -0.25).to(torch.bfloat16)
         return routed, shared
 
+    def moe_front_releases_early(self, like):
+        return False
+
 
 def _fake_layer(layer_idx: int, seed: int):
     layer = mkl.KimiLinearDecoderLayer.__new__(mkl.KimiLinearDecoderLayer)

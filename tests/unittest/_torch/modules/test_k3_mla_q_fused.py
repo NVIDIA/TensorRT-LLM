@@ -497,6 +497,7 @@ def _mla_stand_in(w, md, rot, qkv):
         k_b_proj_trans=w.w_uk,
         k_b_proj_trans_dequant=None,
         _q_b_block_exponents=None,
+        _helix_tail_gate_behind_kv=False,
         _project_qkv_a=lambda hidden_states, prequantized_input: qkv,
         _q_a_layernorm_maybe_fused=lambda q: rmsnorm(q, w.q_norm, EPS),
         _attn_forward_gen=_DecodeAsAttention(md),
