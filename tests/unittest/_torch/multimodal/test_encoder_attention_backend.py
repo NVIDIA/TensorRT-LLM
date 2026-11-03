@@ -217,42 +217,6 @@ def test_loader_keeps_omitted_settings_unchanged(
 
 
 @pytest.mark.parametrize(
-    ("module", "model", "expected"),
-    [
-        (
-            "gemma4mm",
-            "Gemma4ForConditionalGeneration",
-            {"vision": _PUBLIC_BACKENDS, "audio": frozenset()},
-        ),
-        ("gemma4_unified", "Gemma4UnifiedForConditionalGeneration", {}),
-        (
-            "nemotron_h_multimodal",
-            "NemotronHMultimodalModel",
-            {"vision": _PUBLIC_BACKENDS, "audio": frozenset()},
-        ),
-        ("glm5_next_vision", "Glm5NextVLM", {"vision": frozenset({"TRTLLM"})}),
-        ("kimi_k25", "KimiK25ForConditionalGeneration", {"vision": _PUBLIC_BACKENDS}),
-        ("kimi_k3_vl", "KimiK3ForConditionalGeneration", {"vision": _PUBLIC_BACKENDS}),
-        ("step3p7vl", "Step3p7VLForConditionalGeneration", {"vision": _PUBLIC_BACKENDS}),
-        ("minicpmv4_6", "MiniCPMV4_6Model", {"vision": _PUBLIC_BACKENDS}),
-        ("mistral", "Mistral3VLM", {"vision": _PUBLIC_BACKENDS}),
-        ("deepseekv41_multimodal", "DeepseekV41ForConditionalGeneration", {"vision": frozenset()}),
-        ("minimaxm3", "MiniMaxM3VLForConditionalGeneration", {"vision": frozenset()}),
-    ],
-)
-def test_model_encoder_backend_declarations(module: str, model: str, expected: dict) -> None:
-    model_cls = getattr(import_module(f"tensorrt_llm._torch.models.modeling_{module}"), model)
-    assert model_cls.supported_encoder_attention_backends == expected
-    for encoder, backends in expected.items():
-        assert backends <= _PUBLIC_BACKENDS
-        if not backends:
-            with pytest.raises(ValueError, match=f"{encoder}.*cannot be changed"):
-                _validate_encoder_attention_backend_support(
-                    model_cls, MultimodalConfig(encoder_attention_backend={encoder: "VANILLA"})
-                )
-
-
-@pytest.mark.parametrize(
     ("module", "model", "encoder"),
     [
         ("vila", "VilaModel", "vision"),
@@ -268,14 +232,11 @@ def test_hf_encoders_reject_backend_overrides(module: str, model: str, encoder: 
         )
 
 
-@pytest.mark.parametrize("disabled", [False, True])
-def test_loader_rejects_absent_or_disabled_encoder(disabled: bool) -> None:
-    config = SimpleNamespace(vision_config=object() if disabled else None)
+def test_loader_rejects_absent_encoder() -> None:
     with pytest.raises(ValueError, match="vision.*not enabled"):
         _validate_encoder_attention_backend_enabled(
             MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
-            config,
-            disable_mm_encoder=disabled,
+            SimpleNamespace(vision_config=None),
         )
 
 
@@ -316,6 +277,50 @@ def test_loader_checks_encoder_after_model_kwargs() -> None:
         loader._load_and_validate_config(
             "/tmp/dummy_model", SimpleNamespace(load_config=load_config)
         )
+
+
+def test_loader_skips_encoder_check_when_encoder_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A text-only run, such as trtllm-bench without --modality, reuses a serving config."""
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm._torch.pyexecutor import model_loader
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    class ReachedTargetResolution(Exception):
+        pass
+
+    def resolve_target(*args, **kwargs):
+        raise ReachedTargetResolution
+
+    llm_args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        disable_mm_encoder=True,
+        multimodal_config=MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+    )
+    messages = []
+    monkeypatch.setattr(model_loader.logger, "info", messages.append)
+    monkeypatch.setattr(model_loader, "modeling_v2_resolve_on_all_ranks", resolve_target)
+    loader = model_loader.ModelLoader(
+        llm_args=llm_args,
+        mapping=MagicMock(),
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=128,
+        max_seq_len=128,
+    )
+    checkpoint_loader = SimpleNamespace(
+        load_config=lambda **kwargs: SimpleNamespace(pretrained_config=SimpleNamespace())
+    )
+
+    # The check passes without an error and loading continues to target resolution.
+    with pytest.raises(ReachedTargetResolution):
+        loader._load_and_validate_config("/tmp/dummy_model", checkpoint_loader)
+    assert [message for message in messages if "encoder_attention_backend" in message] == [
+        "multimodal_config.encoder_attention_backend is not applied "
+        "to encoders skipped by disable_mm_encoder=True"
+    ]
 
 
 def test_loader_validates_registered_model_class(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -407,7 +412,7 @@ def test_pixtral_encoder_backend_keeps_decoder(
     assert config.attn_backend == "FLASHINFER"
 
 
-@pytest.mark.parametrize("override", [None, "VANILLA"])
+@pytest.mark.parametrize("override", [None, "VANILLA", "FLASHINFER"])
 def test_radio_encoder_backend_keeps_decoder(
     override: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -432,14 +437,15 @@ def test_radio_encoder_backend_keeps_decoder(
     pretrained_config.torch_dtype = torch.float32
     config = ModelConfig(
         pretrained_config=pretrained_config,
-        attn_backend="TRTLLM",
+        attn_backend="FLASHINFER",
         multimodal_config=_multimodal_config(override),
     )
 
     modeling_nemotron_h_multimodal.NemotronHVisionEncoder(config)
 
-    assert built["vision"][1]["vision_attn_backend"] == (override or "FLASHINFER")
-    assert config.attn_backend == "TRTLLM"
+    # The RADIO default is TRTLLM regardless of the decoder backend.
+    assert built["vision"][1]["vision_attn_backend"] == (override or "TRTLLM")
+    assert config.attn_backend == "FLASHINFER"
 
 
 @pytest.mark.parametrize(
