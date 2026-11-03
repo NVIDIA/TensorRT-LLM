@@ -3652,16 +3652,22 @@ def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
     return max(windows) if windows else None
 
 
-def dspark_context_attention_window(model_dir: str) -> Optional[int]:
+def dspark_context_attention_window(model_dir: str,
+                                    trust_remote_code: bool = False
+                                    ) -> Optional[int]:
     """Widest context-attention window of a standalone DSpark drafter.
 
-    Reads the config the drafter is built from (``load_pretrained_config`` with
-    the drafter's arguments), so checkpoint formats normalize as at runtime. An
-    MLA-shaped drafter attends to its whole context, so it has no window.
+    Reads the config the drafter is built from (``load_pretrained_config``), so
+    checkpoint formats normalize as at runtime. ``trust_remote_code`` is the
+    user's setting: a checkpoint whose config needs remote code raises without
+    it. An MLA-shaped drafter attends to its whole context, so it has no window.
     """
+    from tensorrt_llm._torch.model_config import hf_remote_code_lock
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         MINIMAX_DSPARK_DRAFT_ARCH, is_mla, load_pretrained_config)
-    config = load_pretrained_config(model_dir, trust_remote_code=True)
+    with hf_remote_code_lock():
+        config = load_pretrained_config(model_dir,
+                                        trust_remote_code=trust_remote_code)
     architectures = getattr(config, "architectures", None) or []
     if not (architectures and architectures[0]
             == MINIMAX_DSPARK_DRAFT_ARCH) and is_mla(config):
@@ -3769,12 +3775,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
-    def resolve_from_checkpoint(self) -> None:
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
         """Fill unset fields from the draft checkpoint's ``config.json``.
 
         Must run once ``speculative_model`` names a local directory:
         ``target_layer_ids`` has no usable default, and without it no target
-        hidden states are captured. Called from validation for a local path,
+        hidden states are captured. Reads the JSON directly, so
+        ``trust_remote_code`` (the shared loader signature) is unused here.
+        Called from validation for a local path,
         and again from model loading once a HF repo id has been downloaded.
         """
         if self.speculative_model is None:
@@ -3963,14 +3971,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
 
-    def resolve_context_recompute_tail(self) -> None:
+    def resolve_context_recompute_tail(self,
+                                       trust_remote_code: bool = False) -> None:
         """Resolve ``context_recompute_tail: None`` from the drafter's window.
 
         The drafter's context K/V are per-token projections of target hidden
         states, so recomputing its attention window restores exactly its
         inputs; an unwindowed drafter resolves to -1, the embedded one to 0.
         Stays None until a hub drafter's ``config.json`` is downloaded
-        (``resolve_from_checkpoint`` retries).
+        (``resolve_from_checkpoint`` retries). ``trust_remote_code`` is the
+        user's setting for reading the drafter config.
         """
         if self.context_recompute_tail is not None:
             return
@@ -3981,7 +3991,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                                          "config.json")
         if not os.path.exists(draft_config_path):
             return
-        window = dspark_context_attention_window(str(self.speculative_model))
+        window = dspark_context_attention_window(str(self.speculative_model),
+                                                 trust_remote_code)
         self.context_recompute_tail = int(window) if window else -1
         if window:
             reason = f"the drafter's {window}-token attention window"
@@ -3991,13 +4002,13 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         logger.info(f"DSpark context_recompute_tail resolved to "
                     f"{self.context_recompute_tail} ({reason}).")
 
-    def resolve_from_checkpoint(self) -> None:
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
         """Resolve checkpoint-derived fields once a hub repo id is downloaded.
 
         Called by ``CachedModelLoader``. Only ``context_recompute_tail`` is
         resolved here; the other checkpoint fields resolve during validation.
         """
-        self.resolve_context_recompute_tail()
+        self.resolve_context_recompute_tail(trust_remote_code)
         if self.context_recompute_tail is None:
             logger.warning(
                 f"DSpark drafter {self.speculative_model} has no readable "
@@ -8060,7 +8071,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 # Before the KV cache managers read it: an unresolved None
                 # means a full re-prefill there. A hub repo id resolves after
                 # download (resolve_from_checkpoint).
-                spec_cfg.resolve_context_recompute_tail()
+                spec_cfg.resolve_context_recompute_tail(self.trust_remote_code)
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

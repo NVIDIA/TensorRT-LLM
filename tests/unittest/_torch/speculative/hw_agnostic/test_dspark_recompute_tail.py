@@ -315,6 +315,41 @@ class TestDSparkTailResolution:
         )
         assert args.speculative_config.context_recompute_tail == expected
 
+    def test_remote_code_in_the_drafter_config_runs_only_when_trusted(self, tmp_path: Path) -> None:
+        """Resolving ``None`` reads the drafter config under the user's ``trust_remote_code``."""
+        sentinel = tmp_path / "sentinel"
+        ckpt = tmp_path / "drafter"
+        ckpt.mkdir()
+        (ckpt / "configuration_remote.py").write_text(
+            "import pathlib\n"
+            "from transformers import PretrainedConfig\n"
+            f"pathlib.Path({str(sentinel)!r}).write_text('ran')\n"
+            "class RemoteConfig(PretrainedConfig):\n"
+            "    model_type = 'remote_drafter'\n"
+        )
+        config = {
+            "model_type": "remote_drafter",
+            "architectures": ["RemoteForCausalLM"],
+            "auto_map": {"AutoConfig": "configuration_remote.RemoteConfig"},
+            "num_hidden_layers": 2,
+            "sliding_window": 256,
+            "layer_types": [SLIDING] * 2,
+        }
+        spec = _spec(ckpt, config, context_recompute_tail=None)
+        with pytest.raises(ValueError, match="trust_remote_code"):
+            TorchLlmArgs(
+                model="/tmp/dummy_model", skip_tokenizer_init=True, speculative_config=spec
+            )
+        assert not sentinel.exists()
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            trust_remote_code=True,
+            speculative_config=spec,
+        )
+        assert sentinel.exists()
+        assert args.speculative_config.context_recompute_tail == 256
+
 
 def _target(*, enable_block_reuse: bool = True, tail: int = 4096) -> SimpleNamespace:
     """The slice of a target KV cache manager the drafter reports on."""
