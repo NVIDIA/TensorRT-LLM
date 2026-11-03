@@ -209,6 +209,10 @@ _KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV = "KIMI_K3_FP8_WEIGHT_READ_MOE_MLP"
 _SHARED_GEMMS_LEAD_MIN_ROUTED_ROWS = 80
 # Largest token count for which the router GEMM is issued before latent_down.
 _ROUTER_FIRST_MAX_TOKENS = 64
+# Largest token count for which the sharded decode front forks the shared expert after its head
+# instead of before it (the mix before it releases the head at kernel entry; a fork at the start
+# would release the shared GEMMs with the head, onto the SMs the head needs).
+_MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS = 16
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``;
 # the fused FC12 kernel on Rubin does). 16 of the R200's SMs is the measured split.
@@ -686,6 +690,7 @@ def _attn_res_decode_kernel(
             *weights,
             eps,
             out_eps,
+            entry_trigger,
         )
     if in_place:
         view = addends[0].view
@@ -891,17 +896,26 @@ def _apply_attn_res_add_and_rmsnorm(
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
     output_norm: nn.Module,
+    entry_trigger: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm.
 
     ``addend`` may be the attention output's all-reduce left in its workspace, finished or
     pending: the decode attention-residual kernel reads (and finishes) it there where it serves
-    the mix, else it is materialized.
+    the mix, else it is materialized. ``entry_trigger``: the kernel that finishes a pending
+    all-reduce releases its dependent at entry (the caller checked that the next launch is the
+    sharded MoE front's head, ``KimiK3MoERuntime.moe_front_releases_early``).
     """
     if isinstance(addend, MnnvlWorkspaceResult):
         if _FUSED_ATTN_RES_ENABLED:
             decode = _attn_res_decode_kernel(
-                prefix_sum, (addend,), block_residual, proj, norm, output_norm
+                prefix_sum,
+                (addend,),
+                block_residual,
+                proj,
+                norm,
+                output_norm,
+                entry_trigger=entry_trigger,
             )
             if decode is not None:
                 return decode
@@ -2185,9 +2199,19 @@ class KimiK3MoERuntime(nn.Module):
             return None
         return backend.published_routing_word(num_tokens)
 
-    def _moe_front(self, hidden_states: torch.Tensor) -> Tuple[Fp4QuantizedTensor, SortedRouting]:
+    def moe_front_releases_early(self, like: torch.Tensor) -> bool:
+        """Whether the mix that produces this layer's MoE input may release its dependent at
+        kernel entry: the next forward on rows shaped like ``like`` (contiguous BF16 ``[M,
+        hidden]``) runs the sharded decode front, whose head, the next launch on the stream, reads
+        only weights before its grid wait."""
+        return like.dim() == 2 and like.is_contiguous() and self._moe_front_applies(like)
+
+    def _moe_front(
+        self, hidden_states: torch.Tensor, after_head: Optional[Callable[[], None]] = None
+    ) -> Tuple[Fp4QuantizedTensor, SortedRouting]:
         """The sharded decode front on the current stream: the routed experts' NVFP4 input and
-        the routing with this rank's ``moe_sort`` tables."""
+        the routing with this rank's ``moe_sort`` tables; ``after_head`` runs between its two
+        launches."""
         from ..moe.kernels.blackwell import kimi_k3_moe_front, kimi_k3_routing
 
         num_tokens = hidden_states.shape[0]
@@ -2198,6 +2222,7 @@ class KimiK3MoERuntime(nn.Module):
             self._moe_front_ws,
             self.routed_experts.nvfp4_input_scale(num_tokens),
             publish_word,
+            after_head,
         )
         if publish_word is not None:
             tables = MoESortTables(kimi_k3_routing.TILE_SIZE, (), published=True)
@@ -2575,6 +2600,15 @@ class KimiK3MoERuntime(nn.Module):
         early_routed_in = None
         shared_partial = None
         sharded_front = self._moe_front_applies(hidden_states)
+        # The shared expert forks after the front's head (see _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS).
+        fork_at_head = (
+            sharded_front
+            and hidden_states.shape[0] <= _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS
+            and self.shared_expert_stream is not None
+            and do_multi_stream()
+            and not self._defer_shared_allreduce
+        )
+        forked_shared = []
         if sharded_front:
             # The routed branch starts with the sharded front, which routes and produces the
             # NVFP4 routed input; the logits only carry the shape.
@@ -2631,7 +2665,9 @@ class KimiK3MoERuntime(nn.Module):
             # is already a single fused GEMM (fp8_swap_ab_gemm).
             moe_kwargs = {}
             if sharded_front:
-                routed_in, moe_kwargs["sorted_routing"] = self._moe_front(hidden_states)
+                routed_in, moe_kwargs["sorted_routing"] = self._moe_front(
+                    hidden_states, _fork_shared if fork_at_head else None
+                )
             elif projected_input is not None:
                 routed_in = projected_input
             elif early_routed_in is not None:
@@ -2687,7 +2723,20 @@ class KimiK3MoERuntime(nn.Module):
         # MegaMoE). The final join includes the shared all-reduce, so it
         # precedes the routed all-reduce: concurrent collectives on different
         # streams can corrupt SYMM_MEM all-reduce state.
-        if shared_partial is not None:
+        def _fork_shared():
+            self.moe_main_event.record()
+            with torch.cuda.stream(self.shared_expert_stream):
+                self.moe_main_event.wait()
+                forked_shared.append(_shared_output())
+                self.moe_shared_event.record()
+
+        if fork_at_head:
+            routed_out = _routed_output()
+            self.moe_shared_event.wait()
+            shared_out = forked_shared[0]
+            if not torch.cuda.is_current_stream_capturing():
+                shared_out.record_stream(torch.cuda.current_stream())
+        elif shared_partial is not None:
             routed_out = _routed_output()
             with torch.cuda.stream(self.shared_expert_stream):
                 shared_out = shared_partial
@@ -3279,6 +3328,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.post_attention_layernorm,
+                entry_trigger=self.is_moe
+                and self.block_sparse_moe.moe_front_releases_early(prefix_sum),
             )
         if self.is_moe:
             defers = defer_moe_residual and _defers_moe_residual(prefix_sum, num_snapshots + 1)

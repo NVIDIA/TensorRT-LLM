@@ -56,7 +56,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import struct
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1343,6 +1343,7 @@ def run_moe_front(
     ws: MoEFrontWorkspace,
     global_sf: torch.Tensor,
     publish_word: Optional[torch.Tensor] = None,
+    after_head: Optional[Callable[[], None]] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, Optional[Tuple[torch.Tensor, ...]], torch.Tensor, torch.Tensor
 ]:
@@ -1355,7 +1356,8 @@ def run_moe_front(
     uint8 ``[M, 1792]`` and ``scales`` uint8 ``[M, 224]`` (linear layout) under ``global_sf``.
     ``publish_word``: an int32 word (zero) the route kernel adds 1 to per routed token (release)
     instead of writing the tables (``sort_outputs`` is then ``None``); the next launch on the
-    stream, which polls it, must be the routed experts. The first call of each shape compiles
+    stream, which polls it, must be the routed experts. ``after_head``: called between the two
+    launches (e.g. to fork a side stream after the head). The first call of each shape compiles
     (outside CUDA graph capture)."""
     m = x.shape[0]
     if not can_run(x, plan, global_sf):
@@ -1376,6 +1378,8 @@ def run_moe_front(
         Int64(x.data_ptr()),
         stream,
     )
+    if after_head is not None:
+        after_head()
     device = x.device
     max_tiles, max_permuted = sort_buffer_sizes(m, plan.local_num)
     i32 = dict(dtype=torch.int32, device=device)
