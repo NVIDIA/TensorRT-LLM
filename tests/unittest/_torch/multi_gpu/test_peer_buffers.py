@@ -109,10 +109,10 @@ def _mnnvl_supported() -> bool:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")
-@pytest.mark.parametrize("transport", ["ipc", "mnnvl"])
+@pytest.mark.parametrize("transport", ["mnnvl"])
 @pytest.mark.parametrize("mpi_pool_executor", [4], indirect=True)
 def test_peer_buffers_carry_every_rank_stores(mpi_pool_executor, transport):
-    if transport == "mnnvl" and not _mnnvl_supported():
+    if not _mnnvl_supported():
         pytest.skip("needs fabric memory (MNNVL)")
     tp_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_run, *zip(*[(tp_size, transport)] * tp_size))

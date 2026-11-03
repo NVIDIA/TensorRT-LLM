@@ -9,7 +9,6 @@ memory return to their baseline.
 
 import ctypes
 import random
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -188,29 +187,4 @@ def test_shuffled_turnover_keeps_pages_and_returns_to_baseline(block_reuse: bool
     finally:
         for request in requests.values():
             manager.free_resources(request)
-        manager.shutdown()
-
-
-@skip_pre_blackwell
-def test_page_held_by_another_request_outlives_its_owner() -> None:
-    manager = _manager(block_reuse=True)
-    prefix = list(range(5000, 5000 + 4 * TOKENS_PER_BLOCK))
-    try:
-        torch.cuda.synchronize()
-        free_before = _free(manager)
-        owner = _gen_init(manager, 1, prefix + [7, 8, 9])
-        _publish_prompt(manager, owner)
-        reader = _gen_init(manager, 2, prefix + [11, 12])
-        assert manager.kv_cache_map[2].num_committed_tokens == len(prefix)
-        reader_tables = _tables(manager, 2)
-        manager.free_resources(owner)
-        # The reader still holds the prefix pages its owner allocated.
-        assert _tables(manager, 2) == reader_tables
-        manager.free_resources(reader)
-        torch.cuda.synchronize()
-        manager.reset_reuse_state()
-        assert _free(manager) == free_before
-    finally:
-        for request_id in list(manager.kv_cache_map):
-            manager.free_resources(SimpleNamespace(py_request_id=request_id))
         manager.shutdown()

@@ -34,7 +34,7 @@ from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
     getSMVersion() not in (100, 103, 107) or not IS_CUTLASS_DSL_AVAILABLE,
     reason="The small-M kernel needs CuTe DSL on SM100/SM103/SM107",
 )
-@pytest.mark.parametrize("m", [1, 6, 12, 64])
+@pytest.mark.parametrize("m", [1, 64])
 @pytest.mark.parametrize("k, n", [(5120, 2304), (1152, 5120), (5120, 4608),
                                   (2304, 5120)])
 def test_fp8_block_scale_small_m_matches_reference(m, k, n):

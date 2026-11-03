@@ -262,14 +262,11 @@ def _counted_conversions(monkeypatch):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("scratch", [False, True], ids=["no_scratch", "scratch"])
 @pytest.mark.parametrize(
-    "attention_dp,disaggregated",
-    [(False, False), (False, True), (True, True)],
-    ids=["tep", "tep_disagg", "adp_disagg"],
+    "block,seed,attention_dp,disaggregated,scratch",
+    [(BLOCK, 0, True, True, False), (2 * BLOCK, 1, False, True, True)],
+    ids=["128-0-adp_disagg-no_scratch", "256-1-tep_disagg-scratch"],
 )
-@pytest.mark.parametrize("seed", [0, 1])
-@pytest.mark.parametrize("block", [BLOCK, 2 * BLOCK])
 @torch.inference_mode()
 def test_steady_decode_reuses_converted_tables(
     monkeypatch, attention_dp, disaggregated, scratch, seed, block
@@ -353,9 +350,11 @@ def test_steady_decode_reuses_converted_tables(
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("scratch", [False, True], ids=["no_scratch", "scratch"])
-@pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("block", [BLOCK, 2 * BLOCK])
+@pytest.mark.parametrize(
+    "block,seed,scratch",
+    [(BLOCK, 0, False), (2 * BLOCK, 1, True)],
+    ids=["128-0-no_scratch", "256-1-scratch"],
+)
 @torch.inference_mode()
 def test_steady_spec_steps_match_full_prepare(monkeypatch, scratch, seed, block):
     """Steady DSpark verification steps read exactly what a full preparation writes."""

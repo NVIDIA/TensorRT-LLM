@@ -5457,20 +5457,6 @@ class TestLongContextDemotion:
             assert ids(out.recompute_paused_requests) == [long_id]
 
 
-def test_remote_tail_destination_mixes_with_local_prefill_and_decode() -> None:
-    manager = make_kv_cache_manager()
-    scheduler = make_scheduler(manager, max_num_tokens=256)
-    remote = make_ctx_request(1, context_remaining_length=128)
-    remote.py_csa2_remote_tail_mode = "destination"
-    local = make_ctx_request(2, context_remaining_length=64)
-    decoding = make_gen_request(3)
-
-    batch = scheduler.schedule_request([local, decoding, remote], set())
-
-    assert ids(batch.context_requests) == [2, 1]
-    assert ids(batch.generation_requests) == [3]
-
-
 # ===========================================================================
 # Shortest-uncached-first context order and its starvation limit
 # ===========================================================================

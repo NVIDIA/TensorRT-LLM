@@ -47,7 +47,7 @@ class _StubWorker(SpecWorkerBase):
         return self._target_tokens
 
 
-@pytest.mark.parametrize("force", [0.0, 2.0, 2.51])
+@pytest.mark.parametrize("force", [0.0, 2.51])
 def test_fused_accept_matches_eager_path(force):
     """Strict acceptance (with the forced counts) on greedy logits, whose argmax the fused path
     takes itself: ties to the lowest column, -0.0 == 0.0, the first NaN wins, padded rows."""

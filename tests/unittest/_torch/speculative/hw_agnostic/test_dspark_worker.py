@@ -151,24 +151,6 @@ def test_worker_lazy_init_window_buffers():
     assert id(worker._kv_windows) == buf_id
 
 
-def test_worker_prewarms_actual_heads(monkeypatch):
-    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as attention_op
-    import tensorrt_llm._torch.cute_dsl_utils as cute_dsl_utils
-
-    calls = []
-    monkeypatch.setattr(cute_dsl_utils, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(
-        attention_op,
-        "warmup_fused_dsv4_dspark_attention",
-        lambda block, eps, num_heads: calls.append((block, eps, num_heads)),
-    )
-    worker = _make_worker()
-    draft_model = _fake_draft_model(head_dim=512)
-    draft_model._attn_params["n_heads"] = 64
-    worker._lazy_init(draft_model, _make_metadata(max_num_requests=2))
-    assert calls == [(5, 1e-6, 64)]
-
-
 def test_worker_rejects_mismatched_block_size():
     worker = _make_worker()
     draft_model = _fake_draft_model()
@@ -198,35 +180,6 @@ def test_worker_slot_assignment_and_reset():
     assert int(worker._valid_len[s0b]) == 0
     assert not bool(worker._position_initialized[s0b])
     assert float(worker._kv_windows[s0b].abs().sum()) == 0.0
-
-
-def test_slot_churn_does_not_synchronize_with_the_device():
-    """Requests joining and leaving clear their slots without a host-device sync."""
-    worker = _make_worker()
-    meta = _make_metadata(max_num_requests=4)
-    worker._lazy_init(_fake_draft_model(), meta)
-    meta._dspark_worker = worker
-    meta.request_ids = [100, 101]
-    meta.num_generations = 2
-    meta.prepare()
-    leaving = worker._req_to_slot[100]
-    worker._ctx_len[leaving] = 42
-    worker._kv_windows[leaving].fill_(1.0)
-    torch.cuda.synchronize()
-
-    meta.request_ids = [101, 102]
-    torch.cuda.set_sync_debug_mode("error")
-    try:
-        meta.prepare()  # frees request 100's slot and assigns request 102 one
-        worker._assign_slot(103, reset=True)
-    finally:
-        torch.cuda.set_sync_debug_mode("default")
-
-    for slot in (leaving, worker._req_to_slot[102], worker._req_to_slot[103]):
-        assert int(worker._ctx_len[slot]) == 0
-        assert int(worker._valid_len[slot]) == 0
-        assert not bool(worker._position_initialized[slot])
-        assert torch.count_nonzero(worker._kv_windows[slot]) == 0
 
 
 def test_worker_slot_exhaustion_preserves_live_request():

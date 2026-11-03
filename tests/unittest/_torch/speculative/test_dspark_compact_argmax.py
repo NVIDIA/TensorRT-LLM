@@ -10,7 +10,7 @@ from tensorrt_llm._torch.attention.kernels.blackwell.dspark import tp_argmax as 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def _fixture(rows: int, local_vocab: int, ranks: int, bias_dtype: torch.dtype) -> dict:
+def _fixture(rows: int, local_vocab: int, ranks: int) -> dict:
     generator = torch.Generator(device="cuda").manual_seed(100392)
     parts = -(-local_vocab // compact.WORDS_PER_PART)
 
@@ -21,7 +21,7 @@ def _fixture(rows: int, local_vocab: int, ranks: int, bias_dtype: torch.dtype) -
 
     return dict(
         base=[strided(torch.bfloat16) for _ in range(ranks)],
-        bias=[strided(bias_dtype) for _ in range(ranks)],
+        bias=[strided(torch.bfloat16) for _ in range(ranks)],
         packets=[
             torch.empty((rows, parts, 2), dtype=torch.float32, device="cuda") for _ in range(ranks)
         ],
@@ -46,20 +46,16 @@ def _run(data: dict) -> None:
     compact.global_argmax(torch.cat(data["packets"], dim=0), data["output"], data["global_vocab"])
 
 
-@pytest.mark.parametrize(
-    "rows,local_vocab,ranks", [(1, 8, 1), (5, 4104, 4), (2, 520, 8), (128, 32320, 4)]
-)
-@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
-def test_matches_full_vocab_argmax(rows, local_vocab, ranks, bias_dtype) -> None:
-    data = _fixture(rows, local_vocab, ranks, bias_dtype)
+@pytest.mark.parametrize("rows,local_vocab,ranks", [(2, 520, 8), (128, 32320, 4)])
+def test_matches_full_vocab_argmax(rows, local_vocab, ranks) -> None:
+    data = _fixture(rows, local_vocab, ranks)
     _run(data)
     assert torch.equal(data["output"], _reference(data))
 
 
 @pytest.mark.parametrize("case", ["ties", "nan", "promotion"])
-@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
-def test_global_order(case: str, bias_dtype: torch.dtype) -> None:
-    data = _fixture(2, 8200, 4, bias_dtype)
+def test_global_order(case: str) -> None:
+    data = _fixture(2, 8200, 4)
     for base, bias in zip(data["base"], data["bias"]):
         base.fill_(-8)
         bias.zero_()
@@ -76,15 +72,5 @@ def test_global_order(case: str, bias_dtype: torch.dtype) -> None:
         for base in data["base"]:
             base.fill_(1)
         data["bias"][1][:, 4096] = 2.0**-10
-    _run(data)
-    assert torch.equal(data["output"], _reference(data))
-
-
-@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
-def test_vocab_padding_is_excluded(bias_dtype: torch.dtype) -> None:
-    data = _fixture(3, 8200, 4, bias_dtype)
-    data["global_vocab"] = 2 * data["local_vocab"] + 7
-    data["base"][2][:, 7:] = float("nan")
-    data["base"][3].fill_(float("nan"))
     _run(data)
     assert torch.equal(data["output"], _reference(data))

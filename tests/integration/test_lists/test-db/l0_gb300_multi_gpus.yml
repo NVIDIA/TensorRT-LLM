@@ -145,3 +145,10 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] TIMEOUT (240)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)
+  # DeepSeek-V4.1 on SM103: MegaMoE serving path, online expert placement, attention-DP
+  # graph passes and breakable prefill graphs against eager prefill.
+  - unittest/_torch/moe/test_megamoe_e2e.py
+  - unittest/_torch/moe/test_moe_warmup_placement.py::test_megamoe_placement[mid]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_pass_graph[world2]
+  - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_encoder_pass_graph[world2]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_breakable_prefill_cuda_graph TIMEOUT (60)

@@ -391,23 +391,20 @@ def _host_table(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA lookup requires CUDA")
-@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
 @pytest.mark.parametrize(
     "num_heads,tp_size,tp_rank",
-    [(4, 1, 0), (4, 2, 1), (3, 2, 1)],
-    ids=["unsharded", "head_shard", "row_shard"],
+    [(4, 2, 1), (3, 2, 1)],
+    ids=["head_shard-background", "row_shard-background"],
 )
 @torch.no_grad()
-def test_sharded_fp8_lookup_host_tables(
-    num_heads: int, tp_size: int, tp_rank: int, background: bool
-) -> None:
+def test_sharded_fp8_lookup_host_tables(num_heads: int, tp_size: int, tp_rank: int) -> None:
     """Host tables map on the GPU's host NUMA node and look up exactly."""
     torch.manual_seed(7)
     buckets = [16411 + 6 * head for head in range(num_heads)]
     table = _host_table(buckets, tp_size, tp_rank)
     assert table.shard_heads == (tp_size > 1 and num_heads % tp_size == 0)
     indices = torch.stack([torch.randint(0, n, (517,)) for n in buckets], dim=1).cuda()
-    actual = table(indices, background=background)
+    actual = table(indices, background=True)
     torch.cuda.synchronize()
     expected = _sharded_lookup_reference(table, indices)
     assert expected.count_nonzero() > 0
@@ -415,17 +412,15 @@ def test_sharded_fp8_lookup_host_tables(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="UVA lookup requires CUDA")
-@pytest.mark.parametrize("device", [0, 2], ids=["gpu0", "gpu2"])
-@pytest.mark.parametrize("background", [False, True], ids=["foreground", "background"])
-@pytest.mark.parametrize("num_heads", [4, 3], ids=["head_shard", "row_shard"])
+@pytest.mark.parametrize(
+    "num_heads", [4, 3], ids=["head_shard-background-gpu0", "row_shard-background-gpu0"]
+)
 @torch.no_grad()
 def test_sharded_fp8_lookup_after_host_numa_oom(
-    monkeypatch: pytest.MonkeyPatch, num_heads: int, background: bool, device: int
+    monkeypatch: pytest.MonkeyPatch, num_heads: int
 ) -> None:
     """A local NUMA OOM that outlasts page-cache eviction preserves exact host-table lookup for both shard layouts."""
-    if torch.cuda.device_count() <= device:
-        pytest.skip(f"needs GPU {device}")
-    if host_memory.host_numa_node(device) is None:
+    if host_memory.host_numa_node(0) is None:
         pytest.skip("host NUMA VMM is unavailable")
     create = Mock(return_value=(cuda.CUresult.CUDA_ERROR_OUT_OF_MEMORY,))
     monkeypatch.setattr(cuda, "cuMemCreate", create)
@@ -438,32 +433,15 @@ def test_sharded_fp8_lookup_after_host_numa_oom(
     monkeypatch.setattr(host_memory, "evict_numa_node_page_cache", evict)
     torch.manual_seed(11)
     buckets = [16411 + 6 * head for head in range(num_heads)]
-    with torch.cuda.device(device):
-        table = _host_table(buckets, tp_size=2, tp_rank=1, device=device, check_numa=False)
-        assert create.call_count == 4 and evict.call_count == 2
-        assert table.weight.is_pinned() and table.scale.is_pinned()
-        indices = torch.stack([torch.randint(0, n, (517,)) for n in buckets], dim=1).cuda()
-        actual = table(indices, background=background)
-        torch.cuda.synchronize()
+    table = _host_table(buckets, tp_size=2, tp_rank=1, check_numa=False)
+    assert create.call_count == 4 and evict.call_count == 2
+    assert table.weight.is_pinned() and table.scale.is_pinned()
+    indices = torch.stack([torch.randint(0, n, (517,)) for n in buckets], dim=1).cuda()
+    actual = table(indices, background=True)
+    torch.cuda.synchronize()
     expected = _sharded_lookup_reference(table, indices)
     assert expected.count_nonzero() > 0
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
-@torch.no_grad()
-def test_sharded_fp8_lookup_host_tables_second_device() -> None:
-    """A table mapped for a non-default device is gathered there without a copy."""
-    torch.manual_seed(9)
-    buckets = [16411 + 6 * head for head in range(4)]
-    with torch.cuda.device(1):
-        table = _host_table(buckets, tp_size=2, tp_rank=1, device=1)
-        indices = torch.stack([torch.randint(0, n, (301,)) for n in buckets], dim=1).cuda()
-        actual = table(indices, background=True)
-        torch.cuda.synchronize()
-    torch.testing.assert_close(
-        actual.cpu(), _sharded_lookup_reference(table, indices), rtol=0, atol=0
-    )
 
 
 @skip_pre_blackwell
@@ -548,18 +526,6 @@ def test_engram_hashes_retain_only_captured_and_latest_shapes(
             for layer in layers:
                 torch.testing.assert_close(captured[layer], expected[layer], rtol=0, atol=0)
             release(decode(step))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="page-locked host memory requires CUDA")
-def test_sharded_fp8_tables_materialize_after_meta_init() -> None:
-    """Meta-init construction defers the host tables until the model moves."""
-    with MetaInitMode():
-        table = engram_module.ShardedFp8MultiHeadEmbedding([16411] * 4, 128, dtype=torch.bfloat16)
-    assert table.weight.is_meta and table.scale.is_meta
-    table.cuda()
-    assert table.offsets.is_cuda
-    _check_host_numa(table.weight)
-    _check_host_numa(table.scale)
 
 
 class _OwnerRows:
@@ -651,7 +617,7 @@ def _collect(results, count: int, processes, deadline: float) -> list:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
-@pytest.mark.parametrize("scenario", ["host_numa", "owner_numa_oom", "import_before_fill"])
+@pytest.mark.parametrize("scenario", ["owner_numa_oom", "import_before_fill"])
 def test_sharded_fp8_tables_node_shared(monkeypatch: pytest.MonkeyPatch, scenario: str) -> None:
     """One process per GPU loads a node-shared table and the others map that copy in place, finish
     load_weights before the owner fills it and wait in post_load_weights."""

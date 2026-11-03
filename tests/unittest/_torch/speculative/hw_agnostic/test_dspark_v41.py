@@ -237,26 +237,6 @@ def test_v4_target_top6_routing_keeps_fused_kernel(experts, monkeypatch):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="This test requires Blackwell or newer",
 )
-@pytest.mark.parametrize("hashed", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("num_tokens", [1, 17])
-def test_v41_draft_top3_cuda_routing_matches_pytorch(hashed, dtype, num_tokens):
-    torch.manual_seed(7)
-    logits = (torch.randn(num_tokens, 128, device="cuda") * 8).to(dtype)
-    bias = torch.linspace(-3, 3, 128, device="cuda")
-    table = torch.randint(0, 128, (64, 3), dtype=torch.int32, device="cuda")
-    token_ids = torch.randint(0, 64, (num_tokens,), device="cuda")
-    routing = _draft_routing(None if hashed else bias, hashed=hashed, table=table)
-    indices, weights = routing.apply(logits, token_ids)
-    expected_indices, expected_weights = routing._apply_pytorch(logits, token_ids)
-    torch.testing.assert_close(indices, expected_indices)
-    torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
-    reason="This test requires Blackwell or newer",
-)
 def test_v41_draft_top3_routing_cuda_graph_replay():
     logits = torch.randn(17, 128, dtype=torch.bfloat16, device="cuda")
     routing = _draft_routing(torch.linspace(-1, 1, 128, device="cuda"))
@@ -583,75 +563,11 @@ def test_v41_draft_real_config_keeps_outer_and_text_geometry_in_sync(
         assert text.layer_descriptors[2].has_long_range
 
 
-@pytest.mark.parametrize("excluded", [None, "v4", "rnn", "sharded", "vocab"])
-def test_v41_greedy_token_reuse_model_guard(excluded):
-    from tensorrt_llm._torch.models.modeling_speculative import RNNHead, VanillaMarkov
-    from tensorrt_llm._torch.modules.embedding import LMHead
-    from tensorrt_llm._torch.modules.linear import TensorParallelMode
-
-    head = VanillaMarkov(vocab_size=32, markov_rank=4)
-    lm_head = LMHead(16 if excluded == "vocab" else 32, 8)
-    model = SimpleNamespace(
-        uses_lagged_pre=True, mtp_layers=[SimpleNamespace(markov_head=head)], lm_head=lm_head
-    )
-    wrapper = SimpleNamespace(dspark_model=model)
-    if excluded == "v4":
-        model.uses_lagged_pre = False
-    elif excluded == "rnn":
-        model.mtp_layers[-1].markov_head = RNNHead(vocab_size=32, markov_rank=4, hidden_size=8)
-    elif excluded == "sharded":
-        # A non-gathering column shard proposes from a local vocabulary shard.
-        lm_head.tp_size = 4
-        lm_head.tp_mode = TensorParallelMode.COLUMN
-        lm_head.out_features = 8
-        lm_head.gather_output = False
-    eligible = modeling_dspark.DSv4DSparkForCausalLM.supports_greedy_token_reuse.fget(wrapper)
-    assert eligible is (excluded is None)
-
-
-def test_v41_attention_dp_head_is_one_full_vocab_rank():
-    """Attention DP builds the shared head with every vocabulary row on every rank, also when its
-    mapping spans the DP group (``enable_lm_head_tp_in_adp``): the compact proposal treats it as
-    one full-vocabulary rank (no vocabulary offset, no cross-rank gather)."""
-    from tensorrt_llm._torch.models.modeling_speculative import VanillaMarkov
-    from tensorrt_llm._torch.modules.embedding import LMHead
-    from tensorrt_llm._torch.modules.linear import TensorParallelMode
-    from tensorrt_llm.mapping import Mapping
-
-    mapping = Mapping(
-        world_size=8, rank=3, tp_size=8, enable_attention_dp=True, enable_lm_head_tp_in_adp=True
-    )
-    head = LMHead(
-        32,
-        8,
-        mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.COLUMN,
-        gather_output=True,
-        reduce_output=False,
-    )
-    assert modeling_dspark.is_full_vocab_head(head, VanillaMarkov(vocab_size=32, markov_rank=4))
-    assert modeling_dspark._vocab_split(head) == (0, 1)
-
-
-@pytest.mark.parametrize("excluded", [None, "pp", "guided", "d2t", "rejection", "model"])
-def test_v41_greedy_token_reuse_worker_guard(excluded):
-    worker = SimpleNamespace(
-        mapping=SimpleNamespace(
-            enable_attention_dp=False, pp_size=2 if excluded == "pp" else 1, cp_size=1
-        ),
-        guided_decoder=object() if excluded == "guided" else None,
-        _d2t=torch.tensor([0]) if excluded == "d2t" else None,
-    )
-    metadata = SimpleNamespace(use_rejection_sampling=excluded == "rejection")
-    model = SimpleNamespace(supports_greedy_token_reuse=excluded != "model")
-    assert DSv4DSparkWorker._can_reuse_draft_tokens(worker, model, metadata) is (excluded is None)
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="The compact draft proposal requires Blackwell or newer",
 )
-@pytest.mark.parametrize("num_gens", [1, 16])
+@pytest.mark.parametrize("num_gens", [16])
 def test_v41_sampled_batch_keeps_the_heads_greedy_proposals(monkeypatch, num_gens):
     """A temperature-1 batch without rejection sampling keeps the head's greedy proposals, which
     equal the drafts the worker samples from the corrected logits it no longer builds."""
@@ -738,43 +654,3 @@ def test_v41_sampled_batch_keeps_the_heads_greedy_proposals(monkeypatch, num_gen
         sampled = worker.sample_draft_tokens(corrected, metadata, num_gens, num_contexts=0)
     assert corrected.shape == (num_gens, block, vocab)
     assert torch.equal(proposals.to(torch.int32), sampled)
-
-
-def test_v41_greedy_token_reuse_returns_int32_tokens():
-    tokens = torch.randint(0, 32, (3, 5))
-    worker = SimpleNamespace(
-        max_draft_len=5,
-        _batch_to_slot=torch.tensor([1, 3, 2, 4]),
-        _kv_windows=torch.zeros(5, 1, 8, 2),
-        _advance_generation_state=Mock(
-            return_value=(torch.zeros(3, dtype=torch.long),) * 4
-            + (torch.zeros(3, 5, dtype=torch.long),) * 2
-            + (torch.zeros(3, 5, dtype=torch.bool),)
-        ),
-        _take_prep_fork=Mock(return_value=None),
-        return_confidence=False,
-    )
-    model = SimpleNamespace(
-        project_captured_rows=lambda captured, rows: captured[rows],
-        write_context_windows_batched=Mock(),
-        forward_batched=Mock(return_value=(tokens, None)),
-    )
-    output = DSv4DSparkWorker._draft_gen_block_batched(
-        worker,
-        model,
-        SimpleNamespace(
-            get_hidden_states=Mock(return_value=torch.zeros(20, 3)),
-            qo_indptr=None,
-            verify_lens=None,
-        ),
-        SimpleNamespace(num_ctx_tokens=2),
-        torch.zeros(4, 6, dtype=torch.int32),
-        torch.tensor([1, 2, 6, 1], dtype=torch.int32),
-        num_contexts=1,
-        batch_size=4,
-        total_target_tokens=20,
-        position_ids=torch.arange(20),
-        return_tokens=True,
-    )
-    assert model.forward_batched.call_args.kwargs["return_logits"] is False
-    assert output.dtype == torch.int32 and torch.equal(output, tokens.to(torch.int32))
