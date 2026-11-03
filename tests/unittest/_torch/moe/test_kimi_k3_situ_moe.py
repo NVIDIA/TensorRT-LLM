@@ -2328,11 +2328,10 @@ def test_cutedsl_fc12_small_batch_matches_fc12_kernel(num_tokens):
 
 
 @nvfp4_moe_supported
-def test_cutedsl_fc12_die_major_weights():
-    """Die-major placement on a two-domain device: the expert parameters keep their shapes, the
-    small-batch kernel reads them (same NVFP4 MoE), and a call it does not serve raises instead
-    of running the FC12 kernel on die-major bytes. The placement is not taken when the
-    deployment's calls can exceed the small-batch kernel."""
+def test_cutedsl_fc12_die_major_weights(monkeypatch):
+    """Die-major placement on a two-domain device: the expert parameters keep their shapes, and
+    the small-batch kernel (8 tokens) and the FC12 kernel (64 tokens) read them: the same NVFP4
+    MoE as on the default placement. Without two locality domains the placement is not taken."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 
@@ -2357,25 +2356,26 @@ def test_cutedsl_fc12_die_major_weights():
     moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
     _stream_nvfp4_bank(moe, bank)
     moe.backend._weights_transformed = False
+    monkeypatch.setenv("DISABLE_LOCALITY_DOMAINS", "1")
     moe.post_load_weights()
     backend = moe.backend
-    # the default max_num_tokens exceeds the small-batch kernel
     assert not backend._die_major_applies() and not backend.weights_die_major
 
-    x8 = x[:8]
-    logits8 = gate.compute_logits(x8)
-    default = moe.forward(x8, logits8, all_rank_num_tokens=None).float()
+    inputs = {n: (x[:n], gate.compute_logits(x[:n])) for n in (8, 64)}
+    default = {
+        n: moe.forward(xs, logits, all_rank_num_tokens=None).float()
+        for n, (xs, logits) in inputs.items()
+    }
+    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS")
     shapes = [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)]
-    backend._max_call_tokens = 32
     assert backend._die_major_applies()
     backend._place_weights_die_major()
     assert backend.weights_die_major
     assert [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)] == shapes
-    die_major = moe.forward(x8, logits8, all_rank_num_tokens=None).float()
-    rel = (die_major - default).norm() / default.norm().clamp_min(1e-30)
-    assert rel < 1e-2, f"relative difference to the default placement {rel:.3e}"
-    with pytest.raises(RuntimeError, match="die-major"):
-        moe.forward(x, gate.compute_logits(x), all_rank_num_tokens=None)
+    for n, (xs, logits) in inputs.items():
+        die_major = moe.forward(xs, logits, all_rank_num_tokens=None).float()
+        rel = (die_major - default[n]).norm() / default[n].norm().clamp_min(1e-30)
+        assert rel < 1e-2, f"{n} tokens: relative difference to the default placement {rel:.3e}"
 
 
 def test_fp8_block_scaled_dequantization():

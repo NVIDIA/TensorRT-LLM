@@ -26,6 +26,7 @@ from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
 from ..locality_domain.autotune import tune_locality_domain_concurrent
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import (get_current_locality_domain,
+                                     is_locality_domain_enabled,
                                      node_local_max_active_clusters)
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
@@ -92,6 +93,11 @@ SITU_BETA_DISABLED = -1.0
 def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
     return None if situ_beta <= 0 else float(situ_beta)
 
+
+# Fused FC12 calls of at least this many tokens on die-major expert weights
+# claim their tiles per locality domain; smaller ones keep one counter per
+# phase (the claim overhead outweighs the locality gain at a few rows).
+FC12_DIE_CLAIM_MIN_TOKENS = 24
 
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
@@ -18945,7 +18951,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             The only interface delta versus the existing CuteDSL backend is the
             three int32 atomic counters (fc1_ready / fc1_scheduler_counter /
             fc2_scheduler_counter), which are allocated and memset to zero here
-            on every launch.  Geometry follows the routing tile: tile_size=128
+            on every launch.  ``die_major``: the expert weights and their block
+            scales hold ``die_major_layout`` bytes under their usual shapes; calls
+            of at least FC12_DIE_CLAIM_MIN_TOKENS tokens on 1-CTA tactics then
+            claim tiles per locality domain (one scheduler counter per domain).
+            Geometry follows the routing tile: tile_size=128
             runs 1-CTA (mma_tiler 128x{128,256}, cluster (1,1)) and
             tile_size=256 runs 2-CTA (mma_tiler 256x{128,256}, cluster (2,1));
             the autotuner picks between them per shape.  scheduler="l2_atomic".
@@ -18973,7 +18983,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
                     situ_linear_beta: Optional[float] = None,
-                    sm_reserve: int = 0):
+                    sm_reserve: int = 0,
+                    die_major: bool = False):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -18989,6 +19000,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     raise ValueError(
                         f"sm_reserve must be non-negative, got {sm_reserve}")
                 self.sm_reserve = sm_reserve
+                self.die_major = die_major
                 # Used only by the in-op output memset (moved here so the memset
                 # is the fused kernel's immediate stream predecessor).
                 self.ep_size = ep_size
@@ -19017,6 +19029,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     self.sm_reserve,
+                    self.die_major,
                 )
 
             def get_valid_tactics(
@@ -19054,8 +19067,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # runners): this kernel's per-CTA M-tile is 128, so one
                     # 256-row logical tile is exactly one (2,1) cluster and a
                     # single-tile problem is valid for 2-CTA.
-                    # The fused N-tile must divide both FC1 and FC2 output N.
-                    if fc1_n % mma_n != 0 or fc2_n % mma_n != 0:
+                    # The fused N-tile must divide both FC1 and FC2 output N
+                    # (each die-major half of them).
+                    n_split = 2 if self.die_major else 1
+                    if (fc1_n // n_split) % mma_n != 0 or (
+                            fc2_n // n_split) % mma_n != 0:
                         continue
 
                     mma_tiler = (mma_tiler_m, mma_n, mma_tiler_k)
@@ -19186,18 +19202,32 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc1_sfc = torch.empty(m * interm_size // sf_vec,
                                       dtype=fc1_sfa.dtype,
                                       device=fc1_sfa.device)
+                # Per-domain claiming (``die_major``): one scheduler counter per
+                # locality domain and phase.
+                die_claim = (self.die_major
+                             and tuple(cluster_shape_mn) == (1, 1)
+                             and num_tokens >= FC12_DIE_CLAIM_MIN_TOKENS
+                             and is_locality_domain_enabled())
+                sm_domain_words = ()
+                if die_claim:
+                    from ...locality_domain.placement import sm_locality_domains
+                    from ..moe.kernels.rubin.rubin_small_batch_fused_moe import \
+                        pack_sm_domain_words
+                    sm_domain_words = pack_sm_domain_words(
+                        sm_locality_domains(fc1_a.device.index))
                 # Three atomic counters zeroed by one fill (they sit on the
-                # routing chain); each scheduler counter on its own 128 B line.
+                # routing chain); each scheduler counter on its own 128 B line,
+                # two lines per phase (one per locality domain).
                 ints_per_line = 32
                 fc1_at = ((num_tiles + ints_per_line - 1) // ints_per_line *
                           ints_per_line)
-                fc2_at = fc1_at + ints_per_line
-                counters = torch.zeros(fc2_at + ints_per_line,
+                fc2_at = fc1_at + 2 * ints_per_line
+                counters = torch.zeros(fc2_at + 2 * ints_per_line,
                                        dtype=torch.int32,
                                        device=fc1_a.device)
                 fc1_ready = counters[:num_tiles]
-                fc1_scheduler_counter = counters[fc1_at:fc1_at + 1]
-                fc2_scheduler_counter = counters[fc2_at:fc2_at + 1]
+                fc1_scheduler_counter = counters[fc1_at:fc2_at]
+                fc2_scheduler_counter = counters[fc2_at:]
 
                 # Zero the scatter-add output right before the fused kernel so
                 # the memset becomes the kernel's immediate stream predecessor
@@ -19315,11 +19345,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 sf_vec_cx = self.scaling_vector_size
                 tile_size_cx = self.tile_size
                 top_k_cx = self.top_k
+                # Die-major B: slots of half of every expert's N rows.
+                n_split_cx = 2 if self.die_major else 1
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, max_active_clusters,
                              self.swiglu_limit, int(self.activation_type),
-                             self.situ_beta, self.situ_linear_beta)
+                             self.situ_beta, self.situ_linear_beta,
+                             self.die_major, sm_domain_words)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         self.scaling_vector_size,
@@ -19334,6 +19367,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         activation_type=self.activation_type,
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
+                        die_major=self.die_major,
+                        sm_domain_words=sm_domain_words,
                     )
 
                     @cute.jit
@@ -19373,13 +19408,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         scale_k = k // sf_vec_cx
                         fc2_scale_k = fc2_k // sf_vec_cx
                         num_tiles = m // tile_size_cx
+                        b_rows = fc1_n // n_split_cx
+                        w2_rows = fc2_n // n_split_cx
+                        slots = l * n_split_cx
                         a = cute.make_tensor(a_ptr,
                                              layout=cute.make_ordered_layout(
                                                  (orig_m, k, 1),
                                                  order=(1, 0, 2)))
                         b = cute.make_tensor(b_ptr,
                                              layout=cute.make_ordered_layout(
-                                                 (fc1_n, k, l),
+                                                 (b_rows, k, slots),
                                                  order=(1, 0, 2)))
                         c = cute.make_tensor(c_ptr,
                                              layout=cute.make_layout(
@@ -19393,7 +19431,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         sfb = cute.make_tensor(
                             sfb_ptr,
                             layout=cute.make_ordered_layout(
-                                (32, 4, fc1_n // 128, 4, scale_k // 4, l),
+                                (32, 4, b_rows // 128, 4, scale_k // 4, slots),
                                 order=(2, 1, 4, 0, 3, 5)))
                         sfc = cute.make_tensor(
                             sfc_ptr,
@@ -19423,18 +19461,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      (num_tiles, )))
                         fc1_sched = cute.make_tensor(fc1_sched_ptr,
                                                      layout=cute.make_layout(
-                                                         (1, )))
+                                                         (2 * ints_per_line, )))
                         fc2_sched = cute.make_tensor(fc2_sched_ptr,
                                                      layout=cute.make_layout(
-                                                         (1, )))
+                                                         (2 * ints_per_line, )))
                         w2 = cute.make_tensor(w2_ptr,
                                               layout=cute.make_ordered_layout(
-                                                  (fc2_n, fc2_k, l),
+                                                  (w2_rows, fc2_k, slots),
                                                   order=(1, 0, 2)))
                         w2_sf = cute.make_tensor(
                             w2_sf_ptr,
                             layout=cute.make_ordered_layout(
-                                (32, 4, fc2_n // 128, 4, fc2_scale_k // 4, l),
+                                (32, 4, w2_rows // 128, 4, fc2_scale_k // 4,
+                                 slots),
                                 order=(2, 1, 4, 0, 3, 5)))
                         out = cute.make_tensor(out_ptr,
                                                layout=cute.make_layout(
@@ -19573,6 +19612,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
             sm_reserve: int = 0,
+            die_major: bool = False,
         ) -> torch.Tensor:
             tuner = AutoTuner.get()
             runner = Sm107BlockScaledContiguousGroupedGemmFusedFc12Runner(
@@ -19589,6 +19629,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_beta=_canonicalize_situ_beta(situ_beta),
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
                 sm_reserve=sm_reserve,
+                die_major=die_major,
             )
             # Input order matches Fc12FusedInputsHelper (FC1 prefix 0..9 mirrors
             # GatherGroupedGemmInputsHelper; FC2 tensors 10..14; expanded_idx 15
@@ -19628,7 +19669,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             "str? precomputed_tactic=None, "
             f"SymInt activation_type={int(ActivationType.Swiglu)}, "
             "float situ_beta=-1.0, float situ_linear_beta=-1.0, "
-            "SymInt sm_reserve=0) -> ()",
+            "SymInt sm_reserve=0, bool die_major=False) -> ()",
             device_types="cuda")
         def cute_dsl_nvfp4_fc12_fused_rubin(
             input: torch.Tensor,
@@ -19661,6 +19702,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
             sm_reserve: int = 0,
+            die_major: bool = False,
         ) -> None:
             # In-place: finalize scatter-adds into ``output`` (mutates_args);
             # the op returns nothing so it does not alias its own input.
@@ -19675,7 +19717,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ep_size, enable_alltoall,
                 "trtllm::cute_dsl_nvfp4_fc12_fused_rubin",
                 ActivationType(activation_type), situ_beta, situ_linear_beta,
-                sm_reserve)
+                sm_reserve, die_major)
 
         @torch.library.register_fake("trtllm::cute_dsl_nvfp4_fc12_fused_rubin")
         def _(
@@ -19709,5 +19751,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             situ_beta: float = SITU_BETA_DISABLED,
             situ_linear_beta: float = SITU_BETA_DISABLED,
             sm_reserve: int = 0,
+            die_major: bool = False,
         ) -> None:
             return None

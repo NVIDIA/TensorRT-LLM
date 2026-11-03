@@ -30,10 +30,10 @@ all-to-all) run the small-batch kernel
 (``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin``) instead: FC1, SiTU, NVFP4
 requantization, FC2 and the combine in one persistent grid on the same weights
 and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices. When
-that kernel serves every call of the deployment, the device has two locality
-domains and the weights stay where they are loaded (no EPLB, no DWDP),
-``post_load_weights`` places the expert weights die-major (each domain homes
-one half of every expert), which only the small-batch kernel reads.
+the device has two locality domains and the weights stay where they are loaded
+(no EPLB, no DWDP), ``post_load_weights`` places the expert weights die-major
+(each domain homes one half of every expert); both kernels read them and claim
+their work per domain.
 """
 
 import torch
@@ -253,12 +253,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # Created by the first small-batch call (warmup runs before any graph capture); every
         # launch leaves it zero.
         self._small_batch_counters: torch.Tensor | None = None
-        # Largest MoE call of the deployment: the scheduler's chunk, at most every DP rank's tokens.
-        self._max_call_tokens = min(
-            model_config.moe_max_num_tokens or model_config.max_num_tokens,
-            model_config.max_num_tokens * model_config.mapping.dp_size,
-        )
-        # Set by post_load_weights; only the small-batch kernel reads die-major weights.
+        # Set by post_load_weights.
         self.weights_die_major = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
@@ -326,13 +321,11 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.weights_die_major = False
 
     def _die_major_applies(self) -> bool:
-        """Die-major weights need every MoE call of the deployment served by the small-batch
-        kernel (the FC12 kernel cannot read them; attention DP would add all-to-all calls), two
-        locality domains, and weights that stay where they are loaded (no EPLB, no DWDP)."""
+        """Die-major weights need two locality domains, halves of whole 128-row blocks (the FC12
+        tactics then keep to N tiles that divide a half) and weights that stay where they are
+        loaded (no EPLB, no DWDP)."""
         return (
-            self._max_call_tokens <= self.small_batch_max_tokens
-            and not self.use_dp
-            and (2 * self.intermediate_size_per_partition) % 256 == 0
+            (2 * self.intermediate_size_per_partition) % 256 == 0
             and self.hidden_size % 256 == 0
             and not self._using_load_balancer()
             and getattr(self, "dwdp_handle_collector", None) is None
@@ -445,11 +438,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
                 moe_output,
                 weight_view,
                 sort_tables,
-            )
-        if self.weights_die_major:
-            raise RuntimeError(
-                f"Layer {self.layer_idx}: {token_selected_experts.size(0)} tokens reach the FC12 "
-                "kernel, which cannot read the die-major expert weights placed at load"
             )
 
         effective_top_k = token_selected_experts.size(-1)
@@ -664,5 +652,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             sm_reserve=self._concurrent_sm_reserve,
+            die_major=self.weights_die_major,
         )
         return moe_output
