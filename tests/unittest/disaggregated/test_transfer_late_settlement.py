@@ -374,6 +374,7 @@ def test_settlement_retries_in_order() -> None:
         dst_ptrs=np.array([]),
         sizes=np.array([]),
         receiver_slice_id=3,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     initial = transfer_mod._make_kv_result_msg(
         7,
@@ -402,6 +403,8 @@ def test_settlement_retries_in_order() -> None:
         for call in dealer.send.call_args_list
     ]
     assert codes == [2, 2, 3, 3]
+    tokens = [call.args[0][2] for call in dealer.send.call_args_list]
+    assert tokens == [_KV_RESULT_REPORT_TOKEN] * 4
     sender._shutdown = True
 
 
@@ -516,6 +519,7 @@ def test_worker_polls_retained_status_when_queue_is_idle(
         src_ptrs=np.array([]),
         dst_ptrs=np.array([]),
         sizes=np.array([]),
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     work_queue = Mock(get=Mock(side_effect=[queue.Empty, None]))
     dealer = Mock()
@@ -552,6 +556,8 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     assert task.resources_drained
     assert not sender._pending_settlements[0]
     assert dealer.send.call_count == (4 if initial_send_fails else 2)
+    sent_tokens = {call.args[0][2] for call in dealer.send.call_args_list}
+    assert sent_tokens == {_KV_RESULT_REPORT_TOKEN}
     assert status.is_completed.call_count == 2
     assert task.status is transfer_mod.TaskStatus.ERROR
     sender._shutdown = True
