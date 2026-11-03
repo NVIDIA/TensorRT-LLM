@@ -14,9 +14,13 @@
 """CPU unit tests for embedding-server config handling in serve.py."""
 
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import click
 import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _write_config(tmp_path, architectures, with_pooling=True):
@@ -58,6 +62,35 @@ def test_pplx_decider_is_remapped_to_decision_model(tmp_path):
     override = _resolve_embedding_architecture_override(model, trust_remote_code=False)
 
     assert override == {"architectures": ["PplxDeciderForDecision"]}
+
+
+@pytest.mark.parametrize("has_decision_config", [True, False])
+def test_remote_pplx_decider_routing(tmp_path, monkeypatch, has_decision_config):
+    from tensorrt_llm.commands.serve import _resolve_embedding_architecture_override
+
+    _write_decision_config(tmp_path)
+    auto_config = Mock(return_value=SimpleNamespace(architectures=["Qwen3_5Model"]))
+    cached_file = Mock(
+        return_value=str(tmp_path / "decision_config.json") if has_decision_config else None
+    )
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", auto_config)
+    monkeypatch.setattr("transformers.utils.hub.cached_file", cached_file)
+    model = "perplexity-ai/pplx-decider-v1.1-27b"
+
+    result = _resolve_embedding_architecture_override(
+        model, trust_remote_code=False, revision="pinned-revision"
+    )
+
+    expected = {"architectures": ["PplxDeciderForDecision"]} if has_decision_config else None
+    assert result == expected
+    auto_config.assert_called_once_with(model, trust_remote_code=False, revision="pinned-revision")
+    cached_file.assert_called_once_with(
+        model,
+        "decision_config.json",
+        revision="pinned-revision",
+        _raise_exceptions_for_missing_entries=False,
+        _raise_exceptions_for_connection_errors=False,
+    )
 
 
 @pytest.mark.parametrize(

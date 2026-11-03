@@ -15,7 +15,7 @@ from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.fla.chunk import chunk_gated_delta_rule
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.linear import Linear
 from ..modules.mamba.causal_conv1d import causal_conv1d_fn
 from ..modules.mamba.fuse_elementwise_ops import (
     extract_transpose_prefill_slice,
@@ -169,8 +169,6 @@ class PplxDeciderForDecision(DecoderModelForCausalLM[PplxDeciderModel, Qwen3Next
             bias=False,
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
             reduce_output=False,
             allreduce_strategy=model_config.allreduce_strategy,
         )
@@ -210,6 +208,18 @@ class PplxDeciderForDecision(DecoderModelForCausalLM[PplxDeciderModel, Qwen3Next
         mapped = weight_mapper.preprocess_weights(
             weights, allow_partial_loading=allow_partial_loading
         )
+        readout_weight = mapped.get("readout.weight")
+        if readout_weight is not None:
+            shape = (
+                readout_weight.shape
+                if isinstance(readout_weight, torch.Tensor)
+                else readout_weight.get_shape()
+            )
+            if shape[0] != self.num_labels:
+                raise ValueError(
+                    f"pplx-decider requires {self.num_labels} decision labels, "
+                    f"but readout.weight has {shape[0]} rows"
+                )
         if hasattr(weights, "clear"):
             weights.clear()
         super().load_weights(
