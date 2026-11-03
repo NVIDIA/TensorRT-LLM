@@ -2,6 +2,7 @@ metadata:
   model_name: ltx2_bf16
   supported_gpus:
     - B200
+    - VR200
 hardware:
   gpus_per_node: 8
 environment:
