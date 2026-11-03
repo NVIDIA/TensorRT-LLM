@@ -1726,6 +1726,26 @@ class TestRequestBudget(unittest.TestCase):
                                           req.max_new_tokens,
                                           req.py_beam_width), 5)
 
+    def test_available_tokens_cross_uses_beam_aware_bound(self):
+        """CROSS shares prompt blocks but allocates appended tokens per beam,
+        so its capacity must use the same conservative beam-aware bound."""
+        mgr = self._make_kv_cache_manager()
+        mgr.kv_cache_type = (
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS)
+        mgr.get_num_free_blocks = lambda: 12
+
+        # tpb=8, appended=2, beam=4 -> 2 worst-case blocks per beam,
+        # 12 - 4 * 2 = 4 shared blocks, capacity=(4 + 1) * 8 - 1.
+        self.assertEqual(
+            mgr.get_num_available_tokens(token_num_upper_bound=1000,
+                                         max_num_draft_tokens=2,
+                                         max_beam_width=4), 39)
+        # Beam width one keeps the historical single-sequence bound.
+        self.assertEqual(
+            mgr.get_num_available_tokens(token_num_upper_bound=1000,
+                                         max_num_draft_tokens=2,
+                                         max_beam_width=1), 94)
+
     def test_container_returns_v1_primary_pool_budget(self):
         mgr = self._make_kv_cache_manager()
         resource_manager = ResourceManager(

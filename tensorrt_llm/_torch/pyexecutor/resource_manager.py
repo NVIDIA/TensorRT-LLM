@@ -2076,11 +2076,13 @@ class KVCacheManager(BaseResourceManager):
         """
         free_blocks = self.get_num_free_blocks()
         num_appended_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
-        if max_beam_width > 1 and self.kv_cache_type != CacheTypeCpp.CROSS:
+        if max_beam_width > 1:
             # Block usage is not monotonic in the sequence length (a
             # block-aligned prompt shares all of its blocks), so bound it by
             # the worst case: a partially filled last prompt block followed by
-            # the appended tokens, all allocated per beam.
+            # the appended tokens, all allocated per beam. CROSS shares the
+            # prompt blocks but still allocates the appended tokens per beam;
+            # this bound is conservative for that case as well.
             max_blocks_per_beam = math.ceil(
                 (self.tokens_per_block - 1 + num_appended_tokens) /
                 self.tokens_per_block)
