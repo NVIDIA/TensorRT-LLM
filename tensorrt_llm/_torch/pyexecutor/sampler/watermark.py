@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 from tensorrt_llm.watermark.prf import PAD_TOKEN, context_seeds_torch, secondary_key
 from tensorrt_llm.watermark.state_kernels import commit_windows, plan_windows
 from tensorrt_llm.watermark.step_kernel import StepScratch, watermark_step
@@ -55,7 +56,12 @@ from ..llm_request import LlmRequest
 if TYPE_CHECKING:
     from tensorrt_llm.watermark.config import WatermarkConfig
 
-__all__ = ["WatermarkHandler", "WatermarkRows", "request_wants_watermark"]
+__all__ = [
+    "WatermarkHandler",
+    "WatermarkRows",
+    "request_carries_watermark",
+    "request_wants_watermark",
+]
 
 
 def request_wants_watermark(config: "Optional[WatermarkConfig]", request: LlmRequest) -> bool:
@@ -69,6 +75,24 @@ def request_wants_watermark(config: "Optional[WatermarkConfig]", request: LlmReq
     if getattr(request, "py_watermarking", None) is False:
         return not config.allow_request_opt_out
     return True
+
+
+def request_carries_watermark(config: "Optional[WatermarkConfig]", request: LlmRequest) -> bool:
+    """Whether ``request`` is eligible for a watermark: the one rule every path uses.
+
+    The engine has a ``watermark_config``, the request has not opted out (or opting out is
+    disallowed), and it samples (greedy and beam-search requests cannot carry a watermark).
+    Eligible requests are watermarked only at the positions that take the keyed draw: a context
+    that repeats (``deduplicate_contexts``), the first ``context_width`` tokens under ``"all"`` and
+    the accepted drafts of target-only rejection sampling fall back to ordinary sampling.
+    """
+    # Imported here: the sampling resolution module imports the sampler package.
+    from .sampling_resolution import SamplingMode, request_row_params
+
+    return (
+        request_wants_watermark(config, request)
+        and request_row_params(request).mode is SamplingMode.SAMPLING
+    )
 
 
 def _signed64(value: int) -> int:
@@ -156,7 +180,7 @@ class WatermarkHandler:
     def observe(
         self,
         requests: list[LlmRequest],
-        is_sampling: Callable[[LlmRequest], bool],
+        is_sampling: Optional[Callable[[LlmRequest], bool]] = None,
         is_neutral: Optional[Callable[[LlmRequest], bool]] = None,
     ) -> None:
         """Reset the state of every slot whose occupant changed.
@@ -164,8 +188,8 @@ class WatermarkHandler:
         Called on the host before the sampling step, with the requests that will sample in it.
         A new occupant's context window starts as the last ``context_width`` tokens it holds,
         which is the prompt (plus any first token a disaggregated context worker already
-        produced). ``is_sampling`` says whether the request's sampling mode can carry a
-        watermark at all (greedy and beam search cannot).
+        produced). Eligibility is :func:`request_carries_watermark`; ``is_sampling`` replaces its
+        sampling-mode test, for callers that already hold the resolved modes.
         """
         width = self.config.context_width
         new_slots: list[int] = []
@@ -179,7 +203,16 @@ class WatermarkHandler:
             if owner is not None and owner() is request:
                 continue
             self._slot_owner[slot] = _owner_ref(request)
-            enabled = self.requested(request) and is_sampling(request)
+            if is_sampling is None:
+                enabled = request_carries_watermark(self.config, request)
+            else:
+                enabled = self.requested(request) and is_sampling(request)
+            if self.requested(request) and not enabled:
+                logger.warning_once(
+                    "A request asked for a text watermark but samples greedily or with beam "
+                    "search, which cannot carry one; it is generated without a watermark.",
+                    key="watermark_request_not_eligible",
+                )
             self._slot_enabled[slot] = enabled
             self._slot_neutral[slot] = enabled and is_neutral is not None and is_neutral(request)
             if not enabled:

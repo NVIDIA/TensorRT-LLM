@@ -8,6 +8,16 @@ The watermark uses a keyed Gumbel-max draw in place of the random draw of the fi
 Temperature, top-k, top-p and min-p are applied first, so the output distribution is unchanged on
 average over keys. Detection needs only the token ids, the tokenizer and the key.
 
+## Which requests are watermarked
+
+| Request | Watermarked? |
+|---------|--------------|
+| The engine has no `watermark_config` | No. |
+| `SamplingParams.watermarking=False` | No, unless the engine sets `allow_request_opt_out=False`. |
+| `watermarking=None` (the default) or `True` | Yes. The two behave the same: the field is only an opt-out. |
+| Greedy (`temperature=0`) or beam search | No. The request is generated normally and a warning is logged once. |
+| A sampled request | Yes, token by token. A token whose context repeats (`deduplicate_contexts`), the first `context_width` tokens with `"all"`, and the accepted drafts with `allow_target_only_watermarking` use ordinary sampling. |
+
 ## Enable it
 
 ```python
@@ -61,6 +71,11 @@ detector = GumbelWatermarkDetector(WatermarkConfig(key=123456789))
 result = detector.detect(output_token_ids, prompt_token_ids=prompt_token_ids)
 print(result.p_value, result.is_watermarked)
 ```
+
+`result.num_tokens` is the number of tokens given and `result.num_scored` the number of positions that could carry the
+mark (repeated contexts and, with `"all"`, the first tokens are not scored). A watermarked response with few scored
+positions, or whose tokens the model was nearly certain about, cannot reach a small p-value; the engine does not count
+keyed tokens per request, because that would need a device-to-host read on every step.
 
 Tokenize text with the tokenizer used for generation. The configuration must match generation: key,
 `context_width`, PRF and deduplication settings. Without `prompt_token_ids` the first `context_width`

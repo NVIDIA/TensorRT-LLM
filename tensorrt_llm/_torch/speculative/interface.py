@@ -1128,8 +1128,6 @@ class SpecMetadata:
         if handler is None:
             return
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-        from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
-            SamplingMode, request_row_params)
 
         def samples_a_token(request) -> bool:
             if request.py_seq_slot is None:
@@ -1138,9 +1136,7 @@ class SpecMetadata:
                     or request.is_last_context_chunk)
 
         sampling = [r for r in requests if samples_a_token(r)]
-        handler.observe(
-            sampling,
-            lambda r: request_row_params(r).mode is SamplingMode.SAMPLING)
+        handler.observe(sampling)
         flags = [
             samples_a_token(r) and handler.is_enabled(r.py_seq_slot)
             for r in requests

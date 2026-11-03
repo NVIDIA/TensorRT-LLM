@@ -47,8 +47,7 @@ from ..pyexecutor.sampler import (
 from ..pyexecutor.sampler.penalties import has_occurrence_penalty
 from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, top_p_decay_active
 from ..pyexecutor.sampler.sampler_features import handle_stop_criteria
-from ..pyexecutor.sampler.sampling_resolution import SamplingMode, request_row_params
-from ..pyexecutor.sampler.watermark import request_wants_watermark
+from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
 
 # Rejection messages for the sampling features the one-model speculative path
@@ -218,10 +217,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
         # A greedy request cannot carry a watermark, so it is served normally.
-        if (
-            self._watermark_unsupported_reason is not None
-            and request_wants_watermark(self._watermark_config, request)
-            and request_row_params(request).mode is SamplingMode.SAMPLING
+        if self._watermark_unsupported_reason is not None and request_carries_watermark(
+            self._watermark_config, request
         ):
             raise ValueError(self._watermark_unsupported_reason)
 
