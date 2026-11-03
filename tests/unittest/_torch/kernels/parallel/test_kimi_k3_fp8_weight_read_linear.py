@@ -26,6 +26,7 @@ from utils.util import getSMVersion
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     _get_kimi_k3_mxfp8_tuning_buckets,
+    _is_kimi_k3_mxfp8_tactic_profiled,
     _kimi_k3_mxfp8_tuning_bucket,
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
@@ -241,6 +242,46 @@ def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
         512,
         512,
     )
+
+
+def test_kimi_k3_mxfp8_tactic_filter():
+    def base(tiler_m, inst_m, swap_ab, use_prefetch, split_k):
+        return (
+            "base",
+            (tiler_m, 192, 128),
+            (inst_m, 192, 64),
+            (2, 1),
+            swap_ab,
+            use_prefetch,
+            "clc_dynamic",
+            "m",
+            split_k,
+        )
+
+    def mixed(tiler_m, inst_m, swap_ab, use_prefetch):
+        return (
+            "mixed_clusters",
+            (tiler_m, 256, 128),
+            (inst_m, 256, 64),
+            (4, 2),
+            (2, 1),
+            swap_ab,
+            use_prefetch,
+            "clc_dynamic",
+            "m",
+        )
+
+    profiled = _is_kimi_k3_mxfp8_tactic_profiled
+    assert profiled(base(256, 256, True, False, 8), 256)
+    assert not profiled(base(256, 256, False, False, 2), 512)
+    assert not profiled(base(256, 128, True, False, 1), 64)
+    assert profiled(base(512, 256, False, True, 1), 16384)
+    assert not profiled(base(512, 256, True, True, 1), 64)
+    assert not profiled(base(256, 256, False, True, 1), 16384)
+    assert profiled(mixed(512, 256, False, False), 4096)
+    assert profiled(mixed(512, 256, False, True), 4096)
+    assert not profiled(mixed(256, 128, False, False), 4096)
+    assert not profiled(mixed(128, 128, False, True), 4096)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

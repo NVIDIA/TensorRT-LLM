@@ -146,6 +146,34 @@ def _kimi_k3_mxfp8_tuning_bucket(num_tokens: int) -> int:
     return next_positive_power_of_2(num_tokens)
 
 
+# Largest tuning M at which the K3 MXFP8 runner profiles split-K tactics.
+_KIMI_K3_MXFP8_MAX_SPLIT_K_M = 256
+
+
+def _is_kimi_k3_mxfp8_tactic_profiled(tactic: tuple, m: int) -> bool:
+    """Whether the K3 MXFP8 runner profiles an SM107 tactic at tuning M ``m``.
+
+    Skips 1-CTA b-reuse tiles (mma_tiler_m 256, mma_inst_m 128), prefetch on
+    any tile but the unswapped 2-CTA b-reuse tile (512, 256), and split-K
+    above M 256. For every K3 MXFP8 weight and tuning bucket, the best
+    remaining tactic is within 1% of the best of the full SM107 space.
+    """
+    if tactic[0] == "base":
+        mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
+        swap_ab, use_prefetch = tactic[4], tactic[5]
+        split_k = tactic[8] if len(tactic) > 8 else 1
+    else:
+        mma_tiler_mnk, mma_inst_shape = tactic[1], tactic[2]
+        swap_ab, use_prefetch = tactic[5], tactic[6]
+        split_k = 1
+    mma_m = (mma_tiler_mnk[0], mma_inst_shape[0])
+    if mma_m == (256, 128):
+        return False
+    if use_prefetch and (swap_ab or mma_m != (512, 256)):
+        return False
+    return split_k == 1 or m <= _KIMI_K3_MXFP8_MAX_SPLIT_K_M
+
+
 def _with_input_cuda_device(function):
     """Run a custom-op implementation under its input tensor's CUDA device."""
 
@@ -14945,6 +14973,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
                 use_cuda_graph=True,
             )
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[tuple]:
+                m = inputs[0].shape[0]
+                return [
+                    tactic for tactic in super().get_valid_tactics(
+                        inputs, profile, **kwargs)
+                    if _is_kimi_k3_mxfp8_tactic_profiled(tactic, m)
+                ]
 
         class CuteDSLMXFP8InplaceRubinLinear(CuteDSLMXFP8RubinLinear):
             """SM107 MXFP8 runner that writes into a caller-owned output.
