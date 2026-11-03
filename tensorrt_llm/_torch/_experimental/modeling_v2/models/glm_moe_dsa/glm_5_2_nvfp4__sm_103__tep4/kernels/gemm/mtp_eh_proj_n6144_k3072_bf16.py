@@ -106,7 +106,11 @@ def _compile_projection(
     """Compile the device implementation selected for one M bucket."""
     if isinstance(schedule, TgvSchedule):
         return compile_swapped_tgv_gemm(input_tensor, weight, output, schedule)
-    return compile_persistent_gemm(input_tensor, weight, output, schedule)
+    # Own symbol name: the shared persistent kernel otherwise inherits the prefix of
+    # whichever projection was compiled last.
+    return compile_persistent_gemm(
+        input_tensor, weight, output, schedule, kernel_name_prefix="glm52_mtp_eh_proj"
+    )
 
 
 def _validate_weight(weight: torch.nn.Parameter) -> None:

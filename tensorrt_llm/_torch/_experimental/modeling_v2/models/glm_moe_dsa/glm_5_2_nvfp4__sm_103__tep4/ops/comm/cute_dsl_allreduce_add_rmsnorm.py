@@ -22,9 +22,10 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
     order on every rank; the residual add is fp32 and rounds once to bf16, and
     the norm reads that bf16 residual. `eps` is the workspace's, fixed at build.
 
-    Up to `TWOSHOT_ABOVE` rows the kernel is one-shot: every rank pulls every
-    peer's whole partial. Above it, two-shot: each rank reduces a quarter of
-    the rows and the reduced rows are gathered back. The two-shot gather moves
+    Up to `TWOSHOT_ABOVE` (512) rows the kernel is one-shot: every rank pulls every
+    peer's whole partial. Above it, two-shot: each rank pushes its partial rows to
+    the rows' owner, the owner reduces them, and the reduced rows are pushed back
+    to every rank. The two-shot gather moves
     the reduced rows as bf16, so the residual add there rounds twice (sum,
     then sum + residual). The choice is a function of the row count alone and
     is made here, identically on every rank.
@@ -38,10 +39,9 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="one decode row, one-shot", spec=dict(rows=1)),
         Cell(why="the full decode batch, 64 rows, one-shot", spec=dict(rows=64)),
-        Cell(why="the last one-shot row count, 3072", spec=dict(rows=3072)),
-        Cell(
-            why="the first two-shot row count, 3073: a ragged last row block", spec=dict(rows=3073)
-        ),
+        Cell(why="the last one-shot row count, 512", spec=dict(rows=512)),
+        Cell(why="the first two-shot row count, 513: a ragged last row block", spec=dict(rows=513)),
+        Cell(why="a two-shot context chunk of 3073 rows", spec=dict(rows=3073)),
         Cell(why="the token budget, 8192 rows, two-shot", spec=dict(rows=8192)),
     )
 

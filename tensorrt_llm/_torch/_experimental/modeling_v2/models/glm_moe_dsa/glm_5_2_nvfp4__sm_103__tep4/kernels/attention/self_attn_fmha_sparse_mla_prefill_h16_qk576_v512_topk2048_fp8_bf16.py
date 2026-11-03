@@ -247,9 +247,14 @@ NUM_TMEM_COLS_DC: int = 512
 # (latent) / 2 KiB (RoPE) offsets keep the 128-B / 64-B swizzle phase, so the
 # smem image and the dk/dkr/dv descriptors are those of the sparse path.
 KV_BOX_ROWS_DC: int = 32
-# Eight 16-KiB ring slots = one complete five-panel tile plus three panels of
-# look-ahead; nine do not fit the 227-KiB budget.
-ST_KV_DC: int = 8
+# Nine 16-KiB ring slots = one complete five-panel tile plus four panels of
+# look-ahead. The latent panels double as V and stay held until PV(kt) ends, so
+# with eight slots the last latent panel of tile kt+1 waited for PV(kt) plus a
+# TMA round trip and tiles ran back to back. The ninth slot is the 16 KiB the
+# epilogue frees by staging one token at a time (partial_o_tokens below), so
+# total SMEM is unchanged. 8x987 tokens: 180.2 -> 155.6 us; 4x1984: 285.5 ->
+# 224.2 us; output bitwise identical.
+ST_KV_DC: int = 9
 # Q is single-staged (N_DC rows x 576 B = 36 KiB).  q_empty is released by the
 # last QK commit of a group, well before its epilogue, so the next group's Q
 # load still overlaps the current group's softmax/PV tail.
@@ -707,7 +712,9 @@ def prepare_runner(
         if dense_causal_groups.dtype != torch.int32:
             raise TypeError("dense_causal_groups must be int32")
         if dense_causal_groups.ndim != 2 or dense_causal_groups.shape[1] != 2:
-            raise ValueError("dense_causal_groups must be [num_groups, 2] = (q0, n_tok)")
+            raise ValueError(
+                "dense_causal_groups must be [num_groups, 2] = (q0, n_tok)"
+            )
         if dense_causal_groups.shape[0] <= 0:
             raise ValueError("dense_causal_groups must contain at least one group")
         if not dense_causal_groups.is_contiguous():
@@ -721,7 +728,9 @@ def prepare_runner(
             if int(n_tok.min()) < 1 or int(n_tok.max()) > G_TOK:
                 raise ValueError(f"dense_causal_groups n_tok must be in [1, {G_TOK}]")
             if int(q0.min()) < 0 or int((q0 + n_tok).max()) > total_q:
-                raise ValueError("dense_causal_groups q0 + n_tok must not exceed total_q")
+                raise ValueError(
+                    "dense_causal_groups q0 + n_tok must not exceed total_q"
+                )
             group_table = dense_causal_groups.to(q_storage.device)
         else:
             group_table = dense_causal_groups
@@ -1187,9 +1196,10 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
     # barrier, so all four softmax warps release s_empty (one arrival each);
     # the sparse path releases it from W0 lane 0 after the shared barrier.
     s_empty_arrivals: cutlass.Constexpr[int] = 4 if dense_causal else 1
-    # Epilogue staging: one token (16 rows x 512 BF16) on the sparse path, a
-    # half group of two tokens in dense_causal mode.
-    partial_o_tokens: cutlass.Constexpr[int] = 2 if dense_causal else 1
+    # Epilogue staging: one token (16 rows x 512 BF16) per pass on both paths;
+    # dense_causal mode used to stage a half group of two tokens and gave that
+    # 16 KiB up for the ninth K/V ring slot.
+    partial_o_tokens: cutlass.Constexpr[int] = 1
 
     # ---- SMEM ------------------------------------------------------------
     sQ = cutlass.Array(
@@ -1520,7 +1530,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 ):
                     pass
                 if prims.elect_sync():
-                    prims.mbarrier_arrive_expect_tx(q_full.data_ptr() + work_stage, q_bytes)
+                    prims.mbarrier_arrive_expect_tx(
+                        q_full.data_ptr() + work_stage, q_bytes
+                    )
                     q_stage_base = work_stage * cutlass.Int32(NUM_HEADS * L)
                     for c in cutlass.range_constexpr(N_LAT):
                         prims.cp_async_bulk_tensor_shared_cta_global(
@@ -1550,9 +1562,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 valid_count = cutlass.Int32(TOPK)
                 if cutlass.const_expr(not all_sparse_indices_valid):
                     if prims.elect_sync():
-                        valid_count = (cu_seqlen_ke_ptr + query_idx).load(alignment=4) - (
-                            cu_seqlen_ks_ptr + query_idx
-                        ).load(alignment=4)
+                        valid_count = (cu_seqlen_ke_ptr + query_idx).load(
+                            alignment=4
+                        ) - (cu_seqlen_ks_ptr + query_idx).load(alignment=4)
                         if valid_count < cutlass.Int32(0):
                             valid_count = cutlass.Int32(0)
                         if valid_count > cutlass.Int32(TOPK):
@@ -1577,11 +1589,15 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     space=prims.SharedSpace.shared_cta,
                 )
                 if prims.elect_sync():
-                    prims.mbarrier_arrive(index_full.data_ptr() + work_stage, relaxed=True)
+                    prims.mbarrier_arrive(
+                        index_full.data_ptr() + work_stage, relaxed=True
+                    )
 
                 for kt in cutlass.range(0, num_active, 1, unroll=1):
                     index_stage = tile_iteration % cutlass.Int32(ST_I)
-                    index_phase = (tile_iteration // cutlass.Int32(ST_I)) % cutlass.Int32(2)
+                    index_phase = (
+                        tile_iteration // cutlass.Int32(ST_I)
+                    ) % cutlass.Int32(2)
                     while not prims.mbarrier_try_wait_parity(
                         tile_index_empty.data_ptr() + index_stage,
                         index_phase ^ cutlass.Int32(1),
@@ -1762,7 +1778,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     tile_iteration += cutlass.Int32(1)
                 else:
                     index_stage = tile_iteration % cutlass.Int32(ST_I)
-                    index_phase = (tile_iteration // cutlass.Int32(ST_I)) % cutlass.Int32(2)
+                    index_phase = (
+                        tile_iteration // cutlass.Int32(ST_I)
+                    ) % cutlass.Int32(2)
                     while not prims.mbarrier_try_wait_parity(
                         tile_index_full.data_ptr() + index_stage,
                         index_phase,
@@ -1779,7 +1797,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                             routed_row = values[j]
                             if routed_row < cutlass.Int32(0):
                                 routed_row = cutlass.Int32(0)
-                            routed_rows[g * 4 + j] = cute.arch.make_warp_uniform(routed_row)
+                            routed_rows[g * 4 + j] = cute.arch.make_warp_uniform(
+                                routed_row
+                            )
                     if prims.elect_sync():
                         prims.mbarrier_arrive(
                             tile_index_empty.data_ptr() + index_stage,
@@ -1808,7 +1828,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                     kv_full.data_ptr() + slot,
                                     KVR_STAGE_BYTES if c == 0 else KV_STAGE_BYTES,
                                 )
-                        for g in cutlass.range_constexpr(CTA_N // (NUM_GATHER_WARPS * 4)):
+                        for g in cutlass.range_constexpr(
+                            CTA_N // (NUM_GATHER_WARPS * 4)
+                        ):
                             if c == 0:
                                 _tma_gather4_cta1(
                                     sKv.data_ptr()
@@ -2138,8 +2160,8 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 if warp_idx == cutlass.Int32(0):
                     # 64 running-max slots (t * 16 + packed head), two per lane.
                     softmax_max[lane] = _float_to_u32_for_atomic_max(ACC_DTYPE(-3.0e38))
-                    softmax_max[lane + cutlass.Int32(32)] = _float_to_u32_for_atomic_max(
-                        ACC_DTYPE(-3.0e38)
+                    softmax_max[lane + cutlass.Int32(32)] = (
+                        _float_to_u32_for_atomic_max(ACC_DTYPE(-3.0e38))
                     )
                 prims.barrier_cta_sync(BAR_SM0, thread_count=128)
 
@@ -2327,7 +2349,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                             )
                             packed_p = half_probs.to(IO_DTYPE).bitcast(cutlass.Int32)
                             address_row = lane % cutlass.Int32(8)
-                            address_segment = (lane // cutlass.Int32(8)) % cutlass.Int32(2)
+                            address_segment = (
+                                lane // cutlass.Int32(8)
+                            ) % cutlass.Int32(2)
                             row_start = (
                                 stage * cutlass.Int32(N_DC * QK_N)
                                 + cutlass.Int32(t * NUM_HEADS * QK_N)
@@ -2372,7 +2396,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                 ).store(warp_sum, alignment=16)
                         prims.barrier_cta_sync(BAR_SM0, thread_count=128)
                         for t in cutlass.range_constexpr(G_TOK):
-                            sum_base = cutlass.Int32(t * NUM_HEADS) + col_idx * cutlass.Int32(4)
+                            sum_base = cutlass.Int32(
+                                t * NUM_HEADS
+                            ) + col_idx * cutlass.Int32(4)
                             prev_sum = (softmax_sum.data_ptr() + sum_base).load(
                                 count=4, alignment=16
                             )
@@ -2392,20 +2418,24 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                         4
                                     )
                                     sum_t = cutlass.Vector.from_elements(
-                                        tuple(prev_sum_arr[t * 4 + i] for i in range(4)),
+                                        tuple(
+                                            prev_sum_arr[t * 4 + i] for i in range(4)
+                                        ),
                                         dtype=ACC_DTYPE,
                                     )
                                     max_t = cutlass.Vector.from_elements(
-                                        tuple(prev_max_arr[t * 4 + i] for i in range(4)),
+                                        tuple(
+                                            prev_max_arr[t * 4 + i] for i in range(4)
+                                        ),
                                         dtype=ACC_DTYPE,
                                     )
                                     corr_t = cutlass.Vector.from_elements(
                                         tuple(corr_arr[t * 4 + i] for i in range(4)),
                                         dtype=ACC_DTYPE,
                                     )
-                                    (compact_stats.data_ptr() + stat_base + head_base).store(
-                                        sum_t, alignment=16
-                                    )
+                                    (
+                                        compact_stats.data_ptr() + stat_base + head_base
+                                    ).store(sum_t, alignment=16)
                                     (
                                         compact_stats.data_ptr()
                                         + stat_base
@@ -2626,9 +2656,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                             if lane < cutlass.Int32(4):
                                 stat_base = stage * cutlass.Int32(NUM_HEADS * 3)
                                 head_base = lane * cutlass.Int32(4)
-                                (compact_stats.data_ptr() + stat_base + head_base).store(
-                                    prev_sum, alignment=16
-                                )
+                                (
+                                    compact_stats.data_ptr() + stat_base + head_base
+                                ).store(prev_sum, alignment=16)
                                 (
                                     compact_stats.data_ptr()
                                     + stat_base
@@ -2651,7 +2681,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     tile_iteration += cutlass.Int32(1)
 
                 if prims.elect_sync():
-                    prims.mbarrier_arrive(index_empty.data_ptr() + work_stage, relaxed=True)
+                    prims.mbarrier_arrive(
+                        index_empty.data_ptr() + work_stage, relaxed=True
+                    )
                 query_idx, work_valid = _consume_clc_response(
                     clc_response,
                     clc_full,
@@ -2699,7 +2731,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 cst = tile_iteration % cutlass.Int32(ST_C)
                 cph = (tile_iteration // cutlass.Int32(ST_C)) % cutlass.Int32(2)
                 for kt in cutlass.range(0, num_kt, 1, unroll=1):
-                    while not prims.mbarrier_try_wait_parity(c_full.data_ptr() + cst, cph):
+                    while not prims.mbarrier_try_wait_parity(
+                        c_full.data_ptr() + cst, cph
+                    ):
                         pass
                     stat_base = cst * cutlass.Int32(N_DC * 3)
                     if kt + cutlass.Int32(1) == num_kt:
@@ -2761,11 +2795,11 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 final_phase = (tile_iteration + num_kt - cutlass.Int32(1)) % cutlass.Int32(2)
                 while not prims.mbarrier_try_wait_parity(o_full, final_phase):
                     pass
-                for half in cutlass.range_constexpr(2):
-                    # CTA-uniform skip of a half whose two tokens are dummies.
-                    if cutlass.Int32(half * 2) < group_n_tok:
-                        for t_half in cutlass.range_constexpr(2):
-                            t: cutlass.Constexpr[int] = half * 2 + t_half
+                for half in cutlass.range_constexpr(G_TOK // partial_o_tokens):
+                    # CTA-uniform skip of a staging pass whose tokens are dummies.
+                    if cutlass.Int32(half * partial_o_tokens) < group_n_tok:
+                        for t_half in cutlass.range_constexpr(partial_o_tokens):
+                            t: cutlass.Constexpr[int] = half * partial_o_tokens + t_half
                             r_sum = cutlass.Vector.from_elements(
                                 tuple(r_sum_arr[t * 4 + i] for i in range(4)),
                                 dtype=ACC_DTYPE,
@@ -2788,7 +2822,8 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                 tmem_addr = my_addr + TMEM_O_OFF_DC + s * N_DC + t * NUM_HEADS
                                 tp_lo = cutlass.inttoptr(tmem_addr, 6, ACC_DTYPE)
                                 tp_hi = cutlass.inttoptr(
-                                    tmem_addr + (cutlass.Int32(16) << cutlass.Int32(16)),
+                                    tmem_addr
+                                    + (cutlass.Int32(16) << cutlass.Int32(16)),
                                     6,
                                     ACC_DTYPE,
                                 )
@@ -2810,7 +2845,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                 # [128 B]: the sparse token image at a 4-KiB
                                 # token pitch and an 8-KiB stripe pitch.
                                 for row_half in cutlass.range_constexpr(2):
-                                    matrix_col = matrix_col_base + cutlass.Int32(row_half * 2)
+                                    matrix_col = matrix_col_base + cutlass.Int32(
+                                        row_half * 2
+                                    )
                                     smem_offset_bytes = (
                                         cutlass.Int32(
                                             s * partial_o_tokens * NUM_HEADS * PV_M * 2
@@ -2842,8 +2879,10 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                         )
                         prims.barrier_cta_sync(BAR_CORR, thread_count=128)
                         for s in cutlass.range_constexpr(N_V):
-                            for t_half in cutlass.range_constexpr(2):
-                                t: cutlass.Constexpr[int] = half * 2 + t_half
+                            for t_half in cutlass.range_constexpr(partial_o_tokens):
+                                t: cutlass.Constexpr[int] = (
+                                    half * partial_o_tokens + t_half
+                                )
                                 # Only real tokens are stored (CTA-uniform).
                                 if cutlass.Int32(t) < group_n_tok:
                                     head = corr_thread // cutlass.Int32(8)
@@ -2866,10 +2905,12 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                         (logical_sector + cutlass.Int32(1)) ^ swizzle
                                     ) * cutlass.Int32(16)
                                     values0 = (
-                                        partial_o.data_ptr() + load_offset0 // cutlass.Int32(2)
+                                        partial_o.data_ptr()
+                                        + load_offset0 // cutlass.Int32(2)
                                     ).load(count=8, alignment=16)
                                     values1 = (
-                                        partial_o.data_ptr() + load_offset1 // cutlass.Int32(2)
+                                        partial_o.data_ptr()
+                                        + load_offset1 // cutlass.Int32(2)
                                     ).load(count=8, alignment=16)
                                     values = cutlass.Vector.from_elements(
                                         tuple(values0[i] for i in range(8))
@@ -2877,7 +2918,8 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                                         dtype=OUT_DTYPE,
                                     )
                                     output_row = (
-                                        (group_q0 + cutlass.Int32(t)) * cutlass.Int32(NUM_HEADS)
+                                        (group_q0 + cutlass.Int32(t))
+                                        * cutlass.Int32(NUM_HEADS)
                                         + head
                                     ) * cutlass.Int32(L)
                                     (
@@ -2920,7 +2962,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 cst = tile_iteration % cutlass.Int32(ST_C)
                 cph = (tile_iteration // cutlass.Int32(ST_C)) % cutlass.Int32(2)
                 for kt in cutlass.range(0, num_kt, 1, unroll=1):
-                    while not prims.mbarrier_try_wait_parity(c_full.data_ptr() + cst, cph):
+                    while not prims.mbarrier_try_wait_parity(
+                        c_full.data_ptr() + cst, cph
+                    ):
                         pass
                     stat_base = cst * cutlass.Int32(NUM_HEADS * 3)
                     if kt + cutlass.Int32(1) == num_kt:
@@ -3021,8 +3065,12 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                         tile_lo = prims.tcgen05_ld("16x256b", tp_lo, num=2)
                         tile_hi = prims.tcgen05_ld("16x256b", tp_hi, num=2)
                         prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-                        packed_lo = (tile_lo * scale).to(OUT_DTYPE).bitcast(cutlass.Int32)
-                        packed_hi = (tile_hi * scale).to(OUT_DTYPE).bitcast(cutlass.Int32)
+                        packed_lo = (
+                            (tile_lo * scale).to(OUT_DTYPE).bitcast(cutlass.Int32)
+                        )
+                        packed_hi = (
+                            (tile_hi * scale).to(OUT_DTYPE).bitcast(cutlass.Int32)
+                        )
 
                         slice_idx = corr_warp // cutlass.Int32(2)
                         warp_in_slice = corr_warp % cutlass.Int32(2)
@@ -3101,7 +3149,9 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                         prims.mbarrier_arrive(o_empty, relaxed=True)
 
                 if prims.elect_sync():
-                    prims.mbarrier_arrive(index_empty.data_ptr() + work_stage, relaxed=True)
+                    prims.mbarrier_arrive(
+                        index_empty.data_ptr() + work_stage, relaxed=True
+                    )
                 query_idx, work_valid = _consume_clc_response(
                     clc_response,
                     clc_full,

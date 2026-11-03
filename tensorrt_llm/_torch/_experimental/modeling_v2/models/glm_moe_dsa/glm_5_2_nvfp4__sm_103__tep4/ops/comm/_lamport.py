@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The workspace the three TP4 Lamport all-reduce entries share.
+"""The workspace the TP4 Lamport collective entries share.
 
 `cute_dsl_allreduce`, `cute_dsl_allreduce_add_rmsnorm` and
 `cute_dsl_allreduce_add_rmsnorm_quant_nvfp4` are one transport with three
-epilogues. They read and write the same symmetric-memory peer buffers and
+epilogues; `cute_dsl_allgather_widen` (the lm_head's vocabulary gather) is a
+fourth. They read and write the same symmetric-memory peer buffers and
 rotate the same device slot counter, so every collective of a forward goes
 through one `LamportWorkspace`, built once at load by `build_workspace`.
 
@@ -24,6 +25,7 @@ from dataclasses import dataclass
 import cutlass
 import torch
 
+from ...kernels.comm import tp4_allgather_lamport as _ag
 from ...kernels.comm import tp4_allreduce_fused_rms as _ar
 
 _PING_PONG = 3
@@ -47,10 +49,13 @@ _FUSED_OPTIONS = dict(
     rotated_poll_order=True,
 )
 #: Above this many rows the add+RMSNorm entry runs two-shot: one-shot has every rank pull
-#: the whole message from every peer. Below it two-shot measured slower. The choice is a
-#: function of the row count alone, and every rank derives the row count from the same
-#: batch, so all ranks take the same side.
-TWOSHOT_ABOVE = 3072
+#: the whole message from every peer. The two-shot is the push variant (each rank writes its
+#: partial rows straight into the owning rank's slot, readers clear what they consumed): it
+#: beats the one-shot from 512 rows up (4x B300: 30.7 vs 42.5 us at 512, 81.5 vs 133.1 at
+#: 2048, 109.9 vs 192.8 at 3072; 258 us at 8192 against 429 for the flagged two-shot it
+#: replaces). The choice is a function of the row count alone, and every rank derives the
+#: row count from the same batch, so all ranks take the same side.
+TWOSHOT_ABOVE = 512
 
 
 def ensure_process_group(rank: int, world: int) -> None:
@@ -134,6 +139,9 @@ class LamportWorkspace:
     fused: object
     fused_quant: object
     fused_twoshot: object
+    #: The lm_head's vocabulary all-gather (bf16 `[M, 38720]` shards to fp32 `[M, 154880]`)
+    #: on the same buffers and slot state, or None when the group did not build it.
+    gather: object = None
 
 
 def build_workspace(
@@ -143,9 +151,10 @@ def build_workspace(
 
     Collective: every rank of the group calls it, with the same `hidden`, `eps` and
     `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter of that
-    in int32 flags of symmetric memory per rank, and compiles four CuTe DSL kernels
-    (pure, fused, fused+quant, fused two-shot) for this rank on the current device.
-    Launches nothing beyond the buffer fills and the one-element multicast agreement.
+    in int32 flags of symmetric memory per rank, and compiles five CuTe DSL kernels
+    (pure, fused, fused+quant, fused two-shot, the lm_head all-gather) for this rank on
+    the current device. Launches nothing beyond the buffer fills and the one-element
+    multicast and all-gather agreements.
 
     The multicast decision is agreed across the group: a rank compiling the multicast
     variant while a peer did not would wait on a store that never lands.
@@ -218,6 +227,25 @@ def build_workspace(
         use_pdl=True,
         pdl_release_policy=_PDL_POLICY,
     )
+    # The all-gather is separate on purpose: a group that cannot build it keeps its
+    # logits on upstream's gather, never its all-reduces. Agreed like multicast: a rank
+    # launching the gather while a peer did not would wait on stores that never land.
+    try:
+        gather = _ag.compile_for_rank(
+            rank,
+            world,
+            dev.index,
+            _ag.LM_HEAD_SHARD_N,
+            out_fp32=True,
+            use_pdl=True,
+            pdl_release_policy=_PDL_POLICY,
+        )
+    except Exception:  # noqa: BLE001 -- that group's logits take upstream's gather
+        gather = None
+    built = torch.tensor([0 if gather is None else 1], dtype=torch.int32, device=dev)
+    dist.all_reduce(built, op=dist.ReduceOp.MIN, group=group)
+    if not bool(built.item()):
+        gather = None
     return LamportWorkspace(
         hidden=hidden,
         eps=eps,
@@ -234,6 +262,7 @@ def build_workspace(
         fused=fused,
         fused_quant=fused_quant,
         fused_twoshot=fused_twoshot,
+        gather=gather,
     )
 
 
@@ -254,3 +283,10 @@ def check_rows(rows: int, workspace: LamportWorkspace) -> None:
     assert rows <= workspace.max_rows, (
         f"{rows} rows exceed the collective's budget of {workspace.max_rows}"
     )
+
+
+def check_rows_by_numel(numel: int, workspace: LamportWorkspace) -> None:
+    """The same budget for a collective whose rows are not hidden-wide (the all-gather's
+    `[M, 38720]` shard): its elements must fit one peer region, `max_rows * hidden`."""
+    budget = workspace.max_rows * workspace.hidden
+    assert numel <= budget, f"{numel} elements exceed the collective's budget of {budget}"

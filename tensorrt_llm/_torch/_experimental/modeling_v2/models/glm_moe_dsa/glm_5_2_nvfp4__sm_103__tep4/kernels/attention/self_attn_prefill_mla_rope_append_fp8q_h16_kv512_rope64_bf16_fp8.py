@@ -83,6 +83,11 @@ class PrefillRopeSpecialization:
     q_pe_ld: int = DEFAULT_Q_PE_LD
     q_pe_stride: int = DEFAULT_Q_PE_STRIDE
     latent_cache_stride: int = HEAD_SIZE
+    # Launch only the rope and c_kv copy groups (grid y = Q_BASE_START): the
+    # caller's K-B GEMM already wrote e4m3(q_base) into quant_q_buffer[..., :512],
+    # so the 128 q-base quantize groups (and their 129 MB bf16 re-read at
+    # T ~ 8k) are skipped. fused_q[..., :512] is then neither read nor needed.
+    skip_q_base: bool = False
 
     def validate(self) -> None:
         if self.tokens_per_block <= 0 or (self.tokens_per_block & (self.tokens_per_block - 1)):
@@ -202,13 +207,15 @@ def _store_bf16x8(dst, idx, v0, v1, v2, v3, v4, v5, v6, v7) -> None:
 
 @cute.jit
 def _locate_request(cu_seqlens, num_requests, token) -> cutlass.Int32:
-    """Request index b with cu_seqlens[b] <= token < cu_seqlens[b+1] (unrolled scan)."""
+    """Request index b: the largest b < num_requests with cu_seqlens[b] <= token.
+    Fixed-step binary search (MAX_REQUESTS = 64 -> 6 probes) instead of a 63-load scan;
+    same result for non-decreasing cu_seqlens, including zero-length requests."""
     req = cutlass.Int32(0)
-    for i in cutlass.range_constexpr(MAX_REQUESTS - 1):
-        boundary = cutlass.Int32(i + 1)
-        if boundary < num_requests:
-            if token >= cutlass.Int32(cu_seqlens.load(idx=boundary)):
-                req = req + cutlass.Int32(1)
+    for i in cutlass.range_constexpr(6):
+        cand = req + cutlass.Int32(32 >> i)
+        if cand < num_requests:
+            if token >= cutlass.Int32(cu_seqlens.load(idx=cand)):
+                req = cand
     return req
 
 
@@ -390,12 +397,16 @@ def _launch(
     q_pe_ld: cutlass.Constexpr[int],
     q_pe_stride: cutlass.Constexpr[int],
     latent_cache_stride: cutlass.Constexpr[int],
+    skip_q_base: cutlass.Constexpr[bool],
 ) -> None:
     num_tokens = fused_q.shape[0]
     num_requests = cached_lens.shape[0]
     max_blocks_per_seq = kv_cache_block_offsets.shape[2]
     storage = cute.make_tensor(kv_cache_storage, cute.make_layout((1,), stride=(1,)))
     grid_x = (num_tokens + TOKENS_PER_CTA - 1) // TOKENS_PER_CTA
+    grid_y = WORK_GROUPS
+    if cutlass.const_expr(skip_q_base):
+        grid_y = Q_BASE_START
     glm52_self_attn_prefill_mla_rope_append_fp8q_kernel(
         fused_q,
         q_pe,
@@ -413,7 +424,11 @@ def _launch(
         q_pe_ld,
         q_pe_stride,
         latent_cache_stride,
-    ).launch(grid=(grid_x, WORK_GROUPS, 1), block=(THREADS, 1, 1), stream=stream)
+    ).launch(
+        grid=(grid_x, grid_y, 1),
+        block=(THREADS, 1, 1),
+        stream=stream,
+    )
 
 
 # ----------------------------------------------------------------------------- host: compile
@@ -481,6 +496,7 @@ def _compile_for(spec: PrefillRopeSpecialization, device_index: int):
         spec.q_pe_ld,
         spec.q_pe_stride,
         spec.latent_cache_stride,
+        spec.skip_q_base,
     )
     cached = _COMPILE_CACHE.get(key)
     if cached is not None:
@@ -495,6 +511,7 @@ def _compile_for(spec: PrefillRopeSpecialization, device_index: int):
         spec.q_pe_ld,
         spec.q_pe_stride,
         spec.latent_cache_stride,
+        spec.skip_q_base,
         options="--enable-tvm-ffi",
     )
     _COMPILE_CACHE[key] = compiled
@@ -538,6 +555,7 @@ def prepare_runner(
     *,
     tokens_per_block: int = TOKENS_PER_BLOCK,
     refresh_stream: bool = False,
+    skip_q_base: bool = False,
 ) -> PreparedPrefillRopeRunner:
     """Validate the ABI, pick the specialization, compile (cached), bind pointers.
 
@@ -547,7 +565,10 @@ def prepare_runner(
     [T,16,576]; ``kv_cache_storage`` = layer base pointer (int) or the pool tensor;
     ``kv_cache_block_offsets`` int32 [B,2,max_blocks] contiguous (K row used);
     ``cu_seqlens`` int32 [B+1]; ``cached_lens`` int32 [B]; ``rotary_cos_sin`` float32
-    [positions,64,2].
+    [positions,64,2]. ``skip_q_base=True``: the caller has already written
+    ``quant_q_buffer[..., :512]`` (e.g. a K-B GEMM with an e4m3 epilogue); only the
+    RoPE columns ``[..., 512:]`` of ``quant_q_buffer`` are written and
+    ``fused_q[..., :512]`` is not read.
     """
     rotary_cos_sin = _normalize_rotary_cos_sin(rotary_cos_sin)
     t = fused_q.shape[0]
@@ -638,6 +659,7 @@ def prepare_runner(
         q_pe_ld=int(q_pe.stride(1)),
         q_pe_stride=int(q_pe.stride(0)),
         latent_cache_stride=int(latent_cache.stride(0)),
+        skip_q_base=bool(skip_q_base),
     )
     device_index = _device_index(fused_q)
     compiled = _compile_for(spec, device_index)

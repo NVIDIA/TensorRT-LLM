@@ -251,7 +251,7 @@ class CuteDslMoeTopkRouting(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # Decode: the block kernel (<= 16 rows) and the 4-CTA cluster at 64, the SIMT
+    # Decode: the block kernel (<= 8 rows) and the 8-CTA cluster at 64, the SIMT
     # router's 2-D logits and the tensor-core router's four partials, a width that does
     # not signal the grouped GEMM, and the MTP layer's zero-fusing variant. Prefill: each
     # histogram width at both edges of its row range, and the token budget.
@@ -265,11 +265,15 @@ class CuteDslMoeTopkRouting(OpWrapper):
             spec=dict(rows=3, splits=1, signal_gg1=False, offset=64),
         ),
         Cell(
-            why="12 rows summing four split-K partials, not a power of two",
+            why="8 rows, the block kernel's last count",
+            spec=dict(rows=8, splits=4, signal_gg1=True, offset=0),
+        ),
+        Cell(
+            why="12 rows summing four split-K partials on the 2-CTA cluster, not a power of two",
             spec=dict(rows=12, splits=4, signal_gg1=False, offset=128),
         ),
         Cell(
-            why="the full decode batch on the 4-CTA cluster kernel",
+            why="the full decode batch on the 8-CTA cluster kernel",
             spec=dict(rows=64, splits=4, signal_gg1=True, offset=192),
         ),
         Cell(

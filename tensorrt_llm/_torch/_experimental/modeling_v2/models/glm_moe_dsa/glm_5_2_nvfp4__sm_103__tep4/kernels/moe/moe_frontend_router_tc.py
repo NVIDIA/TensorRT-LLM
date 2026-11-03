@@ -65,7 +65,7 @@ if _SPLIT_K not in (2, 4, 8):
 _MMA_TILER_MN = (64, 32)
 _CLUSTER_SHAPE_MN = (1, 2)
 _SPLITK_CLUSTER_SHAPE_MN = (
-    2,
+    1,  # T <= 64 is one M tile
     2,
 )
 
@@ -208,7 +208,9 @@ def _compile_gemm(
     )
     max_active_clusters = min(
         hardware_limit,
-        _work_clusters(m, n, _SPLITK_CLUSTER_SHAPE_MN),
+        # The persistent scheduler's work is M x N x split-K tiles: size the grid for all of
+        # it, or each CTA runs _SPLIT_K slices back to back (16 CTAs instead of 64 at T=64).
+        _work_clusters(m, n, _SPLITK_CLUSTER_SHAPE_MN) * _SPLIT_K,
     )
 
     _GEMM_CACHE[key] = cute.compile(

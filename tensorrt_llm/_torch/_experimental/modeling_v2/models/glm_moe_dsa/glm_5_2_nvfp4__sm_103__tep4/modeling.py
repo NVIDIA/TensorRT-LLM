@@ -14,8 +14,11 @@ routed experts four ways, so every layer ends in an all-reduce (`ops/comm/`).
 
 Most kernels are the checkpoint-specialised CuTe DSL kernels in `kernels/`, reached through
 the `cute_dsl_*` entries in `ops/` (projections, norms, indexer, absorbed BMMs, sparse MLA,
-the all-reduce, the routed experts' router, top-k, routing, quantize and grouped GEMMs). A
-call site whose row count has no compiled kernel falls back to the stock op. Both attention
+the all-reduce, the routed experts' router, top-k, routing, quantize and grouped GEMMs), and
+around them the logits head (the `lm_head` shard GEMM and a Lamport all-gather that widens to
+fp32), the spec worker's greedy picks, and the row ops the fused kernels leave over (hidden-
+width norms and adds, row lookups, copies). A call site whose row count or layout has no
+compiled kernel falls back to the stock op. Both attention
 phases run the specialised sparse-MLA kernels: the context phase on the sm103 prefill kernel,
 the decode phase on the decode kernel.
 The context step's projections, absorbed BMMs and rope/KV append run on the prefill
@@ -51,8 +54,10 @@ from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
+from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
 from .ops.activation.cute_dsl_dense_swiglu import cute_dsl_dense_swiglu
+from .ops.activation.cute_dsl_swiglu_rows import cute_dsl_swiglu_rows
 from .ops.attention import cute_dsl_mla_rope_append_prefill as _ctx_rope_op
 from .ops.attention import cute_dsl_mla_rope_generation as _mla_rope_op
 from .ops.attention import cute_dsl_sparse_mla_decode as _fmha_dec_op
@@ -84,14 +89,22 @@ from .ops.attention.indexer_k_cache_gather_op import indexer_k_cache_gather_op
 from .ops.attention.indexer_topk_decode import indexer_topk_decode
 from .ops.attention.mla_rope_append_paged_kv_assign_q import mla_rope_append_paged_kv_assign_q
 from .ops.attention.mla_rope_generation import mla_rope_generation
+from .ops.comm import cute_dsl_allgather_widen as _allgather_op
 from .ops.comm._lamport import build_workspace as build_lamport_workspace
+from .ops.comm.cute_dsl_allgather_widen import cute_dsl_allgather_widen
 from .ops.comm.cute_dsl_allreduce import cute_dsl_allreduce
 from .ops.comm.cute_dsl_allreduce_add_rmsnorm import cute_dsl_allreduce_add_rmsnorm
 from .ops.comm.cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 import (
     cute_dsl_allreduce_add_rmsnorm_quant_nvfp4,
 )
+from .ops.elementwise import cute_dsl_copy as _copy_op
+from .ops.elementwise import cute_dsl_hidden_add as _hidden_add_op
+from .ops.elementwise.cute_dsl_copy import cute_dsl_copy
+from .ops.elementwise.cute_dsl_hidden_add import cute_dsl_hidden_add
+from .ops.embedding import cute_dsl_hidden_row_gather as _row_gather_op
 from .ops.embedding.cute_dsl_embedding import build as build_embedding
 from .ops.embedding.cute_dsl_embedding import cute_dsl_embedding
+from .ops.embedding.cute_dsl_hidden_row_gather import cute_dsl_hidden_row_gather
 from .ops.gemm import cute_dsl_absorbed_bmm as _absorbed_bmm_op
 from .ops.gemm import cute_dsl_indexer_pre_proj_split as _ix_pre_split_op
 from .ops.gemm import cute_dsl_mtp_eh_proj as _mtp_eh
@@ -107,6 +120,7 @@ from .ops.moe import cute_dsl_moe_merge as _moe_merge_op
 from .ops.moe import cute_dsl_moe_nvfp4_experts as _moe_experts_op
 from .ops.moe import cute_dsl_moe_router as _moe_router_op
 from .ops.moe import cute_dsl_moe_routing as _moe_routing_op
+from .ops.moe import cute_dsl_moe_sigmoid_topk as _topk_rows_op
 from .ops.moe import cute_dsl_moe_topk_routing as _moe_topk_op
 from .ops.moe import cute_dsl_moe_zero as _moe_zero_op
 from .ops.moe import cute_dsl_mtp_moe_experts as _mtp_experts_op
@@ -114,16 +128,22 @@ from .ops.moe.cute_dsl_moe_merge import cute_dsl_moe_merge
 from .ops.moe.cute_dsl_moe_nvfp4_experts import cute_dsl_moe_nvfp4_experts
 from .ops.moe.cute_dsl_moe_router import cute_dsl_moe_router
 from .ops.moe.cute_dsl_moe_routing import cute_dsl_moe_routing
+from .ops.moe.cute_dsl_moe_sigmoid_topk import cute_dsl_moe_sigmoid_topk
 from .ops.moe.cute_dsl_moe_topk_routing import cute_dsl_moe_topk_routing
 from .ops.moe.cute_dsl_moe_zero import cute_dsl_moe_zero
 from .ops.moe.cute_dsl_mtp_moe_experts import cute_dsl_mtp_moe_experts
 from .ops.moe.noaux_tc_op import noaux_tc_op
+from .ops.norm import cute_dsl_hidden_rmsnorm as _hidden_norm_op
+from .ops.norm import cute_dsl_qkv_a_rmsnorm as _qkv_a_norm_op
+from .ops.norm.cute_dsl_hidden_rmsnorm import cute_dsl_hidden_rmsnorm
 from .ops.norm.cute_dsl_mtp_norm_shard import compile as compile_mtp_norm_shard
 from .ops.norm.cute_dsl_mtp_norm_shard import cute_dsl_mtp_norm_shard
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import compile as compile_qkv_a_rmsnorm
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import cute_dsl_qkv_a_rmsnorm
 from .ops.quantization import cute_dsl_moe_quantize_nvfp4 as _moe_quant_op
 from .ops.quantization.cute_dsl_moe_quantize_nvfp4 import cute_dsl_moe_quantize_nvfp4
+from .ops.sampling import cute_dsl_argmax as _argmax_op
+from .ops.sampling.cute_dsl_argmax import cute_dsl_argmax
 
 
 def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
@@ -146,6 +166,10 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         primary_pool=md.kv_cache_manager.get_unique_primary_pool(),
         # The prefill rope kernel's and the dense-causal FMHA's per-request lengths.
         ctx_uncached_token_indptr=md.ctx_uncached_token_indptr,
+        # Their host twins, which the engine fills first and copies to the device: the
+        # prefill rope kernel's int32 operands are staged from these.
+        host_ctx_uncached_token_indptr=md.host_ctx_uncached_token_indptr,
+        host_ctx_cached_token_indptr=md.host_ctx_cached_token_indptr,
         num_ctx_cached_tokens=md.num_ctx_cached_tokens,
         seq_lens=md.seq_lens,
         seq_lens_cuda=md.seq_lens_cuda,
@@ -155,6 +179,9 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
 _QUANT_MODE_FP8_KV = 128
 _KV_RESIDUAL_DIM = 0
 _MOE_MAX_T = 8192
+# How often rank 0 logs the route counters, in decode forwards (eager forwards and graph
+# captures: a replay does not re-enter Python). Context steps always report.
+_ROUTE_REPORT_EVERY = 16
 # The MTP width the specialised MLA rope kernel and the base-row index kind are built for.
 _MLA_ROPE_MTP_WIDTH = 2
 # The decode kernels' widest compiled row count. Above it a projection with no compiled runner
@@ -218,6 +245,91 @@ def _direct_ok(t: torch.Tensor, dtype: torch.dtype) -> bool:
     cannot pass through, so it is skipped for a 128-byte aligned contiguous tensor -- the
     collective's output, whose graph-pool address is stable."""
     return t.dtype is dtype and t.is_contiguous() and t.data_ptr() % 128 == 0
+
+
+def _try_build(what: str, build):
+    """`build()`, or None with a warning: the caller's call sites then keep the stock op."""
+    try:
+        return build()
+    except Exception as e:  # noqa: BLE001 -- that op stays on the stock path
+        logger.warning(f"modeling_v2 GLM-5.2: {what} build failed ({e}); using the stock op")
+        return None
+
+
+def _dc_bounds_nosync(seq_lens: torch.Tensor, cached, total_q: int):
+    """The dense-causal per-row KV windows, `(ks, ke)` = `(0, cached + local + 1)`, on the
+    device without a host sync: `total_q` is trusted, the caller having checked the host
+    lengths sum to it. The kernel module's `dense_causal_bounds` reads the device sum back
+    to validate it, a full drain of the device on every context step."""
+    starts = torch.cumsum(seq_lens, 0) - seq_lens
+    pos = torch.arange(
+        total_q, dtype=torch.int32, device=seq_lens.device
+    ) - torch.repeat_interleave(starts, seq_lens, output_size=total_q)
+    if cached is not None:
+        pos = pos + torch.repeat_interleave(cached, seq_lens, output_size=total_q)
+    ks = torch.zeros(total_q, dtype=torch.int32, device=seq_lens.device)
+    ke = (pos + 1).to(torch.int32).contiguous()
+    return ks, ke
+
+
+def _dc_groups_host(host_lens: torch.Tensor, g_tok: int) -> torch.Tensor:
+    """The kernel module's `dense_causal_groups`, vectorized on the host: `[G, 2] = (q0,
+    n_tok)`, request-major, `q0 = cu[r] + g_tok * j`, `n_tok = min(g_tok, len_r - g_tok *
+    j)`; the module's version loops in Python over T / 4 groups."""
+    lens = host_lens.to(torch.int64)
+    if bool((lens < 0).any()):
+        raise ValueError(f"seq_lens must be non-negative, got {host_lens.tolist()}")
+    ng = (lens + g_tok - 1) // g_tok
+    total = int(ng.sum())
+    if total == 0:
+        raise ValueError("seq_lens must describe at least one query row")
+    req = torch.repeat_interleave(torch.arange(lens.numel()), ng, output_size=total)
+    local = (torch.arange(total) - (torch.cumsum(ng, 0) - ng)[req]) * g_tok
+    q0 = (torch.cumsum(lens, 0) - lens)[req] + local
+    ntok = torch.clamp(lens[req] - local, max=g_tok)
+    return torch.stack((q0, ntok), 1).to(torch.int32).contiguous()
+
+
+class _DcGroupsUploader:
+    """The per-step dense-causal group table's upload without a host sync: pinned,
+    double-buffered host staging and one persistent device buffer. A pinned slot is
+    rewritten only after its previous upload completed (its event, two steps old in
+    practice), and every reader runs on the stream that uploaded, after the upload, so
+    reusing the device buffer next step is stream-ordered. Grows, with one sync, the rare
+    time a step needs more rows. A pageable `.to(device)` drains the device instead."""
+
+    def __init__(self, dev) -> None:
+        self._dev = dev
+        self._cap = 0
+        self._host: list = []
+        self._done: list = [None, None]
+        self._buf = None
+        self._slot = 0
+
+    def _grow(self, rows: int) -> None:
+        torch.cuda.synchronize(self._dev)
+        self._cap = max(rows, 2 * self._cap, 2048 + 64)
+        self._host = [
+            torch.empty((self._cap, 2), dtype=torch.int32, pin_memory=True) for _ in range(2)
+        ]
+        self._done = [None, None]
+        self._buf = torch.empty((self._cap, 2), dtype=torch.int32, device=self._dev)
+
+    def __call__(self, groups_host: torch.Tensor) -> torch.Tensor:
+        g = int(groups_host.shape[0])
+        if g > self._cap:
+            self._grow(g)
+        s = self._slot
+        self._slot ^= 1
+        if self._done[s] is not None:
+            self._done[s].synchronize()
+        self._host[s][:g].copy_(groups_host)
+        out = self._buf[:g]
+        out.copy_(self._host[s][:g], non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self._done[s] = ev
+        return out
 
 
 class GlmMoeDsaTep4ModelingV2(DecoderModel):
@@ -288,6 +400,23 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # Context steps on the dense-causal context attention, and the others by reason.
         self.dense_causal_steps = 0
         self.dense_causal_misses: dict[str, int] = {}
+        # The dense-causal group table's sync-free uploader, built at first use.
+        self._dc_uploader: _DcGroupsUploader | None = None
+        # The row ops outside the fused kernels and the logits head's local GEMM, built in
+        # `post_load_weights` and `build_logits_head`; None keeps a call site's stock op.
+        self._rows = SimpleNamespace(
+            norm=None, add=None, gather=None, topk=None, swiglu=None, copy=None, argmax=None
+        )
+        self._lm_head = None
+        self._lm_head_runners: dict = {}
+        # Per-route counters, by the name a smoke asserts on: `route_hits[name]` counts the
+        # calls that ran the CuTe DSL route, `route_misses[name]` those its call site sent to
+        # the stock op. Python-side, so they count eager forwards and each CUDA graph's
+        # capture, not its replays. Created here, before the weights load, and never
+        # replaced: the load-time builds above only fill in what they point at.
+        self.route_hits: dict[str, int] = {}
+        self.route_misses: dict[str, int] = {}
+        self._forwards = 0
 
     def _rope_tables(self, device, positions: int) -> dict:
         """Two layouts of one table, built in fp64 and rounded once.
@@ -493,6 +622,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._absorb_pre = {
             kind: _absorbed_bmm_op.build_prefill(kind, dev) for kind in self._absorb
         }
+        # The context step's K-B with the e4m3 q-base epilogue: on the context rope kernel's
+        # path it writes the FMHA's fp8 query bytes itself. None keeps the bf16 K-B there.
+        self._kb_fp8_pre = _try_build(
+            "fp8 q-base K-B", lambda: _absorbed_bmm_op.build_prefill_fp8_q_base(dev)
+        )
         self._ix_pre_split = _ix_pre_split_op.compile_all(dev)
         # The same split at the context row counts, on the prefill GEMM against the decode
         # handles' bf16 weight; every indexer layer shares it. None keeps the fp32 projection.
@@ -524,6 +658,25 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._lamport = build_lamport_workspace(
             self.w["embed"].shape[1], self.eps, _MOE_MAX_T, self.tp_rank, self.tp_size
         )
+        # The row ops the fused kernels leave over: layer 0's input norm, the MTP module's
+        # norms and output adds, the logits rows' lookup, the forward's copies, routing and
+        # SwiGLU at row counts the fused front end has no kernel for, and the greedy picks.
+        # Each is independent: one that fails to build keeps its call sites on the stock op.
+        self._rows = SimpleNamespace(
+            norm=_try_build("hidden RMSNorm", _hidden_norm_op.compile),
+            add=_try_build("hidden add", _hidden_add_op.compile),
+            gather=_try_build("hidden row gather", _row_gather_op.compile),
+            topk=_try_build("sigmoid top-k", _topk_rows_op.compile),
+            swiglu=_try_build("SwiGLU rows", _swiglu_rows_op.compile),
+            copy=_try_build("copy/convert", _copy_op.compile),
+            argmax=_try_build("argmax", _argmax_op.compile),
+        )
+        if self.tp_rank == 0:
+            built = " ".join(f"{k}={v is not None}" for k, v in vars(self._rows).items())
+            logger.info(
+                f"modeling_v2 GLM-5.2 row ops built: {built} "
+                f"logits_gather={self._lamport.gather is not None}"
+            )
 
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
@@ -691,7 +844,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
     ) -> torch.Tensor:
         """Derive what the first step fixes, then route."""
         self._derive_first_step(attn_metadata)
-        return self._select_target(attn_metadata).forward(
+        out = self._select_target(attn_metadata).forward(
             attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -699,6 +852,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             lora_params=lora_params,
             **kwargs,
         )
+        # After the step, so a report includes it. Every context step reports (they run
+        # eagerly and are few); decode steps every `_ROUTE_REPORT_EVERY` Python forwards.
+        self._forwards += 1
+        if self.tp_rank == 0 and (
+            attn_metadata.num_contexts or self._forwards % _ROUTE_REPORT_EVERY == 0
+        ):
+            logger.info(f"modeling_v2 GLM-5.2 routes after {self._forwards} forwards: "
+                        f"{self.route_report()}")  # fmt: skip
+        return out
 
     def _derive_first_step(self, md) -> None:
         """What depends on values the engine resolves: compiled on the first forward, which
@@ -784,6 +946,112 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
 
     # ---- blocks both targets run ----
 
+    def _count(self, route: str, hit: bool) -> None:
+        """One call of `route`: on its CuTe DSL kernel (`hit`) or on the stock op."""
+        counts = self.route_hits if hit else self.route_misses
+        counts[route] = counts.get(route, 0) + 1
+
+    def route_report(self) -> str:
+        """`name=hits` per route, `/misses` appended where a call took the stock op."""
+        names = sorted(set(self.route_hits) | set(self.route_misses))
+        return " ".join(
+            f"{n}={self.route_hits.get(n, 0)}"
+            + (f"/{self.route_misses[n]}" if self.route_misses.get(n) else "")
+            for n in names
+        )
+
+    def _rmsnorm(self, x, weight):
+        """RMSNorm of hidden-width rows: the CuTe DSL kernel, else FlashInfer's."""
+        rows = self._rows
+        hit = rows.norm is not None and _hidden_norm_op.takes(x, weight)
+        self._count("hidden_norm", hit)
+        if hit:
+            return cute_dsl_hidden_rmsnorm(x, weight, self.eps, rows.norm)
+        return flashinfer_rmsnorm(x, weight, self.eps)
+
+    def _add(self, a, b):
+        """A residual add of hidden-width rows: the CuTe DSL kernel, else `torch.add`."""
+        rows = self._rows
+        hit = rows.add is not None and _hidden_add_op.takes(a, b)
+        self._count("hidden_add", hit)
+        if hit:
+            return cute_dsl_hidden_add(a, b, rows.add)
+        return torch.add(a, b)
+
+    def _copy_into(self, dst, src):
+        """`dst.copy_(src)`: the CuTe DSL copy/convert kernel for the pairs it takes."""
+        rows = self._rows
+        hit = rows.copy is not None and _copy_op.takes(dst, src)
+        self._count("copy", hit)
+        if hit:
+            return cute_dsl_copy(dst, src, rows.copy)
+        return dst.copy_(src)
+
+    def _route(self, logits, bias):
+        """`(topk_w, topk_ids)` for a chunk the fused front end does not take: the CuTe DSL
+        top-k when it takes the routing, else `noaux_tc_op`."""
+        rows = self._rows
+        args = (logits, bias, self.n_group, self.topk_group, self.topk)
+        hit = rows.topk is not None and _topk_rows_op.takes(*args)
+        self._count("topk_rows", hit)
+        if hit:
+            return cute_dsl_moe_sigmoid_topk(*args, self.routed_scale, rows.topk)
+        return noaux_tc_op(*args, self.routed_scale)
+
+    def build_logits_head(self, lm_head) -> None:
+        """Compile the `lm_head` local GEMM (this rank's vocabulary shard) at every row
+        count it has a schedule for. Taken only for the head the gather was built for:
+        unpadded, column-parallel, gathering, the TP4 shard shape. Called by the shell
+        once the weight is loaded; a head this does not take keeps upstream's path."""
+        w = lm_head.weight
+        if (
+            self._lamport.gather is None
+            or not getattr(lm_head, "gather_output", False)
+            or getattr(lm_head, "padding_size", 0) != 0
+            or int(getattr(lm_head, "tp_size", 1)) != self.tp_size
+            or tuple(w.shape) != (_allgather_op.SHARD_N, self.w["embed"].shape[1])
+        ):
+            logger.warning("modeling_v2 GLM-5.2: lm_head not on the gathered fast path")
+            return
+        self._lm_head = lm_head
+        self._lm_head_runners = _projection_op.build_all("lm_head", w)
+        if self.tp_rank == 0:
+            logger.info(
+                f"modeling_v2 GLM-5.2 lm_head: {len(self._lm_head_runners)} of "
+                f"{len(_projection_op.ROWS['lm_head'])} row counts on the CuTe DSL GEMM"
+            )
+
+    def logits(self, x, lm_head, logits_processor, attn_metadata):
+        """Full-vocabulary fp32 logits for the hidden rows `x`, every one of them (what
+        `LogitsProcessor.forward` returns with `return_context_logits=True`): the local
+        GEMM on its CuTe DSL kernel, then one Lamport launch that gathers the four shards
+        and widens them. Any other head, row count or layout keeps `logits_processor`."""
+        rows = int(x.shape[0])
+        runner = self._lm_head_runners.get(rows) if lm_head is self._lm_head else None
+        if (
+            runner is not None
+            and x.dtype is torch.bfloat16
+            and x.is_contiguous()
+            and x.data_ptr() % 128 == 0
+            and rows * _allgather_op.SHARD_N <= self._lamport.max_rows * self._lamport.hidden
+        ):
+            self._count("logits", True)
+            local = torch.empty([rows, runner.n], dtype=torch.bfloat16, device=x.device)
+            cute_dsl_projection(x, lm_head.weight, local, runner)
+            out = torch.empty([rows, self.tp_size * runner.n], dtype=torch.float32, device=x.device)
+            return cute_dsl_allgather_widen(local, out, self._lamport)
+        self._count("logits", False)
+        return logits_processor.forward(x, lm_head, attn_metadata, True)
+
+    def gather_rows(self, hidden, rows):
+        """`hidden[rows]`: the CuTe DSL row gather, else `embedding(rows, hidden)`."""
+        handle = self._rows.gather
+        hit = handle is not None and _row_gather_op.takes(hidden, rows)
+        self._count("logits_rows", hit)
+        if hit:
+            return cute_dsl_hidden_row_gather(hidden, rows, handle)
+        return nn.functional.embedding(rows, hidden)
+
     def _check_rows(self, partial) -> None:
         # The all-reduce kernels take the row count from their input, so a call above the
         # token budget the peer buffers were sized for would write past every peer's buffer.
@@ -832,8 +1100,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             res = cublas_mm(x, w_colmajor, None, out_dtype)
             if out is None:
                 return res
-            out.copy_(res)
-            return out
+            return self._copy_into(out, res)
         if out is None:
             out = torch.empty([rows, runner.n], dtype=runner.out_dtype, device=x.device)
         return cute_dsl_projection(x, w_colmajor.t(), out, runner)
@@ -903,6 +1170,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         fused projection's tail, a strided view."""
         qkva = self._project("qkva", x, a.qkva)
         q_a_raw, ckv_raw, _ = torch.split(qkva, [self.q_lora, self.kv_lora, self.rope_dim], -1)
+        # Both kernels are this op's; the counter shows which one a step's row count took.
+        wr = _qkv_a_norm_op.takes_warp_row(q_a_raw, a.q_norm, ckv_raw, a.kv_norm)
+        self._count("qkv_a_warp_row" if wr else "qkv_a_cta", True)
+        # Eager calls on the in-place layout skip the kernel module's per-call checks.
+        if _qkv_a_norm_op.takes_direct(q_a_raw, a.q_norm, ckv_raw, a.kv_norm):
+            self._count("qkv_a_direct", True)
         q_a, _ = cute_dsl_qkv_a_rmsnorm(
             q_a_raw, a.q_norm, ckv_raw, a.kv_norm, self.eps, self._qkv_a_norm
         )
@@ -920,9 +1193,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             [rows, self.idx_topk], dtype=torch.int32, device=torch.cuda.current_device()
         )
         if skip_ctx and tc:
-            buf[:tc].copy_(md.topk_indices_buffer[:tc])
+            self._copy_into(buf[:tc], md.topk_indices_buffer[:tc])
         if skip_gen and rows > tc:
-            buf[tc:].copy_(md.topk_indices_buffer[tc:rows])
+            self._copy_into(buf[tc:], md.topk_indices_buffer[tc:rows])
         return buf
 
     def _indexer_project(self, x, q_a, pos, ix, rows: int, need_q: bool):
@@ -948,7 +1221,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # fp32: the only `weights` dtype fp8_mqa_logits takes.
             fused = self._project("ix_fused", x.float(), ix.fused, torch.float32)
             k_raw, wq_raw = torch.split(fused, [di, hi], -1)
-            kb.copy_(k_raw)
+            self._copy_into(kb, k_raw)
             # The scorers check `weights`' stride(1) but not stride(0), then read it densely:
             # a strided slice scores each row with another row's head weights.
             wq = wq_raw.contiguous()
@@ -1150,7 +1423,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 return cute_dsl_projection(mid, dn.t(), res, k.shared_down_pre)
         runner = self._shared_gu_swiglu.get(rows)
         if runner is None:
-            act = flashinfer_silu_and_mul(self._project("shared_gate_up", x, gu))
+            gate_up = self._project("shared_gate_up", x, gu)
+            swiglu = self._rows.swiglu
+            hit = swiglu is not None and _swiglu_rows_op.takes(gate_up)
+            self._count("swiglu_rows", hit)
+            if hit:
+                act = cute_dsl_swiglu_rows(gate_up, swiglu)
+            else:
+                act = flashinfer_silu_and_mul(gate_up)
         else:
             act = torch.empty([rows, gu.shape[1] // 2], dtype=x.dtype, device=x.device)
             cute_dsl_shared_gate_up_swiglu(x, gu_il, act, runner)
@@ -1203,7 +1483,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             xs = x
         else:
             xs = s.router_x[:rows]
-            xs.copy_(x)
+            self._copy_into(xs, x)
         out = (
             s.router_out[:rows]
             if rows <= _moe_router_op.SIMT_MAX_ROWS
@@ -1235,7 +1515,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return None
         if not in_slot:
             lg = s.logits[:rows].view(rows, -1)
-            lg.copy_(logits.reshape(rows, -1))
+            self._copy_into(lg, logits.reshape(rows, -1))
             logits = lg
         outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.topk_scratch, **s.maps}
         return cute_dsl_moe_topk_routing(
@@ -1280,14 +1560,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._moe_slot ^= 1
         s = self._moe_slots[slot]
         if not prequantized:
-            x_s = s.x[:padded]
-            x_s.copy_(x)
-            x = x_s
+            # An activation the engine allocated inside a CUDA-graph capture is not safe to
+            # hand over as a raw pointer, so a captured call stages it. An eager call (context
+            # and mixed steps) whose `x` already is the contiguous, 16-byte aligned bf16
+            # `[padded, hidden]` operand goes to the quantize directly, which takes it per
+            # call: a `[T, 6144]` copy per MoE layer skipped (98 MB at T ~ 8k; 3.0-3.4 ms of
+            # copies per context step, measured on the staircase frontend).
+            if (
+                x.dtype is torch.bfloat16
+                and x.is_contiguous()
+                and x.data_ptr() % 16 == 0
+                and tuple(x.shape) == tuple(s.x[:padded].shape)
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._count("moe_stage_skip", True)
+            else:
+                x_s = s.x[:padded]
+                self._copy_into(x_s, x)
+                x = x_s
         # fp32, as both top-k kernels write it and FC2 reads it: a top-k kernel's own output
         # at an unpadded width goes in as it is.
         if topk_maps is None or padded != rows:
             w_s = s.w[:padded]
-            w_s.copy_(topk_w)
+            self._copy_into(w_s, topk_w)
             topk_w = w_s
         if topk_maps is not None and padded == rows:
             maps = topk_maps
@@ -1296,7 +1591,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # inputs, and the fused top-k signals its dependents before it writes the ids.
             # The copy puts a node no PDL edge can cross between the two.
             sel = s.sel[: padded * _MOE_TOP_K]
-            sel.copy_(topk_ids.reshape(-1))
+            self._copy_into(sel, topk_ids.reshape(-1))
             maps = cute_dsl_moe_routing(
                 sel, self.expert_offset, s.maps, s.counts, s.barrier, k.routing
             )
@@ -1352,14 +1647,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 logits = self._project("router", chunk, m.router_t, torch.float32)
             selected = self._moe_topk(logits, in_slot, m, slot)
             if selected is None:
-                topk_w, topk_ids = noaux_tc_op(
-                    logits,
-                    m.router_bias,
-                    self.n_group,
-                    self.topk_group,
-                    self.topk,
-                    self.routed_scale,
-                )
+                topk_w, topk_ids = self._route(logits, m.router_bias)
                 maps = None
             else:
                 topk_w, topk_ids, maps = selected
@@ -1368,7 +1656,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
             if result is None:
                 return part
-            result[start : start + n].copy_(part)
+            self._copy_into(result[start : start + n], part)
             start += n
         return result
 
@@ -1404,10 +1692,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     and routed.is_contiguous()
                 ):
                     if not shared.is_contiguous():
-                        shared = shared.contiguous()
+                        packed = torch.empty_like(shared, memory_format=torch.contiguous_format)
+                        shared = self._copy_into(packed, shared)
                     mlp_out = cute_dsl_moe_merge(routed, shared, merge)
                 else:
-                    mlp_out = torch.add(routed, shared)
+                    mlp_out = self._add(routed, shared)
             else:
                 mlp_out = routed
         return self._reduce_norm(mlp_out, residual, self._next_norm[i])
@@ -1425,13 +1714,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 src, nw, local, (self.tp_rank % 2) * k, self.eps, mw["norm_shard"]
             )
             return self._reduce(cute_dsl_mtp_eh_proj(local, mw["eh_local"], mw["ehproj"]))
-        cat = torch.cat(
-            [
-                flashinfer_rmsnorm(e, mw["enorm"], self.eps),
-                flashinfer_rmsnorm(h, mw["hnorm"], self.eps),
-            ],
-            -1,
-        )
+        # The concat written by two copies into one buffer: the copy kernel takes each
+        # half (a column slice of the buffer), torch.cat would be one more launch.
+        en, hn = self._rmsnorm(e, mw["enorm"]), self._rmsnorm(h, mw["hnorm"])
+        cat = torch.empty([rows, 2 * en.shape[1]], dtype=en.dtype, device=en.device)
+        self._copy_into(cat[:, : en.shape[1]], en)
+        self._copy_into(cat[:, en.shape[1] :], hn)
         # The replicated projection: the prefill GEMM above the decode row counts, else cuBLAS.
         return self._project("mtp_eh", cat, mw["eh"])
 
@@ -1484,12 +1772,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             # The routing kernel does not wait before reading the ids, and `noaux_tc_op`
             # releases it before its stores are visible: these copies are what order them.
             xs = s.x[:padded]
-            xs.copy_(x)
+            self._copy_into(xs, x)
             w_s = s.w[:padded]
-            w_s.copy_(topk_w)
+            self._copy_into(w_s, topk_w)
             topk_w = w_s
             sel = s.sel[: padded * _MOE_TOP_K]
-            sel.copy_(topk_ids.reshape(-1))
+            self._copy_into(sel, topk_ids.reshape(-1))
             maps = cute_dsl_moe_routing(
                 sel, self.expert_offset, s.maps, s.counts, s.barrier, self._moe_k.routing
             )
@@ -1513,18 +1801,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 part = self._mtp_experts(chunk, None, None, n, frontend=True)
             else:
                 logits = self._project("router", chunk, mw["router_t"], torch.float32)
-                topk_w, topk_ids = noaux_tc_op(
-                    logits,
-                    mw["router_bias"],
-                    self.n_group,
-                    self.topk_group,
-                    self.topk,
-                    self.routed_scale,
-                )
+                topk_w, topk_ids = self._route(logits, mw["router_bias"])
                 part = self._mtp_experts(chunk, topk_ids, topk_w, n, frontend=False)
             if result is None:
                 return part
-            result[start : start + n].copy_(part)
+            self._copy_into(result[start : start + n], part)
             start += n
         return result
 
@@ -1542,7 +1823,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             shared = self._shared_mlp(o, gu, self._shared_gu_il[j], dn)
         routed = self._mtp_routed(o, rows)
         main.wait_stream(side)
-        return torch.add(residual, self._reduce(torch.add(routed, shared)))
+        return self._add(residual, self._reduce(self._add(routed, shared)))
 
 
 class PrefillTarget:
@@ -1577,7 +1858,10 @@ class PrefillTarget:
         """The context rope kernel's per-step operands: the new-row prefix sum and the cached
         lengths, int32, from the engine's int64 prefix sums. None sends the step's context rows
         to the stock rope/append op. Context steps are not captured, so a fresh pair per step
-        is fine."""
+        is fine.
+
+        Built on the host from the prefix sums' host copies and uploaded in one copy: the
+        conversions and the difference on the device would be four small kernels per step."""
         core = self.core
         ctx = step["num_contexts"]
         compiled = core._ctx_rope_compiled
@@ -1588,9 +1872,14 @@ class PrefillTarget:
             or tc >= _ROPE_APPEND_MAX_TOKENS
         ):
             return None
-        cu = step["ctx_uncached_token_indptr"][: ctx + 1].to(torch.int32)
-        cached = torch.diff(step["ctx_cached_token_indptr"][: ctx + 1]).to(torch.int32)
-        return cu, cached
+        host_cached = step["host_ctx_cached_token_indptr"]
+        staged = torch.empty([2 * ctx + 1], dtype=torch.int32, pin_memory=True)
+        staged[: ctx + 1].copy_(step["host_ctx_uncached_token_indptr"][: ctx + 1])
+        staged[ctx + 1 :].copy_(host_cached[1 : ctx + 1] - host_cached[:ctx])
+        # The caching host allocator keeps the pinned block until this copy has run.
+        dev = step["ctx_uncached_token_indptr"].device
+        both = staged.to(dev, non_blocking=True)
+        return both[: ctx + 1], both[ctx + 1 :]
 
     def _dense_causal_step(self, md, step, tc: int, skip_ctx: bool, req_idx, dev):
         """The dense-causal context attention's per-step operands, shared by every layer, or
@@ -1621,14 +1910,17 @@ class PrefillTarget:
         cached = None
         if int(step["num_ctx_cached_tokens"]):
             cached = torch.diff(step["ctx_cached_token_indptr"][: ctx + 1]).to(torch.int32)
-        ks, ke = _fmha_pre_op.dense_causal_bounds(
-            step["seq_lens_cuda"][:ctx].to(torch.int32), cached, tc
-        )
+        # Both without a host sync (the kernel module's helpers read the device lengths back
+        # and upload pageable memory): the host already checked the row total above.
+        ks, ke = _dc_bounds_nosync(step["seq_lens_cuda"][:ctx].to(torch.int32), cached, tc)
+        if core._dc_uploader is None:
+            core._dc_uploader = _DcGroupsUploader(dev)
+        groups = core._dc_uploader(_dc_groups_host(host_lens, _fmha_pre_op.DENSE_CAUSAL_GROUP))
         core.dense_causal_steps += 1
         return SimpleNamespace(
             ks=ks,
             ke=ke,
-            groups=_fmha_pre_op.dense_causal_groups(host_lens).to(dev),
+            groups=groups,
             req_idx=req_idx[:tc],
             block_table=md.block_table,
             # One fp8 query for the step: each layer writes it and its attention reads it
@@ -1654,13 +1946,6 @@ class PrefillTarget:
         )
         fused_q = torch.empty([tc, heads, core.lat_dim], dtype=dt, device=dev)
         fq_nope, fq_pe = torch.split(fused_q, [core.kv_lora, core.rope_dim], -1)
-        core._absorbed_bmm(
-            "k_b",
-            torch.transpose(q_nope, 0, 1),
-            a.k_b,
-            a.k_b_nk,
-            torch.transpose(fq_nope, 0, 1),
-        )
         quant_q = (
             dc.quant_q
             if dc is not None
@@ -1670,20 +1955,53 @@ class PrefillTarget:
         pool_ptrs = step["host_kv_cache_pool_pointers"]
         mapping = step["host_kv_cache_pool_mapping"][layer]
         pool_idx, layer_in_pool = int(mapping[0]), int(mapping[1])
-        if (
+        on_kernel = (
             ctx_rope is not None
             and int(pool_ptrs[pool_idx, 0]) == pool.data_ptr()
             and int(pool_ptrs[pool_idx, 1]) == 0
-        ):
+        )
+        core._count("ctx_rope", on_kernel)
+        # On the rope kernel's path the attention reads only the fp8 query: K-B writes its
+        # e4m3 q-base bytes straight into `quant_q[..., :kv_lora]` and the rope kernel skips
+        # its q-base groups, so the bf16 `fused_q[..., :kv_lora]` (129 MB at 8k rows) is
+        # neither written nor re-read. Same bytes into the attention (FP32 -> BF16 -> E4M3,
+        # nearest, on both paths). Row counts the decode groups serve keep the bf16 K-B.
+        kb_fp8 = (
+            on_kernel
+            and core._kb_fp8_pre is not None
+            and tc not in core._absorb["k_b"]
+            and tc <= _absorbed_bmm_op.PREFILL_MAX_ROWS
+        )
+        if kb_fp8:
+            core._count("ctx_kb_fp8", True)
+            q_base = torch.split(quant_q.view(torch.uint8), [core.kv_lora, core.rope_dim], -1)[0]
+            cute_dsl_absorbed_bmm(
+                torch.transpose(q_nope, 0, 1),
+                a.k_b_nk,
+                torch.transpose(q_base, 0, 1),
+                core._kb_fp8_pre,
+            )
+        else:
+            core._absorbed_bmm(
+                "k_b",
+                torch.transpose(q_nope, 0, 1),
+                a.k_b,
+                a.k_b_nk,
+                torch.transpose(fq_nope, 0, 1),
+            )
+        if on_kernel:
+            in_place = latent.stride(0) in core._ctx_rope_compiled.kernels and latent.stride(1) == 1
+            core._count("ctx_rope_latent_in_place", in_place)
             # One launch: rope(q_pe) into the tail of fused_q straight from the strided view,
             # rope(k_pe) and the latent row appended as e4m3 to this layer's pool rows, and
             # e4m3(fused_q). Context requests are the first `num_contexts` of the batch.
             cute_dsl_mla_rope_append_prefill(
                 fused_q,
                 q_pe,
-                # A packed copy: `contiguous()` keeps a one-row view's 2624 row stride, and
-                # the kernel is compiled for the packed 576. Nothing reads the latent after.
-                latent.clone(memory_format=torch.contiguous_format),
+                # In place: the latent is the projection row's tail (stride q_lora + 576),
+                # which the kernel was compiled for, and nothing reads it after the append
+                # rotates its k_pe. Any other stride gets a packed copy.
+                latent if in_place else latent.clone(memory_format=torch.contiguous_format),
                 quant_q,
                 pool,
                 layer_in_pool,
@@ -1692,12 +2010,13 @@ class PrefillTarget:
                 core._rope["rotary_cos_sin"],
                 step["tokens_per_block"],
                 core._ctx_rope_compiled,
+                skip_q_base=kb_fp8,
             )
         else:
             # The append rotates the query's rope tail in place, reading its own
             # pre-rotation contents, and the absorbed BMM wrote only the first kv_lora
             # columns: seed the tail.
-            fq_pe.copy_(q_pe)
+            core._copy_into(fq_pe, q_pe)
             mla_rope_append_paged_kv_assign_q(
                 torch.reshape(fused_q, [tc, heads * core.lat_dim]),
                 latent.contiguous(),
@@ -1724,7 +2043,7 @@ class PrefillTarget:
                 1,
                 core.quant_mode,
             )
-            quant_q.copy_(fused_q)
+            core._copy_into(quant_q, fused_q)
         lat_out = torch.empty([tc, heads * core.kv_lora], dtype=dt, device=dev)
         if dc is not None:
             # The pool rows this layer's selection would name, `to_global` of the dense
@@ -1883,7 +2202,7 @@ class PrefillTarget:
         # conversion runs on the generation rows alone, or not at all.
         slot_lo = tc if dc is not None else 0
 
-        x = flashinfer_rmsnorm(h, core._attn[0].norm1, core.eps)
+        x = core._rmsnorm(h, core._attn[0].norm1)
         residual = h
         for i in range(core.num_layers):
             layer_id = core._pool_layer_id[i]
@@ -1928,7 +2247,7 @@ class PrefillTarget:
         emb = core._embed(input_ids)
         x = core._mtp_front(emb, hidden_states, rows)
         residual = x
-        xn = flashinfer_rmsnorm(x, core._attn[j].norm1, core.eps)
+        xn = core._rmsnorm(x, core._attn[j].norm1)
         skip_ctx = bool(md.skip_indexer_for_ctx_reqs) if tc else True
         skip_gen = bool(md.skip_indexer_for_gen_reqs) if gen else True
         topk_buf = core._topk_buf(md, rows, tc, skip_ctx, skip_gen)
@@ -1944,12 +2263,19 @@ class PrefillTarget:
             )
             return torch.split(slots, [tc, gen], 0)
 
-        # The MTP layer's context rows take the stock rope/append op and the index path.
+        # The MTP layer's context rows take the trunk's rope/append kernel, at its own pool's
+        # layer (`_attn_ctx` falls back to the stock op on any other pool layout), and the
+        # index path.
+        ctx_rope = self._ctx_rope_step(step, tc) if tc else None
+        on_kernel = core.route_hits.get("ctx_rope", 0)
         attn_out = torch.empty([rows, core.heads * core.v_dim], dtype=x.dtype, device=x.device)
         self._layer_attention(
             md, step, xn, torch.reshape(position_ids, [-1]), attn_out, j, local, slots_of,
             topk_buf, rows, tc, gen, gen_p, ctx, not (skip_ctx and skip_gen), skip_ctx, skip_gen,
+            ctx_rope,
         )  # fmt: skip
+        if tc:
+            core._count("mtp_ctx_rope", core.route_hits.get("ctx_rope", 0) > on_kernel)
         return core._mtp_close(attn_out, residual, rows)
 
 
@@ -2046,7 +2372,7 @@ class DecodeTarget:
         mtp_width = gen_p == _MLA_ROPE_MTP_WIDTH
         base = None
 
-        x = flashinfer_rmsnorm(h, core._attn[0].norm1, core.eps)
+        x = core._rmsnorm(h, core._attn[0].norm1)
         residual = h
         for i in range(core.num_layers):
             layer_id = core._pool_layer_id[i]
@@ -2093,7 +2419,7 @@ class DecodeTarget:
         emb = core._embed(input_ids)
         x = core._mtp_front(emb, hidden_states, rows)
         residual = x
-        xn = flashinfer_rmsnorm(x, core._attn[j].norm1, core.eps)
+        xn = core._rmsnorm(x, core._attn[j].norm1)
         skip_gen = bool(md.skip_indexer_for_gen_reqs)
         topk_buf = core._topk_buf(md, rows, 0, True, skip_gen)
         live_map = md.host_kv_cache_pool_mapping
@@ -2114,6 +2440,55 @@ class DecodeTarget:
             rows, gen_p, skip_gen, gen_p == _MLA_ROPE_MTP_WIDTH,
         )  # fmt: skip
         return core._mtp_close(attn_out, residual, rows)
+
+
+def _greedy_on_argmax(worker, core) -> None:
+    """Put the spec worker's two all-greedy picks on the CuTe DSL argmax.
+
+    * `greedy_sample_draft_with_tp_gather`: the draft token. This target's draft logits
+      are the gathered full vocabulary on every rank (`MTPLayer.shared_head`), so the
+      worker already takes its plain `argmax` branch; this is that argmax. A call with
+      `mapping_lm_head_tp` (LM-head TP under attention DP) keeps the worker's.
+    * `_sample_tokens_for_batch`, all-greedy batch: the target's token. `torch.argmax`
+      there, int64; int32 here, which every caller stores into an int32 tensor.
+
+    Bound on this worker instance, which the target built; logits the kernel does not
+    take keep the worker's own code, counted as misses. A worker without either method is
+    left as is. Idempotent: a second load does not wrap the wrappers.
+    """
+    if getattr(worker, "_glm_greedy_on_argmax", False):
+        return
+    draft = getattr(worker, "greedy_sample_draft_with_tp_gather", None)
+    target = getattr(worker, "_sample_tokens_for_batch", None)
+    if draft is None or target is None:
+        logger.warning("modeling_v2 GLM-5.2: spec worker has no greedy picks to route")
+        return
+
+    def _pick(logits, route: str):
+        hit = _argmax_op.takes(logits)
+        core._count(route, hit)
+        if not hit:
+            return None
+        tokens = torch.empty([logits.shape[0]], dtype=torch.int32, device=logits.device)
+        return cute_dsl_argmax(logits, tokens, core._rows.argmax)
+
+    def greedy_sample_draft_with_tp_gather(logits, spec_metadata=None, mapping_lm_head_tp=None):
+        if mapping_lm_head_tp is None:
+            tokens = _pick(logits, "greedy_draft")
+            if tokens is not None:
+                return tokens
+        return draft(logits, spec_metadata, mapping_lm_head_tp)
+
+    def _sample_tokens_for_batch(logits, spec_metadata, num_contexts, batch_size):
+        if spec_metadata.is_all_greedy_sample:
+            tokens = _pick(logits, "greedy_target")
+            if tokens is not None:
+                return tokens
+        return target(logits, spec_metadata, num_contexts, batch_size)
+
+    worker.greedy_sample_draft_with_tp_gather = greedy_sample_draft_with_tp_gather
+    worker._sample_tokens_for_batch = _sample_tokens_for_batch
+    worker._glm_greedy_on_argmax = True
 
 
 class MTPLayer:
@@ -2138,12 +2513,10 @@ class MTPLayer:
         """The module's own norm (a distinct parameter from `model.norm`), then the trunk's
         `lm_head`."""
         core = self.core
-        return self.logits_processor.forward(
-            flashinfer_rmsnorm(hidden_states, core._mtp["head_norm"], core.eps),
-            lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
+        x = core._rmsnorm(hidden_states, core._mtp["head_norm"])
+        if return_context_logits:
+            return core.logits(x, lm_head, self.logits_processor, attn_metadata)
+        return self.logits_processor.forward(x, lm_head, attn_metadata, return_context_logits)
 
     def forward(
         self, embed_tokens, all_rank_num_tokens, input_ids, hidden_states, attn_metadata, **kwargs
@@ -2232,11 +2605,11 @@ class ModelingV2Glm52Nvfp4Sm103Tep4(
             lora_params=lora_params,
             **kwargs,
         )
-        logits = self.logits_processor.forward(
-            nn.functional.embedding(spec_metadata.gather_ids, hidden),
+        logits = self.model.logits(
+            self.model.gather_rows(hidden, spec_metadata.gather_ids),
             self.lm_head,
+            self.logits_processor,
             attn_metadata,
-            True,
         )
         return self.spec_worker(
             input_ids=input_ids,
@@ -2255,3 +2628,8 @@ class ModelingV2Glm52Nvfp4Sm103Tep4(
     def post_load_weights(self):
         super().post_load_weights()
         self.model.post_load_weights()
+        # The shell's `lm_head` is the one module of the forward the core does not own: its
+        # local GEMM compiles here, against the loaded weight.
+        self.model.build_logits_head(self.lm_head)
+        if self.spec_worker is not None and self.model._rows.argmax is not None:
+            _greedy_on_argmax(self.spec_worker, self.model)

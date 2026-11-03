@@ -36,6 +36,9 @@ class GemmSchedule:
     swizzle_size: int = 1
     raster_along: Literal["m", "n"] = "m"
     use_tma_store: bool = True
+    # TMA-store epilogue subtile N (columns drained per TMEM load / smem store / TMA store
+    # round); None keeps the library rule (4096 elements, i.e. 32 at a 128-row CTA tile).
+    epilogue_tile_n: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,10 +102,52 @@ def _check_glm_mma_tiler_and_cluster_shape(self) -> None:
         raise testing.CantImplementError(f"invalid cluster shape: {self.cluster_shape_mn}")
 
 
+def setup_attributes_with_epilogue_tile_n(gemm, library_setup_attributes) -> None:
+    """Run the library ``_setup_attributes`` with the epilogue subtile N set by the schedule.
+
+    The library sizes the TMA-store epilogue subtile for 4096 elements (``(128, 32)`` at a
+    128-row CTA tile, ``cutlass.utils.blackwell_helpers.compute_epilogue_tile_size``), so a
+    128 x 256 CTA tile drains in 8 serialized rounds of TMEM load -> convert -> smem store ->
+    proxy fence -> named barrier -> TMA store -> barrier.  When the mainloop per tile is short
+    (K = 192 for the absorbed-MLA K-B BMM: 3 k-blocks) that drain bounds the kernel.
+    ``gemm.glm_epilogue_tile_n`` (set from :attr:`GemmSchedule.epilogue_tile_n`) replaces only
+    the subtile N for this one call; the subtile M, the TMEM/smem copy atoms, the C smem
+    layout and the stage counts are then derived by the library from it as usual.  The
+    accumulation (mainloop, K order) is untouched, so the output bytes do not change.
+    """
+    tile_n = getattr(gemm, "glm_epilogue_tile_n", None)
+    if tile_n is None:
+        library_setup_attributes(gemm)
+        return
+    import cutlass.utils.blackwell_helpers as helpers
+
+    library_size = helpers.compute_epilogue_tile_size
+
+    def sized(cta_tile_m, cta_tile_n, *args, **kwargs):
+        tile_m, _ = library_size(cta_tile_m, cta_tile_n, *args, **kwargs)
+        if cta_tile_n % tile_n:
+            raise testing.CantImplementError(
+                f"epilogue_tile_n {tile_n} does not divide the CTA tile N {cta_tile_n}"
+            )
+        return tile_m, tile_n
+
+    helpers.compute_epilogue_tile_size = sized
+    try:
+        library_setup_attributes(gemm)
+    finally:
+        helpers.compute_epilogue_tile_size = library_size
+
+
 class _GlmPersistentDenseGemmKernel(_DENSE_GEMM.PersistentDenseGemmKernel):
     """Extend the example's conservative MMA-N gate for measured GLM tiles."""
 
     check_mma_tiler_and_cluster_shape = _check_glm_mma_tiler_and_cluster_shape
+    glm_epilogue_tile_n: int | None = None
+
+    def _setup_attributes(self):
+        setup_attributes_with_epilogue_tile_n(
+            self, _DENSE_GEMM.PersistentDenseGemmKernel._setup_attributes
+        )
 
 
 def _make_runtime_arguments(

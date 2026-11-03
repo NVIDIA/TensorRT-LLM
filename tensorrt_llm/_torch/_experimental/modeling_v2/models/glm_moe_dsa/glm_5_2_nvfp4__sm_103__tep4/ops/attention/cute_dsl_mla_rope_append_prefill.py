@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 
@@ -26,15 +27,24 @@ QK_HEAD_DIM = _kernel.QK_HEAD_DIM
 MAX_REQUESTS = _kernel.MAX_REQUESTS
 #: e4m3's largest finite value; the kernel's conversion saturates to it.
 _E4M3_MAX = 448.0
+#: The latent row strides `compile` builds: a packed `[T, 576]` latent, and the latent
+#: tail of the `[T, 2048 + 576]` `q_a | kv_a | k_pe` projection row, where the in-place
+#: kv_a norm leaves it. The kernel reads either through its row stride, so the second
+#: needs no packing copy.
+Q_LORA_RANK = 2048
+LATENT_STRIDES = (LATENT_DIM, Q_LORA_RANK + LATENT_DIM)
 
 
 @dataclass(frozen=True)
 class CompiledMlaRopeAppendPrefill:
-    """The kernel `compile` built: the page size and device it is specialised for."""
+    """The kernels `compile` built: the page size and device they are specialised for,
+    one kernel per latent row stride in `LATENT_STRIDES`, and the same per stride with
+    `skip_q_base` (only the rope and latent-append groups launch)."""
 
     device_index: int
     tokens_per_block: int
-    kernel: object
+    kernels: Mapping[int, object]
+    kernels_skip_q_base: Mapping[int, object] = dataclasses.field(default_factory=dict)
 
 
 def compile(  # noqa: A001 -- the kernel module's own name for this step
@@ -44,31 +54,43 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     `compiled`. Call once at load.
 
     The specialization is this target's layout: `q_pe` the rope tail of the
-    `[T, 16, 256]` q_b output, a packed `[T, 576]` latent. Token and request
-    counts are symbolic, so one compile serves every context step. Costs one CuTe
-    DSL compile and one launch on a one-token, one-block case.
+    `[T, 16, 256]` q_b output, and a latent of either stride in `LATENT_STRIDES`.
+    The kernel keys its compile on the latent stride and on `skip_q_base`, so each
+    pair is a separate kernel. Token and request counts are symbolic, so one compile
+    per pair serves every context step. Costs one CuTe DSL compile and one launch on
+    a one-token, one-block case per pair.
     """
     tpb, dev = int(tokens_per_block), torch.device("cuda", int(device_index))
-    kernel = _kernel.compile(tokens_per_block=tpb, device_index=int(device_index))
-    # The first call of a compiled function binds and loads its module: done here,
-    # not on the first served step.
     bf16 = torch.bfloat16
     q = torch.zeros([1, NUM_HEADS, QK_HEAD_DIM], dtype=bf16, device=dev)
-    runner = _kernel.prepare_runner(
-        torch.zeros([1, NUM_HEADS, LATENT_DIM], dtype=bf16, device=dev),
-        q[..., QK_HEAD_DIM - ROPE_DIM :],
-        torch.zeros([1, LATENT_DIM], dtype=bf16, device=dev),
-        torch.empty([1, NUM_HEADS, LATENT_DIM], dtype=torch.uint8, device=dev),
-        torch.zeros([tpb * LATENT_DIM], dtype=torch.uint8, device=dev),
-        torch.zeros([1, 2, 1], dtype=torch.int32, device=dev),
-        torch.tensor([0, 1], dtype=torch.int32, device=dev),
-        torch.zeros([1], dtype=torch.int32, device=dev),
-        torch.zeros([1, ROPE_DIM, 2], dtype=torch.float32, device=dev),
-        tokens_per_block=tpb,
-    )
-    dataclasses.replace(runner, compiled=kernel)()
+    kernels, kernels_skip = {}, {}
+    for stride, skip in ((s, k) for s in LATENT_STRIDES for k in (False, True)):
+        kernel = _kernel._compile_for(
+            _kernel.PrefillRopeSpecialization(
+                tokens_per_block=tpb, latent_cache_stride=stride, skip_q_base=skip
+            ),
+            int(device_index),
+        )
+        # The first call of a compiled function binds and loads its module: done here,
+        # not on the first served step.
+        row = torch.zeros([1, stride], dtype=bf16, device=dev)
+        runner = _kernel.prepare_runner(
+            torch.zeros([1, NUM_HEADS, LATENT_DIM], dtype=bf16, device=dev),
+            q[..., QK_HEAD_DIM - ROPE_DIM :],
+            row[:, stride - LATENT_DIM :],
+            torch.empty([1, NUM_HEADS, LATENT_DIM], dtype=torch.uint8, device=dev),
+            torch.zeros([tpb * LATENT_DIM], dtype=torch.uint8, device=dev),
+            torch.zeros([1, 2, 1], dtype=torch.int32, device=dev),
+            torch.tensor([0, 1], dtype=torch.int32, device=dev),
+            torch.zeros([1], dtype=torch.int32, device=dev),
+            torch.zeros([1, ROPE_DIM, 2], dtype=torch.float32, device=dev),
+            tokens_per_block=tpb,
+            skip_q_base=skip,
+        )
+        dataclasses.replace(runner, compiled=kernel)()
+        (kernels_skip if skip else kernels)[stride] = kernel
     torch.cuda.synchronize(dev)
-    return CompiledMlaRopeAppendPrefill(int(device_index), tpb, kernel)
+    return CompiledMlaRopeAppendPrefill(int(device_index), tpb, kernels, kernels_skip)
 
 
 def _positions(cu_seqlens: torch.Tensor, cached_lens: torch.Tensor, tokens: int):
@@ -122,6 +144,11 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
     conversions of those bf16 values, as the stock rope/append op and cast do.
     Returns `(fused_q, latent_cache, quant_q_buffer, kv_pool)`, all written in
     place.
+
+    `skip_q_base=True`: the caller has already written `quant_q_buffer[..., :512]`
+    (the fp8 q-base K-B writes those bytes itself); only the rope columns
+    `[..., 512:]` of `quant_q_buffer` are written and `fused_q[..., :512]` is not
+    read. The kernel launches only its rope and latent-append groups.
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -149,14 +176,45 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
             why="one new row on a 511-token prefix next to a fresh 9-row request",
             spec=dict(new=[1, 9], cached=[511, 0], layers=2, layer=0),
         ),
+        Cell(
+            why="the latent read in place from the projection row (stride 2624), "
+            "as the target's context step passes it",
+            spec=dict(
+                new=[37, 64, 300], cached=[0, 32, 100], layers=3, layer=2, latent_stride=2624
+            ),
+        ),
+        Cell(
+            why="the in-place latent on a 4100-row chunk",
+            spec=dict(new=[4100], cached=[0], layers=1, layer=0, latent_stride=2624),
+        ),
+        Cell(
+            why="skip_q_base after the fp8 K-B: three requests with cached prefixes, "
+            "the in-place latent",
+            spec=dict(
+                new=[37, 64, 300],
+                cached=[0, 32, 100],
+                layers=3,
+                layer=2,
+                latent_stride=2624,
+                skip_q_base=True,
+            ),
+        ),
+        Cell(
+            why="skip_q_base on a 4100-row chunk, the in-place latent",
+            spec=dict(
+                new=[4100], cached=[0], layers=1, layer=0, latent_stride=2624, skip_q_base=True
+            ),
+        ),
     )
 
     note = """
     The target compiles one handle at load for its page size and takes this
-    op on the trunk's context rows when the step has at most MAX_REQUESTS (64)
-    context requests and the layer's pool base is the primary pool with no
-    secondary pool; otherwise it runs the stock `mla_rope_append_paged_kv_assign_q`
-    plus a cast. The MTP layer's context rows take the stock op.
+    op on the context rows (the trunk's and the MTP layer's) when the step has
+    at most MAX_REQUESTS (64) context requests and the layer's pool base is the
+    primary pool with no secondary pool; otherwise it runs the stock
+    `mla_rope_append_paged_kv_assign_q` plus a cast. The latent is the
+    projection row's tail, read in place (stride 2624): `k_pe` is rotated
+    inside the projection output, which nothing reads after the append.
 
     The kernel validates every call on the host (dtypes, shapes, alignment,
     devices, request count). It keys its compile on the `q_pe` and latent
@@ -181,6 +239,7 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         rotary_cos_sin: torch.Tensor,
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
+        skip_q_base: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if fused_q.device.index != compiled.device_index:
             raise ValueError(
@@ -192,12 +251,12 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
                 f"not {tokens_per_block}"
             )
         # Another layout selects a specialization nothing compiled at load.
-        if tuple(q_pe.stride()[:2]) != (NUM_HEADS * QK_HEAD_DIM, QK_HEAD_DIM) or (
-            latent_cache.stride(0) != LATENT_DIM
-        ):
+        table = compiled.kernels_skip_q_base if skip_q_base else compiled.kernels
+        kernel = table.get(int(latent_cache.stride(0)))
+        if tuple(q_pe.stride()[:2]) != (NUM_HEADS * QK_HEAD_DIM, QK_HEAD_DIM) or kernel is None:
             raise ValueError(
                 "q_pe must be the rope tail of a contiguous [T, 16, 256] query and "
-                "latent_cache a packed [T, 576]"
+                f"latent_cache a [T, 576] with a row stride in {sorted(compiled.kernels)}"
             )
         base = kv_pool.data_ptr() + int(layer_in_pool) * int(tokens_per_block) * LATENT_DIM
         runner = _kernel.prepare_runner(
@@ -211,8 +270,9 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
             cached_lens,
             rotary_cos_sin,
             tokens_per_block=int(tokens_per_block),
+            skip_q_base=bool(skip_q_base),
         )
-        dataclasses.replace(runner, compiled=compiled.kernel)()
+        dataclasses.replace(runner, compiled=kernel)()
         return fused_q, latent_cache, quant_q_buffer, kv_pool
 
     def reference(
@@ -229,10 +289,12 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         rotary_cos_sin: torch.Tensor,
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
+        skip_q_base: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(fused_q, latent_cache, quant_q_buffer, kv_pool)` as the op leaves them,
         as new tensors; nothing passed in is written. `quant_q_buffer` is returned
-        as uint8 bytes and `kv_pool` as a flat uint8 byte copy. `compiled` is
+        as uint8 bytes and `kv_pool` as a flat uint8 byte copy; with `skip_q_base`
+        its first 512 columns of each head are the bytes passed in. `compiled` is
         ignored.
 
         Bit-exact by construction: the rotation reproduces the kernel's fp32
@@ -252,7 +314,10 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         start = (int(layer_in_pool) + block) * tpb * LATENT_DIM + (pos % tpb) * LATENT_DIM
         cols = torch.arange(LATENT_DIM, device=pool.device)
         pool[start[:, None] + cols[None, :]] = _e4m3(lat_out)
-        return q_out, lat_out, _e4m3(q_out), pool
+        quant = _e4m3(q_out)
+        if skip_q_base:
+            quant[..., :KV_LORA_RANK] = quant_q_buffer.view(torch.uint8)[..., :KV_LORA_RANK]
+        return q_out, lat_out, quant, pool
 
     def is_valid(
         self,
@@ -268,6 +333,7 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
         rotary_cos_sin: torch.Tensor,
         tokens_per_block: int,
         compiled: CompiledMlaRopeAppendPrefill,
+        skip_q_base: bool = False,
     ) -> None:
         """Reads the prefix sum and offsets back to the host: never on the serving path."""
         t, tpb = int(fused_q.shape[0]), int(tokens_per_block)

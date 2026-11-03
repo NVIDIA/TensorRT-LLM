@@ -60,12 +60,16 @@ def _build(spec, seed):
         used += n
     t = sum(new)
     q = torch.randn(t, HEADS, QK, generator=g, device="cuda").to(torch.bfloat16)
+    # The latent as the target hands it over: the tail of a wider projection row when the
+    # cell names a stride, else packed.
+    stride = spec.get("latent_stride", LATENT)
+    row = torch.randn(t, stride, generator=g, device="cuda").to(torch.bfloat16)
     cu = torch.tensor([0] + torch.tensor(new).cumsum(0).tolist(), dtype=torch.int32)
     return dict(
         # The absorbed half random, the rope tail garbage the kernel must overwrite.
         fused_q=torch.randn(t, HEADS, LATENT, generator=g, device="cuda").to(torch.bfloat16),
         q_pe=q[..., QK - ROPE :],
-        latent_cache=torch.randn(t, LATENT, generator=g, device="cuda").to(torch.bfloat16),
+        latent_cache=row[:, stride - LATENT :],
         quant_q_buffer=torch.full(
             (t, HEADS, LATENT), SENTINEL, dtype=torch.uint8, device="cuda"
         ).view(torch.float8_e4m3fn),
@@ -78,6 +82,9 @@ def _build(spec, seed):
         cached_lens=torch.tensor(cached, dtype=torch.int32, device="cuda"),
         rotary_cos_sin=_rope_table(max(c + n for c, n in zip(cached, new)) + 3),
         tokens_per_block=PAGE,
+        # After the fp8 q-base K-B: the q-base bytes are already in quant_q_buffer (here
+        # the sentinel, which must survive) and fused_q's first 512 columns are not read.
+        skip_q_base=bool(spec.get("skip_q_base", False)),
     )
 
 
@@ -97,9 +104,19 @@ def test_certified_cells(cell, compiled) -> None:
     args = _build(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
     ref = op.reference(**{k: v.clone() if torch.is_tensor(v) else v for k, v in args.items()},
                        compiled=compiled)  # fmt: skip
+    lat = args["latent_cache"]
+    head = None
+    if lat.stride(0) != LATENT:
+        # The projection row's columns ahead of the latent are q_a: read by nothing here,
+        # and the kernel must not write them.
+        parent = torch.as_strided(lat, (lat.shape[0], lat.stride(0)), (lat.stride(0), 1),
+                                  lat.storage_offset() - (lat.stride(0) - LATENT))  # fmt: skip
+        head = (parent, parent[:, : lat.stride(0) - LATENT].clone())
     with validating(op):
         got = op(**args, compiled=compiled)
     torch.cuda.synchronize()
+    if head is not None:
+        assert torch.equal(head[0][:, : head[1].shape[1]], head[1]), "the q_a columns were written"
     assert got[0] is args["fused_q"] and got[3] is args["kv_pool"]
     names = ("fused_q", "latent_cache", "quant_q_buffer", "kv_pool")
     for name, out, want in zip(names, got, ref):
@@ -109,11 +126,12 @@ def test_certified_cells(cell, compiled) -> None:
 
 
 def test_the_op_refuses_a_layout_it_did_not_compile(compiled) -> None:
-    """A strided latent selects another specialization, which would compile here."""
+    """A latent stride outside LATENT_STRIDES selects another specialization, which would
+    compile here."""
     args = _build(dict(new=[8], cached=[0], layers=1, layer=0), seed=1)
-    wide = torch.zeros(8, 2624, dtype=torch.bfloat16, device="cuda")
-    args["latent_cache"] = wide[:, 2624 - LATENT :]
-    with pytest.raises(ValueError, match="packed"):
+    wide = torch.zeros(8, 2 * LATENT, dtype=torch.bfloat16, device="cuda")
+    args["latent_cache"] = wide[:, LATENT:]
+    with pytest.raises(ValueError, match="row stride in"):
         op(**args, compiled=compiled)
 
 

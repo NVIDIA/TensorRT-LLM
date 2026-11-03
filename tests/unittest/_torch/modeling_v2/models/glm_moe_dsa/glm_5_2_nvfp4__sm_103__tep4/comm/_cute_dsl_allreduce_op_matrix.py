@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the GLM-5.2 target's three Lamport all-reduce entries.
+"""GPU certification matrix for the GLM-5.2 target's four Lamport collective entries.
 
-`cute_dsl_allreduce`, `cute_dsl_allreduce_add_rmsnorm` and
-`cute_dsl_allreduce_add_rmsnorm_quant_nvfp4` share one workspace -- the
-symmetric-memory peer buffers and the device slot counter every launch reads
-and advances -- so they are certified together, on one workspace, with their
-calls interleaved the way a forward interleaves them.
+`cute_dsl_allreduce`, `cute_dsl_allreduce_add_rmsnorm`,
+`cute_dsl_allreduce_add_rmsnorm_quant_nvfp4` and the lm_head's
+`cute_dsl_allgather_widen` share one workspace -- the symmetric-memory peer
+buffers and the device slot counter every launch reads and advances -- so they
+are certified together, on one workspace, with their calls interleaved the way
+a forward interleaves them.
 
 A collective cannot be exercised in one process, so this script is its own
 launcher: run it plainly and it spawns one worker process per device named in
@@ -42,7 +43,7 @@ import torch
 import torch.distributed as dist
 
 _WORKER_FLAG = "--rank-worker"
-#: Four CuTe DSL compiles per rank, then the cells, the largest of which build
+#: Five CuTe DSL compiles per rank, then the cells, the largest of which build
 #: fp64 references over 8192 x 6144. Read by `_rank_job.run`.
 DEADLINE_S = 1800
 
@@ -72,6 +73,9 @@ TWOSHOT_ABOVE = 0
 pure: Any = None
 fused: Any = None
 quant: Any = None
+gather: Any = None
+#: The lm_head's vocabulary shard per rank, the all-gather's row width.
+SHARD_N = 38720
 fp4_quantize: Any = None
 fp4_quantize_mod: Any = None
 validating: Any = None
@@ -84,15 +88,20 @@ assert_within_ulp: Any = None
 # slot (3), release epoch]`. Every launch of any of the four kernels takes
 # the current slot, records how many 16-byte vectors it published there, and
 # moves the slot on by one mod 3; the entry counter returns to 0 when the
-# launch completes. The epoch moves only under the `strict` PDL policy, which
-# no kernel of the workspace uses.
+# launch completes. The fused entry's two-shot (above TWOSHOT_ABOVE rows) is
+# the push variant: every reader clears the vectors it consumed, so it records
+# 0 and leaves the slot's next user nothing to clear. The cells interleave row
+# counts and kinds, so a slot tail that push left dirty would show in a later
+# cell's outputs. The epoch moves only under the `strict` PDL policy, which no
+# kernel of the workspace uses.
 _slot = 0
 _counts = [0, 0, 0]
 
 
-def _launched(rows: int) -> None:
+def _launched(rows: int, width: int = HIDDEN, kind: str = "") -> None:
     global _slot
-    _counts[_slot] = rows * HIDDEN // 8
+    pushed = kind == "fused" and rows > TWOSHOT_ABOVE
+    _counts[_slot] = 0 if pushed else rows * width // 8
     _slot = (_slot + 1) % 3
 
 
@@ -349,6 +358,44 @@ class _Call:
             _assert_same_on_every_rank(self.residual, where)
 
 
+class _Gather:
+    """One all-gather call: this rank's bf16 shard and the fp32 full-vocabulary output.
+
+    Every rank regenerates every rank's shard from the seed, as `_partials` does, so
+    the reference is arithmetic on this rank. A few -0.0 lanes per shard: the
+    readiness sentinel, which the kernel must deliver as +0.0 on every rank."""
+
+    def __init__(self, rows: int) -> None:
+        self.rows = rows
+        self.local = torch.empty(rows, SHARD_N, dtype=torch.bfloat16, device="cuda")
+        self.out = torch.empty(rows, WORLD * SHARD_N, dtype=torch.float32, device="cuda")
+        self._shards: Optional[List[torch.Tensor]] = None
+
+    def fill(self, seed: int) -> None:
+        shards = []
+        for r in range(WORLD):
+            g = torch.Generator(device="cuda").manual_seed(seed * 977 + 300 + r)
+            x = (torch.randn(self.rows, SHARD_N, generator=g, device="cuda") * 4).to(torch.bfloat16)
+            x[:, r::4099] = -0.0
+            shards.append(x)
+        self.local.copy_(shards[RANK])
+        self.out.fill_(float("nan"))
+        self._shards = shards
+
+    def launch(self) -> None:
+        assert gather(self.local, self.out, WS) is self.out
+
+    def check(self, where: str) -> None:
+        where = f"{where}: gather {self.rows} rows"
+        ref = gather.reference(self._shards, self.out, WS)
+        assert ref.abs().sum() > 0, f"{where}: a zero reference proves nothing"
+        # Bit-exact: a copy and an exact widening, -0.0 delivered as +0.0.
+        assert torch.equal(self.out.view(torch.int32), ref.view(torch.int32)), (
+            f"{where}: the gathered logits are not the shards, bit for bit"
+        )
+        _assert_same_on_every_rank(self.out, where)
+
+
 def _entry(kind: str) -> Any:
     return {"pure": pure, "fused": fused, "quant": quant}[kind]
 
@@ -362,6 +409,9 @@ def check_the_workspace_agreed_and_launched_nothing() -> None:
     dist.all_gather_object(flags, WS.multicast_base != 0)
     assert len(set(flags)) == 1, f"ranks disagree on multicast: {flags}"
     assert WS.max_rows == MAX_ROWS and WS.hidden == HIDDEN and WS.world == WORLD
+    built: List[Any] = [None] * WORLD
+    dist.all_gather_object(built, WS.gather is not None)
+    assert all(built), f"the all-gather did not build on every rank: {built}"
     _assert_state("after build")
     if RANK == 0:
         print(f"[rank 0] multicast publish {'on' if flags[0] else 'off'}", flush=True)
@@ -391,7 +441,7 @@ def check_every_cell_interleaved_on_one_workspace() -> None:
         dist.barrier()
         with validating(_entry(kind)):
             call.launch()
-        _launched(rows)
+        _launched(rows, kind=kind)
         _assert_state(f"cell {kind} {cell.why!r}")
         call.check(f"cell {cell.why!r}")
         dist.barrier()
@@ -446,6 +496,67 @@ def check_cuda_graph_replays_rotate_the_slot_counter() -> None:
     dist.barrier()
 
 
+def check_allgather_cells_interleaved_with_the_all_reduces() -> None:
+    """Drive every all-gather cell, inside `validating`, each between two all-reduce
+    calls of a different row count: the gather's shard is 38720 wide where the
+    all-reduces' rows are 6144, so the per-slot vector counts it leaves behind are
+    what the next launch's clear has to read right."""
+    for i, cell in enumerate(gather.CELLS):
+        rows = cell.spec["rows"]
+        g = _Gather(rows)
+        g.fill(_seed(cell.why))
+        before = _Call("pure", 1 + 7 * i)
+        after = _Call("fused", 64)
+        before.fill(_seed(cell.why) + 1)
+        after.fill(_seed(cell.why) + 2)
+        torch.cuda.synchronize()
+        dist.barrier()
+        before.launch()
+        _launched(before.rows)
+        with validating(gather):
+            g.launch()
+        _launched(rows, SHARD_N)
+        after.launch()
+        _launched(after.rows)
+        _assert_state(f"gather cell {cell.why!r}")
+        before.check(f"gather cell {cell.why!r}")
+        g.check(f"gather cell {cell.why!r}")
+        after.check(f"gather cell {cell.why!r}")
+        dist.barrier()
+
+
+def check_allgather_replays_in_a_cuda_graph() -> None:
+    """A captured forward's tail: the last layer's fused all-reduce, then the logits
+    gather, twice (trunk head and MTP head), replayed three times on fresh inputs."""
+    plan = [("fused", 64), ("gather", 64), ("pure", 2), ("gather", 32)]
+    calls = [_Gather(rows) if kind == "gather" else _Call(kind, rows) for kind, rows in plan]
+    base = _seed("gather cuda graph")
+    for c in calls:
+        c.fill(base)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        for c in calls:
+            c.launch()
+    _assert_state("after the gather capture: capturing launches nothing")
+    dist.barrier()
+    for replay in range(3):
+        for c in calls:
+            c.fill(base + 1 + replay)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph.replay()
+        for kind, rows in plan:
+            _launched(rows, SHARD_N if kind == "gather" else HIDDEN)
+        _assert_state(f"gather replay {replay}")
+        for c in calls:
+            c.check(f"gather replay {replay}")
+        dist.barrier()
+    del graph
+    dist.barrier()
+
+
 def check_guards_refuse_a_row_count_above_the_budget() -> None:
     """Above `max_rows` the kernel would write past every peer's buffer.
 
@@ -463,6 +574,16 @@ def check_guards_refuse_a_row_count_above_the_budget() -> None:
             assert "budget" in str(exc), exc
         else:
             raise AssertionError(f"{kind} accepted {rows} rows")
+    rows = MAX_ROWS * HIDDEN // SHARD_N + 1
+    local = torch.zeros(rows, SHARD_N, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(rows, WORLD * SHARD_N, dtype=torch.float32, device="cuda")
+    try:
+        with validating(gather):
+            gather(local, out, WS)
+    except AssertionError as exc:
+        assert "budget" in str(exc), exc
+    else:
+        raise AssertionError(f"the gather accepted a {rows}-row shard")
     _assert_state("after the refused calls")
     dist.barrier()
 
@@ -495,6 +616,8 @@ CHECKS = (
     check_the_workspace_agreed_and_launched_nothing,
     check_every_cell_interleaved_on_one_workspace,
     check_cuda_graph_replays_rotate_the_slot_counter,
+    check_allgather_cells_interleaved_with_the_all_reduces,
+    check_allgather_replays_in_a_cuda_graph,
     check_guards_refuse_a_row_count_above_the_budget,
     check_quant_guard_refuses_what_the_kernel_misreads,
 )
@@ -503,7 +626,7 @@ CHECKS = (
 def _run_one_rank() -> int:
     """Body of one spawned rank: run every check; a failing rank exits nonzero
     and the launcher kills its siblings."""
-    global RANK, WORLD, WS, TWOSHOT_ABOVE, pure, fused, quant
+    global RANK, WORLD, WS, TWOSHOT_ABOVE, pure, fused, quant, gather
     global fp4_quantize, fp4_quantize_mod, validating, assert_within_ulp
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
@@ -515,6 +638,9 @@ def _run_one_rank() -> int:
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E501
         _lamport,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allgather_widen import (  # noqa: E501
+        cute_dsl_allgather_widen,
     )
     from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce import (  # noqa: E501
         cute_dsl_allreduce,
@@ -543,6 +669,7 @@ def _run_one_rank() -> int:
     pure = cute_dsl_allreduce
     fused = cute_dsl_allreduce_add_rmsnorm
     quant = cute_dsl_allreduce_add_rmsnorm_quant_nvfp4
+    gather = cute_dsl_allgather_widen
     fp4_quantize_mod = _fp4_mod
     fp4_quantize = _fp4_mod.fp4_quantize
     validating, assert_within_ulp = _validating_cm, _within

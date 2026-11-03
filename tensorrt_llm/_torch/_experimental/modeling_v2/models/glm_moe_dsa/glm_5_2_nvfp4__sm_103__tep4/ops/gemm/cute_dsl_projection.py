@@ -18,6 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 )
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
+from ...kernels.gemm import lm_head_n38720_k6144_bf16 as _lm_head
 from ...kernels.gemm import mlp_dense_down_proj_n6144_k3072_bf16 as _dense_down
 from ...kernels.gemm import mlp_dense_gate_up_proj_n6144_k6144_bf16 as _dense_gate_up
 from ...kernels.gemm import mlp_gate_m64_n256_k6144_bf16_fp32 as _router
@@ -43,6 +44,7 @@ _MODULES = {
     "dense_down": _dense_down,
     "shared_gate_up": _shared_gate_up,
     "shared_down": _shared_down,
+    "lm_head": _lm_head,
 }
 
 #: The fp32 indexer projection compiles per row count: the bf16 projections'
@@ -194,8 +196,10 @@ def build_prefill(kernel: str, weight: torch.Tensor) -> PrefillProjectionRunner:
     `weight` is the row-major `[N, K]` bf16 weight of any one layer; the runner
     takes the weight per call, so one runner serves every layer. Compiles every
     row range of the entry's schedule table (two for the attention projections),
-    shared process-wide per entry, then launches once per range on zeros, so no
-    context step meets a first compile or a first module load.
+    and for kv_a / o_proj every tile-width candidate the kernel picks per row count
+    above 2048 rows, shared process-wide per entry, then launches each compiled
+    instance once on zeros, so no context step meets a first compile or a first
+    module load.
 
     Raises if the vendored kernel has no entry for `kernel`, or if the entry's
     output dtype is not the projection's (the router's logits are fp32): the
@@ -211,12 +215,11 @@ def build_prefill(kernel: str, weight: torch.Tensor) -> PrefillProjectionRunner:
     dev = weight.device
     with torch.cuda.device(dev):
         launch = _prefill.build(entry, weight)
-        low = 1
-        for high, _ in abi.schedule_table():
-            x = torch.zeros([low, abi.in_features], dtype=torch.bfloat16, device=dev)
-            out = torch.empty([low, abi.out_features], dtype=abi.out_dtype, device=dev)
+        # One row count per compiled instance: each row range, and each tile candidate.
+        for rows in launch.warm_rows(floor=1):
+            x = torch.zeros([rows, abi.in_features], dtype=torch.bfloat16, device=dev)
+            out = torch.empty([rows, abi.out_features], dtype=abi.out_dtype, device=dev)
             launch(x, weight, out)
-            low = high + 1
     return PrefillProjectionRunner(
         kernel,
         abi.out_features,
@@ -305,7 +308,7 @@ class CuteDslProjection(OpWrapper):
     except `ix_fused`, which takes fp32 operands and multiplies in TF32. The
     output is bf16, except `router` and `ix_fused`, which write fp32.
 
-    The ten decode kernels, by the name the target uses (per-rank shapes, TP4):
+    The eleven decode kernels, by the name the target uses (per-rank shapes, TP4):
 
         qkva            [M, 6144] x [2624, 6144]  q_a | kv_a | k_pe
         q_b             [M, 2048] x [4096, 2048]
@@ -317,6 +320,7 @@ class CuteDslProjection(OpWrapper):
         dense_down      [M, 3072] x [6144, 3072]
         shared_gate_up  [M, 6144] x [1024, 6144]  shared expert
         shared_down     [M, 512]  x [6144, 512]
+        lm_head         [M, 6144] x [38720, 6144] this rank's vocabulary shard
 
     A `PrefillProjectionRunner` runs the same product on the prefill GEMM at any row
     count up to 8192: bf16 operands, fp32 accumulation, the entry's output dtype.
@@ -403,6 +407,18 @@ class CuteDslProjection(OpWrapper):
             why="shared_down at the smallest prefill chunk: persistent",
             spec=dict(kernel="shared_down", rows=1099),
         ),
+        Cell(
+            why="lm_head, one row: the 2-CTA swapped schedule", spec=dict(kernel="lm_head", rows=1)
+        ),
+        Cell(
+            why="lm_head at 37 rows, a draining batch on the 48-row bucket's schedule",
+            spec=dict(kernel="lm_head", rows=37),
+        ),
+        Cell(why="lm_head, full decode batch", spec=dict(kernel="lm_head", rows=64)),
+        Cell(
+            why="lm_head at 1024 rows: the direct-orientation context schedule",
+            spec=dict(kernel="lm_head", rows=1024),
+        ),
         # The prefill GEMM: one compiled instance per row range (split at 2048 rows
         # for the attention projections), any row count inside it. The cells take
         # the smallest row count the target sends there, a mid one, both sides of
@@ -473,7 +489,9 @@ class CuteDslProjection(OpWrapper):
     note = """
     The target compiles, per kernel, the row counts in `ROWS` (the kernel's
     own schedule table: 1, 2, 4, 8, 16, 32, 48, 64, plus 24 for the dense MLP,
-    every count in 1..64 for shared_down, and the prefill chunks 1099, 3282,
+    every count in 1..64 for shared_down and lm_head (plus 128..8192 in powers
+    of two for lm_head, whose rows are a step's logits rows), and the prefill
+    chunks 1099, 3282,
     7491, 7527, 7554, 7578, 8192; `IX_FUSED_ROWS` for ix_fused) through
     `build_all`, which leaves out a row count that fails to compile. Every
     other row count, and any that was left out, goes to `cublas_mm` at the

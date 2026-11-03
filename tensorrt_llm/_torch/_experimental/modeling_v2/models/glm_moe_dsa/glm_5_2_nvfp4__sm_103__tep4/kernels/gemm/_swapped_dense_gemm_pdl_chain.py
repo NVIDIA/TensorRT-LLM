@@ -65,7 +65,7 @@ def make_pdl_chain_kernel(
     """Create a persistent GEMM kernel carrying one immutable PDL role."""
     if schedule.orientation != "swapped":
         raise ValueError("PDL-chain persistent GEMM requires swapped orientation")
-    return _GlmPersistentDenseGemmKernel(
+    gemm = _GlmPersistentDenseGemmKernel(
         cutlass.Float32,
         schedule.use_2cta_instrs,
         schedule.mma_tiler_mn,
@@ -77,6 +77,8 @@ def make_pdl_chain_kernel(
         signal_next_pdl=role.signal_next,
         prewait_tma_operand=role.prewait_tma_operand,
     )
+    gemm.glm_epilogue_tile_n = schedule.epilogue_tile_n
+    return gemm
 
 
 def compile_pdl_chain_persistent_gemm(

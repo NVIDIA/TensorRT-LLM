@@ -116,6 +116,30 @@ from ..common import compat48 as _compat48
 QK_HEAD_DIM = 256
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 _MAX_ACTIVE_CLUSTERS_CACHE: dict[tuple[int, int], int] = {}
+# Split-KV completion counters, one zeroed int32 buffer per device, reused across
+# eager launches. The kernel's `atomicrmw INC` with limit `num_ctas_kv - 1` wraps
+# each row's counter back to 0 when its last split arrives, so a buffer that
+# starts at zero is zero again after every completed launch; allocating (and
+# filling) a fresh one per call cost one PyTorch fill launch per layer on every
+# eager mixed step (13 per context step in a served profile). Grown on demand.
+_COMPLETION_COUNTER_CACHE: dict[int, torch.Tensor] = {}
+
+
+def _completion_counters(total_q: int, device: torch.device) -> torch.Tensor:
+    """Zeroed split-KV completion counters for ``total_q`` query rows.
+
+    Under CUDA-graph capture this returns a fresh allocation, as before: a
+    capture-pool tensor must not outlive its graph in a module cache.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(total_q, dtype=torch.int32, device=device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _COMPLETION_COUNTER_CACHE.get(index)
+    if cached is None or cached.numel() < total_q:
+        cached = torch.zeros(max(total_q, 1024), dtype=torch.int32, device=device)
+        _COMPLETION_COUNTER_CACHE[index] = cached
+    return cached[:total_q]
+
 
 IO_DTYPE = cutlass.Float8E4M3FN
 OUT_DTYPE = cutlass.BFloat16
@@ -3261,11 +3285,7 @@ def prepare_runner(
             dtype=torch.float32,
             device=device,
         )
-        completion_counters = torch.zeros(
-            total_q,
-            dtype=torch.int32,
-            device=device,
-        )
+        completion_counters = _completion_counters(total_q, device)
     else:
         # These constexpr-dead parameters retain one launch ABI across modes.
         partial_o_workspace = output.reshape(-1)[:1]

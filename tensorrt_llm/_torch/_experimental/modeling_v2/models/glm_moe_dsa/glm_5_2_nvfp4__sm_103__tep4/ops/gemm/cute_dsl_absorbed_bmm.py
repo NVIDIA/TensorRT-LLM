@@ -108,6 +108,29 @@ def build_prefill(kernel: str, device_id: int) -> AbsorbedBmmRunner:
     return AbsorbedBmmRunner(kernel, "prefill", range(1, PREFILL_MAX_ROWS + 1), launch)
 
 
+def build_prefill_fp8_q_base(device_id: int) -> AbsorbedBmmRunner:
+    """The prefill K-B with the e4m3 q-base epilogue on `device_id`. Call at load.
+
+    Same kernel, schedules and accumulation as `build_prefill("k_b", ...)`; the epilogue
+    rounds each output FP32 -> BF16 -> E4M3 (nearest, saturating) and stores the bytes
+    into `out`, the uint8 `[16, M, 512]` transpose view of the FMHA's `[M, 16, 576]` fp8
+    query. That is the conversion the context rope/append kernel applies to the bf16
+    K-B output, so the fp8 query is byte-identical, and the bf16 `fused_q[..., :512]` the
+    rope kernel would otherwise re-read (129 MB at 8k rows) is never written. Both
+    schedules are launched once here on zeros. Costs two CuTe DSL compiles.
+    """
+    dev = torch.device("cuda", device_id)
+    lay = LAYOUTS["k_b"]
+    with torch.cuda.device(device_id):
+        launch = _prefill.build("k_b", emit_fp8_q_base=True)
+        for m in (_prefill.SCHEDULE_SPLIT_ROWS, PREFILL_MAX_ROWS):
+            a, weight, _ = _views("k_b", m, dev)
+            quant = torch.zeros([m, lay.heads, lay.out_row], dtype=torch.uint8, device=dev)
+            launch(a, weight, quant[..., : lay.n].transpose(0, 1))
+        torch.cuda.synchronize(device_id)
+    return AbsorbedBmmRunner("k_b", "prefill_fp8", range(1, PREFILL_MAX_ROWS + 1), launch)
+
+
 class CuteDslAbsorbedBmm(OpWrapper):
     """`out[h] = a[h] @ weight[h].T` for every head, in place. Returns `out`.
 
@@ -162,6 +185,18 @@ class CuteDslAbsorbedBmm(OpWrapper):
             why="prefill V-B at max_num_tokens, 8192 rows",
             spec=dict(kernel="v_b", rows=8192, prefill=True),
         ),
+        Cell(
+            why="fp8 q-base K-B at 65 rows, the first context row count past decode",
+            spec=dict(kernel="k_b", rows=65, prefill=True, fp8=True),
+        ),
+        Cell(
+            why="fp8 q-base K-B at 2049 rows, the large-T schedule's first, a ragged tile",
+            spec=dict(kernel="k_b", rows=2049, prefill=True, fp8=True),
+        ),
+        Cell(
+            why="fp8 q-base K-B at max_num_tokens, 8192 rows",
+            spec=dict(kernel="k_b", rows=8192, prefill=True, fp8=True),
+        ),
     )
 
     note = """
@@ -170,6 +205,11 @@ class CuteDslAbsorbedBmm(OpWrapper):
     1..8192). A row count above 8192, or every row count outside the decode
     groups if a prefill build failed, goes to `bmm_out` at the target's call
     site, with the `[16, K, N]` weight that op takes.
+
+    On the context step the target takes the fp8 q-base K-B (`build_prefill_fp8_q_base`)
+    instead when the rows go on the context rope/append kernel: K-B then writes the FMHA's
+    e4m3 query bytes itself and the rope kernel skips its q-base groups. Row counts the
+    decode groups serve keep the bf16 kernels and the full rope.
 
     Both kernel kinds check every call: row count in the runner's range, and
     every shape and stride of `a` and `out` exactly as compiled. Anything else
@@ -195,9 +235,14 @@ class CuteDslAbsorbedBmm(OpWrapper):
         runner: AbsorbedBmmRunner,
     ) -> torch.Tensor:
         """The product the op writes into `out`, fp32-accumulated (TF32 off),
-        rounded once. `out` is not written; `runner` is ignored."""
+        rounded once. For the fp8 q-base runner, those bf16 values converted to e4m3
+        (nearest, saturating), as uint8 bytes. `out` is not written."""
         with true_fp32_matmul():
-            return (a.float() @ weight.float().transpose(1, 2)).to(out.dtype)
+            prod = a.float() @ weight.float().transpose(1, 2)
+        if runner.group == "prefill_fp8":
+            bf16 = prod.to(torch.bfloat16).float().clamp(-448.0, 448.0)
+            return bf16.to(torch.float8_e4m3fn).view(torch.uint8)
+        return prod.to(out.dtype)
 
     def is_valid(
         self,

@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     AbsorbedBmmRunner,
     build,
     build_prefill,
+    build_prefill_fp8_q_base,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_absorbed_bmm import (  # noqa: E402, E501
     cute_dsl_absorbed_bmm as op,
@@ -73,13 +74,52 @@ _PREFILL: dict[str, AbsorbedBmmRunner] = {}
 def _prefill(kernel: str) -> AbsorbedBmmRunner:
     """One prefill runner per kernel for the module, as the target builds it."""
     if kernel not in _PREFILL:
-        _PREFILL[kernel] = build_prefill(kernel, torch.cuda.current_device())
+        if kernel == "k_b_fp8":
+            _PREFILL[kernel] = build_prefill_fp8_q_base(torch.cuda.current_device())
+        else:
+            _PREFILL[kernel] = build_prefill(kernel, torch.cuda.current_device())
     return _PREFILL[kernel]
+
+
+#: The fp8 query buffer's bytes before the call, outside what K-B writes.
+SENTINEL_BYTE = 0xA5
+
+
+def _check_fp8_cell(rows: int, seed: int) -> None:
+    """The e4m3 bytes K-B writes are exactly the bf16 prefill K-B's output converted the
+    way the rope/append kernel converts it (nearest, saturating): same kernel, same
+    accumulation, only the epilogue differs. The rope tail of each head (`[..., 512:]`)
+    and the rows past M stay as they were."""
+    lay = LAYOUTS["k_b"]
+    a, weight, out_bf16, _ = _build("k_b", rows, seed)
+    op(a, weight, out_bf16, _prefill("k_b"))
+    quant = torch.full(
+        (rows + CANARY_ROWS, lay.heads, lay.out_row), SENTINEL_BYTE, dtype=torch.uint8,
+        device="cuda",
+    )  # fmt: skip
+    out = quant[:rows, :, : lay.n].transpose(0, 1)
+    runner = _prefill("k_b_fp8")
+    assert rows in runner.rows
+    with validating(op):
+        assert op(a, weight, out, runner) is out, "the op writes `out` and returns it"
+    torch.cuda.synchronize()
+    want = out_bf16.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+    bad = int((out != want).sum())
+    assert bad == 0, f"{bad} e4m3 bytes differ from e4m3(bf16 K-B)"
+    # And within an e4m3 step of the fp32-accumulated reference.
+    ref = op.reference(a, weight, out, runner).view(torch.float8_e4m3fn).float()
+    got = out.view(torch.float8_e4m3fn).float()
+    assert bool(((got - ref).abs() <= ref.abs() * 2.0**-3 + 2.0**-9).all())
+    assert bool((quant[:rows, :, lay.n :] == SENTINEL_BYTE).all()), "the kernel wrote past N"
+    assert bool((quant[rows:] == SENTINEL_BYTE).all()), "the kernel wrote past the last row"
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     kernel, rows = cell.spec["kernel"], cell.spec["rows"]
+    if cell.spec.get("fp8"):
+        _check_fp8_cell(rows, zlib.crc32(cell.why.encode()) % 2**31)
+        return
     if cell.spec.get("prefill"):
         runner = _prefill(kernel)
     else:
