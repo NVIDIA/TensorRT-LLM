@@ -828,14 +828,14 @@ def test_draft_forward_swaps_in_draft_staging():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_retained_row_indices_point_at_the_twin():
-    """A plain pool reads a retained position from the twin's row; released pages keep the pool row."""
+def test_mixed_precision_high_row_indices_point_at_the_high_pool():
+    """Held positions point at the mixed-precision high pool's rows; released pages keep pool rows."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
-        retained_row_indices,
+        mixed_precision_high_row_indices,
     )
 
     manager = SimpleNamespace(
-        layer_offsets={3: 0}, tokens_per_block=4, retained_row_layer_offsets={0: 1}
+        layer_offsets={3: 0}, tokens_per_block=4, mixed_precision_high_layer_offsets={0: 1}
     )
     table = torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda")
     metadata = SimpleNamespace(kv_cache_manager=manager, mixed_precision_high_block_table=table)
@@ -843,8 +843,8 @@ def test_retained_row_indices_point_at_the_twin():
     topk = torch.tensor([[0, 5, 9, -1]], dtype=torch.int32, device="cuda")
     pool_rows = torch.tensor([[100, 101, 102, -1]], dtype=torch.int32, device="cuda")
     requests = torch.zeros(1, dtype=torch.int32, device="cuda")
-    rows = retained_row_indices(metadata, attention, topk, pool_rows, requests)
-    # Twin page 8 holds position 0 at row 8 * 4 + 1 * 4 + 0; the twin released block 1.
+    rows = mixed_precision_high_row_indices(metadata, attention, topk, pool_rows, requests)
+    # High page 8 holds position 0 at row 8 * 4 + 1 * 4 + 0; the high pool released block 1.
     assert rows.tolist() == [[36, 101, 53, -1]]
 
 

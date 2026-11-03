@@ -504,19 +504,29 @@ def overlay_mixed_precision_high_rows(
         )
 
 
-def retained_row_indices(
+def mixed_precision_high_row_indices(
     metadata: "DSAtrtllmAttentionMetadata",
     attention: "TrtllmAttention",
     topk_indices: torch.Tensor,
     topk_indices_global: torch.Tensor,
     requests: torch.Tensor,
 ) -> torch.Tensor:
-    """Plain pool: the global rows with every retained position pointing at the twin's row.
+    """Point the selected positions the mixed-precision high pool holds at its rows.
 
-    The twin shares the pool's memory (the manager checks the layout), so its rows have row
-    indices like any other; positions the twin no longer holds map to -1 and keep the pool's
-    row. ``topk_indices`` / ``topk_indices_global``: ``[num_rows, topk]`` int32 selected
-    positions and pool rows; ``requests``: ``[num_rows]`` int32 batch rows.
+    On a plain pool the mixed-precision high pool shares the pool's memory (the manager checks
+    the layout), so its rows have row indices like any other; positions it no longer holds map
+    to -1 and keep the pool's row.
+
+    Args:
+        metadata: Attention metadata of the batch.
+        attention: Attention layer whose mixed-precision high pool supplies the rows.
+        topk_indices: `[num_rows, topk]` int32 KV positions each query token selected, -1 for
+            none; contiguous in the last dimension.
+        topk_indices_global: `[num_rows, topk]` int32 pool rows of those positions.
+        requests: `[num_rows]` int32 batch index of each query token's request.
+
+    Returns:
+        `[num_rows, topk]` int32 pool rows, with the held positions redirected.
     """
     block_table = metadata.mixed_precision_high_block_table
     if isinstance(block_table, dict):
@@ -525,19 +535,19 @@ def retained_row_indices(
     if block_table is None:
         return topk_indices_global
     manager = metadata.kv_cache_manager
-    layer_offset = manager.retained_row_layer_offsets.get(
+    layer_offset = manager.mixed_precision_high_layer_offsets.get(
         manager.layer_offsets[attention.layer_idx]
     )
     if layer_offset is None:
-        # A layer without a twin (e.g. a drafter with its own architecture) keeps a plain cache.
+        # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
         return topk_indices_global
     num_rows, topk = topk_indices.shape
     if num_rows == 0 or topk == 0:
         return topk_indices_global
     assert topk_indices.stride(1) == 1
     tokens_per_block = manager.tokens_per_block
-    # The twin table already carries the page scale, so a page is one block of rows.
-    twin_rows = torch.ops.trtllm.convert_req_index_to_global(
+    # The page table already carries the page scale, so a page is one block of rows.
+    high_rows = torch.ops.trtllm.convert_req_index_to_global(
         requests, block_table, topk_indices, tokens_per_block, topk, tokens_per_block, layer_offset
     )
-    return torch.where(twin_rows >= 0, twin_rows, topk_indices_global)
+    return torch.where(high_rows >= 0, high_rows, topk_indices_global)

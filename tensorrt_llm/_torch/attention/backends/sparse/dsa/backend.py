@@ -21,7 +21,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows, retained_row_indices
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_row_indices,
+    overlay_mixed_precision_high_rows,
+)
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -250,14 +253,17 @@ class DSATrtllmAttention(TrtllmAttention):
             kv_cache_dtype != tensorrt_llm.bindings.DataType.NVFP4
             and metadata.has_mixed_precision_high_rows
         ):
-            # Plain pool: attention reads a retained row from the twin, which shares the pool.
+            # Plain pool: a position the mixed-precision high pool holds is read from that
+            # pool's row, which lives in the same pool.
             requests = (
                 metadata.req_idx_per_token[metadata.num_ctx_tokens : metadata.num_tokens]
                 if is_generation
                 else metadata._cached_req_idx_ctx
             )
             return (
-                retained_row_indices(metadata, self, topk_indices, topk_indices_global, requests),
+                mixed_precision_high_row_indices(
+                    metadata, self, topk_indices, topk_indices_global, requests
+                ),
                 None,
             )
 

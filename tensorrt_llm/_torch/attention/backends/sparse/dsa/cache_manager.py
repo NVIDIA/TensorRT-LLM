@@ -454,8 +454,8 @@ class DSACacheManagerV2(KVCacheManagerV2):
                 f"{self.mla_kv_cache_residual_dim} > {head_dim}"
             )
         self._unique_primary_pool: Optional[torch.Tensor] = None
-        # Local layer -> its retained-token twin's page offset inside a shared pool slot.
-        self.retained_row_layer_offsets: dict[int, int] = {}
+        # Local layer -> page offset of its mixed-precision high layer inside a shared pool slot.
+        self.mixed_precision_high_layer_offsets: dict[int, int] = {}
         self.use_fp8_ds_mla, head_dim = _resolve_fp8_ds_mla_head_dim(
             kv_cache_config, tokens_per_block, head_dim, dtype
         )
@@ -647,13 +647,15 @@ class DSACacheManagerV2(KVCacheManagerV2):
             if int(address) != int(expected_address):
                 raise ValueError("DSA requires contiguous per-layer K pages in each slot")
 
-        # A plain pool keeps each retained-token twin in the same pool as its layer, so
-        # sparse attention reads a retained row by the twin's row index.
-        self.retained_row_layer_offsets = {}
+        # A plain pool keeps each mixed-precision high layer in the same pool as its layer, so
+        # sparse attention reads a held row by the high layer's row index.
+        self.mixed_precision_high_layer_offsets = {}
         if self.dtype != DataType.NVFP4:
-            for local_layer_idx, twin in self.mixed_precision_high_layers.items():
-                converter = self.impl.get_page_index_converter(twin, Role.KEY)
-                address = self.impl.get_mem_pool_base_address(twin, Role.KEY, PageIndexMode.SHARED)
+            for local_layer_idx, high_layer in self.mixed_precision_high_layers.items():
+                converter = self.impl.get_page_index_converter(high_layer, Role.KEY)
+                address = self.impl.get_mem_pool_base_address(
+                    high_layer, Role.KEY, PageIndexMode.SHARED
+                )
                 expected_address = base_address + int(converter.layer_offset) * page_stride
                 if (
                     int(converter.scale) != int(first_converter.scale)
@@ -661,9 +663,11 @@ class DSACacheManagerV2(KVCacheManagerV2):
                     or int(address) != int(expected_address)
                 ):
                     raise ValueError(
-                        "DSA retained-token twins must share the K pool with their layers"
+                        "DSA mixed-precision high layers must share the K pool with their layers"
                     )
-                self.retained_row_layer_offsets[local_layer_idx] = int(converter.layer_offset)
+                self.mixed_precision_high_layer_offsets[local_layer_idx] = int(
+                    converter.layer_offset
+                )
 
         element_per_container = 2 if self.dtype == DataType.NVFP4 else 1
         dtype = torch.int8 if self.dtype == DataType.NVFP4 else self.dtype

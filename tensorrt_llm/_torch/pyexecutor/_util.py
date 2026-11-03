@@ -934,15 +934,16 @@ def _derive_draft_max_attention_window(
 
 
 def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
-                          retained_window: bool = False) -> None:
+                          mixed_precision_high_window: bool = False) -> None:
     """Adapt the target's pool_ratio to a separate one-model draft manager's pools.
 
-    ``retained_window``: the cold-page first/last-N window gives an MTP draft
-    manager a retained-token pool, as ``mixed_precision_kv`` does.
+    ``mixed_precision_high_window``: the cold-page first/last-N window gives an
+    MTP draft manager a mixed-precision high pool, as ``mixed_precision_kv`` does.
     """
     if draft_kv_config.pool_ratio is None:
         return
-    if draft_kv_config.mixed_precision_kv is not None or retained_window:
+    if (draft_kv_config.mixed_precision_kv is not None
+            or mixed_precision_high_window):
         # An MTP draft manager with mixed-precision KV, or with the cold-page
         # window, has its own pool plus a mixed-precision high pool, so the
         # target's pool_ratio does not fit it.
@@ -2438,9 +2439,9 @@ class KvCacheCreator:
             ))
         _fit_draft_pool_ratio(
             draft_kv_config,
-            retained_window=self._speculative_config.spec_dec_mode.
+            mixed_precision_high_window=self._speculative_config.spec_dec_mode.
             is_mtp_one_model()
-            and getattr(cold_page_codec_provider, "retained_token_window",
+            and getattr(cold_page_codec_provider, "mixed_precision_high_window",
                         None) is not None)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
@@ -3970,9 +3971,9 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        # A retained-token layer group must exist in the estimation run so its
-        # attention staging copy is profiled with the other activation memory.
-        if estimating_kv_cache and config.retained_token_window is None:
+        # A mixed-precision high layer group must exist in the estimation run so
+        # its attention staging copy is profiled with the other activation memory.
+        if estimating_kv_cache and config.mixed_precision_high_window is None:
             return None
         quant_config = model_engine.model.model_config.quant_config
         if (quant_config is not None and getattr(
