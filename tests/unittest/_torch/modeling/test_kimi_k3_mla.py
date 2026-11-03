@@ -23,6 +23,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures, KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -172,8 +173,10 @@ def test_k3_mla_output_gate_unfused_under_helix_with_attention_dp(monkeypatch, h
         aux_stream_dict={},
         mapping_with_cp=mapping_with_cp,
     )
-    # Both projections declare the gated epilogue, so only the mapping decides.
+    # Both projections declare the gated epilogue, so only the mapping decides. The base
+    # MLA's head slicing needs loaded weights, which this construction-only test skips.
     monkeypatch.setattr(kimi_k3_mla_attention, "GatedEpilogueProjection", Linear)
+    monkeypatch.setattr(MLA, "cache_derived_state", lambda self: None)
     mla.cache_derived_state()
     assert mla._fused_output_gate == (not helix_adp)
 
