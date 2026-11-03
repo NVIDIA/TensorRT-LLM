@@ -1241,7 +1241,8 @@ def _fold_into_open_assistant_turn(messages: list[ChatCompletionMessageParam],
     or dropping characters. A call joins it unless it has content of its own.
     A reasoning item always opens a new message, and so does any item after a
     message that is not the assistant's. Only messages from ``turn_start``
-    on, converted from this request's input, are extended.
+    on, converted from this request's input, are extended; the caller moves
+    it past a reasoning item it skips.
     """
     if message.get("role") != "assistant" or len(messages) <= turn_start:
         return False
@@ -1314,6 +1315,13 @@ def chat_messages_from_responses_input(
             message = _response_output_item_to_chat_completion_message(
                 inp, tool_resolution)
             if message is None:
+                # A reasoning item opens a new message even when none of it
+                # is replayed, so the items after it are not folded into the
+                # turn before it.
+                item_type = (inp.get("type") if isinstance(inp, dict) else
+                             getattr(inp, "type", None))
+                if item_type == "reasoning":
+                    turn_start = len(messages)
                 continue
             if _fold_into_open_assistant_turn(messages, message, turn_start):
                 continue

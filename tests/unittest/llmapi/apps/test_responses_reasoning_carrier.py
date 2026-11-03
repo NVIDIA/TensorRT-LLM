@@ -225,6 +225,47 @@ def test_reasoning_this_server_did_not_write_is_not_replayed(item):
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+def _assistant(text, item_id):
+    return {
+        "type": "message",
+        "role": "assistant",
+        "id": item_id,
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+_CALL = {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"}
+
+
+@pytest.mark.parametrize(
+    "item, reasoning",
+    [
+        (_replayed_reasoning(_carrier(REASONING)), REASONING),
+        (_replayed_reasoning(_FOREIGN), None),
+        ({"type": "reasoning", "summary": []}, None),
+    ],
+    ids=["readable", "foreign", "nothing_readable"],
+)
+@pytest.mark.parametrize(
+    "after, rest",
+    [(_assistant("Second.", "msg_2"), ("Second.", [])), (_CALL, (None, ["call_1"]))],
+    ids=["text", "call"],
+)
+def test_a_reasoning_item_between_assistant_items_opens_a_new_message(item, reasoning, after, rest):
+    # Read or skipped, the reasoning item starts the next assistant message;
+    # a skipped one only leaves its reasoning out.
+    messages = _messages(
+        _request(input=[_user("q"), _assistant("First.", "msg_1"), item, after, _user("next")])
+    )
+
+    assert [
+        (m.get("reasoning"), m.get("content"), [c["id"] for c in m.get("tool_calls") or []])
+        for m in messages
+        if m["role"] == "assistant"
+    ] == [(None, "First.", []), (reasoning, *rest)]
+
+
 # ---------------------------------------------------------------------------
 # Round trip: emitted, replayed, rendered
 # ---------------------------------------------------------------------------
