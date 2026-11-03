@@ -281,6 +281,41 @@ def test_reuse_last_n_from_low_restores_evicted_window(make_manager):
     manager.free_resources(reader)
 
 
+def test_recompute_last_n_reuses_up_to_before_the_missing_window(make_manager):
+    """Without its high-precision last N tokens, a prefix is reused only up to the block boundary
+    before them; the window there is restored and the request recomputes the rest."""
+    manager = make_manager(
+        config=mixed_config(
+            mixed_precision_reuse_last_n_from_low=True, mixed_precision_recompute_last_n=True
+        )
+    )
+
+    def make_request(request_id, tokens):
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=tokens,
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+        )
+
+    tokens = list(range(640))
+    source = make_request(1, tokens)
+    assert manager.prepare_context(source) and manager.resize_context(source, len(tokens))
+    source.move_to_next_context_chunk()
+    manager.try_commit_blocks(source)
+    manager.free_resources(source)
+
+    # Per-request snapshots keep the high pages of the source's last window only. The window at
+    # 512 tokens is missing, so the reader backs off by last_n = 65 tokens to the block boundary
+    # at 384; the window there is missing too and is restored.
+    reader = make_request(2, tokens[:512] + [9999])
+    assert manager.prepare_context(reader)
+    assert manager.kv_cache_map[2].num_committed_tokens == 384
+    assert manager.mixed_precision_restore_requests == {2}
+    manager.free_resources(reader)
+
+
 def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     import numpy as np
 

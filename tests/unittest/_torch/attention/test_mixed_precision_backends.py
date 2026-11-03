@@ -407,7 +407,7 @@ def test_mixed_precision_public_options():
 
     assert KvCacheConfig().mixed_precision_kv is None
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
-    assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256, False)
+    assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256, False, False)
     assert config.mixed_precision_first_n == config.mixed_precision_last_n == 256
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
@@ -420,6 +420,8 @@ def test_mixed_precision_public_options():
         {"dtype": "mixed_nvfp4_fp8", "mixed_precision_last_n": -1},
         {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": 0, "mixed_precision_last_n": 0},
         {"mixed_precision_config": {"mixed_precision_first_n": 1}},
+        # Recomputing the last N tokens builds on reusing the prefix without them.
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_recompute_last_n": True},
     ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
