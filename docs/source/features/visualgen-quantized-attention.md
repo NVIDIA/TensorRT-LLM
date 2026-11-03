@@ -139,7 +139,7 @@ args = VisualGenArgs(
     attention_config=AttentionConfig(
         backend="TRTLLM",
         quant_attention_config=QuantAttentionConfig(
-            qk_dtype="int8",
+            qk_dtype="fp8",
             v_dtype="fp8",
             q_block_size=1,
             k_block_size=16,
@@ -153,14 +153,16 @@ args = VisualGenArgs(
 attention_config:
   backend: TRTLLM
   quant_attention_config:
-    qk_dtype: int8
+    qk_dtype: fp8
     v_dtype: fp8
     q_block_size: 1
     k_block_size: 16
     v_block_size: 1
 ```
 
-For Hopper SageAttention, set `q_block_size` to `2`.
+These examples work on B200/GB200, B300/GB300, and Rubin. For Hopper
+SageAttention, set `qk_dtype` to `int8` and `q_block_size` to `2`, keeping
+`k_block_size: 16` and `v_block_size: 1`.
 
 ## VC-Attention in the `TRTLLM` backend
 

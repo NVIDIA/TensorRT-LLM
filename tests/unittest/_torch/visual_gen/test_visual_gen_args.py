@@ -106,6 +106,7 @@ class TestAttentionConfigQuantValidation:
 
     @pytest.mark.parametrize("sm_ver", [103, 107])
     def test_int8_sage_rejected_without_int8_tensor_cores(self, sm_ver):
+        """Reject INT8 Sage recipes on SM103 and SM107 with an actionable error."""
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             with pytest.raises(
                 ValidationError, match=f"INT8 SageAttention is unsupported on SM{sm_ver}"
@@ -181,6 +182,7 @@ class TestAttentionConfigQuantValidation:
     def test_supported_quant_config_trtllm(
         self, sm_ver, qk_dtype, q_block_size, k_block_size, v_block_size
     ):
+        """Accept each tested quantization recipe on its supported GPU architecture."""
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             attention = AttentionConfig(
                 backend="TRTLLM",
@@ -345,6 +347,8 @@ class TestAttentionConfigQuantValidation:
         ],
     )
     def test_smooth_v_requires_primts_architecture(self, sm_ver, qk_dtype, q_block_size, accepted):
+        """Allow V smoothing only on architectures supported by PrimTS."""
+
         def build():
             return AttentionConfig(
                 backend="TRTLLM",

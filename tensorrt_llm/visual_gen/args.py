@@ -170,6 +170,7 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
+        """Validate quantization recipes and smoothing against backend and GPU support."""
         # SAGE supports different recipes for different architectures.
         SAGE_RECIPES = {
             90: {

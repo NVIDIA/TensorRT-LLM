@@ -194,6 +194,7 @@ def test_attention_trtllm_sage(
     rtol: float,
     supported_sms: Tuple[int, ...],
 ):
+    """Compare supported SageAttention recipes with SDPA across shapes and options."""
     # Skip-softmax is unavailable on SM90.
     sm_version = get_sm_version()
     if sm_version not in supported_sms or (skip_softmax and sm_version == 90):
@@ -230,6 +231,7 @@ def test_attention_trtllm_sage(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TRTLLM attention.")
 def test_attention_trtllm_sage_rejects_unsupported_int8():
+    """Unsupported INT8 must raise in the native path before any unfused fallback."""
     if get_sm_version() not in (103, 107):
         pytest.skip("This test requires an SM103 or SM107 device without INT8 SageAttention.")
 
