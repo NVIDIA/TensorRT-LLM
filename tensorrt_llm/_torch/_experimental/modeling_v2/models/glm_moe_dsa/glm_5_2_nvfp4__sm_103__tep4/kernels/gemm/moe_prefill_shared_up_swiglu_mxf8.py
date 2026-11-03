@@ -20,12 +20,13 @@ only the weight's rows are permuted (``interleave_gate_up``): MXF8 block scales 
 K, so a row permutation permutes whole quantized rows and leaves every product and partial
 sum as it was.
 
-Speed (1 B300, CUDA graph, producer-written operand; 5106624): T = 7310 37.1 us vs 46.9
+Speed (1 B300, CUDA graph, producer-written operand): T = 7310 37.1 us vs 46.9
 for the GEMM + rows SwiGLU (GEMM alone 33.0); T = 2048 12.2 vs 21.8.
 
 Layout contract: the epilogue subtile is 128 x 32 (``EPI_N``; BF16 output, no source C)
 and the 32 dp x 32 bit TMEM load gives each epilogue thread one row's 32 consecutive
-accumulator columns (the C coordinate tuple is (n, m), ``CRD_MN``).  The weight rows are interleaved in blocks of ``HALF`` = 16 -- gate
+accumulator columns (the C coordinate tuple is (n, m), ``CRD_MN``).  The weight rows are
+interleaved in blocks of ``HALF`` = 16 -- gate
 rows 16b..16b+15, then up rows 16b..16b+15, b = 0..31 -- so a thread's subtile holds the
 16 gate and the 16 matching up values of output columns 16b..16b+15 (b = subtile column /
 32).  It stores them with two 16-byte stores to ``out[row, 16b:16b+16]`` (rows >= T are
@@ -89,7 +90,7 @@ def silu_nr(g: cutlass.Float32) -> cutlass.Float32:
     ``d = +inf`` (``exp`` overflow, g < -88.7) is ``g * 0`` (= ``g / inf``), ``g = +inf``
     is ``g`` (= ``inf / 1``), ``g = +-0`` is ``g`` (= ``+-0 / 2``; the residual FMA
     would turn -0 into +0).  ``s`` is a function of the 16 BF16 bits of ``g`` alone, so
-    ``check_division`` proves it equal to ``silu_rn`` for all 65536 inputs (5106624: the
+    ``check_division`` proves it equal to ``silu_rn`` for all 65536 inputs (measured: the
     correction alone differed only at g = -0).  The precise divide's per-element branch
     keeps the 16 quotients of a subtile from interleaving: 46.9 -> 56.0 us with it,
     37.1 us without, vs 33.0 us for the GEMM alone (T = 7310)."""
@@ -268,7 +269,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         # Setup smem tensor A/B/SFA/SFB/C
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
+        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)  # noqa: F841
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -641,7 +642,8 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
 
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] in {64, 192}):
-                    # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
+                    # If this is an ODD tile, shift the TMEM start address for
+                    # cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
                     offset = cutlass.Int32((mma_tile_coord_mnl[1] % 2) * 2)
                     shifted_ptr = cute.recast_ptr(
                         acc_tmem_ptr
@@ -918,7 +920,7 @@ _COMPILED: dict[tuple, Compiled] = {}
 _ALIGN = 16
 # (row, column) entries of a C coordinate: the coordinate tensor is the TMA store's, whose tuple
 # runs in TMA dimension order -- the contiguous N first -- so a row-major C coordinate is (n, m).
-# (Measured: 5106496 dumped (col, row) with the column +1 per fragment element; (0, 1) faulted.)
+# (Measured: a probe dumped (col, row) with the column +1 per fragment element; (0, 1) faulted.)
 CRD_MN = (1, 0)
 
 
@@ -997,7 +999,7 @@ def interleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
 
 
 # Largest row count on SMALL_TILE (256x128): the fused epilogue makes the 2-accumulator-stage
-# tile faster than 256x256 up to ~4k rows (5106624: T=2048 12.2 vs 19.4 us, 4096 19.9 vs 20.6,
+# tile faster than 256x256 up to ~4k rows (measured: T=2048 12.2 vs 19.4 us, 4096 19.9 vs 20.6,
 # 7310 43.1 vs 37.1).  The bytes do not depend on the tile.
 SMALL_MAX_ROWS = 4_096
 

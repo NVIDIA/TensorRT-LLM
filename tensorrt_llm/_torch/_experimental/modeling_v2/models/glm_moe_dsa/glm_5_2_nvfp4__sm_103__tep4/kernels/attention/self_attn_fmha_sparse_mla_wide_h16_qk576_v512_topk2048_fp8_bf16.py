@@ -24,7 +24,7 @@ ring (203 KB instead of 187 KB) and the producer schedule change.
 
 Measured (B300, CUDA-graph replay of 8 calls on 8 pool layers, 2048 valid rows per query,
 lengths 3000..6007): MTP2 (``max_sq`` 2) 32 sequences 28.2 -> 20.7 us, MTP5 32 sequences
-84.0 -> 56.1, 24 sequences 55.6 -> 35.3, MTP3 32 sequences 45.1 -> 31.2 (job 5202322). When
+84.0 -> 56.1, 24 sequences 55.6 -> 35.3, MTP3 32 sequences 45.1 -> 31.2. When
 most rows hit L2 (short, overlapping selections) the kernel is latency-bound and the two
 variants tie within ~5 %.
 

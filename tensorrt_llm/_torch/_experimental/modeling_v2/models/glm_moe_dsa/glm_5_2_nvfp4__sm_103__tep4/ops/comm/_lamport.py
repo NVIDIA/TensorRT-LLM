@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import cutlass
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ...kernels.comm import tp4_allgather_lamport as _ag
 from ...kernels.comm import tp4_allreduce_fused_rms as _ar
 from ...kernels.common.cuda_stream import raw_stream as _raw_stream
@@ -282,6 +284,12 @@ def build_workspace(
     fused_wide = None
     if wide:
         lv = wide_ar_levers()
+        # The two levers change the slot protocol, so the ranks must agree on them: a rank
+        # self-cleaning while a peer is not reads a stale vector as ready (a wrong sum).
+        # Agreed like multicast, the minimum over the group.
+        agreed_lv = torch.tensor([int(lv[k]) for k in _WIDE_AR_ENV], dtype=torch.int32, device=dev)
+        dist.all_reduce(agreed_lv, op=dist.ReduceOp.MIN, group=group)
+        lv = dict(zip(_WIDE_AR_ENV, (bool(v) for v in agreed_lv.tolist())))
         head = dict(cta_head=True, early_input_load=True) if lv["cta_head"] else {}
         fused_quant_twoshot = _ar.compile_fused_out_quant_for_rank(
             rank,
@@ -334,7 +342,8 @@ def build_workspace(
             use_pdl=True,
             pdl_release_policy=_PDL_POLICY,
         )
-    except Exception:  # noqa: BLE001 -- that group's qkva keeps its activation quant
+    except Exception as e:  # noqa: BLE001 -- that group's qkva keeps its activation quant
+        logger.warning(f"modeling_v2 GLM-5.2: MXF8-out two-shot all-reduce build failed ({e})")
         fused_twoshot_x8 = None
     built = torch.tensor([0 if fused_twoshot_x8 is None else 1], dtype=torch.int32, device=dev)
     dist.all_reduce(built, op=dist.ReduceOp.MIN, group=group)
@@ -353,7 +362,8 @@ def build_workspace(
             use_pdl=True,
             pdl_release_policy=_PDL_POLICY,
         )
-    except Exception:  # noqa: BLE001 -- that group's logits take upstream's gather
+    except Exception as e:  # noqa: BLE001 -- that group's logits take upstream's gather
+        logger.warning(f"modeling_v2 GLM-5.2: logits all-gather build failed ({e})")
         gather = None
     built = torch.tensor([0 if gather is None else 1], dtype=torch.int32, device=dev)
     dist.all_reduce(built, op=dist.ReduceOp.MIN, group=group)

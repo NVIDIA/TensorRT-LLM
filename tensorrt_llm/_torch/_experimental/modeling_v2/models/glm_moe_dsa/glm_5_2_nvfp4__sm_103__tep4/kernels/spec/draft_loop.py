@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Triton kernels of the MTP draft loop's bookkeeping (`ops/spec/draft_loop.py`).
 
-Ported from Xiao's glm_moe_dsa draft loop (`models/glm_moe_dsa/shared/kernels/draft_loop/`,
+Ported from the glm_moe_dsa draft loop (`models/glm_moe_dsa/shared/kernels/draft_loop/`,
 TensorRT-LLM PR #20524 at d8735393c2): the acceptance, the finalize stack and the per-step DSA
 metadata update, each one launch in place of the built-in worker's chains of small torch ops.
 Every output holds the value the built-in chain writes; the DeepGEMM schedule's split length

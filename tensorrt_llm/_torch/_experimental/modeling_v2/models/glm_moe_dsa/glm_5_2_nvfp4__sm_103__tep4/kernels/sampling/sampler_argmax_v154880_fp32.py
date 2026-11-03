@@ -23,7 +23,8 @@ contiguous segment.  Each thread streams 16-byte vectors (four FP32) with
 ``_VECTORS_IN_FLIGHT`` loads issued before any compare and keeps its own best
 pair; a butterfly warp reduction and a shared-memory pass across warps give the
 CTA's pair, which it stores into cluster rank 0's shared memory (DSMEM); one
-cluster barrier, then rank 0 reduces the segment pairs and writes the token.  ``M`` is symbolic; the logits must be contiguous rows of
+cluster barrier, then rank 0 reduces the segment pairs and writes the token.  ``M`` is
+symbolic; the logits must be contiguous rows of
 ``VOCAB`` elements on 16-byte-aligned storage.
 
 """

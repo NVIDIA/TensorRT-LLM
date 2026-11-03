@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The MTP draft loop's bookkeeping on `kernels/spec/draft_loop.py` (`Glm52MTPEagleWorker`).
 
-Ported from Xiao's glm_moe_dsa draft loop (`models/glm_moe_dsa/shared/kernels/draft_loop/`,
+Ported from the glm_moe_dsa draft loop (`models/glm_moe_dsa/shared/kernels/draft_loop/`,
 TensorRT-LLM PR #20524 at d8735393c2). Around each one-model MTP decode step the built-in
 `MTPEagleWorker` runs about a hundred small torch ops on the target's stream: the strict
 acceptance (`cumprod`, compares, the forced-acceptance draw), the step-0 gather rows, the

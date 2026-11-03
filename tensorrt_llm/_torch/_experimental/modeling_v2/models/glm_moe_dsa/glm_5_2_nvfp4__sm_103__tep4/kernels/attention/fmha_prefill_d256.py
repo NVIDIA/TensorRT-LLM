@@ -40,7 +40,7 @@ Optimizations carried:
   is software-pipelined (scale-FMA runs ahead; cvt and row-sum trail behind).
 - Arch-gated fused-reduction S load (tcgen05.ld.red MAX) on devices with
   cc >= 10.7; on Blackwell the plain chunked-load path compiles unchanged.
-  LDSTAT=auto|0|1 overrides the gate (debug).
+  TRTLLM_GLM52_FMHA_LDSTAT=auto|0|1 overrides the gate (debug).
 - Per-chunk O accumulator handoff: pv_acc_stage == iterations_pv with the
   pipeline stage index equal to the dv-chunk index (mbar pairs only, no extra
   TMEM), so the correction warpgroup rescales/drains chunk i while the MMA
@@ -56,7 +56,6 @@ bottom-right alignment), GQA (h_q % h_k == 0), seqlen_q != seqlen_k, and
 persistent tile scheduling. Exact math (no ex2 emulation / skip-correction).
 """
 
-import math
 import os
 from typing import Optional, Tuple, Type
 
@@ -67,7 +66,6 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import testing
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64
 from cutlass.memory import SmemAllocator, TmemAllocator
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -286,11 +284,11 @@ class FusedMultiHeadAttentionPrefillD256:
         self.load_warp_id = 9  # load
         self.empty_warp_ids = (10, 11)  # empty
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        # Fused-reduction (tcgen05.ld.red MAX) S load, available past
-        # sm_100f. LDSTAT=auto (default) resolves from the device compute
-        # capability so the same file runs on Blackwell (plain chunked load +
-        # FMAX chains) and cc >= 10.7 (fused-max load). LDSTAT=0/1 forces the path.
-        _ldstat = os.environ.get("LDSTAT", "auto")
+        # Fused-reduction (tcgen05.ld.red MAX) S load, available past sm_100f.
+        # TRTLLM_GLM52_FMHA_LDSTAT=auto (default) resolves from the device compute
+        # capability so the same file runs on Blackwell (plain chunked load + FMAX
+        # chains) and cc >= 10.7 (fused-max load); 0/1 forces the path.
+        _ldstat = os.environ.get("TRTLLM_GLM52_FMHA_LDSTAT", "auto")
         if _ldstat == "auto":
             self.use_ldstat = _device_cc() >= (10, 7)
         else:

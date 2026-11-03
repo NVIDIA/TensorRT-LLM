@@ -70,6 +70,7 @@ from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
+from .kernels.common import cuda_stream as _cuda_stream
 from .kernels.moe import moe_fc1_kblock as _fc1_kblock
 from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
 from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
@@ -603,7 +604,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # decode-cell GEMMs a mixed step's generation rows take (q_b, K-B, V-B) launch TVM-FFI
         # twins of their kernels; the context rope/append and the generation sparse MLA launch a
         # call signature their `prepare_runner` passed before without its contract walk.
-        self._ctx_host_diet = os.environ.get("TRTLLM_GLM52_CTX_HOST_DIET", "1") == "1"
+        # Read once, at import, by `kernels/common/cuda_stream.py`: the launch wrappers and
+        # this target must agree on it.
+        self._ctx_host_diet = _cuda_stream.DIET
         # TRTLLM_GLM52_FMHA_UNION (default 1): MTP3 / MTP5 pure decode steps take the
         # union decode attention (`cute_dsl_sparse_mla_decode_union`); 0 keeps the per-row one.
         self._union_on = os.environ.get("TRTLLM_GLM52_FMHA_UNION", "1") == "1"
@@ -762,7 +765,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # decode step's (`_wide_decode`, graph-captured) row counts up to 64 without a decode
         # cell of their own (MTP5 at 1-3 requests: 6 / 12 / 18; MTP3 at 3: 12) take the same
         # rule as an eager draft step (`_cell_up`): the next cell up at their exact rows.
-        # AI Hub job 948929 (MTP5 b=2, 12 rows): the indexer projection there ran as `x.float()`
+        # Measured at MTP5 b=2 (12 rows): the indexer projection there ran as `x.float()`
         # + an fp32 SIMT cuBLAS GEMM + split-K reduce + copies (27 us per indexer layer).
         self._dec_cell_up = os.environ.get("TRTLLM_GLM52_DEC_CELL_UP", "1") == "1"
         # TRTLLM_GLM52_MOE_ACC_PADDED (default 1; 0 restores the add after FC2): at a decode
@@ -1410,6 +1413,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         cells = _try_build("q_b | wq_b fold", lambda: _qbix_op.build_all(dev))
         want = set(self._proj_mtp.get("q_b", {}))
         if not cells or set(cells) != want or set(self._proj_mtp.get("ix_qb", {})) != want:
+            if cells:
+                logger.warning(
+                    "modeling_v2 GLM-5.2: q_b | wq_b fold cells do not match the MTP cells; "
+                    "the two GEMMs stay separate"
+                )
             return {}
         return cells
 
@@ -1420,6 +1428,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         the build fails."""
         cells = _try_build("qkva indexer fold", lambda: _ix_fold_op.build_all(dev))
         if not cells or set(cells) != set(self._proj_mtp.get("qkva", {})):
+            if cells:
+                logger.warning(
+                    "modeling_v2 GLM-5.2: qkva indexer fold cells do not match the qkva MTP "
+                    "cells; the two GEMMs stay separate"
+                )
             return {}
         return cells
 
@@ -1869,13 +1882,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         f32 = {"dtype": torch.float32, "device": dev}
         u8 = {"dtype": torch.uint8, "device": dev}
 
-        def optional(build):
+        def optional(build, what: str = "MoE prefill kernel"):
             try:
                 return build()
             except Exception as e:  # noqa: BLE001 -- that launch takes its stock op at the call site
-                logger.warning(
-                    f"modeling_v2 GLM-5.2: MoE prefill kernel build failed ({e}); using stock op"
-                )
+                logger.warning(f"modeling_v2 GLM-5.2: {what} build failed ({e}); using stock op")
                 return None
 
         def slot(mtp: bool) -> SimpleNamespace:
@@ -2061,7 +2072,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         k.router_wide = None
         k.topk_wide = {}
         if self.max_draft_len > 1 and k.topk_pre is not None:
-            k.router_wide = optional(lambda: _moe_router_op.build_wide(dev))
+            k.router_wide = optional(
+                lambda: _moe_router_op.build_wide(dev), "wide decode MoE router"
+            )
             splits = _moe_router_op.SPLIT_K if k.router_wide is not None else 1
             wide = optional(
                 lambda: {
@@ -2074,7 +2087,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                         trim=self.wide_topk_schedule[1],
                     )
                     for r in _moe_topk_op.WIDE_RANGES
-                }
+                },
+                "wide decode MoE top-k",
             )
             if wide is None:
                 k.router_wide = None
@@ -2335,6 +2349,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     max_batch_size=int(md.max_num_requests),
                     device_index=dev,
                     max_sq=self.max_draft_len + 1,
+                )
+            elif self._union_on and self.max_draft_len + 1 in _fmha_union_op.UNION_ROWS_PER_GROUP:
+                logger.warning(
+                    f"modeling_v2 GLM-5.2: union decode attention needs tokens_per_block "
+                    f"{_fmha_dec_op.LAYER_ROW_STRIDE} (got {int(md.tokens_per_block)}); "
+                    "pure decode steps keep the per-row decode attention"
                 )
         self._derive_pending = False
         self._derived_for = md.kv_cache_manager
@@ -3481,7 +3501,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         4-GPU decode-step chain (real AR, 3 MoE layers per step, 280 alternating replays):
         -30.6 us per step at 128 rows, -17.9 us at 192. Ordering only: every byte is the
         same. MTP1 and context steps never call it."""
-        torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+        fence = getattr(self, "_shared_order_fence", None)
+        if fence is None:
+            # Allocated on the first (eager, warmup) call, then reused: only the launch
+            # matters, so one persistent element serves every layer and step.
+            fence = self._shared_order_fence = torch.zeros(
+                1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+        else:
+            fence.zero_()
         self._count("moe_shared_after_ar", True)
 
     def _shared_mlp(self, x, gu, gu_il, dn, out=None, trunk=False, x8=None, w8=None):
@@ -5601,12 +5629,14 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
     * `_sample_tokens_for_batch`, all-greedy batch: the target's token. `torch.argmax`
       there, int64; int32 here, which every caller stores into an int32 tensor.
 
+    `TRTLLM_GLM52_GREEDY_ARGMAX=0` keeps both picks on the built-in code.
+
     Logits the kernel does not take keep the built-in code, counted as misses. Until the
     core's argmax launcher is built (`post_load_weights`), or if it failed to build, both
     methods are the built-in ones and nothing is counted.
 
     On a pure decode step it also runs the draft loop's bookkeeping on one launch per group
-    (`ops/spec/draft_loop.py`, ported from Xiao's glm_moe_dsa draft loop): the acceptance and
+    (`ops/spec/draft_loop.py`, ported from the glm_moe_dsa draft loop of PR #20524): the acceptance and
     draft-0 inputs, the metadata refresh before draft step 0 and the update after each draft
     step, and the final draft-token stack with `next_new_tokens`. Routes `draft_accept`,
     `draft_step`, `draft_finalize`; `TRTLLM_GLM52_DRAFT_LOOP=0` keeps the built-in code. Every
@@ -5630,10 +5660,13 @@ class Glm52MTPEagleWorker(MTPEagleWorker):
         # reached through a closure: the core belongs to the shell and is no submodule here.
         self._glm_count = core._count
         self._glm_argmax_rows = lambda: core._rows.argmax
+        # TRTLLM_GLM52_GREEDY_ARGMAX (default 1): 0 keeps both greedy picks on the built-in
+        # torch.argmax.
+        self._glm_argmax_on = os.environ.get("TRTLLM_GLM52_GREEDY_ARGMAX", "1") == "1"
 
     def _glm_pick(self, logits: torch.Tensor, route: str) -> torch.Tensor | None:
         """int32 argmax tokens of `logits` on the CuTe DSL kernel, or None for the built-in."""
-        rows = self._glm_argmax_rows()
+        rows = self._glm_argmax_rows() if self._glm_argmax_on else None
         if rows is None:
             return None
         hit = _argmax_op.takes(logits)

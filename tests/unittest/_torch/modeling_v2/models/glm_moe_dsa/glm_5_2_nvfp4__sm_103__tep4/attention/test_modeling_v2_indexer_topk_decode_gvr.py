@@ -255,7 +255,7 @@ _ON = dict(enable_heuristic_topk=True, use_cute_dsl_topk=True, use_cute_dsl_page
 @pytest.mark.parametrize(
     "cfg, topk, sm, dsl, env, want",
     [
-        # Eric's config: GVR, not deterministic.
+        # The GVR sparse config: GVR, not deterministic.
         (_ON, TOP_K, 103, True, None, False),
         (dict(_ON, gvr_deterministic_topk=True), TOP_K, 103, True, None, True),
         (dict(_ON, use_cute_dsl_topk=False), TOP_K, 100, True, None, False),

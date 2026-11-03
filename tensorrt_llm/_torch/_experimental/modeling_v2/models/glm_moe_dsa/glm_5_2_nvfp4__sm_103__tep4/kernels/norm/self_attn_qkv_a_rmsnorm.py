@@ -1513,7 +1513,7 @@ def _rmsnorm_row_warp_ctx_ilp(
         for pair in cutlass.range_constexpr(_BF16_VEC_SIZE // 2):
             x0 = chunks[pass_idx][2 * pair].to(cutlass.Float32)
             x1 = chunks[pass_idx][2 * pair + 1].to(cutlass.Float32)
-            # rnd explicit: the internal DSL defaults to RN, public cutlass-dsl 4.8 to none
+            # rnd explicit: some cutlass-dsl builds default to RN, public cutlass-dsl 4.8 to none
             n0, n1 = _prims.mul_packed_f32x2((x0, x1), (inv_rms, inv_rms), rnd=_FPRnd.RN)
             n0, n1 = _prims.mul_packed_f32x2(
                 (n0, n1),

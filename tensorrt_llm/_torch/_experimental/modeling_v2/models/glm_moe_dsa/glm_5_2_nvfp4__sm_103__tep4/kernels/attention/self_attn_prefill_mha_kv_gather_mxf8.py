@@ -16,7 +16,7 @@ expansion GEMMs in MXF8 (``self_attn_prefill_projections_mxf8``
   act-quant rule of ``self_attn_prefill_act_quant_mxf8`` (``s = amax / 448``
   rounded up to a power of two, values ``e4m3(x / s)``, RN): block scaling keeps
   the precision of layers whose c_kv values sit below the e4m3 normal range at
-  scale 1.0 (layer 3 of GLM-5.2: 88 % of them; MXF8 K/V expansion stage 0, 5091589).
+  scale 1.0 (layer 3 of GLM-5.2: 88 % of them; MXF8 K/V expansion stage 0).
 
 Outputs (one pass):
 

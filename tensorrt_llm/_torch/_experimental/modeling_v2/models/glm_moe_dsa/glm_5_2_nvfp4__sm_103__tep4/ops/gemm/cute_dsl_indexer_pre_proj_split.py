@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm.logger import logger
 
 from ...kernels.gemm import self_attn_indexer_pre_indexer_proj_m64_n160_k6144_tf32 as _kernel
 from ...kernels.gemm import self_attn_indexer_prefill_wk_split_f32 as _wk_split
@@ -101,7 +102,8 @@ def build_prefill(weight: torch.Tensor) -> PrefillSplitHandle:
         try:
             _wk_split.warm(dev)
             split = _wk_split.split_
-        except Exception:  # noqa: BLE001 -- the handle keeps the two copies
+        except Exception as e:  # noqa: BLE001 -- the handle keeps the two copies
+            logger.warning(f"modeling_v2 GLM-5.2: indexer column-split build failed ({e})")
             split = None
     return PrefillSplitHandle(PREFILL_MAX_ROWS, launch, split)
 
@@ -116,7 +118,10 @@ def compile_all(
     for m in rows:
         try:
             handles[int(m)] = compile(device_id, m)
-        except Exception:  # noqa: BLE001 -- that row count takes the fp32 projection
+        except Exception as e:  # noqa: BLE001 -- that row count takes the fp32 projection
+            logger.warning(
+                f"modeling_v2 GLM-5.2: indexer pre-projection build at {m} rows failed ({e})"
+            )
             continue
     return handles
 

@@ -19,7 +19,8 @@ A request's K/V rows are its cached prefix (KV block reuse) followed by its new 
 bottom-right aligned). Without ``cu_seqlens_k`` (no cached prefix) K/V use ``cu_seqlens``.
 
 Device code: the uniform-precision hd256 prefill FMHA (``_deps/fmha_prefill_d256.py``: 2-CTA
-M=256 UMMA, P in TMEM, softmax / correction / MMA / load warps), imported for every helper; ``__call__`` and ``kernel`` are overridden for varlen:
+M=256 UMMA, P in TMEM, softmax / correction / MMA / load warps), imported for every helper;
+``__call__`` and ``kernel`` are overridden for varlen:
 
 * layouts are token-major with batch stride 0; every work tile reads ``cu_seqlens[b]`` and
   re-bases the Q/K/V TMA coordinate tensors and the O tensor at that row (``domain_offset``) --

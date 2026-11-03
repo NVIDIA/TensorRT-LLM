@@ -35,7 +35,7 @@ from cutlass._mlir import ir as _mlir_ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.nvgpu import tcgen05
-from cutlass.cute.typing import Boolean, Float16, Int64
+from cutlass.cute.typing import Boolean
 from cutlass.cutlass_dsl import (
     Float32,
     Int16,
@@ -540,9 +540,11 @@ class MaskEnum(enum.Enum):
 
     - RESIDUAL_MASK: Residual mask for handling variable sequence lengths
     - WINDOW_MASK: Window mask for attention which also includes causal and no mask
-    - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end of q is aligned with the end of k
+    - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end
+      of q is aligned with the end of k
     - WINDOW_MASK_BWD: Window mask for backward pass
-    - WINDOW_MASK_BWD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
+    - WINDOW_MASK_BWD_INFERENCE: Same as the window mask for backward pass, but has the
+      limitation that the end of q is aligned with the end of k
     """
 
     RESIDUAL_MASK = enum.auto()
