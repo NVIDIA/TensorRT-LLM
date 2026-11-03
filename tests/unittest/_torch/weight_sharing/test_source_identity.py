@@ -248,6 +248,47 @@ def test_quant_model_dump_uses_python_mode():
     assert identity.quant_fingerprint
 
 
+def _excluding(patterns: list[str]) -> QuantConfig:
+    return QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, exclude_modules=patterns)
+
+
+@pytest.mark.parametrize(
+    "patterns",
+    [
+        pytest.param(["*eh_proj", "*kv_b_proj*", "*k_b_proj*"], id="reordered"),
+        pytest.param(["*kv_b_proj*", "*k_b_proj*", "*eh_proj", "*kv_b_proj*"], id="repeated"),
+    ],
+)
+def test_quant_fingerprint_hashes_exclude_modules_as_a_set(patterns: list[str]) -> None:
+    """Exclusion patterns match as a set, so their order and repeats do not change the identity.
+
+    The config keeps its patterns in the order its producer wrote them.
+    """
+    reference = identity_from(
+        FakeModelConfig(quant_config=_excluding(["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]))
+    )
+    quant_config = _excluding(list(patterns))
+
+    identity = identity_from(FakeModelConfig(quant_config=quant_config))
+
+    assert identity.quant_fingerprint == reference.quant_fingerprint
+    assert quant_config.exclude_modules == patterns
+    fewer = identity_from(FakeModelConfig(quant_config=_excluding(["*kv_b_proj*", "*k_b_proj*"])))
+    assert fewer.quant_fingerprint != reference.quant_fingerprint
+
+
+def test_quant_fingerprint_hashes_layer_exclude_modules_as_a_set() -> None:
+    """Per-layer quantization configs hash their exclusion patterns as a set too."""
+
+    def identity(patterns: list[str]) -> SourceIdentity:
+        config = FakeModelConfig()
+        config.quant_config_dict = {"model.layers.0.mlp": _excluding(patterns)}
+        return identity_from(config)
+
+    assert identity(["b", "a"]).quant_fingerprint == identity(["a", "b"]).quant_fingerprint
+    assert identity(["a"]).quant_fingerprint != identity(["a", "b"]).quant_fingerprint
+
+
 def test_parallel_size_mismatch_flags_global():
     a = identity_from(FakeModelConfig(mapping=FakeMapping(tp_size=8)))
     b = identity_from(FakeModelConfig(mapping=FakeMapping(tp_size=4)))

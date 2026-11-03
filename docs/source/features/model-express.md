@@ -148,14 +148,16 @@ TensorRT LLM applies two independent compatibility gates:
 
 - The qualification profile records that a model/config/lifecycle combination
   has passed full-load versus staged-load equivalence testing.
-- `SourceIdentity` format version 3 binds two concrete runs to the same
+- `SourceIdentity` format version 4 binds two concrete runs to the same
   checkpoint artifact, runtime layout choices, local shard layout, and
-  transform-layout ABI.
+  transform-layout ABI. Quantization exclusion patterns compare as a set, so
+  their order in the checkpoint's config does not matter.
 
 The transfer protocol version identifies the staged receiver protocol. The
 transform-layout ABI identifies the meaning of the transferred tensor names,
-layouts, aliases, and receiver finalization. A pre-version-3 identity, a
-missing ABI, or a different ABI is rejected rather than treated as compatible.
+layouts, aliases, and receiver finalization. An identity of another format
+version, a missing ABI, or a different ABI is rejected rather than treated as
+compatible.
 
 Loads that require a separately loaded draft model also fall back to the
 standard checkpoint path. Target-plus-draft post-transform transfer remains
