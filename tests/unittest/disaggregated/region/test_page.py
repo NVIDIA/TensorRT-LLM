@@ -106,7 +106,6 @@ def test_layer_group_roundtrip():
     entries = _make_buffer_entries()
     lg = AttentionLayerGroup(
         pool_group_idx=0,
-        kv_head_num_per_rank=8,
         sliding_window_size=None,
         local_layers=[LocalLayer(0, 5), LocalLayer(1, 6)],
         pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
@@ -114,7 +113,6 @@ def test_layer_group_roundtrip():
     d = lg.to_dict()
     restored = LayerGroup.from_dict(d)
     assert restored.pool_group_idx == 0
-    assert restored.kv_head_num_per_rank == 8
     assert restored.sliding_window_size is None
     assert len(restored.local_layers) == 2
     assert len(restored.pool_views) == 1
@@ -154,7 +152,6 @@ def test_kv_cache_page_table_roundtrip():
         layer_groups=[
             AttentionLayerGroup(
                 pool_group_idx=0,
-                kv_head_num_per_rank=8,
                 sliding_window_size=None,
                 local_layers=[LocalLayer(0, 5)],
                 pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],

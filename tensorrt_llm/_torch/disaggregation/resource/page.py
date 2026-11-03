@@ -60,12 +60,13 @@ class MapperKind(IntEnum):
     buffers purely by ``(life_cycle, buffer size)``, so e.g. MiniMax M3's
     replicated index-K shares the K/V pool at TP degrees where their
     per-block sizes coincide. The page-table builder therefore emits one
-    PoolView per ``(physical pool, mapper kind)`` — a view covers exactly
-    the bytes of one role class, and its per-layer byte ranges come from
-    ``buffer_entries`` (offsets are per layer because another class may
-    interleave between layers; only the per-layer size is uniform, recorded
-    in ``bytes_per_layer``). View count per layer group is bounded by the
-    number of role classes, never by layer count.
+    PoolView per ``(physical pool, mapper kind, manager partition, KV-head
+    count)`` — a view covers exactly the bytes of one role class, and its
+    per-layer byte ranges come from ``buffer_entries`` (offsets are per layer
+    because another class may interleave between layers; only the per-layer
+    size is uniform, recorded in ``bytes_per_layer``). View count per layer
+    group is bounded by the number of role classes and head geometries,
+    never by layer count.
 
     Mamba state pools use SECTIONED for convolution state, INDEXED for SSM
     state, and REPLICATED for auxiliary recurrent state. The policy is chosen
@@ -87,8 +88,8 @@ class RoleLayout:
 
     Carried onto the role's :class:`PoolView` by the page-table builder.
     ``section_bytes`` describes a SECTIONED role (one entry per section, in
-    slot order); ``bytes_per_head`` describes an INDEXED role whose head
-    count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
+    slot order); ``bytes_per_head`` describes an INDEXED recurrent-state
+    (SSM) role, whose views carry no ``num_kv_heads``.
     ``ring_slot_bytes`` describes a REPLICATED role whose per-layer region is
     a ring of token slots addressed by global token position modulo the slot
     count (see :attr:`PoolView.ring_slot_bytes`). Roles with none of these need
@@ -202,10 +203,10 @@ class PoolView:
             layer's region, in slot order (``sum == bytes_per_layer``). Each
             section is TP-sharded independently, so a TP mismatch is resolved
             per section.
-        bytes_per_head: INDEXED views whose head count is not derivable from
-            ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
-            bytes_per_head`` is the per-rank head count. Attention K/V leaves
-            it ``None``; its head count is ``num_kv_heads``.
+        bytes_per_head: Recurrent-state (SSM) INDEXED views only.
+            ``bytes_per_layer // bytes_per_head`` is the per-rank head count.
+            Attention K/V leaves it ``None``; its head count is
+            ``num_kv_heads``.
         num_kv_heads: Attention K/V views only. Per-rank KV-head count shared
             by every layer of the view, so views of one rank (e.g. target and
             draft layers) may shard or replicate heads differently. Required
@@ -319,14 +320,12 @@ class LayerGroup:
 class AttentionLayerGroup(LayerGroup):
     """Layer group for attention KV cache."""
 
-    kv_head_num_per_rank: int = 0
     sliding_window_size: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
             "kind": int(self.kind),
             "pool_group_idx": int(self.pool_group_idx),
-            "kv_head_num_per_rank": int(self.kv_head_num_per_rank),
             "sliding_window_size": self.sliding_window_size,
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
@@ -338,7 +337,6 @@ class AttentionLayerGroup(LayerGroup):
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data.get("local_layers", [])],
             pool_views=[PoolView.from_dict(pv) for pv in data.get("pool_views", [])],
-            kv_head_num_per_rank=int(data["kv_head_num_per_rank"]),
             sliding_window_size=data.get("sliding_window_size"),
         )
 

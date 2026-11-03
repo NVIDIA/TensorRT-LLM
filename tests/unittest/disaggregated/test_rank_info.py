@@ -101,7 +101,7 @@ def test_rank_info_roundtrip_with_aux_meta():
     assert restored.aux_meta.device == "cpu"
 
 
-def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> None:
+def test_from_kv_cache_manager_records_bounded_replay(monkeypatch) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
     mapping = SimpleNamespace(
         rank=0,
@@ -126,7 +126,6 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
-    assert info.attention.kv_heads_per_rank == 8
     assert info.bounded_replay_on_generation is False
 
     manager.bounded_replay_on_generation = True
@@ -162,7 +161,6 @@ def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.attention is not None
-    assert info.attention.kv_heads_per_rank == 0
     assert info.attention.enable_attention_dp
     assert MambaPolicy._mamba_tp(info) == (1, 0)
 

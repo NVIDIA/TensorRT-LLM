@@ -67,9 +67,7 @@ class DummyRankInfo:
     cp_size = 1
     cp_rank = 0
     device_id = 0
-    kv_heads_per_rank = 8
     tokens_per_block = 32
-    dims_per_head = 16
     element_bytes = 2
     enable_attention_dp = False
     is_mla = False
@@ -197,7 +195,7 @@ def test_build_page_table():
     assert page_table.layer_groups is not None
     assert len(page_table.layer_groups) == get_num_layer_groups(page_table)
     assert len(get_global_layer_ids(page_table.layer_groups[0])) > 0
-    assert page_table.layer_groups[0].kv_head_num_per_rank == num_kv_heads
+    assert pv.num_kv_heads == num_kv_heads
 
     layer_to_lg = get_layer_to_layer_group(page_table)
     assert layer_to_lg is not None
@@ -238,7 +236,6 @@ def test_layer_group_meta_serialization():
     ]
     lg = AttentionLayerGroup(
         pool_group_idx=0,
-        kv_head_num_per_rank=4,
         sliding_window_size=512,
         local_layers=local_layers,
         pool_views=[pv],
@@ -253,7 +250,6 @@ def test_layer_group_meta_serialization():
     restored_lg = restored.layer_groups[0]
     assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert restored_lg.sliding_window_size == 512
-    assert restored_lg.kv_head_num_per_rank == 4
     assert len(restored_lg.local_layers) == 2
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
     assert restored_lg.pool_views[0].num_kv_heads == 4
@@ -323,6 +319,8 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         impl=impl,
         pp_layers=[0, 1],
         layer_offsets={0: 0, 1: 1},
+        layer_specs=None,
+        num_kv_heads=1,
         num_kv_heads_per_layer=[1, 1],
         get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
         get_disagg_role_layouts=lambda: {},
@@ -513,7 +511,6 @@ def test_v2_builder_resolves_mixed_precision_twin_heads() -> None:
 
     layer_group = build_page_table_from_manager(manager).layer_groups[0]
 
-    assert layer_group.kv_head_num_per_rank == 2
     assert layer_group.sliding_window_size == 128
     assert layer_group.local_layers[0].global_layer_id == 45
     assert layer_group.pool_views[0].num_kv_heads == 2
@@ -570,7 +567,6 @@ def test_v2_builder_accepts_replicated_only_layer_group_without_head_count() -> 
 
     layer_group = build_page_table_from_manager(manager).layer_groups[0]
 
-    assert layer_group.kv_head_num_per_rank == 0
     assert len(layer_group.pool_views) == 1
     assert layer_group.pool_views[0].mapper_kind == MapperKind.REPLICATED
     assert layer_group.pool_views[0].num_kv_heads is None
@@ -591,6 +587,27 @@ def test_v2_builder_splits_mixed_heads_without_view_partition() -> None:
     manager.num_kv_heads_per_layer = [2, 1]
     views = build_page_table_from_manager(manager).layer_groups[0].pool_views
     assert [view.num_kv_heads for view in views] == [2, 1]
+    assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_splits_layers_whose_heads_only_match_per_rank() -> None:
+    from types import SimpleNamespace
+
+    # 4 and 2 KV heads hold one head per rank at TP4 but not at TP2, so their
+    # views stay apart at every TP size.
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.num_kv_heads = [4, 2]
+    manager.num_kv_heads_per_layer = [1, 1]
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert [view.num_kv_heads for view in views] == [1, 1]
     assert [get_unique_layers(view) for view in views] == [{0}, {1}]
 
 
@@ -896,6 +913,8 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
     manager.pp_layers = [0, 1, 2]
     manager._mamba_layer_mask = [True, True, False]
     manager.local_num_mamba_layers = 2
+    manager.layer_specs = None
+    manager.num_kv_heads = 1
     manager.num_kv_heads_per_layer = [1, 1, 1]
     # conv: [8, 4] fp16 = 64 bytes as sections [2, 2, 4] * 4 * 2 = [16, 16, 32]
     manager.conv_state_shape = [8, 4]
@@ -1101,7 +1120,6 @@ def test_mixed_page_table_serialization():
     )
     attn_lg = AttentionLayerGroup(
         pool_group_idx=0,
-        kv_head_num_per_rank=4,
         local_layers=[LocalLayer(0, 0)],
         pool_views=[PoolView(pool_idx=0, buffer_entries=entries)],
     )
@@ -1157,7 +1175,6 @@ def test_mixed_page_table_serialization():
     assert len(restored.layer_groups) == 2
     assert isinstance(restored.layer_groups[0], AttentionLayerGroup)
     assert isinstance(restored.layer_groups[1], MambaLayerGroup)
-    assert restored.layer_groups[0].kv_head_num_per_rank == 4
     assert [
         (ll.local_layer_id, ll.global_layer_id) for ll in restored.layer_groups[1].local_layers
     ] == [

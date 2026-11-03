@@ -2288,7 +2288,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
         peer_extractor=lambda name, rank: _BlockExtractor(CacheKind.PAGED),
         get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
-        should_send_pool=lambda targets, ri, lg, pi: True,
+        should_send_pool=lambda ri, self_key, peer_key: True,
         get_kv_map=lambda ri, src, dst: _IdentityMapper(),
     )
     task = SimpleNamespace(
@@ -2385,7 +2385,7 @@ def _helix_ring_write_meta(
         get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
         peer_extractor=lambda name, rank: _PtrExtractor(dst_base),
         get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
-        should_send_pool=lambda targets, ri, lg, pi: True,
+        should_send_pool=lambda ri, self_key, peer_key: True,
         get_kv_map=lambda ri, src, dst: mapper,
     )
     task = SimpleNamespace(

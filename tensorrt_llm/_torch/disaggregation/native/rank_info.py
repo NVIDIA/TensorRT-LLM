@@ -74,11 +74,6 @@ class RankInfo:
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
         enable_attention_dp = m.enable_attention_dp
-        # Keep AttentionInfo on attention-free PP stages so it can still carry
-        # the attention-DP topology used by Mamba transfers.  A zero head count
-        # means that this rank has no local attention cache; AttentionPolicy
-        # must not perform head-ratio arithmetic for such ranks.
-        kv_heads_per_rank = next((h for h in kvm.num_kv_heads_per_layer if h > 0), 0)
         # Eight is the smallest element count guaranteed to occupy whole bytes
         # for every supported sub-byte cache dtype (including NVFP4).
         bytes_for_eight_elements = get_size_in_bytes(8, kvm.dtype)
@@ -104,9 +99,7 @@ class RankInfo:
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(
-                kv_heads_per_rank=kv_heads_per_rank,
                 tokens_per_block=kvm.tokens_per_block,
-                dims_per_head=kvm.head_dim,
                 element_bytes=element_bytes,
                 enable_attention_dp=enable_attention_dp,
                 is_mla=kvm.kv_factor == 1,

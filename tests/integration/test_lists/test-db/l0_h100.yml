@@ -142,6 +142,8 @@ l0_h100:
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_uneven_pp -k "v2 and vswa"
   # Boundary request lengths.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_boundary_lengths -k "v2"
+  # Layers with different KV-head counts and head_dim.
+  - unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver_per_layer_kv_heads
   # Python transceiver with the C++ NIXL agent's bounce v2 enabled.
   - unittest/disaggregated/test_cache_transceiver_single_process.py::test_python_nixl_cache_transceiver_uses_cpp_bounce
   # Helix CP

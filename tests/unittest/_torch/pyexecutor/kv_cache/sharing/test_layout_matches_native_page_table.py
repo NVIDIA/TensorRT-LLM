@@ -78,6 +78,8 @@ def native_groups(page_table):
         global_of = {int(ll.local_layer_id): int(ll.global_layer_id) for ll in lg.local_layers}
         state = lg.kind == CacheKind.STATE
         rows, roles, geometry = [], {}, {}
+        heads = {pv.num_kv_heads for pv in lg.pool_views if pv.num_kv_heads is not None}
+        assert len(heads) <= 1, heads
         for pv in lg.pool_views:
             key = (pools[pv.pool_idx][0], MapperKind(int(pv.mapper_kind)).name)
             assert key not in roles, f"two views of pool and mapper {key}"
@@ -91,7 +93,7 @@ def native_groups(page_table):
             {
                 "kind": "state" if state else "attention",
                 "window": None if state else lg.sliding_window_size,
-                "heads": None if state else int(lg.kv_head_num_per_rank),
+                "heads": None if state else (heads.pop() if heads else 0),
                 "layers": sorted(global_of.values()),
                 "pools": pools,
                 "rows": sorted(rows),
@@ -105,7 +107,7 @@ def native_groups(page_table):
 def layout_groups(geometry):
     """The same per layer group from ``derive_layout``'s result, without local-only buffers (native
     skips ignored roles); transferred buffers no group claims are listed last. Attention heads are
-    the head-sharded buffers' ``num_heads``: native's attention views have no per-head size."""
+    the head-sharded buffers' ``num_heads``, which native records as views' ``num_kv_heads``."""
     layout = geometry.layout
     out, claimed = [], set()
     for desc in layout.layer_groups:

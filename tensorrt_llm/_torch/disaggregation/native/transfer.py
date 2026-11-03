@@ -1390,8 +1390,7 @@ class Sender(SenderBase):
         timer = task._perf_timer
         if timer:
             timer.record_prepare_args_start(peer_ri.instance_rank)
-        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
-        expected_transfers = len(targets.ranks)
+        expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
         # Recorded on the task as well: the count on the write meta settles the task, while the
         # handle has to answer how many writes are still out after one of them has already failed.
         task.expected_transfers = expected_transfers
@@ -1421,7 +1420,9 @@ class Sender(SenderBase):
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
             if (self_lg, self_pi) in task._chunk.excluded_pool_views:
                 continue
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+            if not self._registrar.should_send_pool(
+                peer_ri, (self_lg, self_pi), (peer_lg, peer_pi)
+            ):
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
@@ -2964,7 +2965,6 @@ class Receiver(ReceiverBase):
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
                 message = messenger.receive()
-                sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
 
@@ -2975,8 +2975,11 @@ class Receiver(ReceiverBase):
             # dealers are connected and no partial registration happens for
             # the bad peer. The failure is converted to PeerIncompatibleError
             # (handled in dispatch_task) so only requests targeting this peer
-            # fail, and cached so later requests fail fast.
+            # fail, and cached so later requests fail fast. A peer from another
+            # build usually fails earlier, while its RankInfo is decoded
+            # (TypeError/KeyError).
             try:
+                sender_info = RankInfo.from_bytes(message[0])
                 self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
@@ -2989,9 +2992,10 @@ class Receiver(ReceiverBase):
                     sender_info.page_table,
                 )
                 self._registrar.validate_view_head_geometry(sender_info)
-            except ValueError as e:
+            except (KeyError, TypeError, ValueError) as e:
                 msg = (
-                    f"context peer at '{info_endpoint}' is incompatible: {e} "
+                    f"context peer at '{info_endpoint}' is incompatible: "
+                    f"{type(e).__name__}: {e} "
                     "(cached: all further requests to this context peer fail "
                     "fast; restart this generation worker to re-validate, "
                     "e.g. after redeploying a compatible server on the same "

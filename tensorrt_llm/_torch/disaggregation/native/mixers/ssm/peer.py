@@ -345,9 +345,7 @@ class MambaPolicy:
     def __init__(self, self_rank_info: RankInfo):
         self._ri = self_rank_info
 
-    def should_send(
-        self, peer_overlap, peer_rank_info, *, mapper_kind: Optional[MapperKind] = None
-    ) -> "bool | None":
+    def should_send(self, peer_ri: RankInfo, self_pv: PoolView, peer_pv: PoolView) -> "bool | None":
         """Mamba TP routing.
 
         Sharded state (conv/SSM): always send, each rank owns a unique shard.
@@ -355,7 +353,7 @@ class MambaPolicy:
         None to signal fan-in election. REPLICATED side state holds identical
         bytes on every rank regardless of mamba_tp, so it always elects.
         """
-        if mapper_kind == MapperKind.REPLICATED:
+        if self_pv.mapper_kind == MapperKind.REPLICATED:
             return None
         mamba_tp, _ = MambaPolicy._mamba_tp(self._ri)
         if mamba_tp == 1:

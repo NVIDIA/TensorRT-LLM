@@ -16,12 +16,9 @@
 from dataclasses import asdict, dataclass
 
 
-# [numLayers, kv_factor, heads, tokens, dims_per_head]
 @dataclass
 class AttentionInfo:
-    kv_heads_per_rank: int
     tokens_per_block: int
-    dims_per_head: int
     element_bytes: int | float
     enable_attention_dp: bool
     is_mla: bool

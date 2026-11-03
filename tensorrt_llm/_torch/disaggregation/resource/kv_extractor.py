@@ -50,8 +50,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
-# size within a life cycle); the page-table builder emits one PoolView per
-# (pool, kind) so each view stays kind-homogeneous.
+# size within a life cycle); the page-table builder still keeps each
+# PoolView kind-homogeneous (see _build_pool_views_for_variant).
 _V2_ROLE_MAPPER_KINDS = frozenset(
     {
         MapperKind.INDEXED,
@@ -170,6 +170,26 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
+def _virtual_layer_owners(manager) -> Optional[Dict[int, tuple]]:
+    """Internal layer id -> (owning model layer, attention type) for managers
+    with virtual layers (``_layer_attn_to_layer_id``); None for other managers.
+
+    `setdefault`, not assignment: the mapping is many-to-one under DeepSeek-V4.1,
+    where long-range layers that share a compressed cache all resolve to the
+    LayerId of the layer that allocated it. The owner is inserted first (it
+    precedes its dependents in layer order), so keeping the first entry names the
+    owner. Keeping the last would name whichever dependent happened to come last
+    on this rank, which differs between PP ranks and would break peer matching.
+    """
+    mapping = getattr(manager, "_layer_attn_to_layer_id", None)
+    if mapping is None:
+        return None
+    owners: Dict[int, tuple] = {}
+    for (model_layer, attn_type), layer_id in mapping.items():
+        owners.setdefault(int(layer_id), (int(model_layer), attn_type))
+    return owners
+
+
 def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     """Compute collision-free layer IDs for a pool group for disaggregated transfer.
 
@@ -199,23 +219,13 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
             )
         return global_layer_ids
 
-    if not hasattr(manager, "_layer_attn_to_layer_id"):
+    owners = _virtual_layer_owners(manager)
+    if owners is None:
         # Standard: local_layer_id is index into pp_layers
         return [manager.pp_layers[lid] for lid in local_layer_ids]
 
-    # Virtual layers: build inverse mapping internal_layer_id -> (model_layer, attn_type)
-    # and encode as model_layer * num_attn_types + attn_type_value
-    # `setdefault`, not assignment: the mapping is many-to-one under DeepSeek-V4.1,
-    # where long-range layers that share a compressed cache all resolve to the
-    # LayerId of the layer that allocated it. The owner is inserted first (it
-    # precedes its dependents in layer order), so keeping the first entry names the
-    # owner. Keeping the last would name whichever dependent happened to come last
-    # on this rank, which differs between PP ranks and would break the peer
-    # matching this ID is required to be consistent for.
-    inverse = {}
-    for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
-        inverse.setdefault(layer_id, (model_layer, attn_type.value))
-
+    # Virtual layers: encode the owning (model_layer, attn_type) as
+    # model_layer * num_attn_types + attn_type_value.
     # Use the full enum range for consistent encoding across all PP ranks.
     # Different PP ranks may have different subsets of attention types (e.g.,
     # a rank with only ratio=128 layers won't have INDEXER_* types), so using
@@ -225,7 +235,7 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     attn_type_class = type(first_key[1])
     num_attn_types = max(e.value for e in attn_type_class) + 1
 
-    return [inverse[lid][0] * num_attn_types + inverse[lid][1] for lid in local_layer_ids]
+    return [owners[lid][0] * num_attn_types + owners[lid][1].value for lid in local_layer_ids]
 
 
 def _build_pool_views_for_variant(
@@ -236,18 +246,21 @@ def _build_pool_views_for_variant(
     role_layouts: Optional[Dict] = None,
     ignored_roles: frozenset[DataRole] = frozenset(),
     view_partition: Optional[Callable] = None,
-    kv_heads_for_layer: Optional[Callable[[int], int]] = None,
+    kv_heads_for_layer: Optional[Callable[[int], Tuple[int, Optional[int]]]] = None,
 ) -> List[PoolView]:
     """Bucket one slot-desc variant's coalesced buffers into pool views.
 
-    One view is emitted per ``(physical pool, mapper kind)``; roles sharing a
-    kind share a view (KEY+VALUE), roles with different kinds in the same
-    physical pool get separate views (M3 coalesced index-K). ``role_layouts``
-    supplies the per-role resharding geometry carried onto the view.
-    ``view_partition`` further splits roles of one kind (e.g. by owning
-    model). ``kv_heads_for_layer`` gives a layer's positive per-rank KV-head
-    count; head-sharded views also partition by that count so equal-sized
-    buffers with different head geometry never share a view.
+    One view is emitted per ``(physical pool, mapper kind, manager partition,
+    KV-head count)``; roles sharing a kind share a view (KEY+VALUE), roles
+    with different kinds in the same physical pool get separate views (M3
+    coalesced index-K). ``role_layouts`` supplies the per-role resharding
+    geometry carried onto the view. ``view_partition`` further splits roles
+    of one kind (e.g. by owning model). ``kv_heads_for_layer`` gives a
+    layer's (per-rank, unsharded) KV-head counts. Head-sharded views split
+    on both: the per-rank count becomes the view's ``num_kv_heads``, and the
+    unsharded count keeps the split the same at every TP size, since per-rank
+    counts of two layer classes can round up to the same value at one TP size
+    and not at another.
     """
     role_layouts = role_layouts or {}
     bucket_entries: Dict[tuple, list] = defaultdict(list)
@@ -266,13 +279,13 @@ def _build_pool_views_for_variant(
                     if view_partition is not None
                     else None
                 )
-                num_kv_heads = (
+                kv_heads = (
                     kv_heads_for_layer(int(buffer_id.layer_id))
                     if kv_heads_for_layer is not None
                     and kind in (MapperKind.INDEXED, MapperKind.NHD)
                     else None
                 )
-                bucket_key = (pool_idx, kind, partition, num_kv_heads)
+                bucket_key = (pool_idx, kind, partition, kv_heads)
                 bucket_entries[bucket_key].append(
                     (int(buffer_id.layer_id), offset, single_buffer_size)
                 )
@@ -290,7 +303,7 @@ def _build_pool_views_for_variant(
         key=lambda key: (key[0], min(entry[1] for entry in bucket_entries[key])),
     )
     for bucket_key in lg_bucket_keys:
-        pool_idx, mapper_kind, _, num_kv_heads = bucket_key
+        pool_idx, mapper_kind, _, kv_heads = bucket_key
         roles = frozenset(bucket_roles[bucket_key])
         context = (
             f"View(layer_group={layer_group_id}, pool={pool_idx}, "
@@ -341,7 +354,7 @@ def _build_pool_views_for_variant(
                     list(layout.section_bytes) if layout.section_bytes is not None else None
                 ),
                 bytes_per_head=layout.bytes_per_head,
-                num_kv_heads=num_kv_heads,
+                num_kv_heads=kv_heads[0] if kv_heads is not None else None,
                 ring_slot_bytes=layout.ring_slot_bytes,
             )
         )
@@ -416,41 +429,34 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
 
         raise ValueError(f"Cannot resolve layer config for internal layer {internal_layer_id}")
 
-    virtual_layer_mapping = getattr(manager, "_layer_attn_to_layer_id", None)
-    model_layer_by_internal_id: dict[int, int] = {}
-    if virtual_layer_mapping is not None:
-        # Shared caches are declared by their owner before dependent layers.
-        for (model_layer, _attn_type), internal_layer_id in virtual_layer_mapping.items():
-            model_layer_by_internal_id.setdefault(int(internal_layer_id), int(model_layer))
+    layer_owners = _virtual_layer_owners(manager)
 
-    def _kv_heads_for_layer(internal_layer_id: int) -> int:
+    def _kv_heads_for_layer(internal_layer_id: int) -> Tuple[int, Optional[int]]:
+        """(per-rank, unsharded) KV heads of the model layer that owns this storage layer.
+
+        Unlike the window size, which belongs to the storage layer itself (a
+        mixed-precision twin is SWA), heads come from the owning model layer.
+        The unsharded count is None when the manager takes one count for every
+        layer or when rank-local layer specs give per-rank counts only.
+        """
         local_layer_id = internal_layer_id
-        if virtual_layer_mapping is not None:
-            model_layer = model_layer_by_internal_id.get(internal_layer_id)
-            if model_layer is None:
-                raise ValueError(
-                    f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
-                    "no owning model layer"
-                )
-            local_layer_id = manager.layer_offsets.get(model_layer)
-            if local_layer_id is None:
-                raise ValueError(
-                    f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
-                    f"model layer {model_layer} is not local to this rank"
-                )
+        if layer_owners is not None:
+            owner = layer_owners.get(internal_layer_id)
+            local_layer_id = manager.layer_offsets.get(owner[0]) if owner else None
         heads = manager.num_kv_heads_per_layer
-        if not 0 <= local_layer_id < len(heads):
+        if (
+            local_layer_id is None
+            or not 0 <= local_layer_id < len(heads)
+            or heads[local_layer_id] <= 0
+        ):
             raise ValueError(
-                f"Cannot resolve KV-head count for internal layer {internal_layer_id}: "
-                f"local layer {local_layer_id} is outside the per-layer head list"
+                f"Cannot resolve KV-head count for internal layer {internal_layer_id} "
+                f"(local layer {local_layer_id}); expected a positive per-rank count"
             )
-        num_kv_heads = int(heads[local_layer_id])
-        if num_kv_heads <= 0:
-            raise ValueError(
-                f"Internal layer {internal_layer_id} must have a positive KV-head count, "
-                f"got {num_kv_heads}"
-            )
-        return num_kv_heads
+        per_rank = int(heads[local_layer_id])
+        if manager.layer_specs is not None or isinstance(manager.num_kv_heads, int):
+            return per_rank, None
+        return per_rank, int(manager.num_kv_heads[manager.pp_layers[local_layer_id]])
 
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
@@ -500,12 +506,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 )
             cache_kind = CacheKind.STATE if is_recurrent else CacheKind.PAGED
 
-            # Bucket buffer entries by pool, mapper kind, manager partition
-            # and resolved KV-head count. ``pool_role`` stays
-            # the manager-supplied equivalence label used for peer matching
-            # without enumerating role names. Buffer offsets within a slot
-            # follow ``buffer_ids`` order: the i-th buffer of a coalesced
-            # buffer lives at ``i * single_buffer_size``.
+            # ``pool_role`` stays the manager-supplied equivalence label used
+            # for peer matching without enumerating role names. Buffer offsets
+            # within a slot follow ``buffer_ids`` order: the i-th buffer of a
+            # coalesced buffer lives at ``i * single_buffer_size``.
             pool_views = _build_pool_views_for_variant(
                 variant,
                 role_mapper_kinds,
@@ -533,18 +537,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 )
                 continue
 
-            # The group field describes its first head-sharded view; each
-            # view carries the actual geometry used for transfer.
-            first_local_layer = all_internal_layer_ids[0]
-            num_kv_heads = next(
-                (view.num_kv_heads for view in pool_views if view.num_kv_heads is not None), 0
-            )
-            sliding_window_size = _window_size_for_layer(first_local_layer)
-
             layer_groups_by_id[layer_group_id] = AttentionLayerGroup(
                 pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
-                kv_head_num_per_rank=num_kv_heads,
-                sliding_window_size=sliding_window_size,
+                sliding_window_size=_window_size_for_layer(all_internal_layer_ids[0]),
                 local_layers=local_layers,
                 pool_views=pool_views,
             )

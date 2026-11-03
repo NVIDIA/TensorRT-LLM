@@ -320,12 +320,14 @@ def _get_ctx_seed(
     """Compute random seed for ctx pool initialization.
 
     When num_kv_heads >= tp_size, heads are split across TP ranks -> unique seed per rank.
-    When num_kv_heads < tp_size, heads are replicated -> same seed for all TP ranks in a PP group.
+    When num_kv_heads < tp_size, each head is replicated on tp_size // num_kv_heads TP ranks
+    -> the ranks of a PP group that hold the same head share a seed.
     """
     if num_kv_heads >= tp_size:
         return seed_base + pp_rank * tp_size + tp_rank
     else:
-        return seed_base + pp_rank
+        head = tp_rank * num_kv_heads // tp_size
+        return seed_base + pp_rank + 1000 * head
 
 
 def _create_cache_manager(
@@ -335,9 +337,16 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    layer_kv_heads: Optional[List[int]] = None,
+    layer_head_dims: Optional[List[int]] = None,
 ) -> "KVCacheManagerV2":
-    """Create a KVCacheManagerV2 for the given mapping."""
-    num_kv_heads = 1 if is_mla else NUM_KV_HEADS
+    """Create a KVCacheManagerV2 for the given mapping.
+
+    layer_kv_heads / layer_head_dims give each layer's total KV heads and head_dim,
+    passed as lists the way models with per-layer KV geometry (Gemma4) pass them;
+    None keeps NUM_KV_HEADS (1 for MLA) and HEAD_DIM for every layer.
+    """
+    num_kv_heads = (1 if is_mla else NUM_KV_HEADS) if layer_kv_heads is None else layer_kv_heads
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
     if max_attention_window_vec is None:
@@ -352,7 +361,7 @@ def _create_cache_manager(
         cache_type,
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
-        head_dim=HEAD_DIM,
+        head_dim=HEAD_DIM if layer_head_dims is None else layer_head_dims,
         tokens_per_block=TOKENS_PER_BLOCK,
         max_seq_len=MAX_SEQ_LEN,
         max_batch_size=max_batch_size,
@@ -373,6 +382,8 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     cp_size: int = 1,
+    layer_kv_heads: Optional[List[int]] = None,
+    layer_head_dims: Optional[List[int]] = None,
 ) -> list[KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance.
 
@@ -404,6 +415,8 @@ def _create_managers_for_instance(
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
+                        layer_kv_heads,
+                        layer_head_dims,
                     )
                 )
     return managers
@@ -420,9 +433,15 @@ def _init_pool_data_v2(
     is_mla: bool,
     fill_random: bool = True,
     seed_base: int = 1000,
+    layer_kv_heads: Optional[List[int]] = None,
 ):
-    """Initialize pool data for V2 managers."""
-    num_kv_heads = 1 if is_mla else NUM_KV_HEADS
+    """Initialize pool data for V2 managers.
+
+    Pools are seeded for the largest per-layer KV-head count. A layer with fewer
+    heads replicates each head over more TP ranks, so it is refilled to give every
+    rank that holds one of its heads the same bytes.
+    """
+    num_kv_heads = 1 if is_mla else max(layer_kv_heads or [NUM_KV_HEADS])
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         tp_rank = rank % tp
@@ -455,10 +474,30 @@ def _init_pool_data_v2(
             else:
                 pool_tensor.zero_()
 
+        if not fill_random or layer_kv_heads is None:
+            continue
+        for layer_idx in mgr.layer_offsets:
+            layer_heads = layer_kv_heads[layer_idx]
+            if layer_heads >= min(tp, num_kv_heads):
+                continue
+            layer_tensor = mgr.get_buffers(layer_idx, kv_layout="HND")
+            seed = _get_ctx_seed(tp_rank, pp_rank, tp, layer_heads, seed_base + 100 * layer_idx)
+            generator = torch.Generator(device=layer_tensor.device).manual_seed(seed)
+            layer_tensor.copy_(
+                torch.rand(
+                    layer_tensor.shape,
+                    dtype=layer_tensor.dtype,
+                    device=layer_tensor.device,
+                    generator=generator,
+                )
+            )
 
-def _init_pool_data(managers, tp, is_mla, use_v2, fill_random=True, seed_base=1000):
+
+def _init_pool_data(
+    managers, tp, is_mla, use_v2, fill_random=True, seed_base=1000, layer_kv_heads=None
+):
     """Initialize V2 pool data for every rank."""
-    _init_pool_data_v2(managers, tp, is_mla, fill_random, seed_base)
+    _init_pool_data_v2(managers, tp, is_mla, fill_random, seed_base, layer_kv_heads)
 
 
 # ---------------------------------------------------------------------------
@@ -691,12 +730,15 @@ def _gather_full_layer_data(
     req_idx: int = 0,
     num_layers: int = NUM_LAYERS,
     drop_tail_blocks: int = 0,
+    check_replicas: bool = False,
 ):
     """Gather the full (unsharded) KV data for a layer by concatenating across TP ranks.
 
     Returns tensor of shape [num_blocks, kv_factor, num_kv_heads, tokens_per_block, head_dim]
     (HND layout) where num_kv_heads is the total (not per-rank) count.
-    For replicated heads (MLA), returns data from a single TP rank (all are identical).
+    For replicated heads (num_kv_heads < tp, e.g. MLA), each head comes from the first
+    TP rank that holds it; check_replicas also requires the other ranks holding that
+    head to hold the same bytes.
     """
     pp_rank = _pp_rank_of_layer(layer_idx, num_layers, pp)
     is_replicated = num_kv_heads < tp
@@ -710,11 +752,45 @@ def _gather_full_layer_data(
         )
 
     if is_replicated:
-        # All TP ranks have identical data; take from tp_rank=0
-        rank = pp_rank * tp + 0
-        return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid, drop_tail_blocks
-        )
+        # Each head lives on tp // num_kv_heads consecutive TP ranks.
+        replicas = tp // num_kv_heads
+        head_data = []
+        for owner in range(0, tp, replicas):
+            data = _get_block_data_for_layer(
+                managers[pp_rank * tp + owner],
+                request_id,
+                layer_idx,
+                use_v2,
+                expected_valid,
+                drop_tail_blocks,
+            )
+            if check_replicas:
+                for tp_rank in range(owner + 1, owner + replicas):
+                    replica = _get_block_data_for_layer(
+                        managers[pp_rank * tp + tp_rank],
+                        request_id,
+                        layer_idx,
+                        use_v2,
+                        expected_valid,
+                        drop_tail_blocks,
+                    )
+                    assert (replica is None) == (data is None), (
+                        f"TP ranks {owner} and {tp_rank} disagree on layer {layer_idx} blocks"
+                    )
+                    if data is not None:
+                        torch.testing.assert_close(
+                            replica,
+                            data,
+                            rtol=0,
+                            atol=0,
+                            msg=lambda m: (
+                                f"TP rank {tp_rank} differs from rank {owner} "
+                                f"at layer {layer_idx}: {m}"
+                            ),
+                        )
+            if data is not None:
+                head_data.append(data)
+        return torch.cat(head_data, dim=2) if head_data else None
 
     # Gather from all TP ranks and concat along kv_heads dim.
     # In HND layout the shape is [blocks, kv_factor, heads, tpb, dim],
@@ -777,15 +853,16 @@ def verify_all_requests(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     gen_scratch_tokens: int = 0,
+    layer_kv_heads: Optional[List[int]] = None,
 ):
     """Verify transferred cache data for all requests.
 
     For each request and each global layer, reconstruct the full (unsharded)
     KV data from both ctx and gen sides by gathering across TP ranks, then
     compare.  This correctly handles asymmetric TP/PP configurations.
+    With layer_kv_heads, every rank holding a replicated head is checked too: on ctx
+    this checks the test data, on gen the transfer to every replica.
     """
-    num_kv_heads = 1 if is_mla else NUM_KV_HEADS
-
     # Build layer_to_window_size mapping from ctx_managers
     # Aggregate from all PP ranks since each rank only handles a subset of layers
     layer_to_window = _get_layer_to_window_size(ctx_managers, ctx_tp, ctx_pp, use_v2, num_layers)
@@ -803,6 +880,11 @@ def verify_all_requests(
         ) // TOKENS_PER_BLOCK - prompt_blocks
 
         for layer_idx in range(num_layers):
+            num_kv_heads = (
+                (1 if is_mla else NUM_KV_HEADS)
+                if layer_kv_heads is None
+                else layer_kv_heads[layer_idx]
+            )
             # Compute expected_valid: the number of non-stale blocks that
             # were actually transferred, using the same eviction formula as
             # _create_chunk.  Only compare these blocks in verification.
@@ -825,6 +907,7 @@ def verify_all_requests(
                 req_idx,
                 num_layers,
                 0,  # ctx has no MTP scratch tail
+                check_replicas=layer_kv_heads is not None,
             )
             gen_full = _gather_full_layer_data(
                 gen_managers,
@@ -839,6 +922,7 @@ def verify_all_requests(
                 req_idx,
                 num_layers,
                 gen_scratch_blocks,
+                check_replicas=layer_kv_heads is not None,
             )
 
             if ctx_full is None or gen_full is None:
@@ -987,8 +1071,13 @@ def run_transfer_test(
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
     pipelined_piece_tokens: Optional[int] = None,
+    layer_kv_heads: Optional[List[int]] = None,
+    layer_head_dims: Optional[List[int]] = None,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    layer_kv_heads / layer_head_dims set each layer's total KV heads and head_dim
+    (see _create_cache_manager) on both instances.
 
     pipelined_piece_tokens enables enable_pipelined_transfer: the context sends each prompt in
     pieces of that many tokens instead of whole.
@@ -1027,6 +1116,8 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        layer_kv_heads=layer_kv_heads,
+        layer_head_dims=layer_head_dims,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -1038,10 +1129,20 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         cp_size=gen_cp,
+        layer_kv_heads=layer_kv_heads,
+        layer_head_dims=layer_head_dims,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
-    _init_pool_data(ctx_managers, ctx_tp, is_mla, use_v2, fill_random=True, seed_base=1000)
+    _init_pool_data(
+        ctx_managers,
+        ctx_tp,
+        is_mla,
+        use_v2,
+        fill_random=True,
+        seed_base=1000,
+        layer_kv_heads=layer_kv_heads,
+    )
     # Gen pools start zeroed; gen_cp folds into the TP stride so per-rank pool
     # seeding stays a no-op (fill_random=False ignores the seed anyway).
     _init_pool_data(gen_managers, gen_tp * gen_cp, is_mla, use_v2, fill_random=False)
@@ -1236,6 +1337,7 @@ def run_transfer_test(
                 max_attention_window_vec=max_attention_window_vec,
                 num_layers=num_layers,
                 gen_scratch_tokens=gen_scratch_tokens,
+                layer_kv_heads=layer_kv_heads,
             )
 
         # Programmatic bounce check (no log parsing): every agent must have the C++
@@ -1444,6 +1546,64 @@ def test_cache_transceiver(
         use_v2=use_v2,
         max_attention_window_vec=max_attention_window_vec,
         gen_scratch_tokens=gen_scratch_tokens,
+    )
+
+    print("PASSED")
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,gen_tp",
+    [(2, 2), (2, 4), (4, 2), (4, 4)],
+    ids=["tp2", "tp2_to_tp4", "tp4_to_tp2", "tp4"],
+)
+@pytest.mark.parametrize(
+    "layer_kv_heads,layer_head_dims,max_attention_window_vec",
+    [
+        # Head counts differ, head_dim does not (e.g. variable GQA). At TP4 both
+        # layer kinds hold one head per rank in one pool, and the 2-head layers
+        # replicate each head over two ranks.
+        pytest.param([4, 4, 2, 2], None, None, id="heads-no_window"),
+        # Head counts and head_dim differ (Gemma4): sliding layers 4 x 128 and
+        # full layers 1 x 256, starting from a sliding layer as Gemma4 does.
+        pytest.param([4, 1, 4, 1], [128, 256, 128, 256], None, id="heads_and_dims-no_window"),
+        # With ctx at TP2 both layer types hold 256 elements per token, so their
+        # layer groups may share slots: the full-layer refill then also writes
+        # the sliding layers, and ctx ranks hold identical sliding data. Reading
+        # the wrong ctx rank goes unnoticed there; heads_and_dims-no_window
+        # covers it.
+        pytest.param(
+            [4, 1, 4, 1], [128, 256, 128, 256], [24, MAX_SEQ_LEN], id="heads_and_dims-vswa"
+        ),
+    ],
+)
+def test_cache_transceiver_per_layer_kv_heads(
+    ctx_tp, gen_tp, layer_kv_heads, layer_head_dims, max_attention_window_vec
+):
+    """Transfer layers whose KV-head counts (and head_dim) differ.
+
+    Each layer's heads are sharded or replicated over TP by its own count, so
+    the full layer gathered on both sides must match, and every generation rank
+    that holds a replicated head must hold the same copy.
+    """
+    print(
+        f"\nRunning per-layer KV-head transfer test: ctx_tp={ctx_tp} gen_tp={gen_tp} "
+        f"heads={layer_kv_heads} head_dims={layer_head_dims} "
+        f"window={max_attention_window_vec}"
+    )
+
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=False,
+        use_v2=True,
+        max_attention_window_vec=max_attention_window_vec,
+        layer_kv_heads=layer_kv_heads,
+        layer_head_dims=layer_head_dims,
     )
 
     print("PASSED")

@@ -16,6 +16,7 @@ import math
 import os
 import sys
 from collections import OrderedDict, defaultdict, deque
+from collections.abc import Hashable
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import (
@@ -4265,25 +4266,20 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return frozenset()
 
-    def get_disagg_pool_view_partition(
-        self, layer_id: LayerId, role: DataRole
-    ) -> tuple[str, int] | None:
-        """Keep different owners and KV-head counts in separate transfer views.
+    def get_disagg_pool_view_partition(self, layer_id: LayerId, role: DataRole) -> Hashable | None:
+        """Opaque bucket key that keeps buffers in separate transfer views.
 
-        Layers may share a physical pool when their buffers have equal byte
-        sizes, even if their head counts differ within the same model.
+        With explicit layer specs (target and draft layers in one manager),
+        each owner gets views of its own. The specs carry per-rank KV-head
+        counts only, and a target and a draft layer class can share a per-rank
+        count at one TP size but not at another; splitting by owner keeps both
+        peers' view splits identical. Without layer specs this returns None
+        and legacy draft layers share target views; the page-table builder
+        splits head-sharded views by KV-head counts either way.
         """
-        layer_specs = getattr(self, "layer_specs", None)
-        if layer_specs is None:
-            # Virtual storage IDs may not index the model-layer head list.
-            local_layer_id = int(layer_id)
-            if hasattr(self, "_layer_attn_to_layer_id") or not (
-                0 <= local_layer_id < len(self.num_kv_heads_per_layer)
-            ):
-                return None
-            return KVCacheLayerOwner.TARGET.value, self.num_kv_heads_per_layer[local_layer_id]
-        layer = layer_specs[int(layer_id)]
-        return layer.owner.value, layer.num_kv_heads
+        if self.layer_specs is None:
+            return None
+        return self.layer_specs[int(layer_id)].owner
 
     def get_layer_cache_spec(self, global_layer_id: int) -> KVCacheLayerSpec:
         """Return an explicitly supplied rank-local layer specification."""
