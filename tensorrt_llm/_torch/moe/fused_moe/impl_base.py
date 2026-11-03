@@ -327,6 +327,15 @@ class MoEImplBase(
         """
         return 0
 
+    def allow_die_major_weights(self) -> bool:
+        """Let the backend place its expert weights die-major (each locality domain homes one
+        half of every expert) on a device with two locality domains; returns whether it may.
+
+        Called once, at construction, by a model whose MoE layers opt in. Declining (False, the
+        default) keeps the loaded layout; overriding this is how a backend opts in.
+        """
+        return False
+
     def try_route_with_sort(
         self, router_logits: "torch.Tensor"
     ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":

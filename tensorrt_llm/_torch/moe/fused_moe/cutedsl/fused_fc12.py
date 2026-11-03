@@ -30,10 +30,11 @@ all-to-all) run the small-batch kernel
 (``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin``) instead: FC1, SiTU, NVFP4
 requantization, FC2 and the combine in one persistent grid on the same weights
 and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices. When
-the device has two locality domains and the weights stay where they are loaded
-(no EPLB, no DWDP), ``post_load_weights`` places the expert weights die-major
-(each domain homes one half of every expert); both kernels read them and claim
-their work per domain.
+the model opts in (``allow_die_major_weights``), the device has two locality
+domains and the weights stay where they are loaded (no EPLB, no DWDP),
+``post_load_weights`` places the expert weights die-major (each domain homes
+one half of every expert); both kernels read them and claim their work per
+domain.
 """
 
 import torch
@@ -106,6 +107,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ConfigurableMoE reads this off the backend type: the fused kernel takes
     # per-tile expert ranges, so EP need not divide the expert count.
     _supports_non_divisible_ep: bool = True
+    # Set by allow_die_major_weights (a model's opt-in at construction).
+    _die_major_allowed: bool = False
 
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "nvfp4"),
@@ -296,6 +299,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self._concurrent_sm_reserve = num_sms
         return num_sms
 
+    def allow_die_major_weights(self) -> bool:
+        """Both kernels read die-major weights; ``post_load_weights`` places them where
+        ``_die_major_applies``."""
+        self._die_major_allowed = True
+        return True
+
     def consumes_sort_tables(self) -> bool:
         """``run_moe_nvfp4`` runs on the routing kernel's tables when they match
         the tuned tile; not with a slot remap."""
@@ -321,11 +330,12 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.weights_die_major = False
 
     def _die_major_applies(self) -> bool:
-        """Die-major weights need two locality domains, halves of whole 128-row blocks (the FC12
-        tactics then keep to N tiles that divide a half) and weights that stay where they are
-        loaded (no EPLB, no DWDP)."""
+        """Die-major weights need the model's opt-in, two locality domains, halves of whole
+        128-row blocks (the FC12 tactics then keep to N tiles that divide a half) and weights that
+        stay where they are loaded (no EPLB, no DWDP)."""
         return (
-            (2 * self.intermediate_size_per_partition) % 256 == 0
+            self._die_major_allowed
+            and (2 * self.intermediate_size_per_partition) % 256 == 0
             and self.hidden_size % 256 == 0
             and not self._using_load_balancer()
             and getattr(self, "dwdp_handle_collector", None) is None

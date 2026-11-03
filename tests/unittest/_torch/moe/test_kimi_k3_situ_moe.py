@@ -2328,10 +2328,11 @@ def test_cutedsl_fc12_small_batch_matches_fc12_kernel(num_tokens):
 
 
 @nvfp4_moe_supported
-def test_cutedsl_fc12_die_major_weights(monkeypatch):
-    """Die-major placement on a two-domain device: the expert parameters keep their shapes, and
-    the small-batch kernel (8 tokens) and the FC12 kernel (64 tokens) read them: the same NVFP4
-    MoE as on the default placement. Without two locality domains the placement is not taken."""
+def test_cutedsl_fc12_die_major_weights():
+    """Die-major placement on a two-domain device: a MoE whose model did not opt in keeps the
+    default layout; after the opt-in (``allow_die_major_weights``, what Kimi K3 calls at
+    construction) the expert parameters keep their shapes, and the small-batch kernel (8 tokens)
+    and the FC12 kernel (64 tokens) read them: the same NVFP4 MoE as on the default placement."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 
@@ -2356,9 +2357,9 @@ def test_cutedsl_fc12_die_major_weights(monkeypatch):
     moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
     _stream_nvfp4_bank(moe, bank)
     moe.backend._weights_transformed = False
-    monkeypatch.setenv("DISABLE_LOCALITY_DOMAINS", "1")
     moe.post_load_weights()
     backend = moe.backend
+    # no opt-in: main's layout on a two-domain device
     assert not backend._die_major_applies() and not backend.weights_die_major
 
     inputs = {n: (x[:n], gate.compute_logits(x[:n])) for n in (8, 64)}
@@ -2366,8 +2367,8 @@ def test_cutedsl_fc12_die_major_weights(monkeypatch):
         n: moe.forward(xs, logits, all_rank_num_tokens=None).float()
         for n, (xs, logits) in inputs.items()
     }
-    monkeypatch.delenv("DISABLE_LOCALITY_DOMAINS")
     shapes = [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)]
+    assert backend.allow_die_major_weights()
     assert backend._die_major_applies()
     backend._place_weights_die_major()
     assert backend.weights_die_major
@@ -2376,6 +2377,19 @@ def test_cutedsl_fc12_die_major_weights(monkeypatch):
         die_major = moe.forward(xs, logits, all_rank_num_tokens=None).float()
         rel = (die_major - default[n]).norm() / default[n].norm().clamp_min(1e-30)
         assert rel < 1e-2, f"{n} tokens: relative difference to the default placement {rel:.3e}"
+
+
+def test_die_major_weights_need_the_model_opt_in():
+    """Die-major placement is a model's opt-in: backends decline by default, and the FC12
+    backend places nothing before ``allow_die_major_weights`` was called (on any device)."""
+    from tensorrt_llm._torch.moe.fused_moe import MoEImplBase
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl
+
+    assert MoEImplBase.allow_die_major_weights(None) is False
+    backend = object.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
+    assert not backend._die_major_applies()
+    assert backend.allow_die_major_weights() is True
+    assert backend._die_major_allowed
 
 
 def test_fp8_block_scaled_dequantization():

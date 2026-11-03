@@ -146,7 +146,13 @@ from ..modules.projection_capabilities import (
 )
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
-from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
+from ..moe.fused_moe import (
+    ConfigurableMoE,
+    MoEImplBase,
+    SiTuActivation,
+    TRTLLMGenFusedMoE,
+    create_moe,
+)
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
@@ -1790,6 +1796,10 @@ class KimiK3MoERuntime(nn.Module):
             if reserve_sms is not None and not self._defer_shared_allreduce
             else 0
         )
+        # Kimi K3's routed experts may be placed die-major on a two-domain device (the backend
+        # decides at load).
+        if isinstance(self.routed_experts.backend, MoEImplBase):
+            self.routed_experts.backend.allow_die_major_weights()
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
