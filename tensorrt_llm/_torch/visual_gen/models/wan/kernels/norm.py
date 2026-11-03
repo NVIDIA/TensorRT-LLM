@@ -338,9 +338,115 @@ class VaeNormKernel:
         eps: Float32,
     ):
         p = self.p
-        v = p.v
-
         c = _Ctx()
+        self._global_views(
+            c,
+            x_ptr,
+            m_ptr,
+            d_ptr,
+            residual_ptr,
+            cache_ptr,
+            sum_ptr,
+            y_tail_ptr,
+            y_ptr,
+            halo_l_ptr,
+            halo_r_ptr,
+        )
+        self._channel_tables(c, gamma_ptr, bias_ptr, in_bias_ptr, scale)
+        self._frame_geometry(
+            c,
+            positions,
+            frames,
+            height,
+            width,
+            pad_h,
+            pad_w,
+            in_w,
+            in_off,
+            out_w,
+            out_off,
+            in_frame,
+            out_frame,
+            comp_vecs,
+            in_comp_vecs,
+            scale,
+        )
+        self._halo_geometry(
+            c,
+            halo_frame_l,
+            halo_frame_r,
+            halo_comp_l,
+            halo_comp_r,
+            halo_step_l,
+            halo_step_r,
+            halo_axis,
+            has_l,
+            has_r,
+        )
+        self._register_buffers(c)
+
+        prefetched = cutlass.Boolean(False)
+        src_in = Int64(0)
+        src_res = Int64(0)
+
+        bid, _, _ = cute.arch.block_idx()
+        out_pos = Int32(bid) * p.positions_per_block + c.pos_in_block
+        while out_pos < c.positions_out:
+            pos = self._source_pos(c, out_pos)
+            pos_src = self._in_index(c, pos)
+            pos_out = self._out_index(c, out_pos)
+            halo = self._halo_targets(c, pos)
+
+            is_pad = cutlass.Boolean(False)
+            if cutlass.const_expr(p.v.padded):
+                is_pad = pos < 0
+            if is_pad:
+                self._store_pad_rows(c, out_pos)
+                prefetched = cutlass.Boolean(False)
+            else:
+                src_in, src_res = self._begin_position(
+                    c, pos, pos_src, cache_frames, prefetched, src_in, src_res
+                )
+                prefetched = cutlass.Boolean(False)
+                for t0 in cutlass.range(0, frames, p.order):
+                    for j in cutlass.range_constexpr(p.order):
+                        src_in, src_res, prefetched = self._frame_step(
+                            c,
+                            j,
+                            t0,
+                            pos,
+                            pos_src,
+                            out_pos,
+                            pos_out,
+                            halo,
+                            eps,
+                            src_in,
+                            src_res,
+                            prefetched,
+                        )
+                if cutlass.const_expr(p.winograd_out):
+                    self._store_cache_tail(c, pos)
+            out_pos = out_pos + c.position_stride
+
+    # ------------------------------------------------------------------ kernel setup
+    # Plain helpers: they only build views and copy launch arguments into ``c`` (compile-time
+    # branches only), so they inline at no cost.
+
+    def _global_views(
+        self,
+        c,
+        x_ptr,
+        m_ptr,
+        d_ptr,
+        residual_ptr,
+        cache_ptr,
+        sum_ptr,
+        y_tail_ptr,
+        y_ptr,
+        halo_l_ptr,
+        halo_r_ptr,
+    ):
+        """The global buffers as 16-byte vector views (``g*``) or packed-pair views (``u*``)."""
         c.gx = vec_view(x_ptr)
         c.gm = vec_view(m_ptr)
         c.gres = vec_view(residual_ptr)
@@ -351,6 +457,12 @@ class VaeNormKernel:
         c.uy = u32_view(y_ptr)
         c.uhl = u32_view(halo_l_ptr)
         c.uhr = u32_view(halo_r_ptr)
+
+    def _channel_tables(self, c, gamma_ptr, bias_ptr, in_bias_ptr, scale):
+        """Fill the per-channel tables (gamma, bias, input bias) into shared memory, set this
+        thread's position in its block, and keep the tables in registers when every lane owns
+        one vector."""
+        p = self.p
         g_gamma = cute.make_tensor(gamma_ptr, cute.make_layout((p.channels,)))
         g_bias = cute.make_tensor(bias_ptr, cute.make_layout((p.channels,)))
         g_in_bias = cute.make_tensor(in_bias_ptr, cute.make_layout((p.channels,)))
@@ -365,8 +477,6 @@ class VaeNormKernel:
         c.uhist = u32_view(cute.recast_ptr(smem_f + 3 * p.channels, dtype=p.row_dtype))
 
         tid, _, _ = cute.arch.thread_idx()
-        bid, _, _ = cute.arch.block_idx()
-        gdim, _, _ = cute.arch.grid_dim()
         tid = Int32(tid)
         lane = tid % 32
         warp = tid // 32
@@ -383,6 +493,29 @@ class VaeNormKernel:
                 self._table_vec(c, table, 0, c.lane_in_group) for table in (_GAMMA, _BIAS, _IN_BIAS)
             ]
 
+    def _frame_geometry(
+        self,
+        c,
+        positions,
+        frames,
+        height,
+        width,
+        pad_h,
+        pad_w,
+        in_w,
+        in_off,
+        out_w,
+        out_off,
+        in_frame,
+        out_frame,
+        comp_vecs,
+        in_comp_vecs,
+        scale,
+    ):
+        """Frame sizes, the input/output position maps and frame strides, and the grid stride
+        of the position walk."""
+        p = self.p
+        v = p.v
         c.positions = positions
         c.frames = frames
         c.height = height
@@ -395,15 +528,6 @@ class VaeNormKernel:
         c.scale = scale
         c.comp_vecs = comp_vecs
         c.in_comp_vecs = in_comp_vecs
-        c.halo_frame_l = halo_frame_l
-        c.halo_frame_r = halo_frame_r
-        c.halo_comp_l = halo_comp_l
-        c.halo_comp_r = halo_comp_r
-        c.halo_step_l = halo_step_l
-        c.halo_step_r = halo_step_r
-        c.halo_axis = halo_axis
-        c.has_l = has_l
-        c.has_r = has_r
         positions_out = positions
         if cutlass.const_expr(v.padded):
             positions_out = (height + pad_h) * c.out_row_width
@@ -415,112 +539,134 @@ class VaeNormKernel:
         if cutlass.const_expr(v.out_map):
             out_frame_pos = out_frame
         c.out_frame_pos = out_frame_pos
-        position_stride = Int32(gdim) * p.positions_per_block
-        c.position_stride = position_stride
+        gdim, _, _ = cute.arch.grid_dim()
+        c.position_stride = Int32(gdim) * p.positions_per_block
 
-        # Register buffers: three input slices (inputs x terms) and their residual slices. The
-        # row being normalized travels between the passes as packed bf16 pairs.
+    def _halo_geometry(
+        self,
+        c,
+        halo_frame_l,
+        halo_frame_r,
+        halo_comp_l,
+        halo_comp_r,
+        halo_step_l,
+        halo_step_r,
+        halo_axis,
+        has_l,
+        has_r,
+    ):
+        """Where the left / right neighbours' halo lines go (spatially sharded decode)."""
+        c.halo_frame_l = halo_frame_l
+        c.halo_frame_r = halo_frame_r
+        c.halo_comp_l = halo_comp_l
+        c.halo_comp_r = halo_comp_r
+        c.halo_step_l = halo_step_l
+        c.halo_step_r = halo_step_r
+        c.halo_axis = halo_axis
+        c.has_l = has_l
+        c.has_r = has_r
+
+    def _register_buffers(self, c):
+        """Three input slices (inputs x terms) and their residual slices; the row being
+        normalized travels between the passes as packed bf16 pairs."""
+        p = self.p
         c.in_buf = [
             cute.make_rmem_tensor((CHANNELS_PER_VECTOR, p.max_terms), p.in_dtype) for _ in range(3)
         ]
         c.res_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), p.row_dtype) for _ in range(3)]
 
-        prefetched = cutlass.Boolean(False)
-        src_in = Int64(0)
-        src_res = Int64(0)
+    # ------------------------------------------------------------------ the position walk
 
-        out_pos = Int32(bid) * p.positions_per_block + c.pos_in_block
-        while out_pos < positions_out:
-            pos = self._source_pos(c, out_pos)
-            pos_src = self._in_index(c, pos)
-            pos_out = self._out_index(c, out_pos)
-            halo = self._halo_targets(c, pos)
+    @cute.jit
+    def _begin_position(self, c, pos, pos_src, cache_frames, prefetched, src_in, src_res):
+        """Start position ``pos``: load the causal cache into the frame ring (Winograd output)
+        and, unless the previous position already prefetched it, the first frame's input rows.
+        Returns the input / residual row indices of the first frame."""
+        p = self.p
+        if cutlass.const_expr(p.winograd_out):
+            self._load_cache_into_ring(c, pos, cache_frames)
+        # An empty then-branch instead of ``if not prefetched``: ``not`` on a dynamic Boolean
+        # emits an extra negation in front of the branch.
+        if prefetched:
+            pass
+        else:
+            src_in, src_res = self._input_rows(c, Int32(0), pos, pos_src)
+            if cutlass.const_expr(p.next_frame_prefetched):
+                self._load_frame_start(c, 0, 0, src_in, src_res)
+        return src_in, src_res
 
-            is_pad = cutlass.Boolean(False)
-            if cutlass.const_expr(v.padded):
-                is_pad = pos < 0
-            if is_pad:
-                self._store_pad_rows(c, out_pos)
-                prefetched = cutlass.Boolean(False)
+    @cute.jit
+    def _frame_step(
+        self,
+        c,
+        j: cutlass.Constexpr,
+        t0,
+        pos,
+        pos_src,
+        out_pos,
+        pos_out,
+        halo,
+        eps,
+        src_in,
+        src_res,
+        prefetched,
+    ):
+        """Frame ``t0 + j`` of position ``pos``: prefetch the next frame's first slices, pass 1
+        (input, bias, residual, sum of squares), the RMS scale and pass 2 (normalize, outputs),
+        then hand the next frame's rows over. Returns ``(src_in, src_res, prefetched)`` for
+        the next frame (``prefetched``: the next position's first frame is already loaded)."""
+        p = self.p
+        v = p.v
+        t = t0 + j
+        lane_opaque = _opaque(c.lane_in_group)
+        nxt = self._next_position(c, t, pos, pos_src, out_pos)
+        next_in_pos, has_next = nxt[0], nxt[1]
+        next_src_in = Int64(0)
+        next_src_res = Int64(0)
+
+        if cutlass.const_expr(p.one_vector_per_lane):
+            # The next frame's single slice goes to buffer 1 and moves to buffer 0 once this
+            # frame is done.
+            next_src_in, next_src_res = self._prefetch_next_frame(
+                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
+            )
+        elif cutlass.const_expr(not p.cross_frame_prefetch):
+            self._load_slice(c, j, 0, src_in, src_res, 0)
+
+        sum_sq = Float32(0.0)
+        orow = Int64(t) * c.out_frame_pos + pos_out
+        srow = Int64(t) * c.positions + pos
+        sum_sq, row_words = self._pass1_frame(
+            c, j, src_in, src_res, sum_sq, orow, srow, lane_opaque
+        )
+
+        if cutlass.const_expr(p.cross_frame_prefetch):
+            next_src_in, next_src_res = self._prefetch_next_frame(
+                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
+            )
+
+        if cutlass.const_expr(v.mid != MID_NONE):
+            denom, inv_denom = self._rms_scale(sum_sq, eps)
+            self._pass2_frame(
+                c, j, t, t0, pos_out, orow, row_words, denom, inv_denom, lane_opaque, halo
+            )
+
+        if cutlass.const_expr(p.next_frame_prefetched):
+            src_in = next_src_in
+            src_res = next_src_res
+            if cutlass.const_expr(p.one_vector_per_lane):
+                if has_next:
+                    c.in_buf[0].store(c.in_buf[1].load())
+                    if cutlass.const_expr(v.has_residual):
+                        c.res_buf[0].store(c.res_buf[1].load())
+            if next_in_pos:
+                pass
             else:
-                if cutlass.const_expr(p.winograd_out):
-                    self._load_cache_into_ring(c, pos, cache_frames)
-
-                # An empty then-branch instead of ``if not prefetched``: ``not`` on a dynamic
-                # Boolean emits an extra negation in front of the branch.
-                if prefetched:
-                    pass
-                else:
-                    src_in, src_res = self._input_rows(c, Int32(0), pos, pos_src)
-                    if cutlass.const_expr(p.next_frame_prefetched):
-                        self._load_frame_start(c, 0, 0, src_in, src_res)
-                prefetched = cutlass.Boolean(False)
-
-                for t0 in cutlass.range(0, frames, p.order):
-                    for j in cutlass.range_constexpr(p.order):
-                        t = t0 + j
-                        lane_opaque = _opaque(c.lane_in_group)
-                        nxt = self._next_position(c, t, pos, pos_src, out_pos)
-                        next_in_pos, has_next = nxt[0], nxt[1]
-                        next_src_in = Int64(0)
-                        next_src_res = Int64(0)
-
-                        if cutlass.const_expr(p.one_vector_per_lane):
-                            # The next frame's single slice goes to buffer 1 and moves to
-                            # buffer 0 once this frame is done.
-                            next_src_in, next_src_res = self._prefetch_next_frame(
-                                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
-                            )
-                        elif cutlass.const_expr(not p.cross_frame_prefetch):
-                            self._load_slice(c, j, 0, src_in, src_res, 0)
-
-                        sum_sq = Float32(0.0)
-                        orow = Int64(t) * out_frame_pos + pos_out
-                        srow = Int64(t) * positions + pos
-                        sum_sq, row_words = self._pass1_frame(
-                            c, j, src_in, src_res, sum_sq, orow, srow, lane_opaque
-                        )
-
-                        if cutlass.const_expr(p.cross_frame_prefetch):
-                            next_src_in, next_src_res = self._prefetch_next_frame(
-                                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
-                            )
-
-                        if cutlass.const_expr(v.mid != MID_NONE):
-                            denom, inv_denom = self._rms_scale(sum_sq, eps)
-                            self._pass2_frame(
-                                c,
-                                j,
-                                t,
-                                t0,
-                                pos_out,
-                                orow,
-                                row_words,
-                                denom,
-                                inv_denom,
-                                lane_opaque,
-                                halo,
-                            )
-
-                        if cutlass.const_expr(p.next_frame_prefetched):
-                            src_in = next_src_in
-                            src_res = next_src_res
-                            if cutlass.const_expr(p.one_vector_per_lane):
-                                if has_next:
-                                    c.in_buf[0].store(c.in_buf[1].load())
-                                    if cutlass.const_expr(v.has_residual):
-                                        c.res_buf[0].store(c.res_buf[1].load())
-                            if next_in_pos:
-                                pass
-                            else:
-                                prefetched = has_next
-                        else:
-                            if next_in_pos:
-                                src_in, src_res = self._input_rows(c, t + 1, pos, pos_src)
-
-                if cutlass.const_expr(p.winograd_out):
-                    self._store_cache_tail(c, pos)
-            out_pos = out_pos + position_stride
+                prefetched = has_next
+        else:
+            if next_in_pos:
+                src_in, src_res = self._input_rows(c, t + 1, pos, pos_src)
+        return src_in, src_res, prefetched
 
     # ------------------------------------------------------------------ trace-time helpers
     # Everything a helper reads comes in through ``c`` or its arguments (a staged loop may not

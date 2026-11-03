@@ -74,6 +74,22 @@ FILTER_TILE = 16  # filter-transform block: 16 Cout x 16 Cin
 FILTER_THREADS = FILTER_TILE * FILTER_TILE
 
 
+@cute.struct
+class _Barriers:
+    """Shared memory of the pipeline mbarriers and the TMEM allocator."""
+
+    u_mbar: cute.struct.MemRange[cutlass.Int64, NUM_U_STAGE * 2]
+    v_mbar: cute.struct.MemRange[cutlass.Int64, NUM_V_STAGE * 2]
+    x_mbar: cute.struct.MemRange[cutlass.Int64, NUM_RAW_STAGE * 2]
+    acc_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    acc_b_free_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    acc_a_final_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    pass0_lo_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    pass0_hi_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+    tmem_dealloc_mbar: cutlass.Int64
+    tmem_holding_buf: cutlass.Int32
+
+
 def supports(cin: int, cout: int, h: int, w: int) -> bool:
     """Shapes the fused conv covers: 256 output channels, at least two 32-channel input chunks
     (the MMA schedule peels a first and a last chunk per pass), ``h`` a multiple of 8 and ``w``
@@ -470,49 +486,18 @@ class Wino23Conv:
         bidx, _, bidz = cute.arch.block_idx()
         cta_v = bidx % 2
         is_leader = cta_v == 0
-        slot = bidz
-        cta_in_slot = bidx
+        slot, cta_in_slot = bidz, bidx
 
-        if warp_idx == self.utma_warp:
-            cpasync.prefetch_descriptor(tma_atom_u)
-            cpasync.prefetch_descriptor(tma_atom_u_half)
-        if warp_idx == self.xtma_warp:
-            cpasync.prefetch_descriptor(tma_atom_x)
-        if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_y)
-
-        @cute.struct
-        class SharedStorage:
-            u_mbar: cute.struct.MemRange[cutlass.Int64, NUM_U_STAGE * 2]
-            v_mbar: cute.struct.MemRange[cutlass.Int64, NUM_V_STAGE * 2]
-            x_mbar: cute.struct.MemRange[cutlass.Int64, NUM_RAW_STAGE * 2]
-            acc_mbar: cute.struct.MemRange[cutlass.Int64, 2]
-            acc_b_free_mbar: cute.struct.MemRange[cutlass.Int64, 2]
-            acc_a_final_mbar: cute.struct.MemRange[cutlass.Int64, 2]
-            pass0_lo_mbar: cute.struct.MemRange[cutlass.Int64, 2]
-            pass0_hi_mbar: cute.struct.MemRange[cutlass.Int64, 2]
-            tmem_dealloc_mbar: cutlass.Int64
-            tmem_holding_buf: cutlass.Int32
-
+        self._prefetch_descriptors(warp_idx, tma_atom_u, tma_atom_u_half, tma_atom_x, tma_atom_y)
         smem = utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
+        storage = smem.allocate(_Barriers)
         sync = self._make_pipelines(storage, cluster_layout_vmnk, u_bytes)
-
         pipeline_init_arrive(cluster_shape_mn=(2 * pairs_per_cluster, 1), is_relaxed=True)
 
         sU, sU_h, sRaw, sV, sEpi = self._alloc_smem(
             smem, b_layout, b_layout_h, raw_layout, epi_layout
         )
-
-        # MMA fragments
-        tCrB = tiled_mma.make_fragment_B(sU)  # (MMA, 1, 2, STAGE)
-        tCrBh = tiled_mma_h.make_fragment_B(sU_h)  # (MMA, 1, 2, 2 * STAGE)
-        acc_shape = tiled_mma.partition_shape_C((2 * MT, NCO))
-        acc_layout_frag = tiled_mma.make_fragment_C(cute.append(acc_shape, NACC))
-        # half-N accumulators: A_lo, A_hi, B_lo, B_hi (128 columns each)
-        acc_shape_h = tiled_mma_h.partition_shape_C((2 * MT, NCO // 2))
-        acc_h_layout_frag = tiled_mma_h.make_fragment_C(cute.append(acc_shape_h, 2 * NACC))
-
+        frags = self._mma_fragments(tiled_mma, tiled_mma_h, sU, sU_h)
         u_loads, u_half_loads, u_mcast_mask = self._partition_u(
             tiled_mma,
             tiled_mma_h,
@@ -521,14 +506,11 @@ class Wino23Conv:
             (tma_atom_u, mU, sU),
             (tma_atom_u_half, mU_half, sU_h),
         )
-
         pipeline_init_wait(cluster_shape_mn=(2 * pairs_per_cluster, 1))
 
         if warp_idx == self.spare_warp:
             cute.arch.setmaxregister_decrease(56)
-
         rot = slot % self.nkc
-
         if warp_idx == self.utma_warp:
             self._u_producer(sync.u, u_loads, u_half_loads, u_mcast_mask, slot, rot)
         if warp_idx == self.xtma_warp:
@@ -536,27 +518,66 @@ class Wino23Conv:
         if warp_idx >= self.tr_warp0 and warp_idx < self.tr_warp0 + self.num_tr_warps:
             self._transform_warps(sync.x, sync.v, sRaw, sV, tidx, slot)
         if warp_idx == self.mma_warp:
-            self._mma_warp(
-                sync,
-                tiled_mma,
-                tiled_mma_h,
-                tCrB,
-                tCrBh,
-                acc_layout_frag,
-                acc_h_layout_frag,
-                a_layout,
-                sV,
-                is_leader,
-                slot,
-            )
+            self._mma_warp(sync, tiled_mma, tiled_mma_h, frags, a_layout, sV, is_leader, slot)
         if warp_idx < self.num_epi_warps:
-            self._epilogue(
-                sync, acc_layout_frag, tma_atom_y, mY, sEpi, warp_idx, tidx, slot, cta_in_slot
-            )
+            self._epilogue(sync, frags[2], tma_atom_y, mY, sEpi, warp_idx, tidx, slot, cta_in_slot)
 
     # ---------------------------------------------------------------- CTA setup
 
+    @cute.jit
+    def _prefetch_descriptors(self, warp_idx, tma_atom_u, tma_atom_u_half, tma_atom_x, tma_atom_y):
+        """Each TMA descriptor is prefetched by the warp that issues its copies."""
+        if warp_idx == self.utma_warp:
+            cpasync.prefetch_descriptor(tma_atom_u)
+            cpasync.prefetch_descriptor(tma_atom_u_half)
+        if warp_idx == self.xtma_warp:
+            cpasync.prefetch_descriptor(tma_atom_x)
+        if warp_idx == 0:
+            cpasync.prefetch_descriptor(tma_atom_y)
+
+    @staticmethod
+    def _mma_fragments(tiled_mma, tiled_mma_h, sU, sU_h):
+        """U (B operand) fragments of the N = 256 and N = 128 MMAs, and the accumulator
+        fragments: A, B (N = 256) and A_lo, A_hi, B_lo, B_hi (N = 128)."""
+        tCrB = tiled_mma.make_fragment_B(sU)  # (MMA, 1, 2, STAGE)
+        tCrBh = tiled_mma_h.make_fragment_B(sU_h)  # (MMA, 1, 2, 2 * STAGE)
+        acc_shape = tiled_mma.partition_shape_C((2 * MT, NCO))
+        acc_layout_frag = tiled_mma.make_fragment_C(cute.append(acc_shape, NACC))
+        acc_shape_h = tiled_mma_h.partition_shape_C((2 * MT, NCO // 2))
+        acc_h_layout_frag = tiled_mma_h.make_fragment_C(cute.append(acc_shape_h, 2 * NACC))
+        return tCrB, tCrBh, acc_layout_frag, acc_h_layout_frag
+
     def _make_pipelines(self, storage, cluster_layout_vmnk, u_bytes):
+        u_pipe, v_pipe, x_pipe = self._make_operand_pipelines(storage, cluster_layout_vmnk, u_bytes)
+        pass0_lo_pipe, pass0_hi_pipe, acc_pipe, acc_b_free_pipe, acc_a_final_pipe = (
+            self._make_acc_pipelines(storage, cluster_layout_vmnk)
+        )
+        tmem_alloc_barrier = pipeline.NamedBarrier(
+            barrier_id=1, num_threads=32 * (self.num_epi_warps + 1)
+        )
+        tmem = utils.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=0,
+            is_two_cta=True,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+        )
+        epi_all_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * self.num_epi_warps)
+        return _Sync(
+            u=u_pipe,
+            v=v_pipe,
+            x=x_pipe,
+            pass0_lo=pass0_lo_pipe,
+            pass0_hi=pass0_hi_pipe,
+            acc=acc_pipe,
+            acc_b_free=acc_b_free_pipe,
+            acc_a_final=acc_a_final_pipe,
+            tmem=tmem,
+            epi_all=epi_all_barrier,
+        )
+
+    def _make_operand_pipelines(self, storage, cluster_layout_vmnk, u_bytes):
+        """U, V and raw x pipelines."""
         u_pipe = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.u_mbar.data_ptr(),
             num_stages=NUM_U_STAGE,
@@ -583,6 +604,10 @@ class Wino23Conv:
             tx_count=RAW_BYTES,
             defer_sync=True,
         )
+        return u_pipe, v_pipe, x_pipe
+
+    def _make_acc_pipelines(self, storage, cluster_layout_vmnk):
+        """MMA <-> epilogue accumulator pipelines: pass-0 lo / hi, acc, acc_b_free, acc_a_final."""
         pass0_lo_pipe = self._umma_to_epilogue(
             storage.pass0_lo_mbar, cluster_layout_vmnk, self.num_epi_warps
         )
@@ -603,30 +628,7 @@ class Wino23Conv:
         acc_a_final_pipe = self._umma_to_epilogue(
             storage.acc_a_final_mbar, cluster_layout_vmnk, 2 * self.num_epi_warps
         )
-
-        tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=1, num_threads=32 * (self.num_epi_warps + 1)
-        )
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
-            barrier_for_retrieve=tmem_alloc_barrier,
-            allocator_warp_id=0,
-            is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
-        )
-        epi_all_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=32 * self.num_epi_warps)
-        return _Sync(
-            u=u_pipe,
-            v=v_pipe,
-            x=x_pipe,
-            pass0_lo=pass0_lo_pipe,
-            pass0_hi=pass0_hi_pipe,
-            acc=acc_pipe,
-            acc_b_free=acc_b_free_pipe,
-            acc_a_final=acc_a_final_pipe,
-            tmem=tmem,
-            epi_all=epi_all_barrier,
-        )
+        return pass0_lo_pipe, pass0_hi_pipe, acc_pipe, acc_b_free_pipe, acc_a_final_pipe
 
     @staticmethod
     def _umma_to_epilogue(mbar, cluster_layout_vmnk, consumer_count):
@@ -735,8 +737,8 @@ class Wino23Conv:
     @cute.jit
     def _u_producer(self, u_pipe, u_loads, u_half_loads, mcast_mask, slot, rot):
         cute.arch.setmaxregister_decrease(56)
-        # U may be written by an earlier kernel in the stream: wait for the previous grid
-        # (programmatic dependent launch) before the first U load.
+        # The kernel is launched with programmatic dependent launch: every role that touches
+        # global memory waits for the previous grid first (the wait is per thread).
         cute.arch.griddepcontrol_wait()
         state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_U_STAGE)
         unit = slot
@@ -792,9 +794,29 @@ class Wino23Conv:
 
     # ---------------------------------------------------------------- raw x TMA producer
 
+    def _partition_x(self, tma_atom_x, mX, sRaw, blk):
+        """TMA partitions (SMEM, GMEM) of the raw x boxes of block ``blk``, one per Cin chunk:
+        rows h0-1 .. h0+RC, px w0-1 .. w0+2*WT+1 (out-of-range rows and px are zero-filled)."""
+        n, rem = self._split_block(blk)
+        h0 = (rem // self.wb) * RC
+        w0 = (rem % self.wb) * (2 * WT)
+        gX = cute.local_tile(
+            cute.domain_offset((n, h0 - 1, w0 - 1, 0), mX),
+            (1, BOXH, BOXW, KC),
+            (0, 0, 0, None),
+        )
+        return cpasync.tma_partition(
+            tma_atom_x,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sRaw, 0, 4),
+            cute.group_modes(gX, 0, 4),
+        )
+
     @cute.jit
     def _x_producer(self, x_pipe, tma_atom_x, mX, sRaw, slot, cta_in_slot, rot):
         cute.arch.setmaxregister_decrease(56)
+        cute.arch.griddepcontrol_wait()  # x is written by the previous grid
         state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_RAW_STAGE)
         unit = slot
         while unit < self.nunit:
@@ -803,21 +825,7 @@ class Wino23Conv:
             # the epilogue skips its stores
             if blk >= self.nblk:
                 blk = self.nblk - 1
-            n, rem = self._split_block(blk)
-            h0 = (rem // self.wb) * RC
-            w0 = (rem % self.wb) * (2 * WT)
-            gX = cute.local_tile(
-                cute.domain_offset((n, h0 - 1, w0 - 1, 0), mX),
-                (1, BOXH, BOXW, KC),
-                (0, 0, 0, None),
-            )
-            tXsX, tXgX = cpasync.tma_partition(
-                tma_atom_x,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sRaw, 0, 4),
-                cute.group_modes(gX, 0, 4),
-            )
+            tXsX, tXgX = self._partition_x(tma_atom_x, mX, sRaw, blk)
             for _ in cutlass.range_constexpr(NPASS):
                 for kc in cutlass.range(self.nkc, unroll=1):
                     x_pipe.producer_acquire(state)
@@ -948,32 +956,23 @@ class Wino23Conv:
         return tiled_mma, u_state
 
     @cute.jit
-    def _mma_first_chunk(
-        self,
-        tiled_mma,
-        ops,
-        u_pipe,
-        v_pipe,
-        b_free_pipe,
-        u_state,
-        v_state,
-        b_free_state,
-        is_leader,
-    ):
+    def _mma_first_chunk(self, tiled_mma, ops, sync, u_state, v_state, b_free_state, is_leader):
         """Pass 0, chunk 0: coord 1 into A, then coord 2 into B once the epilogue has drained B
         of the previous block. Both overwrite their accumulator."""
+        v_pipe = sync.v
+        acc_b_free_pipe = sync.acc_b_free
         if is_leader:
             v_pipe.consumer_wait(v_state)
         tiled_mma, u_state = self._mma_acc_taps(
-            tiled_mma, ops, u_pipe, u_state, v_state.index, 0, True, is_leader
+            tiled_mma, ops, sync.u, u_state, v_state.index, 0, True, is_leader
         )
         if is_leader:
-            b_free_pipe.consumer_wait(b_free_state)
+            acc_b_free_pipe.consumer_wait(b_free_state)
         tiled_mma, u_state = self._mma_acc_taps(
-            tiled_mma, ops, u_pipe, u_state, v_state.index, 1, True, is_leader
+            tiled_mma, ops, sync.u, u_state, v_state.index, 1, True, is_leader
         )
         if is_leader:
-            b_free_pipe.consumer_release(b_free_state)
+            acc_b_free_pipe.consumer_release(b_free_state)
         b_free_state.advance()
         if is_leader:
             v_pipe.consumer_release(v_state)
@@ -981,14 +980,15 @@ class Wino23Conv:
         return tiled_mma, u_state, v_state, b_free_state
 
     @cute.jit
-    def _mma_middle_chunks(self, tiled_mma, ops, u_pipe, v_pipe, u_state, v_state, is_leader):
+    def _mma_middle_chunks(self, tiled_mma, ops, sync, u_state, v_state, is_leader):
         """Chunks 1 .. nkc-2 of a pass, N = 256."""
+        v_pipe = sync.v
         for _ in cutlass.range(1, self.nkc - 1, unroll=1):
             if is_leader:
                 v_pipe.consumer_wait(v_state)
             for acc_idx in cutlass.range_constexpr(NACC):
                 tiled_mma, u_state = self._mma_acc_taps(
-                    tiled_mma, ops, u_pipe, u_state, v_state.index, acc_idx, False, is_leader
+                    tiled_mma, ops, sync.u, u_state, v_state.index, acc_idx, False, is_leader
                 )
             if is_leader:
                 v_pipe.consumer_release(v_state)
@@ -996,48 +996,59 @@ class Wino23Conv:
         return tiled_mma, u_state, v_state
 
     @cute.jit
+    def _mma_cout_half(
+        self, tiled_mma_h, ops, sync, u_state, v_index, lo_state, hi_state, is_leader, pass_idx, hh
+    ):
+        """Cout half ``hh`` of a split chunk (see :meth:`_mma_split_chunk`). ``u_state`` is not
+        advanced: both halves read the same U stages."""
+        pass0_lo_pipe = sync.pass0_lo
+        pass0_hi_pipe = sync.pass0_hi
+        if cutlass.const_expr(pass_idx == 1):
+            if is_leader:
+                if cutlass.const_expr(hh == 0):
+                    pass0_lo_pipe.producer_acquire(lo_state)
+                else:
+                    pass0_hi_pipe.producer_acquire(hi_state)
+        half_state = u_state.clone()
+        for ut in cutlass.range_constexpr(NACC * NTAP):
+            if is_leader:
+                tiled_mma_h = self._issue_tap(
+                    ops, tiled_mma_h, sync.u, half_state, v_index, ut, half=hh
+                )
+            if cutlass.const_expr(ut % U_GROUP == U_GROUP - 1):
+                half_state.advance()
+        if cutlass.const_expr(pass_idx == 0):
+            if is_leader:
+                if cutlass.const_expr(hh == 0):
+                    pass0_lo_pipe.producer_commit(lo_state)
+                else:
+                    pass0_hi_pipe.producer_commit(hi_state)
+        return tiled_mma_h
+
+    @cute.jit
     def _mma_split_chunk(
-        self,
-        tiled_mma_h,
-        ops,
-        u_pipe,
-        v_pipe,
-        lo_pipe,
-        hi_pipe,
-        u_state,
-        v_state,
-        lo_state,
-        hi_state,
-        is_leader,
-        pass_idx: int,
+        self, tiled_mma_h, ops, sync, u_state, v_state, lo_state, hi_state, is_leader, pass_idx
     ):
         """A Cin chunk as two N = 128 Cout halves (both read the same U stages). Pass 0 (last
         chunk): each half's pass-0 result is committed to its butterfly warps as soon as its
         MMAs are issued, lo first. Pass 1 (chunk 0): each half starts once its butterfly
         released it."""
+        v_pipe = sync.v
         if is_leader:
             v_pipe.consumer_wait(v_state)
         for hh in cutlass.range_constexpr(2):
-            if cutlass.const_expr(pass_idx == 1):
-                if is_leader:
-                    if cutlass.const_expr(hh == 0):
-                        lo_pipe.producer_acquire(lo_state)
-                    else:
-                        hi_pipe.producer_acquire(hi_state)
-            half_state = u_state.clone()
-            for ut in cutlass.range_constexpr(NACC * NTAP):
-                if is_leader:
-                    tiled_mma_h = self._issue_tap(
-                        ops, tiled_mma_h, u_pipe, half_state, v_state.index, ut, half=hh
-                    )
-                if cutlass.const_expr(ut % U_GROUP == U_GROUP - 1):
-                    half_state.advance()
-            if cutlass.const_expr(pass_idx == 0):
-                if is_leader:
-                    if cutlass.const_expr(hh == 0):
-                        lo_pipe.producer_commit(lo_state)
-                    else:
-                        hi_pipe.producer_commit(hi_state)
+            tiled_mma_h = self._mma_cout_half(
+                tiled_mma_h,
+                ops,
+                sync,
+                u_state,
+                v_state.index,
+                lo_state,
+                hi_state,
+                is_leader,
+                pass_idx,
+                hh,
+            )
         if cutlass.const_expr(pass_idx == 0):
             lo_state.advance()
             hi_state.advance()
@@ -1049,30 +1060,21 @@ class Wino23Conv:
         return tiled_mma_h, u_state, v_state, lo_state, hi_state
 
     @cute.jit
-    def _mma_last_chunk(
-        self,
-        tiled_mma,
-        ops,
-        u_pipe,
-        v_pipe,
-        a_final_pipe,
-        u_state,
-        v_state,
-        a_final_state,
-        is_leader,
-    ):
+    def _mma_last_chunk(self, tiled_mma, ops, sync, u_state, v_state, a_final_state, is_leader):
         """Pass 1, last chunk: coord 0 into A, then A (= y0, final) is committed to the
         epilogue before coord 3 into B."""
+        v_pipe = sync.v
+        acc_a_final_pipe = sync.acc_a_final
         if is_leader:
             v_pipe.consumer_wait(v_state)
         tiled_mma, u_state = self._mma_acc_taps(
-            tiled_mma, ops, u_pipe, u_state, v_state.index, 0, False, is_leader
+            tiled_mma, ops, sync.u, u_state, v_state.index, 0, False, is_leader
         )
         if is_leader:
-            a_final_pipe.producer_commit(a_final_state)
+            acc_a_final_pipe.producer_commit(a_final_state)
         a_final_state.advance()
         tiled_mma, u_state = self._mma_acc_taps(
-            tiled_mma, ops, u_pipe, u_state, v_state.index, 1, False, is_leader
+            tiled_mma, ops, sync.u, u_state, v_state.index, 1, False, is_leader
         )
         if is_leader:
             v_pipe.consumer_release(v_state)
@@ -1080,30 +1082,70 @@ class Wino23Conv:
         return tiled_mma, u_state, v_state, a_final_state
 
     @cute.jit
-    def _mma_warp(
+    def _mma_block(
         self,
         sync,
         tiled_mma,
         tiled_mma_h,
-        tCrB,
-        tCrBh,
-        acc_layout_frag,
-        acc_h_layout_frag,
-        a_layout,
-        sV,
+        ops,
+        u_state,
+        v_state,
+        acc_state,
+        b_free_state,
+        a_final_state,
+        lo_state,
+        hi_state,
         is_leader,
-        slot,
     ):
-        """Per block: pass 0 (coords 1, 2 -> A, B) with chunk 0 peeled and the last chunk split
-        into Cout halves; pass 1 (coords 0, 3) with chunk 0 split and the last chunk peeled.
-        Only the leader CTA of the pair issues MMAs; both CTAs walk the pipeline states."""
-        u_pipe, v_pipe = sync.u, sync.v
-        pass0_lo_pipe, pass0_hi_pipe = sync.pass0_lo, sync.pass0_hi
-        acc_pipe, acc_b_free_pipe, acc_a_final_pipe = sync.acc, sync.acc_b_free, sync.acc_a_final
-        cute.arch.setmaxregister_decrease(56)
-        sync.tmem.wait_for_alloc()
-        tmem_ptr = sync.tmem.retrieve_ptr(cutlass.Float32)
-        ops = _MmaOperands(
+        """All MMAs of one block: pass 0 with chunk 0 peeled and the last chunk split into Cout
+        halves, pass 1 with chunk 0 split and the last chunk peeled, then the commit of the
+        final accumulators. Returns both MMAs and every pipeline state, advanced."""
+        acc_a_final_pipe = sync.acc_a_final
+        acc_pipe = sync.acc
+        # coord-1 MMAs into A only need y0 of the previous block drained (not the whole
+        # previous pass 1 retired), so the tensor pipe never empties between blocks
+        if is_leader:
+            acc_a_final_pipe.producer_acquire(a_final_state)
+        tiled_mma, u_state, v_state, b_free_state = self._mma_first_chunk(
+            tiled_mma, ops, sync, u_state, v_state, b_free_state, is_leader
+        )
+        tiled_mma, u_state, v_state = self._mma_middle_chunks(
+            tiled_mma, ops, sync, u_state, v_state, is_leader
+        )
+        for pass_idx in cutlass.range_constexpr(NPASS):
+            tiled_mma_h, u_state, v_state, lo_state, hi_state = self._mma_split_chunk(
+                tiled_mma_h, ops, sync, u_state, v_state, lo_state, hi_state, is_leader, pass_idx
+            )
+        tiled_mma, u_state, v_state = self._mma_middle_chunks(
+            tiled_mma, ops, sync, u_state, v_state, is_leader
+        )
+        tiled_mma, u_state, v_state, a_final_state = self._mma_last_chunk(
+            tiled_mma, ops, sync, u_state, v_state, a_final_state, is_leader
+        )
+        if is_leader:
+            acc_pipe.producer_acquire(acc_state)
+            acc_pipe.producer_commit(acc_state)
+        acc_state.advance()
+        return (
+            tiled_mma,
+            tiled_mma_h,
+            u_state,
+            v_state,
+            acc_state,
+            b_free_state,
+            a_final_state,
+            lo_state,
+            hi_state,
+        )
+
+    @staticmethod
+    def _mma_operands(sync, frags, a_layout, sV):
+        """Wait for the TMEM allocation and gather the MMA operands."""
+        tmem = sync.tmem
+        tCrB, tCrBh, acc_layout_frag, acc_h_layout_frag = frags
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
+        return _MmaOperands(
             acc=cute.make_tensor(tmem_ptr, acc_layout_frag.layout),
             acc_h=cute.make_tensor(tmem_ptr, acc_h_layout_frag.layout),
             v_ptr=sV.iterator,
@@ -1111,74 +1153,58 @@ class Wino23Conv:
             b=tCrB,
             b_h=tCrBh,
         )
-        u_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, NUM_U_STAGE)
-        v_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, NUM_V_STAGE)
-        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        acc_b_free_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        acc_a_final_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        pass0_lo_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        pass0_hi_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+
+    @cute.jit
+    def _mma_warp(self, sync, tiled_mma, tiled_mma_h, frags, a_layout, sV, is_leader, slot):
+        """Issues the MMAs of every block of the slot (see :meth:`_mma_block`). Only the leader
+        CTA of the pair issues MMAs; both CTAs walk the pipeline states. ``frags``: see
+        :meth:`_mma_fragments`."""
+        pass0_lo_pipe = sync.pass0_lo
+        pass0_hi_pipe = sync.pass0_hi
+        acc_a_final_pipe = sync.acc_a_final
+        acc_pipe = sync.acc
+        cute.arch.setmaxregister_decrease(56)
+        ops = self._mma_operands(sync, frags, a_layout, sV)
+        consumer, producer = pipeline.PipelineUserType.Consumer, pipeline.PipelineUserType.Producer
+        u_state = pipeline.make_pipeline_state(consumer, NUM_U_STAGE)
+        v_state = pipeline.make_pipeline_state(consumer, NUM_V_STAGE)
+        acc_state = pipeline.make_pipeline_state(producer, 1)
+        b_free_state = pipeline.make_pipeline_state(consumer, 1)
+        a_final_state = pipeline.make_pipeline_state(producer, 1)
+        lo_state = pipeline.make_pipeline_state(producer, 1)
+        hi_state = pipeline.make_pipeline_state(producer, 1)
         if is_leader:
-            pass0_lo_pipe.producer_acquire(pass0_lo_state)
-            pass0_hi_pipe.producer_acquire(pass0_hi_state)
+            pass0_lo_pipe.producer_acquire(lo_state)
+            pass0_hi_pipe.producer_acquire(hi_state)
         unit = slot
         while unit < self.nunit:
-            # coord-1 MMAs into A only need y0 of the previous block drained (not the whole
-            # previous pass 1 retired), so the tensor pipe never empties between blocks
-            if is_leader:
-                acc_a_final_pipe.producer_acquire(acc_a_final_state)
-            tiled_mma, u_state, v_state, acc_b_free_state = self._mma_first_chunk(
+            (
                 tiled_mma,
-                ops,
-                u_pipe,
-                v_pipe,
-                acc_b_free_pipe,
+                tiled_mma_h,
                 u_state,
                 v_state,
-                acc_b_free_state,
-                is_leader,
-            )
-            tiled_mma, u_state, v_state = self._mma_middle_chunks(
-                tiled_mma, ops, u_pipe, v_pipe, u_state, v_state, is_leader
-            )
-            for pass_idx in cutlass.range_constexpr(NPASS):
-                tiled_mma_h, u_state, v_state, pass0_lo_state, pass0_hi_state = (
-                    self._mma_split_chunk(
-                        tiled_mma_h,
-                        ops,
-                        u_pipe,
-                        v_pipe,
-                        pass0_lo_pipe,
-                        pass0_hi_pipe,
-                        u_state,
-                        v_state,
-                        pass0_lo_state,
-                        pass0_hi_state,
-                        is_leader,
-                        pass_idx,
-                    )
-                )
-            tiled_mma, u_state, v_state = self._mma_middle_chunks(
-                tiled_mma, ops, u_pipe, v_pipe, u_state, v_state, is_leader
-            )
-            tiled_mma, u_state, v_state, acc_a_final_state = self._mma_last_chunk(
+                acc_state,
+                b_free_state,
+                a_final_state,
+                lo_state,
+                hi_state,
+            ) = self._mma_block(
+                sync,
                 tiled_mma,
+                tiled_mma_h,
                 ops,
-                u_pipe,
-                v_pipe,
-                acc_a_final_pipe,
                 u_state,
                 v_state,
-                acc_a_final_state,
+                acc_state,
+                b_free_state,
+                a_final_state,
+                lo_state,
+                hi_state,
                 is_leader,
             )
-            if is_leader:
-                acc_pipe.producer_acquire(acc_state)
-                acc_pipe.producer_commit(acc_state)
-            acc_state.advance()
             unit += self.nslots
         if is_leader:
-            acc_a_final_pipe.producer_tail(acc_a_final_state)
+            acc_a_final_pipe.producer_tail(a_final_state)
             acc_pipe.producer_tail(acc_state)
 
     # ---------------------------------------------------------------- epilogue warps
@@ -1251,6 +1277,19 @@ class Wino23Conv:
             )
             ec.rY[2 * cc + acc_idx].store(ec.rD32.load().to(self.out_dtype))
 
+    @staticmethod
+    def _fill_store_box(sEpi, ec, lane, cc):
+        # store step `cc`: the thread's 16 Cout of px 2 * col (y0) and 2 * col + 1 (y1) into
+        # the warp's SMEM box
+        c32 = cc // 2
+        off = (cc % 2) * DR_COLS
+        for px in range(2):
+            sy = sEpi[(0, lane.row, 2 * lane.col + px, None, lane.warp)]
+            cute.autovec_copy(
+                cute.make_tensor(ec.rY[2 * c32 + px].iterator + off, ec.lay16),
+                cute.make_tensor(sy.iterator, ec.lay16),
+            )
+
     @cute.jit
     def _store_outputs(self, tma_atom_y, mY, sEpi, ec, lane, n, rem, blk):
         """Write this warp's 2 rows x 32 px x 128 Cout of block ``blk`` from registers through its
@@ -1273,18 +1312,7 @@ class Wino23Conv:
             if lane.lane == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
             cute.arch.sync_warp()
-            c32 = cc // 2
-            off = (cc % 2) * DR_COLS
-            sy = sEpi[(0, lane.row, 2 * lane.col, None, lane.warp)]
-            cute.autovec_copy(
-                cute.make_tensor(ec.rY[2 * c32].iterator + off, ec.lay16),
-                cute.make_tensor(sy.iterator, ec.lay16),
-            )
-            sy = sEpi[(0, lane.row, 2 * lane.col + 1, None, lane.warp)]
-            cute.autovec_copy(
-                cute.make_tensor(ec.rY[2 * c32 + 1].iterator + off, ec.lay16),
-                cute.make_tensor(sy.iterator, ec.lay16),
-            )
+            self._fill_store_box(sEpi, ec, lane, cc)
             _fence_proxy_async_smem()
             cute.arch.sync_warp()
             if lane.lane == 0:
@@ -1292,80 +1320,139 @@ class Wino23Conv:
                     cute.copy(tma_atom_y, tYs, tYg[(None, ccg)])
                 cute.arch.cp_async_bulk_commit_group()
 
+    @staticmethod
+    def _epi_lane(warp_idx, tidx):
+        """This epilogue thread's :class:`_EpiLane` and its thread index within its lane
+        quadrant group (0 .. 127)."""
+        epi_tid = tidx % 128
+        lane_e = tidx % 32
+        lane = _EpiLane(
+            warp=warp_idx,
+            cout_half=warp_idx // 4,
+            row_pair=warp_idx % 4,
+            lane=lane_e,
+            row=lane_e // WT,
+            col=epi_tid % WT,
+        )
+        return lane, epi_tid
+
+    @cute.jit
+    def _epi_butterfly(self, sync, ec, cout_half, lo_state, hi_state):
+        """Butterfly of this warp's Cout half as soon as pass 0 has finished on that half, then
+        the release that lets pass 1 start on it."""
+        pass0_lo_pipe = sync.pass0_lo
+        pass0_hi_pipe = sync.pass0_hi
+        if cout_half == 0:
+            pass0_lo_pipe.consumer_wait(lo_state)
+        else:
+            pass0_hi_pipe.consumer_wait(hi_state)
+        self._butterfly_half(ec, cout_half)
+        cute.arch.fence_view_async_tmem_store()
+        with cute.arch.elect_one():
+            if cout_half == 0:
+                pass0_lo_pipe.consumer_release(lo_state)
+            else:
+                pass0_hi_pipe.consumer_release(hi_state)
+        lo_state.advance()
+        hi_state.advance()
+        return lo_state, hi_state
+
+    @cute.jit
+    def _epi_drain(self, sync, ec, cout_half, acc_state, a_final_state, b_free_state):
+        """Drain y0 = A as soon as the last coord-0 MMAs are done (the tensor core is still on
+        coord 3), then y1 = B after pass 1; TMEM is then free for the next block's MMAs."""
+        acc_a_final_pipe = sync.acc_a_final
+        acc_pipe = sync.acc
+        acc_b_free_pipe = sync.acc_b_free
+        acc_a_final_pipe.consumer_wait(a_final_state)
+        self._drain_acc(ec, 0, cout_half)
+        cute.arch.fence_view_async_tmem_load()
+        with cute.arch.elect_one():
+            acc_a_final_pipe.consumer_release(a_final_state)
+        a_final_state.advance()
+        acc_pipe.consumer_wait(acc_state)
+        with cute.arch.elect_one():
+            acc_pipe.consumer_release(acc_state)
+        acc_state.advance()
+        acc_b_free_pipe.producer_acquire(b_free_state)
+        self._drain_acc(ec, 1, cout_half)
+        cute.arch.fence_view_async_tmem_load()
+        with cute.arch.elect_one():
+            acc_b_free_pipe.producer_commit(b_free_state)
+        b_free_state.advance()
+        return acc_state, a_final_state, b_free_state
+
+    @cute.jit
+    def _epilogue_block(
+        self,
+        sync,
+        ec,
+        lane,
+        y_out,
+        acc_state,
+        a_final_state,
+        lo_state,
+        hi_state,
+        b_free_state,
+        blk,
+    ):
+        """Butterfly, drain and TMA stores of block ``blk``. ``y_out``: (TMA atom, output
+        tensor, SMEM store boxes). Returns every pipeline state, advanced."""
+        tma_atom_y, mY, sEpi = y_out
+        n, rem = self._split_block(blk)
+        lo_state, hi_state = self._epi_butterfly(sync, ec, lane.cout_half, lo_state, hi_state)
+        acc_state, a_final_state, b_free_state = self._epi_drain(
+            sync, ec, lane.cout_half, acc_state, a_final_state, b_free_state
+        )
+        self._store_outputs(tma_atom_y, mY, sEpi, ec, lane, n, rem, blk)
+        return acc_state, a_final_state, lo_state, hi_state, b_free_state
+
     @cute.jit
     def _epilogue(
         self, sync, acc_layout_frag, tma_atom_y, mY, sEpi, warp_idx, tidx, slot, cta_in_slot
     ):
         """8 warps: 4 lane quadrants x 2 Cout halves. Per block: butterfly after pass 0, drain
         of y0 and y1, then the TMA stores (overlapping the next block's MMAs)."""
-        pass0_lo_pipe, pass0_hi_pipe = sync.pass0_lo, sync.pass0_hi
-        acc_pipe, acc_b_free_pipe, acc_a_final_pipe = sync.acc, sync.acc_b_free, sync.acc_a_final
+        acc_b_free_pipe = sync.acc_b_free
+        epi_all = sync.epi_all
         tmem = sync.tmem
         cute.arch.setmaxregister_increase(176)
         tmem.allocate(512)
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(cutlass.Float32)
-        cout_half = warp_idx // 4
-        epi_tid = tidx % 128
+        lane, epi_tid = self._epi_lane(warp_idx, tidx)
         ec = self._epi_tmem_copies(tmem_ptr, acc_layout_frag, epi_tid)
-        col = epi_tid % WT
-        lane_e = tidx % 32
-        row = lane_e // WT
-        row_pair = warp_idx % 4
-        lane = _EpiLane(warp_idx, cout_half, row_pair, lane_e, row, col)
 
-        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        acc_a_final_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        pass0_lo_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        pass0_hi_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-        acc_b_free_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        consumer, producer = pipeline.PipelineUserType.Consumer, pipeline.PipelineUserType.Producer
+        acc_state = pipeline.make_pipeline_state(consumer, 1)
+        a_final_state = pipeline.make_pipeline_state(consumer, 1)
+        lo_state = pipeline.make_pipeline_state(consumer, 1)
+        hi_state = pipeline.make_pipeline_state(consumer, 1)
+        b_free_state = pipeline.make_pipeline_state(producer, 1)
         # accumulator B starts out free
-        acc_b_free_pipe.producer_acquire(acc_b_free_state)
+        acc_b_free_pipe.producer_acquire(b_free_state)
         with cute.arch.elect_one():
-            acc_b_free_pipe.producer_commit(acc_b_free_state)
-        acc_b_free_state.advance()
+            acc_b_free_pipe.producer_commit(b_free_state)
+        b_free_state.advance()
+        cute.arch.griddepcontrol_wait()  # y may still be read by the previous grid
         unit = slot
         while unit < self.nunit:
-            blk = unit * SLOT_CTAS + cta_in_slot
-            n, rem = self._split_block(blk)
-            # butterfly of this warp's Cout half as soon as pass 0 has finished on that half
-            if cout_half == 0:
-                pass0_lo_pipe.consumer_wait(pass0_lo_state)
-            else:
-                pass0_hi_pipe.consumer_wait(pass0_hi_state)
-            self._butterfly_half(ec, cout_half)
-            cute.arch.fence_view_async_tmem_store()
-            with cute.arch.elect_one():
-                if cout_half == 0:
-                    pass0_lo_pipe.consumer_release(pass0_lo_state)
-                else:
-                    pass0_hi_pipe.consumer_release(pass0_hi_state)
-            pass0_lo_state.advance()
-            pass0_hi_state.advance()
-            # drain y0 = A as soon as the last coord-0 MMAs are done (the tensor core is still
-            # on coord 3), then y1 = B after pass 1
-            acc_a_final_pipe.consumer_wait(acc_a_final_state)
-            self._drain_acc(ec, 0, cout_half)
-            cute.arch.fence_view_async_tmem_load()
-            with cute.arch.elect_one():
-                acc_a_final_pipe.consumer_release(acc_a_final_state)
-            acc_a_final_state.advance()
-            acc_pipe.consumer_wait(acc_state)
-            with cute.arch.elect_one():
-                acc_pipe.consumer_release(acc_state)
-            acc_state.advance()
-            acc_b_free_pipe.producer_acquire(acc_b_free_state)
-            self._drain_acc(ec, 1, cout_half)
-            cute.arch.fence_view_async_tmem_load()
-            with cute.arch.elect_one():
-                acc_b_free_pipe.producer_commit(acc_b_free_state)
-            acc_b_free_state.advance()
-            # TMEM is free for the next block's MMAs
-            self._store_outputs(tma_atom_y, mY, sEpi, ec, lane, n, rem, blk)
+            acc_state, a_final_state, lo_state, hi_state, b_free_state = self._epilogue_block(
+                sync,
+                ec,
+                lane,
+                (tma_atom_y, mY, sEpi),
+                acc_state,
+                a_final_state,
+                lo_state,
+                hi_state,
+                b_free_state,
+                unit * SLOT_CTAS + cta_in_slot,
+            )
             unit += self.nslots
-        if lane_e == 0:
+        if lane.lane == 0:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
-        sync.epi_all.arrive_and_wait()
+        epi_all.arrive_and_wait()
         tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
 
