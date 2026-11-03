@@ -9,6 +9,26 @@ ROWS_Q4 = 128 * 4
 ROWS_Q2 = 128 * 2
 
 
+@pytest.fixture(autouse=True)
+def _internal_kernel_calibration(monkeypatch):
+    """The shapes below were measured with the internal mufu16 2x kernel (T2 scale 1.0); the main tree ships a slower
+    packed path (DEFAULT_T2_SCALE 1.2), so pin the calibration and test the main one separately."""
+    monkeypatch.setenv(ts.TWOSTREAM_T2_SCALE_ENV, "1.0")
+    monkeypatch.delenv(ts.TWOSTREAM_R2_ENV, raising=False)
+    monkeypatch.delenv(ts.TWOSTREAM_ENV, raising=False)
+    monkeypatch.delenv(ts.TWOSTREAM_MIN_GAIN_ENV, raising=False)
+    monkeypatch.delenv(ts.TWOSTREAM_MAX_R2_ENV, raising=False)
+
+
+def test_slower_2x_kernel_calibration(monkeypatch):
+    """With a 20 % slower 2x kernel (GitHub-main packed path, 2026-11-02) the B128/q4 split no longer pays: the 2x arm
+    would be the critical path (measured: r2 10-13 all equal to the plain 4x time); B48/q4 still splits."""
+    monkeypatch.setenv(ts.TWOSTREAM_T2_SCALE_ENV, "1.2")
+    assert _plan(128, ROWS_Q4, 30080).r2 == 0
+    assert _plan(96, ROWS_Q4, 30080).r2 == 0
+    assert _plan(48, ROWS_Q4, 30080).r2 == 2
+
+
 def _plan(num_requests, rows, max_kv_len, **kw):
     return ts.plan_two_stream(
         num_requests=num_requests, rows_per_request=rows, max_kv_len=max_kv_len, sm_count=SM_COUNT, **kw
