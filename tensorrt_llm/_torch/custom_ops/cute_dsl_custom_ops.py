@@ -699,6 +699,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -736,7 +737,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                              reserved_sms: int) -> int:
         """Return the cached full-device occupancy for a cluster shape.
 
-        ``reserved_sms`` (``TRTLLM_CUTEDSL_SM_RESERVE``, applied inside
+        ``reserved_sms`` (``cute_dsl_utils.sm_reserve()``, applied inside
         ``HardwareInfo.get_max_active_clusters``) is part of the key so a
         reserve set after the first query is not hidden by the cache.
         """
@@ -5606,6 +5607,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
+                                   weight_scale: torch.Tensor) -> torch.Tensor:
+        """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
+
+        Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
+        BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
+        ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
+        Returns BF16 ``[M, N]``.
+        """
+        fp8_low_m.check_inputs(input, weight, weight_scale)
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+
+    @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
+    def _(input: torch.Tensor, weight: torch.Tensor,
+          weight_scale: torch.Tensor) -> torch.Tensor:
+        return input.new_empty((input.shape[0], weight.shape[0]),
+                               dtype=torch.bfloat16)
+
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
     # =============================================================================
@@ -9420,8 +9445,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int):
-            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+                     max_decode_query_len: int, head_dim: int, split_k: int):
+            key = (q_dtype, num_heads, max_decode_query_len, head_dim, split_k)
             if key in cls.kernel_cache:
                 return
 
@@ -9468,7 +9493,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute_dtype,
                 num_heads,
                 max_decode_query_len,
-                cls.SPLIT_K,
+                split_k,
                 head_dim,
             )
             cls.kernel_cache[key] = cute.compile(
@@ -9493,8 +9518,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             score: torch.Tensor,
             max_decode_query_len: int,
+            split_k: int = SPLIT_K,
         ) -> None:
             """Score one decode step, compiling the kernel on first use.
+
+            ``split_k`` is the number of CTAs per request; each block is scored
+            by exactly one of them, so the scores do not depend on it.
 
             The compile allocates, so it must not land inside a CUDA graph
             capture. It does not: CUDAGraphRunner.capture runs eager warmup
@@ -9502,10 +9531,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             captures will replay.
             """
             _, num_heads, head_dim = idx_q.shape
-            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
+                   split_k)
             if key not in cls.kernel_cache:
                 cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
-                             head_dim)
+                             head_dim, split_k)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens)
 
@@ -9519,6 +9549,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         """Write per-block max index scores for one decode step, in place.
 
@@ -9537,6 +9568,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
+            split_k: CTAs per request (compile-time); each walks blocks
+                split, split + split_k, ... The scores do not depend on it.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9561,6 +9594,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
+            split_k,
         )
 
     @torch.library.register_fake(
@@ -9572,6 +9606,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         return None
 

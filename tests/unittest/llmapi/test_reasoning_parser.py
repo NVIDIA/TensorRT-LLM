@@ -1343,6 +1343,30 @@ _GLM_CASES = [
      "<tool_call>exec" + _ARGS, "Done."),
     ("glm47", None, "Plan.<tool_call>exec" + _ARGS, "<tool_call>exec" + _ARGS,
      "Plan."),
+    # A block a call ended still owes `</think>`: the first one outside a call
+    # is dropped, wherever it stands.
+    ("glm", None, "Plan.<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call>", "Plan."),
+    ("glm", None, "Plan.<tool_call>f</tool_call>\n</think>\nDone.",
+     "<tool_call>f</tool_call>\n\nDone.", "Plan."),
+    ("glm", None, "P<tool_call>a</tool_call><tool_call>b</tool_call></think>c",
+     "<tool_call>a</tool_call><tool_call>b</tool_call>c", "P"),
+    ("glm", None, "P<tool_call>a</tool_call>More.</think><tool_call>b",
+     "<tool_call>a</tool_call>More.<tool_call>b", "P"),
+    ("glm47", None, "Plan.<tool_call>exec" + _ARGS + "</think>",
+     "<tool_call>exec" + _ARGS, "Plan."),
+    ("glm45", None, "<think>plan<tool_call>f</tool_call></think>Done.",
+     "<tool_call>f</tool_call>Done.", "plan"),
+    # Only one is owed, a call cut off keeps its text, and a block closed by
+    # `</think>` owes nothing.
+    ("glm", None, "P<tool_call>a</tool_call></think></think>",
+     "<tool_call>a</tool_call></think>", "P"),
+    ("glm", None, "P<tool_call>f<arg_value>a</think>b",
+     "<tool_call>f<arg_value>a</think>b", "P"),
+    ("glm", None, "p</think><tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", "p"),
+    ("glm47", _OFF, "<tool_call>f</tool_call></think>",
+     "<tool_call>f</tool_call></think>", ""),
     # With thinking off the template closed the block in the prompt.
     ("glm47", _OFF, "Paris.", "Paris.", ""),
     ("glm_moe_dsa", _OFF, "</think>Paris.</think><tool_call>f",
@@ -1401,6 +1425,23 @@ def test_glm_streaming_matches_parse_on_random_text(key: str) -> None:
         chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
         expected = (whole.content, whole.reasoning_content)
         assert _glm_stream(key, None, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("key", ["glm", "glm45", "glm47", "glm_moe_dsa"])
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("<|assistant|><think>", True),
+        ("<|assistant|></think>", False),
+        ("<|assistant|><think></think>", False),
+        ("<|assistant|>\n<think></think>", False),
+        # GLM-4.5/4.6 with thinking on: the model opens the block itself.
+        ("<|assistant|>", None),
+    ])
+def test_glm_mode_is_read_off_the_prompt(key: str, tail: str,
+                                         expected: bool | None) -> None:
+    assert ReasoningParserFactory.resolve_prefilled_thinking(
+        key, "<|user|>hi" + tail) is expected
 
 
 def test_deepseek_r1_keeps_a_second_close_as_content() -> None:

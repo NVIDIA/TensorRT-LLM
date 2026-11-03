@@ -328,6 +328,13 @@ class PleNgramEmbed(OpWrapper):
             table="ckpt",
             eos_density=0.05,
         ),
+        _cell(
+            "MTP3 verify: 64 sequences x 4 rows, 461 slots",
+            (4,) * 64,
+            pool_slots=ENGINE_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
         # Context-shaped (prefill / mixed) steps: the packed-row form.
         _cell(
             "mixed step: 2 contexts + 64 decode rows",
@@ -356,12 +363,10 @@ class PleNgramEmbed(OpWrapper):
     - token id * max multiplier < 2^63 (int64 wraps, as in `ngram_hash`).
 
     Certified at a 128 x 1-row decode on a host-resident table and on the
-    full checkpoint-height device table, and a mixed step of 2 contexts (one
-    fresh, one carrying) + 64 decode rows on the packed-row form. Not
-    certified: more than one row per sequence on the per-sequence path
-    (`1 < max_rows <= PER_SEQ_MAX_ROWS`) or zero-row sequences -- a verify
-    step takes the unfused ops, so the target's per-sequence path runs one
-    row.
+    full checkpoint-height device table, an MTP3 verify step of 64 x 4 rows
+    on the per-sequence path, and a mixed step of 2 contexts (one fresh, one
+    carrying) + 64 decode rows on the packed-row form. Not certified:
+    zero-row sequences.
 
     Bitwise equal to `ngram_token_history` + `ngram_hash` + embedding +
     `dequantize_e4m3_per_tensor`, window, rows, values and pool alike.

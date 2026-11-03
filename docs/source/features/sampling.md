@@ -221,7 +221,8 @@ sampling configuration such that a filter is always disabled (`top_k = 0` /
 `advanced_sampling_mode` (on `DecodingBaseConfig`, so it is available to any
 speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
-disabled, so this is a lossless throughput optimization for advanced use cases:
+disabled (except for the seeded draws noted below), so this is a lossless
+throughput optimization for advanced use cases:
 
 | Mode | `top_k` kernel | `top_p` kernel | `min_p` kernel |
 |---|---|---|---|
@@ -249,6 +250,13 @@ Notes:
   sampling batches without a special case.
 * `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
   graph key, so it adds no extra warmup graphs.
+* Seeded draws of DFlash/DSpark: a one-model DFlash/DSpark deployment with
+  `no_topk_no_topp`, `use_rejection_sampling=False` and a vocab-sharded TP target
+  LM head (plain TP, no attention DP) samples its temperature-only target tokens
+  on each rank's vocab shard (Gumbel-max, without gathering the logits). They
+  follow the same distribution as with `FULL` (up to a tail below ~4e-9
+  probability that is never drawn), but from a different random stream: a seeded
+  request need not reproduce the token sequence it gets with `FULL`.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig

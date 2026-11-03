@@ -18,14 +18,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_blo
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mxe4m3_mxe2m1_block_scale_moe_runner requires a CUDA device"
 
 DEV = "cuda"
-# The reference GEMMs must be true fp32; TF32 would leave the reference with
-# 10 mantissa bits, coarser than the bf16 output it is meant to bound.
-torch.backends.cuda.matmul.allow_tf32 = False
 
 # Relative distance between neighbouring bf16 values (1 + 2^-7 stored mantissa
 # bits -> one ulp is 2^-8 of the binade top).
@@ -391,6 +389,7 @@ def _q_intermediate(act: torch.Tensor, recipe: str | None = None) -> torch.Tenso
     return (q * scale).reshape(rows, cols)
 
 
+@true_fp32_matmul()
 def _ref_moe(
     x_valid,
     ids,
@@ -403,6 +402,7 @@ def _ref_moe(
     num_local: int | None = None,
     swap_gate_up: bool = False,
     quantize_intermediate: bool = True,
+    act: str = "swiglu",
 ):
     """Native-torch MoE over dequantized mxfp4 weights, fp32 throughout.
 
@@ -410,6 +410,11 @@ def _ref_moe(
     `[offset, offset + num_local)`. `scales[t, j]` multiplies slot `j`'s
     expert output; nothing is renormalized. The FC1 activation is requantized
     to MXFP8 before FC2, which is what the kernel does.
+
+    `act="swiglu"` (act_type 0) is the clamped GLU `(up + beta) * gate *
+    sigmoid(alpha * gate)`; `act="situ"` (act_type 3) is Kimi K3's SiTu,
+    `beta * tanh(up / beta) * alpha * tanh(gate / alpha) * sigmoid(gate)`,
+    with `alpha` the gate's cap and `beta` the linear half's.
     """
     num_tokens, hidden = x_valid.shape
     up_c, up_s, up_b = ref["up"]
@@ -434,10 +439,13 @@ def _ref_moe(
             up = up.clamp(-lim, lim)
         a = 1.0 if alpha is None else float(alpha[local_e])
         b = 0.0 if beta is None else float(beta[local_e])
-        act = (up + b) * gate * torch.sigmoid(a * gate)
+        if act == "situ":
+            h = b * torch.tanh(up / b) * (a * torch.tanh(gate / a) * torch.sigmoid(gate))
+        else:
+            h = (up + b) * gate * torch.sigmoid(a * gate)
         if quantize_intermediate:
-            act = _q_intermediate(act)
-        y = act @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
+            h = _q_intermediate(h)
+        y = h @ _dequant(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
         out.index_add_(0, tok, y * scales[tok, slot].float().unsqueeze(1))
     return out
 
@@ -566,6 +574,55 @@ def test_gpt_oss_pre_routed():
     print("  test_gpt_oss_pre_routed OK")
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_situ_expert_window():
+    """Kimi K3's routed experts as one rank of its TP16-attention / TP4 x EP4
+    expert layout runs them: 224 of 896 experts (the window at global id 448),
+    hidden 3584, intermediate 768 per rank, top-16 pre-routed ids over all 896
+    experts, SiTu (act_type 3) with Kimi K3's caps on every local expert (gate
+    4.0 in gemm1_alpha, linear 25.0 in gemm1_beta), no biases, no clamp, and
+    the routing arguments its model passes (routing_method_type 2, one group).
+    Slots routed outside the window contribute nothing."""
+    num_experts, num_local, offset, top_k = 896, 224, 448, 16
+    args, ref = _build(num_local, 3584, 768, seed=300)
+    gen = ref["gen"]
+    no_bias = dict(args, gemm1_bias=None, gemm2_bias=None)
+    zero_bias_ref = dict(ref)
+    for role in ("up", "gate", "down"):
+        codes, scales, bias = ref[role]
+        zero_bias_ref[role] = (codes, scales, torch.zeros_like(bias))
+    alpha = torch.full((num_local,), 4.0, dtype=torch.float32, device=DEV)
+    beta = torch.full((num_local,), 25.0, dtype=torch.float32, device=DEV)
+    for num_tokens in (1, 8, 64, 65, 512):
+        data, sf, xv = _rand_mxfp8(num_tokens, 3584, ref["h1_pad"], gen)
+        ids, wts = _routing(num_tokens, num_experts, top_k, gen)
+        out = _call(
+            data,
+            sf,
+            no_bias,
+            num_experts,
+            top_k,
+            topk_ids=ids,
+            topk_weights=wts,
+            n_group=1,
+            topk_group=1,
+            local_expert_offset=offset,
+            local_num_experts=num_local,
+            routing_method_type=2,
+            act_type=3,
+            gemm1_alpha=alpha,
+            gemm1_beta=beta,
+        )
+        assert out.shape == (num_tokens, 3584), out.shape
+        exp = _ref_moe(
+            xv, ids, wts, zero_bias_ref, alpha, beta, offset=offset, num_local=num_local, act="situ"
+        ).to(torch.bfloat16)
+        _assert_moe_close(out, exp)
+    print("  test_kimi_k3_situ_expert_window OK")
+
+
 def test_gpt_oss_router_entry_point():
     """Routing inside the call: Renormalize (top-k then softmax) and Default."""
     args, ref = _gpt_oss()
@@ -673,7 +730,7 @@ def test_mxfp8_quantize_pairing():
 
 
 def test_intermediate_is_mxfp8_quantized():
-    """The FC1 activation reaches FC2 as MXFP8, on the OCP scale, bit-exactly.
+    """The FC1 activation reaches FC2 as MXFP8, on the architecture's block scale, bit-exactly.
 
     A down projection set to the identity turns the returned rows into the
     kernel's own post-activation intermediate, so the requantization can be
@@ -724,8 +781,9 @@ def test_intermediate_is_mxfp8_quantized():
             gemm1_clamp_limit=limit,
         ).float()
 
-        up = xv @ _dequant(up_c[0], up_s[0]).t()
-        gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
+        with true_fp32_matmul():
+            up = xv @ _dequant(up_c[0], up_s[0]).t()
+            gate = xv @ _dequant(gt_c[0], gt_s[0]).t()
         act = (
             (up.clamp(-7.0, 7.0) + 1.0)
             * gate.clamp(max=7.0)
@@ -745,7 +803,7 @@ def test_intermediate_is_mxfp8_quantized():
             "differ bit-exactly and every other cell's reference depends on "
             "which one is in force"
         )
-        # The other architecture's recipe must NOT also fit, or this case does
+        # The other recipe must NOT also fit, or this case does
         # not actually separate them and the bit-exact claim is vacuous.
         other = _OCP_SCALE if recipe == _ROUND_UP_SCALE else _ROUND_UP_SCALE
         assert not torch.equal(out, _q_intermediate(act, other)), (
@@ -1788,19 +1846,20 @@ def test_certified_cells(cell):
         entry = dict(topk_ids=ids, topk_weights=wts)
 
     # 1. The entry's reference against this file's, on identical inputs.
-    entry_ref = moe.reference(
-        xv,
-        ids,
-        wts,
-        sub_ref["up"],
-        sub_ref["gate"],
-        sub_ref["down"],
-        alpha=alpha,
-        beta=beta,
-        clamp_limit=limit,
-        local_expert_offset=off,
-        local_num_experts=n,
-    )
+    with true_fp32_matmul():
+        entry_ref = moe.reference(
+            xv,
+            ids,
+            wts,
+            sub_ref["up"],
+            sub_ref["gate"],
+            sub_ref["down"],
+            alpha=alpha,
+            beta=beta,
+            clamp_limit=limit,
+            local_expert_offset=off,
+            local_num_experts=n,
+        )
     local_ref = _ref_moe(xv, ids, wts, sub_ref, alpha, beta, limit, offset=off, num_local=n)
     torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
 
