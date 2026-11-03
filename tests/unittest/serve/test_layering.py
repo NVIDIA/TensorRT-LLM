@@ -103,6 +103,35 @@ CONTRACTS = (
             "what they need. Move the shared helper to serve/_base/ instead."
         ),
     ),
+    Contract(
+        name="openai_protocol imports no handler module",
+        importers=("tensorrt_llm.serve.openai_protocol",),
+        forbidden=(
+            # Modules that define routes, build an app or run request handling today ...
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+            "tensorrt_llm.serve.openai_disagg_service",
+            "tensorrt_llm.serve.openai_service",
+            "tensorrt_llm.serve.coordinator_server",
+            "tensorrt_llm.serve.openai_video_routes",
+            "tensorrt_llm.serve.responses_utils",
+            "tensorrt_llm.serve.postprocess_handlers",
+            "tensorrt_llm.serve.harmony_adapter",
+            "tensorrt_llm.serve.anthropic_adapter",
+            "tensorrt_llm.serve.anthropic_batches",
+            # ... and the serve modules for such code, whether or not they exist.
+            "tensorrt_llm.serve.api",
+            "tensorrt_llm.serve.app",
+            "tensorrt_llm.serve.disagg",
+        ),
+        include_type_checking=True,
+        fix=(
+            "serve/openai_protocol/ holds request and response models and the helpers that turn "
+            "them into engine parameters; servers, handlers and routers import it, never the "
+            "reverse. Move the code that needs the handler module out of the "
+            "protocol package, or have the caller pass the value in."
+        ),
+    ),
 )
 
 
