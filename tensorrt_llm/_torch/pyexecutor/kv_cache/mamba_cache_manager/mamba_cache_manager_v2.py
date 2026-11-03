@@ -45,6 +45,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
 )
@@ -159,6 +161,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _inforward_stage_conv: Optional[torch.Tensor] = None
     # Recurrent snapshots use their own commit/history endpoints without draft backoff.
     _supports_reuse_match_backoff = False
+    # Whether the KV cache creator may append a standalone drafter's layers
+    # (``layer_specs``) to this manager; set by the subclasses validated with one.
+    _accepts_appended_draft_layers = False
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
@@ -212,6 +217,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Args:
             gdn_fused_verify: Whether the GDN layers verify drafts with the
                 fused kernels (see gdn_replay_partitioned).
+            layer_specs: Draft-owned attention layers a standalone drafter
+                keeps in this manager, appended after the target layers that
+                the mask arguments describe (see ``_append_draft_layers``).
         """
         if conv_state_layout not in ("x_b_c", "q_k_v"):
             raise ValueError(f"Unsupported convolution state layout: {conv_state_layout!r}")
@@ -224,6 +232,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"(got {kwargs['model_type']!r}); pass "
                 "conv_state_layout='x_b_c' or 'q_k_v' instead"
             )
+        draft_layer_specs = tuple(kwargs.pop("layer_specs", None) or ())
+        mamba_layer_mask, layer_mask, num_kv_heads = self._append_draft_layers(
+            draft_layer_specs,
+            mamba_layer_mask,
+            layer_mask,
+            num_kv_heads,
+            k_only=kv_cache_type == CacheTypeCpp.SELFKONLY,
+        )
+        num_layers += len(draft_layer_specs)
         total_layers = len(mamba_layer_mask)
         if layer_mask is None:
             full_attention_layer_mask = [False] * total_layers
@@ -276,6 +293,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layer_idx for layer_idx in self.pp_layers if mamba_layer_mask[layer_idx]
         ]
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
+        local_ids = {layer_idx: offset for offset, layer_idx in enumerate(self.pp_layers)}
+        self._appended_draft_layer_specs = {
+            local_ids[layer.global_layer_id]: layer
+            for layer in draft_layer_specs
+            if layer.global_layer_id in local_ids
+        }
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -411,6 +434,53 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._setup_state_pool()
 
+    @staticmethod
+    def _append_draft_layers(
+        draft_layer_specs: Sequence[KVCacheLayerSpec],
+        mamba_layer_mask: List[bool],
+        layer_mask: Optional[List[bool]],
+        num_kv_heads: Union[int, List[Optional[int]]],
+        *,
+        k_only: bool,
+    ) -> Tuple[List[bool], Optional[List[bool]], Union[int, List[Optional[int]]]]:
+        """Masks and KV heads with a standalone drafter's layers appended.
+
+        The masks describe this manager's recurrent and target attention
+        layers; the drafter's layers follow them in global layer id order and
+        keep the storage of their specs.
+        """
+        if not draft_layer_specs:
+            return mamba_layer_mask, layer_mask, num_kv_heads
+        num_target_layers = len(mamba_layer_mask)
+        expected_ids = list(range(num_target_layers, num_target_layers + len(draft_layer_specs)))
+        if [layer.global_layer_id for layer in draft_layer_specs] != expected_ids:
+            raise ValueError(
+                "MambaHybridCacheManagerV2 layer_specs must be the drafter's layers "
+                f"{expected_ids} after the target layers"
+            )
+        for layer in draft_layer_specs:
+            if layer.owner is not KVCacheLayerOwner.DRAFT:
+                raise ValueError(
+                    "MambaHybridCacheManagerV2 describes its target layers itself; "
+                    f"layer_specs may add only draft-owned layers (layer {layer.global_layer_id})"
+                )
+            if layer.kv_factor != (1 if k_only else 2):
+                raise ValueError(
+                    f"draft layer {layer.global_layer_id} has kv_factor {layer.kv_factor}, "
+                    "unlike the target cache type"
+                )
+        if layer_mask is None:
+            layer_mask = [False] * num_target_layers
+        if isinstance(num_kv_heads, int):
+            num_kv_heads = [num_kv_heads] * num_target_layers
+        num_draft = len(draft_layer_specs)
+        return (
+            list(mamba_layer_mask) + [False] * num_draft,
+            list(layer_mask) + [True] * num_draft,
+            # Placeholders: the base manager takes the rank-local heads from the specs.
+            list(num_kv_heads) + [layer.num_kv_heads for layer in draft_layer_specs],
+        )
+
     @override
     def _disagg_transfer_overwrites_whole_cached_prefix(self) -> bool:
         # A transferred recurrent state summarizes and overwrites the whole prefix.
@@ -442,6 +512,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         **kwargs,
     ):
         spec_config = kwargs.get("spec_config")
+        # Appended draft layers grow with every token like the target's pages.
+        draft_layer_specs = kwargs.pop("layer_specs", None) or ()
+        kwargs.pop("shared_draft_block_width", None)
+        draft_slope = sum(layer.bytes_per_token() for layer in draft_layer_specs)
         num_reserved_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
         ) + int(mapping.enable_attention_dp)
@@ -503,7 +577,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             attention_page_bytes_override=attention_page_bytes_override,
             **kwargs,
         )
-        return slope, intercept + attention_intercept
+        return slope + draft_slope, intercept + attention_intercept
+
+    @classmethod
+    @override
+    def _get_per_request_layer_tokens(cls, *args, layer_specs=None, **kwargs):
+        # ``layer_specs`` holds only the appended draft layers here; the
+        # recurrent and target layers keep the base estimate (None for hybrids).
+        return super()._get_per_request_layer_tokens(*args, layer_specs=None, **kwargs)
 
     @classmethod
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:

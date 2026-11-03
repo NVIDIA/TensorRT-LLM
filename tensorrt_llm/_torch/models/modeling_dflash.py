@@ -514,6 +514,14 @@ class DFlashForCausalLM(nn.Module):
     # (speculative_config.context_kv_dtype); the worker binds an FP8 pool.
     context_kv_fp8 = False
 
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Whether the block decode reads the context KV from a KV cache
+        manager's pages of ``tokens_per_block`` tokens.
+
+        The worker validates the TRTLLM kernels' page sizes when it binds them.
+        """
+        return self.dflash_attention_backend == "TRTLLM"
+
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:
         """Turn ``AUTO`` into a concrete backend for this drafter family."""

@@ -3811,6 +3811,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             return cute_dsl_mla_decode_unavailability_reason()
         return None
 
+    def reads_managed_ctx_pages(self, tokens_per_block: int) -> bool:
+        """Every backend pages (``_paged_ctx_cache``); the kernels bound the page size:
+        trtllm-gen MLA decode takes 32 or 64, the CuTe DSL decode a divisor of 128 above 1.
+        """
+        if self.dflash_attention_backend == "TRTLLM":
+            return tokens_per_block in (32, 64)
+        if self.dflash_attention_backend == "CUTEDSL":
+            return tokens_per_block > 1 and 128 % tokens_per_block == 0
+        return True
+
     def _mla_block_decode_variant(self, paged: bool) -> str:
         """Which of the three block-decode implementations this step runs.
 

@@ -1785,7 +1785,8 @@ class KvCacheCreator:
         if self._is_kv_cache_manager_v2:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 self._kv_cache_config)
-            if unified_layer_specs:
+            if unified_layer_specs and not issubclass(
+                    self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
                 # Target and draft layers can differ in page size and life
                 # cycle, so the group count comes from the combined layout.
                 num_pool_groups = _get_num_storage_pool_groups(
@@ -1797,6 +1798,10 @@ class KvCacheCreator:
                     self._model_engine.max_seq_len,
                     self._kv_cache_config,
                 )
+                if unified_layer_specs:
+                    # A hybrid manager's appended draft layers.
+                    num_pool_groups += _get_num_storage_pool_groups(
+                        unified_layer_specs, self._tokens_per_block)
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2371,6 +2376,28 @@ class KvCacheCreator:
             backend = getattr(draft_model, "dflash_attention_backend", None)
         return backend
 
+    def _unified_drafter_reads_paged_kv(self, backend: Optional[str]) -> bool:
+        """Whether the drafter's block attention reads its context KV from the
+        manager's pages at this run's page size.
+
+        A loaded drafter declares it; without one, only the TRTLLM backend pages.
+        """
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        if draft_model is None:
+            return backend == "TRTLLM"
+        return draft_model.reads_managed_ctx_pages(self._tokens_per_block)
+
+    def _unified_target_manager_cls_supported(self) -> bool:
+        """Whether the target's manager class can hold the drafter's layers.
+
+        Hybrid managers describe their own target layers and append the
+        drafter's after them when they opt in.
+        """
+        cls = self._kv_cache_manager_cls
+        return cls is KVCacheManagerV2 or (
+            issubclass(cls, MambaHybridCacheManagerV2)
+            and cls._accepts_appended_draft_layers)
+
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""
         draft_model = getattr(self._model_engine.model, "draft_model", None)
@@ -2414,8 +2441,10 @@ class KvCacheCreator:
         if spec_config is None:
             return "speculative decoding is not enabled"
         backend = self._unified_drafter_attention_backend()
-        if backend != "TRTLLM":
-            return f"the drafter attention_backend is {backend}, not TRTLLM"
+        if not self._unified_drafter_reads_paged_kv(backend):
+            return (f"the drafter's {backend} block attention does not read "
+                    "paged draft KV from a KV cache manager at "
+                    f"tokens_per_block={self._tokens_per_block}")
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
         if spec_config.draft_len_schedule is not None:
@@ -2438,8 +2467,9 @@ class KvCacheCreator:
             return "mixed-precision KV is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback.
-        if self._kv_cache_manager_cls is not KVCacheManagerV2:
-            return "the target does not use KVCacheManagerV2"
+        if not self._unified_target_manager_cls_supported():
+            return (f"the target's {self._kv_cache_manager_cls.__name__} "
+                    "cannot hold draft layers")
         target_layout = self._dflash_kv_layout(
             self._model_engine.model.model_config,
             self._model_engine.model.config.torch_dtype)
@@ -2557,9 +2587,16 @@ class KvCacheCreator:
     def _build_unified_dflash_layer_specs(
             self,
             kv_cache_config: KvCacheConfig) -> tuple[KVCacheLayerSpec, ...]:
-        """Build the rank-local target+DFlash storage layout used by cost and allocation."""
+        """Build the rank-local target+DFlash storage layout used by cost and allocation.
+
+        A hybrid target manager describes its own layers, so it gets only the
+        drafter's.
+        """
         if not self._should_unify_dflash_kv_cache():
             return ()
+        draft_specs = self._build_unified_draft_layer_specs(kv_cache_config)
+        if issubclass(self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            return draft_specs
 
         target_model_config = self._model_engine.model.model_config
         target_config = target_model_config.pretrained_config
@@ -2582,20 +2619,6 @@ class KvCacheCreator:
             target_local_ids,
         )
 
-        draft_model_config = self._get_draft_kv_model_config()
-        draft_config = draft_model_config.pretrained_config
-        draft_layers = int(draft_config.num_hidden_layers)
-        draft_local_ids = list(self._mapping.pp_layers(draft_layers))
-        draft_heads, draft_head_dim, draft_dtype, draft_k_only = (
-            self._dflash_kv_layout(draft_model_config,
-                                   draft_config.torch_dtype))
-        draft_windows = _resolve_v2_max_attention_window_vec(
-            self._get_draft_max_attention_window(self._max_seq_len,
-                                                 kv_cache_config),
-            self._max_seq_len,
-            draft_local_ids,
-        )
-
         specs = [
             KVCacheLayerSpec(
                 global_layer_id=layer_id,
@@ -2609,7 +2632,28 @@ class KvCacheCreator:
                 reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(target_local_ids, target_windows)
         ]
-        specs.extend(
+        return (*specs, *draft_specs)
+
+    def _build_unified_draft_layer_specs(
+            self,
+            kv_cache_config: KvCacheConfig) -> tuple[KVCacheLayerSpec, ...]:
+        """Rank-local storage of the drafter's layers, after the target's."""
+        target_layers = int(self._model_engine.model.model_config.
+                            pretrained_config.num_hidden_layers)
+        draft_model_config = self._get_draft_kv_model_config()
+        draft_config = draft_model_config.pretrained_config
+        draft_layers = int(draft_config.num_hidden_layers)
+        draft_local_ids = list(self._mapping.pp_layers(draft_layers))
+        draft_heads, draft_head_dim, draft_dtype, draft_k_only = (
+            self._dflash_kv_layout(draft_model_config,
+                                   draft_config.torch_dtype))
+        draft_windows = _resolve_v2_max_attention_window_vec(
+            self._get_draft_max_attention_window(self._max_seq_len,
+                                                 kv_cache_config),
+            self._max_seq_len,
+            draft_local_ids,
+        )
+        return tuple(
             KVCacheLayerSpec(
                 global_layer_id=target_layers + layer_id,
                 owner=KVCacheLayerOwner.DRAFT,
@@ -2621,7 +2665,6 @@ class KvCacheCreator:
                 sliding_window_size=window,
                 reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
-        return tuple(specs)
 
     def _joint_reuse_supported(self) -> bool:
         """Span half of the pairing decision; ``build_managers`` ANDs it with

@@ -111,7 +111,9 @@ def test_dspark_checkpoint_width_reaches_shared_cache_cost_and_construction(
     )
     creator._speculative_config.max_draft_len = 7
     creator._speculative_config.draft_is_embedded_in_target = False
-    creator._model_engine.model.draft_model = SimpleNamespace(_dspark_shift_label=shift_label)
+    creator._model_engine.model.draft_model = SimpleNamespace(
+        _dspark_shift_label=shift_label, reads_managed_ctx_pages=lambda tokens_per_block: True
+    )
     creator._kv_cache_config = KvCacheConfig()
     creator._tokens_per_block = 32
     creator._max_batch_size = 4
