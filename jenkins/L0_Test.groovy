@@ -1188,8 +1188,8 @@ def sweepOrphanedSlurmResources(pipeline) {
 // primary state token -- e.g. "TIMEOUT", "COMPLETED", "FAILED", "NODE_FAIL",
 // "OUT_OF_MEMORY", "CANCELLED" -- or null when it can't be determined.
 //
-// Best-effort: any SSH/sacct error returns null so callers fall back to the
-// duration heuristic rather than failing the stage.
+// Best-effort: SSH/sacct errors return null so callers fall back to the
+// duration heuristic. Pipeline interruptions must still propagate.
 def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, String slurmJobID) {
     if (!isValidSlurmJobId(slurmJobID)) {
         return null
@@ -1210,6 +1210,8 @@ def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, S
                 state = out.readLines()[0]?.trim()?.tokenize(' ')?.getAt(0)?.toUpperCase(java.util.Locale.ROOT)
             }
         }
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         pipeline.echo("[INFRA-RETRY] Could not query SLURM job ${slurmJobID} state via sacct: ${e.message}")
     }
@@ -1703,38 +1705,19 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
         long executeStartMs = System.currentTimeMillis()
-        // Reclassify a raw test-execution failure against the SLURM job's terminal
-        // state: a walltime kill is a UserFailure (not retryable), while a job still
-        // alive when the monitor lost contact is transient infra (retry on a fresh
-        // node). Kept as a closure so executeLLMTestOnSlurm can apply it INSIDE the
-        // task runner -- that way cacheErrorAndUploadResult suppresses this attempt's
-        // junit for the SAME typed failure the retry loop acts on. Deciding it only
-        // here (after junit already ran) is what left retried-and-passed agent stages
-        // UNSTABLE from an intermediate attempt's results.
-        // Classify each SLURM test-execution failure exactly once. The closure sets
-        // this when it runs (inside the task runner), so the outer catch reclassifies
-        // only failures that never reached it (image pull, node/agent bring-up) --
-        // avoiding a second querySlurmJobState round trip that could reach a different
-        // verdict as elapsed time and the job's state move on.
+        // Classify before junit suppression so reporting and retry use the same
+        // verdict. The allocation normally stays RUNNING until cleanup, so only
+        // timeout state or failure evidence can determine the failure category.
+        // The outer catch handles failures that never reached the task runner.
         boolean slurmFailureClassified = false
         def classifySlurmFailure = { Throwable err ->
             slurmFailureClassified = true
-            // A completed-pytest deterministic failure (tests ran, were re-run via
-            // --reruns, and still failed) is a real test failure, not lost-contact
-            // infra. On the agent path the SLURM allocation outlives pytest, so the
-            // job is still RUNNING here even though pytest already finished -- do NOT
-            // let the job state below relabel it as slurm-job-still-running and retry
-            // it (which masks the failure whenever the retry happens to pass). Key
-            // off the propagated rerun-failure error: it is raised only when reruns
-            // genuinely failed and takes precedence over the timeout path. Do not key
-            // off failed_results.xml -- generateRerunReport writes it from the first
-            // run whenever any rerun occurred, even when the rerun passed or the job
-            // timed out, so it would wrongly suppress a legitimate infra retry. Defer
-            // so the base classifier treats it as a UserFailure (no retry); a monitor-
-            // lost-contact cut raises "terminated unexpectedly" instead and retries.
-            if ((err?.toString() ?: "").contains("still failed after rerun attempts")) {
-                echo "[INFRA-RETRY] ${stageName}: pytest reported deterministic test failure(s); not an infra retry."
+            def classified = FailureClassifier.classify(err, InfraFailure.SLURM)
+            if (classified instanceof PipelineInterruption) {
                 return err
+            }
+            if (err instanceof TrtllmCiException) {
+                return classified
             }
             // Measure elapsed from when the job was first observed RUNNING; fall back
             // to executeStartMs if the RUNNING stamp was never set.
@@ -1761,17 +1744,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     err)
             }
 
-            if (isNonTerminalSlurmState(slurmState)) {
-                return new InfraFailure(
-                    "SLURM job ${slurmJobID} for ${stageName} is still in non-terminal state ${slurmState} " +
-                    "(${elapsedMin}min of ${walltimeMin}min walltime); the monitor lost contact while the job was " +
-                    "alive (transient infra), so this is not a test failure. Original failure: ${err.message}",
-                    err, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
-            }
-
-            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} terminal state=${slurmState ?: 'unknown'}, " +
-                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; deferring to failure classifier."
-            return err
+            echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobID} state=${slurmState ?: 'unknown'}, " +
+                 "ran ${elapsedMin}min of ${walltimeMin}min walltime; classifying failure evidence."
+            return classifyFailure(pipeline, err, InfraFailure.SLURM, retryContext)
         }
         try {
             executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
@@ -1833,12 +1808,9 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                // Label the failure against the SLURM job's terminal state before
-                // cacheErrorAndUploadResult decides junit suppression, so a monitor-
-                // detected infra failure (e.g. slurm-job-still-running) suppresses this
-                // attempt's results and a passing retry stays green. Pipeline aborts
-                // (FlowInterruptedException) must not be relabeled.
-                if (classifySlurmFailure == null || e.getClass().name.contains("FlowInterruptedException")) {
+                // Classify before result handling; the classifier preserves
+                // interruptions, including those wrapped in another exception.
+                if (classifySlurmFailure == null) {
                     throw e
                 }
                 throw classifySlurmFailure(e)
@@ -6287,8 +6259,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
                             unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
                             hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
-                            if (!retryContextAllowsRetry(pipeline, retryContext,
-                                    rerunInfraFailure ?: unrerunInfraFailure)) {
+                            if (rerunInfraFailure == null && unrerunInfraFailure == null) {
                                 isolatedWaiveResult = finishIsolatedTestStage(
                                     pipeline, preprocessedLists, isolatedResult, llmSrc, stageName)
                             }
@@ -6369,7 +6340,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         def infraFailure = rerunInfraFailure ?: unrerunInfraFailure
-        if (retryContextAllowsRetry(pipeline, retryContext, infraFailure)) {
+        if (infraFailure != null) {
             throw infraFailure
         }
 
@@ -6391,31 +6362,22 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        if (rerunFailed || hasUnrerunFailure || unfinishedTests) {
-            if (rerunInfraFailure != null) {
-                throw rerunInfraFailure
-            }
-            if (unrerunInfraFailure != null) {
-                throw unrerunInfraFailure
-            }
-        }
-
         // Checked after perfMode so perf artifacts are generated first.
         // The exception must reach cacheErrorAndUploadResult to fail the build.
         if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
+            throw new UserFailure("Some tests still failed after rerun attempts, please check the test report.", null)
         }
 
         if (unfinishedTests) {
-            error "Some tests terminated unexpectedly, please check the test report."
+            throw new UserFailure("Some tests terminated unexpectedly, please check the test report.", null)
         }
 
         if (hasUnrerunFailure) {
-            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+            throw new UserFailure("Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report.", null)
         }
 
         if (perfRegressionExitCode != null) {
-            error "Performance regression detected and failing the build (exit code: ${perfRegressionExitCode})"
+            throw new UserFailure("Performance regression detected and failing the build (exit code: ${perfRegressionExitCode})", null)
         }
     }
 
