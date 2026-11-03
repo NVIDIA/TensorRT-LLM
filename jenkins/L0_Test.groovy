@@ -5749,7 +5749,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // isFatSqsh: deps and wheel are pre-baked in the fat sqsh — skip all installs.
         // skipInstallWheel: wheel already installed externally (e.g. K8s sanity check
         //   pre-installs a platform-specific wheel) — install deps but skip the wheel.
-        timeout(time: 45, unit: 'MINUTES') {
+        timeout(time: 60, unit: 'MINUTES') {
             if (!isFatSqsh) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
                 // SMG's generated package remains an opt-in dependency. OpenEngine's
