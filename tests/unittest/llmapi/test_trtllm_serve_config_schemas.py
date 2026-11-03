@@ -1449,3 +1449,28 @@ def test_dwdp_launch_rules_leave_unset_fields_to_runtime(
         TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True, **launch)
     for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
         assert Draft202012Validator(schemas[filename]).is_valid(launch), filename
+
+
+@pytest.mark.parametrize(
+    "settings,valid",
+    [
+        ({"async_load": True, "async_load_workers": 2, "staging_buffer_bytes": "2GiB"}, True),
+        ({"staging_buffer_bytes": 1024}, True),
+        ({"async_load_workers": 0}, False),
+        ({"staging_buffer_bytes": 0}, False),
+        ({"async_load": "true"}, False),
+    ],
+)
+def test_mooncake_async_load_config_schema(schemas, settings, valid):
+    config = {
+        "kv_connector_config": {
+            "connector": "mooncake-store",
+            "mooncake_store": {
+                "pool": "file:///pool.json",
+                "model_key": "test-model",
+                **settings,
+            },
+        }
+    }
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        assert Draft202012Validator(schemas[filename]).is_valid(config) is valid

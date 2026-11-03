@@ -1791,13 +1791,21 @@ class PyExecutor:
 
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
+            speculative_prefill_only = getattr(self.kv_connector_manager,
+                                               "speculative_prefill_only",
+                                               False) is True
+            if speculative_prefill_only and not is_kv_cache_manager_v2:
+                raise NotImplementedError(
+                    "Speculative prefill with a KV connector requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
 
             if self.enable_attention_dp and not is_kv_cache_manager_v2:
                 raise NotImplementedError(
                     "KV connector attention data parallelism requires KVCacheManagerV2. "
                     "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not speculative_prefill_only):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "
@@ -1856,6 +1864,12 @@ class PyExecutor:
                     "rather than per-token KV blocks, so the connector's "
                     "per-layer load/save hooks have nothing meaningful to "
                     "transfer for those layers.")
+
+            if (speculative_prefill_only and getattr(
+                    self, "draft_kv_cache_manager", None) is not None):
+                raise NotImplementedError(
+                    "Speculative prefill with a KV connector requires draft "
+                    "layers to share the registered target KV cache.")
 
             self.kv_connector_manager.configure_prefix_reservations(
                 is_kv_cache_manager_v2
@@ -8382,6 +8396,13 @@ class PyExecutor:
             from ..speculative.dspark import validate_confidence_request
 
             validate_confidence_request(self.model_engine.spec_config, request)
+        connector = getattr(self, "kv_connector_manager", None)
+        if (getattr(connector, "speculative_prefill_only", False) is True
+                and getattr(connector, "capacity_only", False) is not True
+                and not request.is_context_only_request):
+            raise ValueError(
+                "This speculative-prefill KV connector accepts context-only "
+                "requests; send generation requests to the generation server.")
         self._configure_csa2_remote_tail(request)
         retention = request.kv_cache_retention_config
         if self._is_kv_manager_v2 and retention is not None:
@@ -9613,8 +9634,21 @@ class PyExecutor:
                 request for request in scheduling_requests
                 if request.lora_task_id is None
             ]
-        scheduler_output = self.scheduler.schedule_request(
-            scheduling_requests, self.inflight_req_ids)
+        if (self.enable_attention_dp
+                and getattr(self.kv_cache_manager,
+                            "_scheduler_async_load_admission", False) is True):
+            # Early admission invokes the connector before the usual batch
+            # preparation gate. Every owner must vote before later collectives.
+            error = None
+            try:
+                scheduler_output = self.scheduler.schedule_request(
+                    scheduling_requests, self.inflight_req_ids)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            self._kv_connector_sync_status(False, error)
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                scheduling_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = self._encoder_requests_in_arrival_order(
             scheduler_output.encoder_requests)

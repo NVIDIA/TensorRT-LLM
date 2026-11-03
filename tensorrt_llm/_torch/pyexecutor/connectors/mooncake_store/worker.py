@@ -19,8 +19,8 @@ between that pool and its own GPU KV cache. It is also the only place that
 knows how a page is addressed and how a key is spelled, which is why the
 leader, colocated with rank 0's worker, asks it to run prefix lookups.
 
-Loads are synchronous: the runtime has already told the scheduler those tokens
-are computed, so a failed load is a wrong answer rather than a slow one.
+Loads can run in background threads. Requests stay parked until every page has
+landed; any failed load stops execution rather than exposing incomplete KV.
 
 Saves are asynchronous and gated on a CUDA event, since the pages are complete
 only once the forward pass that wrote them has retired and blocking the
@@ -49,7 +49,7 @@ from tensorrt_llm._utils import mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.logger import logger
 
-from ..kv_cache_connector import KvCacheConnectorWorker
+from ..kv_cache_connector import AllocationFence, KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
 from .config import CONFIG_PATH_ENV, MooncakeStoreConnectorConfig, local_address, pool_config
@@ -58,7 +58,6 @@ from .keys import KeyNamespace
 from .ledger import record_segment
 from .metadata import MooncakeStoreMetadata, RequestTransfers
 from .staging import (
-    MAX_STAGING_BUFFER_BYTES,
     HostStagingPool,
     describe_batch_for_get,
     plan_slot_geometry,
@@ -66,7 +65,12 @@ from .staging import (
     unstage_batch_after_get,
 )
 from .staging import sync_stream as _sync_stream
-from .validation import validate_layout, validate_llm_args, validate_node_budget
+from .validation import (
+    validate_layout,
+    validate_llm_args,
+    validate_node_budget,
+    validate_speculative_config,
+)
 
 __all__ = ["MooncakeStoreConnectorWorker", "resolve_local_worker"]
 
@@ -177,11 +181,18 @@ def _stream_handle(stream: Optional[torch.cuda.Stream]) -> int:
 class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
     """Moves KV pages between this rank's GPU cache and the Mooncake pool."""
 
+    supports_attention_dp = True
+    supports_speculative_prefill = True
+
     def __init__(self, llm_args: TorchLlmArgs):
         super().__init__(llm_args)
 
         validate_llm_args(llm_args)
         self._config = MooncakeStoreConnectorConfig.resolve(llm_args)
+        validate_speculative_config(llm_args, self._config)
+        self.drops_reuse_match_backoff = self._config.role.loads
+        self._attention_dp = getattr(llm_args, "enable_attention_dp", False)
+        self._async_load = self._config.async_load and self._config.role.loads
         # Where this rank records the segment it mounts. `None` when the
         # deployment named no directory, which only makes the run
         # unreportable; see `ledger.record_segment`.
@@ -217,6 +228,14 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             Queue()
         )
         self._save_thread: Optional[threading.Thread] = None
+        self._load_queue: Queue = Queue()
+        self._load_threads: List[threading.Thread] = []
+        self._async_staging: List[Optional[HostStagingPool]] = []
+        self._load_lock = threading.Lock()
+        self._load_error: Optional[BaseException] = None
+        self._submitted_loads: Set[int] = set()
+        self._completed_loads: Set[int] = set()
+        self._announced_loads: Set[int] = set()
         #: Set once the save thread has finished its device and stream setup,
         #: whether or not that succeeded.
         self._save_started = threading.Event()
@@ -319,12 +338,26 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         for layer_group_id in addressing.layer_group_ids:
             bytes_per_page = addressing.bytes_per_page(layer_group_id)
             self._namespaces[layer_group_id] = self._namespace(
-                self._rank, layer_group_id, bytes_per_page
+                0 if self._attention_dp else self._rank, layer_group_id, bytes_per_page
             )
             self._peer_namespaces[layer_group_id] = tuple(
                 self._namespace(rank, layer_group_id, bytes_per_page)
-                for rank in range(self._world_size)
+                for rank in range(1 if self._attention_dp else self._world_size)
             )
+
+        if self._async_load:
+            for index in range(self._config.async_load_workers):
+                ready = threading.Event()
+                thread = threading.Thread(
+                    target=self._drain_loads,
+                    args=(index, ready),
+                    name=f"mooncake-store-load-{self._rank}-{index}",
+                    daemon=True,
+                )
+                self._load_threads.append(thread)
+                thread.start()
+                ready.wait()
+                self._raise_load_error()
 
         if self._config.role.saves:
             self._save_thread = threading.Thread(
@@ -422,15 +455,31 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         slot_bytes, num_slots = plan_slot_geometry(
             max_bytes_per_page,
             self._config.transfer_batch_size,
-            MAX_STAGING_BUFFER_BYTES,
+            self._config.staging_buffer_bytes,
         )
         if self._config.role.loads:
-            self._load_staging = HostStagingPool(
-                slot_bytes=slot_bytes,
-                num_slots=num_slots,
-                store=self._store,
-                label="load",
+            workers = self._config.async_load_workers if self._async_load else 1
+            budget = self._config.staging_buffer_bytes // workers
+            if budget < max_bytes_per_page:
+                raise ValueError(
+                    "mooncake-store staging budget cannot fit one page per load worker"
+                )
+            load_slot_bytes, load_slots = plan_slot_geometry(
+                max_bytes_per_page, self._config.transfer_batch_size, budget
             )
+            pools = [
+                HostStagingPool(
+                    slot_bytes=load_slot_bytes,
+                    num_slots=load_slots,
+                    store=self._store,
+                    label=f"load-{index}",
+                )
+                for index in range(workers)
+            ]
+            if self._async_load:
+                self._async_staging = pools
+            else:
+                self._load_staging = pools[0]
         if self._config.role.saves:
             self._save_staging = HostStagingPool(
                 slot_bytes=slot_bytes,
@@ -444,7 +493,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 f"mooncake-store rank {self._rank} reduced its transfer batch from "
                 f"{self._config.transfer_batch_size} to {self._batch_size} pages: "
                 f"staging {max_bytes_per_page} B pages within the "
-                f"{MAX_STAGING_BUFFER_BYTES} B pinned-memory ceiling does not fit "
+                f"{self._config.staging_buffer_bytes} B pinned-memory ceiling does not fit "
                 f"more. Lower transfer_batch_size to make the reduction explicit."
             )
 
@@ -453,7 +502,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             namespace=self._config.namespace,
             model_key=self._model_key,
             rank=rank,
-            world_size=self._world_size,
+            world_size=1 if self._attention_dp else self._world_size,
             layer_group_id=layer_group_id,
             tokens_per_block=self._addressing.tokens_per_block,
             bytes_per_page=bytes_per_page,
@@ -521,37 +570,103 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     # ---- load path ----
 
+    def bind_connector_meta(self, metadata: MooncakeStoreMetadata) -> None:
+        super().bind_connector_meta(metadata)
+        if metadata.async_loads:
+            self.start_async_loads(metadata.async_loads, self.get_allocation_fence())
+
+    def start_async_loads(
+        self, transfers: List[RequestTransfers], allocation_fence: Optional[AllocationFence]
+    ) -> None:
+        """Queue allocated prefixes without replacing the active forward metadata."""
+        self._raise_load_error()
+        if not self._async_load or not self._load_threads:
+            raise RuntimeError("mooncake-store asynchronous load workers are not running")
+        if allocation_fence is None and any(entry.pages for entry in transfers):
+            raise RuntimeError("mooncake-store asynchronous loads require an allocation fence")
+        with self._load_lock:
+            for entry in transfers:
+                if entry.request_id in self._submitted_loads:
+                    raise RuntimeError(
+                        f"mooncake-store duplicate load for request {entry.request_id}"
+                    )
+                self._submitted_loads.add(entry.request_id)
+                self._load_queue.put((entry, allocation_fence))
+
+    def _raise_load_error(self) -> None:
+        with self._load_lock:
+            error = self._load_error
+        if error is not None:
+            raise RuntimeError(
+                f"mooncake-store asynchronous prefix load failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def _drain_loads(self, index: int, ready: threading.Event) -> None:
+        try:
+            if self._device_index is not None:
+                torch.cuda.set_device(self._device_index)
+            staging = self._async_staging[index] if self._async_staging else None
+            stream = (
+                torch.cuda.Stream() if staging is not None and torch.cuda.is_available() else None
+            )
+            handle = _stream_handle(stream)
+            batch_size = min(self._batch_size, staging.num_slots) if staging else self._batch_size
+        except Exception as exc:
+            # Thread boundaries cannot let an exception silently strand parked requests.
+            with self._load_lock:
+                self._load_error = exc
+            return
+        finally:
+            ready.set()
+        while True:
+            item = self._load_queue.get()
+            if item is None:
+                return
+            entry, fence = item
+            try:
+                self._raise_load_error()
+                if entry.pages:
+                    # Applies to both host scatter and NIC DMA: recycled pages
+                    # must no longer be written by the previous forward pass.
+                    fence({entry.request_id})
+                    self._load_transfers([entry], staging, handle, batch_size)
+                with self._load_lock:
+                    self._completed_loads.add(entry.request_id)
+            except Exception as exc:
+                with self._load_lock:
+                    if self._load_error is None:
+                        self._load_error = exc
+
     def start_load_kv(self, stream: torch.cuda.Stream):
-        """Pull every scheduled page into its GPU slot before the forward pass."""
+        """Complete synchronous loads before the forward pass."""
+        self._raise_load_error()
         metadata: Optional[MooncakeStoreMetadata] = self.get_connector_meta()
         if metadata is None or not metadata.loads:
             return
-
-        keys, addresses, sizes, total_pages = self._resolve(metadata.loads)
-        if not keys:
-            return
-
+        if self._async_load:
+            raise RuntimeError("mooncake-store received synchronous loads in asynchronous mode")
         staging = self._load_staging
-        handle = _stream_handle(stream) if staging is not None else 0
         if staging is None:
-            # The previous pass may still write a recycled target page, e.g. the
-            # last token of a request that stopped there. Only the loading
-            # requests' pages are waited for, so a load into free pages still
-            # overlaps that pass.
             fence = self.get_allocation_fence()
             if fence is None:
-                raise RuntimeError(
-                    "mooncake-store: a zero-copy load has no allocation fence to "
-                    "wait on, so the NIC could write pages earlier GPU work still "
-                    "owns. The KV cache manager must offer wait_allocation_fences; "
-                    "KVCacheManagerV2 does."
-                )
+                raise RuntimeError("mooncake-store zero-copy load has no allocation fence")
             fence({entry.request_id for entry in metadata.loads})
+        self._load_transfers(metadata.loads, staging, _stream_handle(stream), self._batch_size)
 
+    def _load_transfers(
+        self,
+        transfers: List[RequestTransfers],
+        staging: Optional[HostStagingPool],
+        handle: int,
+        batch_size: int,
+    ) -> None:
+        keys, addresses, sizes, total_pages = self._resolve(transfers)
+        if not keys:
+            return
         for batch in zip(
-            _batched(keys, self._batch_size),
-            _batched(addresses, self._batch_size),
-            _batched(sizes, self._batch_size),
+            _batched(keys, batch_size),
+            _batched(addresses, batch_size),
+            _batched(sizes, batch_size),
         ):
             batch_keys, batch_addresses, batch_sizes = batch
             if staging is None:
@@ -625,10 +740,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
         Args:
             finished_gen_req_ids: Requests that will produce no further KV.
-            started_loading_req_ids: Requests loading asynchronously. Always
-                empty here, since `get_num_new_matched_tokens` only offers
-                synchronous loads; echoed back so the runtime does not wait on
-                something that already happened.
+            started_loading_req_ids: Newly registered asynchronous loads. Their
+                completion is retained until both the worker and runtime agree.
 
         Returns:
             Requests that have finished saving, and requests that have finished
@@ -644,7 +757,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             for request_id in finished_saving:
                 self._closed_requests.discard(request_id)
                 self._outstanding_saves.pop(request_id, None)
-        return finished_saving, list(started_loading_req_ids)
+        self._raise_load_error()
+        if not self._async_load:
+            return finished_saving, list(started_loading_req_ids)
+        with self._load_lock:
+            self._announced_loads.update(started_loading_req_ids)
+            finished_loading = self._announced_loads & self._completed_loads
+            self._announced_loads.difference_update(finished_loading)
+            self._completed_loads.difference_update(finished_loading)
+            self._submitted_loads.difference_update(finished_loading)
+        return finished_saving, list(finished_loading)
 
     def _drain_saves(self) -> None:
         try:
@@ -777,7 +899,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         return keys, addresses, sizes, pages
 
     def shutdown(self) -> None:
-        """Stop the save thread, then release what it was reading. Idempotent."""
+        """Drain transfer threads before releasing their store and buffers. Idempotent."""
+        for load_thread in self._load_threads:
+            self._load_queue.put(None)
+        for load_thread in self._load_threads:
+            load_thread.join(timeout=SAVE_DRAIN_TIMEOUT)
+        if any(thread.is_alive() for thread in self._load_threads):
+            logger.error("mooncake-store load thread still active; keeping transfer buffers alive")
+            return
+        self._load_threads.clear()
         thread = self._save_thread
         if thread is not None:
             self._save_queue.put(None)
@@ -812,6 +942,7 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         # Released only after the store is closed, since it holds registrations
         # against this memory.
         self._load_staging = None
+        self._async_staging.clear()
         self._save_staging = None
         self._save_stream = None
         global _LOCAL_WORKER

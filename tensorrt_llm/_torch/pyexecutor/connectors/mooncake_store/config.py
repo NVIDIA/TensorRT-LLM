@@ -290,6 +290,9 @@ class MooncakeStoreConnectorConfig:
     #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
     #: RDMA, which registering device memory requires.
     stage_through_host: bool = False
+    staging_buffer_bytes: int = 1 << 30
+    async_load: bool = False
+    async_load_workers: int = 1
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
@@ -301,6 +304,10 @@ class MooncakeStoreConnectorConfig:
             raise ValueError("global_segment_size must be >= 0")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+        if self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0")
+        if self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be >= 1")
 
     @property
     def capacity_only(self) -> bool:
@@ -336,6 +343,11 @@ class MooncakeStoreConnectorConfig:
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
             stage_through_host=bool(raw.get("stage_through_host", False)),
+            staging_buffer_bytes=parse_size(
+                raw.get("staging_buffer_bytes", 1 << 30), strict_units=True
+            ),
+            async_load=bool(raw.get("async_load", False)),
+            async_load_workers=int(raw.get("async_load_workers", 1)),
         )
 
     @staticmethod

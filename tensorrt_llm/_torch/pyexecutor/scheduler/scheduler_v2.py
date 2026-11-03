@@ -264,6 +264,27 @@ class KVCacheV2Scheduler(RequestScheduler):
             self.chunking_policy = ctx_chunk_config[0]
             self.chunk_unit_size = ctx_chunk_config[1]
 
+        connector = kv_cache_manager.kv_connector_manager
+        kv_cache_manager._scheduler_async_load_admission = (
+            os.environ.get("TRTLLM_MOONCAKE_EARLY_ADMISSION", "0") == "1"
+            and self.chunking_enabled
+            and enable_prefix_aware_scheduling
+            and draft_kv_cache_manager is None
+            and cross_kv_cache_manager is None
+            and peft_cache_manager is None
+            and not self.has_cp_helix
+            and kv_cache_manager.mapping.pp_size == 1
+            and kv_cache_manager.mapping.cp_size == 1
+            and connector is not None
+            and connector.supports_scheduler_async_load is True
+            and connector.scheduler_async_load_capacity > 0
+        )
+        if kv_cache_manager._scheduler_async_load_admission:
+            logger.info(
+                "Mooncake early async admission enabled: "
+                f"{connector.scheduler_async_load_capacity} owner-local load credits"
+            )
+
         # State value caches for fast comparison.
         # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
         # MicroBatchScheduler. For encoder-decoder models, caller should pass
@@ -530,6 +551,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         disagg_candidates: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
+        async_loads_admitted = 0
 
         budget = BudgetTracker(
             self.max_num_tokens,
@@ -927,6 +949,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
                     if action is ScheduleAction.SKIP:
                         continue
+                    if (
+                        self.kv_cache_manager._scheduler_async_load_admission is True
+                        and self.kv_cache_manager.try_admit_async_connector_load(req)
+                    ):
+                        async_loads_admitted += 1
+                        continue
                     has_chunking = has_chunking or chunking_flag
                     scheduled_ctx.append(req)
                     if self._prefix_wait_planner is not None:
@@ -970,6 +998,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or async_loads_admitted
         )
         if (
             self.remote_tail_phase is None

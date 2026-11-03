@@ -6465,6 +6465,25 @@
       "additionalProperties": false,
       "description": "How this server joins a Mooncake store pool.\n\nThe settings every participant shares come from the master named by\n`pool`; what is left here is per-server. Setting this makes\n`trtllm-serve` render the Mooncake client config and export\n`MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.",
       "properties": {
+        "async_load": {
+          "default": false,
+          "description": "Load external KV pages in background threads while other requests run. Requests become runnable only after their load completes.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load",
+          "type": "boolean"
+        },
+        "async_load_workers": {
+          "default": 1,
+          "description": "Background load threads per rank when async_load is enabled.",
+          "exclusiveMinimum": 0,
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Async Load Workers",
+          "type": "integer"
+        },
         "local_hostname": {
           "anyOf": [
             {
@@ -6565,6 +6584,23 @@
           },
           "title": "Stage Through Host",
           "type": "boolean"
+        },
+        "staging_buffer_bytes": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "1GiB",
+          "description": "Pinned host memory ceiling per rank and transfer direction when stage_through_host is enabled. Load threads share this budget. Accepts a byte count or a binary size such as '2GiB'.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Staging Buffer Bytes"
         },
         "transfer_batch_size": {
           "default": 64,
