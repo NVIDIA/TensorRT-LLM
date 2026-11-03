@@ -4,6 +4,16 @@
   config_path: examples/configs/curated/nemotron-3-super-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "B200, GB200"
+- model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+  arch: NemotronH_Omni_Reasoning_V3
+  config_path: examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml
+  scenario: Max Throughput (Hyperdrive, MTP3)
+  gpu_compatibility: "B200"
+- model: nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
+  arch: NemotronH_Omni_Reasoning_V3
+  config_path: examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml
+  scenario: Max Throughput (Hyperdrive, MTP3)
+  gpu_compatibility: "B300"
 - model: nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4
   arch: NemotronHForCausalLM
   config_path: examples/configs/curated/nemotron-3-ultra-throughput.yaml
