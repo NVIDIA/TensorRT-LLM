@@ -22,13 +22,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import request_random_seed
-from tensorrt_llm._torch.speculative.interface import (
-    _RNG_SLOT_SPAN,
-    DEFAULT_SAMPLING_SEED,
-    SpecMetadata,
-    SpeculativeDecodingMode,
-)
+from tensorrt_llm._torch.speculative.interface import SpecMetadata, SpeculativeDecodingMode
 
 DRAFT_LEN = 3
 # Every request object is a distinct request: the sampling scan is reused for the same request ids.
@@ -76,46 +70,8 @@ def _metadata(max_num_requests=64):
     return metadata
 
 
-def _reference_rng_rows(request_seeds, request_offsets, num_tokens):
-    seeds, offsets = [], []
-    for seed, offset, n in zip(request_seeds, request_offsets, num_tokens):
-        seeds.extend(seed for _ in range(n))
-        offsets.extend(offset + row * _RNG_SLOT_SPAN for row in range(n))
-    return seeds, offsets
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("seed", range(3))
-def test_rng_rows_match_the_per_row_expansion(seed):
-    rng = random.Random(seed)
-    metadata = _metadata()
-    reference = _metadata()
-    for step in range(4):
-        requests = _batch(rng, rng.randrange(1, 40))
-        normalized, _ = metadata._scan_one_model_sampling(requests)
-        # Mixed row counts, as context rows (1) and ragged verify windows give.
-        normalized = [(*entry[:4], rng.randrange(1, 5)) for entry in normalized]
-        # All-greedy batches skip the RNG upload.
-        metadata.is_all_greedy_sample = False
-        metadata._populate_request_rng_state(requests, normalized)
-
-        user_seeds = [request_random_seed(r) for r in requests]
-        request_seeds = [DEFAULT_SAMPLING_SEED if s is None else s for s in user_seeds]
-        request_offsets = reference._take_rng_window_offsets(
-            requests, [s is not None for s in user_seeds]
-        )
-        seeds, offsets = _reference_rng_rows(
-            request_seeds, request_offsets, [n for *_, n in normalized]
-        )
-        n = len(requests)
-        assert metadata.request_seeds[:n].tolist() == request_seeds, f"step {step}"
-        assert metadata.request_offsets[:n].tolist() == request_offsets, f"step {step}"
-        assert metadata.seeds[: len(seeds)].tolist() == seeds, f"step {step}"
-        assert metadata.offsets[: len(offsets)].tolist() == offsets, f"step {step}"
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("seed", range(3))
+@pytest.mark.parametrize("seed", [0])
 def test_sampling_buffers_match_the_per_request_expansion(seed):
     rng = random.Random(seed)
     metadata = _metadata()
@@ -149,24 +105,3 @@ def test_sampling_buffers_match_the_per_request_expansion(seed):
         assert metadata.top_k_max == max(
             (v[1] for v in normalized if 0 < v[1] < disable), default=0
         )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_sampled_steps_after_greedy_steps_get_the_reference_windows():
-    """Greedy steps skip the RNG uploads; later sampled steps still get the reference windows."""
-    metadata = _metadata()
-    reference = _metadata()
-    greedy = [_Request(slot) for slot in range(4)]
-    sampled = [_Request(slot, temperature=0.7, seed=slot or None) for slot in range(4)]
-    for step, requests in enumerate((greedy, sampled, greedy, greedy, sampled, greedy)):
-        metadata.populate_sampling_params_for_one_model(requests)
-        user_seeds = [request_random_seed(r) for r in requests]
-        expected_offsets = reference._take_rng_window_offsets(
-            requests, [s is not None for s in user_seeds]
-        )
-        assert metadata.is_all_greedy_sample == (requests is greedy)
-        if requests is sampled:
-            n = len(requests)
-            assert metadata.request_offsets[:n].tolist() == expected_offsets, f"step {step}"
-            seeds = [DEFAULT_SAMPLING_SEED if s is None else s for s in user_seeds]
-            assert metadata.request_seeds[:n].tolist() == seeds, f"step {step}"

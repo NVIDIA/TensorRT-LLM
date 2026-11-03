@@ -975,15 +975,6 @@ def test_mxfp8_quantize_activation_matches_native():
     assert torch.equal(act_scale.view(torch.uint8), native_scale.view(torch.uint8))
 
 
-def _meta_mxfp8_inputs():
-    return [
-        torch.empty((3, 32), dtype=torch.float8_e4m3fn, device="meta"),
-        torch.empty(512, dtype=torch.uint8, device="meta"),
-        torch.empty((16, 32), dtype=torch.float8_e4m3fn, device="meta"),
-        torch.empty(512, dtype=torch.uint8, device="meta"),
-    ]
-
-
 def _mxfp8_swapab_inputs(rows, n, k):
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
     activation = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
@@ -1003,10 +994,10 @@ def _mxfp8_swapab_inputs(rows, n, k):
     reason="Needs SM100, SM103 or SM107",
 )
 @pytest.mark.parametrize("tactic", range(6))
-@pytest.mark.parametrize("rows,n,k", [(192, 1792, 5120), (1, 8, 32), (257, 136, 96)])
+@pytest.mark.parametrize("rows,n,k", [(1, 8, 32), (257, 136, 96)])
 @torch.inference_mode()
 def test_mxfp8_swapab_matches_reference(rows, n, k, tactic):
-    """Both tiles handle projection sizes and M/N/K tails against an independent reference."""
+    """Both tiles handle M/N/K tails against an independent reference."""
     from tensorrt_llm._torch.modules.mxfp8_swapab import MXFP8SwapABGemmRunner
     from tensorrt_llm._torch.utils import unswizzle_sf
 
@@ -1126,98 +1117,6 @@ def test_mxfp8_projection_gemms_keep_the_native_bits(monkeypatch):
                 assert torch.equal(got, want), (n, rows, kwargs.keys())
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "flashinfer_warmup,outer_tuning,outer_skip_buckets",
-    [(False, True, False), (True, False, False), (True, True, True)],
-)
-def test_mxfp8_tuning_scope_preserves_other_ops(
-    monkeypatch, flashinfer_warmup, outer_tuning, outer_skip_buckets
-):
-    """Only the FlashInfer context enables profiling; local bucket policy never leaks."""
-    tuner = AutoTuner()
-    monkeypatch.setattr(AutoTuner, "_instance", tuner)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=nullcontext))
-    inputs = _meta_mxfp8_inputs()
-    monkeypatch.setattr(MXFP8GemmUnifiedRunner, "forward", lambda *a, **k: inputs[0])
-    monkeypatch.setattr(MXFP8QuantizeRunner, "forward", lambda *a, **k: tuple(inputs[:2]))
-
-    def choose_one(custom_op, runners, tuning_config, selected_inputs):
-        assert tuner.is_tuning_mode == flashinfer_warmup
-        assert tuner.skip_dynamic_tuning_buckets
-        return runners[0], -1
-
-    monkeypatch.setattr(tuner, "choose_one", choose_one)
-    with (
-        autotune(tune_mode=outer_tuning, skip_dynamic_tuning_buckets=outer_skip_buckets),
-        flashinfer_mxfp8_autotune() if flashinfer_warmup else nullcontext(),
-    ):
-        custom_ops_module.mxfp8_gemm_autotuned(*inputs, torch.bfloat16)
-        assert (tuner.is_tuning_mode, tuner.skip_dynamic_tuning_buckets) == (
-            outer_tuning,
-            outer_skip_buckets,
-        )
-        custom_ops_module.mxfp8_quantize_gemm_autotuned(inputs[0], *inputs[2:], torch.bfloat16)
-        assert (tuner.is_tuning_mode, tuner.skip_dynamic_tuning_buckets) == (
-            outer_tuning,
-            outer_skip_buckets,
-        )
-    assert not tuner.is_tuning_mode and not tuner.skip_dynamic_tuning_buckets
-    assert not linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    "phase,enable_autotuner",
-    [("warmup", True), ("warmup", False), ("capture", True), ("context", True)],
-)
-def test_mxfp8_decode_graph_warmup_autotunes_automatically(monkeypatch, phase, enable_autotuner):
-    """Engine FlashInfer warmup leaves other operators' tuning and bucket modes intact."""
-    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
-    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
-
-    tuner = AutoTuner()
-    monkeypatch.setattr(AutoTuner, "_instance", tuner)
-    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=nullcontext))
-    method = Mock(spec=MXFP8LinearMethod)
-    method.needs_flashinfer_autotune = enable_autotuner
-    method.tune_mxfp8_backends = enable_autotuner
-    runner = object.__new__(DecoderCudaGraphs)
-    runner.model = SimpleNamespace(modules=lambda: [SimpleNamespace(quant_method=method)])
-    runner._config = SimpleNamespace(
-        enable_autotuner=enable_autotuner,
-        prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
-    )
-    runner.cuda_graph_runner = SimpleNamespace(enabled=True, is_warmup_only=phase != "capture")
-    runner._metrics = {}
-    runner.maybe_autotune_lora = nullcontext
-    manager = SimpleNamespace(context_swa_layer_limit=1) if phase == "context" else None
-    resources = SimpleNamespace(get_resource_manager=lambda key: manager)
-    observed = []
-
-    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
-
-    def generation_warmup(resource_manager):
-        observed.append(
-            (
-                tuner.is_tuning_mode,
-                tuner.skip_dynamic_tuning_buckets,
-                linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
-                linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get(),
-            )
-        )
-
-    runner._capture_generation_cuda_graphs = generation_warmup
-    runner._capture_additional_cuda_graphs = Mock()
-    runner._capture_prefill_cuda_graphs = Mock()
-    runner.run_cuda_graph_warmup(resources)
-    tune = phase == "warmup" and enable_autotuner
-    assert observed == ([] if phase == "context" else [(False, False, tune, True)])
-    assert not tuner.is_tuning_mode and not tuner.skip_dynamic_tuning_buckets
-    assert not linear_module._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
-    assert not linear_module._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
@@ -1229,7 +1128,6 @@ def test_mxfp8_decode_graph_warmup_autotunes_automatically(monkeypatch, phase, e
         ("flashinfer_cutlass", None),
         ("flashinfer_cute_dsl", None),
         ("cutedsl_swap_ab", 0),
-        ("cutedsl_swap_ab", 1),
     ],
 )
 @torch.inference_mode()

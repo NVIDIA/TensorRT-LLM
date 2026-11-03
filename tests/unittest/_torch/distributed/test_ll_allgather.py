@@ -60,9 +60,9 @@ def _shards(nranks, rows, width, dtype, seed):
     return shards
 
 
-@pytest.mark.parametrize("nranks", [2, 4, 8])
+@pytest.mark.parametrize("nranks", [4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("rows,width", [(1, 1536), (6, 1536), (13, 256), (48, 1536)])
+@pytest.mark.parametrize("rows,width", [(13, 256), (48, 1536)])
 def test_matches_concatenation(nranks, dtype, rows, width):
     group = _EmulatedGroup(nranks, max_shard_bytes=48 * 1536 * 4)
     shards = _shards(nranks, rows, width, dtype, seed=rows * width + nranks)

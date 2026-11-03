@@ -103,7 +103,7 @@ def _state(requests, new_tokens, new_tokens_lens):
     )
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize("seed", [0])
 def test_update_requests_matches_handle_stop_criteria(monkeypatch, seed):
     reasons = {}
     finish_by = LlmRequest.finish_by

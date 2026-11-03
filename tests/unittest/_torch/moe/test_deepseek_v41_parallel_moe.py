@@ -74,6 +74,9 @@ class _ReferenceRouting(BaseMoeRoutingMethod):
 
 def _init_worker(paths: list[str]) -> None:
     sys.path[:] = paths
+    # Resolve __extra_import_path__ imports, such as test_modeling_deepseekv41's, as pytest does.
+    import test_common.magic_import  # noqa: F401
+
     os.environ["TRTLLM_FORCE_COMM_METHOD"] = "ALLGATHER"
     os.environ["ENABLE_PERFECT_ROUTER"] = "0"
     # Keep torch backend proxies out of the initializer's pickle.

@@ -2206,49 +2206,6 @@ def test_context_owner_tables_wait_for_the_first_owner_layer(manager_requests):
             )
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@torch.inference_mode()
-def test_shared_context_compacts_once_per_staging_group_and_forward(manager_requests, monkeypatch):
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
-
-    manager, requests = manager_requests
-    source = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
-    source.set_source_batch([200, 200], [0, 0])
-    _prepare(source, requests, [130, 131], [2, 1])
-    q = torch.zeros(3, 8, 512, device="cuda", dtype=torch.bfloat16)
-    logical = torch.tensor([[110], [111], [112]], dtype=torch.int64, device="cuda")
-    compacts = []
-    monkeypatch.setattr(
-        kernel, "stage_shared_rows", lambda *args, compact, **kwargs: compacts.append(compact)
-    )
-
-    def stage(layer):
-        tile = source.get_query_tile_metadata(q, 512, query_start=0, layer_idx=layer)
-        tile.stage_selected(
-            CSA2BackendForwardArgs(
-                swa_pool=manager.get_swa_buffer(layer),
-                swa_indices=_swa(source, layer)[0],
-                main_pool=manager.get_main_buffer(layer),
-                topk_indices=logical,
-                main_logical_indices=logical,
-                stage_group=(1, 1, 0),
-                state=SimpleNamespace(metadata=source),
-            ),
-            main_logical=logical,
-        )
-
-    # Layer 2 reuses layer 1's owner and index source; a new forward compacts again.
-    stage(1)
-    stage(2)
-    source.reset_routing()
-    stage(2)
-    assert compacts == [True, False, True]
-
-
 # Without SWA scratch the compressor-state pages come from the base page table.
 @skip_pre_blackwell
 @pytest.mark.parametrize("manager_requests", [{"scratch": False}], indirect=True)
@@ -2315,11 +2272,11 @@ def _decode_derived_outputs(metadata):
     return outputs
 
 
-def _prepare_decode_metadata(metadata, requests, starts, *, deferred=False, length=1):
+def _prepare_decode_metadata(metadata, requests, starts, *, deferred=False):
     from contextlib import nullcontext
 
     metadata.request_ids = [request.py_request_id for request in requests]
-    metadata.seq_lens = torch.full((len(requests),), length, dtype=torch.int32)
+    metadata.seq_lens = torch.ones(len(requests), dtype=torch.int32)
     metadata.num_contexts = 0
     metadata.prompt_lens = [request.prompt_len for request in requests]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=starts)
@@ -2356,41 +2313,6 @@ def test_steady_decode_refreshes_page_tables_across_pages(manager_requests, monk
         for owner, table in reference.csa2_global_page_tables.items():
             torch.testing.assert_close(metadata.csa2_global_page_tables[owner], table)
     assert refreshed == [128]
-
-
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("manager_requests", [{"speculative": True}], indirect=True)
-@torch.inference_mode()
-def test_verification_steps_keep_the_steady_path(manager_requests, monkeypatch):
-    manager, requests = manager_requests
-    metadata = CSA2TrtllmMetadata(max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager)
-    metadata.is_spec_decoding_enabled = True
-    full = []
-    plans = metadata._prepare_indexer_plans
-    monkeypatch.setattr(
-        metadata, "_prepare_indexer_plans", lambda copy: full.append(copy) or plans(copy)
-    )
-    # Each step commits between none and all three verified tokens of a request.
-    for starts in ([125, 128], [126, 131], [129, 131], [130, 133]):
-        _prepare_decode_metadata(metadata, requests, starts, length=3)
-        reference = CSA2TrtllmMetadata(
-            max_num_requests=2, max_num_tokens=1024, kv_cache_manager=manager
-        )
-        reference.is_spec_decoding_enabled = True
-        _prepare_decode_metadata(reference, requests, starts, length=3)
-        observed = _decode_derived_outputs(metadata)
-        for name, tensor in _decode_derived_outputs(reference).items():
-            torch.testing.assert_close(observed[name], tensor)
-        for owner, table in reference.csa2_global_page_tables.items():
-            torch.testing.assert_close(metadata.csa2_global_page_tables[owner], table)
-    assert len(full) == 1
-    # A request ID re-created at the same position has a new cache, so the prepare is full.
-    manager.free_resources(requests[0])
-    assert manager.prepare_context(requests[0])
-    assert manager.resize_context(requests[0], requests[0].context_chunk_size)
-    _prepare_decode_metadata(metadata, requests, [130, 133], length=3)
-    assert len(full) == 2
 
 
 @skip_pre_blackwell

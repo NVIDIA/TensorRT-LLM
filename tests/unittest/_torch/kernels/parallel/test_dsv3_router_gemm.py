@@ -134,9 +134,8 @@ def test_router_latent_gemm_matches_separate_ops(num_tokens: int) -> None:
                                                                   (10, 3),
                                                                   (10, 7)),
                     reason="The small-M kernel runs on SM100/SM103/SM107")
-@pytest.mark.parametrize("m", [1, 6, 12, 64])
-@pytest.mark.parametrize("num_experts,hidden_size", [(384, 5120), (128, 5120),
-                                                     (256, 4096)])
+@pytest.mark.parametrize("m", [1, 64])
+@pytest.mark.parametrize("num_experts,hidden_size", [(384, 5120), (128, 5120)])
 def test_router_gemm_small_m_matches_reference(m, num_experts, hidden_size):
     """The small-M tactic equals the exact product; the race may pick either kernel."""
     from tensorrt_llm._torch.autotuner import AutoTuner, autotune

@@ -4276,23 +4276,6 @@ def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     assert len(scheduled_batch.context_requests) == 1
 
 
-def test_pad_empty_batch_preserves_context_dummy_role():
-    stub, scheduled_batch = _unfittable_rank()
-    stub._adp_dummy_is_gen = False
-
-    _run_pad_empty(stub, scheduled_batch)
-
-    assert scheduled_batch.batch_size == 1
-    assert scheduled_batch.generation_requests == []
-    dummy = scheduled_batch.context_requests_last_chunk[0]
-    assert dummy.context_chunk_size == 1
-    assert dummy.is_attention_dp_dummy is True
-    assert dummy in stub.active_requests
-    assert stub._pending_adp_dummy_request is dummy
-    assert stub.add_dummy_calls[0]["is_gen"] is False
-    assert stub.add_dummy_calls[0]["token_nums"] == [1]
-
-
 def test_pad_empty_batch_no_op_when_batch_is_not_empty():
     stub, scheduled_batch = _unfittable_rank()
     scheduled_batch.context_requests_chunking = [

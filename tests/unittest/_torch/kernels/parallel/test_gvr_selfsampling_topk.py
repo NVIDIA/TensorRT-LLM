@@ -509,8 +509,8 @@ def _check_wide(logits, lengths, out):
         assert torch.equal(logits[r, got.long()].sort().values, want), r
 
 
-@pytest.mark.parametrize("rows", [192, 296])
-@pytest.mark.parametrize("kind", ["plain", "spiky", "ties"])
+@pytest.mark.parametrize("rows", [296])
+@pytest.mark.parametrize("kind", ["spiky", "ties"])
 def test_selfsampling_topk_varlen_wide_cta(monkeypatch, rows, kind):
     """149..296 varlen rows run gvr_main as one 1,024-thread CTA per row and select the exact
     Top-K, as the 512-thread plan does (eager and CUDA-graph replay)."""

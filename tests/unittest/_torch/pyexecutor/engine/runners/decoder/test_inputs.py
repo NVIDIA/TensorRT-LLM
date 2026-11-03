@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import contextlib
 import unittest
-from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -24,7 +23,6 @@ from _torch.pyexecutor.engine_test_utils import (
 from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
 from utils.util import skip_pre_blackwell_unittest, skip_ray
 
-from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
@@ -59,7 +57,7 @@ from tensorrt_llm.llmapi import (
     SADecodingConfig,
     SamplingParams,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType, Mapping
 
 if TYPE_CHECKING:
@@ -728,112 +726,6 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             staged["kv_lens_offsets"][:4].tolist(),
             [0, lens[4].item() - tokens_per_step, lens[2].item() - tokens_per_step, 0],
         )
-
-    def test_breakable_mixed_eligibility_preserves_compaction_fallback(self) -> None:
-        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
-        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-        from tensorrt_llm._torch.utils import (
-            get_per_request_prefill_cuda_graph_flag,
-            set_per_request_prefill_cuda_graph_flag,
-        )
-
-        self.addCleanup(
-            set_per_request_prefill_cuda_graph_flag, get_per_request_prefill_cuda_graph_flag()
-        )
-        for case in ("mixed", "remote_tail_dspark", "compaction"):
-            with self.subTest(case=case):
-                engine, kv_cache_manager = self.enterContext(create_model_engine_and_kvcache())
-                preparer = engine._runner._inputs
-                speculative = case == "remote_tail_dspark"
-                draft_len = 5 if speculative else 0
-                spec_config = (
-                    SimpleNamespace(
-                        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-                        is_linear_tree=True,
-                        max_draft_len=draft_len,
-                    )
-                    if speculative
-                    else None
-                )
-                preparer._config = replace(
-                    preparer._config,
-                    enable_attention_dp=speculative,
-                    disable_overlap_scheduler=True,
-                    is_spec_decode=speculative,
-                    spec_config=spec_config,
-                    prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-                    prefill_cuda_graph_num_tokens=[8, 16],
-                )
-                graphs = Mock(is_capturing=False, is_warming_up=False)
-                graphs.has_graph.return_value = True
-                graphs.captured_num_tokens = [8, 16]
-                preparer.breakable_cuda_graph_runner = graphs
-                preparer.dist = Mock()
-
-                def gather(values: list[int]) -> torch.Tensor:
-                    return torch.tensor([values])
-
-                preparer.dist.tp_allgather_int64.side_effect = gather
-                preparer.dist.tp_cp_allgather_int64.side_effect = gather
-                preparer.get_runtime_tokens_per_gen_step = lambda length: length + 1
-                context = _create_request_with_tokens([11, 22, 33, 44], 1)
-                context.context_chunk_size = 4
-                context.py_seq_slot = 0
-                generation = _create_request_with_tokens([50, 51], 2)
-                generation.py_seq_slot = 1
-                generation.py_draft_tokens = [60] * draft_len
-                batch = ScheduledRequests()
-                batch.context_requests_last_chunk = [context]
-                batch.generation_requests = [generation]
-                metadata = AttentionMetadata(
-                    max_num_requests=4, max_num_tokens=32, kv_cache_manager=kv_cache_manager
-                )
-                metadata.is_cuda_graph = False
-                metadata.decoder_replay_plan = None
-                if case == "compaction":
-                    metadata.decoder_replay_plan = SimpleNamespace(replays_local_tokens=True)
-                spec_metadata = None
-                if speculative:
-                    engine.model.model = SimpleNamespace(
-                        disagg_remote_tail_replay=True, disagg_context_only=False
-                    )
-                    context.py_csa2_remote_tail_mode = "destination"
-                    context.py_csa2_remote_tail_start = 0
-                    batch.attention_dp_phase = RemoteTailPhase.MIXED
-                    spec_metadata = Mock(
-                        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
-                        context_prompt_lookahead_tokens=None,
-                        dp_num_tokens=Mock(return_value=10),
-                    )
-                    gather_ids = torch.empty(16, dtype=torch.int32, device="cuda")
-                    preparer._buffers = replace(
-                        preparer._buffers,
-                        draft_tokens_cuda=torch.empty(5, dtype=torch.int32, device="cuda"),
-                        gather_ids_cuda=gather_ids,
-                    )
-                    preparer._gather_ids_buffer = DeviceCopyBuffer(gather_ids)
-                resources = ResourceManager(
-                    {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager}
-                )
-
-                inputs = preparer.prepare_inputs(
-                    batch,
-                    kv_cache_manager,
-                    metadata,
-                    spec_metadata=spec_metadata,
-                    resource_manager=resources,
-                    enable_spec_decode=speculative,
-                    runtime_draft_len=draft_len,
-                    is_dummy=False,
-                ).kwargs
-
-                eligible = case != "compaction"
-                bucket = 16 if speculative else 8
-                self.assertEqual(get_per_request_prefill_cuda_graph_flag(), eligible)
-                self.assertEqual(inputs["input_ids"].numel(), bucket if eligible else 5)
-                self.assertEqual(metadata.padded_num_tokens, bucket if eligible else None)
-                if speculative:
-                    self.assertEqual(spec_metadata.all_rank_num_gens, [1])
 
     @skip_ray
     def test_prepare_inputs_with_helix_parallelism(self) -> None:

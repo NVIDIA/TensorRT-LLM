@@ -245,12 +245,7 @@ SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
 // "Fail Fast" feature is enabled by default for the pre-merge pipeline.
 // "Fail Fast" feature is always disabled for the post-merge pipeline.
-// TRTLLMINF-435 TEMPORARY: This flag also controls DS v4.1 feature-branch test continuation.
-// Remove the temporary behavior before merging feat/ds-v4.1-bringup into main or a release branch.
-boolean disableFailFastRequested = gitlabParamsFromBot.get("disable_fail_fast", false)
-boolean enableFailFast =
-    !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) &&
-    !disableFailFastRequested
+boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ /.*Dependency_Testing_TRT.*/) && !gitlabParamsFromBot.get("disable_fail_fast", false)
 
 boolean isReleaseCheckMode = (runMode == "release_check")
 
@@ -2699,8 +2694,7 @@ def getPLCRepoUrlKey()
     def repoUrlKey = "tensorrt_llm_github_sync"
     def normalizedRepo = LLM_REPO.replaceFirst(/\.git$/, "")
     withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-        if (normalizedRepo == DEFAULT_LLM_REPO.replaceFirst(/\.git$/, "") ||
-            (env.gitlabMergeRequestIid && env.gitlabTargetRepoHttpUrl == DEFAULT_LLM_REPO)) {
+        if (normalizedRepo == DEFAULT_LLM_REPO.replaceFirst(/\.git$/, "")) {
             repoUrlKey = "tensorrt_llm_internal"
         } else if (normalizedRepo == "https://github.com/NVIDIA/TensorRT-LLM") {
             repoUrlKey = "tensorrt_llm_github"
@@ -2812,12 +2806,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
                     return
                 }
-                catchError(
-                    buildResult: 'FAILURE',
-                    stageResult: 'FAILURE',
-                    catchInterruptions: false) {
-                    launchReleaseCheck(this, globalVars)
-                }
+                launchReleaseCheck(this, globalVars)
             }
         },
         "Check-Test-List": {
@@ -3030,10 +3019,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    // TRTLLMINF-435 TEMPORARY: Keep multi-GPU coverage on the DS v4.1 feature branch.
-                    // Remove this flag exception before merging into main or a release branch.
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || disableFailFastRequested) {
-                        echo "Fail-fast is disabled; x86_64 multi-GPU test is still kept running after the single-GPU test failed."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
@@ -3043,12 +3030,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. Block multi-GPU when fail-fast is enabled;
-                // post-merge and explicit --disable-fail-fast runs keep it for maximum signal.
-                // TRTLLMINF-435 TEMPORARY: Remove the flag exception before main/release merge.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || disableFailFastRequested) {
-                        echo "Fail-fast is disabled; x86_64 multi-GPU test is still kept running after the single-GPU test was infra-incomplete (UNSTABLE)."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
@@ -3253,10 +3241,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    // TRTLLMINF-435 TEMPORARY: Keep multi-GPU coverage on the DS v4.1 feature branch.
-                    // Remove this flag exception before merging into main or a release branch.
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || disableFailFastRequested) {
-                        echo "Fail-fast is disabled; SBSA multi-GPU test is still kept running after the single-GPU test failed."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
@@ -3266,12 +3252,13 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 // Single-GPU was infra-incomplete (UNSTABLE): its coverage is a
-                // prerequisite for multi-GPU. Block multi-GPU when fail-fast is enabled;
-                // post-merge and explicit --disable-fail-fast runs keep it for maximum signal.
-                // TRTLLMINF-435 TEMPORARY: Remove the flag exception before main/release merge.
+                // prerequisite for multi-GPU. In pre-merge, explicitly block multi-GPU
+                // rather than mark it skipped: it is required but cannot run until the
+                // single-GPU sub-job is re-run. Post-merge keeps running multi-GPU for
+                // maximum signal, mirroring the single-GPU-failed policy.
                 if (singleGpuInfraIncomplete) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || disableFailFastRequested) {
-                        echo "Fail-fast is disabled; SBSA multi-GPU test is still kept running after the single-GPU test was infra-incomplete (UNSTABLE)."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test was infra-incomplete (UNSTABLE); multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {

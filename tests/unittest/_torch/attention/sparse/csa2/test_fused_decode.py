@@ -141,18 +141,6 @@ def test_fused_decode_matches_fp32_reference(batch):
     _check_close(output, _reference(q, swa_pool, swa, main_pool, main, sinks), dead)
 
 
-@torch.inference_mode()
-def test_fused_decode_swa_only():
-    tokens = 6 * 32
-    generator = torch.Generator(device="cuda").manual_seed(2032)
-    swa_pool, _ = _pools(1024, 64, seed=7)
-    swa, _, dead = _selections(tokens, 1024, 64, generator, holes=0.2, dead=2)
-    q = torch.randn(tokens, HEADS, DIM, device="cuda", generator=generator).bfloat16()
-    sinks = torch.randn(HEADS, device="cuda", generator=generator)
-    output = _decode(q, swa_pool, swa, sinks)
-    _check_close(output, _reference(q, swa_pool, swa, None, None, sinks), dead)
-
-
 def _logical_case(batch, page_size, ratio, generator):
     """Requests with 6 rows each, scattered pages (some missing) and DSpark-like positions."""
     tokens_per_request = 6

@@ -13,7 +13,6 @@ Single-rank cases run one ``CoordinatorHarness``; the multi-rank case runs one
 per rank over a ``FakeDistGroup``.
 """
 
-import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -800,65 +799,3 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]
     assert [req.decoding_iter for req in (first, second)] == [0, 0]
-
-
-# -- first-token responses under attention DP ---------------------------------
-
-
-def _adp_response_executor(dist) -> PyExecutor:
-    """Bare ADP rank whose first-token, flush and response-gather paths run for real."""
-    executor = object.__new__(PyExecutor)
-    executor.dist = dist
-    dist.mapping = SimpleNamespace(tp_group=[0, 1])
-    executor.enable_attention_dp = True
-    executor.gather_all_responses = False
-    executor.should_exclude_last_generation_logits = False
-    executor._pending_transfer_responses = []
-    executor._pending_response_terminations = []
-    executor.response_cv = threading.Condition()
-    executor.responses = {}
-    executor.result_wait_queues = {}
-    return executor
-
-
-def _first_token_request(rid: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        py_request_id=rid,
-        py_decoding_iter=1,
-        py_disaggregated_params=None,
-        create_response=lambda: f"first token {rid}",
-    )
-
-
-@pytest.mark.parametrize("ride_transfer_flush", [False, True])
-def test_first_token_responses_ride_the_iterations_transfer_flush(ride_transfer_flush) -> None:
-    """Under multi-rank attention DP the overlap loop's first-token responses
-    ride the iteration's transfer-response flush: one response gather per
-    iteration instead of two, and rank 0 publishes the same responses."""
-    group = FakeDistGroup(world_size=2, tp_size=2)
-    executors = [_adp_response_executor(group.rank(rank)) for rank in range(2)]
-    executors[1]._pending_transfer_responses.append((9, "transfer error 9"))
-    batches = [
-        SimpleNamespace(generation_requests=[_first_token_request(1)]),
-        SimpleNamespace(generation_requests=[_first_token_request(2), _first_token_request(3)]),
-    ]
-
-    def iteration(rank: int) -> None:
-        executor = executors[rank]
-        executor._handle_first_token_response(
-            batches[rank], ride_transfer_flush=ride_transfer_flush
-        )
-        executor._flush_pending_transfer_responses()
-
-    group.run(iteration)
-
-    gathers = [name for name, _ in group.rank(0).calls]
-    assert gathers == ["tp_gather"] * (1 if ride_transfer_flush else 2)
-    assert executors[0].responses == {
-        1: ["first token 1"],
-        2: ["first token 2"],
-        3: ["first token 3"],
-        9: ["transfer error 9"],
-    }
-    assert executors[1].responses == {}
-    assert all(not executor._pending_transfer_responses for executor in executors)

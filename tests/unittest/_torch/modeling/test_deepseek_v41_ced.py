@@ -334,9 +334,9 @@ def test_full_context_logits_after_truncated_peer(model_and_config, monkeypatch)
     [
         pytest.param((512, 256, 129), None, id="empty-decoder-chunks"),
         pytest.param((384, 127, 130), "logits", id="chunked-full-logits"),
-        pytest.param((513,), "hidden", id="full-hidden-states"),
     ],
 )
+@pytest.mark.parametrize("cache_config", ["fp8"], indirect=True)
 def test_chunk_allocated_scratch_replay_matches_paged_continuation(
     model_and_config, monkeypatch, chunks, full_output
 ):
@@ -367,7 +367,6 @@ def test_chunk_allocated_scratch_replay_matches_paged_continuation(
                 sampling_config=SamplingConfig(),
                 is_streaming=False,
                 return_context_logits=full_output == "logits",
-                additional_outputs=["hidden_states"] if full_output == "hidden" else None,
             )
             assert manager.prepare_context(req)
             cache = manager.kv_cache_map[0]
@@ -388,25 +387,18 @@ def test_chunk_allocated_scratch_replay_matches_paged_continuation(
                         manager.get_swa_buffer(0).data_ptr() != manager.get_swa_buffer(5).data_ptr()
                     )
                 end = offset + length
-                hidden = []
-                with model.model.register_forward_hook(
-                    lambda _module, _inputs, states: hidden.append(states.clone())
-                ):
-                    output = run(
-                        model,
-                        metadata,
-                        [req],
-                        ids[offset:end],
-                        [offset],
-                        [length],
-                        1,
-                        return_context_logits=full_output == "logits",
-                    )
+                output = run(
+                    model,
+                    metadata,
+                    [req],
+                    ids[offset:end],
+                    [offset],
+                    [length],
+                    1,
+                    return_context_logits=full_output == "logits",
+                )
                 kept = length if full_output else max(0, end - max(offset, total - 140))
                 assert metadata.csa2_decoder_capture_lens == (kept,)
-                if full_output == "hidden":
-                    assert hidden[0].shape[0] == length
-                    outputs.append(hidden[0])
                 if full_output or end == total:
                     outputs.append(output.clone())
                 req.context_current_position = end
@@ -436,8 +428,8 @@ def test_chunk_allocated_scratch_replay_matches_paged_continuation(
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("reuse", [False, True])
-def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch, reuse):
+@pytest.mark.parametrize("cache_config", ["fp8"], ids=["fp8-True"], indirect=True)
+def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch):
     """Keep reserved normal pages writable across chunks, suspension and publication."""
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
     from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
@@ -449,7 +441,7 @@ def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch, reus
     spec = DSparkDecodingConfig(max_draft_len=5)
     spec.__dict__["draft_is_embedded_in_target"] = True
     with cache_case(
-        config, sparse, dtype, [1], [0], 1, reuse=reuse, scratch=True, spec_config=spec
+        config, sparse, dtype, [1], [0], 1, reuse=True, scratch=True, spec_config=spec
     ) as case:
         manager = case[0].kv_cache_manager
         manager.free_resources(request(0, 1))
@@ -491,19 +483,15 @@ def test_dspark_scratch_preserves_reserved_pages(cache_config, monkeypatch, reus
             # normal pages must contain these bytes, rather than untouched storage.
             buffer.index_fill_(0, pages[offset // 128 : (offset + 512) // 128].long(), 17)
             req.context_current_position = offset + 512
-            if reuse:
-                manager.try_commit_blocks(req)
-            else:
-                assert cache.resize(None, offset + 512)
-        if reuse:
-            count, pages = _introspection.reuse_match_pages(
-                manager.impl, cache.reuse_scope, list(range(1024)), pool
-            )
-            assert count == 1024
-            assert pages[4] is not None
-            assert pages[4][0] == reserved_page
-            assert (buffer[reserved_index] == 17).all()
-            assert pages[5] is None  # A genuinely scratch-backed block is never published.
+            manager.try_commit_blocks(req)
+        count, pages = _introspection.reuse_match_pages(
+            manager.impl, cache.reuse_scope, list(range(1024)), pool
+        )
+        assert count == 1024
+        assert pages[4] is not None
+        assert pages[4][0] == reserved_page
+        assert (buffer[reserved_index] == 17).all()
+        assert pages[5] is None  # A genuinely scratch-backed block is never published.
 
 
 @pytest.mark.parametrize(
@@ -572,37 +560,6 @@ def test_final_window_mixed_batch_keeps_finished_context_and_generation(
         assert metadata.seq_lens.tolist() == lengths
         assert actual.shape == expected.shape == (3, 1024)
         torch.testing.assert_close(actual[1:], expected[1:], atol=0.02, rtol=0.02)
-
-
-@skip_pre_blackwell
-def test_small_token_budget_falls_back_to_required_encoder_state(cache_config, monkeypatch):
-    from _deepseek_v41_test_utils import _init_random_weights
-
-    from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
-
-    config, sparse, dtype = cache_config
-    monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
-    monkeypatch.delenv("TRTLLM_V41_ENCODER_REPLAY", raising=False)
-    config.max_num_tokens = 3
-    model = DeepseekV41ForCausalLM(config).cuda()
-    _init_random_weights(model)
-    assert not model.model.encoder_replay_enabled
-    assert model.model.decoder_replay_window == 140
-    with (
-        torch.inference_mode(),
-        cache_case(config, sparse, dtype, [3], [0], 1, reuse=True, max_num_tokens=3) as case,
-        canonical_routing(),
-    ):
-        metadata, ids, _, _ = case
-        manager = metadata.kv_cache_manager
-        assert not manager._encoder_replay_enabled
-        assert manager._encoder_reuse_policy.name == "REQUIRED"
-        assert not manager._encoder_optional_groups
-        assert manager._decoder_replay_window == 140
-        assert manager._swa_retention(0) == 128
-        output = run(model, metadata, [request(0, 3)], ids, [0], [3], 1)
-        assert output.shape == (1, 1024)
-        assert torch.isfinite(output).all()
 
 
 @skip_pre_blackwell

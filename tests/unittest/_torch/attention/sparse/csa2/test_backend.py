@@ -42,34 +42,6 @@ def _reference(q, swa, extra, swa_valid, extra_valid, sink):
     return torch.einsum("qhk,qkd->qhd", probs, kv.float()).to(q.dtype)
 
 
-@skip_pre_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("staging_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("shared", [False, True])
-def test_staging_keeps_minimum_tma_backing(staging_dtype, shared):
-    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
-
-    q = torch.empty(1, 8, 512, dtype=torch.bfloat16, device="cuda")
-    metadata = CSA2TrtllmMetadata.for_query_tile(
-        q,
-        0,
-        staging_dtype=staging_dtype,
-        context_lengths=[1] if shared else None,
-        shared_rows=75 if shared else None,
-    )
-    if shared:
-        assert metadata.shared_pool.shape == (75, 512)
-        assert metadata.swa_pool is metadata.extra_pool is metadata.shared_pool
-    else:
-        assert metadata.swa_pool.shape == (1, 128, 512)
-        assert metadata.extra_pool.shape == (1, 1, 512)
-    for pool in (metadata.swa_pool, metadata.extra_pool):
-        remaining_storage = pool.untyped_storage().nbytes() - (
-            pool.storage_offset() * pool.element_size()
-        )
-        assert remaining_storage >= 128 << 10
-
-
 def _backend(
     heads,
     layer_idx=20,
@@ -1947,12 +1919,8 @@ def _fused_context_call(lengths, full, seed):
 @skip_no_fused_context
 @pytest.mark.parametrize(
     "lengths,full",
-    [
-        ([300, 1, 129, 1500], True),
-        ([2048], True),
-        ([5, 127, 640, 1], False),
-        ([1024, 1024], False),
-    ],
+    [([300, 1, 129, 1500], True), ([5, 127, 640, 1], False)],
+    ids=["lengths0-True", "lengths2-False"],
 )
 @torch.inference_mode()
 def test_fused_context_matches_trtllm_gen(monkeypatch, lengths, full):

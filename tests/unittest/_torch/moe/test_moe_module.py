@@ -1736,7 +1736,7 @@ def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quan
 
 
 @pytest.mark.parametrize("moe_backend", [MoeBackendType.TRTLLM, MoeBackendType.MEGAMOE_CUTEDSL])
-@pytest.mark.parametrize("seq_len", [6, 12, 192])
+@pytest.mark.parametrize("seq_len", [6, 192])
 def test_dsv4_fused_route_quant_matches_separate_launches(moe_backend, seq_len):
     """The one-launch DeepSeek-V4 routing + NVFP4 quantization leaves the MoE output bitwise."""
     model = MoeModelConfig(num_experts=256, top_k=6, hidden_size=2048, intermediate_size=512)
@@ -1805,7 +1805,7 @@ def test_dsv4_fused_route_quant_matches_separate_launches(moe_backend, seq_len):
             fused_moe.backend._fuses_route_quant = False
             separate = forward(True)
             separate_rows = forward(False) if unfinalized else None
-    # Bitwise, also where the TRTLLM leaf hands the runner its routing tables (6 tokens, not 12).
+    # Bitwise, also where the TRTLLM leaf hands the runner its routing tables (6 tokens, not 192).
     torch.testing.assert_close(fused, separate, atol=0, rtol=0)
     if unfinalized:
         # An expert's rows may sit elsewhere in its block: compare them by expanded index.

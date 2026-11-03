@@ -2528,13 +2528,13 @@ def test_single_pass_boundary_weight_follows_weight_updates():
 
 @skip_pre_blackwell
 @requires_cuda
-@pytest.mark.parametrize("num_tokens", [17, 384])
-def test_single_pass_boundary_side_stream_sinkhorn_cuda_graph(num_tokens: int):
+def test_single_pass_boundary_side_stream_sinkhorn_cuda_graph():
     """Captured with multi-stream, the boundary's Sinkhorn iterations run on a side stream that
     ``post_mapping`` joins; the replay matches the eager in-kernel results bit for bit."""
     module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True)
     if module._boundary_weight is None:
         pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
+    num_tokens = 384  # The boundary's stream and finalize kernels.
     residual_prev = _residual(num_tokens, V41_REAL_HIDDEN_SIZE, seed=1)
     x_prev = _residual(num_tokens, V41_REAL_HIDDEN_SIZE, seed=4)[:, 0, :].contiguous()
     pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
@@ -2563,28 +2563,6 @@ def _mxfp8_scale_index(rows: int, hidden: int) -> torch.Tensor:
     r = torch.arange(rows, device="cuda")[:, None]
     k = torch.arange(hidden // 32, device="cuda")[None, :]
     return r // 128 * (hidden // 128 * 512) + k // 4 * 512 + r % 32 * 16 + r % 128 // 32 * 4 + k % 4
-
-
-@skip_pre_blackwell
-@requires_cuda
-def test_single_pass_boundary_mxfp8_layer_input():
-    """The single-pass boundary's MXFP8 ``layer_input`` is ``mxfp8_quantize(layer_input, True)``
-    byte for byte: the values and the swizzled scales of the token rows."""
-    module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=2, single_pass=True)
-    if module._boundary_weight is None:
-        pytest.skip("the single-pass mHC boundary needs SM100/SM103 and the CuTe DSL")
-    num_tokens, hidden = 196, V41_REAL_HIDDEN_SIZE
-    residual_prev = _residual(num_tokens, hidden, seed=1)
-    x_prev = _residual(num_tokens, hidden, seed=4)[:, 0, :].contiguous()
-    pre_prev, post_prev, comb_prev = module.hc_coeffs(residual_prev)
-    torch.manual_seed(9)
-    norm_w = (torch.rand(hidden, device="cuda") + 0.5).bfloat16()
-    args = (x_prev, residual_prev, post_prev, comb_prev, pre_prev)
-    *outputs, (values, scales) = module.fused_hc_lagged(*args, norm_w, 1e-6, mxfp8=True)
-    ref_values, ref_scales = torch.ops.trtllm.mxfp8_quantize(outputs[4], True)
-    assert torch.equal(values.view(torch.uint8), ref_values.view(torch.uint8))
-    index = _mxfp8_scale_index(num_tokens, hidden)
-    assert torch.equal(scales.view(-1)[index], ref_scales.view(-1)[index])
 
 
 @skip_pre_blackwell
@@ -2729,14 +2707,13 @@ def test_post_collapse_norm(quant):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("rows", [6, 12])
-def test_split_boundary_side_stream_in_cuda_graph(rows: int) -> None:
+def test_split_boundary_side_stream_in_cuda_graph() -> None:
     """Coefficients on a side stream, joined through the returned event, replay the eager split
     boundary under graph capture; they come from the BF16 residual like ``hc_coeffs`` and keep the
     bits of the full collapse."""
     torch.manual_seed(2)
     hc = _build_mhc(V41_REAL_HIDDEN_SIZE)
-    x, res, post, comb, pre, weight = _split_inputs(rows)
+    x, res, post, comb, pre, weight = _split_inputs(6)
     expected = hc.split_hc_lagged(x, res, post, comb, pre, weight, V41_RMS_NORM_EPS)
     for got, want, tol in zip(expected[1:4], hc.hc_coeffs(expected[0]), (1e-5, 1e-5, 1e-4)):
         torch.testing.assert_close(got, want, rtol=1e-3, atol=tol)

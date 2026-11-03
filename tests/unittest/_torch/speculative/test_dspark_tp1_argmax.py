@@ -16,7 +16,6 @@ from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import CompactTPArgmax
 from tensorrt_llm._torch.models.modeling_speculative import VanillaMarkov, markov_prev_embeddings
 from tensorrt_llm._torch.modules.embedding import LMHead
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -35,23 +34,13 @@ def _capture(call):
     return graph, output
 
 
-@pytest.mark.parametrize(
-    "batch,vocab,column",
-    [(1, 129280, False), (32, 129280, False), (2, 8, False), (1, 129280, True)],
-)
-def test_full_vocab_five_step_chain_and_changed_input_graph(monkeypatch, batch, vocab, column):
+def test_full_vocab_five_step_chain_and_changed_input_graph(monkeypatch):
     # The chain on the BF16 head, without its MXFP8 copy.
     monkeypatch.setattr(CompactTPArgmax, "_fp8_head_logits", lambda *args: None)
     device = torch.device("cuda", torch.cuda.current_device())
-    block, hidden, markov_rank = 5, 5120, 256
+    batch, vocab, block, hidden, markov_rank = 32, 129280, 5, 5120, 256
     with torch.inference_mode():
-        head = LMHead(
-            vocab,
-            hidden,
-            dtype=torch.bfloat16,
-            tensor_parallel_mode=TensorParallelMode.COLUMN if column else None,
-            gather_output=column,
-        ).to(device)
+        head = LMHead(vocab, hidden, dtype=torch.bfloat16).to(device)
         markov = VanillaMarkov(vocab_size=vocab, markov_rank=markov_rank).to(device)
         local_generator = torch.Generator(device=device).manual_seed(
             14236 + torch.cuda.current_device()

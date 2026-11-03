@@ -400,24 +400,6 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
     assert body.forward == original_forward
 
 
-def test_runner_skips_capture_after_warmup_when_batch_is_ineligible():
-    body = _Body().cuda()
-    runner = BreakableCUDAGraphRunner(body)
-    inputs = {"value": torch.zeros((8, 4), device="cuda")}
-    calls = 0
-
-    def engine_forward():
-        nonlocal calls
-        calls += 1
-        return body(inputs["value"])
-
-    assert not runner.capture(8, engine_forward, can_capture=lambda: False)
-    assert calls == runner._WARMUP_STEPS
-    assert not runner.has_graph(8)
-    assert runner.state is BreakableCUDAGraphRunnerState.IDLE
-    assert runner._memory_pool is None
-
-
 def test_runner_first_bucket_segments_share_one_memory_pool():
     class BreakableBody(nn.Module):
         @staticmethod

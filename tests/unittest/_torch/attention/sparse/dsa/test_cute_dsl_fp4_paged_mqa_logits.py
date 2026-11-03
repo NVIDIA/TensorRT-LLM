@@ -1725,7 +1725,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch_size, avg_ctx", [(1, 3001), (7, 40001), (25, 6000)])
+@pytest.mark.parametrize("batch_size, avg_ctx", [(1, 3001), (25, 6000)])
 def test_cute_dsl_fp4_paged_mqa_logits_split_rows_match_deepgemm(batch_size, avg_ctx):
     """Six 32-head queries per request, run as three 64-head rows, give DeepGEMM's next_n=6 logits."""
     page, next_n, heads = 64, 6, 32

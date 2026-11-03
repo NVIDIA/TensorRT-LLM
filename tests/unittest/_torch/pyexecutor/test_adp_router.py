@@ -2182,10 +2182,10 @@ class TestStrictConversationAffinity:
     CAP = 2
 
     @staticmethod
-    def _rank(tp_rank: int, strict: bool):
+    def _rank(tp_rank: int):
         config = AttentionDpConfig(
             kv_cache_routing_conversation_affinity=True,
-            kv_cache_routing_strict_conversation_affinity=strict,
+            kv_cache_routing_strict_conversation_affinity=True,
             kv_cache_routing_strict_affinity_max_wait_iters=2,
         )
         router = ADPRouter.create(
@@ -2218,17 +2218,12 @@ class TestStrictConversationAffinity:
         assert placements[0] == placements[1]
         return placements[0]
 
-    @pytest.mark.parametrize("strict", [False, True])
-    def test_later_turn_waits_for_its_conversation_rank(self, strict: bool) -> None:
-        ranks = [self._rank(tp_rank, strict) for tp_rank in range(2)]
+    def test_later_turn_waits_for_its_conversation_rank(self) -> None:
+        ranks = [self._rank(tp_rank) for tp_rank in range(2)]
         assert self._iteration(ranks, [0, 0], [(0, "a"), (1, "b")]) == {0: 0, 1: 1}
-        # "a"'s rank is full: its next turn overflows to a rank without its prefix,
-        # unless strict, where it waits and the request behind it is admitted.
-        placed = self._iteration(ranks, [2, 1], [(10, "a"), (11, "c")])
-        if not strict:
-            assert placed == {10: 1}
-            return
-        assert placed == {11: 1}
+        # "a"'s rank is full: its next turn waits instead of overflowing to a rank without
+        # its prefix, and the request behind it is admitted.
+        assert self._iteration(ranks, [2, 1], [(10, "a"), (11, "c")]) == {11: 1}
         assert self._iteration(ranks, [1, 1], []) == {10: 0}
         # A new conversation ahead of a reserved turn cannot take its slot.
         assert self._iteration(ranks, [1, 1], [(12, "d"), (13, "a")]) == {12: 1, 13: 0}

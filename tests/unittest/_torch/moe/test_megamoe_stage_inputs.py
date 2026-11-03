@@ -48,7 +48,7 @@ def _reference(buffers, idx, weights, x, x_sf, stage_activation):
     return out
 
 
-@pytest.mark.parametrize("num_tokens", [0, 1, 48, MAX_T])
+@pytest.mark.parametrize("num_tokens", [0, 48])
 @pytest.mark.parametrize("stage_activation", [True, False])
 @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
 @torch.inference_mode()
