@@ -1408,6 +1408,83 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         )
 
 
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+def test_nvfp4_gather_grouped_gemm_act_fusion_partial_n_tile():
+    """MMA N 256, whose last N tile is half past the last column, matches MMA N 128 byte for byte."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+    )
+
+    torch.manual_seed(0)
+    sf_vec_size, tile_size = 16, 256
+    # 10304 columns are 80.5 N tiles of 128 with MMA N 256 (161 of 64 with MMA N 128). The last
+    # N tile of a 256-row M tile overruns into its second 128 rows' SFs, which its first N tile
+    # wrote a persistent wave earlier: 81 N tiles outnumber the 2-CTA clusters of any SM100/103 GPU.
+    num_experts, num_tokens, interm_size, k = 4, 1024, 10304, 256
+    # Top-1 routing of 256 tokens to each expert fills its M tile, so all rows are valid.
+    token_selected_experts = (
+        torch.arange(num_tokens, dtype=torch.int32, device="cuda") % num_experts
+    ).unsqueeze(1)
+    token_final_scales = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=1,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    a_bf16 = torch.randint(-1, 2, (num_tokens, k), dtype=torch.int32, device="cuda").to(
+        torch.bfloat16
+    )
+    b_bf16 = torch.randint(
+        -1, 2, (num_experts, 2 * interm_size, k), dtype=torch.int32, device="cuda"
+    ).to(torch.bfloat16)
+    a_global_sf = a_bf16.abs().max().float() / (448 * 6)
+    b_global_sf = b_bf16.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a_bf16, 1 / a_global_sf, sf_vec_size, False)
+    b, b_sf = torch.ops.trtllm.fp4_quantize(b_bf16, 1 / b_global_sf, sf_vec_size, False)
+    inputs = [
+        a.view(torch.float4_e2m1fn_x2),
+        b.view(torch.float4_e2m1fn_x2),
+        unswizzle_sf(a_sf, num_tokens, k, sf_vec_size),
+        b_sf.view(num_experts, 2 * interm_size, k // sf_vec_size),
+        a_global_sf * b_global_sf,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        # |up * silu(gate)| <= k * k for entries in [-1, 1].
+        torch.tensor([448 * 6 / k**2], dtype=torch.float32, device="cuda"),
+    ]
+    runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts, 1, num_experts, 0, tile_size, sf_vec_size
+    )
+    padded_c, padded_sf = runner(inputs, tactic=((tile_size, 256), (2, 1), False))
+    c, c_sf = runner(inputs, tactic=((tile_size, 128), (2, 1), False))
+
+    # Swizzled SFs keep each 128-row block contiguous, so the valid rows' SFs come first.
+    num_sf_bytes = num_tokens * interm_size // sf_vec_size
+    padded_sf, c_sf = padded_sf[:num_sf_bytes], c_sf[:num_sf_bytes]
+    assert torch.equal(padded_c[:num_tokens].view(torch.uint8), c[:num_tokens].view(torch.uint8))
+    assert torch.equal(padded_sf, c_sf), (
+        f"{(padded_sf != c_sf).sum().item()} scale-factor bytes differ"
+    )
+
+
 # ============================================================================
 # Rubin (SM107) Tests
 # ============================================================================

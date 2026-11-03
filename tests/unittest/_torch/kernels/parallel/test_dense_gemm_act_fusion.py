@@ -399,6 +399,36 @@ def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
     assert _sf_match(c_sf, ref_sf, m, inter) > 0.95, "fp4-out SwiGLU SF match < 95%"
 
 
+@skip_pre_blackwell
+@skip_rubin
+def test_dense_gemm_swiglu_fp4out_cluster_padded_n_tiles():
+    """N tiles that the cluster shape pads past the last column leave every output byte as is."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4SwigluFP4OutBlackwellRunner,
+    )
+
+    torch.manual_seed(0)
+    # 39 N tiles of 128 output columns: cluster N 2 pads one past the last column, cluster N 1
+    # none. 2048 rows take several persistent waves, so padded tiles run after valid ones.
+    m, k, inter = 2048, 256, 39 * 128
+    a_bf16 = torch.randint(-5, 5, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    a, a_sf, a_gsf = _quantize_nvfp4(a_bf16)
+    b, b_sf, b_il, b_sf_il, b_gsf = _swiglu_weight(inter, k)
+    alpha = (a_gsf * b_gsf).view(1)
+    ref = _swiglu_ref(a, b, a_sf, b_sf, alpha)
+    norm_const = (1.0 / (ref.abs().max().float() / (FP8_E4M3_MAX * FP4_E2M1_MAX))).view(1)
+
+    inputs = [a, b_il, a_sf, b_sf_il, alpha, norm_const]
+    runner = CuteDSLNVFP4SwigluFP4OutBlackwellRunner()
+    padded_c, padded_sf = runner(inputs, tactic=((128, 256), (1, 2), False))
+    c, c_sf = runner(inputs, tactic=((128, 256), (1, 1), False))
+
+    assert torch.equal(padded_c.view(torch.uint8), c.view(torch.uint8))
+    assert torch.equal(padded_sf, c_sf), (
+        f"{(padded_sf != c_sf).sum().item()} scale-factor bytes differ"
+    )
+
+
 # ---------------------------------------------------------------------------
 # fp4-out fallback / switching condition (module-level dispatch in MLP.forward).
 # fp4-out is selected only when m >= _FP4OUT_MIN_M; below it the (still-fused)
