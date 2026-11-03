@@ -154,6 +154,13 @@ _SPATIAL_TILE = 4
 _SPATIAL_TILE_STACKED_K = 2
 
 
+def _stamp(*tensors: torch.Tensor | None) -> tuple:
+    """What a value derived from ``tensors`` depends on: each tensor's identity, storage,
+    version counter and dtype. A cache keyed on it is rebuilt when any of them is replaced or
+    modified in place."""
+    return tuple(None if t is None else (id(t), t.data_ptr(), t._version, t.dtype) for t in tensors)
+
+
 def temporal_order_for(frames: int) -> int:
     """The temporal Winograd order of a call with ``frames`` output frames: F(4,3) on the
     points (0, 1, -1, 2, -1/2, inf) for a multiple of four frames, else F(2,3)."""
@@ -470,7 +477,9 @@ class _FrameBuffer:
     a chunk at ``[pos, pos+T)`` and the conv reads ``[pos-2, pos+T)`` with no copy. When a
     chunk would run off the end, the two history frames move to the front (one copy). The
     buffer outlives a clip: a new clip starts at the front over zeroed history. ``depth`` is
-    ``2 + chunks * T`` for the chunk length the buffer was allocated for."""
+    ``2 + chunks * T`` for the chunk length the buffer was allocated for. A window on another
+    device than the buffer's allocates a new buffer there (a new clip); sharded buffers belong
+    to the process group and do not move."""
 
     def __init__(self, channels: int, chunks: int = 4) -> None:
         self.channels = channels
@@ -498,7 +507,12 @@ class _FrameBuffer:
         size = (geo.rows, geo.cols) if geo is not None else (h, w)
         # The layout in terms every rank agrees on (an unequal split can change one rank's
         # extent and not another's, and the direct allocation is collective).
-        key = (dtype, shard.frame_key(h, w) if shard is not None else (h, w))
+        device = torch.device(device)
+        key = (dtype, device, shard.frame_key(h, w) if shard is not None else (h, w))
+        if self.tensor is not None and self.tensor.device != device and shard is not None:
+            raise ValueError(
+                "a spatially sharded WinoVae cannot move to another device after its first call"
+            )
         if self.tensor is None or self._key != key:
             self._replace(frames, dtype, device, size, geo, keep_history=False)
             self._key = key
@@ -731,8 +745,8 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
 
     def _derived_weight(self, key: tuple, build: Callable[[], Any]) -> Any:
         """A tensor derived from the weight, built on first use and rebuilt when the weight
-        tensor changes identity or version."""
-        stamp = (self.weight.data_ptr(), self.weight._version)
+        changes (see :func:`_stamp`)."""
+        stamp = _stamp(self.weight)
         cached = self._derived.get(key)
         if cached is None or cached[0] != stamp:
             cached = (stamp, build())
@@ -1009,22 +1023,21 @@ class WinoVaeResample(WanResample):
 
     def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
         super().__init__(dim, mode, upsample_out_dim)
-        self._packed: tuple[int, int, torch.Tensor, torch.Tensor | None] | None = None
+        self._packed: tuple[tuple, torch.Tensor, torch.Tensor | None] | None = None
         # Downsample conv bias left out of the conv: the time conv absorbs it (downsample3d)
         # or the owning block's shortcut-add kernel adds it (downsample2d). Only a block that
         # takes ``pending_bias`` may enable the deferral.
         self.defer_bias_to_consumer = False
         self.pending_bias: torch.Tensor | None = None
-        self._time_bias: tuple[int, int, int, int, torch.Tensor] | None = None
+        self._time_bias: tuple[tuple, torch.Tensor] | None = None
         self.shard: Shard | None = None
 
     def _packed_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         conv = self.resample[1]
-        key = (conv.weight.data_ptr(), conv.weight._version)
-        if self._packed is None or self._packed[:2] != key:
-            packed, packed_bias = pack_upsample_weights(conv.weight, conv.bias)
-            self._packed = (key[0], key[1], packed, packed_bias)
-        return self._packed[2], self._packed[3]
+        key = _stamp(conv.weight, conv.bias)
+        if self._packed is None or self._packed[0] != key:
+            self._packed = (key, *pack_upsample_weights(conv.weight, conv.bias))
+        return self._packed[1], self._packed[2]
 
     def forward(
         self,
@@ -1065,19 +1078,16 @@ class WinoVaeResample(WanResample):
         self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
     ) -> torch.Tensor:
         """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut):
-        ``[B, C, T, H, W] -> [B, Cout, T, 2H, 2W]``."""
-        batch_size, frames = x.shape[0], x.shape[2]
-        x_4d = _video_to_frames_2d(x)
-        packed, packed_bias = self._packed_weights()
-        cout = packed.shape[0] // 4
+        ``[B, C, T, H, W] -> [B, Cout, T, 2H, 2W]``. Shapes the gather kernel does not take run
+        the inherited nearest upsample and 3x3 conv, then add the shortcut."""
         factor_t, repeats = (
             (1, 1) if shortcut is None else (shortcut[1].factor_t, shortcut[1].repeats)
         )
-        if not upsample_gather_supported(cout, factor_t, repeats):
-            raise ValueError(
-                f"the upsample gather kernel does not take {cout} output channels with a "
-                f"temporal factor {factor_t} and {repeats} shortcut repeats"
-            )
+        if not upsample_gather_supported(self.resample[1].out_channels, factor_t, repeats):
+            return self._upsample_space_eager(x, shortcut)
+        batch_size, frames = x.shape[0], x.shape[2]
+        x_4d = _video_to_frames_2d(x)
+        packed, packed_bias = self._packed_weights()
         defer_bias = packed_bias is not None
         if self.shard is not None:
             # One low-res line from each neighbour; the 2x2 conv then emits the H+1 (or W+1)
@@ -1100,6 +1110,20 @@ class WinoVaeResample(WanResample):
         return upsample_gather(
             temp, residual, batch_size, frames, dup.factor_t, dup.repeats, crop, bias=gather_bias
         )
+
+    def _upsample_space_eager(
+        self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
+    ) -> torch.Tensor:
+        """``_upsample_space`` as ``WanVAE`` computes it (whole frames only)."""
+        if self.shard is not None:
+            raise ValueError("a spatially sharded WinoVae upsamples through the gather kernel")
+        batch_size, frames = x.shape[0], x.shape[2]
+        y = self.resample(_video_to_frames_2d(x))  # [B*T, Cout, 2H, 2W]
+        y = y.view(batch_size, frames, *y.shape[1:]).permute(0, 2, 1, 3, 4)
+        if shortcut is not None:
+            residual, dup, first_chunk = shortcut
+            y = y + dup(residual, first_chunk=first_chunk)
+        return _channels_last_3d_if_needed(y)
 
     def _upsample_time(
         self,
@@ -1191,15 +1215,15 @@ class WinoVaeResample(WanResample):
         every input frame of the stride-2 time conv carries ``bias``, so
         ``b' = b_t + sum_k W_t[:, :, k] @ bias`` (composed in fp32, rounded once)."""
         tc = self.time_conv
-        key = (tc.weight.data_ptr(), tc.weight._version, bias.data_ptr(), bias._version)
-        if self._time_bias is None or self._time_bias[:4] != key:
+        key = _stamp(tc.weight, tc.bias, bias)
+        if self._time_bias is None or self._time_bias[0] != key:
             with torch.inference_mode(False), torch.no_grad():
                 w = tc.weight.detach().float()[:, :, :, 0, 0]  # [Cout, Cin, taps]
                 b = bias.detach().float()
                 bt = tc.bias.detach().float() if tc.bias is not None else torch.zeros_like(b)
                 folded = (bt + torch.einsum("oik,i->o", w, b)).to(tc.weight.dtype)
-            self._time_bias = (*key, folded)
-        return self._time_bias[4]
+            self._time_bias = (key, folded)
+        return self._time_bias[1]
 
     def _downsample_time(
         self,
@@ -1269,7 +1293,7 @@ class WinoVaeResidualBlock(WanResidualBlock):
         self, in_dim: int, out_dim: int, dropout: float = 0.0, non_linearity: str = "silu"
     ) -> None:
         super().__init__(in_dim, out_dim, dropout, non_linearity)
-        self._merged_bias: tuple[int, int, torch.Tensor] | None = None
+        self._merged_bias: tuple[tuple, torch.Tensor] | None = None
         # Spatial Winograd applies to both convs on every path (frame pairs, cached single
         # frames), so it is fixed here, not when a path first runs.
         spatial = kernels_available()
@@ -1282,10 +1306,10 @@ class WinoVaeResidualBlock(WanResidualBlock):
         if not with_shortcut:
             return self.conv2.bias
         b2, bs = self.conv2.bias, self.conv_shortcut.bias
-        key = (b2._version, bs._version)
-        if self._merged_bias is None or self._merged_bias[:2] != key:
-            self._merged_bias = (*key, (b2.detach().float() + bs.detach().float()).to(b2.dtype))
-        return self._merged_bias[2]
+        key = _stamp(b2, bs)
+        if self._merged_bias is None or self._merged_bias[0] != key:
+            self._merged_bias = (key, (b2.detach().float() + bs.detach().float()).to(b2.dtype))
+        return self._merged_bias[1]
 
     def forward(
         self,
@@ -1869,7 +1893,10 @@ class WinoVae(WanVAE):
     def set_shard(self, shard: Shard | None) -> None:
         """Run on one spatial slice of the frames: every module exchanges the halo lines it
         needs with the neighbouring ranks (see :mod:`wino_vae_shard`). The caller splits the
-        latents / pixels along the shard's axis and gathers the outputs."""
+        latents / pixels along the shard's axis and gathers the outputs. Sharding needs the
+        CuTe DSL kernels: the halo exchange lives in them."""
+        if shard is not None and not kernels_available():
+            raise ValueError("a spatially sharded WinoVae needs the CuTe DSL kernels")
         self.shard = shard
         for module in self.modules():
             if isinstance(
@@ -1906,13 +1933,7 @@ class WinoVae(WanVAE):
         fp32, rounded once to the model dtype); ``rows`` keeps only the first output
         channels (the posterior mean) or all of them."""
         conv_out, quant = self.encoder.conv_out, self.quant_conv
-        key = (
-            conv_out.weight.data_ptr(),
-            conv_out.weight._version,
-            quant.weight.data_ptr(),
-            quant.weight._version,
-            rows,
-        )
+        key = (_stamp(conv_out.weight, conv_out.bias, quant.weight, quant.bias), rows)
         cached = self._folded_tail.get(rows)
         if cached is not None and cached[0] == key:
             return cached[1]

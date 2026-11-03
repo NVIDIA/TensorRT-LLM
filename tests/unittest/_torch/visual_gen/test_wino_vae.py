@@ -235,3 +235,73 @@ def test_rejects_non_bf16(dtype: torch.dtype) -> None:
         fast.decode(latents.to(dtype), return_dict=False)
     with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
         fast.encode(pixels.to(dtype), return_dict=False)
+
+
+def test_decode_without_kernels_matches_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no CuTe DSL kernels every module takes its eager path, the upsample included."""
+    from tensorrt_llm._torch.visual_gen.models.wan import wino_vae_kernels
+
+    monkeypatch.setattr(wino_vae_kernels, "kernels_available", lambda: False)
+    monkeypatch.setattr(wino_vae_module, "kernels_available", lambda: False)
+    monkeypatch.setattr(wino_vae_module, "sm100_wino_available", lambda: False)
+    _check_encode_decode(*_pair(), 9)
+
+
+def test_upsample_shape_without_gather_matches_native(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shape the gather kernel does not take runs the inherited upsample and conv."""
+    monkeypatch.setattr(wino_vae_module, "upsample_gather_supported", lambda *args: False)
+    _check_encode_decode(*_pair(), 9)
+
+
+def _warm(fast: WinoVae) -> None:
+    pixels, latents = _inputs(9)
+    with torch.inference_mode():
+        fast.encode(pixels, return_dict=False)
+        fast.decode(latents, return_dict=False)
+
+
+def _assert_matches_fresh(fast: WinoVae) -> None:
+    fresh = WinoVae(SMALL_CONFIG)
+    fresh.load_state_dict(fast.state_dict(), strict=True)
+    fresh = fresh.to(device=DEVICE, dtype=DTYPE).eval()
+    pixels, latents = _inputs(9)
+    with torch.inference_mode():
+        assert torch.equal(
+            fast.encode(pixels, return_dict=False)[0].mode(),
+            fresh.encode(pixels, return_dict=False)[0].mode(),
+        )
+        assert torch.equal(
+            fast.decode(latents, return_dict=False)[0], fresh.decode(latents, return_dict=False)[0]
+        )
+
+
+@pytest.mark.parametrize("change", ["in_place", "new_parameter"])
+def test_bias_changes_reach_the_derived_values(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Every value derived from weights or biases (folded encoder tail, folded time-conv bias,
+    merged residual bias, packed upsample weights, Winograd filters) follows a bias that is
+    modified in place or replaced by another parameter: after a warm run the model matches a
+    freshly built one with the same state."""
+    monkeypatch.setattr(wino_vae_module, "_benchmark_convs", lambda **kw: False)
+    _, fast = _pair()
+    _warm(fast)
+    with torch.no_grad():
+        for module in fast.modules():
+            bias = getattr(module, "bias", None)
+            if not isinstance(bias, torch.nn.Parameter):
+                continue
+            if change == "in_place":
+                bias.add_(0.05)
+            else:
+                module.bias = torch.nn.Parameter(bias.detach() + 0.05)
+    _assert_matches_fresh(fast)
+
+
+def test_frame_buffer_follows_the_device() -> None:
+    """The same window shape on another device allocates a buffer there."""
+    buf = wino_vae_module._FrameBuffer(8)
+    on_gpu = buf.window(1, DTYPE, torch.device(DEVICE), (4, 6))
+    assert on_gpu.device.type == "cuda"
+    on_cpu = buf.window(1, DTYPE, torch.device("cpu"), (4, 6))
+    assert on_cpu.device.type == "cpu"
