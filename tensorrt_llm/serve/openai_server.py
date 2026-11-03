@@ -83,6 +83,10 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
+from tensorrt_llm.serve.api.visual_gen.protocol import (ImageEditRequest,
+                                                        ImageGenerationRequest,
+                                                        ImageGenerationResponse,
+                                                        ImageObject)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -107,12 +111,11 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
     EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
-    ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, PromptTokensDetails, ResponseFormat,
-    ResponsesRequest, ResponsesResponse, RuntimeMemoryUpdateRequest,
-    StartProfileRequest, TokenizeRequest, TokenizeResponse,
-    UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
-    to_llm_conversation_params, to_llm_disaggregated_params)
+    MemoryUpdateRequest, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, RuntimeMemoryUpdateRequest, StartProfileRequest,
+    TokenizeRequest, TokenizeResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,

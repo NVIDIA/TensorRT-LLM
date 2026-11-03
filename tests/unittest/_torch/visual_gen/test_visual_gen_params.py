@@ -1568,14 +1568,14 @@ class TestDeprecatedInputReferenceStaysCompatible:
     """
 
     def test_a_bare_string_is_still_accepted(self):
-        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+        from tensorrt_llm.serve.api.visual_gen.protocol import VideoGenerationRequest
 
         assert VideoGenerationRequest(prompt="x", input_reference="aGk=").input_reference == "aGk="
 
     def test_the_typed_field_still_requires_a_format(self):
         from pydantic import ValidationError
 
-        from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest
+        from tensorrt_llm.serve.api.visual_gen.protocol import VideoGenerationRequest
 
         with pytest.raises(ValidationError):
             VideoGenerationRequest(prompt="x", image_reference="aGk=")
