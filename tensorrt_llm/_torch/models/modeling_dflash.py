@@ -510,6 +510,9 @@ class DFlashForCausalLM(nn.Module):
     # True for a drafter built for a disaggregated context server: it only
     # stores the context KV and holds no modules for the block decode.
     context_kv_only = False
+    # True when the drafter's context KV is stored as FP8 E4M3
+    # (speculative_config.context_kv_dtype); the worker binds an FP8 pool.
+    context_kv_fp8 = False
 
     @classmethod
     def _resolve_auto_attention_backend(cls) -> str:

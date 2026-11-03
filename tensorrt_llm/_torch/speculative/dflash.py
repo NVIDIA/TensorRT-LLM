@@ -39,6 +39,7 @@ from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
     DFLASH_CONTEXT_LOWERING,
     get_dflash_paged_append,
+    to_draft_fp8,
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
 )
@@ -821,6 +822,9 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_kv_last_page_len = None
         self._ctx_page_size = 32
         self._ctx_pages_per_slot = 0
+        # Dtype the drafter computes its context K/V in; the pool stores FP8
+        # instead for a drafter with context_kv_fp8.
+        self._ctx_dtype = torch.bfloat16
         self._ctx_paged_append = None
         # True only when the drafter reads the draft KV cache manager's pool
         # AND that manager joins the target's reuse protocol, which is what
@@ -1387,6 +1391,8 @@ class DFlashWorker(SpecWorkerBase):
             )
 
         dtype = dflash_context_dtype(draft_model)
+        self._ctx_dtype = dtype
+        pool_dtype = torch.float8_e4m3fn if draft_model.context_kv_fp8 else dtype
 
         # Reserve slot index max_batch as a scratch slot for padding/unknown
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
@@ -1444,7 +1450,9 @@ class DFlashWorker(SpecWorkerBase):
             pool = (
                 None
                 if self._dflash_attention_backend == "FA4"
-                else self._managed_ctx_pool(draft_kv_cache_manager, L, nkv, hd, dtype, kv_factor)
+                else self._managed_ctx_pool(
+                    draft_kv_cache_manager, L, nkv, hd, pool_dtype, kv_factor
+                )
             )
             # The manager's page size wins when bound to it: its pool is already
             # carved, so the drafter adopts the geometry rather than imposing one.
@@ -1480,6 +1488,11 @@ class DFlashWorker(SpecWorkerBase):
             if pool is None:
                 if self._ctx_unified_cache:
                     raise ValueError("DFlash could not bind the unified manager's draft KV layers")
+                if draft_model.context_kv_fp8:
+                    raise ValueError(
+                        "speculative_config.context_kv_dtype='fp8' needs the drafter's context "
+                        "KV in an FP8 draft KV cache manager pool."
+                    )
                 # Per-slot reservation is an arena-only notion; the pool path
                 # takes its pages from the manager one iteration at a time.
                 self._ctx_pages_per_slot = (capacity + page_size - 1) // page_size
@@ -1626,7 +1639,12 @@ class DFlashWorker(SpecWorkerBase):
             pages = table[rows.long(), positions.long() // page_size].long()
             offsets = positions.long() % page_size
             for layer_idx in range(k.size(1)):
-                self._ctx_kv_buf[layer_idx][pages, 0, 0, offsets] = k[:, layer_idx, 0]
+                pool, new = self._ctx_kv_buf[layer_idx], k[:, layer_idx, 0]
+                if pool.dtype == torch.float8_e4m3fn:
+                    # Saturated FP8, as the block decode quantizes its query;
+                    # byte views because index_put support for FP8 varies.
+                    pool, new = pool.view(torch.uint8), to_draft_fp8(new).view(torch.uint8)
+                pool[pages, 0, 0, offsets] = new
             return
         append_paged_kv_cache = self._get_ctx_paged_append()
 
@@ -1837,10 +1855,7 @@ class DFlashWorker(SpecWorkerBase):
             # continuation.
             self._req_ctx_pos[req_id] = first_pos + slen
             if actual > 0:
-                cache_dtype = (
-                    self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
-                )
-                chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
+                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_dtype)
                 ctx_len_updates[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
@@ -2506,11 +2521,8 @@ class DFlashWorker(SpecWorkerBase):
 
                 # Fast path: store the pre-projected/pre-RoPE'd K/V.
                 # dflash_forward reads these directly via cache_batch_idx.
-                cache_dtype = (
-                    self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
-                )
                 k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(cache_dtype), pos_flat
+                    proj_flat.to(self._ctx_dtype), pos_flat
                 )
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
@@ -2652,7 +2664,7 @@ class DFlashWorker(SpecWorkerBase):
         gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
         projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
         latent, _ = draft_model.precompute_context_kv(
-            projected.to(self._ctx_kv_buf[0].dtype), prep.ctx_positions
+            projected.to(self._ctx_dtype), prep.ctx_positions
         )
         store_context_latents(
             latent[:, :, 0],

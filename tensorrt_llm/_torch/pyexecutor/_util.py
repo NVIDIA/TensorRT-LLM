@@ -2699,6 +2699,11 @@ class KvCacheCreator:
         spec_dec_mode = self._speculative_config.spec_dec_mode
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
+        if getattr(self._speculative_config, "context_kv_dtype",
+                   "auto") == "fp8":
+            # speculative_config.context_kv_dtype: FP8 E4M3 drafter latents.
+            return self._get_unquantized_kv_model_config(
+                effective_draft_config, kv_cache_quant_algo=QuantAlgo.FP8)
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
@@ -2710,13 +2715,20 @@ class KvCacheCreator:
 
     @staticmethod
     def _get_unquantized_kv_model_config(
-            model_config: ModelConfig) -> ModelConfig:
-        """Describe a model-dtype KV pool without changing the model config."""
+            model_config: ModelConfig,
+            kv_cache_quant_algo: Optional[QuantAlgo] = None) -> ModelConfig:
+        """Describe a model-dtype KV pool (or one stored as
+        ``kv_cache_quant_algo``) without changing the model config."""
         quant_config = model_config.quant_config
-        if quant_config is None or quant_config.kv_cache_quant_algo is None:
+        if quant_config is None:
+            if kv_cache_quant_algo is None:
+                return model_config
+            from tensorrt_llm.models.modeling_utils import QuantConfig
+            quant_config = QuantConfig()
+        elif quant_config.kv_cache_quant_algo == kv_cache_quant_algo:
             return model_config
         neutral_quant = copy.copy(quant_config)
-        neutral_quant.kv_cache_quant_algo = None
+        neutral_quant.kv_cache_quant_algo = kv_cache_quant_algo
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
         # and the copy carries the already-computed caches, so BOTH must be
         # dropped for the mutation to take: _create_kv_cache_manager reads

@@ -3863,6 +3863,18 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "and each drafter layer's latent projection and norm) and emits "
         "placeholder draft tokens. Requires disaggregated serving.")
 
+    context_kv_dtype: Literal["auto", "fp8"] = Field(
+        default="auto",
+        description=
+        "Storage dtype of a standalone MLA DSpark drafter's context KV (one "
+        "latent per token and drafter layer) in its paged draft KV cache. "
+        "'auto' keeps the drafter's weight dtype (BF16). 'fp8' stores FP8 "
+        "E4M3 latents at a unit per-tensor scale, halving the draft cache "
+        "bytes per token; the block decode then reads them with the FP8 CuTe "
+        "DSL MLA decode, so a drafting server needs attention_backend CUTEDSL "
+        "(the MLA drafter's AUTO choice). Lossy. The context and generation "
+        "servers of disaggregated serving must set the same value.")
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len

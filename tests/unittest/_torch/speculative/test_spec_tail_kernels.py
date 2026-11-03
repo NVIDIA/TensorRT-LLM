@@ -271,3 +271,35 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+
+
+def test_store_context_latents_saturates_into_an_fp8_pool():
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+    from tensorrt_llm._torch.speculative.spec_tail_kernels import store_context_latents
+
+    fp8 = torch.float8_e4m3fn
+    num_tokens, num_layers, num_pages, page, latent_dim = 9, 3, 4, 32, 576
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    latent = (torch.randn(num_tokens, num_layers, latent_dim, device="cuda", generator=gen) * 3).to(
+        torch.bfloat16
+    )
+    # Saturating, in range, and subnormal values.
+    latent[0, :, :4] = torch.tensor([600.0, -1000.0, 447.0, 1e-3], device="cuda").to(torch.bfloat16)
+    flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:num_tokens]
+    pages, offsets = flat // page, flat % page
+    mask = torch.tensor([1, 1, 0, 1, 1, 1, 1, 0, 1], dtype=torch.int8, device="cuda")
+
+    pools = [
+        torch.full((num_pages, 1, 1, page, latent_dim), 7.0, device="cuda").to(fp8)
+        for _ in range(num_layers)
+    ]
+    expected = [p.view(torch.uint8).clone() for p in pools]
+    for layer in range(num_layers):
+        rows = to_draft_fp8(latent[:, layer] * mask.to(torch.bfloat16)[:, None])
+        expected[layer][:, 0, 0][pages, offsets] = rows.view(torch.uint8)
+    ptrs = torch.tensor([p.data_ptr() for p in pools], dtype=torch.int64, device="cuda")
+    store_context_latents(latent, pools, ptrs, pages, offsets, mask)
+    for layer in range(num_layers):
+        assert torch.equal(pools[layer].view(torch.uint8), expected[layer])
+    assert pools[0][pages[0], 0, 0, offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
+    assert not pools[0].float().isnan().any()

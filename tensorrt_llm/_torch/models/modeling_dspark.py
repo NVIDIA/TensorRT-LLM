@@ -110,6 +110,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
+from ..speculative.dflash_attention import DRAFT_FP8_KV_SCALE, to_draft_fp8
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
@@ -3613,6 +3614,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     ``TRTLLM``   trtllm-gen absorbed-MLA paged decode + upper-triangle fixup.
     ``VANILLA``  the eager torch reference; where the other two land unpaged.
 
+    ``context_kv_dtype="fp8"`` stores the latents as FP8 E4M3 at a unit
+    per-tensor scale (``to_draft_fp8``), 2880 instead of 5760 B/token/rank, and
+    the CUTEDSL decode reads them with an FP8 query through the FP8 MLA decode;
+    the other two backends read BF16 only.
+
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
@@ -3652,7 +3658,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         *,
         dflash_attention_backend: str = "AUTO",
         context_kv_only: bool = False,
+        context_kv_dtype: str = "auto",
     ):
+        if context_kv_dtype not in ("auto", "fp8"):
+            raise ValueError(f"context_kv_dtype must be 'auto' or 'fp8', got {context_kv_dtype!r}")
         cfg = draft_config.pretrained_config
         # Pin the backbone instead of relying on the model_type-derived name
         # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
@@ -3686,6 +3695,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._mla_workspace = None
         self._mla_freqs = None
         self._mla_freqs_cap = None
+        self._mla_fp8_scales = None
         self._cute_dsl_checked_shape = None
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
@@ -3694,6 +3704,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self.softmax_scale = (mscale * mscale) / math.sqrt(
             self.qk_nope_head_dim + self.qk_rope_head_dim
         )
+        self.context_kv_fp8 = context_kv_dtype == "fp8"
+        if (
+            self.context_kv_fp8
+            and not context_kv_only
+            and self.dflash_attention_backend != "CUTEDSL"
+        ):
+            raise ValueError(
+                "speculative_config.context_kv_dtype='fp8' is read by the CUTEDSL block decode "
+                f"only, but attention_backend resolved to {self.dflash_attention_backend!r}."
+            )
         if context_kv_only:
             self._keep_context_kv_modules()
 
@@ -3800,6 +3820,20 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self._mla_workspace = torch.zeros(want, dtype=torch.uint8, device=device)
         return self._mla_workspace
 
+    def _mla_fp8_decode_scales(self, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """The FP8 decode's device scales at unit q / kv scales.
+
+        ``bmm1 = softmax_scale * dq_q * dq_kv`` and ``bmm2 = dq_kv``, both
+        dequant scales ``DRAFT_FP8_KV_SCALE``. Built on the first (eager) call.
+        """
+        if self._mla_fp8_scales is None or self._mla_fp8_scales[0].device != device:
+            dq = DRAFT_FP8_KV_SCALE
+            self._mla_fp8_scales = (
+                torch.full((1,), self.softmax_scale * dq * dq, dtype=torch.float32, device=device),
+                torch.full((1,), dq, dtype=torch.float32, device=device),
+            )
+        return self._mla_fp8_scales
+
     def _assert_cute_dsl_can_implement(self, batch, block_size, page_size, dtype) -> None:
         """Reject a shape the kernel cannot serve, here, naming the reason.
 
@@ -3811,6 +3845,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
         Page size is the only operand here that is not fixed by the checkpoint,
         and it comes from the draft KV pool, so this cannot move to __init__.
+        ``dtype`` is the kernel input dtype; an FP8 one writes a BF16 output.
         """
         key = (batch, block_size, page_size, dtype)
         if self._cute_dsl_checked_shape == key:
@@ -3819,7 +3854,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
         from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-        in_dtype = cutlass.Float16 if dtype == torch.float16 else cutlass.BFloat16
+        if dtype == torch.float8_e4m3fn:
+            in_dtype, out_dtype = cutlass.Float8E4M3FN, cutlass.BFloat16
+        else:
+            in_dtype = cutlass.Float16 if dtype == torch.float16 else cutlass.BFloat16
+            out_dtype = in_dtype
         runner = CuteDSLNVMlaDecodeBlackwellRunner
         # Mirror the runner's own probe (cute_dsl_custom_ops.py:8542) through its
         # own constants, so this cannot drift from the tactic it will pick. Its
@@ -3832,7 +3871,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             in_dtype,
-            in_dtype,
+            out_dtype,
             cutlass.Float32,
             cutlass.Float32,
             (128, 128),
@@ -3866,6 +3905,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ``cute_dsl_mla_decode_unavailability_reason``; the shape depends on the
         draft pool's page size, which is not known until here, so it is checked
         on the first call.
+
+        An FP8 pool (``context_kv_dtype="fp8"``) is read by the FP8 decode with
+        the query quantized the same way (``to_draft_fp8``); the output stays in
+        the query's dtype.
         """
         import cutlass
 
@@ -3876,13 +3919,17 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
         page_size = pool.shape[1]
         d_latent = self.kv_lora_rank
-        self._assert_cute_dsl_can_implement(batch, block_size, page_size, query.dtype)
+        fp8 = pool.dtype == torch.float8_e4m3fn
+        self._assert_cute_dsl_can_implement(
+            batch, block_size, page_size, pool.dtype if fp8 else query.dtype
+        )
 
         # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470),
         # kept by a 576-wide row sliced at 512. detach() because from_dlpack refuses
         # grad-requiring tensors, which the pool write adds outside inference_mode.
-        q_latent = query.detach()[..., :d_latent].permute(2, 3, 1, 0)
-        q_rope = query.detach()[..., d_latent:].permute(2, 3, 1, 0)
+        kernel_query = to_draft_fp8(query.detach()) if fp8 else query.detach()
+        q_latent = kernel_query[..., :d_latent].permute(2, 3, 1, 0)
+        q_rope = kernel_query[..., d_latent:].permute(2, 3, 1, 0)
         c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
         c_rope = pool.detach()[..., d_latent:].permute(1, 2, 0)
 
@@ -3891,7 +3938,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             num_heads, block_size, d_latent, batch, cutlass.Float32
         )
         workspace = self._mla_decode_workspace(device, workspace_numel)
-        torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell(
+        if fp8:
+            decode = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+            softmax_scale, output_scale = self._mla_fp8_decode_scales(device)
+        else:
+            decode = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
+            softmax_scale, output_scale = self.softmax_scale, 1.0
+        decode(
             q_latent,
             q_rope,
             c_latent,
@@ -3906,8 +3959,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             num_heads,
             block_size,
             page_size,
-            self.softmax_scale,
-            1.0,
+            softmax_scale,
+            output_scale,
             batch,
             None,
             # Every block token sees the whole block, not just its causal prefix.
@@ -3939,12 +3992,17 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # Must precede BOTH decode paths: each reads the block back out of the
         # pool, so writing it afterwards would attend uninitialised slots.
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
-        pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
-            -1, blk_kv.shape[-1]
-        )
+        blk_rows = blk_kv.reshape(-1, blk_kv.shape[-1])
+        if pool.dtype == torch.float8_e4m3fn:
+            # Stored like the context latents; byte views because index_put
+            # support for FP8 varies across builds.
+            pool, blk_rows = pool.view(torch.uint8), to_draft_fp8(blk_rows).view(torch.uint8)
+        pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_rows
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
+        if layer_cache.dtype == torch.float8_e4m3fn:
+            raise NotImplementedError("An FP8 MLA DSpark context needs the CUTEDSL decode.")
 
         out_lower = torch.empty(
             batch,
@@ -4682,13 +4740,17 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
         The draft ``nn.Module`` for this drafter.
     """
     context_kv_only = model_config.spec_config.context_kv_only
-    if context_kv_only and (
-        draft_is_embedded_in_target(model_config) or not is_mla(draft_config.pretrained_config)
+    context_kv_dtype = model_config.spec_config.context_kv_dtype
+    for name, is_set in (
+        ("context_kv_only", context_kv_only),
+        ("context_kv_dtype", context_kv_dtype != "auto"),
     ):
-        raise ValueError(
-            "speculative_config.context_kv_only is implemented for standalone MLA DSpark "
-            "drafters only."
-        )
+        if is_set and (
+            draft_is_embedded_in_target(model_config) or not is_mla(draft_config.pretrained_config)
+        ):
+            raise ValueError(
+                f"speculative_config.{name} is implemented for standalone MLA DSpark drafters only."
+            )
     if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
@@ -4723,6 +4785,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,
             context_kv_only=context_kv_only,
+            context_kv_dtype=context_kv_dtype,
         )
     else:
         drafter_cls = GQADSparkForCausalLM

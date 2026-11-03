@@ -420,6 +420,7 @@ def _store_context_latents_kernel(
     mask_ptr,
     head_dim,
     BLOCK_D: tl.constexpr,
+    POOL_FP8: tl.constexpr,
 ):
     tok = tl.program_id(0)
     layer = tl.program_id(1)
@@ -433,6 +434,9 @@ def _store_context_latents_kernel(
     # The eager path multiplies by the mask in the latent dtype: x * 1 is x and
     # x * 0 a signed zero either way.
     vals = (vals.to(tl.float32) * keep).to(vals.dtype)
+    if POOL_FP8:
+        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
+        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
     pool = tl.load(pool_ptrs_ptr + layer).to(tl.pointer_type(vals.dtype))
     tl.store(pool + page * stride_pool_page + off * stride_pool_off + offs, vals, mask=dmask)
 
@@ -455,13 +459,17 @@ def store_context_latents(
         pool_ptrs: ``[L]`` int64 base addresses of ``pools``.
         pages, offsets: ``[N]`` destination page and offset in the page.
         mask: ``[N]`` int8 write mask; 0 stores a zeroed latent.
+
+    An FP8 E4M3 pool stores ``to_draft_fp8`` of the masked latent.
     """
     num_tokens, num_layers, head_dim = latent.shape
     if num_tokens == 0:
         return
     pool0 = pools[0]
     assert latent.stride(-1) == 1 and pool0.stride(-1) == 1
-    assert all(p.stride() == pool0.stride() and p.dtype == latent.dtype for p in pools)
+    assert all(p.stride() == pool0.stride() and p.dtype == pool0.dtype for p in pools)
+    pool_fp8 = pool0.dtype == torch.float8_e4m3fn
+    assert pool_fp8 or pool0.dtype == latent.dtype
     _store_context_latents_kernel[(num_tokens, num_layers)](
         latent,
         latent.stride(0),
@@ -474,5 +482,6 @@ def store_context_latents(
         mask,
         head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        POOL_FP8=pool_fp8,
         num_warps=4,
     )

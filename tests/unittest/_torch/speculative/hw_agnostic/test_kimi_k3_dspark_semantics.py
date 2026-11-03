@@ -597,6 +597,7 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
         attention_backend="VANILLA",
         draft_is_embedded_in_target=False,
         context_kv_only=False,
+        context_kv_dtype="auto",
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -1894,6 +1895,7 @@ def test_context_kv_only_is_rejected_for_a_drafter_that_drafts_elsewhere():
     for embedded, kv_lora_rank in ((False, None), (True, MLA_KV_LORA)):
         spec = SimpleNamespace(
             context_kv_only=True,
+            context_kv_dtype="auto",
             attention_backend="AUTO",
             draft_is_embedded_in_target=embedded,
         )
@@ -1943,3 +1945,167 @@ def test_context_server_takes_the_drafter_out_of_the_kv_budget_not_the_headroom(
     assert creator._get_context_server_spec_reserve(0.7) == int((1.0 - 0.7) * resident)
     creator._speculative_config.context_kv_only = False
     assert creator._get_context_server_spec_reserve(0.7) == 0
+
+
+# ---------------------------------------------------------------------------
+# FP8 storage of the drafter context KV (speculative_config.context_kv_dtype).
+# ---------------------------------------------------------------------------
+
+
+def test_context_kv_dtype_defaults_to_the_drafter_dtype():
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    assert DSparkDecodingConfig(max_draft_len=2).context_kv_dtype == "auto"
+    assert DSparkDecodingConfig(max_draft_len=2, context_kv_dtype="fp8").context_kv_dtype == "fp8"
+    with pytest.raises(ValueError):
+        DSparkDecodingConfig(max_draft_len=2, context_kv_dtype="nvfp4")
+
+
+def test_fp8_context_kv_is_rejected_for_a_drafter_without_an_mla_latent_cache():
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    for embedded, kv_lora_rank in ((False, None), (True, MLA_KV_LORA)):
+        spec = SimpleNamespace(
+            context_kv_only=False,
+            context_kv_dtype="fp8",
+            attention_backend="AUTO",
+            draft_is_embedded_in_target=embedded,
+        )
+        pretrained = SimpleNamespace(kv_lora_rank=kv_lora_rank, qk_rope_head_dim=MLA_ROPE)
+        with pytest.raises(ValueError, match="context_kv_dtype is implemented for standalone MLA"):
+            _build_dspark_draft(
+                SimpleNamespace(spec_config=spec),
+                SimpleNamespace(pretrained_config=pretrained),
+                None,
+                None,
+            )
+
+
+@needs_cuda
+def test_fp8_context_kv_needs_the_cutedsl_block_decode():
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    def build(**kwargs):
+        model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="TRTLLM")
+        return MLADSparkForCausalLM(model_config, **kwargs)
+
+    with pytest.raises(ValueError, match="CUTEDSL"):
+        build(dflash_attention_backend="VANILLA", context_kv_dtype="fp8")
+    # A context server never runs the block decode, so any backend stores it.
+    ctx = build(dflash_attention_backend="VANILLA", context_kv_only=True, context_kv_dtype="fp8")
+    assert ctx.context_kv_fp8
+    assert not build(dflash_attention_backend="VANILLA").context_kv_fp8
+
+
+@needs_cuda
+def test_fp8_paged_context_store_writes_saturated_fp8():
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+    page, num_pages, layers, num_tokens = 32, 6, 2, 11
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_page_size = page
+    worker._ctx_block_tables = torch.tensor([[4, 1, 5], [0, 2, 3]], device="cuda")
+    worker._ctx_kv_buf = [
+        torch.zeros(num_pages, 1, 1, page, MLA_LATENT, device="cuda").to(torch.float8_e4m3fn)
+        for _ in range(layers)
+    ]
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    k = (torch.randn(num_tokens, layers, 1, MLA_LATENT, device="cuda", generator=gen) * 200).to(
+        torch.bfloat16
+    )
+    rows = torch.tensor([0] * 6 + [1] * 5, device="cuda")
+    positions = torch.tensor([0, 1, 31, 32, 33, 70, 5, 6, 40, 64, 95], device="cuda")
+    worker._store_context_kv_paged(k, None, rows, positions)
+
+    pages = worker._ctx_block_tables[rows, positions // page].long()
+    offsets = positions % page
+    for layer in range(layers):
+        stored = worker._ctx_kv_buf[layer][pages, 0, 0, offsets]
+        assert torch.equal(stored.view(torch.uint8), to_draft_fp8(k[:, layer, 0]).view(torch.uint8))
+    assert not worker._ctx_kv_buf[0].float().isnan().any()
+
+
+def _k3_block_decoder():
+    """What ``MLADSparkForCausalLM._cute_dsl_block_decode`` reads, K3 DSpark geometry."""
+    import types
+
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM, _yarn_get_mscale
+
+    cls = MLADSparkForCausalLM
+    stub = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        _num_heads=64,
+        _cute_dsl_checked_shape=None,
+        _mla_workspace=None,
+        _mla_fp8_scales=None,
+    )
+    # K3 DSpark YaRN: factor 32, mscale_all_dim 1; qk_nope 128 + rope 64.
+    mscale = _yarn_get_mscale(32.0, 1.0)
+    stub.softmax_scale = mscale * mscale / math.sqrt(128 + 64)
+    for name in (
+        "_assert_cute_dsl_can_implement",
+        "_mla_decode_workspace",
+        "_mla_fp8_decode_scales",
+        "_cute_dsl_block_decode",
+    ):
+        setattr(stub, name, types.MethodType(getattr(cls, name), stub))
+    return stub
+
+
+@needs_absorbed_mla
+@pytest.mark.parametrize("block_size", [5, 7])
+def test_fp8_block_decode_follows_bf16_at_k3_shapes(block_size):
+    """The FP8 decode reads to_draft_fp8 of the BF16 pool and query: against an
+    FP32 reference on its own FP8 operands it is as close as the BF16 decode is
+    to one on BF16 operands; against the BF16 decode only the E4M3 rounding of
+    q and K remains."""
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+    heads, page, kv_lora, latent_dim = 64, 64, 512, 576
+    stub = _k3_block_decoder()
+    gen = torch.Generator(device="cuda").manual_seed(block_size)
+    ctx = torch.tensor([300, 1700, 6400, 13700], device="cuda")
+    pages_needed = (ctx + block_size - 1) // page + 1
+    total = int(pages_needed.sum())
+    perm = torch.randperm(total, device="cuda", generator=gen)
+    table = torch.zeros(len(ctx), int(pages_needed.max()), dtype=torch.long, device="cuda")
+    start = 0
+    for b, n in enumerate(pages_needed.tolist()):
+        table[b, :n] = perm[start : start + n]
+        start += n
+    values = torch.randn(total, 1, 1, page, latent_dim, device="cuda", generator=gen)
+    values[..., :kv_lora] *= 0.5 + torch.rand(kv_lora, device="cuda", generator=gen)
+    values[..., kv_lora:] *= 2.0
+    pool = values.bfloat16()
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+    fixup = _build_mla_block_fixup(ctx, table, block_size, page)
+
+    def reference(q, kv_pool):
+        flat = kv_pool[:, 0, 0].reshape(-1, latent_dim)
+        outs = []
+        for b in range(q.shape[0]):
+            pos = torch.arange(int(fixup.seq_lens_i32[b]), device="cuda")
+            rows = fixup.page_tables_i32[b].long()[pos // page] * page + pos % page
+            kv = flat[rows].float()
+            scores = torch.einsum("shc,tc->sht", q[b].float(), kv) * stub.softmax_scale
+            outs.append(torch.einsum("sht,tc->shc", scores.softmax(-1), kv[:, :kv_lora]))
+        return torch.stack(outs)
+
+    def rel_l2(a, e):
+        return ((a.float() - e.float()).norm() / e.float().norm()).item()
+
+    out_bf16 = stub._cute_dsl_block_decode(query, pool, fixup, block_size)
+    pool_fp8 = to_draft_fp8(pool)
+    out_fp8 = stub._cute_dsl_block_decode(query, pool_fp8, fixup, block_size)
+    assert out_fp8.dtype == torch.bfloat16
+    assert rel_l2(out_bf16, reference(query, pool)) < 0.005
+    fp8_operands = reference(to_draft_fp8(query).bfloat16(), pool_fp8.bfloat16())
+    assert rel_l2(out_fp8, fp8_operands) < 0.01
+    cosine = F.cosine_similarity(out_fp8.float().reshape(-1), out_bf16.float().reshape(-1), dim=0)
+    assert cosine.item() > 0.993 and rel_l2(out_fp8, out_bf16) < 0.12

@@ -1771,6 +1771,15 @@
       "path": "speculative_config.block_size"
     },
     {
+      "allowed_values": [
+        "auto",
+        "fp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.context_kv_dtype"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "speculative_config.context_kv_only"
