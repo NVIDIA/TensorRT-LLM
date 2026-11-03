@@ -1444,6 +1444,7 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
     WRITE_Q: tl.constexpr,
     Q1_KV_BLOCKS_PER_PROGRAM: tl.constexpr,
     Q_ROWS_PER_SEQ: tl.constexpr = 0,
+    WRITE_Q_ROWS: tl.constexpr = True,
 ):
     q1_shared_main: tl.constexpr = FUSE_ROPE_CACHE_STORE and MAX_GEN_TILES == 1
     q1_grouped_kv: tl.constexpr = q1_shared_main and Q1_KV_BLOCKS_PER_PROGRAM > 1
@@ -1530,6 +1531,9 @@ def _fp4_mla_generation_fused_qk_rope_cache_update_kernel(
             q_token_head_program = q_program // Q_WORK_BLOCKS
             q_work_block = q_program - q_token_head_program * Q_WORK_BLOCKS
             q_token_idx = q_token_head_program // Q_HEAD_BLOCKS
+            if not WRITE_Q_ROWS:
+                # Another kernel writes the query rows: only the KV programs work.
+                q_token_idx = gen_len
             q_head_block = q_token_head_program - q_token_idx * Q_HEAD_BLOCKS
             if q_token_idx < gen_len:
                 q_token = seq_idx * gen_len + q_token_idx

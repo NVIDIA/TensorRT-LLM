@@ -4,29 +4,34 @@
 
 The base ``MLA`` class owns context attention, cached/chunked prefill,
 absorbed generation, and paged-cache handling. This module only supplies the
-K3 projection topology, NoPE identity table, KV-B checkpoint layout, and
-gated output projection.
+K3 projection topology, NoPE identity table, KV-B checkpoint layout, gated
+output projection, and the fused FP4 decode query of Helix generation on SM107.
 """
 
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
+from ...._utils import get_sm_version
 from ....functional import PositionEmbeddingType
 from ....mapping import Mapping
 from ....quantization import QuantAlgo
-from ...attention.backends import AttentionMetadata, TrtllmAttention
+from ...attention.backends import AttentionInputType, AttentionMetadata, TrtllmAttention
 from ...attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ...attention.mla import MLA
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ...distributed import AllReduceParams
+from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from ...model_config import ModelConfig
 from ...utils import AuxStreamType
 from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import do_multi_stream
 from ..projection_capabilities import GatedEpilogueProjection, PrequantizedInputProjection
+from ..rms_norm import RMSNorm
 
 
 def _make_pos_embd_params(
@@ -127,6 +132,17 @@ class KimiK3MLAAttention(MLA):
     checkpoint projection topology, positional encoding, KV-B runtime layout,
     and gated output projection.
     """
+
+    # Whether generation-only Helix steps of up to k3_mla_q_fused.MAX_TOKENS tokens take
+    # the fused FP4 decode query (_forward_generation_fused_query); set in
+    # cache_derived_state, as are the two flags below.
+    _fused_decode_query = False
+    # The fused query kernel applies the q_a RMSNorm itself.
+    _fused_decode_query_norm = False
+    # The KV half writes the latent row (kv_a RMSNorm + k_pe) in one launch.
+    _fused_latent_row = False
+    # (q_b weight scale, its block exponents or None), cached on first use.
+    _q_b_block_exponents: Optional[tuple] = None
 
     def __init__(
         self,
@@ -257,6 +273,246 @@ class KimiK3MLAAttention(MLA):
         self._qkv_a_takes_prequantized = self.fuse_qkv_a_proj and isinstance(
             self.kv_a_proj_with_mqa, PrequantizedInputProjection
         )
+        self._fused_decode_query = self._supports_fused_decode_query()
+        self._fused_decode_query_norm = (
+            self._fused_decode_query
+            and self._resolve_qa_fused_scale() is None
+            and self._runs_flashinfer_cute_rmsnorm(self.q_a_layernorm)
+        )
+        self._fused_latent_row = self._fused_decode_query and self._runs_flashinfer_cute_rmsnorm(
+            self.kv_a_layernorm
+        )
+        self._q_b_block_exponents = None
+
+    @staticmethod
+    def _runs_flashinfer_cute_rmsnorm(norm: torch.nn.Module) -> bool:
+        """Whether ``norm`` of BF16 rows runs FlashInfer's CuTe DSL RMSNorm, the arithmetic
+        the fused K3 MLA kernels repeat bit for bit."""
+        if not (
+            IS_FLASHINFER_AVAILABLE
+            and type(norm) is RMSNorm
+            and not (norm.use_cuda_tile or norm.use_gemma or norm.is_nvfp4)
+            and not norm.return_hp_output
+            and norm.weight.dtype == torch.bfloat16
+            and norm.weight.is_contiguous()
+        ):
+            return False
+        try:
+            from flashinfer.norm import _use_cuda_norm
+        except ImportError:
+            return False
+        return not _use_cuda_norm(norm.weight.device)
+
+    def _absorption_weight_bf16(self) -> Optional[torch.Tensor]:
+        """The BF16 W_UK ``[H, kv_lora_rank, qk_nope_head_dim]`` the absorbed generation BMM
+        reads (the module weight, or its dequantized copy)."""
+        if self.k_b_proj_trans.dtype == torch.bfloat16:
+            return self.k_b_proj_trans
+        return self.k_b_proj_trans_dequant
+
+    def _supports_fused_decode_query(self) -> bool:
+        """Whether Helix generation of this FP4-KV layer can take the fused decode query: the
+        SM107 kernel's head geometry, the V up-projection before the all-to-all, and FP8 q_b
+        with a BF16 W_UK that the default generation path reads too."""
+        if not (
+            IS_CUTLASS_DSL_AVAILABLE
+            and get_sm_version() == 107
+            and self.mapping.has_cp_helix()
+            and self._helix_v_up_before_exchange
+            and self.mqa.uses_fp4_mla_attention
+            and self.sparse_attn_hooks is None
+            and self.fuse_qkv_a_proj
+            and not self.is_lite
+            and not self.apply_rotary_emb
+            and not self.llama_4_scaling
+        ):
+            return False
+        from ...kernels.blackwell import k3_mla_q_fused
+
+        w_uk = self._absorption_weight_bf16()
+        return (
+            (
+                self.num_heads_tp,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+            )
+            == (
+                k3_mla_q_fused.NUM_HEADS,
+                k3_mla_q_fused.Q_LORA_RANK,
+                k3_mla_q_fused.KV_LORA_RANK,
+                k3_mla_q_fused.NOPE_DIM,
+                k3_mla_q_fused.ROPE_DIM,
+            )
+            and w_uk is not None
+            and k3_mla_q_fused.weights_supported(self.q_b_proj.weight, w_uk)
+        )
+
+    def _q_b_exponents(self) -> Optional[torch.Tensor]:
+        """Block exponents of the q_b weight (``k3_mla_q_fused.block_exponents``), cached per
+        weight scale; None for a scale layout the kernel does not read, or while capturing a
+        CUDA graph before the first eager step built them."""
+        scale = self.q_b_proj.weight_scale
+        cached = self._q_b_block_exponents
+        if cached is not None and cached[0] is scale:
+            return cached[1]
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        from ...kernels.blackwell import k3_mla_q_fused
+
+        try:
+            exponents = k3_mla_q_fused.block_exponents(scale, *self.q_b_proj.weight.shape)
+        except ValueError:
+            exponents = None
+        self._q_b_block_exponents = (scale, exponents)
+        return exponents
+
+    def _takes_fused_decode_query(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        latent_cache_gen: Optional[torch.Tensor],
+    ) -> bool:
+        if not self._fused_decode_query or latent_cache_gen is not None:
+            return False
+        from ...kernels.blackwell import k3_mla_q_fused
+
+        num_tokens = attn_metadata.num_tokens
+        return (
+            type(hidden_states) is torch.Tensor
+            and attn_metadata.num_contexts == 0
+            and 0 < num_tokens <= k3_mla_q_fused.MAX_TOKENS
+            and num_tokens % attn_metadata.num_generations == 0
+            and attn_metadata.helix_position_offsets is not None
+            and attn_metadata.helix_is_inactive_rank is not None
+            and self._q_b_exponents() is not None
+        )
+
+    def _forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> None:
+        if self._takes_fused_decode_query(hidden_states, attn_metadata, latent_cache_gen):
+            self._forward_generation_fused_query(
+                hidden_states, attn_metadata, output, prequantized_input
+            )
+            return
+        super()._forward_impl(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            output,
+            latent_cache_gen=latent_cache_gen,
+            prequantized_input=prequantized_input,
+        )
+
+    def _forward_generation_fused_query(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        prequantized_input: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Absorbed Helix generation of an FP4-KV layer with the fused decode query.
+
+        After the fused q_a / kv_a projection the KV half (the latent row, then the FP4
+        generation cache update without its query rows) runs on the aux stream, and the main
+        stream runs ``k3_mla_q_fused`` (q_a RMSNorm, q_b, W_UK, RoPE and the FP4 query
+        quantization), which writes the query rows into the Q buffers the cache update records
+        on the metadata. The decode joins both; the BF16 query it is handed provides shapes.
+        """
+        from ...attention.backends.fp4_mla.cache_update import _prepare_fp4_mla_q_buffers
+        from ...attention.backends.fp4_mla.config import _fp4_mla_packed_rows_per_seq
+        from ...attention.backends.fp4_mla.layout import _get_fp4_mla_q_global_scale
+        from ...kernels.blackwell import k3_mla_q_fused
+
+        md = attn_metadata
+        num_tokens = md.num_tokens
+        heads, lora, rope = self.num_heads_tp, self.kv_lora_rank, self.qk_rope_head_dim
+        hidden_states = hidden_states[:num_tokens]
+        device = hidden_states.device
+        gen_len = num_tokens // md.num_generations
+        # Create the Q buffers (zero-filled, once) on this stream, which writes them.
+        _prepare_fp4_mla_q_buffers(
+            md, num_tokens, heads, device, rows_per_seq=_fp4_mla_packed_rows_per_seq(heads, gen_len)
+        )
+        q, compressed_kv, k_pe = self._project_qkv_a(hidden_states, prequantized_input).split(
+            [self.q_lora_rank, lora, rope], -1
+        )
+        kv_stream = self.aux_stream if do_multi_stream() else None
+        kv_fork, kv_ready = self.ln_events
+        if kv_stream is not None:
+            kv_fork.record()
+            kv_stream.wait_event(kv_fork)
+        with torch.cuda.stream(kv_stream) if kv_stream is not None else nullcontext():
+            if self._fused_latent_row:
+                latent_cache = k3_mla_q_fused.k3_mla_latent_row(
+                    compressed_kv,
+                    k_pe,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                    use_pdl=get_env_enable_pdl(),
+                )
+            else:
+                latent_cache = torch.concat([self.kv_a_layernorm(compressed_kv), k_pe], dim=-1)
+            self.mqa.fp4_mla_kv_append_generation(latent_cache, md, heads)
+            if kv_stream is not None:
+                kv_ready.record()
+        norm = None
+        if self._fused_decode_query_norm and k3_mla_q_fused.input_supported(q):
+            norm = (self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
+        else:
+            q = self._q_a_layernorm_maybe_fused(q)
+        state = md.fp4_mla_state
+        k3_mla_q_fused.k3_mla_q_fused(
+            q,
+            self.q_b_proj.weight,
+            self._q_b_exponents(),
+            self._absorption_weight_bf16(),
+            _get_fp4_mla_q_global_scale(md, device),
+            self.mqa.rotary_cos_sin,
+            md.helix_position_offsets,
+            state.prequantized_q,
+            state.prequantized_q_sf.view(torch.uint8),
+            gen_len=gen_len,
+            rows_per_seq=state.prequantized_q_rows_per_seq or gen_len * heads,
+            use_pdl=get_env_enable_pdl(),
+            norm=norm,
+        )
+        if kv_stream is not None:
+            torch.cuda.current_stream().wait_event(kv_ready)
+            if not torch.cuda.is_current_stream_capturing():
+                latent_cache.record_stream(torch.cuda.current_stream())
+        fused_q = torch.empty([num_tokens, heads, lora + rope], dtype=q.dtype, device=device)
+        num_seqs = md.num_seqs
+        attn_out = self._attn_forward_gen(
+            self.mqa,
+            fused_q.view([num_tokens, heads * (lora + rope)]),
+            None,
+            None,
+            None,
+            md,
+            helix_v_up=True,
+            attention_input_type=AttentionInputType.generation_only,
+            out_scale=self.out_scale,
+            latent_cache=latent_cache,
+            q_pe=fused_q[..., lora:],
+            cu_q_seqlens=torch.empty(num_seqs + 1, dtype=torch.int32, device=device),
+            cu_kv_seqlens=torch.empty(num_seqs + 1, dtype=torch.int32, device=device),
+            fmha_scheduler_counter=torch.empty(1, dtype=torch.uint32, device=device),
+            mla_bmm1_scale=torch.empty(2, dtype=torch.float32, device=device),
+            mla_bmm2_scale=torch.empty(1, dtype=torch.float32, device=device),
+            quant_q_buffer=torch.empty(
+                num_tokens, heads, lora + rope, dtype=torch.uint8, device=device
+            ),
+        )
+        output[:num_tokens].view(attn_out.shape).copy_(attn_out)
 
     def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
         """Generation-only batches whose fused q_a / kv_a projection takes the MXFP8 form of

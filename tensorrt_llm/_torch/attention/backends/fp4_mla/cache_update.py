@@ -453,6 +453,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     v_page_offset: int,
     helix_position_offsets: Optional[torch.Tensor],
     helix_is_inactive_rank: Optional[torch.Tensor],
+    write_q_rows: bool = True,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
@@ -649,7 +650,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         num_gen,
         max(
             kv_work_blocks,
-            max_gen_len * q_head_blocks * q_work_blocks,
+            max_gen_len * q_head_blocks * q_work_blocks if write_q_rows else 0,
         ),
     )
     store_k_residual = _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
@@ -743,6 +744,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             WRITE_Q=True,
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
             Q_ROWS_PER_SEQ=q_rows_per_seq,
+            WRITE_Q_ROWS=write_q_rows,
             maxnreg=56,
         )
 
@@ -779,6 +781,7 @@ def scatter_fp4_mla_kv_cache(
     helix_is_inactive_rank: Optional[torch.Tensor] = None,
     q_context: Optional[torch.Tensor] = None,
     q_nope_head_dim: Optional[int] = None,
+    q_rows_external: bool = False,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -809,7 +812,14 @@ def scatter_fp4_mla_kv_cache(
     pool. When ``q_quant_input`` is supplied, the generation kernel also emits
     backend-ready residual FP4 Q. The return value reports whether the current
     phase updated the HP pool.
+
+    With ``q_rows_external`` (generation only) the Q buffers are prepared and
+    recorded on ``metadata`` as usual, but the kernel leaves them to the caller
+    (``k3_mla_q_fused`` writes them): it updates the KV cache only, and
+    ``q_pe`` / ``q_rope_out`` / ``q_quant_input`` only provide shapes.
     """
+    if q_rows_external and phase != "generation":
+        raise ValueError("FP4 MLA q_rows_external applies to the generation phase only.")
     if phase == "generation":
         # The first FP4 MLA kernel of a step: it reads the step's metadata.
         metadata.fp4_mla_state.join_generation_metadata()
@@ -918,7 +928,9 @@ def scatter_fp4_mla_kv_cache(
                 "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
                 "and q_quant_input for fused RoPE, cache update, and Q quantization."
             )
-        if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
+        if not q_rows_external and not can_fuse_fp4_mla_q_quant(
+            metadata, q_quant_input, q_pe, latent_cache
+        ):
             raise ValueError(
                 "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
                 "scale mode, or backend."
@@ -1060,6 +1072,7 @@ def scatter_fp4_mla_kv_cache(
             v_page_offset=v_page_offset,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
+            write_q_rows=not q_rows_external,
         )
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts

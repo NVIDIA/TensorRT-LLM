@@ -3513,6 +3513,58 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             raise RuntimeError(
                 "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
 
+    def fp4_mla_kv_append_generation(
+        self,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        num_q_heads: int,
+    ) -> None:
+        """The KV half of ``_fp4_mla_rope_generation``: append this step's latent rows to the
+        FP4 cache and HP pool, and prepare the packed-Q buffers of ``num_q_heads`` heads on
+        ``metadata`` for the decode, without writing the query rows (the caller writes them).
+        The cache bytes are the full update's."""
+        assert self.kv_lora_rank is not None
+        assert self.qk_rope_head_dim is not None
+        if not self.uses_fp4_mla_attention:
+            raise RuntimeError(
+                "The FP4 MLA KV append requires FP4 MLA attention.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        if latent_cache.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise RuntimeError(
+                "FP4 MLA latent_cache last dimension must be "
+                f"{self.kv_lora_rank + self.qk_rope_head_dim}, got "
+                f"{latent_cache.shape[-1]}.")
+        if (self.rotary_cos_sin is None or latent_cache.dtype != torch.bfloat16
+                or self.rotary_cos_sin.dtype != torch.float32):
+            raise RuntimeError(
+                "FP4 MLA generation requires a BF16 latent cache and an FP32 "
+                "rotary table.")
+        num_tokens = latent_cache.shape[0]
+        # Shape-only stand-ins for the query tensors the KV-only update never reads.
+        stub = latent_cache.new_empty(1)
+        q_pe = stub.expand(num_tokens, num_q_heads, self.qk_rope_head_dim)
+        q_input = stub.expand(num_tokens, num_q_heads,
+                              self.kv_lora_rank + self.qk_rope_head_dim)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache,
+            self.layer_idx,
+            token_offset=getattr(metadata, "num_ctx_tokens", 0),
+            phase="generation",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_pe,
+            q_quant_input=q_input,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+            q_rows_external=True,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "FP4 MLA generation KV append did not update the HP pool.")
+
     def can_fuse_fp4_mla_q_quant(
         self,
         fused_q: torch.Tensor,
