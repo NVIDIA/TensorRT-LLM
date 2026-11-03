@@ -3645,7 +3645,7 @@ def run_low_m_gemm(
     w_scale: torch.Tensor,
     out: torch.Tensor,
     *,
-    gate: Optional[torch.Tensor] = None,
+    gate: torch.Tensor | None = None,
     sigmoid: bool = False,
     tactic: LowMTactic | MidMTactic | None = None,
     use_pdl: bool = True,

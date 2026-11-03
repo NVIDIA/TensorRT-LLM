@@ -721,7 +721,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
-    from ..kernels.blackwell.utils import make_ptr
+    from ..kernels.blackwell.utils import TRTLLM_ENABLE_PDL, make_ptr
     from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
@@ -5636,7 +5636,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                         weight_scale,
                                         output,
                                         gate=gate,
-                                        sigmoid=sigmoid)
+                                        sigmoid=sigmoid,
+                                        use_pdl=TRTLLM_ENABLE_PDL)
 
     @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
     def _(input: torch.Tensor,
@@ -5662,8 +5663,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output = torch.empty((input.shape[0], weight.shape[0]),
                              dtype=torch.bfloat16,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm_prequantized(input, input_scale, weight,
-                                                     weight_scale, output)
+        return fp8_low_m.run_low_m_gemm_prequantized(input,
+                                                     input_scale,
+                                                     weight,
+                                                     weight_scale,
+                                                     output,
+                                                     use_pdl=TRTLLM_ENABLE_PDL)
 
     @torch.library.register_fake(
         "trtllm::fp8_block_scale_low_m_gemm_prequantized")
@@ -5692,22 +5697,44 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_rmsnorm",
                              mutates_args=(),
                              device_types="cuda")
-    def kimi_k3_attn_res_rmsnorm(layer: torch.Tensor, block: torch.Tensor,
-                                 res_weight: torch.Tensor,
-                                 rms_weight: torch.Tensor,
-                                 out_weight: torch.Tensor, rms_eps: float,
-                                 out_eps: float) -> torch.Tensor:
-        """Attention-residual mix of ``block`` and ``layer``, then RMSNorm."""
+    def kimi_k3_attn_res_rmsnorm(
+            layer: torch.Tensor,
+            block: torch.Tensor,
+            res_weight: torch.Tensor,
+            rms_weight: torch.Tensor,
+            out_weight: torch.Tensor,
+            rms_eps: float,
+            out_eps: float,
+            snapshots_after_wait: bool = False) -> torch.Tensor:
+        """Attention-residual mix of ``block`` and ``layer``, then RMSNorm.
+
+        ``snapshots_after_wait``: ``block`` was written by the kernel launched
+        immediately before this op, so the kernel loads it after its PDL wait.
+        """
         _check_kimi_k3_attn_res_inputs(layer, (), block, res_weight, rms_weight,
                                        out_weight)
         output = torch.empty_like(layer)
-        kimi_k3_attn_res.run_attn_res(layer, (), block, res_weight, rms_weight,
-                                      out_weight, rms_eps, out_eps, output,
-                                      None)
+        kimi_k3_attn_res.run_attn_res(layer, (),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      None,
+                                      snapshots_after_wait=snapshots_after_wait)
         return output
 
     @torch.library.register_fake("trtllm::kimi_k3_attn_res_rmsnorm")
-    def _(layer, block, res_weight, rms_weight, out_weight, rms_eps, out_eps):
+    def _(layer: torch.Tensor,
+          block: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          out_weight: torch.Tensor,
+          rms_eps: float,
+          out_eps: float,
+          snapshots_after_wait: bool = False) -> torch.Tensor:
         return torch.empty_like(layer)
 
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_add_rmsnorm",
@@ -5730,8 +5757,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return updated, output
 
     @torch.library.register_fake("trtllm::kimi_k3_attn_res_add_rmsnorm")
-    def _(prefix, addend, block, res_weight, rms_weight, out_weight, rms_eps,
-          out_eps):
+    def _(prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+          res_weight: torch.Tensor, rms_weight: torch.Tensor,
+          out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         return torch.empty_like(prefix), torch.empty_like(prefix)
 
     @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
@@ -5755,8 +5784,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         return prefix, output
 
     @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_add_rmsnorm")
-    def _(residual, routed, shared, block, res_weight, rms_weight, out_weight,
-          rms_eps, out_eps):
+    def _(residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+          block: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         return torch.empty_like(residual), torch.empty_like(residual)
 
     def _kimi_k3_attn_res_mxfp8_outputs(
@@ -5798,8 +5829,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.register_fake(
         "trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8")
-    def _(residual, routed, shared, block, res_weight, rms_weight, out_weight,
-          rms_eps, out_eps):
+    def _(
+        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (torch.empty_like(residual), torch.empty_like(residual),
                 *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
