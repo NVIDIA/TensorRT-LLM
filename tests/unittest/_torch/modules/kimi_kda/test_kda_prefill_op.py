@@ -558,6 +558,58 @@ def test_kda_prefill_op_sm_reserve_keeps_results(sequence_lengths, state_dtype, 
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("mode", ["small-bh", "bt16"])
+def test_kda_prefill_op_state_row_beyond_int32_offset(mode) -> None:
+    """A state row more than 2**31 elements into the pool updates like the first row.
+
+    The pool is a strided view of the KV-cache memory, so a row's element offset
+    can exceed the int32 range.
+    """
+    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops  # noqa: F401
+
+    heads, tokens = 8, 256
+    row_elems = heads * HEAD_DIM * HEAD_DIM
+    far_row = (2**31) // row_elems + 1
+    free, _ = torch.cuda.mem_get_info()
+    if free < (far_row + 1) * row_elems * 2 + (1 << 30):
+        pytest.skip("needs a state pool beyond 4 GiB")
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    shape = (1, tokens, heads, HEAD_DIM)
+
+    def bf16(scale: float = 1.0) -> torch.Tensor:
+        return (torch.randn(*shape, generator=gen, device="cuda") * scale).to(torch.bfloat16)
+
+    inputs = dict(
+        q=bf16(),
+        k=bf16(),
+        v=bf16(0.5),
+        g=bf16(),
+        beta=torch.randn(1, tokens, heads, generator=gen, device="cuda").to(torch.bfloat16),
+        cu_seqlens=torch.tensor([0, tokens], dtype=torch.int64, device="cuda"),
+        A_log=torch.zeros(heads, device="cuda"),
+        dt_bias=torch.zeros(heads * HEAD_DIM, device="cuda"),
+        scale=HEAD_DIM**-0.5,
+        lower_bound=-5.0,
+        mode=mode,
+    )
+    seed = (torch.randn(heads, HEAD_DIM, HEAD_DIM, generator=gen, device="cuda") * 0.1).to(
+        torch.bfloat16
+    )
+    pool = torch.zeros(far_row + 1, heads, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    results = []
+    for row in (0, far_row):
+        pool[row].copy_(seed)
+        output = torch.ops.trtllm.kda_prefill(
+            **inputs,
+            state_pool=pool,
+            state_indices=torch.tensor([row], dtype=torch.int32, device="cuda"),
+        )
+        results.append((output, pool[row].clone()))
+    for got, want in zip(results[1], results[0], strict=True):
+        assert torch.equal(got, want)
+
+
+@torch.no_grad()
 def test_kda_mixer_prefill_passes_the_reserve_set_before_construction() -> None:
     """The mixer passes the SM reserve that was set before it was built to the prefill."""
     from tensorrt_llm._torch.cute_dsl_utils import set_sm_reserve
