@@ -37,7 +37,6 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
-    DFLASH_CONTEXT_LOWERING,
     HelixDraftShard,
     get_dflash_paged_append,
     to_draft_fp8,
@@ -1473,20 +1472,16 @@ class DFlashWorker(SpecWorkerBase):
             if self._dflash_attention_backend == "TRTLLM" and getattr(
                 draft_model, "_uses_worker_attention_backend", True
             ):
-                # Gated on the drafter that actually runs the trtllm-gen ops:
-                # one paging its own block decode the same way is not shaped
-                # like them. The context kernel's head-size limits apply only
-                # to layers lowered to it; a non-causal windowed layer runs
-                # the block decode plus the future-block merge.
-                lowerings = draft_model.validate_block_attention_windows()
-                has_context_attention = DFLASH_CONTEXT_LOWERING in lowerings
+                # All supported masks lower to decode, including full non-causal
+                # attention with block queries folded into the query heads.
+                draft_model.validate_block_attention_windows()
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
                     num_kv_heads=nkv,
                     head_dim=hd,
                     tokens_per_block=page_size,
-                    has_context_attention=has_context_attention,
+                    has_context_attention=False,
                 )
             elif self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)

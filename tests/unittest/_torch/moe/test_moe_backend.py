@@ -6473,7 +6473,9 @@ def test_cutedsl_fc12_outer_runner_unique_id_includes_epilogue():
 @pytest.mark.parametrize("num_tokens", [0, 4])
 @pytest.mark.parametrize("with_event", [False, True])
 @pytest.mark.parametrize("provided_output", [False, True])
-def test_cutedsl_fc12_input_ready_event(monkeypatch, num_tokens, with_event, provided_output):
+def test_cutedsl_fc12_input_ready_event(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int, with_event: bool, provided_output: bool
+) -> None:
     """Each forward joins once before input consumption, including empty batches."""
     backend = CuteDslFc12FusedMoE.__new__(CuteDslFc12FusedMoE)
     torch.nn.Module.__init__(backend)

@@ -92,13 +92,15 @@ def _store_global_b64(gmem_ptr, value_lo: Int32, value_hi: Int32, *, loc=None, i
 @dsl_user_op
 def _load_shared_b32(smem_ptr, *, loc=None, ip=None) -> Int32:
     smem_addr = smem_ptr.toint(loc=loc, ip=ip)
+    # The FP8 epilogue reuses this scratch space for each output column tile.
+    # Keep each read ordered with its stores and prevent reuse across tiles.
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [smem_addr.ir_value(loc=loc, ip=ip)],
             "ld.shared.b32 $0, [$1];",
-            "=r,r",
-            has_side_effects=False,
+            "=r,r,~{memory}",
+            has_side_effects=True,
             loc=loc,
             ip=ip,
         )
@@ -879,6 +881,15 @@ class DSparkAttentionKernel:
                     blk_coord=blk_coord,
                     position=cutlass.Int32(cache_seqs[blk_coord[2]]),
                     window_end=cutlass.Int32(cache_seqs[blk_coord[2]]) % 128,
+                    valid_start=max(
+                        0,
+                        cutlass.Int32(cache_seqs[blk_coord[2]])
+                        - cutlass.Int32(window_valid_lens[blk_coord[2]]),
+                    ),
+                    valid_end=min(
+                        cutlass.Int32(cache_seqs[blk_coord[2]]),
+                        cutlass.Int32(capacities[blk_coord[2]]),
+                    ),
                     load_q_pipeline=load_q_pipeline,
                     load_kv_pipeline=load_kv_pipeline,
                     sPT=sPT,
@@ -1408,24 +1419,40 @@ class DSparkAttentionKernel:
         for row in cutlass.range(start_row, start_row + extent, rows):
             context_row = row_base + row
             page = common_params.sPT[context_row, page_table_stage]
+            position = (
+                common_params.position - 1 - (common_params.position - 1 - context_row + 128) % 128
+            )
             legal = cutlass.Boolean(True)
             if cutlass.const_expr(rows > 1):
-                legal = (
-                    (page >= 0)
-                    & (
-                        (common_params.window_end <= context_row)
-                        | (common_params.window_end >= context_row + rows)
+                legal = (page >= 0) & (
+                    page == common_params.sPT[context_row + rows - 1, page_table_stage]
+                )
+                does_not_wrap = (common_params.window_end <= context_row) | (
+                    common_params.window_end >= context_row + rows
+                )
+                if cutlass.const_expr(self.history_page_size > 128):
+                    # Larger pages have distinct offsets for adjacent window cycles.
+                    legal = legal & does_not_wrap
+                else:
+                    # Small pages keep the same offsets across a complete window.
+                    # A partial window can still have invalid rows inside the tile.
+                    full_window = (common_params.valid_start <= common_params.position - 128) & (
+                        common_params.valid_end >= common_params.position
                     )
-                    & (page == common_params.sPT[context_row + rows - 1, page_table_stage])
-                )
+                    legal = legal & (does_not_wrap | full_window)
+                if page < 0:
+                    # A cyclic tile has at most two absolute-position intervals.
+                    # Invalid endpoints alone do not exclude valid rows between them.
+                    span_end = position + rows
+                    has_valid = max(position, common_params.valid_start) < min(
+                        min(span_end, common_params.position), common_params.valid_end
+                    )
+                    has_wrapped_valid = (span_end > common_params.position) & (
+                        max(common_params.position - 128, common_params.valid_start)
+                        < min(span_end - 128, common_params.valid_end)
+                    )
+                    legal = not (has_valid | has_wrapped_valid)
             if legal:
-                # Recover the absolute position represented by this cyclic row.
-                # A 256-token page contains two distinct 128-token window cycles.
-                position = (
-                    common_params.position
-                    - 1
-                    - (common_params.position - 1 - context_row + 128) % 128
-                )
                 offset = position % self.history_page_size // rows
                 if cutlass.const_expr(is_k_load):
                     src = gmem[tile][None, offset, head_tile, page]
@@ -2577,7 +2604,9 @@ class DSparkAttentionKernel:
 
         return mma_o_consumer_state
 
-    def make_and_init_load_pt_pipeline(self, load_pt_mbar_ptr):
+    def make_and_init_load_pt_pipeline(
+        self, load_pt_mbar_ptr: cute.Pointer
+    ) -> pipeline.PipelineAsync:
         """Create the page-index producer/consumer pipeline."""
         load_pt_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread,
@@ -2587,7 +2616,9 @@ class DSparkAttentionKernel:
             pipeline.Agent.Thread,
             self.threads_per_warp * len([self.load_tma_warp_id]),
         )
-        return pipeline.PipelineCpAsync.create(
+        # Every producer lane publishes its generic shared stores; every TMA
+        # lane releases the stage after the last page-table read.
+        return pipeline.PipelineAsync.create(
             barrier_storage=load_pt_mbar_ptr,
             num_stages=self.load_pt_stage,
             producer_group=load_pt_producer_group,

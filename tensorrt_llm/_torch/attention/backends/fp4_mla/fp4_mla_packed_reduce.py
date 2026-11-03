@@ -22,6 +22,7 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import make_ptr
 
+from .config import _fp4_mla_packed_wave_plan_enabled
 from .cute_dsl_utils import _compile_cutedsl, _current_cu_stream
 from .fp4_mla_cutedsl_mufu16 import (
     KV_TILE,
@@ -50,6 +51,10 @@ PLAN_CANDIDATES = PLAN_SIM_CANDIDATES + PLAN_LOAD_CANDIDATES
 # Waves of more slots (four per lane) or batches of more requests keep the rule's length.
 PLAN_SIM_MAX_SLOTS = 128
 PLAN_SIM_MAX_REQUESTS = 64
+# The simulation caches two requests per lane. Extend that register layout
+# before raising this limit, rather than silently omitting later requests.
+if PLAN_SIM_MAX_REQUESTS > 64:
+    raise ValueError("The wave simulation supports at most two requests per lane")
 # Candidates of more tasks are skipped: the simulation leaves out the reduction, whose
 # cost grows with the partials.
 PLAN_SIM_MAX_TASKS = 256
@@ -396,13 +401,36 @@ def _plan_simulated_makespan(
     """
     # Every task but a request's last belongs to a split request.
     task_cost = tiles_per_task + cutlass.Int32(PLAN_TASK_COST_TILES + PLAN_SPLIT_COST_TILES)
+    # The caller gates simulation to PLAN_SIM_MAX_REQUESTS <= 64, so each
+    # lane owns at most two requests. Their tile counts, tails and split flags
+    # are invariant across the rounds that remove one tail at a time.
     full_tasks = cutlass.Int32(0)
-    for request_idx in cutlass.range(lane, num_requests, 32, unroll=1):
-        full_tasks = (
-            full_tasks
-            + (sTiles[request_idx] + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
-            - cutlass.Int32(1)
+    tail_key0 = cutlass.Int32(-1)
+    tail_key1 = cutlass.Int32(-1)
+    split_flags = cutlass.Int32(0)
+    if lane < num_requests:
+        request_tiles0 = sTiles[lane]
+        request_tasks0 = (request_tiles0 + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
+        full_tasks = request_tasks0 - cutlass.Int32(1)
+        tail0 = request_tiles0 - (request_tasks0 - cutlass.Int32(1)) * tiles_per_task
+        tail_key0 = (
+            tail0 * cutlass.Int32(PLAN_MAX_REQUESTS) + cutlass.Int32(PLAN_MAX_REQUESTS - 1) - lane
         )
+        if request_tasks0 > cutlass.Int32(1):
+            split_flags = cutlass.Int32(1)
+    request1 = lane + cutlass.Int32(32)
+    if request1 < num_requests:
+        request_tiles1 = sTiles[request1]
+        request_tasks1 = (request_tiles1 + tiles_per_task - cutlass.Int32(1)) // tiles_per_task
+        full_tasks = full_tasks + request_tasks1 - cutlass.Int32(1)
+        tail1 = request_tiles1 - (request_tasks1 - cutlass.Int32(1)) * tiles_per_task
+        tail_key1 = (
+            tail1 * cutlass.Int32(PLAN_MAX_REQUESTS)
+            + cutlass.Int32(PLAN_MAX_REQUESTS - 1)
+            - request1
+        )
+        if request_tasks1 > cutlass.Int32(1):
+            split_flags = split_flags | cutlass.Int32(2)
     full_tasks = cute.arch.warp_redux_sync(full_tasks, "add")
     # Equal tasks fill the slots round-robin.
     full_rounds = full_tasks // wave_tasks
@@ -435,27 +463,18 @@ def _plan_simulated_makespan(
     for _ in cutlass.range(0, num_requests, 1, unroll=1):
         # The longest last task left (ties: lower request), as tail * 1024 + (1023 - request).
         local_key = cutlass.Int32(-1)
-        for request_idx in cutlass.range(lane, num_requests, 32, unroll=1):
-            taken_bit = (taken >> (request_idx // cutlass.Int32(32))) & cutlass.Int32(1)
-            if taken_bit == cutlass.Int32(0):
-                request_tiles = sTiles[request_idx]
-                request_tasks = (
-                    request_tiles + tiles_per_task - cutlass.Int32(1)
-                ) // tiles_per_task
-                tail = request_tiles - (request_tasks - cutlass.Int32(1)) * tiles_per_task
-                local_key = cutlass.max(
-                    local_key,
-                    tail * cutlass.Int32(PLAN_MAX_REQUESTS)
-                    + cutlass.Int32(PLAN_MAX_REQUESTS - 1)
-                    - request_idx,
-                )
+        if (taken & cutlass.Int32(1)) == cutlass.Int32(0):
+            local_key = tail_key0
+        if (taken & cutlass.Int32(2)) == cutlass.Int32(0):
+            local_key = cutlass.max(local_key, tail_key1)
         key = cute.arch.warp_redux_sync(local_key, "max")
         request = cutlass.Int32(PLAN_MAX_REQUESTS - 1) - key % cutlass.Int32(PLAN_MAX_REQUESTS)
         if lane == request % cutlass.Int32(32):
             taken = taken | (cutlass.Int32(1) << (request // cutlass.Int32(32)))
         tail_cost = key // cutlass.Int32(PLAN_MAX_REQUESTS) + cutlass.Int32(PLAN_TASK_COST_TILES)
-        if sTiles[request] > tiles_per_task:
-            tail_cost = tail_cost + cutlass.Int32(PLAN_SPLIT_COST_TILES)
+        owner_split_flags = cute.arch.shuffle_sync(split_flags, offset=request % cutlass.Int32(32))
+        is_split = (owner_split_flags >> (request // cutlass.Int32(32))) & cutlass.Int32(1)
+        tail_cost = tail_cost + is_split * cutlass.Int32(PLAN_SPLIT_COST_TILES)
         local_free = cutlass.min(cutlass.min(slot0, slot1), cutlass.min(slot2, slot3))
         start = cute.arch.warp_redux_sync(local_free, "min")
         owner_key = cutlass.Int32(32)
@@ -878,7 +897,7 @@ def launch_packed_plan(
     query_len: int,
     helix_kv_bounds: torch.Tensor | None = None,
     generation_lengths: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None = None,
-    wave_plan: bool = True,
+    wave_plan: bool | None = None,
 ) -> None:
     """Write the balanced task plan for ``num_requests * num_splits`` slots into ``plan``.
 
@@ -892,6 +911,8 @@ def launch_packed_plan(
     ``wave_plan=False`` keeps the rule's task length and request order (no
     wave simulation, no tail reordering).
     """
+    if wave_plan is None:
+        wave_plan = _fp4_mla_packed_wave_plan_enabled()
     task_capacity = num_requests * num_splits
     if num_requests <= 0 or num_splits <= 0 or wave_tasks <= 0 or max_tiles_per_task <= 0:
         raise ValueError("plan needs positive request, split, wave and tile counts")
@@ -1005,7 +1026,7 @@ def plan_packed_tasks(
     max_tiles_per_task: int = 1 << 30,
     min_tiles_per_task: int = PACKED_MIN_TILES_PER_TASK,
     one_wave: bool = False,
-    wave_plan: bool = True,
+    wave_plan: bool | None = None,
 ) -> tuple[int, list[int]]:
     """Host mirror of the kernels' balanced task plan: (tiles per task, task begins).
 
@@ -1017,6 +1038,8 @@ def plan_packed_tasks(
     ``len(request_tiles) + 1`` task prefix, whose last element is the number of
     tasks actually used (<= ``task_capacity``). See ``_packed_tiles_per_task``.
     """
+    if wave_plan is None:
+        wave_plan = _fp4_mla_packed_wave_plan_enabled()
     num_requests = len(request_tiles)
     if num_requests <= 0 or task_capacity <= 0 or wave_tasks <= 0 or min(request_tiles) <= 0:
         raise ValueError("plan needs requests, task slots, wave tasks and positive tile counts")
@@ -1142,13 +1165,15 @@ def plan_candidate_lengths(
 
 
 def plan_task_order(
-    request_tiles: list[int], tiles_per_task: int, wave_plan: bool = True
+    request_tiles: list[int], tiles_per_task: int, wave_plan: bool | None = None
 ) -> list[tuple[int, int]]:
     """Grid order of the plan's tasks as (request, split).
 
     Every request's tasks but its last in request order, then the last tasks
     longest first (ties: lower request); without ``wave_plan`` all in request order.
     """
+    if wave_plan is None:
+        wave_plan = _fp4_mla_packed_wave_plan_enabled()
     tasks = [math.ceil(tiles / tiles_per_task) for tiles in request_tiles]
     if not wave_plan:
         return [(r, split) for r, n in enumerate(tasks) for split in range(n)]
@@ -1165,7 +1190,7 @@ def plan_simulated_makespan(request_tiles: list[int], tiles_per_task: int, wave_
     """Host mirror of ``_plan_simulated_makespan``: grid makespan in KV tiles for one length."""
     slots = [0] * wave_tasks
     makespan = 0
-    for request, split in plan_task_order(request_tiles, tiles_per_task):
+    for request, split in plan_task_order(request_tiles, tiles_per_task, wave_plan=True):
         start = heapq.heappop(slots)
         tiles = min(tiles_per_task, request_tiles[request] - split * tiles_per_task)
         end = start + tiles + PLAN_TASK_COST_TILES

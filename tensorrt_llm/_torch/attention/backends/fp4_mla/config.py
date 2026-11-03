@@ -140,6 +140,11 @@ _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
 FP4_MLA_PACKED_WAVE_PLAN_ENV = "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN"
 
 
+def _fp4_mla_packed_wave_plan_enabled() -> bool:
+    """Enable the optional wave simulation only when explicitly requested."""
+    return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, False)
+
+
 def _fp4_mla_packed_q_enabled() -> bool:
     """Whether decode uses the packed per-request Q layout (mufu16 CuTe DSL only)."""
     return (

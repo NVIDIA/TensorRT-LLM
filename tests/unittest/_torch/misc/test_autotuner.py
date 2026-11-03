@@ -1845,21 +1845,22 @@ def test_parallel_tactics_split_skips_non_helix_cp_ranks():
         tactics, DistributedTuningStrategy.PARALLEL) == tactics
 
 
-def test_parallel_tactics_short_list_not_split_across_helix_cp_ranks():
-    """A tactic list shorter than the Helix TP*CP group is not sharded."""
-    from tensorrt_llm.mapping import CpType
+@pytest.mark.parametrize("num_tactics", [0, 1, 3, 15, 16, 17])
+def test_parallel_tactics_short_list_keeps_one_candidate_per_idle_rank(
+        num_tactics: int) -> None:
+    from types import SimpleNamespace
 
-    tactics = list(range(3))
-    for rank in range(4):
-        tuner = autotuner.AutoTuner()
-        mapping = Mapping(world_size=4,
-                          rank=rank,
-                          tp_size=1,
-                          cp_size=4,
-                          cp_config={"cp_type": CpType.HELIX})
-        tuner.setup_distributed_state(mapping, dist=object())
-        assert tuner._maybe_parallelize_tactics(
-            tactics, DistributedTuningStrategy.PARALLEL) == tactics
+    tactics = list(range(num_tactics))
+    shards = []
+    for rank in range(16):
+        tuner = SimpleNamespace(_is_distributed=lambda: True,
+                                _tuning_group=lambda: (16, rank))
+        selected = autotuner.AutoTuner._maybe_parallelize_tactics(
+            tuner, tactics, DistributedTuningStrategy.PARALLEL)
+        shards.append(selected)
+        assert len(selected) <= max(1, (num_tactics + 15) // 16)
+        assert bool(selected) == bool(tactics)
+    assert set(tactic for shard in shards for tactic in shard) == set(tactics)
 
 
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):

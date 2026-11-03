@@ -129,8 +129,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
     RMS_NORM = 9
-    RMS_NORM_QUANT_FP8_BLOCKSCALE = 10
-    RMS_NORM_QUANT_MXFP8 = 11
+    RMS_NORM_QUANT_MXFP8 = 10
 
 
 class AllReduceParams:
@@ -165,7 +164,6 @@ class AllReduceParams:
         self.fp8_payload = fp8_payload
         assert fusion_op in (
             AllReduceFusionOp.NONE.value, AllReduceFusionOp.RMS_NORM.value,
-            AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE.value,
             AllReduceFusionOp.RMS_NORM_QUANT_MXFP8.value) or (residual
                                                               is not None)
 

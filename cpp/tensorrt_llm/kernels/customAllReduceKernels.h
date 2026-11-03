@@ -81,10 +81,8 @@ enum class AllReduceFusionOp : int8_t
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7,
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8,
     RMS_NORM = 9,
-    //! AllReduce + RMSNorm + FP8 1x128 block-scale quant (UE8M0, packed MN-major).
-    RMS_NORM_QUANT_FP8_BLOCKSCALE = 10,
     //! AllReduce + RMSNorm + MXFP8 quant (E4M3, UE8M0 per 1x32 group in the R128c4 layout).
-    RMS_NORM_QUANT_MXFP8 = 11,
+    RMS_NORM_QUANT_MXFP8 = 10,
 };
 
 inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
@@ -103,7 +101,6 @@ inline std::ostream& operator<<(std::ostream& os, AllReduceFusionOp op)
         os << "MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM";
         break;
     case AllReduceFusionOp::RMS_NORM: os << "RMS_NORM"; break;
-    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE: os << "RMS_NORM_QUANT_FP8_BLOCKSCALE"; break;
     case AllReduceFusionOp::RMS_NORM_QUANT_MXFP8: os << "RMS_NORM_QUANT_MXFP8"; break;
     default: os << "UNKNOWN"; break;
     }

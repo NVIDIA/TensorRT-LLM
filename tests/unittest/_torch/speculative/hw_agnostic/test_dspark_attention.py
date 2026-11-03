@@ -40,9 +40,6 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm._torch.modules.linear import Linear
 
-# The captured-context attention primitives were folded into
-# modeling_dspark; keep the historical alias so monkeypatch targets
-# below read unchanged.
 dspark_attention = modeling_dspark
 
 
@@ -532,16 +529,19 @@ def test_attention_forward_does_not_mutate_kv_cache():
 
 
 @pytest.mark.parametrize(
-    "value,tp_size,enable_attention_dp,expected",
+    "value,sm,tp_size,enable_attention_dp,expected",
     [
-        (None, 1, False, False),
-        (None, 2, True, False),
-        (None, 2, False, True),
-        ("fp8", 2, False, True),
-        ("bf16", 1, False, True),
+        (None, 107, 1, False, False),
+        (None, 107, 2, True, False),
+        (None, 107, 2, False, True),
+        (None, 100, 1, False, True),
+        (None, 103, 2, True, True),
+        ("fp8", 100, 1, False, False),
+        ("bf16", 107, 1, False, True),
     ],
 )
-def test_use_dspark_bf16_linear(monkeypatch, value, tp_size, enable_attention_dp, expected):
+def test_use_dspark_bf16_linear(monkeypatch, value, sm, tp_size, enable_attention_dp, expected):
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: sm)
     if value is None:
         monkeypatch.delenv("TRTLLM_DSPARK_LINEAR_BACKEND", raising=False)
     else:
@@ -552,6 +552,13 @@ def test_use_dspark_bf16_linear(monkeypatch, value, tp_size, enable_attention_dp
         enable_attention_dp=enable_attention_dp,
     )
     assert modeling_dspark._use_dspark_bf16_linear(mapping) is expected
+
+
+def test_use_dspark_bf16_linear_rejects_sharded_fp8(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DSPARK_LINEAR_BACKEND", "fp8")
+    mapping = types.SimpleNamespace(tp_size=2, enable_attention_dp=False)
+    with pytest.raises(ValueError, match="requires TP=1 or attention DP"):
+        modeling_dspark._use_dspark_bf16_linear(mapping)
 
 
 def test_use_dspark_bf16_linear_rejects_invalid_backend(monkeypatch):
@@ -611,13 +618,6 @@ def test_fused_fp8_input_producers_feed_prequantized_linears(monkeypatch) -> Non
     concat_input = (object(), object())
     norm_input = (object(), object())
     projection_inputs = []
-    prevalidated_calls = []
-
-    def prevalidated_projection(input, projection):
-        prevalidated_calls.append((input, projection))
-        return projection(input)
-
-    monkeypatch.setattr(dspark_attention, "_prequantized_fp8_projection", prevalidated_projection)
 
     def concat_quant(first, second):
         assert first.shape == (batch, hidden)
@@ -639,7 +639,6 @@ def test_fused_fp8_input_producers_feed_prequantized_linears(monkeypatch) -> Non
         use_fused_fp8_input=True,
     )
     assert projection_inputs == [concat_input]
-    assert prevalidated_calls == [(concat_input, qkv_proj)]
 
     def rmsnorm_quant(input, weight, eps):
         assert input is q_latent
@@ -654,7 +653,6 @@ def test_fused_fp8_input_producers_feed_prequantized_linears(monkeypatch) -> Non
     monkeypatch.setattr(dspark_attention, "cute_dsl_dspark_rmsnorm_fp8_quant", rmsnorm_quant)
     q = dspark_attention._q_projection(q_latent, torch.ones(q_rank), 1e-6, q_b_proj, True)
     assert projection_inputs[-1] == norm_input
-    assert prevalidated_calls[-1] == (norm_input, q_b_proj)
     assert q.shape == (batch, block, q_out)
 
 
@@ -666,13 +664,6 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
     o_a_proj = torch.empty(groups, rank, group_dim, dtype=torch.float8_e4m3fn)
     o_a_scale = object()
     calls = []
-    prevalidated_calls = []
-
-    def prevalidated_projection(input, projection):
-        prevalidated_calls.append((input, projection))
-        return projection(input)
-
-    monkeypatch.setattr(dspark_attention, "_prequantized_fp8_projection", prevalidated_projection)
 
     class FakeOutputLinear:
         has_fp8_block_scales = True
@@ -698,8 +689,6 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
         output,
         packed_scale,
         use_tvm_ffi=True,
-        dspark_max_batch=0,
-        dspark_rows_per_request=0,
     ):
         assert input.shape == (groups, batch * block, group_dim)
         assert weight is o_a_proj
@@ -708,8 +697,6 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
         assert output.shape == (groups, batch * block, rank)
         assert packed_scale.dtype == torch.uint8
         assert use_tvm_ffi is True
-        assert dspark_max_batch == 0
-        assert dspark_rows_per_request == 0
         output.zero_()
         packed_scale.zero_()
 
@@ -722,7 +709,7 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
     )
     monkeypatch.setattr(
         torch.ops.trtllm,
-        "cute_dsl_dspark_fp8_bmm_quantize_rubin_out",
+        "cute_dsl_fp8_bmm_quantize_rubin_out",
         fake_bmm_quantize,
     )
 
@@ -739,8 +726,6 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
 
     assert output.shape == (batch, block, hidden)
     assert len(calls) == 1
-    assert len(prevalidated_calls) == 1
-    assert prevalidated_calls[0][0] is calls[0]
     fp8_output, packed_scale = calls[0]
     assert fp8_output.shape == (batch * block, groups * rank)
     assert fp8_output.dtype == torch.float8_e4m3fn
@@ -887,96 +872,6 @@ def test_context_wkv_autotune_bucket_contract():
     assert _gen_dspark_context_wkv_m_profiles(1024) == (128, 256, 512, 1024)
 
 
-def test_generation_autotune_bucket_contract_uses_dspark_rows():
-    from tensorrt_llm._torch.autotuner import AutoTuner
-    from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
-        _get_dspark_generation_fp8_bmm_quant_tuning_config,
-        _get_dspark_generation_mxfp8_tuning_config,
-    )
-
-    tuner = AutoTuner()
-    block_config = _get_dspark_generation_mxfp8_tuning_config(5, 32)
-    profiles = tuner._optimization_profiles(block_config, [torch.empty(5, 8)])
-    assert [profile.get_opt_shapes() for profile in profiles] == [
-        ((5, 8),),
-        ((10, 8),),
-        ((20, 8),),
-        ((40, 8),),
-        ((80, 8),),
-        ((160, 8),),
-    ]
-    block_spec = block_config.dynamic_tensor_specs[0]
-    assert [block_spec.map_to_tuning_buckets(m) for m in (5, 15, 25, 160)] == [
-        5,
-        20,
-        40,
-        160,
-    ]
-
-    qkv_config = _get_dspark_generation_mxfp8_tuning_config(6, 32)
-    profiles = tuner._optimization_profiles(qkv_config, [torch.empty(6, 8)])
-    assert [profile.get_opt_shapes()[0][0] for profile in profiles] == [
-        6,
-        12,
-        24,
-        48,
-        96,
-        192,
-    ]
-
-    oa_config = _get_dspark_generation_fp8_bmm_quant_tuning_config(5, 32)
-    oa_spec = oa_config.dynamic_tensor_specs[0]
-    assert oa_spec.gen_tuning_buckets == (
-        5,
-        6,
-        10,
-        12,
-        20,
-        24,
-        40,
-        48,
-        80,
-        96,
-        160,
-        192,
-    )
-    assert [oa_spec.map_to_tuning_buckets(m) for m in (5, 6, 15, 18, 160, 192)] == [
-        5,
-        6,
-        20,
-        20,
-        160,
-        192,
-    ]
-
-
-def test_model_configures_projection_owned_generation_buckets():
-    class Projection:
-        def __call__(self, x):
-            return x
-
-    qkv, q_b, o_b = Projection(), Projection(), Projection()
-    model = types.SimpleNamespace(
-        _use_bf16_linear=False,
-        block_size=5,
-        mtp_layers=[
-            types.SimpleNamespace(_dspark_attn={"qkv_proj": qkv, "wq_b": q_b, "wo_b": o_b})
-        ],
-    )
-
-    DSv4DSparkDraftModel.configure_generation_autotuner(model, max_batch=32)
-
-    assert (
-        qkv._dspark_generation_tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets[-1] == 192
-    )
-    assert (
-        q_b._dspark_generation_tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets[-1] == 160
-    )
-    assert o_b._dspark_generation_tuning_config is q_b._dspark_generation_tuning_config
-    assert o_b._dspark_generation_max_batch == 32
-    assert o_b._dspark_generation_rows_per_request == 5
-
-
 def test_stack_fp8_projection_output_rows_preserves_stage_order(monkeypatch):
     rows, output_rows, hidden = 256, 128, 128
     scale_cols = hidden // 32
@@ -1052,6 +947,9 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
     o_b_proj.has_fp8_block_scales = True
     o_b_proj.use_cute_dsl_blockscaling_mm = True
     o_b_proj.disable_deep_gemm = False
+    o_b_proj.bias = None
+    o_b_proj.lora = None
+    o_b_proj._locality_domain_weight_shards = None
     o_b_proj.in_features = 16 * 128
     o_b_proj.weight = torch.empty(8, 16 * 128, dtype=torch.float8_e4m3fn)
     o_b_proj.weight_scale = torch.empty(1, dtype=torch.uint8)
@@ -1097,6 +995,8 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
     assert bound["wq_b"] is q_b_proj
     assert bound["wo_b"] is o_b_proj
     assert model._context_wkv_fp8 is None
+    qkv_proj.prepare_output_slice.assert_called_once_with(6, 14)
+    assert stage._dspark_context_wkv_slice == (qkv_proj, 6, 14)
     assert bound["o_a_proj"] is o_a_proj
     assert bound["o_a_scale"] is o_a_scale
     assert bound["o_a_dequant"] is o_a_dequant
@@ -1135,6 +1035,7 @@ def test_bind_attn_projections_reuses_loaded_mla_modules(monkeypatch):
 
     stack_projections.assert_called_once_with([qkv_proj], 8)
     assert model._context_wkv_fp8 is context_wkv
+    assert stage._dspark_context_wkv_slice is None
 
 
 @pytest.mark.parametrize(
@@ -1241,7 +1142,7 @@ def test_bind_bf16_attn_projections_disables_every_fp8_projection():
     assert model._context_wkv_fp8 is None
 
 
-def test_context_wkv_fp8_quantizes_once_per_page_write(monkeypatch):
+def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
     num_stages, hidden, head_dim, window = 3, 4, 2, 8
     model = DSv4DSparkDraftModel.__new__(DSv4DSparkDraftModel)
     torch.nn.Module.__init__(model)
@@ -1303,39 +1204,29 @@ def test_context_wkv_fp8_quantizes_once_per_page_write(monkeypatch):
     monkeypatch.setattr(modeling_dspark, "_rmsnorm", lambda value, *args: value)
     monkeypatch.setattr(modeling_dspark, "_rope_last_dims_batched", lambda value, *args: value)
 
-    # Capture the paged-store boundary; projection math runs on CPU.
-    writes = []
-    monkeypatch.setattr(
-        modeling_dspark,
-        "write_dspark_context",
-        lambda values, *args: writes.append((values.clone(), args)),
-    )
     main_hidden = torch.arange(2 * 2 * hidden, dtype=torch.float32).view(2, 2, hidden)
     positions = torch.tensor([[1, 32], [3, 4]])
+    slots = torch.tensor([2, 0])
     mask = torch.tensor([[True, False], [True, True]])
-    pools = tuple(torch.zeros(4, 1, 1, window, head_dim) for _ in stages)
-    tables = torch.tensor([[2], [1]], dtype=torch.int32)
-    capacities = torch.tensor([window, window])
-    model.write_context_pages(main_hidden, positions, mask, pools, tables, capacities)
+    windows = torch.full((3, num_stages, window, head_dim), -7.0)
+    expected = windows.clone()
+    for row, col in mask.nonzero().tolist():
+        for stage_id, weight in enumerate(weights):
+            expected[slots[row], stage_id, positions[row, col] % window] = F.linear(
+                main_hidden[row, col], weight
+            )
+    model.write_context_windows_batched(main_hidden, positions, slots, mask, windows)
 
     assert len(quant_calls) == len(gemm_calls) == 1
-    assert len(writes) == num_stages
-    for stage_id, weight in enumerate(weights):
-        values, args = writes[stage_id]
-        torch.testing.assert_close(values, F.linear(main_hidden, weight))
-        assert args[0] is positions and args[1] is mask
-        assert args[2].data_ptr() == pools[stage_id].data_ptr()
-        assert args[3] is tables and args[4] is capacities
+    torch.testing.assert_close(windows, expected)
     assert all(projection.call_count == 0 for projection in qkv_projections)
 
-    expected = [values for values, _ in writes]
-    writes.clear()
+    windows.fill_(-7.0)
     model._context_wkv_fp8 = None
     for stage in stages:
         stage._dspark_attn["qkv_proj"] = None
-    model.write_context_pages(main_hidden, positions, mask, pools, tables, capacities)
-    for (actual, _), wanted in zip(writes, expected):
-        torch.testing.assert_close(actual, wanted)
+    model.write_context_windows_batched(main_hidden, positions, slots, mask, windows)
+    torch.testing.assert_close(windows, expected)
     assert len(quant_calls) == len(gemm_calls) == 1
 
 
@@ -1472,3 +1363,206 @@ def test_context_window_writes_use_projection_modules(batched, stacked):
         reference.write_context_windows(hidden, positions, expected)
         model.write_context_windows(hidden, positions, actual)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("invalid_field", ["_locality_domain_weight_shards", "lora", "bias"])
+def test_fused_fp8_projections_reject_unsupported_linear_contract(monkeypatch, invalid_field):
+    monkeypatch.setattr(modeling_dspark, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+
+    class Projection:
+        has_fp8_block_scales = True
+        use_cute_dsl_blockscaling_mm = True
+        disable_deep_gemm = False
+        in_features = 256
+        weight = torch.empty(512, 256, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(4096, dtype=torch.uint8)
+
+        def __call__(self, x):
+            return x
+
+    projection = Projection()
+    o_a_proj = torch.empty(2, 128, 256, dtype=torch.float8_e4m3fn)
+    assert modeling_dspark._can_use_fused_fp8_input_projection(projection, 256)
+    assert modeling_dspark._can_use_fused_fp8_output_projection(projection, o_a_proj, 2, 128)
+    setattr(projection, invalid_field, object())
+    assert not modeling_dspark._can_use_fused_fp8_input_projection(projection, 256)
+    assert not modeling_dspark._can_use_fused_fp8_output_projection(projection, o_a_proj, 2, 128)
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("block", [5, 6])
+def test_batched_fused_preparation_compacts_qkv_views(monkeypatch, batch, block):
+    torch.manual_seed(17)
+    hidden, q_rank, head_dim, heads = 8, 16, 512, 64
+    x = torch.randn(batch, block, hidden, dtype=torch.bfloat16)
+    main_x = torch.randn(batch, 1, hidden, dtype=torch.bfloat16)
+    weight = torch.randn(q_rank + head_dim, hidden, dtype=torch.bfloat16)
+    expected_main = F.linear(main_x, weight)[..., q_rank:]
+    expected_block = F.linear(x, weight)[..., q_rank:]
+    calls = []
+
+    def preparation_supported(main, draft, *args):
+        assert not draft.is_contiguous()
+        if batch > 1:
+            assert not main.is_contiguous()
+        return True
+
+    def cache_write(main, norm_weight, freqs, cache, slots, positions, eps):
+        assert main.is_contiguous()
+        torch.testing.assert_close(main, expected_main, rtol=0, atol=0)
+        calls.append("cache_write")
+        return slots.int(), positions.int()
+
+    def draft_prepare(draft, norm_weight, freqs, eps):
+        assert draft.is_contiguous()
+        torch.testing.assert_close(draft, expected_block, rtol=0, atol=0)
+        calls.append("draft_block")
+        return draft.new_zeros(batch, 8, head_dim)
+
+    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(modeling_dspark, "is_sm_100f", lambda: False)
+    monkeypatch.setattr(
+        modeling_dspark, "is_fused_dspark_rmsnorm_rope_supported", lambda *args, **kwargs: False
+    )
+    monkeypatch.setattr(
+        modeling_dspark, "is_fused_dsv4_dspark_attention_supported", lambda *args: True
+    )
+    monkeypatch.setattr(
+        modeling_dspark, "is_fused_dspark_attention_preparation_supported", preparation_supported
+    )
+    monkeypatch.setattr(modeling_dspark, "cute_dsl_dspark_rmsnorm_rope_cache_write", cache_write)
+    monkeypatch.setattr(modeling_dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block", draft_prepare)
+    monkeypatch.setattr(
+        modeling_dspark, "fused_dsv4_dspark_attention", lambda q, *args: torch.zeros_like(q)
+    )
+    monkeypatch.setattr(modeling_dspark, "_output_projection", lambda o, **kwargs: o)
+    output = modeling_dspark.dspark_attention_forward_batched(
+        x,
+        main_x,
+        torch.arange(batch) + 3,
+        torch.zeros(batch, 128, head_dim, dtype=x.dtype),
+        torch.arange(batch),
+        torch.full((batch,), 4, dtype=torch.int64),
+        wq_a=None,
+        q_norm_w=torch.ones(q_rank, dtype=x.dtype),
+        wq_b=torch.randn(heads * head_dim, q_rank, dtype=x.dtype),
+        wkv=None,
+        kv_norm_w=torch.ones(head_dim, dtype=x.dtype),
+        wo_a=None,
+        wo_b=None,
+        attn_sink=torch.zeros(heads),
+        n_heads=heads,
+        head_dim=head_dim,
+        rope_head_dim=64,
+        n_groups=8,
+        o_lora_rank=128,
+        window_size=128,
+        eps=1e-6,
+        softmax_scale=head_dim**-0.5,
+        freqs_cis=precompute_dspark_freqs_cis(64, 32),
+        qkv_proj=lambda rows: F.linear(rows, weight),
+    )
+    assert output.shape == (batch, block, heads, head_dim)
+    assert calls == ["cache_write", "draft_block"]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_ring_attention_metadata_maps_wrapped_slots(dtype):
+    slots = torch.tensor([3, 1, 0], dtype=dtype)
+    positions = torch.tensor([0, 64, 255], dtype=dtype)
+    lengths = torch.tensor([1, 32, 128], dtype=dtype)
+    tables, ends, valid, capacities = modeling_dspark._dspark_ring_attention_metadata(
+        slots, positions, lengths, 128
+    )
+    torch.testing.assert_close(tables, torch.tensor([[3, 3], [1, 1], [0, 0]], dtype=torch.int32))
+    torch.testing.assert_close(ends, torch.tensor([129, 193, 256], dtype=torch.int64))
+    torch.testing.assert_close(valid, lengths.long())
+    torch.testing.assert_close(capacities, torch.full((3,), 256, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("with_valid_lengths", [False, True])
+def test_forward_batched_reuses_ring_attention_metadata(monkeypatch, with_valid_lengths):
+    hidden = torch.randn(2, 5, 2, 8)
+    stages = [types.SimpleNamespace(_dspark_attn={}) for _ in range(3)]
+    stage_call = Mock(side_effect=lambda stage, h, *args, **kwargs: h)
+    model = types.SimpleNamespace(
+        mtp_layers=stages,
+        _attn_params={"window_size": 128},
+        forward_embed=Mock(return_value=(hidden, torch.randn(2, 8), torch.zeros(2, 5))),
+        _dspark_freqs_table=Mock(return_value=torch.empty(0)),
+        _initial_pre_mix=Mock(return_value=None),
+        _forward_stage=stage_call,
+        uses_lagged_pre=False,
+        forward_head=Mock(return_value=(None, None)),
+    )
+    build = Mock(wraps=modeling_dspark._dspark_ring_attention_metadata)
+    monkeypatch.setattr(modeling_dspark, "_dspark_ring_attention_metadata", build)
+    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", True)
+    DSv4DSparkDraftModel.forward_batched(
+        model,
+        torch.randn(2, 16),
+        torch.zeros(2, dtype=torch.long),
+        torch.tensor([64, 192]),
+        kv_windows=torch.empty(3, 3, 128, 512),
+        slots=torch.tensor([2, 0]),
+        valid_len=torch.tensor([1, 127]) if with_valid_lengths else None,
+    )
+    assert stage_call.call_count == 3
+    shared = [call.kwargs["ring_attention_metadata"] for call in stage_call.call_args_list]
+    assert all(item is shared[0] for item in shared)
+    assert build.call_count == int(with_valid_lengths)
+    assert (shared[0] is not None) == with_valid_lengths
+
+
+def test_context_wkv_uses_prepared_linear_slice():
+    main = torch.randn(2, 3, 128)
+    weight = torch.randn(640, 128)
+    projection = Mock(side_effect=AssertionError("context must not project Q rows"))
+    projection.forward_slice.side_effect = lambda value, start, end: F.linear(
+        value, weight[start:end]
+    )
+    stage = types.SimpleNamespace(
+        _dspark_context_wkv_slice=(projection, 128, 640),
+        _dspark_attn={"qkv_proj": projection},
+    )
+    model = types.SimpleNamespace(mtp_layers=[stage], _attn_params={"head_dim": 512})
+    actual = DSv4DSparkDraftModel._project_context_wkv_stage(model, main, 0, None)
+    torch.testing.assert_close(actual, F.linear(main, weight[128:640]))
+    projection.assert_not_called()
+    projection.forward_slice.assert_called_once_with(main, 128, 640)
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.int32, torch.uint8])
+def test_context_wkv_slice_prepares_real_fp8_scale_layout(scale_dtype):
+    from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod
+
+    weight = torch.randn(2048, 256).to(torch.float8_e4m3fn)
+    if scale_dtype == torch.float32:
+        scales = torch.randn(16, 2)
+    elif scale_dtype == torch.int32:
+        scales = torch.arange(2048 * 2, dtype=torch.int32).reshape(2, 2048).t()
+    else:
+        scales = torch.arange(2048 * 8, dtype=torch.int32).to(torch.uint8)
+    projection = types.SimpleNamespace(
+        weight=weight,
+        weight_scale=scales,
+        _output_slice_cache=None,
+        transform_weights=Mock(),
+    )
+    method = FP8BlockScalesLinearMethod()
+    method.prepare_output_slice(projection, 1536, 2048)
+    sliced, sliced_scales, crop = projection._output_slice_cache.get(weight, 1536, 2048)
+    assert crop == 0
+    assert sliced.shape == (512, 256)
+    assert sliced.untyped_storage().data_ptr() == weight.untyped_storage().data_ptr()
+    if scale_dtype == torch.float32:
+        torch.testing.assert_close(sliced_scales, scales[12:16])
+    elif scale_dtype == torch.int32:
+        assert sliced_scales.stride() == (1, 512)
+        torch.testing.assert_close(sliced_scales, scales[1536:2048])
+    else:
+        torch.testing.assert_close(sliced_scales, scales[1536 * 8 : 2048 * 8])
+    method.prepare_output_slice(projection, 1536, 2048)
+    _, same_scales, _ = projection._output_slice_cache.get(weight, 1536, 2048)
+    assert same_scales.data_ptr() == sliced_scales.data_ptr()

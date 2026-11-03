@@ -1072,7 +1072,6 @@ class MNNVLAllReduce(nn.Module):
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
         AllReduceFusionOp.RMS_NORM,
-        AllReduceFusionOp.RMS_NORM_QUANT_FP8_BLOCKSCALE,
         AllReduceFusionOp.RMS_NORM_QUANT_MXFP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,

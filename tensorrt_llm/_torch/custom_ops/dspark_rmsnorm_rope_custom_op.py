@@ -20,6 +20,7 @@ from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkRMSNormRoPEKernel,
     DSparkRMSNormRoPEPageWriteKernel,
 )
+from ..utils import mxfp8_scale_infer_shape
 
 _DSV4_DSPARK_HEAD_DIM = 512
 _DSV4_DSPARK_ROPE_DIM = 64
@@ -358,6 +359,7 @@ def _compile_dspark_rmsnorm_rope_cache_write(eps: float):
 
 @functools.cache
 def _compile_dspark_rmsnorm_rope_draft_block(block_size: int, eps: float, device: int):
+    # The device argument scopes this compilation cache to its CUDA device.
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "DSpark RMSNorm/RoPE draft-block must be warmed up before CUDA graph capture"
@@ -433,7 +435,9 @@ def cute_dsl_dspark_rmsnorm_rope(
         )
 
     original_shape = x.shape
-    x_flat = x.view(-1, x.shape[-1])
+    # Fused QKV projections supply regular strided views; this specialization
+    # uses compact rows in its compiled signature.
+    x_flat = x.view(-1, x.shape[-1]).contiguous()
     output = torch.empty_like(x_flat)
     compiled = _compile_fused_dspark_rmsnorm_rope(
         x.shape[-1],
@@ -771,10 +775,6 @@ def _(
     return None
 
 
-def _r128c4_scale_numel(rows: int, hidden_dim: int) -> int:
-    return ((rows + 127) // 128 * 128) * (hidden_dim // 32)
-
-
 def precompile_dspark_fp8_input_fusions(
     qkv_hidden_dim: int | None,
     q_lora_rank: int | None,
@@ -887,9 +887,7 @@ def cute_dsl_dspark_rmsnorm_fp8_quant(
     hidden_dim = x.shape[-1]
     x_flat = x.view(-1, hidden_dim)
     output = x.new_empty(x_flat.shape, dtype=torch.float8_e4m3fn)
-    output_scale = x.new_empty(
-        (_r128c4_scale_numel(x_flat.shape[0], hidden_dim),), dtype=torch.uint8
-    )
+    output_scale = x.new_empty((mxfp8_scale_infer_shape([list(x_flat.shape)]),), dtype=torch.uint8)
     compiled = _compile_dspark_rmsnorm_fp8_quant(hidden_dim, eps)
     compiled(
         x_flat,
@@ -910,7 +908,7 @@ def _(
     rows = x.numel() // x.shape[-1]
     return (
         x.new_empty((rows, x.shape[-1]), dtype=torch.float8_e4m3fn),
-        x.new_empty((_r128c4_scale_numel(rows, x.shape[-1]),), dtype=torch.uint8),
+        x.new_empty((mxfp8_scale_infer_shape([[rows, x.shape[-1]]]),), dtype=torch.uint8),
     )
 
 
@@ -927,7 +925,9 @@ def cute_dsl_dspark_concat_fp8_quant(
     rows = first.shape[0] + second.shape[0]
     hidden_dim = first.shape[1]
     output = first.new_empty((rows, hidden_dim), dtype=torch.float8_e4m3fn)
-    output_scale = first.new_empty((_r128c4_scale_numel(rows, hidden_dim),), dtype=torch.uint8)
+    output_scale = first.new_empty(
+        (mxfp8_scale_infer_shape([[rows, hidden_dim]]),), dtype=torch.uint8
+    )
     compiled = _compile_dspark_concat_fp8_quant(hidden_dim)
     compiled(
         first,
@@ -947,7 +947,7 @@ def _(
     hidden_dim = first.shape[1]
     return (
         first.new_empty((rows, hidden_dim), dtype=torch.float8_e4m3fn),
-        first.new_empty((_r128c4_scale_numel(rows, hidden_dim),), dtype=torch.uint8),
+        first.new_empty((mxfp8_scale_infer_shape([[rows, hidden_dim]]),), dtype=torch.uint8),
     )
 
 

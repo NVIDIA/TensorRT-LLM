@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packed FP4 MLA decode: row layout policy, the CuTe DSL split reducer and the step metadata written ahead."""
 
+import functools
 import importlib
 import math
 from types import SimpleNamespace
@@ -97,7 +98,9 @@ def test_plan_packed_tasks_balances_by_kv_length(
     expected_tiles_per_task: int,
     expected_begins: list[int],
 ) -> None:
-    tiles_per_task, begins = _plan_mod().plan_packed_tasks(tiles, capacity, wave_tasks)
+    tiles_per_task, begins = _plan_mod().plan_packed_tasks(
+        tiles, capacity, wave_tasks, wave_plan=True
+    )
     assert tiles_per_task == expected_tiles_per_task
     assert begins == expected_begins
     assert begins[-1] <= capacity
@@ -107,7 +110,7 @@ def test_plan_packed_tasks_balances_by_kv_length(
 
 
 def test_plan_packed_tasks_simulates_helix_ranks() -> None:
-    plan = _plan_mod().plan_packed_tasks
+    plan = functools.partial(_plan_mod().plan_packed_tasks, wave_plan=True)
     # helix16 bs16 (6 m-tiles, 17 wave tasks), per-rank KV skewed 3.5x: the Helix rule targets one
     # wave of 28-tile tasks (21 tasks, a second wave); the simulation keeps the 16 requests whole.
     tiles = [16] * 12 + [40, 48, 56, 56]
@@ -122,7 +125,7 @@ def test_plan_packed_tasks_simulates_helix_ranks() -> None:
 
 def test_plan_packed_tasks_simulates_the_waves() -> None:
     reduce_mod = _plan_mod()
-    plan = reduce_mod.plan_packed_tasks
+    plan = functools.partial(reduce_mod.plan_packed_tasks, wave_plan=True)
     # Skewed request lengths exercise the task-rounding overhead across waves.
     tiles = [1848, 1250, 977, 743, 586, 430, 313, 196, 106]
     assert plan(tiles, 9 * 9, 35) == (195, [0, 10, 17, 23, 27, 31, 34, 36, 38, 39])
@@ -181,7 +184,7 @@ def test_plan_packed_tasks_takes_the_shortest_simulated_candidate() -> None:
 
 
 def test_plan_task_order_runs_full_tasks_then_longest_tails() -> None:
-    order = _plan_mod().plan_task_order
+    order = functools.partial(_plan_mod().plan_task_order, wave_plan=True)
     # Tails: request 0 -> 4 tiles, request 1 -> 10 (a full task), request 2 -> 3, request 3 -> 4.
     full = [(0, 0), (0, 1), (1, 0), (1, 1), (3, 0)]
     tails = [(1, 2), (0, 2), (3, 1), (2, 0)]
@@ -253,6 +256,11 @@ _DEP16_RANK_KV_LENS = [473000, 320000, 250000, 190000, 150000, 110000, 80000, 50
         # Balanced per-slot load candidates: dep16 B8 MTP7 at 180K, dep16 B16 MTP5 at 175K.
         ([180000] * 8, 8, 17, 8, False, True),
         ([175000] * 16, 8, 21, 6, False, True),
+        # Two cached requests per lane; larger batches take the existing fallback.
+        ([32768] * 31 + [262144], 2, 35, 4, False, True),
+        ([32768] * 32 + [262144], 2, 35, 4, False, True),
+        ([32768] * 63 + [262144], 2, 35, 4, False, True),
+        ([32768] * 64 + [262144], 2, 35, 4, False, True),
         # TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=0, off and on Helix: the rule's length, request order.
         (_DEP16_RANK_KV_LENS, 9, 35, 4, False, False),
         ([131, 20000, 600, 45000], 10, 17, 8, True, False),
@@ -443,7 +451,9 @@ def test_packed_plan_wave_plan_env_rolls_back(monkeypatch) -> None:
     fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
     monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, "0")
     fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
-    assert calls == [True, False]
+    monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, "1")
+    fp4_mla_packed_plan._launch_fp4_mla_packed_plan(geometry, kv_lens, metadata)
+    assert calls == [False, False, True]
 
 
 def test_packed_plan_geometry_is_shared_by_cache_update_and_decode(monkeypatch) -> None:
@@ -928,3 +938,19 @@ def test_generation_metadata_ahead_is_bitwise_eager_and_in_a_graph(
         _first_layer_metadata(reference, num_heads)
         torch.cuda.synchronize()
         _assert_step_outputs_equal(_step_outputs(captured), _step_outputs(reference))
+
+
+@pytest.mark.parametrize("value,enabled", [(None, False), ("0", False), ("1", True)])
+def test_wave_plan_requires_explicit_opt_in(monkeypatch, value: str | None, enabled: bool) -> None:
+    if value is None:
+        monkeypatch.delenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(fp4_mla_config.FP4_MLA_PACKED_WAVE_PLAN_ENV, value)
+    assert fp4_mla_config._fp4_mla_packed_wave_plan_enabled() is enabled
+    plan = _plan_mod()
+    assert plan.plan_packed_tasks([1, 79, 3, 176], 24, 17) == (
+        plan.plan_packed_tasks([1, 79, 3, 176], 24, 17, wave_plan=enabled)
+    )
+    assert plan.plan_task_order([24, 30, 3, 14], 10) == (
+        plan.plan_task_order([24, 30, 3, 14], 10, wave_plan=enabled)
+    )
