@@ -866,6 +866,9 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    if not model_engine.model.model_config.is_generation:
+        enable_chunked_context = False
+
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (
         kv_cache_config.enable_block_reuse)

@@ -36,6 +36,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.logger import logger
 
 from ...utils import torch_multi_arange
@@ -283,6 +284,16 @@ class Sampler(ABC, Generic[GenericSampleState]):
         """
 
 
+def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Optional[int]) -> None:
+    """Reject a prompt that does not fit the one forward a non-generation request runs in."""
+    if max_num_tokens is not None and request.prompt_len > max_num_tokens:
+        raise ValueError(
+            context_length_exceeded_message(
+                max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
+            )
+        )
+
+
 class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
     """
     Use for skipping decoding step for non generation model,
@@ -290,6 +301,13 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
     """
 
     SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
+
+    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
+        self.max_num_tokens = max_num_tokens
+
+    @override
+    def validate_request(self, request: LlmRequest) -> None:
+        _validate_single_forward_request(request, self.max_num_tokens)
 
     @override
     def sample_async(
@@ -406,8 +424,15 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
 
     SampleState: TypeAlias = SampleStateWithMMResult
 
-    def __init__(self, return_mm_results: bool = True) -> None:
+    def __init__(
+        self, return_mm_results: bool = True, max_num_tokens: Optional[int] = None
+    ) -> None:
         self.return_mm_results = return_mm_results
+        self.max_num_tokens = max_num_tokens
+
+    @override
+    def validate_request(self, request: LlmRequest) -> None:
+        _validate_single_forward_request(request, self.max_num_tokens)
 
     @override
     def sample_async(
