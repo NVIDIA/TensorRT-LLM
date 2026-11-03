@@ -5398,12 +5398,25 @@ class TestGemma4StreamingMatchesWholeParse:
         # call and then the text after each of the first k calls, for some k.
         # Without text after a call, that is the text detect_and_parse keeps.
         sendable = [before + "".join(after[:k]) for k in range(len(after) + 1)]
+        # An increment returns the text before a call or one step of a call,
+        # so k depends on the chunking. Arriving whole, finish is left with the
+        # text after every call. One character at a time, each call closes in
+        # the increment that ends its end token and every later character comes
+        # in an increment of its own, so all of it goes out. (Text that ends in
+        # the first characters of a start token is held back; no case does.)
+        exact = {
+            "arriving whole": sendable[0],
+            "one character per delta": sendable[-1],
+        }
 
         for label, chunks in _chunkings(text):
             normal, calls = _g4_stream(chunks, label)
             assert [(name, _g4_arguments(arguments, label))
                     for name, arguments in calls] == expected, label
-            assert normal in sendable, label
+            if label in exact:
+                assert normal == exact[label], label
+            else:
+                assert normal in sendable, label
 
     def test_arguments_go_out_once_the_call_closes(self, sample_tools):
         """In token-sized increments the name goes out first, then the JSON."""
