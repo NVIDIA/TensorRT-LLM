@@ -16,6 +16,14 @@ import importlib
 from importlib.util import find_spec
 
 import pytest
+import torch
+
+
+@pytest.fixture(scope="session", autouse=True)
+def initialized_cuda_context():
+    """Native managers borrow the current CUDA context before allocating pools."""
+    stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    yield stream
 
 
 def _poison_api():

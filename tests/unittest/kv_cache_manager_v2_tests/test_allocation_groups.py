@@ -81,8 +81,8 @@ def _pool_layout(manager: kv.KVCacheManager) -> tuple:
 def test_explicit_token_group_matches_implicit_layout_and_prefix_reuse():
     results = []
     for explicit in (False, True):
-        manager = kv.KVCacheManager(_config(explicit))
         stream = torch.cuda.Stream()
+        manager = kv.KVCacheManager(_config(explicit))
         caches = []
         try:
             layout = _pool_layout(manager)
@@ -131,8 +131,8 @@ def test_equal_explicit_groups_keep_independent_membership():
     config.allocation_groups = [
         kv.AllocationGroupConfig(group, kv.AllocationUnit.TOKEN_BLOCK) for group in (31, 47)
     ]
-    manager = kv.KVCacheManager(config)
     stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
     caches = []
     try:
         key = manager.get_buffer_group_id(0, "key")
@@ -182,8 +182,8 @@ def test_explicit_fixed_group_ignores_layer_kind_and_stays_private(layer_type):
         ],
         commit_min_snapshot=True,
     )
-    manager = kv.KVCacheManager(config)
     stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
     caches = []
     try:
         fixed = manager.get_buffer_group_id(1, "state")
