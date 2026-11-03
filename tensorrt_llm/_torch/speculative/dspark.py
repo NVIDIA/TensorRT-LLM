@@ -1315,7 +1315,7 @@ class DSparkWorker(DFlashWorker):
                 num_contexts,
                 batch_size,
             )
-        from ..models.modeling_speculative import dspark_markov_step_bias
+        from ..models.modeling_speculative import markov_prev_embeddings
 
         num_gens, num_drafts, _ = gen_logits.shape
         # The chain indexes the full Markov table, and verification reads
@@ -1337,25 +1337,41 @@ class DSparkWorker(DFlashWorker):
             None if draft_probs is None else spec_metadata.batch_slot_ids[num_contexts:batch_size]
         )
 
-        prev = inputs["first_prev_tokens"].long()
+        markov_w1, markov_w2 = draft_model.markov_w1, draft_model.markov_w2
+        # The K positions draw from consecutive RNG slots: one state per
+        # position, laid out [K, num_gens], instead of one launch per step.
+        seed = spec_metadata.request_seeds[num_contexts:batch_size]
+        offsets = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            repeat=num_drafts,
+            slot=spec_metadata.rng_draft_slot(0),
+        )[1]
+        offsets = offsets.view(num_gens, num_drafts).t().contiguous()
+        # Only the anchor can be out of vocab (-1 for a row with no accepted
+        # token); every token drawn below is a valid row of the table.
+        emb = markov_prev_embeddings(inputs["first_prev_tokens"], markov_w1)
         drawn = []
         for step in range(num_drafts):
-            bias = dspark_markov_step_bias(prev, draft_model.markov_w1, draft_model.markov_w2)
-            step_logits = gen_logits[:, step] + bias.to(gen_logits.dtype)
-            seed, offset = self._rng_state_per_request(
-                spec_metadata, num_contexts, batch_size, slot=spec_metadata.rng_draft_slot(step)
+            # The add promotes the Markov head's (bf16) bias to the float32
+            # logits itself; the trailing cast only acts on a head wider than
+            # the logits, so no separate cast kernel runs otherwise.
+            step_logits = (gen_logits[:, step] + torch.nn.functional.linear(emb, markov_w2)).to(
+                gen_logits.dtype
             )
             tokens, probs = self._sample_from_logits_with_probs(
                 spec_metadata.advanced_sampling_mode,
                 step_logits,
                 *sampling_params,
                 seed=seed,
-                offset=offset,
+                offset=offsets[step],
             )
             if slots is not None:
                 draft_probs[slots, step, :vocab] = probs
-            prev = tokens.long()
-            drawn.append(prev)
+            drawn.append(tokens)
+            if step + 1 < num_drafts:
+                emb = torch.nn.functional.embedding(tokens, markov_w1)
         if draft_probs is not None:
             spec_metadata.draft_probs_last_dim = vocab
         return torch.stack(drawn, dim=1).to(torch.int32), vocab
