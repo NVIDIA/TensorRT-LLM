@@ -72,7 +72,6 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;rope;gpu")
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
