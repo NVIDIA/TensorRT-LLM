@@ -8,9 +8,9 @@ from pathlib import Path
 import click
 
 from .config import load_prompt_records, load_yaml_mapping
+from .evaluators import build_video_evaluator, ordered_video_paths, resolve_video_directory
 from .generators import build_visual_generator
 from .image_generation_eval import _close_runtime
-from .video_evaluators import build_video_evaluator, ordered_video_paths, resolve_video_directory
 
 
 class VideoGenerationEval:

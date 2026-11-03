@@ -32,7 +32,7 @@ device: cpu               # Optional; default: cpu.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `reference_dir` | Required | Existing directory containing the baseline MP4 videos. |
-| `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped and `--model` is not required. |
+| `generated_dir` | Omitted | Existing directory containing videos to score. When supplied, generation is skipped. The root CLI still requires `--model`, but does not load it in this mode. |
 | `net` | `alex` | LPIPS backbone: `alex`, `vgg`, or `squeeze`. Keep the backbone consistent when comparing scores across runs. |
 | `device` | `cpu` | PyTorch device used for scoring, such as `cpu`, `cuda`, or `cuda:0`. |
 
@@ -46,7 +46,7 @@ fail validation before model loading. Keep prompt order consistent with both dir
 To score existing videos using the YAML above:
 
 ```bash
-trtllm-eval video_generation_eval \
+trtllm-eval --model /path/to/video-model video_generation_eval \
   --evaluator lpips \
   --evaluator-options lpips.yaml \
   --prompts prompts.jsonl \
