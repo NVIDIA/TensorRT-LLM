@@ -321,6 +321,14 @@ _K3_SPLIT_K_CONTEXT_MIN_KV_TOKENS = 6144
 # A/B switch: TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT=0 keeps every FP8-KV chunked prefill on the
 # default path (and skips the split-K kernel compile).
 _K3_SPLIT_K_CONTEXT_ENABLED = os.environ.get("TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT", "1") != "0"
+# Opt-in: TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT_SM100=1 runs FP8-KV chunked prefill on the
+# CuTe DSL split-K context FMHA on SM100/SM103, where the kernel above is unavailable.
+# TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT=0 turns it off too. Its break-even, measured on
+# GB300, is lower than the kernel above.
+_K3_SPLIT_K_CONTEXT_SM100_ENABLED = (
+    os.environ.get("TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT_SM100", "0") == "1"
+)
+_K3_SPLIT_K_CONTEXT_SM100_MIN_KV_TOKENS = 4096
 
 
 def _k3_split_k_context_worthwhile(attn_metadata: TrtllmAttentionMetadata) -> bool:
@@ -1725,6 +1733,152 @@ class MLA(nn.Module):
         )
         return attn_output
 
+    def _fp8_kv_split_k_context_sm100_capable(
+        self,
+        trtllm_attention: TrtllmAttention,
+        q: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        """Whether FP8-KV chunked prefill on this layer can run on the SM100/SM103 split-K MLA context FMHA.
+
+        Opt-in via ``TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT_SM100=1``. Decided once per layer: it depends only on the
+        layer and the cache configuration.
+        """
+        capable = getattr(self, "_fp8_kv_split_k_sm100_capable", None)
+        if capable is None:
+            capable = False
+            # Default off: the CuTe DSL runner is not even imported unless the gate is set.
+            if _K3_SPLIT_K_CONTEXT_ENABLED and _K3_SPLIT_K_CONTEXT_SM100_ENABLED:
+                from ..attention_backend.fmha import mla_context_splitk as splitk
+
+                reason = splitk.unavailable_reason(trtllm_attention)
+                if reason is None and (
+                    q.dtype != torch.bfloat16
+                    or output.dtype != torch.bfloat16
+                    or self.out_scale is not None
+                    or self.num_heads_tp != trtllm_attention.num_heads
+                ):
+                    reason = "requires BF16 Q/output without output quantization"
+                if reason is None:
+                    capable = True
+                else:
+                    logger.warning_once(
+                        "TRTLLM_K3_FP8KV_SPLIT_K_CONTEXT_SM100=1 but the split-K MLA context FMHA is "
+                        f"unavailable: {reason}; using the generic FP8 path.",
+                        key=("k3_split_k_context_sm100_unavailable", reason),
+                    )
+            self._fp8_kv_split_k_sm100_capable = capable
+        return capable
+
+    def forward_context_with_chunked_prefill_splitk(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        latent_cache: torch.Tensor,
+        attn_metadata: TrtllmAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """FP8-KV chunked prefill on the SM100/SM103 split-K MLA context FMHA.
+
+        Same partitioning as ``forward_context_with_chunked_prefill`` (one partition per cached-KV loop, then the
+        new tokens), but each partition is one kernel launch that reads ``k_nope``/``v`` straight from the
+        FP8-quantized ``kv_b_proj`` output and ``k_pe`` once per token, and merges itself into ``output``. No per-head
+        K concat, no BF16-to-FP8 copy of Q/K/V per partition and no separate merge kernel.
+        """
+        from ..attention_backend.fmha import mla_context_splitk as splitk
+
+        trtllm_attention = cast(TrtllmAttention, self.mha)
+        # apply RoPE, append compressed_kv + k_pe to the paged KV cache and assign q_pe to q (as the generic path)
+        trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        logger.info_once(
+            "SM100 split-K FP8 MLA context FMHA engaged: split K (k_nope | k_pe) operand and "
+            f"epilogue merge, heads/rank={self.num_heads_tp}",
+            key="k3_split_k_context_sm100_engaged",
+        )
+
+        num_tokens = q.shape[0]
+        num_heads = self.num_heads_tp
+        unit_scale = _fp8_unit_scale(q.device)
+        # Unit-scaled FP8 scratch (the cache's scale is checked to be 1 by the capability test).
+        q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(q, unit_scale)
+        q_fp8 = q_fp8.view(num_tokens, num_heads, self.qk_head_dim)
+        out3 = output.view(num_tokens, num_heads, self.v_head_dim)
+        stats = torch.empty((num_tokens, num_heads, 2), dtype=torch.float32, device=q.device)
+        cu_q = attn_metadata.mla_prepare_ctx_cu_seqlens()
+        if cu_q is None:
+            raise RuntimeError("split-K MLA context FMHA requires context requests.")
+        # The cumulative cached lengths are int64 in the metadata; the kernel takes int32. One conversion per
+        # iteration, shared by every layer.
+        cached = getattr(attn_metadata, "_split_k_sm100_cu_chunked32", None)
+        if cached is None or cached[0] is not attn_metadata.cu_chunked_seq_len:
+            cached = (
+                attn_metadata.cu_chunked_seq_len,
+                attn_metadata.cu_chunked_seq_len.to(torch.int32),
+            )
+            attn_metadata._split_k_sm100_cu_chunked32 = cached
+        cu_chunked32 = cached[1]
+        sm_scale = self.softmax_scale
+        max_q_len = int(attn_metadata.max_ctx_seq_len)
+
+        def run_partition(partition_kv, partition_k_pe, cu_kv, max_kv, merge_op, causal):
+            kv = self.kv_b_proj(partition_kv)
+            kv_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(kv, unit_scale)
+            k_pe_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                partition_k_pe, unit_scale
+            )
+            rows = kv_fp8.shape[0]
+            split = num_heads * self.qk_nope_head_dim
+            splitk.run_partition(
+                q_fp8,
+                kv_fp8[:, :split].view(rows, num_heads, self.qk_nope_head_dim),
+                k_pe_fp8,
+                kv_fp8[:, split:].view(rows, num_heads, self.v_head_dim),
+                out3,
+                stats,
+                cu_q,
+                cu_kv,
+                merge_op,
+                max_q=max_q_len,
+                max_kv=max_kv,
+                causal=causal,
+                sm_scale=sm_scale,
+            )
+
+        for loop_idx in range(attn_metadata.chunked_loop_num):
+            total_chunked_tokens = int(
+                attn_metadata.host_cu_chunked_seq_len[loop_idx, attn_metadata.num_contexts]
+            )
+            chunked_compressed_kv, chunked_k_pe = trtllm_attention.load_chunked_kv_cache_for_mla(
+                metadata=attn_metadata,
+                num_ctx_cached_tokens=total_chunked_tokens,
+                cu_chunked_seq_len=attn_metadata.cu_chunked_seq_len[loop_idx],
+                chunked_global_offset=attn_metadata.chunked_global_offset[loop_idx],
+                chunked_max_seq_len=int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
+                out_dtype=q.dtype,
+            )
+            run_partition(
+                chunked_compressed_kv,
+                chunked_k_pe,
+                cu_chunked32[loop_idx],
+                int(attn_metadata.max_chunk_len_per_loop[loop_idx]),
+                attn_metadata.merge_op_tensor[loop_idx],
+                False,
+            )
+
+        # the uncached (new) tokens: causal, rotated k_pe straight from the latent cache
+        current_k_pe = latent_cache.reshape(-1, self.kv_lora_rank + self.qk_rope_head_dim)[
+            :, self.kv_lora_rank :
+        ].contiguous()
+        run_partition(
+            compressed_kv,
+            current_k_pe,
+            cu_q,
+            max_q_len,
+            attn_metadata.merge_op_tensor[attn_metadata.chunked_loop_num],
+            True,
+        )
+        return output
+
     def forward_context_with_chunked_prefill(
         self,
         q: torch.Tensor,
@@ -1972,6 +2126,12 @@ class MLA(nn.Module):
             )
             if fp8_kv_split_k_capable:
                 _warmup_k3_split_k_context_fmha(self.num_heads_tp, q.device.index)
+            elif self._fp8_kv_split_k_context_sm100_capable(trtllm_attention, q, output):
+                # JIT-compile both kernel variants at the first context forward (the engine warmup batch), so no
+                # real request pays the compile.
+                from ..attention_backend.fmha import mla_context_splitk as splitk
+
+                splitk.warmup_once(q.device, self.num_heads_tp)
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
@@ -1985,6 +2145,16 @@ class MLA(nn.Module):
                         latent_cache,
                         attn_metadata,
                         output,
+                    )
+                if (
+                    self._fp8_kv_split_k_context_sm100_capable(trtllm_attention, q, output)
+                    and q.is_contiguous()
+                    and output.is_contiguous()
+                    and (attn_metadata.num_ctx_cached_tokens + attn_metadata.num_ctx_tokens)
+                    >= _K3_SPLIT_K_CONTEXT_SM100_MIN_KV_TOKENS
+                ):
+                    return self.forward_context_with_chunked_prefill_splitk(
+                        q, compressed_kv, latent_cache, attn_metadata, output
                     )
                 return self.forward_context_with_chunked_prefill(
                     q, compressed_kv, latent_cache, attn_metadata, output
