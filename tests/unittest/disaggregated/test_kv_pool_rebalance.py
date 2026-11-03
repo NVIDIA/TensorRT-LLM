@@ -42,6 +42,9 @@ from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 PE = pe.PyExecutor
 
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kv_pool_rebalance_worker.py")
+GEN_WORKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "kv_pool_rebalance_gen_worker.py"
+)
 _PROCESS_TIMEOUT_SECONDS = 180
 _TERMINATE_GRACE_SECONDS = 5
 _LOG_TAIL_CHARS = 16 * 1024
@@ -392,6 +395,55 @@ def test_rebalance_integrity(mode, tmp_path):
         assert procs["ctx"].returncode not in (0, None), detail
         assert "NIXL_ERR_NOT_FOUND" in ctx_log, detail
         assert "registered up to" in ctx_log, detail
+
+
+@pytest.mark.timeout(300)
+def test_generation_side_rebalance_integrity(tmp_path):
+    """Copy-based rebalancing: the generation side rebalances while a context peer holds its layout.
+
+    Sends after the rebalance, into slots outside the generation side's old windows, arrive bit-exact
+    with the context peer still on the page table and registration from before it.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("mpi4py")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    mpirun = shutil.which("mpirun")
+    if mpirun is None:
+        pytest.skip("mpirun not found on PATH")
+
+    env = os.environ.copy()
+    env.update({"ZMQ_PORT": str(_find_free_port()), "CUDA_VISIBLE_DEVICES": "0"})
+    # Other test modules set this at import time; the workers need the default (C++) transfer agent.
+    env["TRTLLM_USE_PY_NIXL_KVCACHE"] = "0"
+    cmd = [mpirun, "--allow-run-as-root", "--oversubscribe", "-np", "1", sys.executable, GEN_WORKER]
+    logs = {role: tmp_path / f"{role}.log" for role in ("ctx", "gen")}
+    procs = {}
+    try:
+        for role in ("gen", "ctx"):
+            with open(logs[role], "wb") as f:
+                procs[role] = subprocess.Popen(
+                    cmd + ["--role", role],
+                    env=env,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        try:
+            for role in ("ctx", "gen"):
+                procs[role].wait(timeout=_PROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        for proc in procs.values():
+            _kill_group(proc)
+    ctx_log = logs["ctx"].read_text(errors="replace")
+    gen_log = logs["gen"].read_text(errors="replace")
+    detail = f"ctx log tail:\n{_log_tail(ctx_log)}\ngen log tail:\n{_log_tail(gen_log)}"
+    assert procs["ctx"].returncode == 0 and procs["gen"].returncode == 0, detail
+    assert "[gen] RESULT PASS" in gen_log, detail
+    m = re.search(r"requests received into slots outside the old window: (\d+)/(\d+)", gen_log)
+    assert m and int(m.group(1)) > 0, f"no receive landed outside the old window\n{detail}"
 
 
 @pytest.mark.parametrize("registered, cross_node", [(True, False), (False, True), (True, True)])
