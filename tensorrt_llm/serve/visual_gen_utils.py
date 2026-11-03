@@ -30,6 +30,11 @@ IMAGE_EDIT_MAX_IMAGES = 16
 IMAGE_EDIT_MAX_IMAGE_BYTES = 50 * 1024 * 1024
 IMAGE_EDIT_MAX_TOTAL_IMAGE_BYTES = 256 * 1024 * 1024
 IMAGE_EDIT_MAX_OUTPUT_IMAGES = 64
+
+# Total bytes the ``format='path'`` references of one request may read from
+# local files. A pipeline slot may accept any number of references, so the
+# per-file media limit alone does not bound a request.
+PATH_REFERENCE_MAX_TOTAL_BYTES = 512 * 1024 * 1024
 _IMAGE_EDIT_INPUT_FORMATS = {"PNG", "JPEG"}
 _INVALID_IMAGE_EDIT_INPUT_MESSAGE = "image edit input is not a PNG/JPEG image"
 
@@ -181,27 +186,66 @@ def _reference_transport(ref: Any) -> tuple[Any, str, Optional[str]]:
     return content, ref.format, getattr(ref, "role", None)
 
 
-def _build_reference_list(value: Any) -> Optional[list]:
-    """Normalize one HTTP reference field into a list of ``MediaRef`` objects.
+def _max_references(generator: Any, field: str) -> Optional[int]:
+    """How many entries the loaded pipeline accepts in ``field``.
 
-    ``value`` is None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or
-    a list of those. Each entry becomes a ``MediaRef`` carrying its transport
-    content plus the declared (or, for an upload, implied) wire format. A
-    ``path`` reference is read here under the local media policy; ``url`` and
-    ``base64`` are resolved later, at the engine choke point.
+    ``None`` when a role of the slot is unbounded or the generator declares no
+    slots; a field the pipeline does not accept allows none.
     """
-    if value is None:
+    specs = getattr(generator, "ref_slot_specs", None)
+    if specs is None:
         return None
+    spec = specs.get(field)
+    if spec is None:
+        return 0
+    maxes = [role.max for role in spec.roles]
+    return None if None in maxes else sum(maxes)
+
+
+def _build_reference_lists(request: Any, generator: Any) -> Dict[str, list]:
+    """Normalize the HTTP reference fields into lists of ``MediaRef`` objects.
+
+    Each of ``image_reference`` / ``video_reference`` / ``audio_reference`` is
+    None, a multipart ``UploadFile``, a ``MediaReferenceItem``, or a list of
+    those. Each entry becomes a ``MediaRef`` carrying its transport content
+    plus the declared (or, for an upload, implied) wire format. A ``path``
+    reference is read here under the local media policy; ``url`` and
+    ``base64`` are resolved later, at the engine choke point. A field with
+    more entries than the loaded pipeline accepts is refused before any of
+    them is read, and the ``path`` references of one request read at most
+    ``PATH_REFERENCE_MAX_TOTAL_BYTES``. Only the fields that were set are
+    returned.
+    """
     # Local import: the visual_gen tree is already loaded in a VisualGen serving
     # process, and this keeps it out of every plain-LLM process (see TYPE_CHECKING).
     from tensorrt_llm.visual_gen.params import MediaRef
 
-    raw_items = value if isinstance(value, list) else [value]
-    refs = []
-    for item in raw_items:
-        content, content_format, role = _reference_transport(item)
-        refs.append(MediaRef(content=content, format=content_format, role=role))
-    return refs
+    lists: Dict[str, list] = {}
+    path_bytes = 0
+    for field in ("image_reference", "video_reference", "audio_reference"):
+        value = getattr(request, field, None)
+        if value is None:
+            continue
+        raw_items = value if isinstance(value, list) else [value]
+        limit = _max_references(generator, field)
+        if limit is not None and len(raw_items) > limit:
+            raise ValueError(
+                f"{field}: the loaded pipeline accepts at most {limit} references, "
+                f"got {len(raw_items)}."
+            )
+        refs = []
+        for item in raw_items:
+            content, content_format, role = _reference_transport(item)
+            if getattr(item, "format", None) == "path":
+                path_bytes += len(content)
+                if path_bytes > PATH_REFERENCE_MAX_TOTAL_BYTES:
+                    raise ValueError(
+                        "reference format='path': the files of one request exceed "
+                        f"{PATH_REFERENCE_MAX_TOTAL_BYTES} bytes in total."
+                    )
+            refs.append(MediaRef(content=content, format=content_format, role=role))
+        lists[field] = refs
+    return lists
 
 
 def _read_image_edit_upload(value: Any) -> bytes:
@@ -510,15 +554,9 @@ def parse_visual_gen_params(
         # Reference inputs: hand the pipeline a ``MediaRef`` carrying the
         # transport content (``bytes`` for an upload or an allowed local file,
         # the string otherwise). The engine resolves ``url`` and ``base64``.
-        image_refs = _build_reference_list(request.image_reference)
-        if image_refs:
-            params.image_reference = image_refs
-        video_refs = _build_reference_list(request.video_reference)
-        if video_refs:
-            params.video_reference = video_refs
-        audio_refs = _build_reference_list(request.audio_reference)
-        if audio_refs:
-            params.audio_reference = audio_refs
+        for field, refs in _build_reference_lists(request, generator).items():
+            if refs:
+                setattr(params, field, refs)
         _apply_deprecated_input_reference(request.input_reference, params)
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))

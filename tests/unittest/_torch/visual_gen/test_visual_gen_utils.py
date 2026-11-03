@@ -16,6 +16,7 @@ import os
 import pickle
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -1022,6 +1023,58 @@ class TestPathReferencePolicy:
         params = parse_visual_gen_params(self._request(str(target)), _StubVisualGen())
 
         assert params.image_reference[0].format == "bytes"
+
+
+def _ref_slot(*maxes: Optional[int]) -> SimpleNamespace:
+    """A reference slot whose roles accept at most ``maxes`` entries (None: any number)."""
+    return SimpleNamespace(roles=[SimpleNamespace(max=m) for m in maxes])
+
+
+class TestReferenceBounds:
+    """The reference fields are bounded before any local file is read."""
+
+    _ALLOWED_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
+
+    @staticmethod
+    def _generator(ref_slot_specs: Dict[str, Any]) -> _StubVisualGen:
+        generator = _StubVisualGen()
+        generator.ref_slot_specs = ref_slot_specs
+        return generator
+
+    @pytest.mark.parametrize(
+        "ref_slot_specs, count",
+        [
+            pytest.param({"image_reference": _ref_slot(1, 1)}, 3, id="more-than-the-slot-accepts"),
+            pytest.param({}, 1, id="field-not-accepted"),
+        ],
+    )
+    def test_a_list_the_pipeline_cannot_take_is_refused_before_any_read(
+        self, tmp_path, monkeypatch, ref_slot_specs, count
+    ):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        target = TestPathReferencePolicy._png(tmp_path)
+        reads: list[str] = []
+        monkeypatch.setattr(
+            visual_gen_utils, "read_allowed_local_media", lambda url: reads.append(url) or b"x"
+        )
+        item = {"content": str(target), "format": "path"}
+        request = VideoGenerationRequest(prompt="x", image_reference=[item] * count)
+
+        with pytest.raises(ValueError, match="accepts at most"):
+            parse_visual_gen_params(request, self._generator(ref_slot_specs))
+        assert reads == []
+
+    def test_the_path_bytes_of_one_request_are_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        target = TestPathReferencePolicy._png(tmp_path)
+        monkeypatch.setattr(
+            visual_gen_utils, "PATH_REFERENCE_MAX_TOTAL_BYTES", 2 * target.stat().st_size - 1
+        )
+        item = {"content": str(target), "format": "path"}
+        request = VideoGenerationRequest(prompt="x", image_reference=[item, item])
+
+        with pytest.raises(ValueError, match="bytes in total"):
+            parse_visual_gen_params(request, self._generator({"image_reference": _ref_slot(None)}))
 
 
 class TestPathResponseSwitch:
