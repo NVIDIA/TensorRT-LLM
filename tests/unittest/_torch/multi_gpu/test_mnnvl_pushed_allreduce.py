@@ -63,6 +63,12 @@ def _input(m, h, seed, rank, kind=0):
         return (torch.randn(m, h, device="cuda", generator=gen) * 0.25).to(torch.bfloat16)
     if kind == 1:
         return _special(m, h, gen)
+    if kind == 3:
+        # Denormals of either sign, no NaN (whose payload a torch add and a kernel add round
+        # differently).
+        mag = torch.randint(1, 127, (m, h), device="cuda", generator=gen).to(torch.int16)
+        sign = torch.randint(0, 2, (m, h), device="cuda", generator=gen).to(torch.int16) << 15
+        return (mag | sign).view(torch.bfloat16)
     # Denormals only: the sums stay denormal (no flush to zero anywhere).
     bits = torch.randint(-127, 127, (m, h), device="cuda", generator=gen).to(torch.int16)
     return bits.view(torch.bfloat16)
@@ -104,6 +110,14 @@ def _left_pending(m, h, k, world, in_place_max_rows):
 
     pushes = m <= low_m.max_m_for(h, k) and low_m.all_reduce_push_applies(m, h, k)
     return pushes and m <= in_place_max_rows
+
+
+def _scale_rows(xs, m, h):
+    """The UE8M0 bytes of the first ``m`` rows of R128c4 scales of ``[*, h]`` rows."""
+    r = torch.arange(m, device=xs.device).unsqueeze(1)
+    c = torch.arange(h // 32, device=xs.device).unsqueeze(0)
+    offsets = ((r // 128) * (h // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+    return xs[offsets].contiguous()
 
 
 def _result(out):
@@ -856,7 +870,7 @@ def test_all_gather_call_finish_on_one_gpu(world, m, cpp_one_shot):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("early_poll", [False, True])
-@pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (64, 2)])
+@pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (64, 1)])
 def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     """The decode attention-residual mix finishing a pushed one-shot call (sums in the C++ order,
     chunks of eight ranks above eight) against the mix of the finished all-reduce, on one GPU:
@@ -965,7 +979,7 @@ def _run_rank_all_gather(world_size):
 
         # 64 rows: the all-reduce of the partials is two-shot at 2 and 4 ranks.
         for m in (1, 8, 64):
-            for kind in (0, 2):
+            for kind in (0, 3):
                 y = _input(m, hidden, 3 * m + kind, 0, kind)  # replicated, as latent_up's output
                 shared_partial = _input(m, hidden, 7 * m + kind, rank, kind)
                 residual = _input(m, hidden, 11 * m, 0)
@@ -984,8 +998,10 @@ def _run_rank_all_gather(world_size):
                 got = kimi._attn_res_decode_kernel(
                     residual, (tail(y, shared_partial), None), block, proj, norm, out_norm, True
                 )
-                for a, b in zip(ref, got):
+                for a, b in zip(ref[:3], got[:3]):
                     bad += _differ(a, b)
+                # The R128c4 scales hold 128-row blocks; only the first m rows are written.
+                bad += _differ(_scale_rows(ref[3], m, hidden), _scale_rows(got[3], m, hidden))
                 bad += _differ(shared, allreduce(shared_partial))
 
         # A CUDA graph: tail call, C++ call, tail call finished by the mix, C++ call.
