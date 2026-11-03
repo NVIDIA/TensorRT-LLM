@@ -226,7 +226,7 @@ TEST(KvCacheManagerV2StagingBufferTest, EphemeralHostIndicesUploadIntoDeviceRing
         auto device = deviceManager.acquire(sizeof(PageIndexPair), std::min(remainingBytes, kChunkBytes),
             sizeof(PageIndexPair), alignof(PageIndexPair), reinterpret_cast<CUstream>(stream));
         size_t const chunkPairs = std::min(input.size() - offset, device.size() / sizeof(PageIndexPair));
-        detail::copyPageIndicesToDevice(static_cast<CUdeviceptr>(device.address()), input.data() + offset, chunkPairs,
+        copyToDeviceSyncSource(static_cast<CUdeviceptr>(device.address()), input.data() + offset, chunkPairs,
             reinterpret_cast<CUstream>(stream));
 
         // The helper captures the pageable host source before returning.

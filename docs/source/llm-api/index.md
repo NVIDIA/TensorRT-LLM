@@ -139,7 +139,7 @@ The `py_executor` property contains the timed scopes in `create_py_executor()`, 
 | `worker_start_seconds` | Start the final PyExecutor worker. |
 | `total_py_executor_creation_seconds` | Total time for the `create_py_executor()` call, including all applicable scopes above. |
 
-The two model-engine properties contain times for various `PyTorchModelEngine` warmup stages.
+The two model-engine properties contain times for various `ModelEngine` warmup stages.
 `initial_model_engine` measures the timings for the initial model engine creation as part of the
 `py_executor.initial_py_executor_creation_seconds_for_kv_cache_estimation` timing.
 Likewise, `final_model_engine` measures the timings for the final model engine creation as part of
@@ -284,8 +284,9 @@ Configure these settings together when using `trtllm-llmapi-launch`:
 
 The server shutdown grace starts when it receives the stop request; an earlier
 worker-failure deadline can shorten the remaining grace. The launcher also waits
-for the stop helper's Python startup and `tensorrt_llm` imports before that request
-can be sent. Set the launcher stop timeout above the server grace by enough to
+for the stop helper's Python startup and `pyzmq` import before that request
+can be sent. If the standalone helper is unavailable, the fallback imports
+`tensorrt_llm` instead. Set the launcher stop timeout above the server grace by enough to
 cover measured cold startup/import time, connection/send and queue cleanup, and
 scheduling margin. The defaults leave 60 seconds of allowance; raising only the
 server grace does not raise the launcher timeout.
@@ -312,11 +313,11 @@ nonzero task status still takes precedence.
 ### Remote MPI batch ordering
 
 The remote MPI server dispatches the next batch only after every future in the
-previous batch has completed. The task wrapper retains its entry barrier to
-place one task on each rank, but has no trailing barrier: an individual rank can
-finish or report an error while its peers are still running. Cross-batch ordering
-is enforced by the server; directly invoking the wrapper does not provide a
-collective completion barrier.
+previous batch has completed. Each batch runs exactly once on every rank, but
+the task wrapper has no trailing barrier: an individual rank can finish or report
+an error while its peers are still running. Cross-batch ordering is enforced by
+the server; directly invoking the wrapper does not provide a collective
+completion barrier.
 
 ### Disaggregated MPI leader failures
 
@@ -389,6 +390,32 @@ The following tips typically assist new LLM API users who are familiar with othe
   The LLM instance manages threads and processes, which may prevent its reference count from reaching zero. To address this issue, there are two common solutions:
   1. Wrap the LLM instance in a function, as demonstrated in the quickstart guide. This will reduce the reference count and trigger the shutdown process.
   2. Use LLM as a context manager, with the following code: `with LLM(...) as llm: ...`, the shutdown method will be invoked automatically once it goes out of the `with`-statement block.
+
+### Remote MPI shutdown
+
+After the task exits, `trtllm-llmapi-launch` sends the authenticated stop request
+with a standalone helper. The helper imports `pyzmq`, but does not import
+TensorRT-LLM or initialize MPI. It waits for an authenticated acknowledgment and
+retries on a fresh connection if the server has not accepted the request. Each
+of up to 300 attempts waits one second for the acknowledgment; socket close
+discards unsent messages without waiting. The acknowledgment confirms receipt,
+not completion of worker shutdown. The launcher supervises the helper and server
+using the shutdown budgets described above, including helper startup. Its
+120-second default stop timeout can end the helper before all 300 attempts run.
+
+The launcher resolves symlinks before locating the helper beside the launcher
+file. If resolution fails or the helper is missing or unreadable, it logs a
+warning and uses
+`python3 -m tensorrt_llm.llmapi.mgmn_leader_node --action stop`. This fallback
+imports TensorRT-LLM and can take longer to start. A failure after the helper
+starts is reported directly and does not trigger the fallback.
+
+After a task-first exit, a nonzero task status takes precedence over stop or
+server failures. The helper returns `1` if its attempts finish without an ACK;
+the launcher reports that failure and cleans up its owned processes. It skips
+the stop helper if the server has already exited. Server-first failures and
+shutdown timeouts retain the supervisor behavior described above. The module
+stop command uses the same acknowledged protocol and unacknowledged exit code.
 
 ### Single node hanging when using `docker run --net=host`
 

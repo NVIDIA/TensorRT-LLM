@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""WeightBuffer: Composite VA layout with zero-copy local + page-pool-backed remote double buffer.
+"""WeightBuffer: Composite VA layout with zero-copy local + page-pool-backed remote prefetch slots.
 
 The WeightBuffer is the central component of DWDP weight management. It creates
 a composite virtual address space that seamlessly combines:
@@ -82,7 +82,7 @@ class LayerBufferState:
 
 
 class WeightBuffer:
-    """Composite VA layout with zero-copy local + page-pool-backed remote double buffer.
+    """Composite VA layout with zero-copy local + page-pool-backed remote prefetch slots.
 
     The WeightBuffer does NOT copy any data. It only sets up VA mappings:
         - Local region: cuMemMap to MNNVL handle (zero-copy, no D2D)
@@ -108,6 +108,8 @@ class WeightBuffer:
         "_page_pool",
         "_layer_states",
         "_moe_layer_indices",
+        "_num_slots",
+        "_slot_of_layer",
         "_released",
     )
 
@@ -119,6 +121,7 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int,
         granularity: Optional[int] = None,
         pool_page_size: Optional[int] = None,
     ):
@@ -131,12 +134,21 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Number of remote prefetch slots
+                (``DwdpConfig.num_prefetch_slots``); MoE order ``o`` maps its
+                remote experts to slot ``o % num_slots``.
             granularity: VMM page granularity. If None, queries device.
             pool_page_size: Pool page handle size in bytes. If None,
                 defaults to ``PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER *
                 granularity`` (16MB on GB200). Must be a multiple of
                 granularity.
+
+        Raises:
+            ValueError: If ``num_slots`` is less than 2.
         """
+        if num_slots < 2:
+            raise ValueError(f"num_slots must be at least 2, got {num_slots}")
+        self._num_slots = num_slots
         self._layer_weight_specs = layer_weight_specs
         self._handles = handles
         self._local_start = local_start
@@ -157,6 +169,9 @@ class WeightBuffer:
         self._page_pool: Optional[PagePool] = None
         self._layer_states: Dict[int, LayerBufferState] = {}
         self._moe_layer_indices: List[int] = sorted(layer_weight_specs.keys())
+        self._slot_of_layer: Dict[int, int] = {
+            layer_idx: order % num_slots for order, layer_idx in enumerate(self._moe_layer_indices)
+        }
         self._released = False
 
     @classmethod
@@ -168,13 +183,14 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int,
     ) -> WeightBuffer:
         """Create all VA mappings and remote page pool.
 
         Steps:
             1. Compute page-aligned layout for each (layer, weight) pair
                (num_experts comes from WeightSpec.num_experts per layer)
-            2. Allocate page pool for remote double buffer
+            2. Allocate page pool for the remote prefetch slots
             3. Create per-layer composite VA mappings
             4. Create tensor views
 
@@ -186,6 +202,8 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Number of remote prefetch slots, each holding the
+                remote experts of one MoE layer.
 
         Returns:
             Ready-to-use WeightBuffer with all VA mappings established.
@@ -204,6 +222,7 @@ class WeightBuffer:
             local_end=local_end,
             dwdp_size=dwdp_size,
             device_id=device_id,
+            num_slots=num_slots,
         )
 
         try:
@@ -214,11 +233,7 @@ class WeightBuffer:
             # Step 2: Compute slot sizes and create page pool.
             # Because layouts already have pre/post sizes aligned to
             # pool_page_size, the slot sizes are automatically aligned too.
-            buffer_slot_assignments = {
-                layer_idx: buffer.buffer_index_for_layer(layer_idx)
-                for layer_idx in layer_weight_specs.keys()
-            }
-            slot_sizes = compute_slot_sizes(layouts, buffer_slot_assignments)
+            slot_sizes = compute_slot_sizes(layouts, buffer._slot_of_layer, num_slots)
 
             buffer._page_pool = PagePool.create(
                 slot_sizes, device_id, page_size=buffer._pool_page_size
@@ -621,22 +636,27 @@ class WeightBuffer:
         """CUDA device ordinal."""
         return self._device_id
 
+    @property
+    def num_slots(self) -> int:
+        """Number of remote prefetch slots."""
+        return self._num_slots
+
     def buffer_index_for_layer(self, layer_idx: int) -> int:
-        """Double buffer slot: 0 or 1 based on MoE order (odd/even).
+        """Prefetch slot of a MoE layer: its MoE order modulo ``num_slots``.
+
+        This is the only definition of the slot mapping; the weight manager's
+        prefetch schedule is built from it.
 
         Args:
-            layer_idx: Layer index.
+            layer_idx: MoE layer index.
 
         Returns:
-            Buffer slot index (0 or 1).
-        """
-        # Find position of this layer in the MoE layer sequence
-        if layer_idx in self._moe_layer_indices:
-            moe_order = self._moe_layer_indices.index(layer_idx)
-        else:
-            moe_order = layer_idx
+            Buffer slot index in ``[0, num_slots)``.
 
-        return moe_order % 2
+        Raises:
+            KeyError: If ``layer_idx`` is not a MoE layer of this buffer.
+        """
+        return self._slot_of_layer[layer_idx]
 
     def weight_names(self, layer_idx: int) -> List[str]:
         """Get weight names for a specific layer.
@@ -733,10 +753,12 @@ class WeightBuffer:
         if self._page_pool is not None:
             info["page_pool"] = {
                 "page_size": self._page_pool.page_size,
-                "slot0_pages": self._page_pool.num_pages(0),
-                "slot1_pages": self._page_pool.num_pages(1),
-                "slot0_size": self._page_pool.slot_size(0),
-                "slot1_size": self._page_pool.slot_size(1),
+                "slot_pages": [
+                    self._page_pool.num_pages(slot) for slot in range(self._page_pool.num_slots)
+                ],
+                "slot_sizes": [
+                    self._page_pool.slot_size(slot) for slot in range(self._page_pool.num_slots)
+                ],
             }
 
         return info

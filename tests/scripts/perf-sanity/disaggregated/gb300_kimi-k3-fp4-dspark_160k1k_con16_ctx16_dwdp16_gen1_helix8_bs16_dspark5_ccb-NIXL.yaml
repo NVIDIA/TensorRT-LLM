@@ -1,0 +1,160 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi-K3 NVFP4 + DSpark decode at a fixed long context, for the gen_only_no_context
+# lane: one helix (CP8) gen worker on 2 GB300 nodes decodes 16 requests of exactly
+# 163840 input / 1024 output random tokens. This is the gen-only method of the K3
+# GB300 optimization work (balanced ISL 163840, steady-state step time), on the
+# helix8 bs16 dspark5 gen worker of
+# gb300_kimi-k3-fp4-dspark_agentx_con138_ctx16_dwdp16_gen3_helix8_bs16_dspark5_ccb-NIXL.yaml
+# (ported from the bench-trtllm-disagg srt-slurm recipe
+# disagg-gb300-16p3d-dep1-helix8-c138-b16-mtp). worker_config and the worker env are
+# copied from that file unchanged; the AgentX trace replay, its client env, the
+# conversation router and the chat-history proxy options are left out. The ctx
+# section (the recipe's 16-GPU DWDP prefill fleet) is not started by
+# gen_only_no_context.
+metadata:
+  model_name: kimi_k3_nvfp4
+  precision: fp4
+  model_dir_name: Kimi-K3-NVFP4
+  supported_gpus: [GB300]
+  script_file: disaggr_torch.slurm
+  benchmark_type: 160k1k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: --gres=gpu:4
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 5
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '16'
+  input_length: 163840
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 16
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 ENROOT_ALLOW_DEV=yes
+    NCCL_GRAPH_MIXING_SUPPORT=0 MIMALLOC_ARENA_RESERVE=0 OMP_NUM_THREADS=1 HF_HUB_TRUST_REMOTE_CODE=1
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True KIMI_K3_MLA_MAX_POSITIONS=1048576 KIMI_K3_ATTN_RES_TOPOLOGY=1
+    TRTLLM_KV_TRANSFER_NUM_THREADS=8 TRTLLM_SERVE_ENABLE_MSGSPEC=1 KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1
+    TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS=2.62
+  ctx_worker_env_var: CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_V2_CTX_COST_KV_OFFSET=114000 TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD=143000
+    TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS=0 TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS=0 TLLM_V2_CTX_DEMOTE_MAX_ITERS=0
+    TRTLLM_CUTEDSL_SM_RESERVE=30 TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic TLLM_MOE_ASYNC_INPUT_QUANT=0
+    TRTLLM_DWDP_PREFETCH_GATHER=1 TRTLLM_DWDP_GATHER_KERNEL=tma TRTLLM_DWDP_GATHER_BLOCKS=30 TRTLLM_DWDP_GATHER_THREADS=128
+    TRTLLM_DWDP_GATHER_CLUSTER=2 TLLM_FMHA_LIBS=-flashinfer_trtllm_gen TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=0
+  server_env_var: TRTLLM_SERVER_DISABLE_GC=1
+profiling:
+  nsys_on: false
+worker_config:
+  gen:
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    context_parallel_size: 8
+    cp_config:
+      cp_type: HELIX
+      fifo_version: 2
+      tokens_per_block: 64
+      use_nccl_for_alltoall: false
+    cuda_graph_config:
+      batch_sizes: [1, 2, 4, 8, 16]
+      enable_padding: true
+    enable_attention_dp: false
+    kv_cache_config:
+      block_reuse_config:
+        max_num_turns: 5
+        policy: per_conversation
+      dtype: fp8
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.8
+      host_cache_size: 0
+      mamba_ssm_cache_dtype: float32
+      mamba_state_config:
+        additional_snapshot_offsets_from_end: [0]
+      tokens_per_block: 64
+      use_kv_cache_manager_v2: true
+    max_batch_size: 16
+    max_num_tokens: 96
+    max_seq_len: 997696
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 8
+    num_postprocess_workers: 4
+    num_serve_frontends: 8
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    speculative_config:
+      block_size: 5
+      decoding_type: DSpark
+      max_draft_len: 5
+      speculative_model: Inferact-Kimi-K3-DSpark
+    stream_interval: 100
+    tensor_parallel_size: 1
+    trust_remote_code: true
+  ctx:
+    attention_dp_config:
+      kv_cache_routing_conversation_affinity: true
+      kv_cache_routing_new_conv_placement: least_queued
+    cache_transceiver_config:
+      backend: NIXL
+      kv_cache_bounce_size_mb: 0
+      kv_transfer_timeout_ms: 600000
+      transceiver_runtime: PYTHON
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    dwdp_config:
+      contention_opt: false
+      dwdp_size: 16
+      num_experts_per_worker: 56
+      num_groups: 1
+      num_prefetch_experts: 56
+    enable_attention_dp: true
+    enable_chunked_prefill: true
+    kv_cache_config:
+      avg_seq_len: 149442
+      block_reuse_config:
+        max_num_turns: 5
+        policy: per_conversation
+      dtype: fp8
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      host_cache_size: 171798691840
+      mamba_ssm_cache_dtype: float32
+      mamba_state_config:
+        additional_snapshot_offsets_from_end: [0]
+      tokens_per_block: 64
+      use_kv_cache_manager_v2: true
+    max_batch_size: 16
+    max_num_tokens: 16384
+    max_seq_len: 996672
+    moe_config:
+      backend: CUTEDSL
+      max_num_tokens: 8192
+      use_low_precision_moe_combine: true
+    moe_expert_parallel_size: 1
+    num_serve_frontends: 8
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    stream_interval: 10
+    tensor_parallel_size: 1
+    trust_remote_code: true

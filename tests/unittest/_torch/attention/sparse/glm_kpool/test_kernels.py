@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     compact_sparse_rows,
     kpool_expand,
     kpool_score,
+    kpool_score_fp8,
     kpool_update,
 )
 from tensorrt_llm._utils import get_sm_version
@@ -284,6 +285,50 @@ def test_pool_scores_packed_context_rows_share_tables(bounded, monkeypatch):
     score(slice(lens[0], lens[0] + KPOOL - 1), KPOOL - 1)
 
 
+def test_verify_rows_index_tables_like_repeated_tables():
+    """Verification rows addressing their tables by request id score and expand
+    exactly like rows reading per-row copies of the generation tables."""
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    requests, tokens, heads, pages = 3, 4, 8, 16
+    slots = (requests + 1) * pages + 8
+    pool = _strided_index_pool(slots, gen)
+    # Row 0 is a context request's table; the generation tables follow it.
+    tables = _paged_tables(requests + 1, pages, slots, gen)
+    repeated = tables[1:].repeat_interleave(tokens, dim=0)
+    request_ids = torch.arange(1, requests + 1, dtype=torch.int32, device="cuda")
+    request_ids = request_ids.repeat_interleave(tokens)
+    first = torch.randint(KPOOL, pages * TPB - tokens, (requests, 1), generator=gen, device="cuda")
+    visible = (first + torch.arange(1, tokens + 1, device="cuda")).reshape(-1)
+    n = requests * tokens
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.rand(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(
+        num_pools_max=pages * TPB // KPOOL, head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=1.0
+    )
+    want = kpool_score(q, w, pool, repeated, visible, TPB, precision="bf16", **kwargs)
+    got = kpool_score(
+        q,
+        w,
+        pool,
+        tables,
+        visible,
+        TPB,
+        precision="bf16",
+        request_ids=request_ids,
+        **kwargs,
+    )
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    selected = torch.randint(-1, 32, (n, 8), generator=gen, device="cuda", dtype=torch.int32)
+    expand = dict(base_row=2, rows_per_slot=TPB + 4, kpool=KPOOL, out_width=64)
+    torch.testing.assert_close(
+        kpool_expand(selected, visible, tables, TPB, request_ids=request_ids, **expand),
+        kpool_expand(selected, visible, repeated, TPB, **expand),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_pool_scores_broadcast_table_single_context_request():
     """One context request: a stride-0 broadcast table with rows_per_program=16."""
     gen = torch.Generator(device="cuda").manual_seed(3)
@@ -318,6 +363,159 @@ def test_pool_scores_broadcast_table_single_context_request():
             rows_per_program=16,
             **kwargs,
         )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
+@pytest.mark.parametrize("single_request", [True, False], ids=["one_table", "two_tables"])
+def test_fp8_pool_scores_track_bf16_selection(single_request):
+    """FP8 context scoring keeps the BF16 scorer's top pools on packed context rows."""
+    gen = torch.Generator(device="cuda").manual_seed(10)
+    heads, tpb, slots = 32, 32, 400
+    lens = [6000] if single_request else [6000, 2500]
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(slots, 2, tpb, 3 * HD, generator=gen, device="cuda").to(torch.bfloat16)[:, 1]
+    perm = torch.randperm(slots, generator=gen, device="cuda")
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = perm[start : start + count]
+        start += count
+    request_ids = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
+    ).cuda()
+    kv_lens = torch.cat([torch.arange(1, length + 1, dtype=torch.int32) for length in lens]).cuda()
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(
+        head_dim=HD,
+        kpool=KPOOL,
+        q_scale=HD**-0.5,
+        w_scale=heads**-0.5,
+        request_ids=request_ids,
+        max_kv_len=max(lens),
+    )
+    want = kpool_score(
+        q,
+        w,
+        pool,
+        tables,
+        kv_lens,
+        tpb,
+        num_pools_max=max(pages) * tpb // KPOOL,
+        precision="bf16",
+        rows_per_program=16,
+        **kwargs,
+    )
+    got = kpool_score_fp8(q, w, pool, tables, kv_lens, tpb, **kwargs)
+    assert got is not None and got.stride(1) == 1 and got.stride(0) % 4 == 0
+    overlaps = []
+    for row in torch.randint(0, n, (64,), generator=gen, device="cuda").tolist():
+        visible = int(kv_lens[row]) // KPOOL
+        if visible < 64:
+            continue
+        k = visible // 2
+        a = set(want[row, :visible].topk(k).indices.tolist())
+        b = set(got[row, :visible].topk(k).indices.tolist())
+        overlaps.append(len(a & b) / k)
+    assert overlaps and sum(overlaps) / len(overlaps) > 0.97 and min(overlaps) > 0.9
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
+@pytest.mark.parametrize("lens", [[16384], [16000, 12000, 8000]], ids=["one-table", "three-tables"])
+def test_fp8_pool_score_peak_memory_fits_the_planned_cost(lens):
+    """kpool_score_fp8's peak allocation beyond its row-sized buffers fits the planner's cost."""
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import GlmKpoolSparseAttention
+
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    heads, tpb, rows_per_table = 32, 32, 256
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(sum(pages) + 8, 2, tpb, 3 * HD, generator=gen, device="cuda")
+    pool = pool.to(torch.bfloat16)[:, 1]
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = torch.arange(start, start + count, device="cuda")
+        start += count
+    # The last rows_per_table queries of each prompt, so most pools are visible.
+    request_ids = torch.cat(
+        [torch.full((rows_per_table,), i, dtype=torch.int32) for i in range(len(lens))]
+    ).cuda()
+    kv_lens = torch.cat(
+        [
+            torch.arange(length - rows_per_table + 1, length + 1, dtype=torch.int32)
+            for length in lens
+        ]
+    ).cuda()
+    n = kv_lens.shape[0]
+    q = torch.randn(n, heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(n, heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=heads**-0.5)
+    args = (q, w, pool, tables, kv_lens, tpb)
+    kpool_score_fp8(*args, request_ids=request_ids, max_kv_len=max(lens), **kwargs)  # JIT warmup
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    scores = kpool_score_fp8(*args, request_ids=request_ids, max_kv_len=max(lens), **kwargs)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del scores
+    cost = GlmKpoolSparseAttention._context_score_cost(
+        n, len(lens), max(lens) // KPOOL, fp8=True, head_dim=HD, capacity_pools=0
+    )
+    # Quantized queries (with the quantizer's scratch), head weights and per-row
+    # indices grow only with rows; startup profiling measures them.
+    row_bytes = n * heads * (2 * HD + 16) + 64 * n
+    assert peak <= cost * 4 + row_bytes + (64 << 10)
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103), reason="DeepGEMM MQA logits require SM100/103"
+)
+def test_fp8_pool_scores_of_a_table_range_match_the_packed_call():
+    """Scoring one request against its own table equals its rows of a multi-table call."""
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    heads, tpb, slots = 32, 32, 400
+    lens = [3000, 2500, 1200]
+    pages = [(length + tpb - 1) // tpb for length in lens]
+    pool = torch.randn(slots, 2, tpb, 3 * HD, generator=gen, device="cuda").to(torch.bfloat16)[:, 1]
+    perm = torch.randperm(slots, generator=gen, device="cuda")
+    tables = torch.zeros(len(lens), max(pages), dtype=torch.int64, device="cuda")
+    start = 0
+    for i, count in enumerate(pages):
+        tables[i, :count] = perm[start : start + count]
+        start += count
+    request_ids = torch.cat(
+        [torch.full((length,), i, dtype=torch.int32) for i, length in enumerate(lens)]
+    ).cuda()
+    kv_lens = torch.cat([torch.arange(1, length + 1, dtype=torch.int32) for length in lens]).cuda()
+    q = torch.randn(kv_lens.shape[0], heads, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    w = torch.randn(kv_lens.shape[0], heads, generator=gen, device="cuda").to(torch.bfloat16)
+    kwargs = dict(head_dim=HD, kpool=KPOOL, q_scale=HD**-0.5, w_scale=heads**-0.5)
+    packed = kpool_score_fp8(
+        q, w, pool, tables, kv_lens, tpb, request_ids=request_ids, max_kv_len=max(lens), **kwargs
+    )
+    first = lens[0]
+    rows = slice(first, first + lens[1])
+    alone = kpool_score_fp8(
+        q[rows],
+        w[rows],
+        pool,
+        tables[1:2],
+        kv_lens[rows],
+        tpb,
+        request_ids=request_ids[rows] - 1,
+        max_kv_len=lens[1],
+        **kwargs,
+    )
+    assert packed is not None and alone is not None
+    for row in range(0, lens[1], 97):
+        visible = (row + 1) // KPOOL
+        torch.testing.assert_close(alone[row, :visible], packed[first + row, :visible])
 
 
 def test_pool_expansion_graph_replay_tracks_request_tables_and_tails():

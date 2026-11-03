@@ -115,6 +115,20 @@ class TestConfigAndFactory:
         assert not cfg.supports_speculative_decoding()
         initialize.assert_called_once_with()
 
+        # The selector limit applies to both single-request and batch execution.
+        # Reject unsupported budgets before calibration I/O, while accepting the boundary.
+        with mock.patch.object(TriAttentionCompressionManager, "_load_calibration") as load:
+            with pytest.raises(ValueError, match="budget must be at most 16384"):
+                TriAttentionCompressionManager(
+                    _make_tri_config(budget=16385), pretrained_config=pretrained_config
+                )
+            load.assert_not_called()
+            supported = TriAttentionCompressionManager(
+                _make_tri_config(budget=16384), pretrained_config=pretrained_config
+            )
+            assert supported.budget == 16384
+            load.assert_called_once_with()
+
 
 class TestTriAttentionCompressionManager:
     def test_loads_flat_pt(self, flat_calibration_pt):
@@ -560,6 +574,39 @@ class TestFixedScoreMetadata:
 
         assert snapshot[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
         assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
+
+    def test_device_page_table_snapshot_delegates_to_manager(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        current_stream = torch.cuda.current_stream(device)
+        host_table = torch.empty(
+            1,
+            1,
+            2,
+            8,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        gather = mock.Mock()
+        manager = _make_staging_manager(host_table, gather, current_stream)
+        manager.uses_device_page_table = True
+        manager.materialize_block_offsets_snapshot = mock.Mock()
+        staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
+
+        staging._stage_block_offset_snapshot(
+            manager,
+            [7],
+            staging._block_offsets_host,
+            staging._block_offsets_device,
+        )
+
+        manager.materialize_block_offsets_snapshot.assert_called_once_with(
+            staging._block_offsets_device,
+            [7],
+            host_staging=staging._block_offsets_host,
+            stream=current_stream,
+        )
+        gather.assert_not_called()
 
 
 class TestKernelMaskedSwa:
