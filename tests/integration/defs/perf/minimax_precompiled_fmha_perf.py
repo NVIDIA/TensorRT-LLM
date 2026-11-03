@@ -131,12 +131,14 @@ def test_minimax_precompiled_fmha_ab(
         assert Path(selected).resolve().parent == package.resolve()
         assert not (package / "_aot").exists()
 
+    arm_output_dir = Path(output_dir) / kernel_mode
+    arm_output_dir.mkdir(parents=True, exist_ok=True)
     run_perf_test(
         _CASE,
         trt_performance_cache_fpath,
         trt_gpu_clock_lock,
         llm_session_data_writer,
-        str(Path(output_dir) / kernel_mode),
+        str(arm_output_dir),
         llm_venv,
         llm_root,
     )
