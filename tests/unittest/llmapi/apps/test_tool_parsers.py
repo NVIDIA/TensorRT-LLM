@@ -1837,6 +1837,29 @@ class TestQwen3CoderStreamEnd:
              {
                  "x": "abc"
              }),
+            # EOS after </function> with the last parameter left unclosed.
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</function>", {
+                "x": "abc"
+            }),
+            ("<tool_call><function=f><parameter=x>abc</function>", {
+                "x": "abc"
+            }),
+            ("<tool_call>\n<function=f>\n<parameter=scale>\n42\n</function>",
+             {
+                 "scale": 42
+             }),
+            # max_tokens inside a value or a closing tag: only closed
+            # parameters are kept.
+            ("<tool_call><function=f><parameter=x>abc", {}),
+            ("<tool_call>\n<function=f>\n<parameter=x>\nab", {}),
+            ("<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n"
+             "<parameter=b>\n2\n</param", {
+                 "a": "1"
+             }),
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n"
+             "</func", {
+                 "x": "abc"
+             }),
         ])
     def test_stream_ending_inside_call_closes_arguments(
             self, tools, chunk_size, text, expected):

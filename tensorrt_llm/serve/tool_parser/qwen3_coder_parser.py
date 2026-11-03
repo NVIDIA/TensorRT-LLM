@@ -567,12 +567,20 @@ class Qwen3CoderToolParser(BaseToolParser):
         return calls
 
     def _close_unterminated_call(self, tools: list[Tool]) -> list[ToolCallItem]:
-        body = self._buf
-        function_end = self._find_closing_tag(body, "</function>", complete=True)
-        if function_end != -1:
-            body = body[:function_end]
+        """Flush and close a call the stream ended inside.
+
+        If the body ends with ``</function>`` (EOS before ``</tool_call>``),
+        the function is complete, so an unclosed last parameter ends at that
+        tag. Otherwise generation was cut off (e.g. ``max_tokens``) and only
+        closed parameters are kept, so a truncated value or a partial closing
+        tag is never reported as a final value.
+        """
+        body = self._buf.rstrip()
+        function_closed = not self.grammar_constrained and body.endswith("</function>")
+        if function_closed:
+            body = body[: -len("</function>")]
         param_config = self._get_arguments_config(self._current_function_name, tools)
-        calls = self._parse_and_stream_parameters(body, param_config, complete=True)
+        calls = self._parse_and_stream_parameters(body, param_config, complete=function_closed)
         current_streamed = self.streamed_args_for_tool[self.current_tool_id]
         closing = "}" if current_streamed else "{}"
         calls.append(ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing))
