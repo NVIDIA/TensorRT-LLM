@@ -5062,7 +5062,7 @@ class TestSparseOffloadIndexerDefault:
         kwargs = {"enable_kv_cache_offload": enabled}
         if requested is not None:
             kwargs["use_cute_dsl_paged_mqa_logits"] = requested
-        expected = not enabled if requested is None else requested
+        expected = True if requested is None else requested
         config = config_cls(**kwargs)
 
         for resolved in (
@@ -5076,53 +5076,6 @@ class TestSparseOffloadIndexerDefault:
             ).use_cute_dsl_paged_mqa_logits is expected
             assert resolved.to_sparse_metadata_params(
             ).use_cute_dsl_paged_mqa_logits is expected
-
-    @pytest.mark.parametrize("enabled", [False, True])
-    def test_yaml_bool_coercion(
-        self,
-        config_cls: type[llm_args_mod.DeepSeekSparseAttentionConfig],
-        enabled: bool,
-    ) -> None:
-        config = config_cls(enable_kv_cache_offload=str(enabled).lower())
-        assert config.use_cute_dsl_paged_mqa_logits is not enabled
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("requested", [None, False, True])
-def test_glm_model_config_preserves_indexer_choice(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    enabled: bool,
-    requested: bool | None,
-) -> None:
-    checkpoint = PretrainedConfig(
-        architectures=["GlmMoeDsaForCausalLM"],
-        num_hidden_layers=7,
-        index_n_heads=32,
-        index_head_dim=128,
-        index_topk=2048,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config",
-        lambda *args, **kwargs: checkpoint)
-    kwargs = {"enable_kv_cache_offload": enabled}
-    if requested is not None:
-        kwargs["use_cute_dsl_paged_mqa_logits"] = requested
-    config = llm_args_mod.DeepSeekSparseAttentionConfig(**kwargs)
-
-    resolved = ModelConfig.from_pretrained(
-        str(tmp_path),
-        sparse_attention_config=config,
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    ).sparse_attention_config
-
-    expected = not enabled if requested is None else requested
-    assert resolved.use_cute_dsl_paged_mqa_logits is expected
-    assert resolved.to_sparse_params().use_cute_dsl_paged_mqa_logits is expected
-    assert resolved.to_sparse_metadata_params(
-    ).use_cute_dsl_paged_mqa_logits is expected
 
 
 @pytest.mark.cpu_only

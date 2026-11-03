@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# LongBench v1 GovReport ROUGE-L F1 on a 0-100 scale, with offload disabled.
+# Select the first 32 complete reports with 6144-8192 chat-template tokens
+# after shuffling with seed 0, using each model's tokenizer. No truncation.
+# Greedy generation, seed 0, thinking disabled, up to 512 tokens, EOS allowed.
+# Measured on 4 GB300 GPUs: one TP2/EP2 context worker and one TP2/EP2
+# generation worker, max_batch_size=16, concurrency=32, no speculative
+# decoding, no block reuse, and autotuning disabled. GLM CI uses TP4/EP4.
+# Explicit thresholds allow one absolute ROUGE-L point below the resident
+# score for numerical and scheduling variation on this fixed sample set.
+zai-org/GLM-5.2:
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    extra_acc_spec: "input=6144-8192,output=512,seed=0,thinking=off"
+    index_topk: 2048
+    unit_tokens: 1
+    num_samples: 32
+    rouge-l: 31.620
+    threshold: 30.620
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: NVFP4
+    extra_acc_spec: "input=6144-8192,output=512,seed=0,thinking=off"
+    index_topk: 2048
+    unit_tokens: 1
+    num_samples: 32
+    rouge-l: 31.831
+    threshold: 30.831
+deepseek-ai/DeepSeek-V4-Flash:
+  # NVFP4 routed experts; the checkpoint declares MIXED_PRECISION.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    extra_acc_spec: "input=6144-8192,output=512,seed=0,thinking=off"
+    index_topk: 512
+    unit_tokens: 4
+    num_samples: 32
+    rouge-l: 32.814
+    threshold: 31.814

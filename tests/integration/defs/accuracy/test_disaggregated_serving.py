@@ -15,6 +15,7 @@
 
 import concurrent
 import contextlib
+import copy
 import functools
 import itertools
 import json
@@ -37,19 +38,21 @@ import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
 
+from tensorrt_llm.evaluate.lm_eval import (LmEvalEvaluator,
+                                           _replace_fuzzywuzzy_with_rapidfuzz)
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
                                           Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
-from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
+from tensorrt_llm.llmapi.tokenizer import DeepseekV4Tokenizer, load_hf_tokenizer
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
+from .accuracy_core import (GSM8K, MMLU, GovReport, GSM8KInferenceX,
                             LlmapiAccuracyTestHarness,
                             acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
@@ -97,8 +100,8 @@ def pick_distinct_free_ports(count: int) -> List[int]:
             sock.close()
 
 
-def compute_disagg_acceptance_length(serve_url: str) -> float:
-    """Acceptance length from the generation workers' iteration stats.
+def _get_disagg_generation_stats(serve_url: str) -> list[dict[str, Any]]:
+    """Read the generation workers' iteration stats.
 
     The disaggregated server does not proxy ``/metrics``, so the workers are
     resolved through ``/cluster_info`` -- the only authoritative source for
@@ -119,13 +122,19 @@ def compute_disagg_acceptance_length(serve_url: str) -> float:
 
     stats = []
     for worker in gen_workers:
-        # /metrics drains the buffer, so call it exactly once per worker,
-        # after the workload has finished.
+        # /metrics drains the buffer. Read it before a workload to discard
+        # startup statistics, then after the workload to collect its iterations.
         response = requests.get(
             f"http://{worker['host']}:{worker['port']}/metrics", timeout=60)
         response.raise_for_status()
         stats.extend(response.json())
-    return acceptance_length_from_iteration_stats(stats)
+    return stats
+
+
+def compute_disagg_acceptance_length(serve_url: str) -> float:
+    """Acceptance length from the generation workers' iteration stats."""
+    return acceptance_length_from_iteration_stats(
+        _get_disagg_generation_stats(serve_url))
 
 
 # Timeout for the entire test
@@ -674,6 +683,169 @@ def launch_disaggregated_llm(
                     assert marker_found, (
                         f"No worker logged {assert_worker_log_contains!r}; "
                         "the required transfer path was not exercised")
+
+
+def _test_sparse_offload_long_context(
+    disaggregated_server_config: dict[str, Any],
+    ctx_server_config: dict[str, Any],
+    gen_server_config: dict[str, Any],
+    model_path: str,
+    *,
+    model_name: str,
+    quant_algo: str,
+    index_topk: int,
+    unit_tokens: int,
+    server_waiting_timeout: int = 1200,
+) -> None:
+    """Compare batched GovReport quality against the resident YAML reference."""
+    min_input_len = GovReport.MIN_INPUT_LEN
+    max_input_len = GovReport.MAX_INPUT_LEN
+    max_batch_size = GovReport.MAX_BATCH_SIZE
+    concurrency = 32
+    output_len = GovReport.MAX_OUTPUT_LEN
+    random_seed = GovReport.RANDOM_SEED
+    tokens_per_block = 128
+    reference = GovReport(model_name).get_hypothesis_testing_params(
+        quant_algo=quant_algo,
+        kv_cache_quant_algo=gen_server_config["kv_cache_config"]
+        ["dtype"].upper(),
+        extra_acc_spec=(f"input={min_input_len}-{max_input_len},"
+                        f"output={output_len},seed={random_seed},thinking=off"),
+        index_topk=index_topk,
+        unit_tokens=unit_tokens,
+        num_samples=GovReport.NUM_SAMPLES)
+    num_samples = reference.num_samples
+    assert min_input_len >= 3 * index_topk * unit_tokens
+    if gen_server_config["sparse_attention_config"][
+            "algorithm"] == "deepseek_v4":
+        tokenizer = DeepseekV4Tokenizer.from_pretrained(model_path)
+    else:
+        tokenizer = load_hf_tokenizer(model_path)
+    # Use the same local dataset and task prompt/metric as the LongBench suite.
+    with _replace_fuzzywuzzy_with_rapidfuzz():
+        evaluator = LmEvalEvaluator("longbench_gov_report",
+                                    dataset_path=GovReport.DATASET_DIR,
+                                    random_seed=random_seed)
+    task = evaluator.task_dict["longbench_gov_report"]
+    samples = []
+    prompts = []
+    for sample in task.test_docs():
+        prompt = tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": task.doc_to_text(sample)
+            }],
+            tokenize=True,
+            return_dict=False,
+            add_generation_prompt=True,
+            enable_thinking=False)
+        # Keep complete documents: truncation could remove the facts scored by
+        # the reference summary. Tokenize with each model's actual tokenizer.
+        if not min_input_len <= len(prompt) <= max_input_len:
+            continue
+        samples.append(sample)
+        prompts.append(prompt)
+        if len(samples) == num_samples:
+            break
+    assert len(samples) == num_samples, (
+        f"Need {num_samples} complete GovReport prompts between {min_input_len} "
+        f"and {max_input_len} tokens, found {len(samples)}")
+    assert len({sample["_id"] for sample in samples}) == num_samples
+
+    for config in (ctx_server_config, gen_server_config):
+        config.update(max_batch_size=max_batch_size,
+                      max_seq_len=max(map(len, prompts)) + output_len,
+                      enable_autotuner=False)
+        config["kv_cache_config"] = {
+            **config["kv_cache_config"],
+            "enable_block_reuse": False,
+            "use_kv_cache_manager_v2": True,
+            "tokens_per_block": tokens_per_block,
+        }
+    ctx_server_config.update(enable_chunked_prefill=True, max_num_tokens=8192)
+    gen_server_config.update(enable_iter_perf_stats=True,
+                             iter_stats_max_iterations=-1,
+                             max_stats_len=-1)
+    sparse_config = {
+        **gen_server_config["sparse_attention_config"],
+        "index_topk": index_topk,
+        # Match the indexer used to measure the resident YAML reference.
+        "use_cute_dsl_paged_mqa_logits": False,
+    }
+    ctx_server_config["sparse_attention_config"] = {
+        **sparse_config,
+        "enable_kv_cache_offload": False,
+    }
+    # At factor 1, the cache holds top-k plus at most one page of slack.
+    # The history cannot fit. Check the actual decode lengths below, since
+    # benchmark summaries are allowed to stop at EOS.
+    units_per_page = tokens_per_block // unit_tokens
+    cache_units = (index_topk // units_per_page + 1) * units_per_page
+    assert all(len(prompt) // unit_tokens > cache_units for prompt in prompts)
+
+    gen_server_config["sparse_attention_config"] = {
+        **sparse_config,
+        "enable_kv_cache_offload": True,
+        "kv_cache_offload_config": {
+            "gpu_cache_factor": 1.0
+        },
+    }
+    # The launcher adds discovery and authentication settings in place.
+    with launch_disaggregated_llm(
+            copy.deepcopy(disaggregated_server_config),
+            copy.deepcopy(ctx_server_config),
+            copy.deepcopy(gen_server_config),
+            model_path,
+            server_waiting_timeout=server_waiting_timeout,
+            max_workers=concurrency) as llm, openai.OpenAI(
+                api_key="1234567890",
+                base_url=f"{llm.serve_url}/v1",
+                timeout=300,
+                max_retries=0) as client:
+        _get_disagg_generation_stats(llm.serve_url)
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [
+                pool.submit(client.completions.create,
+                            model=model_path,
+                            prompt=prompt,
+                            max_tokens=output_len,
+                            temperature=0,
+                            seed=random_seed,
+                            extra_body={"detokenize": False})
+                for prompt in prompts
+            ]
+            responses = [future.result() for future in futures]
+        stats = _get_disagg_generation_stats(llm.serve_url)
+        batched_steps = sum(
+            stat.get("inflightBatchingStats", {}).get("numGenRequests", 0) > 1
+            for stat in stats)
+        assert batched_steps >= tokens_per_block, (
+            f"Only {batched_steps} decode iterations had multiple requests; "
+            "the long-context test must exercise sustained batched decode")
+
+        scores = []
+        long_decodes = 0
+        for sample, prompt, response in zip(samples, prompts, responses):
+            assert response.usage.prompt_tokens == len(prompt)
+            choice = response.choices[0]
+            assert choice.finish_reason in ("length", "stop")
+            token_ids = choice.model_dump()["token_ids"]
+            assert 0 < len(token_ids) <= output_len
+            assert response.usage.completion_tokens == len(token_ids)
+            long_decodes += ((len(token_ids) - 1) // unit_tokens
+                             > cache_units - index_topk)
+            prediction = tokenizer.decode(token_ids, skip_special_tokens=True)
+            scores.append(
+                task.process_results(sample, [prediction])["rouge_score"])
+        assert long_decodes >= max_batch_size, (
+            f"Only {long_decodes} summaries decoded beyond the cache's "
+            "free slots; need at least one full batch")
+        score = 100 * sum(scores) / len(scores)
+        print(f"GovReport offload=True: n={num_samples}, "
+              f"ROUGE-L={score:.3f}, batched_steps={batched_steps}, "
+              f"long_decodes={long_decodes}")
+        print(reference.report(score))
+        reference.assert_passing(score)
 
 
 def run_parallel_test(model_name: str,
@@ -2275,16 +2447,20 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
+    @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(8)
-    def test_kv_cache_offload(self):
-        """The generation server keeps the MLA latent history in host memory.
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
+    def test_kv_cache_offload(self, kv_dtype: str) -> None:
+        """GovReport summary quality is preserved with MLA latent history offloaded.
 
         Each decode step fetches the indexer-selected tokens into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
         history resident. Offload takes no speculative decoding and no block
         reuse.
         """
+        # Both servers use the same KV dtype for transfer and decode.
         kv_cache_config = {
+            "dtype": kv_dtype,
             "free_gpu_memory_fraction": 0.7,
             "enable_block_reuse": False,
             "use_kv_cache_manager_v2": True,
@@ -2303,7 +2479,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": True,
             "cuda_graph_config": None,
             "trust_remote_code": True,
-            "max_seq_len": 8192,
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
             "cache_transceiver_config": cache_transceiver_config,
@@ -2316,10 +2491,6 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": False,
             "enable_chunked_prefill": True,
             "trust_remote_code": True,
-            # Each batch row holds a GPU cache for its selected history, about
-            # 180 MiB on GLM-5.2, so the batch stays small.
-            "max_batch_size": 16,
-            "max_seq_len": 8192,
             "kv_cache_config": kv_cache_config,
             "moe_config": moe_config,
             "cache_transceiver_config": cache_transceiver_config,
@@ -2338,15 +2509,14 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      max_workers=16) as llm:
-            # The DuckLLM's bare LlmArgs takes NVFP4 from the model path; the
-            # checkpoint's FP8 KV cache selects the reference entry.
-            llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+        _test_sparse_offload_long_context(disaggregated_server_config,
+                                          ctx_server_config,
+                                          gen_server_config,
+                                          self.MODEL_PATH,
+                                          model_name=self.MODEL_NAME,
+                                          quant_algo="NVFP4",
+                                          index_topk=2048,
+                                          unit_tokens=1)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -2462,11 +2632,10 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
-    # The servers take up to an hour to start, before a full GSM8K run.
-    @pytest.mark.timeout(5400)
+    @pytest.mark.timeout(1800)
     @pytest.mark.skip_less_device(4)
-    def test_kv_cache_offload(self):
-        """The generation server keeps the ratio-4 compressed history in host memory.
+    def test_kv_cache_offload(self) -> None:
+        """GovReport summary quality is preserved with ratio-4 history offloaded.
 
         Each decode step fetches the indexer-selected units into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
@@ -2485,8 +2654,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
             "disable_overlap_scheduler": True,
-            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
-            "max_seq_len": 4096,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
         }
@@ -2495,8 +2662,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "moe_expert_parallel_size": 2,
             "enable_attention_dp": True,
             "disable_overlap_scheduler": True,
-            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
-            "max_seq_len": 4096,
             "moe_config": {
                 "backend": "TRTLLM",
             },
@@ -2520,16 +2685,14 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             },
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config,
-                                      gen_server_config,
-                                      self.MODEL_PATH,
-                                      server_waiting_timeout=3600) as llm:
-            # The DuckLLM's bare LlmArgs knows no checkpoint quantization; these
-            # select the reference entry.
-            llm.args.quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+        _test_sparse_offload_long_context(disaggregated_server_config,
+                                          ctx_server_config,
+                                          gen_server_config,
+                                          self.MODEL_PATH,
+                                          model_name=self.MODEL_NAME,
+                                          quant_algo="MIXED_PRECISION",
+                                          index_topk=512,
+                                          unit_tokens=4)
 
 
 @pytest.mark.timeout(14400)

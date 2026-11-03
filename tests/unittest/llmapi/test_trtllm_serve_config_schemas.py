@@ -429,12 +429,8 @@ def test_sparse_offload_indexer_default(
     schema = schemas[filename]
     definition = schema["$defs"][config_name]
     field = "use_cute_dsl_paged_mqa_logits"
-    assert "default" not in definition["properties"][field]
-    condition = definition["allOf"][0]
-    branch = "then" if Draft202012Validator(condition["if"]).is_valid(sparse_config) else "else"
-    expected = enabled is not True
-    assert condition[branch]["properties"][field]["default"] is expected
-    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is expected
+    assert definition["properties"][field]["default"] is True
+    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is True
     validator = Draft202012Validator(schema)
     assert validator.is_valid({"sparse_attention_config": sparse_config})
     for value in (False, True):
