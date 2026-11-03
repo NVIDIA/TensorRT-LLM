@@ -765,6 +765,19 @@ class MoESortTables:
 
 
 @dataclass(frozen=True)
+class SortedRouting:
+    """Routing a caller computed for one forward together with this rank's
+    ``moe_sort`` tables: what ``MoEImplBase.try_route_with_sort`` returns, for a
+    ``ConfigurableMoE`` whose ``sort_routing_applies`` holds (one chunk, no
+    communication). The scheduler uses it instead of routing ``router_logits``.
+    """
+
+    token_selected_experts: torch.Tensor  # int32 [num_tokens, top_k]
+    token_final_scales: torch.Tensor  # fp32 [num_tokens, top_k]
+    sort_tables: MoESortTables
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 

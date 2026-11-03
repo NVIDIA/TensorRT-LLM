@@ -611,6 +611,19 @@ class NoauxTcRouteSortKernel:
             local_num,
         )
 
+    def load_logits(self, row: Int64, g: Int32, stride: int, n: int):
+        """Logits ``s * stride + g`` (``s < n``) of the token whose logits start at ``row``. A
+        subclass may read them differently (the Kimi-K3 MoE front polls them)."""
+        return [ptx.ld_global_f32(row + Int64((s * stride + g) * 4)) for s in range(n)]
+
+    def load_logits4(self, row: Int64, lane: Int32, n: int):
+        """Logits ``128 j + 4 lane .. + 3`` (``j < n``) of the token whose logits start at
+        ``row``, concatenated (a plain Python loop, unrolled at trace time)."""
+        logit = []
+        for blk in range(n):
+            logit.extend(ptx.ld_global_v4_f32(row + Int64((blk * 128 + lane * 4) * 4)))
+        return logit
+
     @cute.jit
     def team_sync(self, team: Int32):
         if cutlass.const_expr(self.team_warps > 1):
@@ -682,7 +695,7 @@ class NoauxTcRouteSortKernel:
         stride = self.team_lanes
         g = team_warp * 32 + lane
         row = logits_addr + Int64(token) * Int64(self.num_experts * 4)
-        logit = [ptx.ld_global_f32(row + Int64((s * stride + g) * 4)) for s in range(n_slots)]
+        logit = self.load_logits(row, g, stride, n_slots)
         bias = [ptx.ld_shared_f32(bias_smem + (s * stride + g) * 4) for s in range(n_slots)]
         sig = [
             cute.math.tanh(logit[s] * Float32(0.5)) * Float32(0.5) + Float32(0.5)
@@ -774,9 +787,7 @@ class NoauxTcRouteSortKernel:
     def topk_rounds(self, row: Int64, bias_smem: Int32, lane: Int32):
         """Exact fallback by one warp: 16 arg-max rounds over all ``E`` keys of the token (lane
         ``l`` owns experts ``128 j + 4 l + i``); lane ``k`` gets the ``k``-th expert."""
-        logit = []
-        for blk in cutlass.range_constexpr(self.blocks):
-            logit.extend(ptx.ld_global_v4_f32(row + Int64((blk * 128 + lane * 4) * 4)))
+        logit = self.load_logits4(row, lane, self.blocks)
         sig = [
             cute.math.tanh(logit[s] * Float32(0.5)) * Float32(0.5) + Float32(0.5)
             for s in range(self.fallback_slots)

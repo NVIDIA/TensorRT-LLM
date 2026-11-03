@@ -42,6 +42,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     MoERejectReason,
     PreroutedRouting,
+    SortedRouting,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
@@ -739,6 +740,7 @@ class ConfigurableMoE(MoE):
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        sorted_routing: Optional[SortedRouting] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -759,6 +761,10 @@ class ConfigurableMoE(MoE):
         ``prerouted``: the tokens' routing, computed by the caller for a backend
         that declares ``supports_prerouted_routing`` (one chunk, no
         communication).
+
+        ``sorted_routing``: the tokens' routing with this rank's ``moe_sort``
+        tables, computed by the caller where ``sort_routing_applies`` (one
+        chunk, no communication); used instead of routing ``router_logits``.
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -766,6 +772,9 @@ class ConfigurableMoE(MoE):
             routing_aux.ndim == 0 or routing_aux.shape[0] != router_logits.shape[0]
         ):
             raise ValueError("routing_aux must have one row per router-logit row")
+
+        if sorted_routing is not None and not self.sort_routing_applies:
+            raise ValueError("sorted routing needs a backend that runs on moe_sort tables")
 
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -791,6 +800,7 @@ class ConfigurableMoE(MoE):
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
             prerouted=prerouted,
+            sorted_routing=sorted_routing,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

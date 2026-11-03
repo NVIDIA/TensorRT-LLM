@@ -926,6 +926,10 @@ class _AllReducePushMixin:
         cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push[2])
         return cur, nbytes
 
+    #: Features of one Lamport slot row of the push (0: the GEMM's N). Ranks that push slices of
+    #: different widths into the slots of one all-gather (``kimi_k3_moe_front``) set it wider.
+    push_slot_n: int = 0
+
     @cute.jit
     def _push_vector(self, stage, j, m: Int32, n_base, push, state):
         """Push vector ``j`` (token ``j // 16``, features ``n_base + (j % 16) * 8 + [0, 8)``) of
@@ -946,7 +950,7 @@ class _AllReducePushMixin:
                 ar_rank,
                 n_base + c * 8,
                 self.all_reduce_world,
-                self.n,
+                self.push_slot_n or self.n,
                 self.one_shot,
             )
             pushed_ar.push_v4(dst, *w, self.one_shot)
@@ -977,6 +981,7 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         nvfp4_out: bool = False,
         all_reduce_world: int = 0,
         one_shot: bool = False,
+        push_slot_n: int = 0,
     ):
         validate_tactic(n, k, tactic, gated)
         if nvfp4_out:
@@ -988,6 +993,9 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
                 raise ValueError(f"invalid all-reduce push over {all_reduce_world} ranks")
             if not push_stages_fit(n, k, tactic):
                 raise ValueError("the split-K all-reduce push stages its rows in >= 2 b_stages")
+        if push_slot_n and (not all_reduce_world or push_slot_n < n or push_slot_n % 8):
+            raise ValueError(f"push_slot_n={push_slot_n} must be a multiple of 8 and >= N={n}")
+        self.push_slot_n = push_slot_n
         self.gated = gated
         self.sigmoid = sigmoid
         self.nvfp4_out = nvfp4_out
@@ -1140,6 +1148,36 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         stream: cuda.CUstream,
         push=None,
     ):
+        args = self.kernel_args(
+            w_ptr, x_ptr, g_ptr, g_ld, ws_ptr, out_ptr, scales_ptr, gsf_ptr, m, push
+        )
+        self.kernel(*args).launch(
+            grid=(self.n_tiles * self.split_k, 1, 1),
+            block=(self.threads, 1, 1),
+            cluster=(self.split_k, 1, 1),
+            smem=self.shared_storage.size_in_bytes(),
+            min_blocks_per_mp=1,
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.jit
+    def kernel_args(
+        self,
+        w_ptr: cute.Pointer,
+        x_ptr: cute.Pointer,
+        g_ptr,
+        g_ld,
+        ws_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        scales_ptr,
+        gsf_ptr,
+        m: Int32,
+        push=None,
+    ) -> tuple:
+        """The arguments of :meth:`kernel` for one launch (TMA atoms, layouts, tensors), traced in
+        a ``cute.jit`` caller; also sets ``shared_storage``. A kernel that runs this GEMM's CTAs
+        beside CTAs of other roles passes them to :meth:`cta`."""
         n, k = self.n, self.k
         mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
         mX = cute.make_tensor(x_ptr, cute.make_layout((m, k), stride=(k, 1)))
@@ -1255,7 +1293,7 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
 
         self.shared_storage = GatedSharedStorage if self.gated else SharedStorage
 
-        self.kernel(
+        return (
             tiled_mma,
             tma_atom_a,
             tma_tensor_a,
@@ -1274,14 +1312,6 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
             mSF,
             mGSF,
             push,
-        ).launch(
-            grid=(self.n_tiles * self.split_k, 1, 1),
-            block=(self.threads, 1, 1),
-            cluster=(self.split_k, 1, 1),
-            smem=self.shared_storage.size_in_bytes(),
-            min_blocks_per_mp=1,
-            stream=stream,
-            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -1306,6 +1336,53 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
         mGSF: Optional[cute.Tensor],
         push,
     ):
+        self.cta(
+            tiled_mma,
+            tma_atom_a,
+            mA,
+            tma_atom_x,
+            mXt,
+            mWS,
+            mOut,
+            m,
+            a_layout,
+            b_layout,
+            sfa_layout,
+            sfb_layout,
+            x_layout,
+            tma_atom_g,
+            mGt,
+            mSF,
+            mGSF,
+            push,
+        )
+
+    @cute.jit
+    def cta(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_a: cute.CopyAtom,
+        mA: cute.Tensor,
+        tma_atom_x: cute.CopyAtom,
+        mXt: cute.Tensor,
+        mWS: cute.Tensor,
+        mOut: cute.Tensor,
+        m: Int32,
+        a_layout: cute.ComposedLayout,
+        b_layout: cute.ComposedLayout,
+        sfa_layout: cute.Layout,
+        sfb_layout: cute.Layout,
+        x_layout: cute.Layout,
+        tma_atom_g: Optional[cute.CopyAtom],
+        mGt: Optional[cute.Tensor],
+        mSF: Optional[cute.Tensor],
+        mGSF: Optional[cute.Tensor],
+        push,
+        storage=None,
+    ):
+        """One CTA of the GEMM grid (block ``n_tile * split_k + cluster rank``), the body of
+        :meth:`kernel`. ``storage``: the allocated ``shared_storage`` where the calling kernel
+        shares one allocation between this GEMM and CTAs of other roles."""
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -1327,7 +1404,8 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
             else:
                 kt_start = kt_start + kt_rem
 
-        storage = utils.SmemAllocator().allocate(self.shared_storage)
+        if cutlass.const_expr(storage is None):
+            storage = utils.SmemAllocator().allocate(self.shared_storage)
         if cutlass.const_expr(self.gated):
             g_smem = storage.sG.data_ptr()
             storage = storage.base

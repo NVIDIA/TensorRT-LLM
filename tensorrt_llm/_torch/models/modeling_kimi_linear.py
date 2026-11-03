@@ -156,6 +156,7 @@ from ..moe.fused_moe import (
     TRTLLMGenFusedMoE,
     create_moe,
 )
+from ..moe.fused_moe.impl_contract import MoESortTables, SortedRouting
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
@@ -1751,6 +1752,10 @@ class KimiK3MoERuntime(nn.Module):
     # ``(first row, rows)`` of latent_up's output this rank computes in the column-parallel tail
     # (None: no column-parallel tail; set in __init__).
     latent_up_rows: Optional[Tuple[int, int]] = None
+    # The sharded decode front (``kimi_k3_moe_front``): the routed all-reduce group's workspace
+    # and this layer's operands on this rank, built after loading where the front applies.
+    _moe_front_ws = None
+    _moe_front_plan = None
 
     def __init__(
         self,
@@ -2076,6 +2081,118 @@ class KimiK3MoERuntime(nn.Module):
                 AllReduceFusionOp.RMS_NORM_QUANT_MXFP8
             )
         )
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
+
+    def cache_derived_state(self) -> None:
+        self._prepare_moe_front()
+
+    def _moe_front_unsupported(self) -> Optional[str]:
+        """Why this layer cannot run the sharded decode front (``kimi_k3_moe_front``), or
+        ``None``."""
+        from ..moe.kernels.blackwell import kimi_k3_moe_front
+
+        moe = self.routed_experts
+        if not self._reduce_routed_output:
+            return "the routed output is not all-reduced over the TP group"
+        mnnvl = moe.all_reduce.mnnvl_allreduce
+        if mnnvl is None or not kimi_k3_moe_front.supports_world(mnnvl.mapping.tp_size):
+            return "the routed all-reduce is not MNNVL over a supported group"
+        if not moe.routes_with_sort_tables(kimi_k3_moe_front.M_MAX):
+            return "the routed experts are not routed by the moe_sort routing kernel"
+        if moe.nvfp4_input_scale(1) is None:
+            return "the routed experts do not take an NVFP4 input"
+        if (
+            self.hidden_size != kimi_k3_moe_front.HIDDEN
+            or self.moe_hidden_size != kimi_k3_moe_front.LATENT
+            or self.num_experts != kimi_k3_moe_front.NUM_EXPERTS
+            or self.gate.weight.dtype != torch.bfloat16
+        ):
+            return "not the Kimi-K3 geometry with a BF16 router"
+        down = self.routed_expert_down_proj
+        if (
+            not isinstance(down, _Fp8BlockScaleWeightReadLinear)
+            or down._fused_projection is not None
+        ):
+            return "latent_down is not an FP8 weight-read projection"
+        return None
+
+    def _prepare_moe_front(self) -> None:
+        """Build this layer's sharded decode front on this rank (collective over the routed
+        all-reduce group on the first layer: the workspace), or keep the replicated front."""
+        self._moe_front_plan = None
+        reason = self._moe_front_unsupported()
+        down = self.routed_expert_down_proj
+        if reason is None:
+            down.transform_weights()
+            down._prepare_low_m_gemm()
+            if down._low_m_weight_scale is None:
+                reason = "the low-M GEMM does not serve latent_down"
+        if reason is not None:
+            logger.info_once(
+                f"Kimi K3: MoE layers keep the replicated decode front: {reason}",
+                key=f"k3_moe_front_off_{reason}",
+            )
+            return
+        from ..moe.kernels.blackwell import kimi_k3_moe_front
+
+        backend = self.routed_experts.backend
+        self._moe_front_ws = kimi_k3_moe_front.moe_front_workspace(
+            self.routed_experts.all_reduce.mnnvl_allreduce.mapping
+        )
+        ws = self._moe_front_ws
+        with torch.no_grad():
+            self._moe_front_plan = kimi_k3_moe_front.make_plan(
+                down.weight,
+                down._low_m_weight_scale,
+                self.gate.weight,
+                self.gate.e_score_correction_bias,
+                float(self.gate.routed_scaling_factor),
+                ws.world,
+                ws.rank,
+                backend.slot_start,
+                backend.expert_size_per_partition,
+            )
+        logger.info_once(
+            f"Kimi K3: sharded MoE decode front over {ws.world} ranks", key="k3_moe_front_on"
+        )
+
+    def _moe_front_applies(self, hidden_states: torch.Tensor) -> bool:
+        """Whether this forward runs the sharded decode front: a layer it was prepared for,
+        ``1 .. M_MAX`` rows the routed experts take as an NVFP4 input, and kernels already
+        compiled when a CUDA graph is being captured."""
+        plan = self._moe_front_plan
+        if plan is None or torch.compiler.is_compiling():
+            return False
+        from ..moe.kernels.blackwell import kimi_k3_moe_front
+
+        num_tokens = hidden_states.shape[0]
+        if not 1 <= num_tokens <= kimi_k3_moe_front.M_MAX:
+            return False
+        scale = self.routed_experts.nvfp4_input_scale(num_tokens)
+        if scale is None or not kimi_k3_moe_front.can_run(hidden_states, plan, scale):
+            return False
+        return not torch.cuda.is_current_stream_capturing() or kimi_k3_moe_front.is_compiled(
+            num_tokens, plan
+        )
+
+    def _moe_front(self, hidden_states: torch.Tensor) -> Tuple[Fp4QuantizedTensor, SortedRouting]:
+        """The sharded decode front on the current stream: the routed experts' NVFP4 input and
+        the routing with this rank's ``moe_sort`` tables."""
+        from ..moe.kernels.blackwell import kimi_k3_moe_front, kimi_k3_routing
+
+        num_tokens = hidden_states.shape[0]
+        ids, weights, sort_outputs, codes, scales = kimi_k3_moe_front.run_moe_front(
+            hidden_states,
+            self._moe_front_plan,
+            self._moe_front_ws,
+            self.routed_experts.nvfp4_input_scale(num_tokens),
+        )
+        routing = SortedRouting(
+            ids, weights, MoESortTables(kimi_k3_routing.TILE_SIZE, tuple(sort_outputs))
+        )
+        return Fp4QuantizedTensor(codes, scales, is_sf_swizzled=False), routing
 
     @staticmethod
     def _routed_projection(hidden_states: torch.Tensor, projection: nn.Module) -> torch.Tensor:
@@ -2445,7 +2562,14 @@ class KimiK3MoERuntime(nn.Module):
         projected_input = None
         early_routed_in = None
         shared_partial = None
-        if self._can_fuse_router_down(hidden_states):
+        sharded_front = self._moe_front_applies(hidden_states)
+        if sharded_front:
+            # The routed branch starts with the sharded front, which routes and produces the
+            # NVFP4 routed input; the logits only carry the shape.
+            router_logits = hidden_states.new_empty(
+                (hidden_states.shape[0], self.num_experts), dtype=torch.float32
+            )
+        elif self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
@@ -2494,7 +2618,9 @@ class KimiK3MoERuntime(nn.Module):
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
             moe_kwargs = {}
-            if projected_input is not None:
+            if sharded_front:
+                routed_in, moe_kwargs["sorted_routing"] = self._moe_front(hidden_states)
+            elif projected_input is not None:
                 routed_in = projected_input
             elif early_routed_in is not None:
                 routed_in = early_routed_in
