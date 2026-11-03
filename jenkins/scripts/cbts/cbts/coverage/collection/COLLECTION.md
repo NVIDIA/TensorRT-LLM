@@ -164,7 +164,7 @@ These rows describe execution, not every test that depends on a shared fixture. 
 |------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | C++ / nanobind implementations                 | PY_START only sees Python frames; the C++ side of KV cache manager, scheduler and decoder is invisible                                                     |
 | Other test bodies and helpers                  | Under `tests/`, the default include patterns select only `test_common/` and `conftest.py`                                                                  |
-| A Ray stage's GPU worker                       | `RayGPUWorker` lives in the opted-out `default_worker.py`                                                                                                  |
+| Ray stages                                     | excluded from coverage collection                                                                                                                          |
 | Multi-node stages                              | excluded; the channel design is single-producer, so a multi-node stage would need its address published somewhere shared                                  |
 | A channel failure inside an inner-pytest batch | `test_unittests_v2` has no `cbts_plugin` (§3's `inner_pytest` row), so nothing records a taint if a subscriber it spawns falls behind                      |
 
@@ -196,7 +196,7 @@ whether or not the record is sound.
 `L0_MergeRequest.groovy` decides pipeline-level eligibility and `isCbtsStage()` decides each stage:
 
 - `ENABLE_CBTS_COVERAGE` kill switch
-- not a perf stage or a TensorRT / CPP stage
+- not a perf stage, a Ray stage (`-Ray-` in the name), or a TensorRT / CPP stage
 - post-merge: single-GPU stages only; pre-merge: single-node multi-GPU stages only (collection experiment)
 - multi-node stages excluded
 - not listed in `CBTS_EXCLUDE_STAGES`
