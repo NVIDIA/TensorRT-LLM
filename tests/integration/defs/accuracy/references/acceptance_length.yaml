@@ -223,5 +223,10 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Tp1::mtp7_nvfp4_kv_bf16_state_long_context:
 # (test_qwen4_exp.py), over the pass keys of the tp1 target's mtp3_long_context at tep4: three
 # drafts with IndexShare on, bf16 KV.
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
-  ref_al: null
-  min_al: null
+  # modeling_v2's own reading on GB300, at the range's ceiling as the tp1 target's. The
+  # built-in implementation does not start this engine (its decode front's router GEMM
+  # asserts a power-of-two K), so there is no stock reading.
+  ref_al: 4.000
+  # 2.5% below ref_al, as for the tp1 target's mtp3_long_context, whose deliberately wrong
+  # reused selection scores 3.760.
+  min_al: 3.9

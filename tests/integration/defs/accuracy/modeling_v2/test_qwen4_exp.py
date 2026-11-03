@@ -1027,8 +1027,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
     # cases' tripwire: at or above it, more than half the drafts are accepted.
     MTP3_COLLAPSE_FLOOR = 1.0 + MTP3.max_draft_len / 2
 
-    # The pass keys' acceptance-length floor in references/acceptance_length.yaml: the
-    # stock implementation's reading on the same prompts at tep4.
+    # The pass keys' acceptance-length floor in references/acceptance_length.yaml.
     ACCEPTANCE_KEY_LONG_CONTEXT = "ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context"
 
     def _gsm8k(self, mocker, llm, label: str) -> None:
@@ -1086,8 +1085,7 @@ class TestModelingV2Qwen38FlashNextNvfp4Sm103Default(LlmapiAccuracyTestHarness):
         the target's decode steps and its draft layer's take the sparse attention path, which
         gsm8k never leaves, and IndexShare makes the draft loop reuse the selection of its
         first step. A miscomputed draft path keeps the text correct and only lowers the
-        acceptance length, which is held to the stock implementation's reading on the same
-        prompts.
+        acceptance length, which is held to its floor in references/acceptance_length.yaml.
         """
         tokenizer = AutoTokenizer.from_pretrained(self.MODEL_PATH)
         prompts = _passkey_prompts(tokenizer, _PASSKEY_LENGTHS)
