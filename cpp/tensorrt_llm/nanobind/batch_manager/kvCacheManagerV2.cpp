@@ -1564,7 +1564,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::enum_<kv::ReusePolicy>(m, "ReusePolicy")
         .value("REQUIRED", kv::ReusePolicy::REQUIRED)
         .value("PRIVATE", kv::ReusePolicy::PRIVATE)
-        .value("OPTIONAL", kv::ReusePolicy::OPTIONAL);
+        .value("OPTIONAL", kv::ReusePolicy::OPTIONAL)
+        .value("SINK_REQUIRED_ONLY", kv::ReusePolicy::SINK_REQUIRED_ONLY);
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
         .def(nb::init<std::optional<int>, int, kv::ReusePolicy>(), nb::arg("window_size").none(),

@@ -73,6 +73,12 @@ void AttentionLayerConfig::validate() const
     for (auto const& buf : buffers)
     {
         buf.validate();
+        // Sinks required, sliding window optional: the policy needs both a sliding window and sink tokens.
+        if (buf.effectiveReusePolicy(reusePolicy) == ReusePolicy::SINK_REQUIRED_ONLY
+            && (!slidingWindowSize.has_value() || numSinkTokens.value_or(0) == 0))
+        {
+            throw std::invalid_argument("SINK_REQUIRED_ONLY requires a sliding window with sink tokens");
+        }
     }
     TLLM_CHECK_WITH_INFO(!sparseCache.has_value()
             || std::any_of(buffers.begin(), buffers.end(), [](BufferConfig const& b) { return b.isSparse; }),
