@@ -805,7 +805,10 @@ class QSASparseHooks(AttentionSparseHooks):
         if use_prims_ts:
             # The next chunk's scoring and Top-K are queued before this chunk's
             # PrimTS launch is prepared on the host, so the GPU has work while
-            # the host runs the wrapper. Chunks write disjoint Top-K rows.
+            # the host runs the wrapper. This relies on select() writing only
+            # its own packed_slice of top_k_output and visible_blocks; a shared
+            # scratch buffer inside select_qsa_paged_tokens would corrupt the
+            # pending chunk.
             selected_next = select(*bounds[0])
             for i, (start, end) in enumerate(bounds):
                 selected = selected_next

@@ -211,14 +211,15 @@ def test_prefill_rows_share_plans_within_bucket() -> None:
         q, k_cache, v_cache, block_table, block_ids, request_indices, positions, **kwargs
     )
     plans = len(_CORE._plans)
+    # 500 and 510 rows both pad to 512 rows and 256 routes.
     q2, _, _, block_table2, block_ids2, request_indices2, positions2, selected2, metadata = (
-        _make_case([350, 210], seed=6)
+        _make_case([260, 250], seed=6)
     )
     out = prims_ts_sparse_gqa(
         q2, k_cache, v_cache, block_table2, block_ids2, request_indices2, positions2, **kwargs
     )
     assert len(_CORE._plans) == plans
-    assert out.shape[0] == 560
+    assert out.shape[0] == 510
     expected = qsa_sparse_gqa_reference(
         q=q2,
         k_cache=k_cache,

@@ -14,11 +14,16 @@ from .params import QSASparseParams
 
 _PREFILL_GROUP_SIZE = 4
 # Prefill plans are capacity plans over a route count: the route offsets are
-# padded with trailing empty routes to a multiple of this, so a chunk's row
-# count does not create a plan (the wrapper requires routes <= rows, so
-# chunks shorter than the bucket plan per row count). Decode plans are per
-# row count.
+# padded with trailing empty routes to a multiple of this, so the request
+# composition of a chunk does not create a plan (the wrapper requires
+# routes <= rows, so chunks shorter than the bucket plan per row count).
 _PREFILL_ROUTE_BUCKET = 256
+# The wrapper re-prepares its launch, with a host readback of the route
+# offsets, whenever the q/out shape changes. Full chunks share one shape;
+# tail chunks are padded to this many rows so each padded shape keeps its
+# own prepared plan instead of re-preparing on every tail. Decode rows are
+# never padded.
+_PREFILL_ROW_BUCKET = 64
 # Query rows (requests x query tokens per request, so MTP counts draft tokens)
 # below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
 # context, TP2): the core ties at one row, the indexer until ~32 rows.
@@ -164,6 +169,12 @@ def _request_boundaries(request_indices: torch.Tensor) -> tuple[int, ...]:
     return (0, *change.tolist(), req.numel())
 
 
+def _pad_rows(t: torch.Tensor, rows: int, fill: float) -> torch.Tensor:
+    padded = t.new_full((rows, *t.shape[1:]), fill)
+    padded[: t.shape[0]] = t
+    return padded
+
+
 def slice_request_boundaries(cu_seq_lens: list[int], start: int, end: int) -> tuple[int, ...]:
     """Request boundaries of packed rows ``[start, end)`` from host cumulative lengths."""
     inner = cu_seq_lens[
@@ -181,6 +192,8 @@ class _PrimsTSSparseCore:
         self._plans: dict[tuple, object] = {}
         self._last_abi: dict[tuple, tuple] = {}
         self._workspace: torch.Tensor | None = None
+        # Graphs captured before a growth keep the old buffer's address.
+        self._retired_workspaces: list[torch.Tensor] = []
         self._qo_indptr: dict[tuple, torch.Tensor] = {}
         self._qo_indptr_key: tuple | None = None
         self._qo_indptr_buffer_key: tuple | None = None
@@ -191,6 +204,8 @@ class _PrimsTSSparseCore:
         if ws is None or ws.device != device or ws.numel() < nbytes:
             # Plans bind typed views into the workspace; growth invalidates them.
             self._plans.clear()
+            if ws is not None:
+                self._retired_workspaces.append(ws)
             ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
             self._workspace = ws
         return ws
@@ -203,9 +218,10 @@ class _PrimsTSSparseCore:
         device: torch.device,
     ) -> torch.Tensor:
         # The FlashInfer wrapper re-prepares, with host readbacks, whenever the
-        # qo_indptr storage changes. All QSA layers of a forward share one
-        # request layout, so offsets live in a persistent buffer per route count
-        # that is rewritten, stream-ordered, only when the layout changes.
+        # qo_indptr storage changes, so offsets live in one persistent buffer
+        # per route count. The buffer is rewritten, stream-ordered, when the
+        # layout differs from the previous call: once per chunk per layer with
+        # several prefill chunks, never within a chunk's layers.
         layout = (device.index, rows, request_boundaries)
         if layout == self._qo_indptr_key:
             return self._qo_indptr[self._qo_indptr_buffer_key]
@@ -262,6 +278,13 @@ class _PrimsTSSparseCore:
 
         request_indices = request_indices.to(torch.int32).contiguous()
         q = q.contiguous()
+        padded_rows = rows if is_decode else -(-rows // _PREFILL_ROW_BUCKET) * _PREFILL_ROW_BUCKET
+        if padded_rows != rows:
+            # Padding rows select no blocks and are sliced off the output.
+            q = _pad_rows(q, padded_rows, 0)
+            block_ids = _pad_rows(block_ids, padded_rows, -1)
+            request_indices = _pad_rows(request_indices, padded_rows, 0)
+            query_positions = _pad_rows(query_positions, padded_rows, 0)
         if is_decode:
             route_q = q.view(rows, 1, 1, num_qo_heads, head_dim)
             qo_indptr = None
@@ -276,7 +299,7 @@ class _PrimsTSSparseCore:
                 request_boundaries = _request_boundaries(request_indices)
             with self._lock:
                 qo_indptr = self._route_offsets(
-                    make_qo_indptr, request_boundaries, rows, q.device
+                    make_qo_indptr, request_boundaries, padded_rows, q.device
                 )
             group_size = _PREFILL_GROUP_SIZE
             num_routes = qo_indptr.numel() - 1
@@ -288,6 +311,7 @@ class _PrimsTSSparseCore:
             q.device.index,
             k_cache.data_ptr(),
             v_cache.data_ptr(),
+            padded_rows,
             num_routes,
             group_size,
             is_decode,
@@ -302,8 +326,11 @@ class _PrimsTSSparseCore:
             page_size,
             block_topk,
         )
-        if out is None:
-            out = torch.empty((rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device)
+        result = out
+        if out is None or padded_rows != rows:
+            out = torch.empty(
+                (padded_rows, num_qo_heads, head_dim), dtype=out_dtype, device=q.device
+            )
         with self._lock:
             wrapper = self._plans.get(key)
             if wrapper is None:
@@ -373,7 +400,11 @@ class _PrimsTSSparseCore:
                 raise RuntimeError(f"{error}; ABI changes vs first eager run: {changed}") from error
             if key not in self._last_abi:
                 self._last_abi[key] = _run_abi(run_args)
-        return out
+        if result is None:
+            return out[:rows]
+        if result is not out:
+            result.copy_(out[:rows])
+        return result
 
 
 _CORE = _PrimsTSSparseCore()
