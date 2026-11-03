@@ -5684,9 +5684,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             input: torch.Tensor, input_scale: torch.Tensor,
             weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
         """``fp8_block_scale_low_m_gemm`` on an MXFP8 activation quantized
-        upstream: E4M3 ``input [M, K]`` (``M`` in the low-M kernel's range)
-        and its UE8M0 1x32 ``input_scale`` in the R128c4 layout. Bitwise the
-        GEMM of the BF16 activation the operand quantizes."""
+        upstream: E4M3 ``input [M, K]`` and its UE8M0 1x32 ``input_scale`` in
+        the 128-row atom layout of the GEMM's quantization kernel (R128c4 up
+        to 128 rows). Bitwise the GEMM of the BF16 activation the operand
+        quantizes."""
         fp8_low_m.check_prequantized_inputs(input, input_scale, weight,
                                             weight_scale)
         output = torch.empty((input.shape[0], weight.shape[0]),

@@ -956,6 +956,11 @@ def _low_m_gemm_gated_applies(x: torch.Tensor, gate: torch.Tensor, out_features:
     return fp8_block_scale_low_m_gemm.gate_fits(x, gate, out_features)
 
 
+# Rows of one R128c4 scale atom: up to here the R128c4 MXFP8 scales of a producer are also the
+# layout of the low-M GEMM's mid-M kernel.
+_R128C4_ATOM_ROWS = 128
+
+
 def _low_m_gemm_push_applies(num_rows: int, out_features: int, in_features: int) -> bool:
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
 
@@ -1044,11 +1049,11 @@ class _Fp8BlockScaleWeightReadLinear(
 
     def takes_prequantized_input(self, num_rows: int) -> bool:
         """Whether a producer should hand :meth:`forward_prequantized` the MXFP8 form of
-        ``num_rows`` rows instead of the BF16 rows: where :meth:`forward` runs the low-M kernel,
-        so an operand quantized with its arithmetic
-        (``fp8_block_scale_low_m_gemm.mxfp8_quantize_reference``) projects bitwise like
-        :meth:`forward` and the kernel skips the quantization."""
-        return 1 <= num_rows <= self._low_m.kernel_max_m
+        ``num_rows`` rows instead of the BF16 rows: where :meth:`forward` runs the low-M GEMM on
+        at most one 128-row scale atom (whose layout is R128c4), so an operand quantized with its
+        arithmetic (``fp8_block_scale_low_m_gemm.mxfp8_quantize_reference``) projects bitwise
+        like :meth:`forward` and the GEMM skips the quantization."""
+        return 1 <= num_rows <= min(self._low_m.max_m, _R128C4_ATOM_ROWS)
 
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1307,7 +1312,7 @@ class _Fp8BlockScaleWeightReadLinear(
     ) -> torch.Tensor:
         """Project an FP8 activation a fused producer already quantized.
 
-        Runs the low-M kernel where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
+        Runs the low-M GEMM where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
         other row count where :attr:`supports_prequantized_input`.
 
         Args:

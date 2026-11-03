@@ -259,9 +259,9 @@ class KimiK3MLAAttention(MLA):
         )
 
     def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
-        """Generation-only batches whose fused q_a / kv_a projection runs the low-M kernel on
-        all ``num_rows`` rows: there the MXFP8 form of the rows (E4M3 and UE8M0 1x32 R128c4
-        scales, quantized with the low-M kernel's arithmetic) projects bitwise like the rows."""
+        """Generation-only batches whose fused q_a / kv_a projection takes the MXFP8 form of
+        all ``num_rows`` rows (E4M3 and UE8M0 1x32 R128c4 scales, quantized with the low-M
+        GEMM's arithmetic), which projects bitwise like the rows."""
         return (
             self._qkv_a_takes_prequantized
             and attn_metadata.num_contexts == 0

@@ -45,9 +45,12 @@ Mid-M path (``low_m_max_for(N, K) < M <= MAX_M``):
 
 Prequantized input (:func:`run_low_m_gemm_prequantized`): the mid-M path's GEMM kernel on an
 MXFP8 activation a producer quantized with the low-M kernel's arithmetic (E4M3 codes and UE8M0
-1x32 scales in the R128c4 layout, see :func:`mxfp8_quantize_reference`), with the weight block
-scale folded into the activation scales and the low-M kernel's tiling, split-K and reduction
-order, so the output is bitwise the low-M kernel's on the BF16 activation.
+1x32 scales in the 128-row atom layout ``[K/128][ceil(M/128)][512 B]`` of
+:class:`MxFp8QuantKernel`, which is the R128c4 layout up to 128 rows; see
+:func:`mxfp8_quantize_reference`). In the low-M range it folds the weight block scale into the
+activation scales and keeps the low-M kernel's tiling, split-K and reduction order; above it, it
+is the mid-M GEMM without its quantization kernel. Either way the output is bitwise
+:func:`run_low_m_gemm` on the BF16 activation.
 
 Low-M kernel variants for output-gated and gate projections, bitwise equal to the separate
 PyTorch ops followed / preceded by the plain kernel at the same tactic:
@@ -3595,19 +3598,27 @@ def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) 
     """The mid-M path into ``out`` (BF16), or with ``nvfp4 = (scales, global_sf)`` its NVFP4
     output (``out`` the codes)."""
     m, k = x.shape
-    n = w.shape[0]
     sf_blocks = _sf_blocks(tactic.mma_n)
     xq = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
     xs = torch.empty((k // CTA_K) * sf_blocks * 512, dtype=torch.uint8, device=x.device)
-    stream = _current_stream(x.device)
     _compiled_quant(k, sf_blocks, use_pdl)(
         _gmem_ptr(cutlass.BFloat16, x),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
         _gmem_ptr(cutlass.Uint8, xs),
         Int32(m),
-        stream,
+        _current_stream(x.device),
     )
-    gemm = _compiled_mid_kernel(n, k, tactic, use_pdl, nvfp4 is not None)
+    _run_mid_quantized(xq, xs, w, w_scale, out, tactic, use_pdl, nvfp4)
+
+
+def _run_mid_quantized(
+    xq, xs, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None
+) -> None:
+    """The mid-M GEMM on its MXFP8 operand ``(xq, xs)`` (scales in :class:`MxFp8QuantKernel`'s
+    layout with ``_sf_blocks(tactic.mma_n)`` blocks); outputs as for :func:`_run_mid`."""
+    m, n = xq.shape[0], w.shape[0]
+    stream = _current_stream(xq.device)
+    gemm = _compiled_mid_kernel(n, w.shape[1], tactic, use_pdl, nvfp4 is not None)
     operands = (
         _gmem_ptr(cutlass.Float8E4M3FN, w),
         _gmem_ptr(cutlass.Float8E4M3FN, xq),
@@ -3666,22 +3677,26 @@ def run_low_m_gemm_prequantized(
     use_pdl: bool = True,
 ) -> torch.Tensor:
     """Launch ``out = dequant(xq, xs) @ dequant(w, w_scale)^T`` on the current stream: bitwise
-    :func:`run_low_m_gemm` on the BF16 activation that ``(xq, xs)`` quantizes (the TMA-fed
-    kernel with ``fold_weight_scale``).
+    :func:`run_low_m_gemm` on the BF16 activation that ``(xq, xs)`` quantizes. In the low-M
+    range the TMA-fed kernel with ``fold_weight_scale``, above it the mid-M GEMM at
+    :func:`default_mid_tactic` without its quantization kernel.
 
     Args:
-        xq: ``[M, K]`` contiguous E4M3 activation, ``1 <= M <= low_m_max_for(N, K)``.
-        xs: its UE8M0 1x32 scales in the R128c4 layout (uint8, at least ``128 * K / 32``
-            bytes).
+        xq: ``[M, K]`` contiguous E4M3 activation, ``1 <= M <= MAX_M``.
+        xs: its UE8M0 1x32 scales in :class:`MxFp8QuantKernel`'s layout (uint8,
+            ``ceil(M / 128) * 128 * K / 32`` bytes; the R128c4 layout up to 128 rows).
         w, w_scale, out: as for :func:`run_low_m_gemm`.
-        tactic: kernel specialization (``mma_n`` in :data:`SUPPORTED_MMA_N`);
+        tactic: kernel specialization (low-M range: ``mma_n`` in :data:`SUPPORTED_MMA_N`);
             :func:`default_prequantized_tactic` if None.
         use_pdl: launch with programmatic dependent launch.
     """
     m, k = xq.shape
     n = w.shape[0]
-    if not 1 <= m <= low_m_max_for(n, k):
-        raise ValueError(f"the prequantized GEMM serves M <= {low_m_max_for(n, k)}, got {m}")
+    if not 1 <= m <= MAX_M:
+        raise ValueError(f"M={m} must be in [1, {MAX_M}]")
+    if m > low_m_max_for(n, k):
+        _run_mid_quantized(xq, xs, w, w_scale, out, default_mid_tactic(m, n, k), use_pdl)
+        return out
     if tactic is None:
         tactic = default_prequantized_tactic(m, n, k)
     if m > tactic.mma_n:
@@ -3997,8 +4012,9 @@ def check_prequantized_inputs(
     if xq.dtype != torch.float8_e4m3fn or xq.dim() != 2 or not xq.is_contiguous():
         raise ValueError("xq must be a contiguous 2D float8_e4m3fn tensor")
     m, k = xq.shape
-    if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < MMA_M * (k // SF_VEC):
-        raise ValueError(f"xs must be the contiguous uint8 R128c4 scale of {m} rows")
+    sf_bytes = _ceil_div(m, MMA_M) * MMA_M * (k // SF_VEC)
+    if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < sf_bytes:
+        raise ValueError(f"xs must be the contiguous uint8 128-row atom scale of {m} rows")
     if xq.data_ptr() % 16 or xs.data_ptr() % 4:
         raise ValueError("xq must be 16-byte and xs 4-byte aligned")
     _check_weight(w, w_scale, k)
