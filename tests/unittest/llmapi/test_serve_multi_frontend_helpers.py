@@ -37,6 +37,8 @@ from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
+from tensorrt_llm.serve.api.openai.tokenize import api_router as tokenize_router
+from tensorrt_llm.serve.api.openai.tokenize.serving import TokenizeServing
 from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
@@ -113,13 +115,19 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server._enable_runtime_control_endpoints = False
     server.resource_governor = None
     server._launcher_forwarder = forwarder
-    # The order OpenAIServer.__init__ registers them in: the system router
-    # (/health, /version, /v1/models) first, then the launcher forwarding
-    # routes, then the local table.
+    # The order OpenAIServer.__init__ registers them in: the launcher forwarding
+    # routes, then the local table, then the routers of the role (the system
+    # router with /health, /version and /v1/models, and the tokenize router),
+    # which read their serving objects from app.state.
     server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
-    attach_routers(server.app, ServerCapabilities.for_role(None))
+    setattr(
+        server.app.state,
+        tokenize_router.APP_STATE_KEY,
+        TokenizeServing(model="m", tokenizer=None),
+    )
     server._register_launcher_forwarding_routes()
     server.register_routes()
+    attach_routers(server.app, ServerCapabilities.for_role(None))
     return server
 
 
