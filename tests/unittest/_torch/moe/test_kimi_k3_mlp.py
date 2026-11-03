@@ -246,8 +246,12 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     class _FakeAllReduce(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, mapping=None, *args, **kwargs):
             super().__init__()
+            self.mapping = mapping
+
+        def mnnvl_runs_fusion(self, fusion_op):
+            return False
 
     class _FakeMoE(ConfigurableMoE):
         def __init__(self):
@@ -281,6 +285,8 @@ def test_kimi_k3_shared_expert_parallel_construction(
         tp_size=tp_size,
         enable_attention_dp=attention_dp,
     )
+    # The column-parallel tail reads the routed all-reduce's group at construction.
+    fake_moe.all_reduce.mapping = mapping
     model_config = ModelConfig(
         mapping=mapping,
         quant_config=QuantConfig(),
