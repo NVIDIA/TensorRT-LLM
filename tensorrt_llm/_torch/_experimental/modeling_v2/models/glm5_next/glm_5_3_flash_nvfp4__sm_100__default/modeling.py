@@ -57,6 +57,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceParams,
     AllReduceStrategy,
 )
+from tensorrt_llm._torch.distributed.ll_exchange import TPKeyExchange
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
@@ -158,6 +159,7 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.speculative.spec_tail_kernels.strict_accept",
     "tensorrt_llm._torch.speculative.vocab_parallel.VocabParallelHead",
     "tensorrt_llm._torch.speculative.vocab_parallel._PairExchange",
+    "tensorrt_llm._torch.distributed.ll_exchange.TPKeyExchange",
     # The A/B escape hatch's stock MTP-Eagle worker (TLLM_GLM5_NEXT_MTP_STOCK_WORKER=1).
     "tensorrt_llm._torch.speculative.utils.get_spec_worker",
     "tensorrt_llm._torch.distributed.ops.allgather",
@@ -2727,13 +2729,18 @@ def _check_speculation(spec_config: Any) -> None:
 
 
 class _NcclVocabParallelHead(VocabParallelHead):
-    """Vocab-parallel token selection whose (value, index) pair exchange is a plain NCCL all-reduce.
+    """Vocab-parallel token selection over the TP group's low-latency key exchange, else an NCCL pair exchange.
 
-    The pairs are a few floats per row, so the strategy's latency is what matters, not its bandwidth; NCCL is
-    deterministic in which path it takes on every rank, captures in CUDA graphs, and sums the zero-padded pair buffer
-    exactly. (AUTO may take an opportunistic fast path whose selection during warmup autotuning can differ across
-    ranks, which hangs the group.)
+    With peer memory (single-node TP) the greedy tokens come from ``TPKeyExchange.argmax_logits``: the shard's first
+    maximum packed into an orderable key and the group's maximum, in one launch on its own peer buffers. Otherwise, or
+    for more rows than the exchange takes, the (value, index) pairs are summed by an NCCL all-reduce: deterministic in
+    the path it takes on every rank (AUTO may choose differently per rank during warmup autotuning, which hangs the
+    group), graph-capturable, and exact on the zero-padded pair buffer. Both give ``torch.argmax``'s token over the
+    gathered vocabulary.
     """
+
+    #: Rows one key exchange takes: every verify row of a full batch, with room for packed context requests.
+    KEY_EXCHANGE_ROWS = 4096
 
     def __init__(self, lm_head: nn.Module) -> None:
         super().__init__(lm_head)
@@ -2743,6 +2750,16 @@ class _NcclVocabParallelHead(VocabParallelHead):
             mapping.tp_size,
             mapping.tp_rank,
         )
+        # Collective: every rank of the TP group builds its exchange here, at construction.
+        self._keys = TPKeyExchange.create(mapping, self.KEY_EXCHANGE_ROWS)
+
+    def argmax(self, local: torch.Tensor, out_dtype: torch.dtype = torch.int64) -> torch.Tensor:
+        keys = self._keys
+        rows = local.shape[0]
+        if keys is None or not 1 <= rows <= keys.MAX_ROWS:
+            return super().argmax(local, out_dtype)
+        tokens = keys.argmax_logits(local, self.col_base)
+        return tokens if out_dtype == torch.int32 else tokens.to(out_dtype)
 
 
 class Glm5NextDraftModel(nn.Module):
