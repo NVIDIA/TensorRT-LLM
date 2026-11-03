@@ -452,6 +452,14 @@ class KVCacheManager(BaseResourceManager):
         enable_chunked_prefill: bool = False,
         **kwargs,
     ) -> None:
+        logger.warning_once(
+            f"KV cache manager V1 ({type(self).__name__}) is deprecated as of "
+            "TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month "
+            "migration period; it keeps working until then. Use KV cache "
+            "manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, the "
+            "default). See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_kv_cache_manager_v1")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type

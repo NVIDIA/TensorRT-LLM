@@ -157,6 +157,10 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
+```{warning}
+The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
+```
+
 The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
 
 `kv_cache_bounce_size_mb` (default `0`) sets the size, in MiB, of the KV-cache bounce buffer; `0` turns it off. Without the buffer, each KV fragment is a separate descriptor in the NIXL write. With it, the sender gathers an eligible write's fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. This helps when a write consists of many small fragments, which is typical when context and generation split attention heads differently (for example, context TP != generation TP, or attention DP).
