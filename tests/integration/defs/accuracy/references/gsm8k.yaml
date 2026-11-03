@@ -616,3 +616,7 @@ zai-org/GLM-5.3-Flash:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 92.91
+  # RTX PRO 6000 TP4/EP4, NVFP4 checkpoint with FP8 KV cache, harness protocol.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 92.87
