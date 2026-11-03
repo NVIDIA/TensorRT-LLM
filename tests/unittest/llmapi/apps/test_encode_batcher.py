@@ -19,7 +19,7 @@ These tests exercise the pure-async coalescing logic with an injected, synchrono
 
 import pytest
 
-from tensorrt_llm.serve.encode_batcher import EncodeBatcher
+from tensorrt_llm.serve.api.openai.embeddings.batcher import EncodeBatcher
 
 pytestmark = pytest.mark.asyncio
 
@@ -125,7 +125,7 @@ async def test_submit_raises_queue_full_when_queue_is_full():
     """
     import asyncio
 
-    from tensorrt_llm.serve.encode_batcher import QueueFullError
+    from tensorrt_llm.serve.api.openai.embeddings.batcher import QueueFullError
 
     def encode_fn(batch):
         return [0] * len(batch)
@@ -279,7 +279,7 @@ async def test_submit_rejects_input_longer_than_max_seq_len():
     submit raises InputTooLongError (mapped to HTTP 400) before the input ever
     enters the queue.
     """
-    from tensorrt_llm.serve.encode_batcher import InputTooLongError
+    from tensorrt_llm.serve.api.openai.embeddings.batcher import InputTooLongError
 
     def encode_fn(batch):
         return [0] * len(batch)
@@ -309,7 +309,7 @@ async def test_submit_rejects_single_input_over_token_budget():
     than letting encode_fn reject the batch later. validate_input() exposes the
     same check for callers that want to pre-validate before enqueueing.
     """
-    from tensorrt_llm.serve.encode_batcher import InputTooLongError
+    from tensorrt_llm.serve.api.openai.embeddings.batcher import InputTooLongError
 
     def encode_fn(batch):
         return [0] * len(batch)

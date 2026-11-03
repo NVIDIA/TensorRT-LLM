@@ -15,7 +15,8 @@ from fastapi import FastAPI
 
 from tensorrt_llm.llmapi.llm import EncodeLimits
 from tensorrt_llm.serve import openai_server
-from tensorrt_llm.serve.openai_server import OpenAIServer, _record_generator_termination
+from tensorrt_llm.serve._base.serving import _record_generator_termination
+from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
 
