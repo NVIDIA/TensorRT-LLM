@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from wino_vae_test_utils import small_config
 
 from tensorrt_llm._torch.visual_gen.models.wan import wino_vae as wino_vae_module
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
@@ -14,22 +15,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
 )
 
 # Cosmos3-shaped (residual blocks, patch 2, 12 in/out channels) but tiny.
-SMALL_CONFIG = {
-    "base_dim": 16,
-    "decoder_base_dim": 24,
-    "z_dim": 8,
-    "dim_mult": [1, 2, 2, 2],
-    "num_res_blocks": 1,
-    "attn_scales": [],
-    "temperal_downsample": [False, True, True],
-    "dropout": 0.0,
-    "is_residual": True,
-    "in_channels": 12,
-    "out_channels": 12,
-    "patch_size": 2,
-    "scale_factor_temporal": 4,
-    "scale_factor_spatial": 16,
-}
+SMALL_CONFIG = small_config()
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="WinoVae runs on CUDA")
 

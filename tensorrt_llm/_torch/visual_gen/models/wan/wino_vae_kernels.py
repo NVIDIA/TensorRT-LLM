@@ -227,7 +227,7 @@ def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2, order: int = 2
 
 
 def winograd_spatial_taps_weights(weight: torch.Tensor, tile: int, taps: int) -> torch.Tensor:
-    """Filters for :func:`wino_spatial_conv_frames`: ``[Cout, Cin, 3, 3, 3]`` ->
+    """Filters for :func:`wino_spatial_conv_taps`: ``[Cout, Cin, 3, 3, 3]`` ->
     ``U [(tile+2)^2, taps * Cin, Cout]`` fp16. ``taps = 1`` keeps the current-frame tap
     (zero history: the first frame of a clip, every image); ``taps = 3`` stacks the taps
     for frames t-2, t-1, t along K, in that order, so one GEMM sums the causal 3x3x3 conv."""
@@ -238,29 +238,6 @@ def winograd_spatial_taps_weights(weight: torch.Tensor, tile: int, taps: int) ->
     return u.reshape((tile + 2) ** 2, taps * cin, cout).contiguous().to(torch.float16)
 
 
-def wino_spatial_conv_frames(
-    frames: torch.Tensor,
-    u: torch.Tensor,
-    height: int,
-    width: int,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """One output frame of a causal 3x3x3 conv (padding 1) by spatial Winograd alone:
-    ``frames [taps, H*W, Cin]`` bf16 (the taps' input frames, oldest first) with ``u`` from
-    :func:`winograd_spatial_taps_weights` -> ``[H*W, Cout]`` bf16, bias added by the output
-    transform. The taps are summed inside the GEMM (K = taps * Cin)."""
-    taps, _, cin = frames.shape
-    tile = spatial_tile_of(u, 1)
-    tile_rows = -(-height // tile)
-    from .kernels.spatial_winograd import wino_spatial_in, wino_spatial_out
-
-    v = wino_spatial_in(frames.view(taps, height, width, cin), 1, 0, tile_rows, tile, taps > 1)
-    m = torch.bmm(v, u)
-    out = torch.empty((1, height, width, u.shape[2]), dtype=frames.dtype, device=frames.device)
-    wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
-    return out.view(height * width, u.shape[2])
-
-
 def wino_spatial_conv_taps(
     taps: list[torch.Tensor],
     zero_front: int,
@@ -269,10 +246,12 @@ def wino_spatial_conv_taps(
     width: int,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """:func:`wino_spatial_conv_frames` with the taps' input frames in separate buffers:
-    ``zero_front`` zero frames, then the frames of each tensor in ``taps`` (``[n, H*W, C]``
-    bf16, oldest first; the causal history and the new frame, no concatenation). ``u`` from
-    :func:`winograd_spatial_taps_weights`; one batched GEMM and the output transform kernel."""
+    """One output frame of a causal 3x3x3 conv (padding 1) by spatial Winograd alone, from
+    input frames in separate buffers: ``zero_front`` zero frames, then the frames of each
+    tensor in ``taps`` (``[n, H*W, Cin]`` bf16, oldest first; the causal history and the new
+    frame, no concatenation). ``u`` from :func:`winograd_spatial_taps_weights`; the frames are
+    stacked along the GEMM's K axis, so one batched GEMM sums the conv. Returns ``[H*W, Cout]``
+    bf16, the bias added by the output transform."""
     tile = spatial_tile_of(u, 1)
     tile_rows = -(-height // tile)
     cout = u.shape[2]

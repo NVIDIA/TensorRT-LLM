@@ -19,7 +19,6 @@ from typing import Callable
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_wino_vae import shard_extents
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
@@ -30,6 +29,14 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
 )
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
 
+from ._worker_pool import run_distributed
+
+# wino_vae_test_utils is in tests/unittest/_torch/visual_gen (spawned workers inherit pytest's
+# sys.path entry for it).
+__extra_import_path__ = [".."]
+
+from wino_vae_test_utils import small_config  # noqa: E402
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
@@ -37,24 +44,7 @@ def _cleanup_mpi_env():
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
-# Cosmos3-shaped (residual blocks, patch 2, 12 in/out channels) but tiny; the same config
-# as test_wino_vae.py.
-SMALL_CONFIG = {
-    "base_dim": 16,
-    "decoder_base_dim": 24,
-    "z_dim": 8,
-    "dim_mult": [1, 2, 2, 2],
-    "num_res_blocks": 1,
-    "attn_scales": [],
-    "temperal_downsample": [False, True, True],
-    "dropout": 0.0,
-    "is_residual": True,
-    "in_channels": 12,
-    "out_channels": 12,
-    "patch_size": 2,
-    "scale_factor_temporal": 4,
-    "scale_factor_spatial": 16,
-}
+SMALL_CONFIG = small_config()
 
 # "direct" halo exchange is demanded, not left to "auto": a rendezvous failure must fail the
 # test rather than silently run the NCCL path. ``spatial``: spatial Winograd forced onto every
@@ -67,39 +57,13 @@ OPTION_SETS = {
 }
 
 
-def _init_worker(rank: int, world_size: int, port: int):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-
-def _distributed_worker(rank, world_size, test_fn, port, args):
-    try:
-        _init_worker(rank, world_size, port)
-        test_fn(rank, world_size, *args)
-    except Exception as e:
-        print(f"Rank {rank} failed: {e}")
-        raise
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
 def _run(world_size: int, test_fn: Callable, *args):
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, test_fn, port, args),
-            nprocs=world_size,
-            join=True,
-        )
+    # Fresh ranks per test: the direct halo exchange holds symmetric-memory handles for the
+    # life of the process, and _model patches the conv selection in the worker.
+    run_distributed(
+        world_size, test_fn, *args, dist_backend="nccl", reuse=False, preload=("tensorrt_llm",)
     )
 
 

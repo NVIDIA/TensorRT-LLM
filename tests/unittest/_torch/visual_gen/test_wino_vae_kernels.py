@@ -921,9 +921,9 @@ def test_spatial_winograd_frames_matches_conv3d(
     cin_cout: tuple[int, int], hw: tuple[int, int], tile: int, taps: int, with_bias: bool
 ) -> None:
     """One output frame of a causal 3x3x3 conv by spatial Winograd alone: the current frame
-    (zero history) or the three tap frames summed inside the GEMM."""
+    (zero history) or the three input frames summed inside the GEMM, all in one buffer."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        wino_spatial_conv_frames,
+        wino_spatial_conv_taps,
         winograd_spatial_taps_weights,
     )
 
@@ -935,7 +935,7 @@ def test_spatial_winograd_frames_matches_conv3d(
     frames = torch.randn(taps, h * w, cin, device="cuda").to(torch.bfloat16)
     u = winograd_spatial_taps_weights(weight, tile, taps)
     assert u.shape == ((tile + 2) ** 2, taps * cin, cout)
-    got = wino_spatial_conv_frames(frames, u, h, w, bias)
+    got = wino_spatial_conv_taps([frames], 0, u, h, w, bias)
     x = frames.view(taps, h, w, cin).permute(3, 0, 1, 2).unsqueeze(0).float()
     x = F.pad(x, (0, 0, 0, 0, 3 - taps, 0))  # zero history before the first frame
     ref = F.conv3d(x, weight.float(), bias.float() if with_bias else None, 1, (0, 1, 1))
