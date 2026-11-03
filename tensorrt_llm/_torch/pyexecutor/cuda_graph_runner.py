@@ -18,11 +18,6 @@ from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention.backends.fmha.registry import is_fmha_lib_enabled
-from ..attention.backends.fmha.sampling_shared_prefix import \
-    LIB_NAME as SAMPLING_SHARED_PREFIX_LIB
-from ..attention.backends.fmha.sampling_shared_prefix import \
-    resolve_graph_variant
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
 from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
@@ -166,11 +161,6 @@ class KeyType(NamedTuple):
     # when the runner keys its decode graphs by it: True launches the KV split
     # budget, False one task per request. ``None`` keeps one family.
     packed_split: Optional[bool] = None
-    # 1 when the batch is captured with the n-sample shared-prefix attention
-    # library, 0 for the regular kernel. A graph records one kernel sequence, so
-    # the library's size gate must be part of the key. Always 0 unless the
-    # library is enabled (see CUDAGraphRunner.attn_variants).
-    attn_variant: int = 0
 
 
 def _largest_kv_regime(regimes) -> Optional[int]:
@@ -357,11 +347,6 @@ class CUDAGraphRunner:
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
             [ScheduledRequests, Optional[SampleType]], SampleType]] = None
-        # Shared-prefix library graph variants (see KeyType.attn_variant).
-        self.attn_variants_enabled = (
-            self.max_beam_width == 1
-            and is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB))
-        self._capture_attn_variant: Optional[int] = None
         # Called just before each replay, after the static input buffers are
         # filled. For state a model computes inside its own forward and a graph
         # therefore captures the address of: a replay runs no Python, so nothing
@@ -742,23 +727,7 @@ class CUDAGraphRunner:
                        temperature_only=temperature_only,
                        ragged_verify_bucket=self._ragged_verify_bucket(batch),
                        kv_regime=kv_regime,
-                       packed_split=packed_split,
-                       attn_variant=self._resolve_attn_variant(batch))
-
-    def attn_variants(self) -> Tuple[int, ...]:
-        """Graph variants to capture per batch shape."""
-        return (1, 0) if self.attn_variants_enabled else (0, )
-
-    def set_capture_attn_variant(self, variant: Optional[int]) -> None:
-        """Pin the variant captured by the current pass; None restores runtime resolution."""
-        self._capture_attn_variant = variant
-
-    def _resolve_attn_variant(self, batch: ScheduledRequests) -> int:
-        if not self.attn_variants_enabled:
-            return 0
-        if self._capture_attn_variant is not None:
-            return self._capture_attn_variant
-        return resolve_graph_variant(batch)
+                       packed_split=packed_split)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
@@ -1174,8 +1143,6 @@ class CUDAGraphRunner:
             )
             graph_attn_metadata.num_contexts = key.num_contexts
         assert graph_attn_metadata.is_cuda_graph
-        if self.attn_variants_enabled:
-            graph_attn_metadata.shared_prefix_graph = bool(key.attn_variant)
 
         if enable_spec_decode:
             graph_spec_metadata = spec_metadata.create_cuda_graph_metadata(
