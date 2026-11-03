@@ -33,24 +33,24 @@ the weight's N rows are the UMMA M side):
 
 Mid-M path (``low_m_max_for(N, K) < M <= MAX_M``):
 
-* A small kernel quantizes the activation to MXFP8 (FP8 codes + 1x32 UE8M0 scales already
-  in the UMMA scale-factor layout). The GEMM is chained to it with PDL: its weight TMA warp
-  starts streaming before the quantization finishes and only the activation producer waits.
+* A small kernel quantizes the activation to MXFP8 (FP8 codes + 1x32 UE8M0 scales in the
+  R128c4 layout of 512-byte UMMA scale-factor atoms). The GEMM is chained to it with PDL: its
+  weight TMA warp starts streaming before the quantization finishes and only the activation
+  producer waits.
 * The GEMM uses the same swap-AB split-K cluster structure with UMMA N padded to a multiple
-  of 32 tokens. The activation tile arrives by TMA (FP8) plus one bulk copy of its scales;
-  the weight block exponent goes into the A scale operand, refreshed once per K tile.
+  of 32 tokens. The activation tile arrives by TMA (FP8) plus one bulk copy of its scale atom
+  per 128 tokens; the weight block exponent goes into the A scale operand, refreshed once per
+  K tile.
 * The epilogue double-buffers 32-column TMEM loads, reduce-scatters partials with
   ``st.async`` into the owner's DSMEM mailbox, and writes BF16 rows through a token-major
   shared staging buffer with 16-byte stores.
 
 Prequantized input (:func:`run_low_m_gemm_prequantized`): the mid-M path's GEMM kernel on an
 MXFP8 activation a producer quantized with the low-M kernel's arithmetic (E4M3 codes and UE8M0
-1x32 scales in the 128-row atom layout ``[K/128][ceil(M/128)][512 B]`` of
-:class:`MxFp8QuantKernel`, which is the R128c4 layout up to 128 rows; see
-:func:`mxfp8_quantize_reference`). In the low-M range it folds the weight block scale into the
-activation scales and keeps the low-M kernel's tiling, split-K and reduction order; above it, it
-is the mid-M GEMM without its quantization kernel. Either way the output is bitwise
-:func:`run_low_m_gemm` on the BF16 activation.
+1x32 scales in the R128c4 layout, see :func:`mxfp8_quantize_reference`). In the low-M range it
+folds the weight block scale into the activation scales and keeps the low-M kernel's tiling,
+split-K and reduction order; above it, it is the mid-M GEMM without its quantization kernel.
+Either way the output is bitwise :func:`run_low_m_gemm` on the BF16 activation.
 
 Low-M kernel variants for output-gated and gate projections, bitwise equal to the separate
 PyTorch ops followed / preceded by the plain kernel at the same tactic:
@@ -2123,10 +2123,10 @@ class MxFp8QuantKernel:
     kernel's in-kernel path; each thread issues the loads of its ``_ITEMS`` items before
     converting any. CTAs are small so they fit next to a resident GEMM CTA (which
     launches early via PDL and streams its weights meanwhile).
-    Scales are written in the tcgen05 scale-factor atom layout ``[K/128][sf_blocks][512 B]``
-    with atom byte ``(r % 32) * 16 + (r // 32) * 4 + k32 % 4``, so the GEMM moves one
-    contiguous ``sf_blocks * 512`` byte block per K tile. Rows past ``M`` (up to
-    ``128 * sf_blocks``) get the neutral scale 1.0.
+    Scales are written in the R128c4 layout ``[sf_blocks][K/128][512 B]`` of tcgen05
+    scale-factor atoms, atom byte ``(r % 32) * 16 + (r % 128 // 32) * 4 + k32 % 4``; the GEMM
+    moves one atom per 128 rows and K tile. Rows past ``M`` (up to ``128 * sf_blocks``) get the
+    neutral scale 1.0.
     """
 
     _THREADS = 128
@@ -2188,7 +2188,7 @@ class MxFp8QuantKernel:
                 r = item // self.groups
                 g = item - r * self.groups
                 rr = r & (MMA_M - 1)
-                sf_off = ((g >> 2) * self.sf_blocks + (r >> 7)) * 512
+                sf_off = ((r >> 7) * (self.groups >> 2) + (g >> 2)) * 512
                 sf_off = sf_off + (rr & 31) * 16 + (rr >> 5) * 4 + (g & 3)
                 sf_addr = xs_ptr.toint() + Int64(sf_off)
                 if r < m:
@@ -2612,12 +2612,14 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             b_full + stage, self.b_stage_bytes + self.sfb_stage_bytes
                         )
-                        _bulk_load_g2s(
-                            sfb_base + stage * self.sfb_stage_bytes,
-                            xs_ptr.toint() + Int64((kt_start + kt) * self.sfb_stage_bytes),
-                            self.sfb_stage_bytes,
-                            (b_full + stage).toint(),
-                        )
+                        # One R128c4 atom per 128 tokens.
+                        for blk in cutlass.range_constexpr(self.sf_blocks):
+                            _bulk_load_g2s(
+                                sfb_base + stage * self.sfb_stage_bytes + blk * 512,
+                                xs_ptr.toint() + Int64((blk * self.kt_total + kt_start + kt) * 512),
+                                512,
+                                (b_full + stage).toint(),
+                            )
                 cute.copy(
                     tma_atom_b,
                     tBgB[(None, 0, kt_start + kt, 0)],
@@ -3685,8 +3687,8 @@ def _quantize_mid_operand(x, tactic: MidMTactic, use_pdl: bool):
 def _run_mid_quantized(
     xq, xs, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None
 ) -> None:
-    """The mid-M GEMM on its MXFP8 operand ``(xq, xs)`` (scales in :class:`MxFp8QuantKernel`'s
-    layout with ``_sf_blocks(tactic.mma_n)`` blocks); outputs as for :func:`_run_mid`."""
+    """The mid-M GEMM on its MXFP8 operand ``(xq, xs)`` (R128c4 scales of at least
+    ``_sf_blocks(tactic.mma_n)`` 128-row blocks); outputs as for :func:`_run_mid`."""
     m, n = xq.shape[0], w.shape[0]
     stream = _current_stream(xq.device)
     gemm = _compiled_mid_kernel(n, w.shape[1], tactic, use_pdl, nvfp4 is not None)
@@ -3754,8 +3756,8 @@ def run_low_m_gemm_prequantized(
 
     Args:
         xq: ``[M, K]`` contiguous E4M3 activation, ``1 <= M <= MAX_M``.
-        xs: its UE8M0 1x32 scales in :class:`MxFp8QuantKernel`'s layout (uint8,
-            ``ceil(M / 128) * 128 * K / 32`` bytes; the R128c4 layout up to 128 rows).
+        xs: its UE8M0 1x32 scales in the R128c4 layout (uint8, ``ceil(M / 128) * 128 * K / 32``
+            bytes).
         w, w_scale, out: as for :func:`run_low_m_gemm`.
         tactic: kernel specialization (low-M range: ``mma_n`` in :data:`SUPPORTED_MMA_N`);
             :func:`default_prequantized_tactic` if None.
@@ -4126,7 +4128,7 @@ def check_prequantized_inputs(
     m, k = xq.shape
     sf_bytes = _ceil_div(m, MMA_M) * MMA_M * (k // SF_VEC)
     if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < sf_bytes:
-        raise ValueError(f"xs must be the contiguous uint8 128-row atom scale of {m} rows")
+        raise ValueError(f"xs must be the contiguous uint8 R128c4 scale of {m} rows")
     if xq.data_ptr() % 16 or xs.data_ptr() % 4:
         raise ValueError("xq must be 16-byte and xs 4-byte aligned")
     _check_weight(w, w_scale, k)

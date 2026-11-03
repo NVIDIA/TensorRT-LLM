@@ -500,7 +500,7 @@ def _decode_attn_res_on_device(device_index: int) -> bool:
 
 def _attn_res_decode_max_tokens(hidden: int, num_candidates: int, device_index: int) -> int:
     """Largest token count of a BF16 ``[M, hidden]`` mix over ``num_candidates`` on the device
-    that the decode kernel serves (``kimi_k3_attn_res.supports``: from 1 up to 128 tokens);
+    that the decode kernel serves (``kimi_k3_attn_res.supports``: from 1 up to 192 tokens);
     0 where it serves none. ``_attn_res_kernel`` picks the decode kernel exactly there."""
     if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
         return 0
@@ -956,11 +956,6 @@ def _low_m_gemm_gated_applies(x: torch.Tensor, gate: torch.Tensor, out_features:
     return fp8_block_scale_low_m_gemm.gate_fits(x, gate, out_features)
 
 
-# Rows of one R128c4 scale atom: up to here the R128c4 MXFP8 scales of a producer are also the
-# layout of the low-M GEMM's mid-M kernel.
-_R128C4_ATOM_ROWS = 128
-
-
 def _low_m_gemm_push_applies(num_rows: int, out_features: int, in_features: int) -> bool:
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm
 
@@ -1049,11 +1044,11 @@ class _Fp8BlockScaleWeightReadLinear(
 
     def takes_prequantized_input(self, num_rows: int) -> bool:
         """Whether a producer should hand :meth:`forward_prequantized` the MXFP8 form of
-        ``num_rows`` rows instead of the BF16 rows: where :meth:`forward` runs the low-M GEMM on
-        at most one 128-row scale atom (whose layout is R128c4), so an operand quantized with its
-        arithmetic (``fp8_block_scale_low_m_gemm.mxfp8_quantize_reference``) projects bitwise
-        like :meth:`forward` and the GEMM skips the quantization."""
-        return 1 <= num_rows <= min(self._low_m.max_m, _R128C4_ATOM_ROWS)
+        ``num_rows`` rows instead of the BF16 rows: where :meth:`forward` runs the low-M GEMM, so
+        an operand quantized with its arithmetic
+        (``fp8_block_scale_low_m_gemm.mxfp8_quantize_reference``) projects bitwise like
+        :meth:`forward` and the GEMM skips the quantization."""
+        return 1 <= num_rows <= self._low_m.max_m
 
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

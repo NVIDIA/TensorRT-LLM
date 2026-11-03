@@ -867,39 +867,19 @@ def _mxfp8_operand(x):
     return xq, xs
 
 
-def _mxfp8_atom_operand(x):
-    """``(xq, xs)`` of ``x`` with the scales in the mid-M quantization kernel's 128-row atom
-    layout ``[K / 128][ceil(M / 128)][512 B]``."""
-    mod = _kernel_module()
-    m, k = x.shape
-    blocks = -(-m // 128)
-    xq, xs_rows = mod.mxfp8_quantize_reference(x)
-    xs = torch.full((blocks * 128 * (k // 32),), 0x7F, dtype=torch.uint8, device="cuda")
-    r = torch.arange(m, device="cuda").unsqueeze(1)
-    c = torch.arange(k // 32, device="cuda").unsqueeze(0)
-    offsets = ((c // 4) * blocks + r // 128) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
-    xs[offsets] = xs_rows
-    return xq, xs
-
-
-@pytest.mark.parametrize("m", [1, 65, 128])
-def test_r128c4_is_the_atom_layout_up_to_128_rows(m):
-    x = _make_activation(m, 768, seed=m)
-    assert torch.equal(_mxfp8_operand(x)[1], _mxfp8_atom_operand(x)[1])
-
-
 @pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168), (6144, 7168)])
-@pytest.mark.parametrize("m", [65, 96, 128, 129, 160, 200])
+@pytest.mark.parametrize("m", [65, 96, 128, 129, 160, 200, 256])
 def test_prequantized_mid_m_matches_bf16_gemm(m, n, k):
     """Above the low-M kernel's range the prequantized GEMM is the mid-M GEMM without its
-    quantization kernel: bitwise the GEMM of the BF16 rows."""
+    quantization kernel (R128c4 scales, also across two 128-row blocks): bitwise the GEMM of
+    the BF16 rows."""
     mod = _kernel_module()
     if m <= mod.low_m_max_for(n, k):
         pytest.skip("in the low-M kernel's range")
     w_pad, scale = _make_weight(n, k, seed=n + k)
     w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
     x = _make_activation(m, k, seed=m)
-    xq, xs = _mxfp8_atom_operand(x)
+    xq, xs = _mxfp8_operand(x)
     out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
     ref = _run(x, w, packed)
     torch.cuda.synchronize()
@@ -963,16 +943,15 @@ def test_prequantized_cuda_graph(m):
 
 
 @pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168)])
-@pytest.mark.parametrize("m", [1, 7, 32, 64, 65, 96, 128, 129])
+@pytest.mark.parametrize("m", [1, 7, 32, 64, 65, 96, 128, 129, 192])
 def test_weight_read_linear_forward_prequantized(m, n, k):
     """``forward_prequantized`` on the MXFP8 form of the rows (R128c4 scales) is bitwise
-    ``forward`` where ``takes_prequantized_input``: wherever forward runs the low-M GEMM, up to
-    one 128-row scale atom."""
+    ``forward`` where ``takes_prequantized_input``: wherever forward runs the low-M GEMM."""
     linear = _bf16_weight_read_linear(n, k)
     x = _make_activation(m, k, seed=m)
     takes = linear.takes_prequantized_input(m)
     mod = _kernel_module()
-    assert takes == (m <= min(mod.max_m_for(n, k), 128))
+    assert takes == (m <= mod.max_m_for(n, k))
     if not takes:
         return
     out = linear.forward_prequantized(*_mxfp8_operand(x))

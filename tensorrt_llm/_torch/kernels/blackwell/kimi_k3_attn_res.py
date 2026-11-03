@@ -71,7 +71,7 @@ from . import mnnvl_pushed_allreduce as pushed_ar
 #: Candidate counts (snapshots + the layer row) the kernel is instantiated for.
 MIN_CANDIDATES, MAX_CANDIDATES = 2, 12
 #: Largest token count the kernel serves.
-MAX_TOKENS = 128
+MAX_TOKENS = 192
 #: CTAs per token (:func:`cluster_size`).
 CLUSTER_SIZES = (4, 8)
 #: Inputs of the layer row: the row itself; ``bf16(prefix + addend)`` (the C++ fused add);

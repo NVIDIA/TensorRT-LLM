@@ -155,7 +155,8 @@ class Fp8BlockScaleLowMGemmRange:
     #: Forward runs the GEMM on ``1 <= M <= max_m`` BF16 rows.
     max_m: int = 0
     #: Its low-M kernel (and the variants that match it bitwise: gated,
-    #: sigmoid, prequantized input) serves ``1 <= M <= kernel_max_m``.
+    #: sigmoid) serves ``1 <= M <= kernel_max_m``; its prequantized-input
+    #: variant serves the whole ``max_m`` range.
     kernel_max_m: int = 0
 
     @classmethod
