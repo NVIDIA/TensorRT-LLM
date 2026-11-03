@@ -38,16 +38,10 @@ Shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
-
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 LAT = 576  # 512 latent + 64 rope, one pool row in e4m3 bytes
 _VEC = 8  # elements per thread chunk
@@ -118,9 +112,7 @@ def glm52_self_attn_prefill_mha_kv_prefix_gather_kernel(
         dst = idx[w]
         tok = idx[cached + w]
         pos = idx[cached * 2 + w]
-        block = cutlass.Int64(
-            block_table[cutlass.Int64(req_idx[tok]), pos // tokens_per_block]
-        )
+        block = cutlass.Int64(block_table[cutlass.Int64(req_idx[tok]), pos // tokens_per_block])
         src = block * stride_factor + pos % tokens_per_block + layer_offset
         values = _load_e4m3x8_as_bf16(pool.iterator, src * LAT + col)
         _store_bf16x8(lat.iterator, dst * lat_row_stride + col, values)
@@ -128,9 +120,7 @@ def glm52_self_attn_prefill_mha_kv_prefix_gather_kernel(
         t = work - num_cached
         if t < num_new:
             dst = idx[cutlass.Int64(num_cached) * 3 + cutlass.Int64(t)]
-            values = _load_bf16x8(
-                latent_new.iterator, cutlass.Int64(t) * new_row_stride + col
-            )
+            values = _load_bf16x8(latent_new.iterator, cutlass.Int64(t) * new_row_stride + col)
             _store_bf16x8(lat.iterator, dst * lat_row_stride + col, values)
 
 
@@ -195,12 +185,8 @@ def compile_gather(device_index: int = 0) -> CompiledKernel:
                 stride_order=(1, 0),
                 assumed_align=8,
             ),
-            make_fake_compact_tensor(
-                cutlass.Int64, (cute.sym_int32(),), assumed_align=8
-            ),
-            make_fake_compact_tensor(
-                cutlass.Int32, (cute.sym_int32(),), assumed_align=4
-            ),
+            make_fake_compact_tensor(cutlass.Int64, (cute.sym_int32(),), assumed_align=8),
+            make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=4),
             make_fake_tensor(
                 cutlass.Int32,
                 (cute.sym_int32(), cute.sym_int32()),
@@ -269,15 +255,11 @@ def gather(
         or not pool_rows.is_contiguous()
         or not (idx.is_cuda and idx.dtype == torch.int64 and idx.is_contiguous())
         or idx.numel() != 3 * num_cached + num_new
-        or not (
-            req_idx.is_cuda and req_idx.dtype == torch.int32 and req_idx.is_contiguous()
-        )
+        or not (req_idx.is_cuda and req_idx.dtype == torch.int32 and req_idx.is_contiguous())
         or not (block_table.is_cuda and block_table.dtype == torch.int32)
         or block_table.ndim != 2
         or block_table.stride(1) != 1
-        or any(
-            t.device != dev for t in (pool_rows, idx, req_idx, block_table, latent_new)
-        )
+        or any(t.device != dev for t in (pool_rows, idx, req_idx, block_table, latent_new))
         or num_cached < 0
         or num_cached + num_new == 0
         or tokens_per_block <= 0
@@ -323,9 +305,7 @@ def reference(
     src = block_table[req_idx[tok_c].to(torch.int64), pos_c // tokens_per_block].to(
         torch.int64
     ) * stride_factor + (pos_c % tokens_per_block)
-    rows = pool_rows.narrow(
-        0, layer_offset, pool_rows.shape[0] - layer_offset
-    ).index_select(0, src)
+    rows = pool_rows.narrow(0, layer_offset, pool_rows.shape[0] - layer_offset).index_select(0, src)
     lat[dst_c] = rows.view(torch.float8_e4m3fn).to(torch.bfloat16)
     lat[dst_n] = latent_new
     return lat

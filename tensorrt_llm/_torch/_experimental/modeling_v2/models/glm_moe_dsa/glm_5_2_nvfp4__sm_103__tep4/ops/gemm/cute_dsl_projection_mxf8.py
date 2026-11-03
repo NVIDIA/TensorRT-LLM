@@ -24,6 +24,8 @@ ENTRIES: dict[str, str] = {
     # `[cached | new]` latent rows `cute_dsl_mha_kv_gather_mxf8` writes), e4m3 out.
     "kv_b_k8": "kv_b_expand_k_mxf8",
     "kv_b_v8": "kv_b_expand_v512_mxf8",
+    # Both in one launch: `[K | V]` out of the K operand, the V tiles on its first 512 columns.
+    "kv_b_kv8": "kv_b_expand_kv_mxf8",
     # The dense MLP (layers 0-2): gate|up (gate rows first) and down, this rank's 3072-wide
     # slice of the intermediate.
     "dense_gate_up": "dense_gate_up_mxf8",
@@ -98,12 +100,19 @@ class CuteDslProjectionMxf8(OpWrapper):
         q_b_e4m3  [M, 2048] x [4096, 2048]   e4m3 out (nearest, saturating)
         kv_b_k8   [M,  576] x [4096,  576]   A pre-quantized, e4m3 out
         kv_b_v8   [M,  512] x [4096,  512]   A pre-quantized, e4m3 out
+        kv_b_kv8  [M,  576] x [8192,  576]   A pre-quantized, e4m3 out, rows >= 4096 on K < 512
         dense_gate_up  [M, 6144] x [6144, 6144]
         dense_down     [M, 3072] x [6144, 3072]
         mtp_eh         [M, 12288] x [6144, 12288]
 
     The pre-quantized entries take `x` as contiguous uint8 e4m3 bytes and `sfa` its blocked
     e8m0 scales (K padded to 128 for the layout; None means every block at 2^0).
+
+    `kv_b_kv8` is `kv_b_k8` and `kv_b_v8` in one launch: its weight is the K weight stacked
+    over the V weight zero-padded to 576 columns (`quantize_weight` of that `[8192, 576]`
+    matrix), and the output rows hold K then V. Its V tiles issue only the k-blocks below 512,
+    so with `x` / `sfa` the gather's `a_k` / `sfa_k` the output is the two launches' outputs
+    (on `a_v` / `sfa_v`, the same bytes) side by side, bitwise.
 
     Relative error against the bf16 product is e4m3's (about 2^-4 per operand element,
     1e-2 .. 3e-2 relative RMS of a real layer's output); against the same MXF8 operands
@@ -167,6 +176,14 @@ class CuteDslProjectionMxf8(OpWrapper):
         Cell(
             why="kv_b_v8 at 1025 rows with block scales, the large tile's first count",
             spec=dict(kernel="kv_b_v8", rows=1025, sfa=True),
+        ),
+        Cell(
+            why="kv_b_kv8 at 1024 rows: K and V in one launch on the small tile",
+            spec=dict(kernel="kv_b_kv8", rows=1024, sfa=True),
+        ),
+        Cell(
+            why="kv_b_kv8 at 7300 rows with block scales: the large tile, V tiles on K < 512",
+            spec=dict(kernel="kv_b_kv8", rows=7300, sfa=True),
         ),
         Cell(
             why="dense_gate_up at 65 rows through its own activation quant",
@@ -237,11 +254,12 @@ class CuteDslProjectionMxf8(OpWrapper):
         torch twin, or `pre` / the pre-quantized `x` and `sfa` as given; `weight`
         dequantized), rounded once to `out`'s dtype (e4m3 saturating), as a new tensor; `out`
         is not written."""
+        split = _kernel.ABIS[ENTRIES[runner.kernel]].n_split_k
         if pre is not None:
             xq, sf = pre
-            res = _kernel.emulate(xq, weight, runner.k, sfa=sf)
+            res = _kernel.emulate(xq, weight, runner.k, sfa=sf, n_split_k=split)
         else:
-            res = _kernel.emulate(x, weight, runner.k, sfa=sfa)
+            res = _kernel.emulate(x, weight, runner.k, sfa=sfa, n_split_k=split)
         if out.dtype == torch.float8_e4m3fn:
             res = res.clamp(-448.0, 448.0)
         return res.to(out.dtype)
@@ -292,6 +310,12 @@ class CuteDslProjectionMxf8(OpWrapper):
             f"weight must be the MXF8 [N, K] = [{runner.n}, {runner.k}], "
             f"got {tuple(weight.q.shape)}"
         )
+        split = _kernel.ABIS[ENTRIES[runner.kernel]].n_split_k
+        if split is not None:
+            # The split tiles never read these weight bytes: the contract is that they are zero.
+            assert not bool(weight.q[split[0] :, split[1] :].any()), (
+                f"{runner.kernel}: weight rows >= {split[0]} must be zero at columns >= {split[1]}"
+            )
         assert out.dtype == runner.out_dtype, f"{runner.kernel} writes {runner.out_dtype}"
         assert tuple(out.shape) == (rows, runner.n) and out.is_contiguous(), (
             f"out must be a contiguous [{rows}, {runner.n}], got {tuple(out.shape)}"

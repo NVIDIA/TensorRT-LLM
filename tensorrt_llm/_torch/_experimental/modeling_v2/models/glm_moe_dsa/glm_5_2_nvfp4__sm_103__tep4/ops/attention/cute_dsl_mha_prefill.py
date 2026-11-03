@@ -29,9 +29,12 @@ fp8_head_scales = _kernel.fp8_head_scales
 #: MXF8-O handle an epilogue that holds a whole O chunk in registers, hands it back to the MMA,
 #: then rounds and block-scales it with packed converts; and tail-first Q tiling, each
 #: request's partial 256-row tile pair first (its causal kv loop the shortest, the others' up
-#: to the shift shorter). Same output bytes as without them.
+#: to the shift shorter); on the MXF8-O handle only (the bf16-O launcher refuses it), the
+#: epilogue offloaded to four added warps that block-scale and store O while the correction
+#: warps serve the next tile (-0.4 .. -0.55 ms per context step on B300). Same output bytes
+#: as without them.
 _FP8_VARIANT = {"cvt4": True, "tail_first": True}
-_Q8_VARIANT = {"cvt4": True, "epi_fast": True, "tail_first": True}
+_Q8_VARIANT = {"cvt4": True, "epi_fast": True, "tail_first": True, "epi_offload": True}
 
 
 def sf_bytes(rows: int) -> int:
@@ -39,12 +42,22 @@ def sf_bytes(rows: int) -> int:
     return _kernel._mxf8.sf_bytes(rows, NUM_HEADS * HEAD_DIM)
 
 
-def compile(device_index: int, fp8: bool = False, q8: bool = False) -> CompiledMhaPrefill:  # noqa: A001
+def compile(  # noqa: A001
+    device_index: int,
+    fp8: bool = False,
+    q8: bool = False,
+    epi_offload: bool = True,
+    kv_strided: bool = False,
+) -> CompiledMhaPrefill:
     """Compile the kernel for `device_index` and return the handle the op takes as
     `compiled`. Call once at load. `fp8=True` builds the e4m3 variant: q / k / v e4m3,
     out bf16, and a `head_scales` table (`fp8_head_scales`) on every call. `q8=True` (fp8
     only) builds the variant whose epilogue writes O as the o_proj GEMM's MXF8 operand
     (`q8_out`) instead of `out`: o_proj is the only reader of the context rows' attention.
+    `epi_offload=False` builds that variant without the offloaded epilogue (same bytes).
+    `kv_strided=True` builds the handle that reads `k` / `v` at their own token-row strides
+    (the two halves of the one-launch K | V expansion's `[T_k, 8192]` rows,
+    `cute_dsl_projection_mxf8` `kv_b_kv8`) instead of packed rows; same output bytes.
 
     One compile serves every step: query and K/V row counts, request count and the
     longest query are runtime values. Costs one CuTe DSL compile, then one launch in
@@ -53,13 +66,20 @@ def compile(device_index: int, fp8: bool = False, q8: bool = False) -> CompiledM
     """
     if q8 and not fp8:
         raise ValueError("the MXF8-O epilogue is an fp8-handle option")
+    strided = {"kv_strided": True} if kv_strided else {}
     if q8:
         launcher = _kernel.build(
-            int(device_index), fp8=True, q8=True, q8_store_o=False, variant=_Q8_VARIANT
+            int(device_index),
+            fp8=True,
+            q8=True,
+            q8_store_o=False,
+            variant={**_Q8_VARIANT, "epi_offload": bool(epi_offload), **strided},
         )
     else:
         launcher = _kernel.build(
-            int(device_index), fp8=bool(fp8), variant=_FP8_VARIANT if fp8 else None
+            int(device_index),
+            fp8=bool(fp8),
+            variant={**(_FP8_VARIANT if fp8 else {}), **strided} or None,
         )
     dev = torch.device("cuda", int(device_index))
     shape = (NUM_HEADS, HEAD_DIM)
@@ -70,6 +90,9 @@ def compile(device_index: int, fp8: bool = False, q8: bool = False) -> CompiledM
             q = torch.zeros((q_rows, *shape), dtype=dtype, device=dev)
             k = torch.zeros((kv_rows, *shape), dtype=dtype, device=dev)
             v = torch.zeros((kv_rows, *shape), dtype=dtype, device=dev)
+            if kv_strided:
+                kv = torch.zeros((kv_rows, 2, *shape), dtype=dtype, device=dev)
+                k, v = kv[:, 0], kv[:, 1]
             out = torch.empty((q_rows, *shape), dtype=torch.bfloat16, device=dev)
             cu = torch.tensor([0, q_rows], dtype=torch.int32, device=dev)
             cu_k = None
@@ -94,7 +117,8 @@ class CuteDslMhaPrefill(OpWrapper):
     q[t] k^T / 16) v` over the request's K/V rows the causal mask admits.
 
     `q` and `out` are contiguous `[T_q, 16, 256]` bf16 (query rows of the context
-    requests, back to back); `k` and `v` contiguous `[T_k, 16, 256]` bf16.
+    requests, back to back); `k` and `v` contiguous `[T_k, 16, 256]` bf16 (the
+    `kv_strided` handle: any token-row stride that is a multiple of 256 elements).
     `cu_seqlens` (int32 `[B + 1]`) delimits each request's query rows and
     `cu_seqlens_k` (int32 `[B + 1]`, default `cu_seqlens`) its K/V rows: a cached
     prefix first, then the rows of this step, so `kv_len >= q_len`. Query `i` of a

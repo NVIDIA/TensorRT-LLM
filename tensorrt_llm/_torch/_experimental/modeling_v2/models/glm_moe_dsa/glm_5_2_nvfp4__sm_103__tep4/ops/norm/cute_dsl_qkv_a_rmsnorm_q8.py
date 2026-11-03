@@ -14,7 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 from ...kernels.common import self_attn_prefill_act_quant_mxf8 as _quant
 from ...kernels.norm import self_attn_qkv_a_rmsnorm as _kernel
-from .cute_dsl_qkv_a_rmsnorm import _ROW, _Q, WARP_ROW_MIN_ROWS, _served_layout, _stream
+from .cute_dsl_qkv_a_rmsnorm import _Q, _ROW, WARP_ROW_MIN_ROWS, _served_layout, _stream
 
 #: Decode rows the one-CTA-per-row q8 kernel serves: the CUDA-graph batches, 1..64.
 DECODE_MAX_ROWS = 64
@@ -34,17 +34,24 @@ class CompiledQkvARmsnormQ8:
     warp_row_ctx: Callable
     cta: Callable
     dummies: tuple
+    #: `warp_row_ctx` is the ILP build.
+    ilp: bool = False
 
 
-def compile(device_id: int, eps: float) -> CompiledQkvARmsnormQ8:  # noqa: A001
+def compile(device_id: int, eps: float, ilp: bool = True) -> CompiledQkvARmsnormQ8:  # noqa: A001
     """Compile the three kernels for `device_id` with `eps` baked in. Call once, at load; the
-    kernel module caches each per key, so a second call is free."""
+    kernel module caches each per key, so a second call is free. `ilp` builds the variant that
+    skips the low bf16 q rows with fewer instructions per element (packed multiplies and bf16
+    rounding, a min/max tree for the block amax, the power-of-two scale's reciprocal from its
+    exponent): same output bytes, -1.3 .. -1.5 us per launch at 7-8k rows on B300."""
     dev = torch.device("cuda", device_id)
     return CompiledQkvARmsnormQ8(
         warp_row=_kernel.compile_qkv_a_rmsnorm_warp_row_q8(
             device_id, float(eps), inplace_kv_view=True
         ),
-        warp_row_ctx=_kernel.compile_qkv_a_rmsnorm_warp_row_q8_ctx(device_id, float(eps)),
+        warp_row_ctx=_kernel.compile_qkv_a_rmsnorm_warp_row_q8_ctx(
+            device_id, float(eps), ilp=bool(ilp)
+        ),
         cta=_kernel.compile_qkv_a_rmsnorm_q8(
             device_id, float(eps), inplace_kv_view=True, early_signal=True
         ),
@@ -54,6 +61,7 @@ def compile(device_id: int, eps: float) -> CompiledQkvARmsnormQ8:  # noqa: A001
             torch.zeros(2, dtype=torch.int32, device=dev),
             torch.zeros(1, dtype=torch.int32, device=dev),
         ),
+        ilp=bool(ilp),
     )
 
 

@@ -54,7 +54,11 @@ def test_certified_cells(cell, compiled, operands) -> None:
     with validating(op):
         assert op(hist, w, s, compiled) is None
     torch.cuda.synchronize()
-    assert torch.equal(hist, before[0]) and torch.equal(w[:2], before[1]) and torch.equal(s[:2], before[2])
+    assert (
+        torch.equal(hist, before[0])
+        and torch.equal(w[:2], before[1])
+        and torch.equal(s[:2], before[2])
+    )
     # The selection the kernel makes, through its debug form: the reference's ranking.
     sel = torch.full((kernel.MAX_TOP_E,), -7, dtype=torch.int32, device="cuda")
     kernel.run_prefetch(hist, w, s, top_e=entry.TOP_E, ntiles=entry.NTILES, ctas=entry.CTAS,

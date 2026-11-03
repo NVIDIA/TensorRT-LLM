@@ -29,6 +29,7 @@ context rows, the context attention reads the causal window through the block ta
 from __future__ import annotations
 
 import math
+import os
 from types import SimpleNamespace
 from typing import cast
 
@@ -54,13 +55,14 @@ from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModel
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
 from tensorrt_llm.logger import logger
 
+from . import dec_hot_experts as _hot
 from . import weights as _weights
+from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
 from .ops.activation import cute_dsl_swiglu_rows as _swiglu_rows_op
 from .ops.activation.cute_dsl_dense_swiglu import compile as compile_dense_swiglu
 from .ops.activation.cute_dsl_dense_swiglu import cute_dsl_dense_swiglu
-from .ops.activation.cute_dsl_swiglu_rows import cute_dsl_swiglu_rows
-from .ops.activation import cute_dsl_swiglu_mxf8 as _swiglu8_op
 from .ops.activation.cute_dsl_swiglu_mxf8 import cute_dsl_swiglu_mxf8
+from .ops.activation.cute_dsl_swiglu_rows import cute_dsl_swiglu_rows
 from .ops.attention import cute_dsl_mha_kv_gather_mxf8 as _kv_gather8_op
 from .ops.attention import cute_dsl_mha_prefill as _mha_pre_op
 from .ops.attention import cute_dsl_mha_prefix_gather as _mha_prefix_op
@@ -109,56 +111,62 @@ from .ops.comm.cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 import (
 )
 from .ops.elementwise import cute_dsl_copy as _copy_op
 from .ops.elementwise import cute_dsl_hidden_add as _hidden_add_op
+from .ops.elementwise import cute_dsl_rows_select as _rows_sel_op
 from .ops.elementwise.cute_dsl_copy import cute_dsl_copy
 from .ops.elementwise.cute_dsl_hidden_add import cute_dsl_hidden_add
-from .ops.elementwise import cute_dsl_rows_select as _rows_sel_op
 from .ops.elementwise.cute_dsl_rows_select import cute_dsl_rows_select
 from .ops.embedding import cute_dsl_hidden_row_gather as _row_gather_op
 from .ops.embedding.cute_dsl_embedding import build as build_embedding
 from .ops.embedding.cute_dsl_embedding import cute_dsl_embedding
 from .ops.embedding.cute_dsl_hidden_row_gather import cute_dsl_hidden_row_gather
 from .ops.gemm import cute_dsl_absorbed_bmm as _absorbed_bmm_op
+from .ops.gemm import cute_dsl_dense_up_swiglu_mxf8 as _dense_up8_op
 from .ops.gemm import cute_dsl_indexer_pre_proj_split as _ix_pre_split_op
 from .ops.gemm import cute_dsl_mtp_eh_proj as _mtp_eh
 from .ops.gemm import cute_dsl_projection as _projection_op
 from .ops.gemm import cute_dsl_projection_mxf8 as _mxf8_op
+from .ops.gemm import cute_dsl_projection_mxf8_decode as _dec8_op
 from .ops.gemm import cute_dsl_shared_gate_up_swiglu as _shared_gu_swiglu_op
 from .ops.gemm import cute_dsl_shared_up_swiglu_mxf8 as _shared_up8_op
-from .ops.gemm.cute_dsl_shared_up_swiglu_mxf8 import cute_dsl_shared_up_swiglu_mxf8
 from .ops.gemm.bmm_out import bmm_out
 from .ops.gemm.cute_dsl_absorbed_bmm import cute_dsl_absorbed_bmm
+from .ops.gemm.cute_dsl_dense_up_swiglu_mxf8 import cute_dsl_dense_up_swiglu_mxf8
 from .ops.gemm.cute_dsl_indexer_pre_proj_split import cute_dsl_indexer_pre_proj_split
 from .ops.gemm.cute_dsl_mtp_eh_proj import cute_dsl_mtp_eh_proj
 from .ops.gemm.cute_dsl_projection import cute_dsl_projection
-from .ops.gemm import cute_dsl_projection_mxf8_decode as _dec8_op
-from .ops.moe import cute_dsl_moe_l2_prefetch as _l2pf_op
-from .ops.moe.cute_dsl_moe_l2_prefetch import cute_dsl_moe_l2_prefetch
-from .ops.norm import cute_dsl_mtp_eh_norm_cat_mxf8 as _eh8_op
-from .ops.norm.cute_dsl_mtp_eh_norm_cat_mxf8 import cute_dsl_mtp_eh_norm_cat_mxf8
 from .ops.gemm.cute_dsl_projection_mxf8 import cute_dsl_projection_mxf8
 from .ops.gemm.cute_dsl_projection_mxf8_decode import cute_dsl_projection_mxf8_decode
 from .ops.gemm.cute_dsl_shared_gate_up_swiglu import cute_dsl_shared_gate_up_swiglu
+from .ops.gemm.cute_dsl_shared_up_swiglu_mxf8 import cute_dsl_shared_up_swiglu_mxf8
+from .ops.moe import cute_dsl_moe_l2_prefetch as _l2pf_op
 from .ops.moe import cute_dsl_moe_merge as _moe_merge_op
 from .ops.moe import cute_dsl_moe_nvfp4_experts as _moe_experts_op
+from .ops.moe import cute_dsl_moe_prefill_topk_routing_rep as _moe_topk_pre_rep_op
 from .ops.moe import cute_dsl_moe_router as _moe_router_op
 from .ops.moe import cute_dsl_moe_routing as _moe_routing_op
 from .ops.moe import cute_dsl_moe_sigmoid_topk as _topk_rows_op
 from .ops.moe import cute_dsl_moe_topk_routing as _moe_topk_op
+from .ops.moe import cute_dsl_moe_topk_routing_rep as _moe_topk_rep_op
 from .ops.moe import cute_dsl_moe_zero as _moe_zero_op
 from .ops.moe import cute_dsl_mtp_moe_experts as _mtp_experts_op
+from .ops.moe.cute_dsl_moe_l2_prefetch import cute_dsl_moe_l2_prefetch
 from .ops.moe.cute_dsl_moe_merge import cute_dsl_moe_merge
 from .ops.moe.cute_dsl_moe_nvfp4_experts import cute_dsl_moe_nvfp4_experts
+from .ops.moe.cute_dsl_moe_prefill_topk_routing_rep import cute_dsl_moe_prefill_topk_routing_rep
 from .ops.moe.cute_dsl_moe_router import cute_dsl_moe_router
 from .ops.moe.cute_dsl_moe_routing import cute_dsl_moe_routing
 from .ops.moe.cute_dsl_moe_sigmoid_topk import cute_dsl_moe_sigmoid_topk
 from .ops.moe.cute_dsl_moe_topk_routing import cute_dsl_moe_topk_routing
+from .ops.moe.cute_dsl_moe_topk_routing_rep import cute_dsl_moe_topk_routing_rep
 from .ops.moe.cute_dsl_moe_zero import cute_dsl_moe_zero
 from .ops.moe.cute_dsl_mtp_moe_experts import cute_dsl_mtp_moe_experts
 from .ops.moe.noaux_tc_op import noaux_tc_op
 from .ops.norm import cute_dsl_hidden_rmsnorm as _hidden_norm_op
+from .ops.norm import cute_dsl_mtp_eh_norm_cat_mxf8 as _eh8_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm as _qkv_a_norm_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm_q8 as _qkv_a_norm8_op
 from .ops.norm.cute_dsl_hidden_rmsnorm import cute_dsl_hidden_rmsnorm
+from .ops.norm.cute_dsl_mtp_eh_norm_cat_mxf8 import cute_dsl_mtp_eh_norm_cat_mxf8
 from .ops.norm.cute_dsl_mtp_norm_shard import compile as compile_mtp_norm_shard
 from .ops.norm.cute_dsl_mtp_norm_shard import cute_dsl_mtp_norm_shard
 from .ops.norm.cute_dsl_qkv_a_rmsnorm import compile as compile_qkv_a_rmsnorm
@@ -200,6 +208,59 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         seq_lens=md.seq_lens,
         seq_lens_cuda=md.seq_lens_cuda,
     )
+
+
+def _install_dense_topk_on_device() -> None:
+    """TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE (default 1): engine's dense top-k table on the GPU.
+
+    When every context sequence is shorter than the index top-k, the engine skips the indexer
+    and `DSAtrtllmAttentionMetadata.prepare_for_skip_indexer` writes a dense causal table of
+    `num_ctx_tokens x index_topk` entries with its host form of `prepare_dense_topk_indices`
+    (a CPU-compiled kernel plus a host-to-device copy): on B300 ~97 ms of `_prepare_inputs` per
+    8k-token context step, with the GPU idle. The method's `device=True` form computes the
+    same integer table on the GPU. The rebind keeps the engine's body (the two host skip
+    decisions) and redirects only its one table build, with the host `kv_lens` it was given
+    uploaded as-is (`num_seqs` ints), so the table is identical. Installed from this model's
+    constructor, not at import, so a stock process that only registers the target keeps the
+    stock path. Idempotent; raises if the engine's method is not the shape this relies on.
+    """
+    import inspect
+    import re
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSAtrtllmAttentionMetadata as _Md
+
+    if getattr(_Md.prepare_for_skip_indexer, "_glm52_dense_topk_on_device", False):
+        return
+    src = inspect.getsource(_Md.prepare_for_skip_indexer)
+    if (
+        src.count("self.prepare_dense_topk_indices(kv_lens)") != 1
+        or len(re.findall(r"\.item\(\s*\)", src)) != 2
+        or hasattr(_Md, "__slots__")
+    ):
+        raise RuntimeError(
+            "TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE=1 needs DSAtrtllmAttentionMetadata."
+            "prepare_for_skip_indexer with two `.item()` skip decisions and one host "
+            "`self.prepare_dense_topk_indices(kv_lens)` call (no __slots__); this engine's "
+            "differs. Unset the switch or update _install_dense_topk_on_device."
+        )
+    orig = _Md.prepare_for_skip_indexer
+    orig_build = _Md.prepare_dense_topk_indices
+
+    def prepare_for_skip_indexer(self, kv_lens):
+        # The instance attribute shadows the class method for exactly the one table build
+        # inside the engine's body and is removed again.
+        def build_on_device(host_kv_lens, device=False):
+            dev_kv_lens = host_kv_lens.to(self.seq_lens_cuda.device, non_blocking=True)
+            return orig_build(self, dev_kv_lens, device=True)
+
+        self.prepare_dense_topk_indices = build_on_device
+        try:
+            orig(self, kv_lens)
+        finally:
+            del self.prepare_dense_topk_indices
+
+    prepare_for_skip_indexer._glm52_dense_topk_on_device = True
+    _Md.prepare_for_skip_indexer = prepare_for_skip_indexer
 
 
 _QUANT_MODE_FP8_KV = 128
@@ -395,6 +456,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self.ep_rank = mapping.moe_ep_rank
         self.ep_size = mapping.moe_ep_size
         self.quant_mode = _QUANT_MODE_FP8_KV
+        if os.environ.get("TRTLLM_GLM52_DENSE_TOPK_ON_DEVICE", "1") == "1":
+            _install_dense_topk_on_device()
+        self._mixed_base = os.environ.get("TRTLLM_GLM52_MIXED_BASE", "1") == "1"
 
         self.num_layers = cfg.num_hidden_layers
         self.eps = cfg.rms_norm_eps
@@ -430,6 +494,26 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self.moe_inter = cfg.moe_intermediate_size
         self.local_experts = self.num_experts // mapping.moe_ep_size
         self.expert_offset = self.local_experts * self.ep_rank
+        # Decode expert replicas (`dec_hot_experts`): every rank also holds each trunk MoE
+        # layer's `dec_replicas` hottest experts in slots 64.. of its routed stacks; 0 = off.
+        self.dec_replicas = _hot.replicas()
+        self.dec_hot = (
+            {i: _hot.hot(i, self.dec_replicas) for i in _hot.HOT} if self.dec_replicas else {}
+        )
+        # Context expert replicas (`TRTLLM_GLM52_CTX_EXPERT_REPLICAS=R`, 0 = off): a context
+        # step's top-k splits the rows of each trunk MoE layer's first R replica experts
+        # across the EP ranks by producer CTA, levelling the ranks' grouped-GEMM loads (the
+        # slowest rank sets the all-reduce wait). Runs on the decode replicas' slots, so R is
+        # at most `dec_replicas`.
+        # Default: the decode replica count (TRTLLM_GLM52_DEC_EXPERT_REPLICAS=0 turns both off).
+        self.ctx_replicas = int(
+            os.environ.get("TRTLLM_GLM52_CTX_EXPERT_REPLICAS", str(self.dec_replicas))
+        )
+        if not 0 <= self.ctx_replicas <= self.dec_replicas:
+            raise ValueError(
+                "TRTLLM_GLM52_CTX_EXPERT_REPLICAS must be in 0..TRTLLM_GLM52_DEC_EXPERT_REPLICAS "
+                f"({self.dec_replicas}), got {self.ctx_replicas}"
+            )
         self.mtp_enabled = getattr(model_config, "spec_config", None) is not None
 
         self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
@@ -616,6 +700,21 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._proj_mxf8.update(runners)
             self._swiglu8 = swiglu
             self._dense8 = list(zip(wq["dense_gate_up"], wq["dense_down"]))
+            # TRTLLM_GLM52_CTX_DENSE_SWIGLU_EPI (default 1): gate|up with the SwiGLU into the
+            # down GEMM's MXF8 operand in its epilogue (`cute_dsl_dense_up_swiglu_mxf8`, its own
+            # interleaved weight, +0.11 GB per rank): one launch instead of two and no bf16
+            # [T, 6144].
+            dense_sw = (
+                _try_build("dense gate|up + SwiGLU MXF8", lambda: _dense_up8_op.compile(dev))
+                if os.environ.get("TRTLLM_GLM52_CTX_DENSE_SWIGLU_EPI", "1") == "1"
+                else None
+            )
+            if dense_sw is not None:
+                self._dense_sw8 = dense_sw
+                self._dense8 = [
+                    (gu8, dn8, _dense_up8_op.prepare_weight(self.w[f"l{i}_mlp_gu"]))
+                    for i, (gu8, dn8) in zip(dense, self._dense8)
+                ]
         self._shared8 = _try_build("shared gate|up MXF8", lambda: _shared_up8_op.compile(dev))
         self._shared_w8 = [
             _shared_up8_op.prepare_weight(self.w[f"l{i}_mlp_gu"])
@@ -740,7 +839,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         (`cute_dsl_mha_kv_gather_mxf8`: pool bytes at 2^0 for a cached row, the new rows
         block-quantized) and both expansion GEMMs run e4m3 x e4m3 with 1x32 block scales
         against the folded weights quantized once (their bf16 copies not kept; the K / V
-        bounds take `_MHA_FP8_KV_MXF8` more headroom); and the MHA handle whose epilogue
+        bounds take `_MHA_FP8_KV_MXF8` more headroom) -- as ONE launch (`kv_b_kv8`, the two
+        folded weights stacked, V zero-padded to 576; the MHA handles then read K / V as the
+        two halves of its `[T_k, 8192]` rows, `kv_strided`) when that entry and the strided
+        MHA handle build, with the two launches' output bytes; and the MHA handle whose epilogue
         writes O as o_proj's MXF8 operand (`compile(q8=True)`), which o_proj then reads
         without its own quant launch (measured in a served run, MHA + quant + o_proj
         -11.9 .. -13.5 us per layer at a ~7.3k-row step)."""
@@ -751,6 +853,16 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         q_extra = _MHA_FP8_Q_MXF8 if mxf8 else 1.0
         h, nope, rope, v, lora = self.heads, self.nope, self.rope_dim, self.v_dim, self.kv_lora
         kvb8 = self._build_kvb8(dev) if mxf8 else None
+        if kvb8 is not None and kvb8.merged is not None:
+            mha_s = _try_build(
+                "context MHA fp8 on strided K / V",
+                lambda: _mha_pre_op.compile(dev, fp8=True, kv_strided=True),
+            )
+            if mha_s is None:
+                kvb8.merged = None
+            else:
+                mha = mha_s
+        merged = kvb8 is not None and kvb8.merged is not None
         kv_extra = _MHA_FP8_KV_MXF8 if kvb8 is not None else 1.0
         ranges: list[tuple[float, ...]] = []
         layers = []
@@ -764,7 +876,17 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             w_v = kvb[h * nope :].view(h, v, lora)
             w_k8 = _fold_pow2(w_k, s_k).view(h * (nope + rope), lora + rope)
             w_v8 = _fold_pow2(w_v, s_v).view(h * v, lora)
-            if kvb8 is not None:
+            if merged:
+                # K rows over V rows zero-padded to 576: rows quantize independently, so the
+                # K rows' bytes are the K weight's and the V rows' first 512 columns the V's.
+                w_kv = torch.zeros(
+                    h * (nope + rope + v), lora + rope, dtype=kvb.dtype, device=kvb.device
+                )
+                w_kv[: h * (nope + rope)] = w_k8
+                w_kv[h * (nope + rope) :, :lora] = w_v8
+                w_k8, w_v8 = _mxf8_op.quantize_weight(w_kv), None
+                del w_kv
+            elif kvb8 is not None:
                 w_k8, w_v8 = _mxf8_op.quantize_weight(w_k8), _mxf8_op.quantize_weight(w_v8)
             qb8 = _fold_pow2(a.qb.t().view(h, nope + rope, -1), torch.full((h,), s_q)).view(
                 h * (nope + rope), -1
@@ -811,7 +933,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         if "o_proj" in self._proj_mxf8:
             mha_q8 = _try_build(
                 "context MHA fp8 with the MXF8 O epilogue",
-                lambda: _mha_pre_op.compile(dev, fp8=True, q8=True),
+                lambda: _mha_pre_op.compile(dev, fp8=True, q8=True, kv_strided=merged),
             )
             rows_q8 = _try_build("act quant rows", lambda: _aq_rows_op.compile(dev))
             if mha_q8 is not None and rows_q8 is not None:
@@ -823,7 +945,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         logger.info(
             "modeling_v2 GLM-5.2: context MHA fp8, q_b "
             f"{'MXF8' if mxf8 else 'bf16'}, K / V expansion "
-            f"{'MXF8' if kvb8 is not None else 'bf16 MMA'}, o_proj operand "
+            f"{('MXF8, one launch' if merged else 'MXF8') if kvb8 is not None else 'bf16 MMA'}, "
+            "o_proj operand "
             f"{'from the MHA' if self._mha_q8 is not None else 'quantized'}; log2 scales over "
             f"layers q [{min(lg(r[0]) for r in ranges)}, {max(lg(r[0]) for r in ranges)}] "
             f"k [{min(lg(r[1]) for r in ranges)}, {max(lg(r[2]) for r in ranges)}] "
@@ -855,6 +978,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         }
         if not all(runners.values()):
             return None
+        # Both in one launch (`kv_b_kv8`); None keeps the two launches.
+        merged = _try_build(
+            "MXF8 K | V expansion in one launch",
+            lambda: _mxf8_op.build(
+                "kv_b_kv8", _mxf8_op.quantize_weight(torch.zeros(h * (qk + v), lat, **bf))
+            ),
+        )
         d = torch.device("cuda", dev)
         # The gather's pool / index / table operands on a step without a cached prefix: read
         # by nothing (no cached rows, new rows in order), but they must be valid tensors.
@@ -864,7 +994,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             torch.zeros(1, dtype=torch.int32, device=d),
             torch.zeros(1, 1, dtype=torch.int32, device=d),
         )
-        return SimpleNamespace(gather=gather, runners=runners, idle=idle)
+        return SimpleNamespace(gather=gather, runners=runners, merged=merged, idle=idle)
 
     def _mha_fp8_scales(
         self, i: int, q_extra: float, kv_extra: float = 1.0
@@ -922,6 +1052,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         w = self.w
         window = slice(self.expert_offset, self.expert_offset + self.local_experts)
         isc1, isc2 = w[f"l{i}_e_isc1"], w[f"l{i}_e_isc2"]
+        if self.dec_replicas:
+            # The alphas follow the stacks' slots: this rank's window, then the replicas.
+            window = torch.cat(
+                [
+                    torch.arange(self.expert_offset, self.expert_offset + self.local_experts),
+                    torch.tensor(self.dec_hot[i], dtype=torch.long),
+                ]
+            ).to(isc1.device)
         assert torch.equal(isc1, w[f"l{i}_e_isc1_up"]), f"layer {i}: gate/up input_scale differ"
         assert torch.equal(w[f"l{i}_e_ws2_1"], w[f"l{i}_e_ws2_1_up"]), (
             f"layer {i}: gate/up weight_scale_2 differ"
@@ -1165,6 +1303,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._build_dec_mxf8(dev)
         # A CUDA stream created inside a graph capture is not capturable.
         self._side_stream = torch.cuda.Stream(device=dev)
+        # A mixed context step's generation-row attention on its own stream beside the context
+        # rows' MHA (`PrefillTarget._layer_attention`); on by default,
+        # TRTLLM_GLM52_CTX_GEN_SIDE=0 restores the serial order.
+        self._gen_stream = (
+            torch.cuda.Stream(device=dev)
+            if os.environ.get("TRTLLM_GLM52_CTX_GEN_SIDE", "1") == "1"
+            else None
+        )
         self._build_moe(dev)
         # The peer buffers are sized for the whole token budget, so every collective shares
         # one workspace.
@@ -1239,7 +1385,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 x=torch.zeros((rows, hidden), **bf16),
                 w=torch.zeros((rows, _MOE_TOP_K), **f32),
                 sel=torch.empty(rows * _MOE_TOP_K, dtype=torch.int32, device=dev),
-                maps=_moe_routing_op.allocate_maps(rows, dev),
+                # Context replicas: one more partial tile per replica slot (trunk only).
+                maps=_moe_routing_op.allocate_maps(
+                    rows, dev, replicas=0 if mtp else self.ctx_replicas
+                ),
                 counts=counts,
                 barrier=barrier,
                 router_out=torch.zeros((_DECODE_MAX_ROWS, self.num_experts), **f32),
@@ -1247,17 +1396,25 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     (_DECODE_MAX_ROWS, _moe_router_op.SPLIT_K, self.num_experts), **f32
                 ),
                 # The fused top-k checks its outputs against the exact row count: one set
-                # per width.
-                topk_out={w: _moe_topk_op.allocate_decode_outputs(w, dev) for w in widths},
+                # per width; with decode expert replicas the push widths' sets hold the
+                # replica top-k's `64 + replicas` tiles.
+                topk_out={
+                    w: _moe_topk_rep_op.allocate_outputs(w, self.dec_replicas, dev)
+                    if not mtp and self.dec_replicas and _moe_topk_rep_op.uses_rep_path(w)
+                    else _moe_topk_op.allocate_decode_outputs(w, dev)
+                    for w in widths
+                },
             )
             if mtp:
                 ns.c = _mtp_experts_op.allocate_c(rows, inter, dev)
                 return ns
             ns.c = _moe_experts_op.allocate_decode_c(rows, inter, dev)
-            ns.sfc = _moe_experts_op.allocate_sfc(rows, inter, dev)
+            ns.sfc = _moe_experts_op.allocate_sfc(rows, inter, dev, self.ctx_replicas)
             ns.router_x = torch.zeros((_DECODE_MAX_ROWS, hidden), **bf16)
             ns.logits = torch.zeros((rows, 1, self.num_experts), **f32)
             ns.topk_scratch = _moe_topk_op.allocate_prefill_scratch(dev)
+            if self.ctx_replicas:
+                ns.topk_rep_scratch = _moe_topk_pre_rep_op.allocate_scratch(self.ctx_replicas, dev)
             return ns
 
         self._moe_slots = [slot(False) for _ in range(2)]
@@ -1282,7 +1439,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             out=s0.out,
             hidden=hidden,
             inter=inter,
-            experts=experts,
+            # The decode expert replicas' slots follow this rank's 64 (0 when off).
+            experts=experts + self.dec_replicas,
             max_rows=rows,
             # One FC2 tile counter per MoE call site: the trunk layers and the MTP layer.
             dyn_slots=self.num_layers + 1,
@@ -1290,7 +1448,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         k.pair = optional(lambda: _moe_experts_op.build_prefill_pair(hidden, inter, experts, dev))
         if k.pair is not None:
             for sl in self._moe_slots:
-                sl.pc = _moe_experts_op.allocate_pair_c(rows, inter, dev)
+                sl.pc = _moe_experts_op.allocate_pair_c(rows, inter, dev, self.ctx_replicas)
+        # Context replicas: the replica top-k and the prefill pair on the `64 + R` deep
+        # stacks, both or neither (the replica maps address slots past 64).
+        k.topk_pre_rep = k.pair_rep = None
+        self._ctx_hot_ids = {}
+        if self.ctx_replicas and k.pair is not None:
+            rep = optional(
+                lambda: (
+                    _moe_topk_pre_rep_op.build_prefill(self.ctx_replicas, dev),
+                    _moe_experts_op.build_prefill_pair(
+                        hidden, inter, experts + self.ctx_replicas, dev
+                    ),
+                )
+            )
+            k.topk_pre_rep, k.pair_rep = rep if rep is not None else (None, None)
+            self._ctx_hot_ids = {
+                i: torch.tensor(ids[: self.ctx_replicas], dtype=torch.int32, device=dev)
+                for i, ids in self.dec_hot.items()
+                if len(ids) >= self.ctx_replicas
+            }
+        # The maps the replica top-k wrote last (`_moe_topk`); `_moe_experts` runs them on
+        # the replica pair.
+        self._moe_rep_maps = None
         k.router_pre = optional(lambda: _moe_router_op.build_prefill(dev))
         k.topk_pre = optional(lambda: _moe_topk_op.build_prefill(dev))
         k.quant_pre = optional(lambda: _moe_quant_op.build_prefill(dev))
@@ -1332,6 +1512,27 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
             for w in range(1, _DECODE_MAX_ROWS + 1)
         }
+        # Decode expert replicas: the push widths select on the replica top-k, with each
+        # trunk layer's hot ids (the MTP layer passes all -1: the home mapping).
+        k.topk_rep = {}
+        if self.dec_replicas:
+            k.topk_rep = {
+                w: _moe_topk_rep_op.build_decode(
+                    w,
+                    _moe_router_op.decode_splits(w),
+                    self.dec_replicas,
+                    dev,
+                    signal_gg1=(w & (w - 1)) == 0,
+                    expert_hist=self._pf is not None,
+                )
+                for w in range(1, _DECODE_MAX_ROWS + 1)
+                if _moe_topk_rep_op.uses_rep_path(w)
+            }
+            self._dec_hot_ids = {
+                i: torch.tensor(ids, dtype=torch.int32, device=dev)
+                for i, ids in self.dec_hot.items()
+            }
+            self._dec_hot_none = torch.full((self.dec_replicas,), -1, dtype=torch.int32, device=dev)
         # Shared with the MTP layer's front end: the same compiled kernel per row count.
         k.router = _moe_router_op.build_all(dev)
         self._moe_k = k
@@ -1667,8 +1868,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         is the layer's decode MXF8 weight (q_b / o_proj): decode rows take the decode MXF8
         GEMM; `dec_pre` says its producer wrote the operand (`_dec8_takes` must hold)."""
         rows = int(x.shape[0])
-        if self._dec8_takes(name, x, wd8) and out_dtype in (None, torch.bfloat16) and (
-            out is None or (out.dtype == torch.bfloat16 and out.is_contiguous())
+        if (
+            self._dec8_takes(name, x, wd8)
+            and out_dtype in (None, torch.bfloat16)
+            and (out is None or (out.dtype == torch.bfloat16 and out.is_contiguous()))
         ):
             runner = self._dec8[name]
             if out is None:
@@ -1819,6 +2022,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._count("qkv_a_q8", True)
             if q_store_from:
                 self._count("qkv_a_q8_skip", True)
+                if self._qkv_a_norm8.ilp:
+                    self._count("norm_ilp", True)
             latent = torch.split(qkva, [self.q_lora, self.lat_dim], -1)[1]
             return None, q_a, latent, q8
         # Decode rows: the norm writes q_a's MXF8 bytes into the decode q_b GEMM's own operand
@@ -2129,10 +2334,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         operand, no bf16 intermediate. Decode rows: the bf16 GEMMs and SwiGLU."""
         if w8 is not None and self._mxf8_takes("dense_gate_up", o, w8[0]):
             rows = int(o.shape[0])
-            gate_up = self._project("dense_gate_up", o, gu, w8=w8[0], pre=x8)
-            act8 = cute_dsl_swiglu_mxf8(
-                gate_up, *_swiglu8_op.operand(rows, gate_up.shape[1] // 2, o.device), self._swiglu8
-            )
+            if len(w8) > 2:
+                # The SwiGLU into the down GEMM's operand in the gate|up GEMM's epilogue.
+                act8 = cute_dsl_dense_up_swiglu_mxf8(
+                    o, w8[2], *_dense_up8_op.operand(rows, o.device), self._dense_sw8, pre=x8
+                )
+                self._count("dense_up_swiglu", True)
+            else:
+                gate_up = self._project("dense_gate_up", o, gu, w8=w8[0], pre=x8)
+                act8 = cute_dsl_swiglu_mxf8(
+                    gate_up,
+                    *_swiglu8_op.operand(rows, gate_up.shape[1] // 2, o.device),
+                    self._swiglu8,
+                )
             down = self._proj_mxf8["dense_down"]
             out = torch.empty([rows, down.n], dtype=torch.bfloat16, device=o.device)
             self._count("dense_mxf8", True)
@@ -2245,6 +2459,22 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         rows = int(logits.shape[0])
         s = self._moe_slots[slot]
         k = self._moe_k
+        if rows in k.topk_rep:
+            # Decode expert replicas: this layer's hot ids (none on the MTP layer).
+            handle = k.topk_rep[rows]
+            hot = self._dec_hot_ids.get(layer, self._dec_hot_none)
+            if hot is not self._dec_hot_none:
+                self._count("moe_dec_replica", True)
+            return cute_dsl_moe_topk_routing_rep(
+                logits,
+                m.router_bias,
+                hot,
+                self.expert_offset,
+                self.routed_scale,
+                s.topk_out[rows],
+                handle,
+                expert_hist=self._pf.hist[layer] if handle.expert_hist else None,
+            )
         if rows <= _DECODE_MAX_ROWS:
             handle = k.topk[rows]
             return cute_dsl_moe_topk_routing(
@@ -2263,6 +2493,23 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             lg = s.logits[:rows].view(rows, -1)
             self._copy_into(lg, logits.reshape(rows, -1))
             logits = lg
+        hot = self._ctx_hot_ids.get(layer) if k.topk_pre_rep is not None else None
+        if (
+            hot is not None
+            and _moe_topk_pre_rep_op.serves(rows)
+            and self._moe_padded_rows(rows) == rows
+            and self._moe_pair_ok(rows)
+        ):
+            # Context replicas: only where the GEMMs run these maps unpadded on the pair.
+            # Every rank takes the same branch for the same rows and layer.
+            outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.topk_rep_scratch, **s.maps}
+            selected = cute_dsl_moe_prefill_topk_routing_rep(
+                logits, m.router_bias, hot, self.expert_offset, self.routed_scale, outputs,
+                k.topk_pre_rep,
+            )  # fmt: skip
+            self._moe_rep_maps = selected[2]
+            self._count("ctx_ar_rep", True)
+            return selected
         outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.topk_scratch, **s.maps}
         return cute_dsl_moe_topk_routing(
             logits, m.router_bias, self.expert_offset, self.routed_scale, outputs, None, k.topk_pre
@@ -2362,7 +2609,20 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 cute_dsl_moe_zero(out, k.zero_pre)
             else:
                 out.zero_()
-        compiled, c = (k.pair, s.pc) if use_pair else (k.experts, s.c)
+        # Context replicas: maps the replica top-k wrote address slots up to 64 + R - 1 and
+        # run on the replica pair; any other maps are the home mapping.
+        rep = use_pair and maps is self._moe_rep_maps and k.pair_rep is not None
+        self._moe_rep_maps = None
+        compiled, c = (k.pair_rep if rep else k.pair, s.pc) if use_pair else (k.experts, s.c)
+        fc1_w, fc1_s, fc2_w, fc2_s = m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s
+        alpha1, alpha2 = m.alpha1, m.alpha2
+        e = compiled.experts if use_pair else fc1_w.shape[0]
+        if fc1_w.shape[0] != e:
+            # Decode expert replicas: the prefill pair maps home experts (or the first R
+            # replica slots too, `rep`) and reads that prefix of the stacks (a contiguous
+            # view of the same storage).
+            fc1_w, fc1_s, fc2_w, fc2_s = fc1_w[:e], fc1_s[:e], fc2_w[:e], fc2_s[:e]
+            alpha1, alpha2 = alpha1[:e], alpha2[:e]
         # The decode L2 prefetch forked at the o_proj end joins before FC2, with the shared
         # expert's stream.
         pf = self._pf.pending if self._pf is not None else None
@@ -2370,8 +2630,8 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             self._pf.pending = None
             join = (join, pf) if join is not None else pf
         cute_dsl_moe_nvfp4_experts(
-            xq, xsf, maps, topk_w, m.fc1_w, m.fc1_s, m.fc2_w, m.fc2_s,
-            m.norm_const, m.alpha1, m.alpha2, out, c, s.sfc, join, compiled,
+            xq, xsf, maps, topk_w, fc1_w, fc1_s, fc2_w, fc2_s,
+            m.norm_const, alpha1, alpha2, out, c, s.sfc, join, compiled,
             None if use_pair else layer,
         )  # fmt: skip
         return out[:rows]
@@ -2382,11 +2642,18 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         The routed call joins it before FC2 (`_moe_experts`). Only on the push top-k's widths:
         the row bound is checked first, as the context steps call this too."""
         pf = self._pf
-        if pf is None or not 1 <= rows <= _DECODE_MAX_ROWS or not self._moe_k.topk[rows].expert_hist:
+        if (
+            pf is None
+            or not 1 <= rows <= _DECODE_MAX_ROWS
+            or not self._moe_k.topk[rows].expert_hist
+        ):
             return
         pf.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(pf.stream):
-            cute_dsl_moe_l2_prefetch(pf.hist[layer], m.fc1_w, m.fc1_s, pf.compiled)
+            # The home prefix: the prefetch ranks this rank's 64 home experts (replica slots,
+            # when present, follow them in the same storage).
+            e = _moe_routing_op.LOCAL_EXPERTS
+            cute_dsl_moe_l2_prefetch(pf.hist[layer], m.fc1_w[:e], m.fc1_s[:e], pf.compiled)
         pf.pending = pf.stream
         self._count("moe_l2_prefetch", True)
 
@@ -2800,11 +3067,20 @@ class PrefillTarget:
         rows = core.heads * core.qk_dim
         kv_dt = torch.float8_e4m3fn if core._mha_fp8 else torch.bfloat16
         kvb8 = core._mha_fp8 and core._kvb8 is not None
+        # The one-launch expansion writes `[K | V]` rows; K and V are their halves.
+        kv = None
+        if kvb8 and core._kvb8.merged is not None:
+            kv = torch.empty([tk, rows + core.heads * core.v_dim], dtype=kv_dt, device=dev)
         plan = SimpleNamespace(
             max_len=int(host_lens.max()),
             tk=tk,
-            k=torch.empty([tk, rows], dtype=kv_dt, device=dev),
-            v=torch.empty([tk, core.heads * core.v_dim], dtype=kv_dt, device=dev),
+            k=torch.empty([tk, rows], dtype=kv_dt, device=dev) if kv is None else kv[:, :rows],
+            v=(
+                torch.empty([tk, core.heads * core.v_dim], dtype=kv_dt, device=dev)
+                if kv is None
+                else kv[:, rows:]
+            ),
+            kv=kv,
             cached=None,
             # The MXF8 expansion's A operands, written per layer by the gather.
             a8=_kv_gather8_op.buffers(tk, dev) if kvb8 else None,
@@ -2860,7 +3136,9 @@ class PrefillTarget:
             and int(pool_ptrs[pool_idx, 1]) == 0
         )
 
-    def _attn_mha(self, a, layer: int, q, latent, out, tc: int, step, ctx_rope, mha, o8=None) -> bool:
+    def _attn_mha(
+        self, a, layer: int, q, latent, out, tc: int, step, ctx_rope, mha, o8=None
+    ) -> bool:
         """Context attention in the non-absorbed MLA form, as DLSim models it, on a
         dense-causal step; False (nothing launched) where the layer cannot take it.
 
@@ -2906,11 +3184,15 @@ class PrefillTarget:
             q_in_place=True,
             q_e4m3=fp8,
         )
+        if fp8 and compiled.rope_par:
+            core._count("rope_par", True)
         src, cu_k = lat, None
         if mha.a8 is not None:
             self._expand_mxf8(a, lat, mha, layer_in_pool * tpb, tpb)
             cu_k = None if mha.cached is None else mha.cached.cu_k
             core._count("ctx_kvb_mxf8", True)
+            if mha.kv is not None:
+                core._count("ctx_kvb_merged", True)
         elif mha.cached is not None:
             c = mha.cached
             src = cute_dsl_mha_prefix_gather(
@@ -2941,8 +3223,8 @@ class PrefillTarget:
         use_o8 = o8 is not None and fp8 and core._mha_q8 is not None
         cute_dsl_mha_prefill(
             q3,
-            torch.reshape(mha.k, [mha.tk, heads, core.qk_dim]),
-            torch.reshape(mha.v, [mha.tk, heads, core.v_dim]),
+            mha.k.view(mha.tk, heads, core.qk_dim),
+            mha.v.view(mha.tk, heads, core.v_dim),
             torch.reshape(out, [tc, heads, core.v_dim]),
             ctx_rope[0],
             mha.max_len,
@@ -2983,9 +3265,21 @@ class PrefillTarget:
             )  # fmt: skip
         a_k, a_v, sfa_k, sfa_v = mha.a8
         w_k, w_v = a.kvb8
+        blk_k, blk_v = _kv_gather8_op.sf_bytes_k(128), _kv_gather8_op.sf_bytes_v(128)
+        if mha.kv is not None:
+            # One launch: `[K | V]` rows from `a_k` (`w_k` is the stacked weight; the V tiles
+            # read its first 512 columns, the bytes `a_v` holds).
+            rkv = g.merged
+            step = rkv.launch.max_rows
+            for r0 in range(0, mha.tk, step):
+                r1 = min(mha.tk, r0 + step)
+                b = r0 // 128
+                cute_dsl_projection_mxf8(
+                    a_k[r0:r1], w_k, mha.kv[r0:r1], rkv, sfa=sfa_k[b * blk_k :]
+                )
+            return
         rk, rv = core._kvb_expand["k"], core._kvb_expand["v"]
         step = rk.launch.max_rows
-        blk_k, blk_v = _kv_gather8_op.sf_bytes_k(128), _kv_gather8_op.sf_bytes_v(128)
         for r0 in range(0, mha.tk, step):
             r1 = min(mha.tk, r0 + step)
             b = r0 // 128
@@ -3225,9 +3519,10 @@ class PrefillTarget:
         x8=None,
         ctx_last=None,
     ):
-        """One layer's attention block, both phases, into `attn_out`. `slots_of(topk_buf)` maps
-        the request-local selection to this layer's pool rows, `(context, generation)`; the
-        context half is None under the dense-causal context attention (`dc`). `x8` is `x`'s
+        """One layer's attention block, both phases, into `attn_out`. `slots_of(topk_buf, fresh)`
+        maps the request-local selection to this layer's pool rows, `(context, generation,
+        generation index kind, its layer)` (`fresh`: this layer selected anew); the context half
+        is None under the dense-causal context attention (`dc`). `x8` is `x`'s
         MXF8 operand (the closing all-reduce of the layer before wrote it).
 
         Returns o_proj's MXF8 operand `(q8, sf)` when the fp8 context attention wrote the
@@ -3289,7 +3584,7 @@ class PrefillTarget:
                 core._indexer_decode(
                     md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p
                 )
-        slots_ctx, slots_gen = slots_of(topk_buf)
+        slots_ctx, slots_gen, gen_kind, gen_layer = slots_of(topk_buf, ix is not None)
         if mha8:
             q_ctx = core._q_b_e4m3(q_a[:tc], a, pre=qa8)
             q_gen = core._project_tail("q_b", q_a, tc, a.qb) if gen else None
@@ -3312,17 +3607,37 @@ class PrefillTarget:
                 torch.empty([rows, core.heads * core.v_dim], dtype=torch.uint8, device=x.device),
                 torch.empty(_mha_pre_op.sf_bytes(rows), dtype=torch.uint8, device=x.device),
             )
+        # On a mixed step on the fp8 MHA route the generation rows' attention (absorbed K-B,
+        # RoPE append, sparse MLA decode, V-B) reads only q_gen / lat_gen / their slots and the
+        # generation requests' pool pages, and writes only attn_gen and those pages, so it runs
+        # on its own stream beside the context rows' RoPE, K/V expansion and MHA instead of
+        # after them (about 30 us per layer on the critical path at 7-8k context rows on B300;
+        # -9 us per layer net, the expansion GEMM sharing SMs with it). Joined before the
+        # generation rows' quantize and o_proj read attn_gen. Same kernels and inputs: the
+        # outputs are bit for bit the serial ones. The absorbed context path shares K-B / V-B
+        # with these rows and keeps the serial order.
+        gen_side = bool(gen and tc and mha8 and ctx_last is None and core._gen_stream is not None)
+        if gen_side:
+            core._gen_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(core._gen_stream):
+                core._attn_gen(
+                    a, pool_layer, q_gen, lat_gen, attn_gen, slots_gen, gen, gen_p, ctx, md,
+                    gen_kind, gen_layer, False,
+                )  # fmt: skip
+            core._count("ctx_gen_side", True)
         o8_done = False
         if tc:
             o8_done = self._attn_ctx(
                 a, pool_layer, q_ctx, lat_ctx, attn_ctx, slots_ctx, tc, step, ctx_rope, dc, o8,
                 ctx_last,
             )  # fmt: skip
-        if gen:
+        if gen and not gen_side:
             core._attn_gen(
                 a, pool_layer, q_gen, lat_gen, attn_gen, slots_gen, gen, gen_p, ctx, md,
-                INDEX_KIND_GLOBAL, None, False,
+                gen_kind, gen_layer, False,
             )  # fmt: skip
+        if gen_side:
+            torch.cuda.current_stream().wait_stream(core._gen_stream)
         if not o8_done:
             return None
         # The generation rows' bf16 attention into the rows after the context rows (none on a
@@ -3372,6 +3687,18 @@ class PrefillTarget:
         # Under `dc` the context rows' pool rows are formed inside the attention kernel, so the
         # conversion runs on the generation rows alone, or not at all.
         slot_lo = tc if dc is not None else 0
+        # TRTLLM_GLM52_MIXED_BASE (default 1): with only the generation rows converting (the
+        # dense-causal route) at the MTP width, the generation rows take the layer-independent
+        # base rows, converted once per fresh selection, and the sparse MLA decode adds each
+        # layer's offset, as on a pure decode step: the same pool rows, instead of one global
+        # conversion per layer (78 launches per mixed step).
+        mixed_base = (
+            core._mixed_base
+            and slot_lo == tc
+            and gen > 0
+            and gen_p == _MLA_ROPE_MTP_WIDTH
+        )
+        base = None
 
         x = core._rmsnorm(h, core._attn[0].norm1)
         x8 = None
@@ -3379,14 +3706,24 @@ class PrefillTarget:
         for i in range(core.num_layers):
             layer_id = core._pool_layer_id[i]
 
-            def slots_of(buf, layer_id=layer_id):
+            def slots_of(buf, fresh, layer_id=layer_id):
+                nonlocal base
                 if slot_lo == rows:
-                    return None, None
+                    return None, None, INDEX_KIND_GLOBAL, None
+                if mixed_base:
+                    if fresh or base is None:
+                        base = cute_dsl_req_index_to_base(
+                            req_idx[tc:], md.block_table, buf[tc:], md.tokens_per_block,
+                            core._stride_factor, compiled=core._req_base_compiled,
+                        )  # fmt: skip
+                        core._count("mixed_base", True)
+                    return None, base, INDEX_KIND_BASE_WITH_LAYER_OFFSET, layer_id
                 slots = cute_dsl_req_index_to_global(
                     req_idx[slot_lo:], md.block_table, buf[slot_lo:], md.tokens_per_block,
                     core._stride_factor, layer_id, compiled=core._req_global_compiled,
                 )  # fmt: skip
-                return (None, slots) if slot_lo else torch.split(slots, [tc, gen], 0)
+                ctx_s, gen_s = (None, slots) if slot_lo else torch.split(slots, [tc, gen], 0)
+                return ctx_s, gen_s, INDEX_KIND_GLOBAL, None
 
             o8 = self._layer_attention(
                 md, step, x, pos, attn_out, i, i, slots_of, topk_buf, rows, tc, gen, gen_p, ctx,
@@ -3430,7 +3767,9 @@ class PrefillTarget:
         host_cu = step["host_ctx_uncached_token_indptr"][: ctx + 1].to(torch.int64)
         host_ci = step["host_ctx_cached_token_indptr"][: ctx + 1].to(torch.int64)
         lens = host_cu[1:] - host_cu[:-1]
-        if why is None and (int(host_cu[0]) != 0 or int(host_cu[ctx]) != tc or bool((lens < 1).any())):
+        if why is None and (
+            int(host_cu[0]) != 0 or int(host_cu[ctx]) != tc or bool((lens < 1).any())
+        ):
             why = "lens"
         ke = host_ci[1:] - host_ci[:-1] + lens
         if why is None and int(ke.max()) > core.idx_topk:
@@ -3523,20 +3862,21 @@ class PrefillTarget:
         if ctx_rope is not None and core._rows_sel is not None:
             last = self._mtp_last_plan(md, step, ctx, tc, gen, local, stride)
 
-        def slots_of(buf):
+        def slots_of(buf, fresh):
             if last is not None:
                 # The context queries read the block table: only the generation rows convert.
                 if not gen:
-                    return None, None
+                    return None, None, INDEX_KIND_GLOBAL, None
                 slots = convert_req_index_to_global(
                     req_idx[tc:], md.block_table, buf[tc:], md.tokens_per_block, core.idx_topk,
                     stride, pool_layer,
                 )  # fmt: skip
-                return None, slots
+                return None, slots, INDEX_KIND_GLOBAL, None
             slots = convert_req_index_to_global(
                 req_idx, md.block_table, buf, md.tokens_per_block, core.idx_topk, stride, pool_layer
             )
-            return torch.split(slots, [tc, gen], 0)
+            ctx_s, gen_s = torch.split(slots, [tc, gen], 0)
+            return ctx_s, gen_s, INDEX_KIND_GLOBAL, None
 
         on_kernel = core.route_hits.get("ctx_rope", 0)
         out_rows = rows if last is None else last.r_pad
@@ -3551,7 +3891,9 @@ class PrefillTarget:
         if last is None:
             return core._mtp_close(attn_out, residual, rows)
         # The selected rows' residual, the close on those rows, then the rows back in place.
-        res_sel = torch.empty([last.r_pad, residual.shape[1]], dtype=residual.dtype, device=x.device)
+        res_sel = torch.empty(
+            [last.r_pad, residual.shape[1]], dtype=residual.dtype, device=x.device
+        )
         cute_dsl_rows_select(residual, last.rows, res_sel, core._rows_sel)
         out = core._mtp_close(attn_out, res_sel, last.r_pad)
         full = torch.empty([rows, out.shape[1]], dtype=out.dtype, device=out.device)

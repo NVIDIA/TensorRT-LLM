@@ -101,21 +101,33 @@ def _load_kernel(name, policy, use_pdl):
     return module
 
 
-def compile_gg1(*, tile_n: int, num_sms: int, use_pdl: bool):
-    """Compile gather/GG1/SwiGLU/NVFP4 using the actual unpadded input-scale ABI."""
+def _require_experts(experts):
+    """The stacks' expert count: 64 home experts, plus replica slots (up to 16)."""
+    if type(experts) is not int or not 64 <= experts <= 80:
+        raise ValueError("experts must be an integer in [64, 80]")
+
+
+def compile_gg1(*, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64):
+    """Compile gather/GG1/SwiGLU/NVFP4 using the actual unpadded input-scale ABI.
+
+    `experts`: the weight / scale / alpha stacks' depth (64 home experts; 64 + R with replica
+    slots). Only the operands' L extent changes; the kernel indexes the stacks through the
+    tile maps."""
     _require_contract(tile_n, num_sms, use_pdl)
+    _require_experts(experts)
     module = _load_kernel("moe_prefill_nvfp4_gg1", "evict_last", use_pdl)
-    return _compile_gg1(module, tile_n, num_sms)
+    return _compile_gg1(module, tile_n, num_sms, experts=experts)
 
 
-def compile_gg2(*, tile_n: int, num_sms: int, use_pdl: bool):
-    """Compile compact-M128 GG2/weighted BF16 atomic finalize (no bias)."""
+def compile_gg2(*, tile_n: int, num_sms: int, use_pdl: bool, experts: int = 64):
+    """Compile compact-M128 GG2/weighted BF16 atomic finalize (no bias); `experts` as GG1's."""
     _require_contract(tile_n, num_sms, use_pdl)
+    _require_experts(experts)
     module = _load_kernel("moe_prefill_nvfp4_gg2", "evict_first", use_pdl)
-    return _compile_gg2(module, tile_n, num_sms)
+    return _compile_gg2(module, tile_n, num_sms, experts=experts)
 
 
-def _compile_gg1(module, tile_n, num_sms, bindings=None):
+def _compile_gg1(module, tile_n, num_sms, bindings=None, experts=64):
     """Build the packed GG1 ABI; inputs and linear scales share unpadded T."""
     if bindings is None:
         cutlass = importlib.import_module("cutlass")
@@ -133,15 +145,15 @@ def _compile_gg1(module, tile_n, num_sms, bindings=None):
 
     return cute.compile(
         module.moe,
-        fake(cutlass.Float4E2M1FNx2, (64, 3072, 4096), (2, 0, 1)),
-        fake(cutlass.Float8E4M3FN, (64, 32, 96, 512), (3, 2, 1, 0)),
+        fake(cutlass.Float4E2M1FNx2, (experts, 3072, 4096), (2, 0, 1)),
+        fake(cutlass.Float8E4M3FN, (experts, 32, 96, 512), (3, 2, 1, 0)),
         fake(cutlass.Float4E2M1FNx2, (1, rows, 1024), (2, 1, 0)),
         fake(cutlass.Int32, (tiles,), (0,)),
         fake(cutlass.Float4E2M1FNx2, (1, tokens, 3072), (2, 1, 0)),
         fake(cutlass.Float8E4M3FN, (tokens, 384, 1), (2, 1, 0)),
         fake(cutlass.Float8E4M3FN, (1, tiles, 32, 512), (3, 2, 1, 0)),
         fake(cutlass.Float32, (1,), (0,)),
-        fake(cutlass.Float32, (64,), (0,)),
+        fake(cutlass.Float32, (experts,), (0,)),
         fake(cutlass.Int32, (rows,), (0,)),
         fake(cutlass.Int32, (tiles,), (0,)),
         cutlass.Int32(6144),
@@ -162,7 +174,7 @@ def _compile_gg1(module, tile_n, num_sms, bindings=None):
     )
 
 
-def _compile_gg2(module, tile_n, num_sms, bindings=None):
+def _compile_gg2(module, tile_n, num_sms, bindings=None, experts=64):
     """Build compact-M128 GG2 ABI with distinct dynamic row/tile/SF extents."""
     if bindings is None:
         cutlass = importlib.import_module("cutlass")
@@ -182,15 +194,15 @@ def _compile_gg2(module, tile_n, num_sms, bindings=None):
     return cute.compile(
         module.moe,
         fake(cutlass.Float4E2M1FNx2, (1, rows, 1024), (2, 1, 0)),
-        fake(cutlass.Float4E2M1FNx2, (64, 1024, 6144), (2, 0, 1)),
+        fake(cutlass.Float4E2M1FNx2, (experts, 1024, 6144), (2, 0, 1)),
         fake(cutlass.Float8E4M3FN, (1, sf_atoms, 32, 512), (3, 2, 1, 0)),
-        fake(cutlass.Float8E4M3FN, (64, 48, 32, 512), (3, 2, 1, 0)),
+        fake(cutlass.Float8E4M3FN, (experts, 48, 32, 512), (3, 2, 1, 0)),
         fake(cutlass.BFloat16, (tokens, 6144), (1, 0)),
         fake(cutlass.Int32, (tiles,), (0,)),
-        fake(cutlass.Float32, (64, 6144), (1, 0)),
+        fake(cutlass.Float32, (experts, 6144), (1, 0)),
         fake(cutlass.Int32, (rows,), (0,)),
         fake(cutlass.Float32, (tokens, 8), (1, 0)),
-        fake(cutlass.Float32, (64,), (0,)),
+        fake(cutlass.Float32, (experts,), (0,)),
         fake(cutlass.Int32, (tiles,), (0,)),
         cutlass.Int32(2048),
         cutlass.Int32(6144),

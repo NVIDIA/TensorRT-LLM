@@ -41,6 +41,7 @@ from typing import Any, Callable
 import torch
 import torch.nn as nn
 
+from . import dec_hot_experts as _hot
 from .kernels.moe import mtp_moe_gather_grouped_gemm_act_fusion as _mtp_fc1
 
 # FC1 pairs up and gate in 64-row blocks; the MTP kernel's `epi_subtile_n` is the same 64.
@@ -103,11 +104,11 @@ class W:
 
 
 def _rows(start, width):
-    return lambda d: (lambda e: e[start(d) : start(d) + width(d)])
+    return lambda d: lambda e: e[start(d) : start(d) + width(d)]
 
 
 def _cols(start, width):
-    return lambda d: (lambda e: e[:, start(d) : start(d) + width(d)])
+    return lambda d: lambda e: e[:, start(d) : start(d) + width(d)]
 
 
 def _pair_perm(rows: int, device) -> torch.Tensor:
@@ -229,12 +230,15 @@ def _pair(a, b):
 
 
 def _expert_window(suffix, *, pair_with=None):
-    """This rank's routed experts, one source per local expert."""
+    """This rank's routed experts, one source per local expert; then, with decode expert
+    replicas, layer `i`'s hot experts in slots `64 + h` (`dec_hot_experts`)."""
 
     def build(d, i):
+        slots = [(local, d.expert_offset + local) for local in range(d.local_experts)]
+        slots += [(d.local_experts + h, e) for h, e in enumerate(d.dec_hot.get(i, ()))]
         out = []
-        for local in range(d.local_experts):
-            q = f"model.layers.{i}.mlp.experts.{d.expert_offset + local}"
+        for local, expert in slots:
+            q = f"model.layers.{i}.mlp.experts.{expert}"
             key = f"{q}.{suffix}" if pair_with is None else (f"{q}.{suffix}", f"{q}.{pair_with}")
             out.append((key, (local,)))
         return out
@@ -416,7 +420,7 @@ class GlmMoeDsaTep4Weights:
         # --- this rank's NVFP4 routed experts, in the vendored grouped GEMM layout ---
         W(
             "fc1_w",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // 2),
+            shape=lambda d: (d.local_experts + d.dec_replicas, 2 * d.moe_inter, d.hidden // 2),
             dtype=torch.uint8,
             src=_expert_window("up_proj.weight", pair_with="gate_proj.weight"),
             transform=_fc1_w,
@@ -425,7 +429,7 @@ class GlmMoeDsaTep4Weights:
         W(
             "fc1_s",
             shape=lambda d: (
-                d.local_experts,
+                d.local_experts + d.dec_replicas,
                 2 * d.moe_inter // SF_ATOM_MN,
                 d.hidden // SF_ATOM_K,
                 SF_ATOM,
@@ -437,7 +441,7 @@ class GlmMoeDsaTep4Weights:
         ),
         W(
             "fc2_w",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // 2),
+            shape=lambda d: (d.local_experts + d.dec_replicas, d.hidden, d.moe_inter // 2),
             dtype=torch.uint8,
             src=_expert_window("down_proj.weight"),
             layers=_routed_layers,
@@ -445,7 +449,7 @@ class GlmMoeDsaTep4Weights:
         W(
             "fc2_s",
             shape=lambda d: (
-                d.local_experts,
+                d.local_experts + d.dec_replicas,
                 d.hidden // SF_ATOM_MN,
                 d.moe_inter // SF_ATOM_K,
                 SF_ATOM,
@@ -553,13 +557,14 @@ class GlmMoeDsaTep4Weights:
         return rows
 
     def expected_unconsumed(self, core, weights) -> set:
-        """This rank's off-window experts, and the MTP module whole when it is not live."""
+        """This rank's off-window experts (a layer's replicated hot experts are loaded on
+        every rank), and the MTP module whole when it is not live."""
         d = self.dims(core)
         lo, hi = d.expert_offset, d.expert_offset + d.local_experts
         keys = set()
         for i in _routed_layers(d):
             for e in range(d.num_experts):
-                if lo <= e < hi:
+                if lo <= e < hi or e in d.dec_hot.get(i, ()):
                     continue
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     keys.add(f"model.layers.{i}.mlp.experts.{e}.{proj}.weight")
@@ -638,6 +643,7 @@ class GlmMoeDsaTep4Weights:
         mapping = core.model_config.mapping
         tp = mapping.tp_size
         local_experts = cfg.n_routed_experts // mapping.moe_ep_size
+        replicas = _hot.replicas()
         return SimpleNamespace(
             num_layers=cfg.num_hidden_layers,
             hidden=cfg.hidden_size,
@@ -657,6 +663,9 @@ class GlmMoeDsaTep4Weights:
             dense_inter=cfg.intermediate_size // tp,
             local_experts=local_experts,
             expert_offset=local_experts * mapping.moe_ep_rank,
+            # Decode expert replicas: slots 64.. of the routed stacks, per trunk MoE layer.
+            dec_replicas=replicas,
+            dec_hot={i: _hot.hot(i, replicas) for i in _hot.HOT} if replicas else {},
             tp_rank=mapping.tp_rank,
             tp_size=tp,
             idx_heads=cfg.index_n_heads,

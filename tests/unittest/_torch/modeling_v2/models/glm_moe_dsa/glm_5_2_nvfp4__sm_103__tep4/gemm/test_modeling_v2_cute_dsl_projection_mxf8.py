@@ -29,9 +29,14 @@ def _shape(kernel: str) -> tuple[int, int]:
 
 
 def _weight(kernel: str, g: torch.Generator) -> torch.Tensor:
-    """A row-major bf16 `[N, K]` weight scaled so each output is O(1)."""
+    """A row-major bf16 `[N, K]` weight scaled so each output is O(1); zero where a split
+    entry's tiles do not read it (`n_split_k`, the entry's contract)."""
     n, k = _shape(kernel)
-    return (torch.randn(n, k, generator=g, device="cuda") * k**-0.5).to(torch.bfloat16)
+    w = (torch.randn(n, k, generator=g, device="cuda") * k**-0.5).to(torch.bfloat16)
+    split = entry._kernel.ABIS[entry.ENTRIES[kernel]].n_split_k
+    if split is not None:
+        w[split[0] :, split[1] :] = 0
+    return w
 
 
 def _runner(kernel: str) -> entry.Mxf8ProjectionRunner:
@@ -93,9 +98,7 @@ def test_certified_cells(cell) -> None:
         x = torch.randn(rows, k, generator=g, device="cuda").to(torch.bfloat16)
         if cell.spec.get("x_row_stride"):
             # The tail of a wider row, as q_b reads q_a in the q_a | kv_a projection row.
-            wide = torch.zeros(
-                rows, cell.spec["x_row_stride"], dtype=torch.bfloat16, device="cuda"
-            )
+            wide = torch.zeros(rows, cell.spec["x_row_stride"], dtype=torch.bfloat16, device="cuda")
             wide[:, :k] = x
             x = wide[:, :k]
         if cell.spec.get("pre"):

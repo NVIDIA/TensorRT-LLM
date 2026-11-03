@@ -223,8 +223,8 @@ def epilogue_tma_store(
     acc_pipeline: pipeline.PipelineAsync,
     c_pipeline: pipeline.PipelineTmaStore,
 ) -> pipeline.PipelineState:
-    """Dispatch: exact double-round for FP8 C, the BF16 store plus an MXF8 side output for
-    a kernel carrying ``glm_mxf8_side``, else the library epilogue."""
+    """Dispatch: exact double-round for FP8 C (unless ``glm_fp8_single_round``), the BF16 store
+    plus an MXF8 side output for a kernel carrying ``glm_mxf8_side``, else the library epilogue."""
     if const_expr(getattr(gemm_kernel, "glm_mxf8_side", None) is not None):
         return epilogue_tma_store_mxf8_side(
             gemm_kernel,
@@ -242,7 +242,10 @@ def epilogue_tma_store(
             acc_pipeline,
             c_pipeline,
         )
-    if const_expr(gemm_kernel.c_dtype is cutlass.Float8E4M3FN):
+    if const_expr(
+        gemm_kernel.c_dtype is cutlass.Float8E4M3FN
+        and not getattr(gemm_kernel, "glm_fp8_single_round", False)
+    ):
         return epilogue_tma_store_fp8_word_packed(
             gemm_kernel,
             epi_tidx,
@@ -451,9 +454,7 @@ class Mxf8SideOutput:
         if self.q_addr % 16 or self.sf_addr % 16:
             raise ValueError("MXF8 side output buffers must be 16-byte aligned")
         if self.k_cols % 128 or self.l_cols % 32:
-            raise ValueError(
-                "MXF8 side output needs k_cols % 128 == 0 and l_cols % 32 == 0"
-            )
+            raise ValueError("MXF8 side output needs k_cols % 128 == 0 and l_cols % 32 == 0")
 
 
 @cute.jit
@@ -477,12 +478,8 @@ def _mxf8_side_store_subtile(
     M8 = EPI_M // 8
     CHUNKS = M8 * EPI_N
     ITERS = (CHUNKS + num_threads - 1) // num_threads
-    q_base = cute.make_ptr(
-        cutlass.Uint8, side.q_addr, cute.AddressSpace.gmem, assumed_align=16
-    )
-    sf_base = cute.make_ptr(
-        cutlass.Uint8, side.sf_addr, cute.AddressSpace.gmem, assumed_align=16
-    )
+    q_base = cute.make_ptr(cutlass.Uint8, side.q_addr, cute.AddressSpace.gmem, assumed_align=16)
+    sf_base = cute.make_ptr(cutlass.Uint8, side.sf_addr, cute.AddressSpace.gmem, assumed_align=16)
     for it in cutlass.range_constexpr(ITERS):
         c = epi_tidx + it * num_threads
         # Chunks past CHUNKS (only when CHUNKS % num_threads != 0) re-read an in-range chunk
@@ -533,10 +530,8 @@ def epilogue_tma_store_mxf8_side(
     tCgC = sm100_epilogue.transform_partitioned_tensor_layout(tCgC_base)
     tCtAcc = sm100_epilogue.transform_partitioned_tensor_layout(tCtAcc_base)
 
-    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
-        sm100_epilogue.epilogue_tmem_copy_and_partition(
-            gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
-        )
+    tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = sm100_epilogue.epilogue_tmem_copy_and_partition(
+        gemm_kernel, epi_tidx, tCtAcc, tCgC, epi_tile, gemm_kernel.use_2cta_instrs
     )
 
     tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, gemm_kernel.c_dtype)
@@ -742,6 +737,9 @@ class PersistentDenseGemmKernel:
         # decode act-quant fusion: the epilogue also writes the output as MXF8
         # (``epilogue_tma_store_mxf8_side``); set by the PDL-chain factory
         self.glm_mxf8_side = None
+        # FP8 C rounded once (FP32 -> E4M3 RN satfinite, the library epilogue) instead of the
+        # FP32 -> BF16 -> E4M3 double round; set by callers whose FP8 C is defined that way
+        self.glm_fp8_single_round = False
         # K dimension is deferred in _setup_attributes
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)

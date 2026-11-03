@@ -52,17 +52,11 @@ Shape: runtime C cached + T new rows of 576 (512 latent + 64 rope)
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
-
 
 LAT = 576  # 512 latent + 64 rope, one pool row in e4m3 bytes
 KV_LORA = 512
@@ -124,11 +118,7 @@ def _store_words(base, offset, w0, w1) -> None:
 @cute.jit
 def _sf_offset(m, kf, groups: cutlass.Constexpr[int]):
     return (
-        (m % 32) * 16
-        + ((m // 32) % 4) * 4
-        + kf % 4
-        + (kf // 4) * 512
-        + (m // 128) * (512 * groups)
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + kf % 4 + (kf // 4) * 512 + (m // 128) * (512 * groups)
     )
 
 
@@ -172,9 +162,7 @@ def glm52_self_attn_prefill_mha_kv_gather_mxf8_kernel(
         dst = idx[w]
         tok = idx[cached + w]
         pos = idx[cached * 2 + w]
-        block = cutlass.Int64(
-            block_table[cutlass.Int64(req_idx[tok]), pos // tokens_per_block]
-        )
+        block = cutlass.Int64(block_table[cutlass.Int64(req_idx[tok]), pos // tokens_per_block])
         pool_row = block * stride_factor + pos % tokens_per_block + layer_offset
         raw = cute.make_rmem_tensor((_VEC,), cutlass.Uint8)
         cute.autovec_copy(
@@ -196,8 +184,7 @@ def glm52_self_attn_prefill_mha_kv_gather_mxf8_kernel(
                 dst = idx[cutlass.Int64(num_cached) * 3 + cutlass.Int64(t)]
             values = cute.make_rmem_tensor((_VEC,), cutlass.BFloat16)
             new_row = cute.make_tensor(
-                latent_new.iterator
-                + cute.assume(cutlass.Int64(t) * new_row_stride + col, _VEC),
+                latent_new.iterator + cute.assume(cutlass.Int64(t) * new_row_stride + col, _VEC),
                 cute.make_layout((_VEC,)),
             )
             cute.autovec_copy(new_row, values)
@@ -246,9 +233,7 @@ def glm52_self_attn_prefill_mha_kv_gather_mxf8_kernel(
             kf = chunk // 4
             (sfa_k.iterator + _sf_offset(dst, kf, _K_GROUPS)).store(cutlass.Uint8(code))
             if kf < KV_LORA // _SF_VEC:
-                (sfa_v.iterator + _sf_offset(dst, kf, _V_GROUPS)).store(
-                    cutlass.Uint8(code)
-                )
+                (sfa_v.iterator + _sf_offset(dst, kf, _V_GROUPS)).store(cutlass.Uint8(code))
             if kf == LAT // _SF_VEC - 1:
                 # the K operand's last group: blocks 18, 19 are padding (A zero-filled)
                 for pad in cutlass.range_constexpr(_K_GROUPS * 4 - LAT // _SF_VEC):
@@ -314,12 +299,8 @@ def compile_gather(device_index: int = 0) -> CompiledKernel:
                 stride_order=(1, 0),
                 assumed_align=8,
             ),
-            make_fake_compact_tensor(
-                cutlass.Int64, (cute.sym_int32(),), assumed_align=8
-            ),
-            make_fake_compact_tensor(
-                cutlass.Int32, (cute.sym_int32(),), assumed_align=4
-            ),
+            make_fake_compact_tensor(cutlass.Int64, (cute.sym_int32(),), assumed_align=8),
+            make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=4),
             make_fake_tensor(
                 cutlass.Int32,
                 (cute.sym_int32(), cute.sym_int32()),
@@ -419,13 +400,8 @@ def gather(
         or pool_rows.shape[1] != LAT
         or not pool_rows.is_contiguous()
         or not (idx.is_cuda and idx.dtype == torch.int64 and idx.is_contiguous())
-        or (
-            (num_cached > 0 or new_dst_from_idx)
-            and idx.numel() != 3 * num_cached + num_new
-        )
-        or not (
-            req_idx.is_cuda and req_idx.dtype == torch.int32 and req_idx.is_contiguous()
-        )
+        or ((num_cached > 0 or new_dst_from_idx) and idx.numel() != 3 * num_cached + num_new)
+        or not (req_idx.is_cuda and req_idx.dtype == torch.int32 and req_idx.is_contiguous())
         or not (block_table.is_cuda and block_table.dtype == torch.int32)
         or block_table.ndim != 2
         or block_table.stride(1) != 1
@@ -478,17 +454,10 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     amax = xf.abs().amax(-1).clamp_min(_MIN_AMAX)
     scale = amax * torch.tensor(_INV_E4M3_MAX, dtype=torch.float32, device=x.device)
     bits = scale.view(torch.int32)
-    exp_bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(
-        torch.int32
-    ) * 0x00800000
+    exp_bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
     code = (exp_bits >> 23).to(torch.int32)
     inv = 1.0 / exp_bits.view(torch.float32)
-    q = (
-        (xf * inv[..., None])
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
-        .reshape(rows, LAT)
-    )
+    q = (xf * inv[..., None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(rows, LAT)
     return q, code
 
 
@@ -496,11 +465,7 @@ def _sf_offsets(rows: int, kf: int, groups: int, device) -> torch.Tensor:
     m = torch.arange(rows, device=device)[:, None]
     f = torch.arange(kf, device=device)[None, :]
     return (
-        (m % 32) * 16
-        + ((m // 32) % 4) * 4
-        + f % 4
-        + (f // 4) * 512
-        + (m // 128) * (512 * groups)
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + f % 4 + (f // 4) * 512 + (m // 128) * (512 * groups)
     )
 
 
@@ -536,15 +501,13 @@ def reference(
         src = block_table[req_idx[tok_c].to(torch.int64), pos_c // tokens_per_block].to(
             torch.int64
         ) * stride_factor + (pos_c % tokens_per_block)
-        cached = pool_rows.narrow(
-            0, layer_offset, pool_rows.shape[0] - layer_offset
-        ).index_select(0, src)
+        cached = pool_rows.narrow(0, layer_offset, pool_rows.shape[0] - layer_offset).index_select(
+            0, src
+        )
         a_k[dst_c] = cached
         a_v[dst_c] = cached[:, :KV_LORA]
     dst_n = (
-        idx[3 * c :]
-        if new_dst_from_idx
-        else torch.arange(t, device=a_k.device, dtype=torch.int64)
+        idx[3 * c :] if new_dst_from_idx else torch.arange(t, device=a_k.device, dtype=torch.int64)
     )
     q, code_n = quantize_rows(latent_new)
     a_k[dst_n] = q

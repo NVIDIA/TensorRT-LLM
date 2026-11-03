@@ -30,19 +30,17 @@ instance serves every decode bucket.  Pointer arguments only: CUDA-graph safe.
 from collections.abc import Callable
 from dataclasses import dataclass
 
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda_exp
 from cuda.bindings import driver as cuda
-from cutlass.experimental import primitives as prims
-from ..common import compat48 as _compat48
 from cutlass.base_dsl.array import L1EvictKind
+from cutlass.experimental import primitives as prims
+
+from ..common import compat48 as _compat48
 
 MMA_M = 128  # block-scaled tcgen05 cta_group::1 M
-TILE_K = (
-    128  # e4m3 elements (= bytes) of K per pipeline stage: 128 B rows -> s128b swizzle
-)
+TILE_K = 128  # e4m3 elements (= bytes) of K per pipeline stage: 128 B rows -> s128b swizzle
 INST_K = 32  # K of one MXF8 MMA instruction
 KBLOCKS = TILE_K // INST_K  # 4
 SF_VEC = 32
@@ -109,9 +107,7 @@ class Mxf8ProjectionConfig:
                 f"{self.module_name}: prefetch_w must be none/rest/all, got {self.prefetch_w!r}"
             )
         if self.k_sub not in (1, 2):
-            raise ValueError(
-                f"{self.module_name}: k_sub must be 1 or 2, got {self.k_sub}"
-            )
+            raise ValueError(f"{self.module_name}: k_sub must be 1 or 2, got {self.k_sub}")
         if self.local_k_steps % self.k_sub:
             raise ValueError(
                 f"{self.module_name}: per-rank K tiles {self.local_k_steps} not a multiple of k_sub={self.k_sub}"
@@ -121,9 +117,7 @@ class Mxf8ProjectionConfig:
                 f"{self.module_name}: a_box_rows must be 64 or 128, got {self.a_box_rows}"
             )
         if self.mma_n not in (64, 128):
-            raise ValueError(
-                f"{self.module_name}: mma_n must be 64 or 128, got {self.mma_n}"
-            )
+            raise ValueError(f"{self.module_name}: mma_n must be 64 or 128, got {self.mma_n}")
         if self.n % self.mma_n:
             raise ValueError(
                 f"{self.module_name}: N={self.n} must be a multiple of mma_n={self.mma_n}"
@@ -133,9 +127,7 @@ class Mxf8ProjectionConfig:
                 f"{self.module_name}: K={self.k} must be a multiple of {TILE_K} x split_k={self.split_k}"
             )
         if not 1 <= self.split_k <= 8:
-            raise ValueError(
-                f"{self.module_name}: split_k={self.split_k} must be in [1, 8]"
-            )
+            raise ValueError(f"{self.module_name}: split_k={self.split_k} must be in [1, 8]")
         if not 1 <= self.stages <= self.local_k_steps // self.k_sub:
             raise ValueError(
                 f"{self.module_name}: stages={self.stages} must be in [1, {self.local_k_steps // self.k_sub}]"
@@ -145,9 +137,7 @@ class Mxf8ProjectionConfig:
                 f"{self.module_name}: mma_n={self.mma_n} does not split over {self.reducers} reducers"
             )
         if self.tmem_cols_alloc > 512:
-            raise ValueError(
-                f"{self.module_name}: {self.tmem_cols_alloc} TMEM columns > 512"
-            )
+            raise ValueError(f"{self.module_name}: {self.tmem_cols_alloc} TMEM columns > 512")
         if self.smem_total_bytes > SMEM_LIMIT_BYTES:
             raise ValueError(
                 f"{self.module_name}: stages={self.stages} split_k={self.split_k} needs "
@@ -156,10 +146,7 @@ class Mxf8ProjectionConfig:
 
     @property
     def prefix(self) -> str:
-        return (
-            self.kernel_name_prefix
-            or f"glm52_{self.module_name.replace('.', '_')}_mxf8"
-        )
+        return self.kernel_name_prefix or f"glm52_{self.module_name.replace('.', '_')}_mxf8"
 
     @property
     def n_ctas(self) -> int:
@@ -187,12 +174,7 @@ class Mxf8ProjectionConfig:
 
     @property
     def tmem_cols_alloc(self) -> int:
-        return (
-            1
-            << (
-                self.mma_n + 2 * SF_TMEM_COLS * self.k_sub * self.sf_bufs - 1
-            ).bit_length()
-        )
+        return 1 << (self.mma_n + 2 * SF_TMEM_COLS * self.k_sub * self.sf_bufs - 1).bit_length()
 
     @property
     def stage_ab_bytes(self) -> int:
@@ -227,9 +209,7 @@ class Mxf8ProjectionConfig:
     @property
     def mailbox_values(self) -> int:
         return (
-            1
-            if self.reduce_peers == 0
-            else self.reduce_peers * OWNER_TOTAL * self.mailbox_stride
+            1 if self.reduce_peers == 0 else self.reduce_peers * OWNER_TOTAL * self.mailbox_stride
         )
 
     @property
@@ -239,13 +219,7 @@ class Mxf8ProjectionConfig:
     @property
     def smem_total_bytes(self) -> int:
         stage = self.stage_ab_bytes + 2 * SF_ATOM_BYTES * self.k_sub
-        return (
-            self.stages * stage
-            + self.mailbox_values * 4
-            + 8 * (2 * self.stages + 2)
-            + 4
-            + 1024
-        )
+        return self.stages * stage + self.mailbox_values * 4 + 8 * (2 * self.stages + 2) + 4 + 1024
 
     @property
     def weight_bytes(self) -> int:
@@ -300,26 +274,16 @@ def kernel(
     smem_sfw = cutlass.Array(
         cutlass.Int8, stages * SF_STAGE, space=cutlass.AddressSpace.smem, alignment=128
     )
-    full_bar = cutlass.Array(
-        cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    empty_bar = cutlass.Array(
-        cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    acc_mbar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    reduce_full = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
-    )
+    full_bar = cutlass.Array(cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8)
+    empty_bar = cutlass.Array(cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8)
+    acc_mbar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    reduce_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     # Own storage (not aliased onto the stages): a peer's DSMEM partials may land while
     # this rank's TMA is still filling its stages (see _projection_tcgen05_template).
     reduce_mailbox = cutlass.Array(
         cutlass.Float32, mailbox_values, space=cutlass.AddressSpace.smem, alignment=128
     )
-    tmem_ptr_i32 = cutlass.Array(
-        cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
-    )
+    tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
 
     warp_idx = cute.arch.warp_idx()
     tidx, _, _ = cute.arch.thread_idx()
@@ -333,9 +297,7 @@ def kernel(
     sfw_col_offset = cutlass.Int32(0)
     if cutlass.const_expr(mma_n < SF_ATOM_ROWS):
         per_atom: cutlass.Constexpr[int] = SF_ATOM_ROWS // mma_n
-        sfw_col_offset = (bidx % cutlass.Int32(per_atom)) * cutlass.Int32(
-            SF_TMEM_COLS // per_atom
-        )
+        sfw_col_offset = (bidx % cutlass.Int32(per_atom)) * cutlass.Int32(SF_TMEM_COLS // per_atom)
     kt_base = cta_rank * cutlass.Int32(local_k_steps)
     sfw_atom_base = n_atom * cutlass.Int32(k_tiles) + kt_base
 
@@ -348,8 +310,7 @@ def kernel(
                     prims.cp_async_bulk_tensor_prefetch(
                         tma_w.get_ptr(),
                         (
-                            (kt_base + cutlass.Int32(prefetch_lo + kk))
-                            * cutlass.Int32(TILE_K),
+                            (kt_base + cutlass.Int32(prefetch_lo + kk)) * cutlass.Int32(TILE_K),
                             coord_n,
                         ),
                         [],
@@ -550,16 +511,12 @@ def kernel(
                         sf_col + cutlass.Int32(j * SF_TMEM_COLS), 6, cutlass.Int32
                     )
                     sfw_ptr = cutlass.inttoptr(
-                        sf_col
-                        + cutlass.Int32((k_sub + j) * SF_TMEM_COLS)
-                        + sfw_col_offset,
+                        sf_col + cutlass.Int32((k_sub + j) * SF_TMEM_COLS) + sfw_col_offset,
                         6,
                         cutlass.Int32,
                     )
                     for kb in cutlass.range_constexpr(KBLOCKS):
-                        a_step: cutlass.Constexpr[int] = (j * A_BOX >> 4) + (
-                            INST_K >> 4
-                        ) * kb
+                        a_step: cutlass.Constexpr[int] = (j * A_BOX >> 4) + (INST_K >> 4) * kb
                         w_step: cutlass.Constexpr[int] = ((W_OFF + j * W_BOX) >> 4) + (
                             INST_K >> 4
                         ) * kb
@@ -574,9 +531,7 @@ def kernel(
                             sfa_ptr,
                             sfw_ptr,
                         )
-                prims.tcgen05_commit(
-                    empty_bar.subview(stage), group=prims.CTAGroup.CTA_1
-                )
+                prims.tcgen05_commit(empty_bar.subview(stage), group=prims.CTAGroup.CTA_1)
             stage = stage + cutlass.Int32(1)
             if stage == cutlass.Int32(stages):
                 stage = cutlass.Int32(0)
@@ -615,9 +570,7 @@ def kernel(
             for tgt in cutlass.range_constexpr(reducers):
                 if cta_rank != cutlass.Int32(tgt):
                     slot = (
-                        cta_rank - cutlass.Int32(1)
-                        if cta_rank > cutlass.Int32(tgt)
-                        else cta_rank
+                        cta_rank - cutlass.Int32(1) if cta_rank > cutlass.Int32(tgt) else cta_rank
                     )
                     base = slot * cutlass.Int32(
                         OWNER_TOTAL * mailbox_stride
@@ -625,14 +578,10 @@ def kernel(
                     peer_full = prims.mapa(reduce_full, cutlass.Int32(tgt))
                     for ch in cutlass.range_constexpr(chunk_cols // 4):
                         src = tgt * chunk_cols + ch * 4
-                        payload = acc.load(src, vector_size=4, alignment=16).bitcast(
-                            cutlass.Int32
-                        )
+                        payload = acc.load(src, vector_size=4, alignment=16).bitcast(cutlass.Int32)
                         _compat48.store_async(
                             prims.mapa(
-                                reduce_mailbox.data_ptr()
-                                + base
-                                + cutlass.Int32(ch * 4),
+                                reduce_mailbox.data_ptr() + base + cutlass.Int32(ch * 4),
                                 cutlass.Int32(tgt),
                             ),
                             payload,
@@ -650,9 +599,9 @@ def kernel(
                                 peer * OWNER_TOTAL * mailbox_stride
                             ) + owner_id * cutlass.Int32(mailbox_stride)
                             for ch in cutlass.range_constexpr(chunk_cols // 4):
-                                got = reduce_mailbox.subview(
-                                    base + cutlass.Int32(ch * 4)
-                                ).load(vector_size=4, alignment=16)
+                                got = reduce_mailbox.subview(base + cutlass.Int32(ch * 4)).load(
+                                    vector_size=4, alignment=16
+                                )
                                 for i in cutlass.range_constexpr(4):
                                     dst = r * chunk_cols + ch * 4 + i
                                     acc[dst] = acc[dst] + got[i]
@@ -667,9 +616,7 @@ def kernel(
                     for off, width in store_plan:
                         col = coord_n + cutlass.Int32(r * chunk_cols + off)
                         out = (
-                            acc.load(
-                                r * chunk_cols + off, vector_size=width, alignment=16
-                            )
+                            acc.load(r * chunk_cols + off, vector_size=width, alignment=16)
                             .to(cutlass.BFloat16)
                             .bitcast(cutlass.Int16)
                         )
@@ -796,12 +743,8 @@ def compile_projection(config: Mxf8ProjectionConfig) -> CompiledKernel:
     kernel.set_name_prefix(config.prefix, remove_cutlass_symbol=True)
     raw = cute.compile(
         launch,
-        fake(
-            cutlass.Uint8, (ROWS_MAX, config.k), stride_order=(1, 0), assumed_align=128
-        ),
-        fake(
-            cutlass.Uint8, (config.n, config.k), stride_order=(1, 0), assumed_align=128
-        ),
+        fake(cutlass.Uint8, (ROWS_MAX, config.k), stride_order=(1, 0), assumed_align=128),
+        fake(cutlass.Uint8, (config.n, config.k), stride_order=(1, 0), assumed_align=128),
         fake(cutlass.Uint8, (cute.sym_int32(),), assumed_align=128),
         fake(cutlass.Uint8, (cute.sym_int32(),), assumed_align=128),
         cute.runtime.make_fake_tensor(

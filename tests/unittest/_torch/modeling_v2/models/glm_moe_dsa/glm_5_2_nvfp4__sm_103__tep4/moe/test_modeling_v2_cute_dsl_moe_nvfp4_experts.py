@@ -31,11 +31,16 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
     allocate_maps,
     reference_maps,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.moe.cute_dsl_moe_topk_routing_rep import (  # noqa: E402, E501
+    reference_slot_maps,
+)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
 HIDDEN, INTER, EXPERTS, GLOBAL_EXPERTS = 6144, 2048, 64, 256
+#: Context replica slots past the 64 home experts in the replica cells' stacks.
+REPLICAS = 8
 #: The target's capacity: the decode pair is compiled for the token budget.
 MAX_ROWS = PREFILL_MAX_ROWS
 
@@ -60,28 +65,32 @@ def _nvfp4(w: torch.Tensor):
     return packed, sf.view(w.shape[0], -1)
 
 
-def _weights():
-    """One expert stack for the session, NVFP4 in the kernels' layout. Scaled so each
-    GEMM's sums are O(1): the FC1 output's e4m3 scales then sit well inside e4m3's range."""
+def _weights(depth: int = EXPERTS):
+    """The first `depth` slots of one expert stack for the session (`EXPERTS + REPLICAS`
+    deep), NVFP4 in the kernels' layout: a contiguous prefix, as the target's prefill pair
+    reads the home slots of a stack with replica slots. Scaled so each GEMM's sums are
+    O(1): the FC1 output's e4m3 scales then sit well inside e4m3's range."""
     if "weights" not in _STATE:
         g = torch.Generator(device="cuda").manual_seed(20260)
         u8 = {"dtype": torch.uint8, "device": "cuda"}
-        fc1_w = torch.empty(EXPERTS, 2 * INTER, HIDDEN // 2, **u8)
-        fc1_s = torch.empty(EXPERTS, 2 * INTER // 128, HIDDEN // 64, 512, **u8)
-        fc2_w = torch.empty(EXPERTS, HIDDEN, INTER // 2, **u8)
-        fc2_s = torch.empty(EXPERTS, HIDDEN // 128, INTER // 64, 512, **u8)
-        for e in range(EXPERTS):
+        slots = EXPERTS + REPLICAS
+        fc1_w = torch.empty(slots, 2 * INTER, HIDDEN // 2, **u8)
+        fc1_s = torch.empty(slots, 2 * INTER // 128, HIDDEN // 64, 512, **u8)
+        fc2_w = torch.empty(slots, HIDDEN, INTER // 2, **u8)
+        fc2_s = torch.empty(slots, HIDDEN // 128, INTER // 64, 512, **u8)
+        for e in range(slots):
             p, s = _nvfp4(torch.randn(2 * INTER, HIDDEN, generator=g, device="cuda") * 0.02)
             fc1_w[e], fc1_s[e] = p, _sf_atoms(s)
             p, s = _nvfp4(torch.randn(HIDDEN, INTER, generator=g, device="cuda") * 0.03)
             fc2_w[e], fc2_s[e] = p, _sf_atoms(s)
         e4 = torch.float8_e4m3fn
         _STATE["weights"] = (fc1_w, fc1_s.view(e4), fc2_w, fc2_s.view(e4))
-    return _STATE["weights"]
+    return tuple(t[:depth] for t in _STATE["weights"])
 
 
 def _buffers():
-    """The target's per-slot buffers at its capacity, one set for the session."""
+    """The target's per-slot buffers at its capacity, with the replica slots' tiles, one set
+    for the session."""
     if "buffers" not in _STATE:
         u8 = {"dtype": torch.uint8, "device": "cuda"}
         _STATE["buffers"] = dict(
@@ -89,19 +98,21 @@ def _buffers():
             xsf=torch.zeros(MAX_ROWS, HIDDEN // 16, **u8),
             w=torch.zeros(MAX_ROWS, TOP_K, dtype=torch.float32, device="cuda"),
             out=torch.zeros(MAX_ROWS, HIDDEN, dtype=torch.bfloat16, device="cuda"),
-            maps=allocate_maps(MAX_ROWS, "cuda"),
+            maps=allocate_maps(MAX_ROWS, "cuda", replicas=REPLICAS),
             c=allocate_decode_c(MAX_ROWS, INTER, "cuda"),
-            pc=allocate_pair_c(MAX_ROWS, INTER, "cuda"),
-            sfc=allocate_sfc(MAX_ROWS, INTER, "cuda"),
+            pc=allocate_pair_c(MAX_ROWS, INTER, "cuda", REPLICAS),
+            sfc=allocate_sfc(MAX_ROWS, INTER, "cuda", REPLICAS),
         )
     return _STATE["buffers"]
 
 
-def _compiled(pair: bool):
-    key = "pair" if pair else "decode"
+def _compiled(pair: bool, replicas: int = 0):
+    key = f"pair{replicas}" if pair else "decode"
     if key not in _STATE:
         if pair:
-            _STATE[key] = build_prefill_pair(HIDDEN, INTER, EXPERTS, torch.cuda.current_device())
+            _STATE[key] = build_prefill_pair(
+                HIDDEN, INTER, EXPERTS + replicas, torch.cuda.current_device()
+            )
         else:
             b = _buffers()
             _STATE[key] = build_decode(
@@ -155,10 +166,11 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 def test_certified_cells(cell) -> None:
     spec = cell.spec
     rows, offset, pair = spec["rows"], spec["offset"], spec["pair"]
+    replicas = spec.get("replicas", 0)
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
-    fc1_w, fc1_s, fc2_w, fc2_s = _weights()
+    fc1_w, fc1_s, fc2_w, fc2_s = _weights(EXPERTS + replicas)
     b = _buffers()
-    compiled = _compiled(pair)
+    compiled = _compiled(pair, replicas)
 
     # The NVFP4 input as the closing collective or the quantize op writes it.
     xq_full, xsf_full = _nvfp4(
@@ -177,9 +189,22 @@ def test_certified_cells(cell) -> None:
     topk_w = b["w"][:rows]
     topk_w.copy_(raw / raw.sum(-1, keepdim=True) * 2.5)
     maps = b["maps"]
-    _write_maps(maps, reference_maps(ids, offset))
-    alpha1 = torch.rand(EXPERTS, generator=g, device="cuda") + 0.5
-    alpha2 = torch.rand(EXPERTS, generator=g, device="cuda") + 0.5
+    if replicas:
+        # The context replica top-k's maps: home slots `e - offset`, and replica slot
+        # `64 + h` for this rank's share of hot expert `hot[h]`'s rows (a random half here).
+        hot = torch.randperm(GLOBAL_EXPERTS, generator=g, device="cuda")[:replicas]
+        flat = ids.reshape(-1).long()
+        slots = torch.where((flat >= offset) & (flat < offset + EXPERTS), flat - offset, -1)
+        is_hot = flat.unsqueeze(1) == hot.unsqueeze(0)
+        mine = torch.rand(flat.numel(), generator=g, device="cuda") < 0.5
+        slots = torch.where(
+            is_hot.any(1), torch.where(mine, EXPERTS + is_hot.int().argmax(1), -1), slots
+        )
+        _write_maps(maps, reference_slot_maps(slots, EXPERTS + replicas))
+    else:
+        _write_maps(maps, reference_maps(ids, offset))
+    alpha1 = torch.rand(EXPERTS + replicas, generator=g, device="cuda") + 0.5
+    alpha2 = torch.rand(EXPERTS + replicas, generator=g, device="cuda") + 0.5
     norm_const = torch.full((1,), spec.get("norm_const", 1.0), device="cuda")
     c = b["pc"] if pair else b["c"]
     sfc = b["sfc"]

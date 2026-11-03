@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GLM-5.2 decode MoE: L2 prefetch of the routed experts' FC1 weights ahead of GG1 
+"""GLM-5.2 decode MoE: L2 prefetch of the routed experts' FC1 weights ahead of GG1
 
 A decode GG1 (``moe_gather_grouped_gemm_act_fusion``, tiler 128x256, raster M) streams ~600-750 MB of NVFP4
 weights per EP rank and layer from DRAM. The pre-MoE all-reduce and the router that precede it leave DRAM
@@ -37,10 +37,9 @@ o_proj, and they read only the previous step's counts and the load-time weights.
 from typing import Callable, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import dsl_user_op as _dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -127,9 +126,7 @@ def decode_l2_prefetch_kernel(
             _nanosleep(_SPIN_NS)
             t = cute.arch.globaltimer()
     else:
-        sel = cutlass.Array(
-            cutlass.Int32, MAX_TOP_E, space=cutlass.AddressSpace.smem, alignment=16
-        )
+        sel = cutlass.Array(cutlass.Int32, MAX_TOP_E, space=cutlass.AddressSpace.smem, alignment=16)
         sel.subview(lane).store(cutlass.Int32(-1))
         c0 = cutlass.Int32(expert_hist[lane])
         c1 = cutlass.Int32(expert_hist[lane + cutlass.Int32(_WARP)])
@@ -173,8 +170,7 @@ def decode_l2_prefetch_kernel(
                     s_base
                     + cutlass.Int64(e) * s_expert_stride
                     + cutlass.Int64(n) * cutlass.Int64(S_SLICE)
-                    + cutlass.Int64(k - cutlass.Int32(_W_CHUNKS))
-                    * cutlass.Int64(_CHUNK)
+                    + cutlass.Int64(k - cutlass.Int32(_W_CHUNKS)) * cutlass.Int64(_CHUNK)
                 )
                 if k < cutlass.Int32(_W_CHUNKS):
                     addr = (
@@ -258,9 +254,7 @@ def compile_prefetch(
     if key not in _CACHE:
         cutlass.cuda.initialize_cuda_context(device)
         fake = cute.runtime.make_fake_compact_tensor
-        hist = fake(
-            cutlass.Int32, (_LOCAL_EXPERTS,), stride_order=(0,), assumed_align=16
-        )
+        hist = fake(cutlass.Int32, (_LOCAL_EXPERTS,), stride_order=(0,), assumed_align=16)
         extra = (
             (fake(cutlass.Int32, (MAX_TOP_E,), stride_order=(0,), assumed_align=16),)
             if debug_sel
@@ -285,9 +279,7 @@ def compile_prefetch(
     return _CACHE[key]
 
 
-def _layer_bases(
-    fc1_w: "torch.Tensor", fc1_s: "torch.Tensor"
-) -> Tuple[int, int, int, int]:
+def _layer_bases(fc1_w: "torch.Tensor", fc1_s: "torch.Tensor") -> Tuple[int, int, int, int]:
     """(weight base, weight expert stride, scale base, scale expert stride) in bytes of one layer's FC1 operands."""
     if (
         fc1_w.dim() < 2
@@ -333,9 +325,7 @@ def run_prefetch(
         or tuple(expert_hist.shape) != (_LOCAL_EXPERTS,)
         or not expert_hist.is_contiguous()
     ):
-        raise ValueError(
-            f"expert_hist must be a contiguous int32 [{_LOCAL_EXPERTS}] tensor"
-        )
+        raise ValueError(f"expert_hist must be a contiguous int32 [{_LOCAL_EXPERTS}] tensor")
     if ntiles == 0:
         raise ValueError(
             "run_prefetch needs ntiles >= 1 (run_hold launches the carveout-only form)"
@@ -355,15 +345,11 @@ def run_prefetch(
         fn(expert_hist, w, ws, s, ss, 0, sel_out)
 
 
-def run_hold(
-    expert_hist: "torch.Tensor", hold_ns: int, *, ctas: int = DEFAULT_CTAS
-) -> None:
+def run_hold(expert_hist: "torch.Tensor", hold_ns: int, *, ctas: int = DEFAULT_CTAS) -> None:
     """Launch on the current stream the carveout-only form (no prefetch): ``ctas`` one-warp CTAs held ``hold_ns``.
 
     ``expert_hist`` is any int32 [64] device tensor (not read); it only fixes the device and the argument shape."""
-    if expert_hist.dtype != torch.int32 or tuple(expert_hist.shape) != (
-        _LOCAL_EXPERTS,
-    ):
+    if expert_hist.dtype != torch.int32 or tuple(expert_hist.shape) != (_LOCAL_EXPERTS,):
         raise ValueError(f"expert_hist must be an int32 [{_LOCAL_EXPERTS}] tensor")
     fn = compile_prefetch(
         top_e=1, ntiles=0, ctas=ctas, carveout=True, device=expert_hist.device.index
@@ -374,7 +360,5 @@ def run_hold(
 def reference_selection(expert_hist: "torch.Tensor", top_e: int) -> list:
     """The kernel's slot table: experts by (count desc, index asc), zero counts excluded, padded with -1."""
     h = expert_hist.detach().cpu().tolist()
-    order = sorted(
-        (e for e in range(_LOCAL_EXPERTS) if h[e] > 0), key=lambda e: (-h[e], e)
-    )[:top_e]
+    order = sorted((e for e in range(_LOCAL_EXPERTS) if h[e] > 0), key=lambda e: (-h[e], e))[:top_e]
     return order + [-1] * (top_e - len(order))

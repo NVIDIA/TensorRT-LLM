@@ -30,10 +30,9 @@ Shape: runtime rows; 160 = 128 key + 32 weight columns
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
 KEY_COLS = 128
@@ -108,11 +107,7 @@ def compile_split() -> CompiledKernel:
 
 def _check(src: torch.Tensor, keys: torch.Tensor, weights: torch.Tensor) -> int:
     """Validate the operands on the host; return the row count."""
-    if (
-        src.dtype != torch.float32
-        or keys.dtype != torch.bfloat16
-        or weights.dtype != torch.float32
-    ):
+    if src.dtype != torch.float32 or keys.dtype != torch.bfloat16 or weights.dtype != torch.float32:
         raise ValueError(
             f"dtypes must be fp32 / bf16 / fp32, got {src.dtype} / {keys.dtype} / {weights.dtype}"
         )

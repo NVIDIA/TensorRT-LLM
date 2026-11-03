@@ -31,13 +31,11 @@ cluster barrier, then rank 0 reduces the segment pairs and writes the token.  ``
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
 from cutlass.experimental import primitives as prims
-
 
 VOCAB = 154880
 # One cluster of _CTAS_PER_ROW CTAs per row, each scanning a contiguous
@@ -180,12 +178,8 @@ def _argmax_rows_kernel(
                 cta_idx = warp_idxs[w]
         for slot in cutlass.range_constexpr(_CTAS_PER_ROW):
             if cta_rank == slot:
-                prims.mapa(cluster_keys.data_ptr() + slot, cutlass.Int32(0)).store(
-                    cta_key
-                )
-                prims.mapa(cluster_idxs.data_ptr() + slot, cutlass.Int32(0)).store(
-                    cta_idx
-                )
+                prims.mapa(cluster_keys.data_ptr() + slot, cutlass.Int32(0)).store(cta_key)
+                prims.mapa(cluster_idxs.data_ptr() + slot, cutlass.Int32(0)).store(cta_idx)
     # arrive.release publishes the DSMEM stores, wait.acquire makes them
     # visible to rank 0; no CTA touches another's shared memory afterwards.
     prims.barrier_cluster_arrive()
@@ -265,9 +259,7 @@ def _require_inputs(logits: torch.Tensor, tokens: torch.Tensor) -> None:
         raise ValueError("logits must be contiguous and 16-byte aligned")
 
 
-def run(
-    compiled_fn: CompiledKernel, logits: torch.Tensor, tokens: torch.Tensor
-) -> torch.Tensor:
+def run(compiled_fn: CompiledKernel, logits: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
     """Launch a precompiled variant into caller-owned ``tokens``."""
 
     _require_inputs(logits, tokens)

@@ -31,6 +31,17 @@ zero-fills the last block's upper half for A and B, and the weight is quantized
 zero-padded to 640 columns, whose blocked scale layout is the one the kernel
 derives for K = 576 (5 k-groups).
 
+``kv_b_expand_kv_mxf8`` runs both expansions in ONE launch: N = 8192 = K rows 0..4095 |
+V rows 4096..8191 against the K operand ``a_k [T, 576]``, with the GEMM's ``n_split_k =
+(4096, 512)``: the N tiles of the V half issue only the first 4 k-tiles (c_kv, 512 columns),
+so every tile issues exactly the MMAs of the two-launch path on the same bytes (``a_v`` is
+``a_k``'s first 512 columns and ``sfa_v``'s codes ``sfa_k``'s first four k-groups, both written
+by the same gather; the merged weight is the two folded weights stacked, the V rows zero-padded
+to 576, quantized per row, so its K rows' bytes are ``kv_b_expand_k``'s and its V rows' first
+512 columns ``kv_b_expand_v512``'s) and the output ``[T, 8192]`` holds the two outputs side
+by side, bitwise.  One persistent tile schedule over 2 x 16 N tiles instead of two launches
+of 16: one launch tail and one partial wave fewer per layer.
+
 Pattern: glm-ctx-proj-mxf8
 Device: SM100+ (Blackwell)
 Shape: runtime M; (N, K) = kv_a (2624, 6144), q_b (4096, 2048), o_proj (6144, 4096),
@@ -45,16 +56,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.nvgpu import OperandMajorMode
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
 from . import dense_blockscaled_gemm_persistent as _bs
@@ -115,6 +121,9 @@ class Mxf8Abi:
     out_e4m3: bool = False
     # A is given as e4m3 bytes at scale 2^0 (no activation quant; constant unit SFA)
     a_prequant: bool = False
+    # ``(n_split, k_split)``: output columns >= n_split accumulate only K < k_split (the GEMM's
+    # ``n_split_k``); the weight's ``[n_split:, k_split:]`` block must be zero
+    n_split_k: tuple[int, int] | None = None
 
 
 ABIS: dict[str, Mxf8Abi] = {
@@ -122,11 +131,18 @@ ABIS: dict[str, Mxf8Abi] = {
     "q_b_proj": Mxf8Abi("q_b_proj", 4_096, 2_048),
     "q_b_proj_e4m3": Mxf8Abi("q_b_proj_e4m3", 4_096, 2_048, out_e4m3=True),
     "o_proj": Mxf8Abi("o_proj", 6_144, 4_096),
-    "kv_b_expand_k_mxf8": Mxf8Abi(
-        "kv_b_expand_k_mxf8", 4_096, 576, out_e4m3=True, a_prequant=True
-    ),
+    "kv_b_expand_k_mxf8": Mxf8Abi("kv_b_expand_k_mxf8", 4_096, 576, out_e4m3=True, a_prequant=True),
     "kv_b_expand_v512_mxf8": Mxf8Abi(
         "kv_b_expand_v512_mxf8", 4_096, 512, out_e4m3=True, a_prequant=True
+    ),
+    # Both expansions in one launch: [T, 576] -> K | V [T, 4096 + 4096] (module doc).
+    "kv_b_expand_kv_mxf8": Mxf8Abi(
+        "kv_b_expand_kv_mxf8",
+        8_192,
+        576,
+        out_e4m3=True,
+        a_prequant=True,
+        n_split_k=(4_096, 512),
     ),
     # MoE shared expert gate|up (gate rows first, the SwiGLU half order), this rank's
     # 2 x 512 of the 2048-wide shared intermediate; A is the pre-MoE AR+norm's x8 operand.
@@ -162,6 +178,8 @@ SMALL_TILE_MAX_ROWS: dict[str, int] = {
     "o_proj": 1_024,
     "kv_b_expand_k_mxf8": 1_024,
     "kv_b_expand_v512_mxf8": 1_024,
+    # the two-launch path's tile per row count, so the merged launch's tiles are its tiles
+    "kv_b_expand_kv_mxf8": 1_024,
     "shared_up_mxf8": 1_024,
     "shared_down_mxf8": 1_024,
     "dense_gate_up_mxf8": 1_024,
@@ -180,12 +198,9 @@ def compile_gemm(op: str, tile: str = DEFAULT_TILE, device_index: int = 0) -> Co
         abi = ABIS[op]
         tiler, cluster = TILES[tile]
         gemm = GlmMxf8Gemm(_SF_VEC, tiler, cluster)
-        gemm.kernel.set_name_prefix(
-            f"glm52_ctx_proj_mxf8_{op}", remove_cutlass_symbol=True
-        )
-        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            cluster[0] * cluster[1]
-        )
+        gemm.n_split_k = abi.n_split_k
+        gemm.kernel.set_name_prefix(f"glm52_ctx_proj_mxf8_{op}", remove_cutlass_symbol=True)
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         c_dtype = cutlass.Uint8 if abi.out_e4m3 else cutlass.BFloat16
         _COMPILED[key] = cute.compile(
             gemm,
@@ -201,12 +216,8 @@ def compile_gemm(op: str, tile: str = DEFAULT_TILE, device_index: int = 0) -> Co
                 stride=(abi.in_features, 1),
                 assumed_align=_ALIGN,
             ),
-            make_fake_compact_tensor(
-                cutlass.Uint8, (cute.sym_int32(),), assumed_align=_SF_ALIGN
-            ),
-            make_fake_compact_tensor(
-                cutlass.Uint8, (cute.sym_int32(),), assumed_align=_SF_ALIGN
-            ),
+            make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int32(),), assumed_align=_SF_ALIGN),
+            make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int32(),), assumed_align=_SF_ALIGN),
             make_fake_tensor(
                 c_dtype,
                 (cute.sym_int32(), abi.out_features),
@@ -346,9 +357,7 @@ class Mxf8Projection:
             self.pre_hits += 1
         else:
             xq = torch.empty(rows, k, dtype=torch.uint8, device=x.device)
-            sfa = torch.empty(
-                _quant.sf_bytes(rows, k), dtype=torch.uint8, device=x.device
-            )
+            sfa = torch.empty(_quant.sf_bytes(rows, k), dtype=torch.uint8, device=x.device)
             _quant.quantize(self._quant, x, xq, sfa)
         tile = self.tile_for(rows)
         self.choice_hits[tile] += 1
@@ -384,9 +393,7 @@ class Mxf8PrequantProjection:
         self.tiles = (SMALL_TILE, DEFAULT_TILE)
         self._gemms = {t: compile_gemm(op, t, device_index) for t in self.tiles}
         self.choice_hits = {t: 0 for t in self.tiles}
-        self.sfa = unit_sf(
-            max_rows, self.abi.in_features, torch.device("cuda", device_index)
-        )
+        self.sfa = unit_sf(max_rows, self.abi.in_features, torch.device("cuda", device_index))
 
     def tile_for(self, rows: int) -> str:
         return SMALL_TILE if rows <= self.small_max_rows else DEFAULT_TILE
@@ -466,12 +473,20 @@ def dequantize_weight(w: QuantizedWeight) -> torch.Tensor:
 
 
 def emulate(
-    x: torch.Tensor, w: QuantizedWeight, k: int, sfa: torch.Tensor | None = None
+    x: torch.Tensor,
+    w: QuantizedWeight,
+    k: int,
+    sfa: torch.Tensor | None = None,
+    n_split_k: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """FP32 product of the MXF8 operands the GEMM reads: a bf16 ``x`` quantized by the
     activation kernel's torch twin, or a pre-quantized uint8 ``x`` with its blocked scales
-    ``sfa`` (None: all 2^0), against the dequantized weight."""
+    ``sfa`` (None: all 2^0), against the dequantized weight. ``n_split_k = (n, kk)``: output
+    columns >= n read K < kk only (the weight's ``[n:, kk:]`` block taken as zero)."""
     b = dequantize_weight(w)
+    if n_split_k is not None:
+        b = b.clone()
+        b[n_split_k[0] :, n_split_k[1] :] = 0.0
     if x.dtype == torch.uint8:
         if sfa is None:
             return x.view(torch.float8_e4m3fn).float() @ b.t()

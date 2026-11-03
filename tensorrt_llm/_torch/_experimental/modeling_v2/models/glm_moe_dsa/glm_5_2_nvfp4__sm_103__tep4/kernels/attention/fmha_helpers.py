@@ -27,27 +27,28 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import enum
-from typing import Tuple, Optional
-import cutlass
-from cutlass.cute.typing import Boolean, Float16, Int64
-from cutlass._mlir import ir as _mlir_ir
-from cutlass._mlir.dialects import llvm, nvvm as _nvvm, vector
+from typing import Optional, Tuple
 
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir import ir as _mlir_ir
+from cutlass._mlir.dialects import llvm, vector
+from cutlass._mlir.dialects import nvvm as _nvvm
+from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.typing import Boolean, Float16, Int64
 from cutlass.cutlass_dsl import (
+    Float32,
     Int16,
     Int32,
-    Float32,
     T,
-    min,
-    extract_mlir_values,
-    new_from_mlir_values,
     dsl_user_op,
+    extract_mlir_values,
+    min,
+    new_from_mlir_values,
 )
 from cutlass.utils.hardware_info import HardwareInfo
-from ..moe.static_persistent_tile_scheduler import WorkTileInfo
-import cutlass.cute as cute
-from cutlass.cute.nvgpu import tcgen05
 
+from ..moe.static_persistent_tile_scheduler import WorkTileInfo
 
 ##############################################################################
 # Fmha static tile scheduler
@@ -172,9 +173,7 @@ def _map_compact_ragged_fmha_work(
         if not window_missed:
             target_work_begin = work_searched
             if target_lane > 0:
-                target_work_begin = cute.arch.shuffle_sync(
-                    batch_work_end, target_lane - 1
-                )
+                target_work_begin = cute.arch.shuffle_sync(batch_work_end, target_lane - 1)
             target_batch_tiles = cute.arch.shuffle_sync(batch_tiles, target_lane)
             local_work_idx = current_work_linear_idx - target_work_begin
             batch_idx = search_begin + target_lane
@@ -183,9 +182,7 @@ def _map_compact_ragged_fmha_work(
             found = Boolean(True)
 
         if window_missed:
-            work_searched = cute.arch.shuffle_sync(
-                batch_work_end, cute.arch.WARP_SIZE - 1
-            )
+            work_searched = cute.arch.shuffle_sync(batch_work_end, cute.arch.WARP_SIZE - 1)
             search_begin += cute.arch.WARP_SIZE
     return (m_idx, head_idx, batch_idx), found
 
@@ -250,9 +247,7 @@ class FmhaStaticTileScheduler:
         self._q_tile_size = q_tile_size
         if params.persistent_raster_order == "compact" and cum_seqlen_q is None:
             raise ValueError("compact ragged scheduling requires cum_seqlen_q")
-        self._problem_shape_mhb = cute.make_layout(
-            params.problem_shape_mhb, loc=loc, ip=ip
-        )
+        self._problem_shape_mhb = cute.make_layout(params.problem_shape_mhb, loc=loc, ip=ip)
         self._num_blocks = cute.size(self._problem_shape_mhb, loc=loc, ip=ip)
         self._is_first_block = True
         self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
@@ -524,9 +519,7 @@ def compute_grid(
     tile_sched_params = create_fmha_static_tile_scheduler_params(
         is_persistent,
         (
-            cute.round_up(
-                cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]), 2 if is_2cta else 1
-            ),
+            cute.round_up(cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]), 2 if is_2cta else 1),
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
@@ -582,8 +575,7 @@ def _causal_mask_32_regs_setp_selp(
     blocks = []
     for block_start in range(0, reg_count, 4):
         compares = "\n".join(
-            f"    setp.ge.s32 p{i - block_start}, "
-            f"${last_valid_operand}, {group_start + i};"
+            f"    setp.ge.s32 p{i - block_start}, ${last_valid_operand}, {group_start + i};"
             for i in range(block_start, block_start + 4)
         )
         selects = "\n".join(
@@ -607,8 +599,7 @@ def _causal_mask_32_regs_setp_selp(
         ip=ip,
     )
     return tuple(
-        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
-        for i in range(reg_count)
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(reg_count)
     )
 
 
@@ -636,12 +627,8 @@ def _band_mask_32_regs_setp_selp(
         lines = []
         for i in range(block_start, block_start + 4):
             j = i - block_start
-            lines.append(
-                f"    setp.ge.s32 p{j}, ${last_valid_operand}, {group_start + i};"
-            )
-            lines.append(
-                f"    setp.le.s32 q{j}, ${first_valid_operand}, {group_start + i};"
-            )
+            lines.append(f"    setp.ge.s32 p{j}, ${last_valid_operand}, {group_start + i};")
+            lines.append(f"    setp.le.s32 q{j}, ${first_valid_operand}, {group_start + i};")
             lines.append(f"    and.pred p{j}, p{j}, q{j};")
         lines.extend(
             f"    selp.b32 ${i}, ${reg_count + i}, 0xff800000, p{i - block_start};"
@@ -669,8 +656,7 @@ def _band_mask_32_regs_setp_selp(
         ip=ip,
     )
     return tuple(
-        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
-        for i in range(reg_count)
+        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(reg_count)
     )
 
 
@@ -731,8 +717,7 @@ class FusedMask:
         if cutlass.const_expr(mask_type is MaskEnum.RESIDUAL_MASK_BWD):
             result = cute.ceil_div(seqlen_q, tile_shape[0])
         if cutlass.const_expr(
-            mask_type == MaskEnum.WINDOW_MASK
-            or mask_type == MaskEnum.WINDOW_MASK_INFERENCE
+            mask_type == MaskEnum.WINDOW_MASK or mask_type == MaskEnum.WINDOW_MASK_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is None):
                 result = cute.ceil_div(seqlen_k, tile_shape[1])
@@ -743,8 +728,7 @@ class FusedMask:
                 max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
                 result = min(max_blocks_k, tmp_blocks_k)
         if cutlass.const_expr(
-            mask_type == MaskEnum.WINDOW_MASK_BWD
-            or mask_type == MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type == MaskEnum.WINDOW_MASK_BWD or mask_type == MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
             if cutlass.const_expr(window_size_left is None):
                 result = cute.ceil_div(seqlen_q, tile_shape[0])
@@ -801,8 +785,7 @@ class FusedMask:
         if cutlass.const_expr(mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE):
             offset = seqlen_q - seqlen_k
         if cutlass.const_expr(
-            mask_type is MaskEnum.WINDOW_MASK
-            or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+            mask_type is MaskEnum.WINDOW_MASK or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
         ):
             if cutlass.const_expr(window_size_left is not None):
                 min_idx_q = blk_coord[0] * tile_shape[0]
@@ -810,8 +793,7 @@ class FusedMask:
                 tmp_blocks_k = idx_k // tile_shape[1]
                 result = max(tmp_blocks_k, result)
         if cutlass.const_expr(
-            mask_type is MaskEnum.WINDOW_MASK_BWD
-            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type is MaskEnum.WINDOW_MASK_BWD or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
                 min_idx_k = blk_coord[1] * tile_shape[1]
@@ -877,13 +859,10 @@ class FusedMask:
 
         leading_mask_end = leading_mask_begin
         if cutlass.const_expr(
-            mask_type is MaskEnum.WINDOW_MASK
-            or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+            mask_type is MaskEnum.WINDOW_MASK or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
         ):
             if cutlass.const_expr(window_size_left is not None):
-                min_idx_q = (
-                    (blk_coord[0] + 1) * tile_shape[0] + offset - window_size_left
-                )
+                min_idx_q = (blk_coord[0] + 1) * tile_shape[0] + offset - window_size_left
                 leading_mask_end = min(
                     cute.ceil_div(min_idx_q, tile_shape[1]) - 1,
                     trip_count + leading_mask_begin - 1,
@@ -891,13 +870,10 @@ class FusedMask:
             else:
                 leading_mask_end = leading_mask_begin - 1
         elif cutlass.const_expr(
-            mask_type is MaskEnum.WINDOW_MASK_BWD
-            or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type is MaskEnum.WINDOW_MASK_BWD or mask_type is MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
-                min_idx_k = (
-                    (blk_coord[1] + 1) * tile_shape[1] + offset - window_size_right
-                )
+                min_idx_k = (blk_coord[1] + 1) * tile_shape[1] + offset - window_size_right
                 leading_mask_end = cute.ceil_div(min_idx_k, tile_shape[0]) - 1
             else:
                 leading_mask_end = leading_mask_begin - 1
@@ -960,14 +936,11 @@ class FusedMask:
 
         trailing_mask_begin, trailing_mask_end = None, None
         if cutlass.const_expr(
-            mask_type is MaskEnum.WINDOW_MASK
-            or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
+            mask_type is MaskEnum.WINDOW_MASK or mask_type is MaskEnum.WINDOW_MASK_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
                 min_idx_q = blk_coord[0] * tile_shape[0] + offset + window_size_right
-                trailing_mask_begin = min(
-                    min_idx_q // tile_shape[1], trip_count + trip_start - 1
-                )
+                trailing_mask_begin = min(min_idx_q // tile_shape[1], trip_count + trip_start - 1)
                 trailing_mask_end = trip_count + trip_start - 1
             else:
                 # last tile, we always apply mask on it regardless whether it's a residual tile
@@ -976,9 +949,7 @@ class FusedMask:
         else:
             if cutlass.const_expr(window_size_left is not None):
                 min_idx_k = blk_coord[1] * tile_shape[1] + offset + window_size_left + 1
-                max_idx_k = (
-                    (blk_coord[1] + 1) * tile_shape[1] + offset + window_size_left
-                )
+                max_idx_k = (blk_coord[1] + 1) * tile_shape[1] + offset + window_size_left
                 trailing_mask_begin = min(
                     cute.ceil_div(min_idx_k, tile_shape[0]) - 1,
                     trip_count + trip_start - 1,
@@ -1029,12 +1000,9 @@ class FusedMask:
         """
         result = 0
         if cutlass.const_expr(
-            mask_type is not MaskEnum.RESIDUAL_MASK
-            and mask_type is not MaskEnum.RESIDUAL_MASK_BWD
+            mask_type is not MaskEnum.RESIDUAL_MASK and mask_type is not MaskEnum.RESIDUAL_MASK_BWD
         ):
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 leading_mask_begin, leading_mask_end = FusedMask.get_leading_mask_id(
                     mask_type,
                     blk_coord,
@@ -1087,12 +1055,9 @@ class FusedMask:
         result = 0
 
         if cutlass.const_expr(
-            mask_type is not MaskEnum.RESIDUAL_MASK
-            and mask_type is not MaskEnum.RESIDUAL_MASK_BWD
+            mask_type is not MaskEnum.RESIDUAL_MASK and mask_type is not MaskEnum.RESIDUAL_MASK_BWD
         ):
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 trailing_mask_begin, trailing_mask_end = FusedMask.get_trailing_mask_id(
                     mask_type,
                     blk_coord,
@@ -1265,9 +1230,7 @@ class FusedMask:
             window_size_right,
             rem_count,
         )
-        end_count = (
-            start_count + leading_mask_count + unmask_count + trailing_mask_count
-        )
+        end_count = start_count + leading_mask_count + unmask_count + trailing_mask_count
         return (
             start_count,
             end_count,
@@ -1370,9 +1333,7 @@ class FusedMask:
         )
         for i in cutlass.range(cute.size(acc_qk), unroll_full=True):
             index_q, index_k = index_transform(*index_qk[i])
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 if cutlass.const_expr(window_size_left is None):
                     if index_q + offset + window_size_right < index_k:
                         acc_qk[i] = -Float32.inf
@@ -1392,8 +1353,7 @@ class FusedMask:
                         acc_qk[i] = -Float32.inf
 
             if cutlass.const_expr(
-                mask_type == MaskEnum.RESIDUAL_MASK
-                or mask_type == MaskEnum.RESIDUAL_MASK_BWD
+                mask_type == MaskEnum.RESIDUAL_MASK or mask_type == MaskEnum.RESIDUAL_MASK_BWD
             ):
                 if index_k >= seqlen_k or index_q >= seqlen_q:
                     acc_qk[i] = -Float32.inf
@@ -1417,14 +1377,10 @@ def ex2_emulation_packed_f32x2(
     # aligned the exponent to 2^23, so that the digit of ones
     # is at the rightest place
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
-    )
+    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = cute.arch.sub_packed_f32x2(
-        xy_rounded, (fp32_round_int, fp32_round_int)
-    )
+    xy_rounded_back = cute.arch.sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
     xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
 
     @dsl_user_op
@@ -1442,9 +1398,7 @@ def ex2_emulation_packed_f32x2(
         deg = len(coeff) - 1  # started with highest degree
         out = (coeff[deg], coeff[deg])
         for i in cutlass.range_constexpr(deg - 1, -1, -1):
-            out = cute.arch.fma_packed_f32x2(
-                out, (x, y), (coeff[i], coeff[i]), loc=loc, ip=ip
-            )
+            out = cute.arch.fma_packed_f32x2(out, (x, y), (coeff[i], coeff[i]), loc=loc, ip=ip)
         return out
 
     xy_frac_ex2 = polynomial_deg3_packed_f32x2(*xy_frac, loc=loc, ip=ip)
@@ -1484,9 +1438,7 @@ def ex2_emulation_packed_f32x2(
 @cute.jit
 def cvt_f32x4_to_f8x4_pack_i32(fp32x4, fp8_type, *, loc=None, ip=None):
     fp32x4 = fp32x4.load()
-    src_vec4 = (
-        fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
-    )
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
 
     src0 = Float32(vector.extract(src_vec4, [], [0])).ir_value(loc=loc, ip=ip)
     src1 = Float32(vector.extract(src_vec4, [], [1])).ir_value(loc=loc, ip=ip)
@@ -1533,8 +1485,6 @@ def cvt_f32x4_to_f8x4(fp32x4, fp8x4, *, loc=None, ip=None):
     fp8x4_i32 = cute.recast_tensor(fp8x4, cutlass.Int32)
     fp8x4_i32[0] = cutlass.Int32(packed_i32)
     return
-
-
 
 
 def with_collector_op(

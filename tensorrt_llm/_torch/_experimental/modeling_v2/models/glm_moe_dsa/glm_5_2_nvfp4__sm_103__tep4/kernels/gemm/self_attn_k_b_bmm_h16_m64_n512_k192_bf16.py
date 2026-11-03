@@ -50,9 +50,7 @@ _DENSE_GEMM = _swappeddensegemmpersistent._DENSE_GEMM
 _GlmPersistentDenseGemmKernel = _swappeddensegemmpersistent._GlmPersistentDenseGemmKernel
 
 PersistentPdlRole = _swappeddensegemmpdlchain.PersistentPdlRole
-WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = (
-    _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
-)
+WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE = _swappeddensegemmpdlchain.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
 # decode K-B / RoPE overlap: same role plus a dependent signal right after the activation wait, so a
 # late-waiting the RoPE generation kernel (``emit_q_base=False``) runs concurrently with this GEMM.
 WAIT_EARLY_SIGNAL_PRELOAD_WEIGHT_ROLE = (
@@ -287,21 +285,15 @@ def _compile(
         emit_fp8_q_base=emit_fp8_q_base,
     )
     if emit_fp8_q_base and pdl_role is None:
-        raise ValueError(
-            f"{abi.module_name}: emit_fp8_q_base requires a PDL-chain role"
-        )
+        raise ValueError(f"{abi.module_name}: emit_fp8_q_base requires a PDL-chain role")
     if mxf8_side is not None and (
-        pdl_role is None
-        or emit_fp8_q_base
-        or not getattr(schedule, "use_tma_store", True)
+        pdl_role is None or emit_fp8_q_base or not getattr(schedule, "use_tma_store", True)
     ):
         raise ValueError(
             f"{abi.module_name}: the MXF8 side output needs a PDL-chain role, a BF16 C and "
             "the TMA-store epilogue"
         )
-    a, b, c = _make_runtime_arguments(
-        input_tensor, weight, output, fp8_output=emit_fp8_q_base
-    )
+    a, b, c = _make_runtime_arguments(input_tensor, weight, output, fp8_output=emit_fp8_q_base)
     mnkl = (
         abi.output_features,
         abi.active_m,

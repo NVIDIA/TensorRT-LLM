@@ -49,10 +49,18 @@ class CompiledMlaRopeAppendPrefill:
     kernels_skip_q_base: Mapping[int, object] = dataclasses.field(default_factory=dict)
     kernels_q_in_place: Mapping[int, object] = dataclasses.field(default_factory=dict)
     kernels_q_e4m3: Mapping[int, object] = dataclasses.field(default_factory=dict)
+    #: CTAs the `q_e4m3` kernels split a token tile's RoPE work over (0: one CTA).
+    rope_par: int = 0
+
+
+#: The `q_e4m3` mode's build: a token tile's RoPE work over 2 CTAs, loads issued before the
+#: request search, packed rounding, vector c_kv copy loads. Same output bytes as one CTA;
+#: -1.0 .. -1.9 us per launch at 7-8k rows on B300.
+ROPE_PAR = 2
 
 
 def compile(  # noqa: A001 -- the kernel module's own name for this step
-    *, tokens_per_block: int, device_index: int
+    *, tokens_per_block: int, device_index: int, rope_par: int = ROPE_PAR
 ) -> CompiledMlaRopeAppendPrefill:
     """Compile the kernel for `tokens_per_block`; return the handle the op takes as
     `compiled`. Call once at load.
@@ -63,7 +71,8 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     `q_in_place`, `q_e4m3`), so each pair is a separate kernel. The `q_in_place` modes
     run all of a token tile's RoPE groups in one CTA (`merge_rope`). Token and request
     counts are symbolic, so one compile per pair serves every context step. Costs one
-    CuTe DSL compile and one launch on a one-token, one-block case per pair.
+    CuTe DSL compile and one launch on a one-token, one-block case per pair. `rope_par`
+    (2 or 4; 0 for one CTA) builds the `q_e4m3` mode's kernels with the tile split.
     """
     tpb, dev = int(tokens_per_block), torch.device("cuda", int(device_index))
     bf16 = torch.bfloat16
@@ -71,6 +80,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
     for stride, mode in ((s, m) for s in LATENT_STRIDES for m in tables):
         skip, e4m3 = mode == "skip", mode == "e4m3"
         in_place = mode in ("in_place", "e4m3")
+        par = int(rope_par) if e4m3 else 0
         q = torch.zeros(
             [1, NUM_HEADS, QK_HEAD_DIM], dtype=torch.float8_e4m3fn if e4m3 else bf16, device=dev
         )
@@ -82,6 +92,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
                 q_in_place=in_place,
                 q_e4m3=e4m3,
                 merge_rope=in_place,
+                rope_par=par,
             ),
             int(device_index),
         )
@@ -105,6 +116,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
             q_in_place=in_place,
             q_e4m3=e4m3,
             merge_rope=in_place,
+            rope_par=par,
         )
         dataclasses.replace(runner, compiled=kernel)()
         tables[mode][stride] = kernel
@@ -116,6 +128,7 @@ def compile(  # noqa: A001 -- the kernel module's own name for this step
         tables["skip"],
         tables["in_place"],
         tables["e4m3"],
+        int(rope_par),
     )
 
 
@@ -375,6 +388,7 @@ class CuteDslMlaRopeAppendPrefill(OpWrapper):
             q_in_place=bool(q_in_place),
             q_e4m3=bool(q_e4m3),
             merge_rope=bool(q_in_place),
+            rope_par=compiled.rope_par if q_in_place and q_e4m3 else 0,
         )
         dataclasses.replace(runner, compiled=kernel)()
         if q_in_place:

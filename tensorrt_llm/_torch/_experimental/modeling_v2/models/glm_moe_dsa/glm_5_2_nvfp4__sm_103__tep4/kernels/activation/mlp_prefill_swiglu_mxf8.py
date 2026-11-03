@@ -38,15 +38,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
 
@@ -118,9 +113,7 @@ def glm52_prefill_swiglu_mxf8_kernel(
             # the BF16 SwiGLU value, as the served SwiGLU it replaces stores it
             if cutlass.const_expr(fast):
                 exp_neg = cute.math.exp2(-g * cutlass.Float32(_LOG2E), fastmath=True)
-                sig = cute.math.rcp(
-                    cutlass.Float32(1.0) + exp_neg, approx=True, ftz=True
-                )
+                sig = cute.math.rcp(cutlass.Float32(1.0) + exp_neg, approx=True, ftz=True)
                 vals[i] = (u * g * sig).to(cutlass.BFloat16).to(cutlass.Float32)
             else:
                 s = g / (cutlass.Float32(1.0) + cute.math.exp(-g))
@@ -211,9 +204,7 @@ def compile_swiglu_mxf8(
     src_pitch, padded_rows(R) // rows_per_cta, stream)`` (``swiglu_mxf8`` builds the call).
     ``fast``: the dense MLP SwiGLU's MUFU math instead of the rows SwiGLU's precise one."""
     if passes not in PASSES_CHOICES:
-        raise ValueError(
-            f"swiglu mxf8: passes must be one of {PASSES_CHOICES}, got {passes}"
-        )
+        raise ValueError(f"swiglu mxf8: passes must be one of {PASSES_CHOICES}, got {passes}")
     key = (device_index, passes, bool(fast))
     if key not in _COMPILED:
         z32, z64 = cutlass.Int32(0), cutlass.Int64(0)
@@ -276,9 +267,7 @@ def swiglu_mxf8(
     if q is None:
         q = torch.empty(rows, width, dtype=torch.uint8, device=src.device)
     if sf is None:
-        sf = torch.empty(
-            _quant.sf_bytes(rows, width), dtype=torch.uint8, device=src.device
-        )
+        sf = torch.empty(_quant.sf_bytes(rows, width), dtype=torch.uint8, device=src.device)
     if (
         q.dtype != torch.uint8
         or tuple(q.shape) != (rows, width)

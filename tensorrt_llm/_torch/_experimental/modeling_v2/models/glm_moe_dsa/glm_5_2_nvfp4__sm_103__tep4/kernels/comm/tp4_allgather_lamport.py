@@ -93,19 +93,13 @@ def _sanitize_bf16x8(values):
 
 
 @cute.jit
-def _store_output_vector(
-    output_array, offset, values, OUT_FP32: cutlass.Constexpr[bool]
-):
+def _store_output_vector(output_array, offset, values, OUT_FP32: cutlass.Constexpr[bool]):
     """Store one 8-lane BF16 vector at element ``offset`` of the output, widened
     to FP32 (two 16-byte stores) when ``OUT_FP32``."""
 
     if cutlass.const_expr(OUT_FP32):
-        low = cutlass.Array(
-            cutlass.Float32, _FP32_PER_STORE, alignment=_ALIGNMENT_BYTES
-        )
-        high = cutlass.Array(
-            cutlass.Float32, _FP32_PER_STORE, alignment=_ALIGNMENT_BYTES
-        )
+        low = cutlass.Array(cutlass.Float32, _FP32_PER_STORE, alignment=_ALIGNMENT_BYTES)
+        high = cutlass.Array(cutlass.Float32, _FP32_PER_STORE, alignment=_ALIGNMENT_BYTES)
         for lane in cutlass.range_constexpr(_FP32_PER_STORE):
             low[lane] = values[lane].to(cutlass.Float32)
             high[lane] = values[lane + _FP32_PER_STORE].to(cutlass.Float32)
@@ -159,12 +153,8 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
     rows = cute.size(input_tensor, mode=[0])
     active_numel = rows * N
     workspace_numel_i64 = cutlass.Int64(cute.size(buffers[0], mode=[2]))
-    state_counter_ptr = (
-        signal_state.iterator + cutlass.Int64(_SIGNAL_COUNTER_INDEX)
-    ).llvm_ptr
-    state_signal_ptr = (
-        signal_state.iterator + cutlass.Int64(_SIGNAL_VALUE_INDEX)
-    ).llvm_ptr
+    state_counter_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_COUNTER_INDEX)).llvm_ptr
+    state_signal_ptr = (signal_state.iterator + cutlass.Int64(_SIGNAL_VALUE_INDEX)).llvm_ptr
 
     # The slot state and the input are both predecessor-owned.
     if cutlass.const_expr(USE_PDL):
@@ -176,22 +166,14 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
         if tidx == 0:
             cute.arch.griddepcontrol_launch_dependents()
 
-    signal_i32 = cute.arch.load(
-        state_signal_ptr, cutlass.Int32, sem="acquire", scope="gpu"
-    )
+    signal_i32 = cute.arch.load(state_signal_ptr, cutlass.Int32, sem="acquire", scope="gpu")
     signal_i64 = cutlass.Int64(signal_i32)
     ping_slot = signal_i64 % _PING_PONG_SIZE
     clear_slot = (signal_i64 + cutlass.Int64(1)) % _PING_PONG_SIZE
-    ping_base = (
-        cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
-    )
-    clear_base = (
-        cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
-    )
+    ping_base = cutlass.Int64(ping_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
+    clear_base = cutlass.Int64(clear_slot) * cutlass.Int64(WORLD_SIZE) * workspace_numel_i64
 
-    neg_zero_vec = cutlass.Array(
-        cutlass.BFloat16, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
-    )
+    neg_zero_vec = cutlass.Array(cutlass.BFloat16, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
     neg_zero_bits = cutlass.Int16(_NEGATIVE_ZERO_BF16_BITS)
     for lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
         neg_zero_vec[lane] = neg_zero_bits.bitcast(cutlass.BFloat16)
@@ -201,13 +183,9 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
     #    The local rank's own region is skipped: no kernel reads its own region
     #    across launches (the all-reduce reads back what the same thread just wrote).
     clear_count_ptr = (
-        signal_state.iterator
-        + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX)
-        + cutlass.Int64(clear_slot)
+        signal_state.iterator + cutlass.Int64(_SIGNAL_SLOT_COUNTS_INDEX) + cutlass.Int64(clear_slot)
     ).llvm_ptr
-    clear_vectors = cute.arch.load(
-        clear_count_ptr, cutlass.Int32, sem="acquire", scope="gpu"
-    )
+    clear_vectors = cute.arch.load(clear_count_ptr, cutlass.Int32, sem="acquire", scope="gpu")
     clear_vector_idx = bidx * bdim + tidx
     clear_stride = grid_x * bdim
     while clear_vector_idx < clear_vectors:
@@ -235,9 +213,7 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
         col_i64 = base_idx_i64 - row_i64 * cutlass.Int64(N)
         out_row_base = row_i64 * cutlass.Int64(WORLD_SIZE * N) + col_i64
 
-        input_values = input_array.load(
-            base_idx, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES
-        )
+        input_values = input_array.load(base_idx, _BF16_VEC_SIZE, alignment=_ALIGNMENT_BYTES)
         clean_values = _sanitize_bf16x8(input_values)
 
         # 2. Publish to every peer, in rank-rotated order.
@@ -245,9 +221,7 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
             target_rank = PEER_ORDER[peer_ordinal]
             if target_rank != LOCAL_RANK:
                 write_offset = (
-                    ping_base
-                    + cutlass.Int64(LOCAL_RANK) * workspace_numel_i64
-                    + base_idx_i64
+                    ping_base + cutlass.Int64(LOCAL_RANK) * workspace_numel_i64 + base_idx_i64
                 )
                 buffer_arrays[target_rank].store(
                     clean_values[0:_BF16_VEC_SIZE, cutlass.align(_ALIGNMENT_BYTES)],
@@ -270,9 +244,7 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
             source_rank = PEER_ORDER[peer_ordinal]
             if source_rank != LOCAL_RANK:
                 read_offset = (
-                    ping_base
-                    + cutlass.Int64(source_rank) * workspace_numel_i64
-                    + base_idx_i64
+                    ping_base + cutlass.Int64(source_rank) * workspace_numel_i64 + base_idx_i64
                 )
                 peer_values = local_buffer.load(
                     read_offset,
@@ -309,9 +281,7 @@ def _glm_tp_allgather_bf16_oneshot_lamport_kernel(
     #    vectors the peers wrote into ``ping`` (for its future clear), resets the
     #    counter, and rotates the signal.  Every CTA has read the signal above.
     if tidx == 0:
-        active_vectors = (cutlass.Int32(rows) * cutlass.Int32(N)) // cutlass.Int32(
-            _BF16_VEC_SIZE
-        )
+        active_vectors = (cutlass.Int32(rows) * cutlass.Int32(N)) // cutlass.Int32(_BF16_VEC_SIZE)
         _ar._advance_signal_if_last_cta(
             state_counter_ptr,
             state_signal_ptr,
@@ -404,8 +374,7 @@ def compile_for_rank(
         )
     if pdl_release_policy not in _PDL_RELEASE_POLICIES:
         raise ValueError(
-            f"pdl_release_policy must be one of {_PDL_RELEASE_POLICIES}, "
-            f"got {pdl_release_policy!r}"
+            f"pdl_release_policy must be one of {_PDL_RELEASE_POLICIES}, got {pdl_release_policy!r}"
         )
     if not 0 <= local_rank < world_size:
         raise ValueError(f"local_rank {local_rank} outside world size {world_size}")

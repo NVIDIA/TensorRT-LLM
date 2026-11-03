@@ -100,34 +100,30 @@ from __future__ import annotations
 import os
 
 import cuda.bindings.driver as cuda_driver
-
 import cutlass
-import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-
-from .device_bound_scheduler import DeviceBoundPersistentTileScheduler
-
-from .moe_kernel_ops import vectorized_atomic_add_bf16x8_relaxed
-from .glm_nvfp4_utils import (
-    a_dtype,
-    b_dtype,
-    fp4x2_dtype,
-    fp4_lanes_per_storage,
-    sf_dtype,
-    sf_vec_size,
-    num_m0_per_sf_atom,
-    num_m1_per_sf_atom,
-    num_k_per_sf_atom,
-    num_elts_atom_sf_e8,
-    num_elts_atom_sf_fp16,
-    num_tmem_cols_per_sf_atom,
-    compute_sf_rest,
-    compute_ktile_config,
-)  # GLM-5.2 NVFP4 configuration -- the single definition site. Importing any of  # these from moe_utils instead reintroduces the GPT-OSS values, and any  # moe_utils *function* that reads them keeps using them regardless of what this  # file sets locally. See glm_nvfp4_utils' module docstring.
+import cutlass.experimental.cuda as cuda
 from cutlass.experimental import primitives as prims
 
 from ..common import compat48 as _compat48
-
+from .device_bound_scheduler import DeviceBoundPersistentTileScheduler
+from .glm_nvfp4_utils import (
+    a_dtype,
+    b_dtype,
+    compute_ktile_config,
+    compute_sf_rest,
+    fp4_lanes_per_storage,
+    fp4x2_dtype,
+    num_elts_atom_sf_e8,
+    num_elts_atom_sf_fp16,
+    num_k_per_sf_atom,
+    num_m0_per_sf_atom,
+    num_m1_per_sf_atom,
+    num_tmem_cols_per_sf_atom,
+    sf_dtype,
+    sf_vec_size,
+)  # GLM-5.2 NVFP4 configuration -- the single definition site. Importing any of  # these from moe_utils instead reintroduces the GPT-OSS values, and any  # moe_utils *function* that reads them keeps using them regardless of what this  # file sets locally. See glm_nvfp4_utils' module docstring.
+from .moe_kernel_ops import vectorized_atomic_add_bf16x8_relaxed
 from .static_persistent_tile_scheduler import PersistentTileSchedulerParams, WorkTileInfo
 
 # ---------------------------------------------------------------------------
@@ -177,8 +173,7 @@ L2_POLICY_B = "evict_first"
 # feature rather than the kernel.
 USE_PDL = os.environ.get("TRTLLM_ENABLE_PDL", "1").lower() in ("1", "true", "yes", "on")
 assert L2_POLICY_B in ("", "evict_first", "evict_last", "evict_normal"), (
-    f"L2_POLICY_B={L2_POLICY_B!r} is not a valid createpolicy.fractional "
-    f"priority"
+    f"L2_POLICY_B={L2_POLICY_B!r} is not a valid createpolicy.fractional priority"
 )
 
 epilog_warp_id = (0, 1, 2, 3)
@@ -355,8 +350,8 @@ def host_function(
     # to avoid JIT caching issues with baked-in addresses.
 
     # Compute SF atom counts per tile and TMEM columns per MMA kblock
-    tile_sf, num_tmem_cols_per_kblock_sfa, num_tmem_cols_per_kblock_sfb = (
-        compute_sf_rest(mma_tiler_mnk, mma_inst_mnk)
+    tile_sf, num_tmem_cols_per_kblock_sfa, num_tmem_cols_per_kblock_sfb = compute_sf_rest(
+        mma_tiler_mnk, mma_inst_mnk
     )
     rest_k_sf_per_ktile = tile_sf["k"]
     rest_m_sf_per_ktile = tile_sf["m"]
@@ -388,18 +383,10 @@ def host_function(
     num_bytes_a = a_rows * mma_tiler_mnk[2] * a_dtype.width // 8
     num_bytes_b = mma_tiler_mnk[1] * mma_tiler_mnk[2] * b_dtype.width // 8
     num_bytes_sfa = (
-        num_elts_atom_sf_e8
-        * rest_k_sf_per_ktile
-        * rest_m_sf_per_ktile
-        * sf_dtype.width
-        // 8
+        num_elts_atom_sf_e8 * rest_k_sf_per_ktile * rest_m_sf_per_ktile * sf_dtype.width // 8
     )
     num_bytes_sfb = (
-        num_elts_atom_sf_e8
-        * rest_k_sf_per_ktile
-        * rest_n_sf_per_ktile
-        * sf_dtype.width
-        // 8
+        num_elts_atom_sf_e8 * rest_k_sf_per_ktile * rest_n_sf_per_ktile * sf_dtype.width // 8
     )
     # SMEM for blkred staging: each epilogue thread owns `blkred_bufs` scratch rows of
     # epi_subtile_n each. 4 warps × 32 = 128 threads.
@@ -411,9 +398,7 @@ def host_function(
     # More buffers let consecutive reductions overlap, at the cost of SMEM that comes
     # out of the A/B pipeline depth. Which way that trade lands is a measurement.
     num_epi_threads = 32 * len(epilog_warp_id)  # 128
-    num_bytes_c_stage = (
-        num_epi_threads * epi_subtile_n * blkred_bufs * c_dtype.width // 8
-    )
+    num_bytes_c_stage = num_epi_threads * epi_subtile_n * blkred_bufs * c_dtype.width // 8
     # Reserve SMEM for mbar, blkred buffer, bias buffer, and alignment overhead.
     # The kernel allocates sBias_dbuf (aligned to 16) and sC_blkred (aligned to
     # 1024) AFTER the AB pipeline stages. Without accounting for them here, the
@@ -475,9 +460,7 @@ def host_function(
         tile_grid, scheduler_cluster, raster_along_m=raster_along_m
     )
     max_active_clusters = num_sms // cluster_m
-    grid = DeviceBoundPersistentTileScheduler.get_grid_shape(
-        tile_sched_params, max_active_clusters
-    )
+    grid = DeviceBoundPersistentTileScheduler.get_grid_shape(tile_sched_params, max_active_clusters)
 
     # Launch the kernel
     moe_grouped_gemm_finalize_fusion_dyn_kernel(
@@ -660,35 +643,19 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
             alignment=16,
         )
 
-    ab_full_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem
-    )
-    ab_empty_mbar_ptr = cutlass.Array(
-        cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem
-    )
-    acc_full_mbar_ptr = cutlass.Array(
-        cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem
-    )
-    acc_empty_mbar_ptr = cutlass.Array(
-        cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem
-    )
+    ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem)
+    ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, num_ab_stage, space=cutlass.AddressSpace.smem)
+    acc_full_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
+    acc_empty_mbar_ptr = cutlass.Array(cutlass.Int64, acc_stages, space=cutlass.AddressSpace.smem)
     # Warp-specialized scheduler: producer→consumer work_tile via SMEM
-    sched_full_mbar_ptr = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem
-    )
-    sched_empty_mbar_ptr = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem
-    )
-    num_tiles_m_mbar_ptr = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem
-    )
+    sched_full_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+    sched_empty_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+    num_tiles_m_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     # TMEM address buffer - will hold the allocated TMEM address
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
     s_num_tiles_m = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
     # Work tile SMEM: [is_valid_i32, tile_coord_m, tile_coord_n, tile_coord_l] — 4×Int32 for one 128-bit ld.shared
-    s_work_tile = cutlass.Array(
-        cutlass.Int32, 4, space=cutlass.AddressSpace.smem, alignment=16
-    )
+    s_work_tile = cutlass.Array(cutlass.Int32, 4, space=cutlass.AddressSpace.smem, alignment=16)
     # Expert index for this tile — written by TMA warp, read by epilogue warps
 
     # Allocate tensors using cutlass (as flat arrays with alignment)
@@ -759,9 +726,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
             for i in range(acc_stages):
                 prims.mbarrier_init(acc_full_mbar_ptr.subview(i), 1)
                 # All epilogue threads signal acc_empty once T2R is done.
-                prims.mbarrier_init(
-                    acc_empty_mbar_ptr.subview(i), len(epilog_warp_id) * 32
-                )
+                prims.mbarrier_init(acc_empty_mbar_ptr.subview(i), len(epilog_warp_id) * 32)
             # Warp-specialized scheduler: producer (warp 6) → consumers (warps 0-5)
             prims.mbarrier_init(sched_full_mbar_ptr, 1)
             prims.mbarrier_init(sched_empty_mbar_ptr, 32 * num_consumer_warps)
@@ -877,15 +842,11 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                         scope="gpu",
                     )
                 dyn_next = cute.arch.shuffle_sync(dyn_next, 0)
-                tile_sched._current_work_linear_idx = (
-                    dyn_next + tile_sched.num_persistent_clusters
-                )
+                tile_sched._current_work_linear_idx = dyn_next + tile_sched.num_persistent_clusters
             else:
                 tile_sched.advance_to_next_work()
             work_tile = tile_sched.get_current_work()
-            while not prims.mbarrier_try_wait_parity(
-                sched_empty_mbar_ptr, sched_empty_phase
-            ):
+            while not prims.mbarrier_try_wait_parity(sched_empty_mbar_ptr, sched_empty_phase):
                 pass
             if prims.elect_sync():
                 s_work_tile[0:4] = (
@@ -1078,12 +1039,8 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
         # SFA/SFB are only used during the MMA K-loop and can be safely
         # overwritten on the next tile — no per-stage copies needed.
         cols_per_acc_stage = mma_tiler_mnk[1]
-        sfa_tmem_cols_shared = (
-            rest_k_sf_per_ktile * rest_m_sf_per_ktile * num_tmem_cols_per_sf_atom
-        )
-        sfb_tmem_cols_shared = (
-            rest_k_sf_per_ktile * rest_n_sf_per_ktile * num_tmem_cols_per_sf_atom
-        )
+        sfa_tmem_cols_shared = rest_k_sf_per_ktile * rest_m_sf_per_ktile * num_tmem_cols_per_sf_atom
+        sfb_tmem_cols_shared = rest_k_sf_per_ktile * rest_n_sf_per_ktile * num_tmem_cols_per_sf_atom
         # SFA/SFB placed at fixed positions after accumulator stages.
         # Overlapping: SF at end of 512 cols (after two overlapping acc regions).
         # Non-overlapping: SF after both disjoint acc stages.
@@ -1161,23 +1118,17 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
             if cutlass.const_expr(
                 mma_tiler_mnk[1] % (num_m0_per_sf_atom * num_m1_per_sf_atom) != 0
             ):
-                num_mma_n_per_sf_atom = (
-                    num_m0_per_sf_atom * num_m1_per_sf_atom
-                ) // mma_tiler_mnk[1]
-                num_tmem_col_per_mma = (
-                    num_tmem_cols_per_sf_atom // num_mma_n_per_sf_atom
-                )
-                sfb_tmem_col_offset = (
-                    tile_coord_n % num_mma_n_per_sf_atom
-                ) * num_tmem_col_per_mma
+                num_mma_n_per_sf_atom = (num_m0_per_sf_atom * num_m1_per_sf_atom) // mma_tiler_mnk[
+                    1
+                ]
+                num_tmem_col_per_mma = num_tmem_cols_per_sf_atom // num_mma_n_per_sf_atom
+                sfb_tmem_col_offset = (tile_coord_n % num_mma_n_per_sf_atom) * num_tmem_col_per_mma
 
             # TMEM column base for the accumulator write region.
             if cutlass.const_expr(overlapping_accum):
                 # Phase ping-pong: MMA writes to opposite region of epilogue.
                 mma_phys_stage = acc_empty_phase_bit ^ 1
-                cur_base_col_id = base_col_id + mma_phys_stage * (
-                    cols_per_acc_stage - sf_tmem_cols
-                )
+                cur_base_col_id = base_col_id + mma_phys_stage * (cols_per_acc_stage - sf_tmem_cols)
             else:
                 cur_base_col_id = base_col_id + acc_stage_idx * cols_per_acc_stage
             acc_tmem_raw_addr = (base_row_id << 16) | cur_base_col_id
@@ -1217,12 +1168,8 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                 for s2t_idx in cutlass.range(
                     rest_m_sf_per_ktile * rest_k_sf_per_ktile, unroll_full=True
                 ):
-                    sfa_tmem_addr_s2t = (
-                        sfa_tmem_addr_base + s2t_idx * num_tmem_cols_per_sf_atom
-                    )
-                    sfa_tmem_ptr_s2t = prims.make_tmem_ptr(
-                        sfa_tmem_addr_s2t, cutlass.Int32
-                    )
+                    sfa_tmem_addr_s2t = sfa_tmem_addr_base + s2t_idx * num_tmem_cols_per_sf_atom
+                    sfa_tmem_ptr_s2t = prims.make_tmem_ptr(sfa_tmem_addr_s2t, cutlass.Int32)
                     s2t_idx_k = s2t_idx // rest_m_sf_per_ktile
                     s2t_idx_m = s2t_idx % rest_m_sf_per_ktile
                     increment_s2t = (
@@ -1242,12 +1189,8 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                 for s2t_idx in cutlass.range(
                     rest_n_sf_per_ktile * rest_k_sf_per_ktile, unroll_full=True
                 ):
-                    sfb_tmem_addr_s2t = (
-                        sfb_tmem_addr_base + s2t_idx * num_tmem_cols_per_sf_atom
-                    )
-                    sfb_tmem_ptr_s2t = prims.make_tmem_ptr(
-                        sfb_tmem_addr_s2t, cutlass.Int32
-                    )
+                    sfb_tmem_addr_s2t = sfb_tmem_addr_base + s2t_idx * num_tmem_cols_per_sf_atom
+                    sfb_tmem_ptr_s2t = prims.make_tmem_ptr(sfb_tmem_addr_s2t, cutlass.Int32)
                     s2t_idx_k = s2t_idx // rest_n_sf_per_ktile
                     s2t_idx_n = s2t_idx % rest_n_sf_per_ktile
                     increment_s2t = (
@@ -1272,19 +1215,13 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                     sf_col_idx = kblock_idx // num_sf_ids
 
                     sfa_tmem_addr_mma = (
-                        sfa_mma_tmem_addr_base
-                        + sf_col_idx * num_tmem_cols_per_kblock_sfa
+                        sfa_mma_tmem_addr_base + sf_col_idx * num_tmem_cols_per_kblock_sfa
                     )
                     sfb_tmem_addr_mma = (
-                        sfb_mma_tmem_addr_base
-                        + sf_col_idx * num_tmem_cols_per_kblock_sfb
+                        sfb_mma_tmem_addr_base + sf_col_idx * num_tmem_cols_per_kblock_sfb
                     )
-                    sfa_tmem_ptr_mma = prims.make_tmem_ptr(
-                        sfa_tmem_addr_mma, cutlass.Int32
-                    )
-                    sfb_tmem_ptr_mma = prims.make_tmem_ptr(
-                        sfb_tmem_addr_mma, cutlass.Int32
-                    )
+                    sfa_tmem_ptr_mma = prims.make_tmem_ptr(sfa_tmem_addr_mma, cutlass.Int32)
+                    sfb_tmem_ptr_mma = prims.make_tmem_ptr(sfb_tmem_addr_mma, cutlass.Int32)
 
                     idesc_updated = idesc.set_sf_ids(
                         a_sf_id=sf_inside_tmem_col_idx,
@@ -1405,9 +1342,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
             if cutlass.const_expr(overlapping_accum):
                 # reverse_flag: 1 when phase=0 (reverse), 0 when phase=1 (forward)
                 reverse_flag = cutlass.Int32(1) - acc_full_phase_bit
-                _first_subtile_col = (
-                    base_n + reverse_flag * (subtile_cnt - 1) * epi_subtile_n
-                )
+                _first_subtile_col = base_n + reverse_flag * (subtile_cnt - 1) * epi_subtile_n
             else:
                 _first_subtile_col = base_n
             # Pipelined bias cp.async: prefetch first subtile into dbuf[0]
@@ -1428,15 +1363,11 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                         )
                 prims.cp_async_commit_group()
             else:
-                prefetched_bias = cutlass.vector.full(
-                    [t2r_inst_repx], 0.0, cutlass.Float32
-                )
+                prefetched_bias = cutlass.vector.full([t2r_inst_repx], 0.0, cutlass.Float32)
                 if cutlass.const_expr(has_bias):
                     if cutlass.const_expr(overlapping_accum):
                         if is_valid_row and _first_subtile_col < problem_n:
-                            prefetched_bias = bias_expert_base.subview(
-                                _first_subtile_col
-                            ).load(
+                            prefetched_bias = bias_expert_base.subview(_first_subtile_col).load(
                                 vector_size=t2r_inst_repx,
                                 alignment=t2r_inst_repx * 4,
                             )
@@ -1456,9 +1387,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
             # TMEM column base for this acc_stage
             if cutlass.const_expr(overlapping_accum):
                 epi_phys_stage = acc_full_phase_bit
-                cur_base_col_id = base_col_id + epi_phys_stage * (
-                    cols_per_acc_stage - sf_tmem_cols
-                )
+                cur_base_col_id = base_col_id + epi_phys_stage * (cols_per_acc_stage - sf_tmem_cols)
             else:
                 cur_base_col_id = base_col_id + acc_stage_idx * cols_per_acc_stage
 
@@ -1487,9 +1416,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                 # Wait for current subtile's bias data, then prefetch next
                 if cutlass.const_expr(use_bias_smem):
                     prims.cp_async_wait_group(0)
-                    prims.barrier_cta_sync(
-                        epilog_sync_bar_id, thread_count=threads_in_epilogue
-                    )
+                    prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
                     # Prefetch NEXT subtile into the other half of dbuf.
                     # Overlapping: direction depends on region (reverse_flag).
                     if cutlass.const_expr(overlapping_accum):
@@ -1526,9 +1453,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                     cur_base_col_id + real_subtile_idx * t2r_inst_repx,
                     cutlass.Float32,
                 )
-                t2r_rmem_f32 = prims.tcgen05_ld(
-                    t2r_inst_shape, tmem_subtile_ptr, num=t2r_inst_repx
-                )
+                t2r_rmem_f32 = prims.tcgen05_ld(t2r_inst_shape, tmem_subtile_ptr, num=t2r_inst_repx)
                 # Overlapping accum: early acc_empty right after T2R read of the
                 # overlap region. This lets MMA start the next tile while epilogue
                 # continues processing the remaining (non-overlapping) subtiles.
@@ -1546,26 +1471,20 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                     else:
                         next_col_offset = col_offset + epi_subtile_n
                         _has_next_ldg = next_col_offset < base_n + mma_tiler_mnk[1]
-                    next_bias = cutlass.vector.full(
-                        [t2r_inst_repx], 0.0, cutlass.Float32
-                    )
+                    next_bias = cutlass.vector.full([t2r_inst_repx], 0.0, cutlass.Float32)
                     # Same guard as the first prefetch: this is the *next* subtile's
                     # bias, and it feeds `prefetched_bias` for the following iteration.
                     if cutlass.const_expr(has_bias):
                         if _has_next_ldg:
                             if is_valid_row and next_col_offset < problem_n:
-                                next_bias = bias_expert_base.subview(
-                                    next_col_offset
-                                ).load(
+                                next_bias = bias_expert_base.subview(next_col_offset).load(
                                     vector_size=t2r_inst_repx,
                                     alignment=t2r_inst_repx * 4,
                                 )
 
                 if is_valid_row:
                     if col_offset < problem_n:
-                        out_row_base = out_arr.subview(
-                            token_idx * problem_n + col_offset
-                        )
+                        out_row_base = out_arr.subview(token_idx * problem_n + col_offset)
 
                         if cutlass.const_expr(use_bias_smem):
                             _cur_buf_off = (subtile_idx % 2) * epi_subtile_n
@@ -1576,9 +1495,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                             bias_vec = prefetched_bias
 
                         scaled_vec = t2r_rmem_f32 + bias_vec
-                        token_scale_vec = cutlass.vector.full_like(
-                            scaled_vec, token_scale_val
-                        )
+                        token_scale_vec = cutlass.vector.full_like(scaled_vec, token_scale_val)
                         scaled_vec = scaled_vec * token_scale_vec
                         scaled_bf16 = scaled_vec.to(c_dtype)
 
@@ -1607,9 +1524,7 @@ def moe_grouped_gemm_finalize_fusion_dyn_kernel(
                             )
                             prims.cp_async_bulk_commit_group()
                         else:
-                            for elem_idx in cutlass.range(
-                                0, epi_subtile_n, 8, unroll_full=True
-                            ):
+                            for elem_idx in cutlass.range(0, epi_subtile_n, 8, unroll_full=True):
                                 atomic_fn = vectorized_atomic_add_bf16x8_relaxed
                                 atomic_fn(
                                     out_row_base.subview(elem_idx),

@@ -31,8 +31,8 @@ from __future__ import annotations
 
 import torch
 
-from . import _projection_tcgen05_mxf8_template as _tpl
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
+from . import _projection_tcgen05_mxf8_template as _tpl
 from . import self_attn_prefill_projections_mxf8 as _ctx
 
 ROWS_MAX = _tpl.ROWS_MAX
@@ -85,9 +85,7 @@ class DecodeMxf8Projection:
         config: _tpl.Mxf8ProjectionConfig | None = None,
     ):
         if op not in CONFIGS:
-            raise ValueError(
-                f"unknown decode mxf8 projection {op!r}; known: {tuple(CONFIGS)}"
-            )
+            raise ValueError(f"unknown decode mxf8 projection {op!r}; known: {tuple(CONFIGS)}")
         self.op = op
         self.config = config or CONFIGS[op]
         self.n, self.k = self.config.n, self.config.k
@@ -110,9 +108,7 @@ class DecodeMxf8Projection:
     def check(self, x: torch.Tensor, w: QuantizedWeight, out: torch.Tensor) -> None:
         rows = int(x.shape[0])
         if not 1 <= rows <= ROWS_MAX:
-            raise ValueError(
-                f"{self.op} decode mxf8: rows {rows} not in [1, {ROWS_MAX}]"
-            )
+            raise ValueError(f"{self.op} decode mxf8: rows {rows} not in [1, {ROWS_MAX}]")
         if (
             x.dtype is not torch.bfloat16
             or x.shape[1] != self.k
@@ -131,18 +127,12 @@ class DecodeMxf8Projection:
             raise ValueError(
                 f"{self.op} decode mxf8: out must be contiguous bf16 [{rows}, {self.n}]"
             )
-        if (
-            tuple(w.q.shape) != (self.n, self.k)
-            or w.q.data_ptr() % 128
-            or w.sf.data_ptr() % 128
-        ):
+        if tuple(w.q.shape) != (self.n, self.k) or w.q.data_ptr() % 128 or w.sf.data_ptr() % 128:
             raise ValueError(
                 f"{self.op} decode mxf8: weight must be e4m3 [{self.n}, {self.k}], 128B aligned"
             )
 
-    def __call__(
-        self, x: torch.Tensor, w: QuantizedWeight, out: torch.Tensor
-    ) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, w: QuantizedWeight, out: torch.Tensor) -> torch.Tensor:
         rows = int(x.shape[0])
         self._quant.fn(
             x,
@@ -158,16 +148,12 @@ class DecodeMxf8Projection:
         self.hits += 1
         return out
 
-    def gemm_only(
-        self, w: QuantizedWeight, out: torch.Tensor, rows: int
-    ) -> torch.Tensor:
+    def gemm_only(self, w: QuantizedWeight, out: torch.Tensor, rows: int) -> torch.Tensor:
         """The GEMM alone on the activation a producer already wrote into ``xq`` / ``sfa``
         (rows ``< rows``; decode act-quant fusion).  The caller guarantees the producer is this launch's
         stream predecessor and wrote exactly those rows for this call."""
         if not 1 <= rows <= ROWS_MAX:
-            raise ValueError(
-                f"{self.op} decode mxf8: rows {rows} not in [1, {ROWS_MAX}]"
-            )
+            raise ValueError(f"{self.op} decode mxf8: rows {rows} not in [1, {ROWS_MAX}]")
         if (
             out.dtype is not torch.bfloat16
             or tuple(out.shape) != (rows, self.n)

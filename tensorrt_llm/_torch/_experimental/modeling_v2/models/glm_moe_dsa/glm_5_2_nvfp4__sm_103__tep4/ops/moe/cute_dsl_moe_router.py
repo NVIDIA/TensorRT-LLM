@@ -15,8 +15,8 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
-from ...kernels.moe import moe_frontend_router as _vec2
 from ...kernels.moe import moe_decode_router_partials as _partials
+from ...kernels.moe import moe_frontend_router as _vec2
 from ...kernels.moe import moe_frontend_router_tc as _tc
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
 from ...kernels.moe import moe_prefill_router_partials as _prefill

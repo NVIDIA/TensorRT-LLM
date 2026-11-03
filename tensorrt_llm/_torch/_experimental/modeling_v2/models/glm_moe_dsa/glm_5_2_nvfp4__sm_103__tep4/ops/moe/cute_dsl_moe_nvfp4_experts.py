@@ -18,7 +18,6 @@ importable module.
 from __future__ import annotations
 
 import functools
-
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -84,16 +83,18 @@ def allocate_decode_c(max_rows: int, inter: int, device) -> torch.Tensor:
     return torch.zeros((1, max_tiles(max_rows) * TILE, inter), dtype=torch.uint8, device=device)
 
 
-def allocate_pair_c(max_rows: int, inter: int, device) -> torch.Tensor:
-    """One prefill FC1 output buffer: compact `[1, max_tiles(max_rows) * 128, inter / 2]`
-    packed rows (half the decode buffer's row pitch)."""
-    cap_m = max_tiles(max_rows) * TILE
+def allocate_pair_c(max_rows: int, inter: int, device, replicas: int = 0) -> torch.Tensor:
+    """One prefill FC1 output buffer: compact `[1, (max_tiles(max_rows) + replicas) * 128,
+    inter / 2]` packed rows (half the decode buffer's row pitch). `replicas`: replica slots
+    the maps may address, one more partial tile each."""
+    cap_m = (max_tiles(max_rows) + int(replicas)) * TILE
     return torch.zeros((1, cap_m, inter // 2), dtype=torch.uint8, device=device)
 
 
-def allocate_sfc(max_rows: int, inter: int, device) -> torch.Tensor:
-    """One FC1 output-scale buffer in 512-byte atoms, shared by both pairs."""
-    cap_m = max_tiles(max_rows) * TILE
+def allocate_sfc(max_rows: int, inter: int, device, replicas: int = 0) -> torch.Tensor:
+    """One FC1 output-scale buffer in 512-byte atoms, shared by both pairs; `replicas` as
+    `allocate_pair_c`'s."""
+    cap_m = (max_tiles(max_rows) + int(replicas)) * TILE
     return torch.zeros(
         (1, cap_m // SF_ATOM_MN, rest_n_sfc(inter), SF_ATOM), dtype=torch.uint8, device=device
     )
@@ -435,13 +436,19 @@ class CompiledDecodeExperts:
 class CompiledPairExperts:
     """The prefill pair at both MMA N widths, `{128 | 256: (gg1, gg2)}`; the width is
     picked per call (`selected_width`: 128 up to 1536 rows, 256 above). `bias` is the zero
-    fp32 `[experts, hidden]` operand in GG2's ABI that it does not read."""
+    fp32 `[experts, hidden]` operand in GG2's ABI that it does not read. `experts` is the
+    stacks' depth: 64, or 64 + R with context replica slots (`replicas`)."""
 
     pair: Mapping[int, tuple[object, object]]
     bias: torch.Tensor
     hidden: int
     inter: int
     experts: int
+
+    @property
+    def replicas(self) -> int:
+        """Replica slots past the 64 home experts; each adds one partial tile to the bound."""
+        return self.experts - LOCAL_EXPERTS
 
 
 def build_decode(
@@ -618,7 +625,7 @@ def _run_pair(
     n_fc1 = 2 * inter
     gg1, gg2 = compiled.pair[_pair.selected_width(rows)]
     f4, e4 = torch.float4_e2m1fn_x2, torch.float8_e4m3fn
-    cap = max_tiles(rows)
+    cap = max_tiles(rows) + compiled.replicas
     c4, sfc4 = c.view(f4), sfc.view(e4)
     gg1(
         fc1_w.view(f4).view(experts, n_fc1, hidden // 2).permute(0, 2, 1),
@@ -729,7 +736,8 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
     """Compile the prefill pair at both MMA N widths (128, 256), every SM, PDL as the
     engine sets it, and launch each width once on zero tiles: a compiled handle still
     loads its module on its first launch, which the first context step would otherwise
-    pay. Call at load. The pair is fixed at hidden 6144, intermediate 2048, 64 experts.
+    pay. Call at load. The pair is fixed at hidden 6144, intermediate 2048, and `experts`
+    64, or 64 + R for the maps of the context replica top-k (R replica slots, up to 16).
 
     The warm launch allocates weight-shaped scratch for the descriptors (nothing is read
     at zero tiles), freed on return. Raises if the device is not sm_103 or a compile
@@ -739,8 +747,8 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
     with torch.cuda.device(device):
         pair = {
             width: (
-                _pair.compile_gg1(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL),
-                _pair.compile_gg2(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL),
+                _pair.compile_gg1(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL, experts=experts),
+                _pair.compile_gg2(tile_n=width, num_sms=num_sms, use_pdl=_USE_PDL, experts=experts),
             )
             for width in (128, 256)
         }
@@ -754,7 +762,7 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
         u8 = {"dtype": torch.uint8, "device": device}
         e4 = {"dtype": torch.float8_e4m3fn, "device": device}
         n_fc1 = 2 * inter
-        maps = allocate_maps(PREFILL_MAX_ROWS, device)
+        maps = allocate_maps(PREFILL_MAX_ROWS, device, replicas=compiled.replicas)
         for k in ("tile_idx_to_expert_idx", "tile_idx_to_mn_limit", "num_non_exiting_tiles"):
             maps[k].zero_()
         fc1_w = torch.empty((experts, n_fc1, hidden // 2), **u8)
@@ -763,8 +771,8 @@ def build_prefill_pair(hidden: int, inter: int, experts: int, device) -> Compile
         fc2_s = torch.empty((experts, hidden // SF_ATOM_MN, inter // SF_ATOM_K, SF_ATOM), **e4)
         one = torch.ones(1, dtype=torch.float32, device=device)
         alpha = torch.ones(experts, dtype=torch.float32, device=device)
-        c = allocate_pair_c(PREFILL_MAX_ROWS, inter, device)
-        sfc = allocate_sfc(PREFILL_MAX_ROWS, inter, device)
+        c = allocate_pair_c(PREFILL_MAX_ROWS, inter, device, compiled.replicas)
+        sfc = allocate_sfc(PREFILL_MAX_ROWS, inter, device, compiled.replicas)
         # One row count per width: N128 up to 1536 rows, N256 above.
         for rows in (513, PREFILL_MAX_ROWS):
             _run_pair(
@@ -900,13 +908,22 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
             spec=dict(pair=True, rows=1537, offset=192, accumulate=True),
         ),
         Cell(why="8192 rows on the prefill pair, N256", spec=dict(pair=True, rows=8192, offset=0)),
+        Cell(
+            why="2048 rows on the 72-deep pair: maps with 8 context replica slots",
+            spec=dict(pair=True, rows=2048, offset=64, replicas=8),
+        ),
+        Cell(
+            why="8192 rows on the 72-deep pair, N256, replica slots, accumulating",
+            spec=dict(pair=True, rows=8192, offset=128, replicas=8, accumulate=True),
+        ),
     )
 
     note = """
     The target builds the decode pair once for 8192 rows (`build_decode`, with one
     dynamic-FC2 slot per trunk layer: a layer's decode FC2 runs at most once per forward)
-    and the prefill pair once (`build_prefill_pair`). Launches of up to 64 tokens pass
-    their layer's `dyn_slot`; the dynamic FC2's atomics add a token's terms in another
+    and the prefill pair once (`build_prefill_pair`), and with context replicas on a second
+    prefill pair for `64 + R` slots, which runs the replica top-k's maps. Launches of up to
+    64 tokens pass their layer's `dyn_slot`; the dynamic FC2's atomics add a token's terms in another
     order, as the static kernel's already do run to run. Up to 64 rows take the decode pair; 65..8192
     take the prefill pair when it built, else the decode pair. There is no stock path:
     the weights are packed for these kernels alone.
@@ -1051,6 +1068,10 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
                     f"dyn_slot must be in 0..{compiled.dyn_ctr.shape[0] - 1}, got {dyn_slot}"
                 )
         u8, e4, f32 = torch.uint8, torch.float8_e4m3fn, torch.float32
+        # A decode pair built with replica slots (`experts > 64`) also serves a 64-deep stack
+        # (the MTP layer's): its maps then name home slots only.
+        if not pair and fc1_w.shape[0] == LOCAL_EXPERTS:
+            experts = LOCAL_EXPERTS
         for name, t, shape, dtype in (
             ("xq", xq, (rows, hidden // 2), u8),
             ("topk_w", topk_w, (rows, TOP_K), f32),
@@ -1073,8 +1094,13 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         )
         assert xsf.is_contiguous() and xsf.data_ptr() % 16 == 0
         # Up to 128 rows an expert holds at most one tile, so the fused top-k's map sets
-        # hold `min(64, 8 * rows)` tiles; above, `max_tiles` bounds the count.
-        tiles = min(LOCAL_EXPERTS, rows * TOP_K) if rows <= TILE else max_tiles(rows)
+        # hold `min(64, 8 * rows)` tiles; above, `max_tiles` bounds the count, plus one
+        # partial tile per replica slot on a pair built for them.
+        tiles = (
+            min(experts, rows * TOP_K)
+            if rows <= TILE
+            else max_tiles(rows) + (compiled.replicas if pair else 0)
+        )
         for k, size in (
             ("tile_idx_to_expert_idx", tiles),
             ("tile_idx_to_mn_limit", tiles),
@@ -1091,7 +1117,9 @@ class CuteDslMoeNvfp4Experts(OpWrapper):
         assert c.shape[1] >= tiles * TILE and c.is_contiguous()
         assert sfc.dtype == u8 and tuple(sfc.shape[2:]) == (rest_n_sfc(inter), SF_ATOM)
         assert sfc.shape[1] >= tiles and sfc.is_contiguous()
-        assert experts == LOCAL_EXPERTS
+        assert LOCAL_EXPERTS <= experts <= LOCAL_EXPERTS + 16, (
+            f"the stacks hold this rank's 64 experts and up to 16 replica slots, got {experts}"
+        )
 
 
 cute_dsl_moe_nvfp4_experts = CuteDslMoeNvfp4Experts()

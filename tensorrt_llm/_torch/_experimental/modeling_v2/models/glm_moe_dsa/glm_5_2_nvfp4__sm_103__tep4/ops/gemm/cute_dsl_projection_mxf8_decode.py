@@ -13,8 +13,8 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.gemm import self_attn_decode_projections_mxf8 as _kernel
 from ...kernels.common import self_attn_prefill_act_quant_mxf8 as _quant
+from ...kernels.gemm import self_attn_decode_projections_mxf8 as _kernel
 
 #: Entry -> the kernel's op.
 ENTRIES: dict[str, str] = {"q_b": "q_b_proj", "o_proj": "o_proj"}
@@ -86,7 +86,8 @@ class CuteDslProjectionMxf8Decode(OpWrapper):
         Cell(why="q_b at one row", spec=dict(kernel="q_b", rows=1)),
         Cell(why="q_b at 37 rows, a ragged batch", spec=dict(kernel="q_b", rows=37)),
         Cell(
-            why="q_b at 64 rows on the q_a norm's operand", spec=dict(kernel="q_b", rows=64, pre=True)
+            why="q_b at 64 rows on the q_a norm's operand",
+            spec=dict(kernel="q_b", rows=64, pre=True),
         ),
         Cell(why="o_proj at 2 rows, one sequence x MTP 2", spec=dict(kernel="o_proj", rows=2)),
         Cell(why="o_proj at 64 rows", spec=dict(kernel="o_proj", rows=64)),

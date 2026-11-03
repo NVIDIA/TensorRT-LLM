@@ -38,7 +38,9 @@ def _sf_offsets(rows: torch.Tensor, k: int) -> torch.Tensor:
     kf = k // 32
     m = rows[:, None]
     f = torch.arange(kf, device=rows.device)[None, :]
-    return (m % 32) * 16 + ((m // 32) % 4) * 4 + f % 4 + (f // 4) * 512 + (m // 128) * 512 * (k // 128)
+    return (
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + f % 4 + (f // 4) * 512 + (m // 128) * 512 * (k // 128)
+    )
 
 
 class CuteDslActQuantMxf8Rows(OpWrapper):

@@ -131,9 +131,9 @@ class CuteDslAllreduceAddRmsnorm(OpWrapper):
             )
             q8, sf = x8
             n = int(partial.shape[1])
-            assert q8.dtype == torch.uint8 and q8.is_contiguous() and tuple(q8.shape) == (rows, n), (
-                f"x8's values must be a contiguous uint8 [{rows}, {n}]"
-            )
+            assert (
+                q8.dtype == torch.uint8 and q8.is_contiguous() and tuple(q8.shape) == (rows, n)
+            ), f"x8's values must be a contiguous uint8 [{rows}, {n}]"
             need = (rows + 127) // 128 * 128 * (n // 32)
             assert sf.dtype == torch.uint8 and sf.numel() >= need and sf.data_ptr() % 32 == 0, (
                 f"x8's scales must hold {need} bytes, 32-byte aligned"

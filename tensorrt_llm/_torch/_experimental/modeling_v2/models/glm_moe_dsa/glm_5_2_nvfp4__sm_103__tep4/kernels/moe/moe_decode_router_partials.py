@@ -44,11 +44,10 @@ stored. One compile serves every T (symbolic).
 
 from typing import Callable, Dict, Tuple
 
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda_exp
+import torch
 from cuda.bindings import driver as cuda
 from cutlass.base_dsl.array import L1EvictKind
 from cutlass.experimental import primitives as prims
@@ -76,13 +75,8 @@ _STAGES = 3
 if _KTILES % _KSUB or _KSUB not in (1, 2, 3, 4, 6, 8):
     raise ValueError("_KSUB must divide 24 and be <= 8")
 _SMEM_LIMIT = 227 * 1024
-if (
-    _STAGES * _KSUB * _TILE_M * _TILE_K * 2 + _KTILES * _TILE_N * _TILE_K * 2 + 1024
-    > _SMEM_LIMIT
-):
-    raise ValueError(
-        "GLM_DEC_ROUTER_STAGES x KSUB exceeds B300 SMEM with the 96 KiB weight slice"
-    )
+if _STAGES * _KSUB * _TILE_M * _TILE_K * 2 + _KTILES * _TILE_N * _TILE_K * 2 + 1024 > _SMEM_LIMIT:
+    raise ValueError("GLM_DEC_ROUTER_STAGES x KSUB exceeds B300 SMEM with the 96 KiB weight slice")
 
 RouterFn = Callable[..., None]
 _CACHE: Dict[Tuple[int, int, int, bool], RouterFn] = {}
@@ -116,21 +110,11 @@ def decode_router_partials_kernel(
         space=cutlass.AddressSpace.smem,
         alignment=1024,
     )
-    full = cutlass.Array(
-        cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    empty = cutlass.Array(
-        cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    b_full = cutlass.Array(
-        cutlass.Int64, _KTILES, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    acc_full = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    tmem_location = cutlass.Array(
-        cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
-    )
+    full = cutlass.Array(cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8)
+    empty = cutlass.Array(cutlass.Int64, stages, space=cutlass.AddressSpace.smem, alignment=8)
+    b_full = cutlass.Array(cutlass.Int64, _KTILES, space=cutlass.AddressSpace.smem, alignment=8)
+    acc_full = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    tmem_location = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4)
     tid, _, _ = cute.arch.thread_idx()
     block, _, _ = cute.arch.block_idx()
     warp = cute.arch.warp_idx()
@@ -143,9 +127,7 @@ def decode_router_partials_kernel(
         if prims.elect_sync():
             for stage in cutlass.range_constexpr(stages):
                 prims.mbarrier_init(full.subview(stage), 1)
-                prims.mbarrier_init(
-                    empty.subview(stage), cluster
-                )  # every cluster CTA's MMA commit
+                prims.mbarrier_init(empty.subview(stage), cluster)  # every cluster CTA's MMA commit
             for kt in cutlass.range_constexpr(_KTILES):
                 prims.mbarrier_init(b_full.subview(kt), 1)
             prims.mbarrier_init(acc_full.subview(0), 1)
@@ -203,17 +185,13 @@ def decode_router_partials_kernel(
         empty_phase = cutlass.Int32(0)
         for st in cutlass.range(steps):
             if st >= stages:
-                while not prims.mbarrier_try_wait_parity(
-                    empty.subview(stage), empty_phase
-                ):
+                while not prims.mbarrier_try_wait_parity(empty.subview(stage), empty_phase):
                     pass
             if prims.elect_sync():
                 prims.mbarrier_arrive_expect_tx(full.subview(stage), ksub * a_tile * 2)
                 for j in cutlass.range_constexpr(ksub):
                     prims.cp_async_bulk_tensor_shared_cluster_global(
-                        smem_a.subview(
-                            (stage * ksub + j) * a_tile + crank * (a_rows * _TILE_K)
-                        ),
+                        smem_a.subview((stage * ksub + j) * a_tile + crank * (a_rows * _TILE_K)),
                         a_desc.get_ptr(),
                         (k0 + (st * ksub + j) * _TILE_K, crank * a_rows),
                         full.subview(stage),
@@ -250,9 +228,7 @@ def decode_router_partials_kernel(
                 kt = st * ksub + j
                 while not prims.mbarrier_try_wait_parity(b_full.subview(kt), 0):
                     pass
-                stage_desc_a = desc_a.advance_start_address(
-                    (stage * ksub + j) * a_tile * 2
-                )
+                stage_desc_a = desc_a.advance_start_address((stage * ksub + j) * a_tile * 2)
                 stage_desc_b = desc_b.advance_start_address(kt * b_tile * 2)
                 for kb in cutlass.range_constexpr(4):
                     if prims.elect_sync():
@@ -340,9 +316,7 @@ def launch_decode_router_partials(
         box_dims=[_TILE_K, _TILE_N],
         swizzle=cuda_exp.TensorMapSwizzle.s128b,
     )
-    decode_router_partials_kernel(
-        a_desc, b_desc, c, tokens, stages, ksub, use_pdl, cluster
-    ).launch(
+    decode_router_partials_kernel(a_desc, b_desc, c, tokens, stages, ksub, use_pdl, cluster).launch(
         grid=(_CTAS, 1, 1),
         block=(192, 1, 1),
         cluster=(cluster, 1, 1),
@@ -351,9 +325,7 @@ def launch_decode_router_partials(
     )
 
 
-def _validate(
-    input_tensor: "torch.Tensor", weight: "torch.Tensor", output: "torch.Tensor"
-) -> int:
+def _validate(input_tensor: "torch.Tensor", weight: "torch.Tensor", output: "torch.Tensor") -> int:
     m, k = input_tensor.shape
     if not 1 <= m <= _MAX_TOKENS:
         raise ValueError(f"decode router supports T in [1, {_MAX_TOKENS}], got {m}")
@@ -367,16 +339,10 @@ def _validate(
         or output.dtype != torch.float32
     ):
         raise TypeError("decode router: BF16 input and weight, FP32 partials")
-    if not (
-        input_tensor.is_contiguous()
-        and weight.is_contiguous()
-        and output.is_contiguous()
-    ):
+    if not (input_tensor.is_contiguous() and weight.is_contiguous() and output.is_contiguous()):
         raise ValueError("decode router operands must be contiguous")
     if input_tensor.data_ptr() % 16 or weight.data_ptr() % 16 or output.data_ptr() % 32:
-        raise ValueError(
-            "decode router: 16-byte aligned input/weight, 32-byte aligned partials"
-        )
+        raise ValueError("decode router: 16-byte aligned input/weight, 32-byte aligned partials")
     device = (
         input_tensor.device.index
         if input_tensor.device.index is not None
@@ -398,9 +364,7 @@ def compile_router_partials(
     """Compile (once per device / schedule / PDL mode / cluster) the handle ``fn(x, weight, partials, T)``."""
     device = _validate(input_tensor, weight, output)
     if cluster not in _CLUSTERS:
-        raise ValueError(
-            f"decode router cluster must be one of {_CLUSTERS}, got {cluster}"
-        )
+        raise ValueError(f"decode router cluster must be one of {_CLUSTERS}, got {cluster}")
     key = (device, _STAGES, _KSUB, bool(use_pdl), int(cluster))
     if key not in _CACHE:
         cutlass.cuda.initialize_cuda_context(device)
@@ -439,6 +403,6 @@ def run_router_partials(
     cluster: int = _CLUSTER,
 ) -> None:
     """Launch on the current stream: ``output[t, s, e] = sum over K split s of x[t] * weight[e]`` (FP32)."""
-    compile_router_partials(
-        input_tensor, weight, output, use_pdl=use_pdl, cluster=cluster
-    )(input_tensor, weight, output, int(input_tensor.shape[0]))
+    compile_router_partials(input_tensor, weight, output, use_pdl=use_pdl, cluster=cluster)(
+        input_tensor, weight, output, int(input_tensor.shape[0])
+    )

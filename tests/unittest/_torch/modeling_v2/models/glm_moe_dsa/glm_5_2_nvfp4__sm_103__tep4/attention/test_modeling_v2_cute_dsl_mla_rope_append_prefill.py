@@ -193,3 +193,69 @@ def test_is_valid_refuses_a_position_past_the_rope_table() -> None:
     args["rotary_cos_sin"] = args["rotary_cos_sin"][:, : 20 * ROPE * 2]
     with pytest.raises(AssertionError, match="past the rope table"):
         op.is_valid(**args, compiled=_handle())
+
+
+#: Context row counts of the e4m3-query mode's split build: a partial last tile, mid-size and
+#: served steps, the token budget and twice it.
+_PAR_ROWS = (513, 4128, 7340, 8192, 16448)
+
+
+def _par_spec(rows: int) -> dict:
+    """`rows` new rows over up to 8 requests, cached prefixes on most, the target's latent stride."""
+    n = 8 if rows >= 4096 else 3
+    new = [rows // n] * (n - 1) + [rows - rows // n * (n - 1)]
+    cached = [(17 * b) % 300 for b in range(n)]
+    return dict(new=new, cached=cached, layers=2, layer=1, latent_stride=2624, q_in_place=True,
+                q_e4m3=True)  # fmt: skip
+
+
+def _fresh(rows: int, seed: int) -> dict:
+    """A new copy of the same inputs. Not `.clone()`: `q_pe` is a view of the query's rope tail
+    and the latent a view of a wider row, and the op checks those strides."""
+    return _build(_par_spec(rows), seed=seed)
+
+
+def _outputs(args: dict) -> list[torch.Tensor]:
+    """The bytes the op may write: the query's rope tail, the latent rows, the whole pool."""
+    return [args["q_pe"].contiguous().view(torch.uint8), args["latent_cache"].contiguous(),
+            args["kv_pool"]]  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def compiled_one_cta():
+    """The e4m3-query mode on one CTA per token tile: the build the split one replaces."""
+    return entry.compile(
+        tokens_per_block=PAGE, device_index=torch.cuda.current_device(), rope_par=0
+    )
+
+
+@pytest.mark.parametrize("rows", _PAR_ROWS)
+def test_split_build_is_the_one_cta_build_bitwise(rows, compiled, compiled_one_cta) -> None:
+    assert compiled.rope_par == entry.ROPE_PAR and compiled_one_cta.rope_par == 0
+    a, b = _fresh(rows, rows), _fresh(rows, rows)
+    op(**a, compiled=compiled)
+    op(**b, compiled=compiled_one_cta)
+    torch.cuda.synchronize()
+    for got, want, name in zip(_outputs(a), _outputs(b), ("q_pe", "latent", "pool")):
+        assert torch.equal(got, want), f"{name}: the split build differs at {rows} rows"
+
+
+def test_split_build_graph_replay_is_eager(compiled) -> None:
+    args = _fresh(7340, 11)
+    eager, static = _fresh(7340, 11), _fresh(7340, 11)
+    op(**eager, compiled=compiled)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(**_fresh(7340, 11), compiled=compiled)  # warm on the capture stream
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        op(**static, compiled=compiled)
+    for k, v in args.items():  # the capture ran nothing: restore the inputs and replay
+        if torch.is_tensor(v):
+            static[k].copy_(v)
+    graph.replay()
+    torch.cuda.synchronize()
+    for got, want, name in zip(_outputs(static), _outputs(eager), ("q_pe", "latent", "pool")):
+        assert torch.equal(got, want), f"{name}: graph replay differs from eager"

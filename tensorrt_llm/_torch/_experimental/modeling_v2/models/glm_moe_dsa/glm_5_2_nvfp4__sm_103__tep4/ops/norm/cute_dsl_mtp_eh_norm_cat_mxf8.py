@@ -9,8 +9,8 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from ...kernels.norm import mtp_eh_norm_cat_mxf8 as _kernel
 from ...kernels.common import self_attn_prefill_act_quant_mxf8 as _quant
+from ...kernels.norm import mtp_eh_norm_cat_mxf8 as _kernel
 
 HIDDEN = _kernel.HIDDEN
 #: The operand width: the two normalized halves side by side.

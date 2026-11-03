@@ -27,12 +27,10 @@ leaves no limit on the row count.
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
-
 
 _THREADS = 256
 _PER_THREAD = 4

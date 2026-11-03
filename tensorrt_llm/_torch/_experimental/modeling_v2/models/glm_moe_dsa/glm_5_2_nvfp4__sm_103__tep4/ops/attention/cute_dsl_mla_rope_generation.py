@@ -148,7 +148,11 @@ class CuteDslMlaRopeGeneration(OpWrapper):
         Cell(
             why="3 sequences with the q-base from the K-B GEMM: the late-wait partial tile",
             spec=dict(
-                num_seqs=3, cached=[30, 31, 32], num_layers=1, layer_idx=0, q_base_from_kb=True,
+                num_seqs=3,
+                cached=[30, 31, 32],
+                num_layers=1,
+                layer_idx=0,
+                q_base_from_kb=True,
                 **_GLM,
             ),
         ),

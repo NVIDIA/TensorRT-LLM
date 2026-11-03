@@ -42,10 +42,10 @@ PDL-chain variant (weight preload, wait, signal), which the FP8 epilogue require
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable, Literal
 
-import dataclasses
 import torch
 
 from . import self_attn_k_b_bmm_h16_m64_n512_k192_bf16 as _kbbmm
@@ -211,9 +211,7 @@ def _compile_tvm_ffi(
     _kbbmm.reject_unpredicated_store(
         abi.module_name, schedule, rows_allowed, emit_fp8_q_base=emit_fp8_q_base
     )
-    _kbbmm._validate_contract(
-        abi, input_tensor, weight, output, fp8_output=emit_fp8_q_base
-    )
+    _kbbmm._validate_contract(abi, input_tensor, weight, output, fp8_output=emit_fp8_q_base)
     weight = weight.detach()
     a = from_dlpack(
         weight, assumed_align=_ALIGNMENT_BYTES, enable_tvm_ffi=True
@@ -241,22 +239,16 @@ def _compile_tvm_ffi(
         # The FP8 epilogue lives in the PDL-chain variant (decode module's
         # _compile does the same): weight preload, wait for the producer of
         # q_nope, signal after the store tail.
-        max_active_clusters = (
-            _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
-                cluster_size
-            )
+        max_active_clusters = _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
         )
         gemm = _kbbmm.make_pdl_chain_kernel(
             _fp8_q_base_schedule(schedule), _kbbmm.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
         )
-        kernel_name_prefix = (
-            f"{kernel_name_prefix}{_kbbmm.FP8_Q_BASE_KERNEL_SUFFIX}_pdl_chain"
-        )
+        kernel_name_prefix = f"{kernel_name_prefix}{_kbbmm.FP8_Q_BASE_KERNEL_SUFFIX}_pdl_chain"
     else:
-        max_active_clusters = (
-            _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
-                cluster_size
-            )
+        max_active_clusters = _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
         )
         gemm = _kbbmm._GlmPersistentDenseGemmKernel(
             cutlass.Float32,
@@ -267,12 +259,8 @@ def _compile_tvm_ffi(
             schedule.swizzle_size,
             schedule.raster_along,
         )
-    if not gemm.can_implement(
-        mnkl, a.element_type, b.element_type, c.element_type, "k", "k", "m"
-    ):
-        raise ValueError(
-            f"{abi.module_name}: persistent schedule cannot implement {mnkl}"
-        )
+    if not gemm.can_implement(mnkl, a.element_type, b.element_type, c.element_type, "k", "k", "m"):
+        raise ValueError(f"{abi.module_name}: persistent schedule cannot implement {mnkl}")
     gemm.kernel.set_name_prefix(kernel_name_prefix, remove_cutlass_symbol=True)
     return cute.compile(
         _bmm_serving_views,
@@ -426,6 +414,4 @@ def build(
         return TvmFfiBmmLauncher(op, emit_fp8_q_base=emit_fp8_q_base)
     if launch_mode == "legacy":
         return _build_legacy(op, emit_fp8_q_base=emit_fp8_q_base)
-    raise ValueError(
-        f"{op}_bmm: launch_mode must be tvm_ffi or legacy, got {launch_mode!r}"
-    )
+    raise ValueError(f"{op}_bmm: launch_mode must be tvm_ffi or legacy, got {launch_mode!r}")

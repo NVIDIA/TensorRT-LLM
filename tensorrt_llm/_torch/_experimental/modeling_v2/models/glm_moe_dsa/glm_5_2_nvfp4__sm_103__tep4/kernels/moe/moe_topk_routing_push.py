@@ -52,11 +52,10 @@ default) the kernel is the one without it. Nothing else changes either way.
 from typing import Callable, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda_driver
-import torch
-
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import torch
 from cutlass.experimental import primitives as prims
 
 from ..common import compat48 as _compat48
@@ -109,9 +108,7 @@ def _select_topk_lanevec(
         raw_scores[v] = cutlass.Float32(0.0)
     if valid_token:
         lptr = logits.iterator.raw_ptr()
-        row = token * cutlass.Int32(_EXPERTS * logit_splits) + lane * cutlass.Int32(
-            _VEC
-        )
+        row = token * cutlass.Int32(_EXPERTS * logit_splits) + lane * cutlass.Int32(_VEC)
         parts = []
         for split in cutlass.range_constexpr(logit_splits):
             lo = prims.load_ext(
@@ -140,20 +137,14 @@ def _select_topk_lanevec(
             )
         _base._sort8_key_desc(keys)
         if cutlass.const_expr(one_redux):
-            head_idx = cutlass.Int32(65535) - cutlass.Int32(
-                keys[0] & cutlass.Uint64(0xFFFF)
-            )
+            head_idx = cutlass.Int32(65535) - cutlass.Int32(keys[0] & cutlass.Uint64(0xFFFF))
             for k in cutlass.range_constexpr(_TOP_K):
                 score_key = cutlass.Uint32(keys[0] >> cutlass.Uint64(32))
                 warp_score_key = cutlass.Uint32(
-                    prims.redux_sync(
-                        cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK
-                    )
+                    prims.redux_sync(cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK)
                 )
                 is_max = score_key == warp_score_key
-                ball = cutlass.Uint32(
-                    prims.vote_sync(_FULL_MASK, is_max, prims.VoteSync.BALLOT)
-                )
+                ball = cutlass.Uint32(prims.vote_sync(_FULL_MASK, is_max, prims.VoteSync.BALLOT))
                 owner = cutlass.Int32(cute.arch.popc(ball - cutlass.Uint32(1)))
                 if cutlass.Int32(cute.arch.popc(ball)) != cutlass.Int32(1):
                     # Exact score tie: the served tie-break, smallest expert index (largest inverse index).
@@ -171,9 +162,7 @@ def _select_topk_lanevec(
                     if is_max and inverse_idx == winner_inverse_idx:
                         cand = cutlass.Int32(1)
                     ball2 = cutlass.Uint32(
-                        prims.vote_sync(
-                            _FULL_MASK, cand != cutlass.Int32(0), prims.VoteSync.BALLOT
-                        )
+                        prims.vote_sync(_FULL_MASK, cand != cutlass.Int32(0), prims.VoteSync.BALLOT)
                     )
                     owner = cutlass.Int32(cute.arch.popc(ball2 - cutlass.Uint32(1)))
                 head_raw = cutlass.Float32(0.0)
@@ -196,9 +185,7 @@ def _select_topk_lanevec(
             for k in cutlass.range_constexpr(_TOP_K):
                 score_key = cutlass.Uint32(keys[0] >> cutlass.Uint64(32))
                 warp_score_key = cutlass.Uint32(
-                    prims.redux_sync(
-                        cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK
-                    )
+                    prims.redux_sync(cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK)
                 )
                 inverse_idx = cutlass.Uint32(0)
                 if score_key == warp_score_key:
@@ -280,15 +267,9 @@ def fused_topk_routing_push_kernel(
     base = cutlass.Array(
         cutlass.Int32, _LOCAL_EXPERTS, space=cutlass.AddressSpace.smem, alignment=128
     )
-    warp_totals = cutlass.Array(
-        cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=128
-    )
-    count_bar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
-    )
-    base_bar = cutlass.Array(
-        cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
-    )
+    warp_totals = cutlass.Array(cutlass.Int32, 2, space=cutlass.AddressSpace.smem, alignment=128)
+    count_bar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    base_bar = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
     if tidx < cutlass.Int32(_LOCAL_EXPERTS):
         count.subview(tidx).store(cutlass.Int32(0))
     if tidx == cutlass.Int32(0):
@@ -297,16 +278,12 @@ def fused_topk_routing_push_kernel(
         prims.fence_mbarrier_init()
         # Armed now: a peer's complete_tx may land before this CTA reaches its wait.
         if rank == cutlass.Int32(0):
-            prims.mbarrier_arrive_expect_tx(
-                count_bar.subview(0), CLUSTER_CTAS * _LOCAL_EXPERTS * 4
-            )
+            prims.mbarrier_arrive_expect_tx(count_bar.subview(0), CLUSTER_CTAS * _LOCAL_EXPERTS * 4)
         prims.mbarrier_arrive_expect_tx(base_bar.subview(0), _LOCAL_EXPERTS * 4)
     # Router-independent: this lane's 8 contiguous bias values, before the PDL wait.
     bias_vals = cutlass.Array(cutlass.Float32, _VEC)
     for v in cutlass.range_constexpr(_VEC):
-        bias_vals[v] = cutlass.Float32(
-            routing_bias[lane * cutlass.Int32(_VEC) + cutlass.Int32(v)]
-        )
+        bias_vals[v] = cutlass.Float32(routing_bias[lane * cutlass.Int32(_VEC) + cutlass.Int32(v)])
     prims.barrier_cta_sync(0)
     # Orders every CTA's barrier initialisation before any peer's st.async complete_tx (waited below).
     prims.barrier_cluster_arrive()
@@ -347,10 +324,7 @@ def fused_topk_routing_push_kernel(
         total = cutlass.Int32(0)
         for r in cutlass.range_constexpr(CLUSTER_CTAS):
             rank_prefix[r] = total
-            total = (
-                total
-                + all_counts.subview(cutlass.Int32(r * _LOCAL_EXPERTS) + tidx).load()
-            )
+            total = total + all_counts.subview(cutlass.Int32(r * _LOCAL_EXPERTS) + tidx).load()
         active = total != cutlass.Int32(0)
         local_prefix, local_total = _base._ballot_exclusive(active)
         if lane == cutlass.Int32(_WARP - 1):
@@ -484,9 +458,7 @@ def compile_fused_topk_routing(
     )
     if not uses_push_path(num_tokens, fuse_zero):
         if expert_hist is not None:
-            raise ValueError(
-                "expert_hist is written by the push cluster path only (9..64 tokens)"
-            )
+            raise ValueError("expert_hist is written by the push cluster path only (9..64 tokens)")
         return _base.compile_fused_topk_routing(
             logits,
             routing_bias,
@@ -498,9 +470,7 @@ def compile_fused_topk_routing(
         )
     _check_hist(expert_hist, logits.device)
     if logits.data_ptr() % 16:
-        raise ValueError(
-            "push top-k loads 128-bit logits vectors: logits must be 16-byte aligned"
-        )
+        raise ValueError("push top-k loads 128-bit logits vectors: logits must be 16-byte aligned")
     key = (
         device,
         num_tokens,
@@ -575,9 +545,7 @@ def run_fused_topk_routing(
     num_tokens = int(logits.shape[0])
     if not uses_push_path(num_tokens, fuse_zero):
         if expert_hist is not None:
-            raise ValueError(
-                "expert_hist is written by the push cluster path only (9..64 tokens)"
-            )
+            raise ValueError("expert_hist is written by the push cluster path only (9..64 tokens)")
         _base.run_fused_topk_routing(
             logits,
             routing_bias,
@@ -613,9 +581,5 @@ def run_fused_topk_routing(
         cutlass.Int32(local_expert_offset),
         cutlass.Float32(routed_scaling_factor),
         cutlass_torch.current_stream(),
-        *(
-            (_base._as_tensor(expert_hist, assumed_align=16),)
-            if expert_hist is not None
-            else ()
-        ),
+        *((_base._as_tensor(expert_hist, assumed_align=16),) if expert_hist is not None else ()),
     )

@@ -252,12 +252,8 @@ ABIS: dict[str, PrefillProjectionAbi] = {
     # one half of the augmented kv_b weight [8192, 576]: K per head = [W_UK_h | 0 ; 0 | I_64]
     # (nope 192 + k_pe copied exactly by the identity block), V per head = [W_UV_h | 0].
     # Outputs are contiguous [T, 16 * 256] -- the MHA's K and V operands.
-    "kv_b_expand_k": PrefillProjectionAbi(
-        "kv_b_expand_k", 4_096, 576, row_strided_input=True
-    ),
-    "kv_b_expand_v": PrefillProjectionAbi(
-        "kv_b_expand_v", 4_096, 576, row_strided_input=True
-    ),
+    "kv_b_expand_k": PrefillProjectionAbi("kv_b_expand_k", 4_096, 576, row_strided_input=True),
+    "kv_b_expand_v": PrefillProjectionAbi("kv_b_expand_v", 4_096, 576, row_strided_input=True),
     # The V half without its zero rope block: the latent row's c_kv part ([T, 512] view, row
     # stride 2624) times W_UV [16 * 256, 512]. The augmented V rows' last 64 columns are zero and
     # form the last k-block of the K = 576 GEMM, so dropping them only removes "+ 0" terms:
@@ -385,6 +381,9 @@ def compile_persistent_gemm_tvm_ffi(
         schedule.swizzle_size,
         schedule.raster_along,
     )
+    # The E4M3 entries (FP8 context-MHA operands) are defined as the FP32 accumulator rounded
+    # once, RN satfinite (module doc), not the FP8 q-base double round.
+    gemm.glm_fp8_single_round = output.dtype == torch.float8_e4m3fn
     if not gemm.can_implement(mnkl, a.element_type, b.element_type, c.element_type, *majors):
         raise testing.CantImplementError(
             f"persistent GLM projection cannot implement mnkl={mnkl}, majors={majors}, schedule={schedule}"
@@ -469,8 +468,8 @@ class PrefillProjection:
         self._device = weight.device
         self._table = abi.schedule_table()
         for split_rows, schedule in self._table:
-            self._compiled[split_rows], self._orientation[split_rows] = (
-                self._compile_instance(split_rows, schedule, weight)
+            self._compiled[split_rows], self._orientation[split_rows] = self._compile_instance(
+                split_rows, schedule, weight
             )
         # Per-T tile choice: (compiled, orientation) per candidate, the candidate index for
         # every row count in (SCHEDULE_SPLIT_ROWS, MAX_ROWS], and launches per candidate.
@@ -504,17 +503,13 @@ class PrefillProjection:
         """The compiled runtime-M instance of ``schedule``, shared process-wide per key."""
         global COMPILE_COUNT
         abi = self.abi
-        key = compiled_instance_key(
-            abi, split_rows, schedule, self.launch_mode, weight.device
-        )
+        key = compiled_instance_key(abi, split_rows, schedule, self.launch_mode, weight.device)
         shared = _COMPILED_INSTANCES.get(key)
         if shared is not None:
             return shared
         COMPILE_COUNT += 1
         compile_input = weight.new_empty((split_rows, abi.in_features))
-        compile_output = weight.new_empty(
-            (split_rows, abi.out_features), dtype=abi.out_dtype
-        )
+        compile_output = weight.new_empty((split_rows, abi.out_features), dtype=abi.out_dtype)
         if self.launch_mode == "tvm_ffi":
             compiled = compile_persistent_gemm_tvm_ffi(
                 compile_input,
@@ -585,9 +580,7 @@ class PrefillProjection:
             )
         rows = shape[0]
         if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(
-                f"{self.abi.name}: 1 <= T <= {MAX_ROWS} required, got {rows}"
-            )
+            raise ValueError(f"{self.abi.name}: 1 <= T <= {MAX_ROWS} required, got {rows}")
         input_ok = input_tensor.is_contiguous() or (
             self.abi.row_strided_input
             and input_tensor.stride(1) == 1

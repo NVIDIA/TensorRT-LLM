@@ -58,23 +58,22 @@ persistent tile scheduling. Exact math (no ex2 emulation / skip-correction).
 
 import math
 import os
-from typing import Type, Tuple, Optional
+from typing import Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
-from cutlass import testing
-from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass import testing
+from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.memory import SmemAllocator, TmemAllocator
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.tensor_utils import LayoutEnum
 
 from . import fmha_helpers as fmha_utils
-from cutlass.memory import SmemAllocator, TmemAllocator
-from cutlass.tensor_utils import LayoutEnum
 
 
 def _device_cc() -> Tuple[int, int]:
@@ -89,12 +88,8 @@ def _device_cc() -> Tuple[int, int]:
         if err != cuda.CUresult.CUDA_SUCCESS:
             return (0, 0)
     attr = cuda.CUdevice_attribute
-    err0, major = cuda.cuDeviceGetAttribute(
-        attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev
-    )
-    err1, minor = cuda.cuDeviceGetAttribute(
-        attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev
-    )
+    err0, major = cuda.cuDeviceGetAttribute(attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev)
+    err1, minor = cuda.cuDeviceGetAttribute(attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev)
     if err0 != cuda.CUresult.CUDA_SUCCESS or err1 != cuda.CUresult.CUDA_SUCCESS:
         return (0, 0)
     return (major, minor)
@@ -244,9 +239,7 @@ def _apply_mask_hoisted(
             lo_rel = row_q - window_size_left - base_k
             for i in range(cute.size(acc_qk)):
                 k = index_qk_static[i][1]
-                acc_qk[i] = cutlass.select_(
-                    (k < lo_rel) | (k >= hi_rel), -Float32.inf, acc_qk[i]
-                )
+                acc_qk[i] = cutlass.select_((k < lo_rel) | (k >= hi_rel), -Float32.inf, acc_qk[i])
         else:
             for i in range(cute.size(acc_qk)):
                 k = index_qk_static[i][1]
@@ -524,15 +517,15 @@ class FusedMultiHeadAttentionPrefillD256:
             pv_tiled_mma,
             self.cluster_layout_vmnk.shape,
         )
-        self.tma_copy_q_bytes = cute.size_in_bytes(
-            self.q_dtype, q_smem_layout
-        ) * cute.size(qk_tiled_mma.thr_id.shape)
+        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, q_smem_layout) * cute.size(
+            qk_tiled_mma.thr_id.shape
+        )
         # Companion to the K/V workaround above: with the pair-scoped K/V TMA,
         # the leader's transaction barrier receives BOTH CTAs' bytes per
         # stage (as Q already does).
-        self.tma_copy_kv_bytes = cute.size_in_bytes(
-            self.k_dtype, k_smem_layout
-        ) * cute.size(qk_tiled_mma.thr_id.shape)
+        self.tma_copy_kv_bytes = cute.size_in_bytes(self.k_dtype, k_smem_layout) * cute.size(
+            qk_tiled_mma.thr_id.shape
+        )
 
         @cute.struct
         class SharedStorage:
@@ -618,12 +611,8 @@ class FusedMultiHeadAttentionPrefillD256:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
         bidx, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         # Alloc
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -663,9 +652,7 @@ class FusedMultiHeadAttentionPrefillD256:
             ),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                len(self.softmax_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.softmax_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             barrier_storage=storage.mma_s_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -675,9 +662,7 @@ class FusedMultiHeadAttentionPrefillD256:
             num_stages=self.qk_acc_stage,
             producer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                len(self.softmax_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.softmax_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, len([self.mma_warp_id])
@@ -719,9 +704,7 @@ class FusedMultiHeadAttentionPrefillD256:
             ),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread,
-                len(self.correction_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.correction_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             barrier_storage=storage.mma_o_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -730,9 +713,7 @@ class FusedMultiHeadAttentionPrefillD256:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=self.threads_per_warp
-            * len(
-                (self.mma_warp_id, *self.softmax_warp_ids, *self.correction_warp_ids)
-            ),
+            * len((self.mma_warp_id, *self.softmax_warp_ids, *self.correction_warp_ids)),
         )
         tmem_dealloc_barrier = pipeline.NamedBarrier(
             barrier_id=self.tmem_dealloc_sync_bar_id,
@@ -774,9 +755,7 @@ class FusedMultiHeadAttentionPrefillD256:
         if cutlass.const_expr(mLSE_ql is not None):
             sMax = smem.allocate_tensor(
                 element_type=self.qk_acc_dtype,
-                layout=cute.make_layout(
-                    len(self.softmax_warp_ids) * self.threads_per_warp
-                ),
+                layout=cute.make_layout(len(self.softmax_warp_ids) * self.threads_per_warp),
                 byte_alignment=128,
             )
 
@@ -785,16 +764,10 @@ class FusedMultiHeadAttentionPrefillD256:
         tSrQ = qk_thr_mma.make_fragment_A(sQ)
         tSrK = qk_thr_mma.make_fragment_B(sK)
         tOrV = pv_thr_mma.make_fragment_B(sV)
-        qk_acc_shape = pv_thr_mma.partition_shape_C(
-            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-        )
+        qk_acc_shape = pv_thr_mma.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
         # (atomV, restM, restN, accStage)
-        tStS = qk_tiled_mma.make_fragment_C(
-            cute.append(qk_acc_shape, self.qk_acc_stage)
-        )
-        pv_acc_shape = pv_thr_mma.partition_shape_C(
-            cute.select(self.pv_mma_tiler, mode=[0, 1])
-        )
+        tStS = qk_tiled_mma.make_fragment_C(cute.append(qk_acc_shape, self.qk_acc_stage))
+        pv_acc_shape = pv_thr_mma.partition_shape_C(cute.select(self.pv_mma_tiler, mode=[0, 1]))
         # (atomV, restM, restN)
         tOtO = pv_thr_mma.make_fragment_C(pv_acc_shape)
         tOtO_layout = cute.append(
@@ -807,9 +780,7 @@ class FusedMultiHeadAttentionPrefillD256:
         tStS = cute.make_tensor(tStS.iterator + self.tmem_s_offset, tStS.layout)
         tOtO_staged = cute.make_tensor(tOtO.iterator + self.tmem_o_offset, tOtO_layout)
         # Local_tile partition global tensors
-        q_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-        )
+        q_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
         # (bM, bK, restM, restK, loopM, loopK, loopL)
         gQ_qdl = cute.flat_divide(mQ_qdl, cute.select(self.qk_mma_tiler, mode=[0, 2]))
         tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
@@ -820,9 +791,7 @@ class FusedMultiHeadAttentionPrefillD256:
             cute.group_modes(sQ, 0, 3),
             cute.group_modes(tSgQ_qdl, 0, 3),
         )
-        kv_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
+        kv_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
         # (bN, bK, loopN, loopK, loopL)
         gK_kdl = cute.flat_divide(mK_kdl, cute.select(self.qk_mma_tiler, mode=[1, 2]))
         tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
@@ -952,18 +921,16 @@ class FusedMultiHeadAttentionPrefillD256:
                 load_q_releaser = load_q_consumer.clone()
                 pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 if seqlen_kv_loop_steps > 1:
-                    mma_s_producer, load_q_consumer, load_kv_consumer = (
-                        mma_qk_uniform(  # QK0
-                            self.iterations_qk,
-                            qk_tiled_mma,
-                            (tStS, tSrQ, tSrK),
-                            (
-                                mma_s_producer,
-                                load_q_consumer,
-                                None,
-                                load_kv_consumer,
-                            ),
-                        )
+                    mma_s_producer, load_q_consumer, load_kv_consumer = mma_qk_uniform(  # QK0
+                        self.iterations_qk,
+                        qk_tiled_mma,
+                        (tStS, tSrQ, tSrK),
+                        (
+                            mma_s_producer,
+                            load_q_consumer,
+                            None,
+                            load_kv_consumer,
+                        ),
                     )
                     for i in cutlass.range(1, seqlen_kv_loop_steps - 1, 1, unroll=1):
                         mma_s_producer, _, load_kv_consumer = mma_qk_uniform(  # QKi
@@ -982,18 +949,16 @@ class FusedMultiHeadAttentionPrefillD256:
                             (tOtO_staged, tStS, tOrV, p_tmem_layout),
                             (p_mma_consumer, mma_o_producer, load_kv_consumer),
                         )
-                    mma_s_producer, _, load_kv_consumer = (
-                        mma_qk_uniform(  # QKend (release Q)
-                            self.iterations_qk,
-                            qk_tiled_mma,
-                            (tStS, tSrQ, tSrK),
-                            (
-                                mma_s_producer,
-                                None,
-                                load_q_releaser,
-                                load_kv_consumer,
-                            ),
-                        )
+                    mma_s_producer, _, load_kv_consumer = mma_qk_uniform(  # QKend (release Q)
+                        self.iterations_qk,
+                        qk_tiled_mma,
+                        (tStS, tSrQ, tSrK),
+                        (
+                            mma_s_producer,
+                            None,
+                            load_q_releaser,
+                            load_kv_consumer,
+                        ),
                     )
                     (
                         pv_tiled_mma,
@@ -1006,18 +971,16 @@ class FusedMultiHeadAttentionPrefillD256:
                         (p_mma_consumer, mma_o_producer, load_kv_consumer),
                     )
                 else:
-                    mma_s_producer, load_q_consumer, load_kv_consumer = (
-                        mma_qk_uniform(  # QK0
-                            self.iterations_qk,
-                            qk_tiled_mma,
-                            (tStS, tSrQ, tSrK),
-                            (
-                                mma_s_producer,
-                                load_q_consumer,
-                                load_q_releaser,
-                                load_kv_consumer,
-                            ),
-                        )
+                    mma_s_producer, load_q_consumer, load_kv_consumer = mma_qk_uniform(  # QK0
+                        self.iterations_qk,
+                        qk_tiled_mma,
+                        (tStS, tSrQ, tSrK),
+                        (
+                            mma_s_producer,
+                            load_q_consumer,
+                            load_q_releaser,
+                            load_kv_consumer,
+                        ),
                     )
                 pv_tiled_mma, p_mma_consumer, mma_o_producer, load_kv_consumer = (
                     self.mma_pv(  # PVend
@@ -1034,10 +997,7 @@ class FusedMultiHeadAttentionPrefillD256:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
         # ///////////////////////////////////////////////////////////////////////////////
-        if (
-            warp_idx < self.correction_warp_ids[0]
-            and warp_idx >= self.softmax_warp_ids[0]
-        ):
+        if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax_warp_ids[0]:
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             tmem.wait_for_alloc()
             while work_tile.is_valid_tile:
@@ -1073,12 +1033,8 @@ class FusedMultiHeadAttentionPrefillD256:
                     window_size_left,
                     window_size_right,
                 )
-                cS_base = cute.make_identity_tensor(
-                    (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-                )
-                cS = cute.domain_offset(
-                    (mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base
-                )
+                cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
+                cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
                 tScS = qk_thr_mma.partition_C(cS)
                 tScS_static = qk_thr_mma.partition_C(cS_base)
                 row_max = -Float32.inf
@@ -1093,9 +1049,9 @@ class FusedMultiHeadAttentionPrefillD256:
                     # Mask unless step is inside the clean middle segment.
                     # Unsigned-wrap trick: (step - ld) as Uint32 is huge for
                     # step < ld, so one compare covers both masked edges.
-                    need_apply_mask = cutlass.Uint32(
-                        step - ld_mask_steps
-                    ) >= cutlass.Uint32(unmask_steps)
+                    need_apply_mask = cutlass.Uint32(step - ld_mask_steps) >= cutlass.Uint32(
+                        unmask_steps
+                    )
                     # Si -> Pi
                     (
                         row_max,
@@ -1116,9 +1072,7 @@ class FusedMultiHeadAttentionPrefillD256:
                         (mma_s_consumer, p_mma_producer, s_corr_producer),
                     )
                     row_max_prev = row_max
-                sum_producer = self.store_sum(
-                    row_sum, row_max_prev, sSum, sMax, sum_producer
-                )
+                sum_producer = self.store_sum(row_sum, row_max_prev, sSum, sMax, sum_producer)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
             p_mma_producer.tail()
@@ -1150,15 +1104,9 @@ class FusedMultiHeadAttentionPrefillD256:
                     window_size_left,
                     window_size_right,
                 )
-                gO_staged = gO_qdl[
-                    None, None, curr_block_coord[0], None, curr_block_coord[2]
-                ]
-                cO_staged = cO_qdl[
-                    None, None, curr_block_coord[0], None, curr_block_coord[2]
-                ]
-                cS = cute.make_identity_tensor(
-                    (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-                )
+                gO_staged = gO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                cO_staged = cO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                 tScS = qk_thr_mma.partition_C(cS)
                 # Empty step as the first step is no need for correction
                 stats_handle = s_corr_consumer.wait_and_advance()
@@ -1174,9 +1122,7 @@ class FusedMultiHeadAttentionPrefillD256:
                 # O_partial -> O_final
                 gLSE_staged = None
                 if cutlass.const_expr(gLSE_ql is not None):
-                    gLSE_staged = gLSE_ql[
-                        None, curr_block_coord[0], curr_block_coord[2]
-                    ]
+                    gLSE_staged = gLSE_ql[None, curr_block_coord[0], curr_block_coord[2]]
                 mma_o_consumer, sum_consumer = self.correction_epilog(
                     (seqlen_q, scale_output, scale_softmax_log2),
                     (sum_consumer, sSum, sMax),
@@ -1208,9 +1154,7 @@ class FusedMultiHeadAttentionPrefillD256:
         pv_tiled_mma, pv_thr_mma = mma_args
         tOtO_staged, tStS, tOrV, p_tmem_layout = tensor_args
         p_mma_consumer, mma_o_producer, load_kv_consumer = pipeline_args
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         is_leader_cta = cta_rank_in_cluster % 2 == 0
         if is_leader_cta:
             p_handle = p_mma_consumer.wait_and_advance()
@@ -1399,9 +1343,7 @@ class FusedMultiHeadAttentionPrefillD256:
         stats_c_layout = cute.composition(
             tScS_slice.layout, cute.make_layout((tScS_slice.shape[0], 2))
         )
-        tOtStats = cute.make_tensor(
-            tStS_slice.iterator + self.tilePlikeFP32, stats_layout
-        )
+        tOtStats = cute.make_tensor(tStS_slice.iterator + self.tilePlikeFP32, stats_layout)
         tOcStats = cute.make_tensor(tScS_slice.iterator, stats_c_layout)
         tmem_store_stats_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(2)),
@@ -1410,9 +1352,7 @@ class FusedMultiHeadAttentionPrefillD256:
         tiled_tmem_store_stats = tcgen05.make_tmem_copy(tmem_store_stats_atom, tOtStats)
         thr_tmem_store_stats = tiled_tmem_store_stats.get_slice(thread_idx)
         tTMEM_STOREcStats = thr_tmem_store_stats.partition_S(tOcStats)
-        tTMEM_STORErStats = cute.make_rmem_tensor(
-            tTMEM_STOREcStats.shape, self.qk_acc_dtype
-        )
+        tTMEM_STORErStats = cute.make_rmem_tensor(tTMEM_STOREcStats.shape, self.qk_acc_dtype)
         tTMEM_STORErStats[0] = old_row_max
         tTMEM_STORErStats[1] = row_max_safe
         tTMEM_STOREtStats = thr_tmem_store_stats.partition_D(tOtStats)
@@ -1434,12 +1374,8 @@ class FusedMultiHeadAttentionPrefillD256:
         CVT_COUNT = 4
         CVT_PER_STEP = 2
         SIZE = cute.size(tTMEM_LOADrS)
-        tTMEM_LOADrS_cvt = cute.logical_divide(
-            tTMEM_LOADrS, cute.make_layout(CVT_PER_STEP)
-        )
-        tTMEM_STORErP_cvt = cute.logical_divide(
-            tTMEM_STORErP, cute.make_layout(CVT_PER_STEP)
-        )
+        tTMEM_LOADrS_cvt = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(CVT_PER_STEP))
+        tTMEM_STORErP_cvt = cute.logical_divide(tTMEM_STORErP, cute.make_layout(CVT_PER_STEP))
         for i in cutlass.range_constexpr(0, FMA_COUNT, 2):
             tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
                 (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
@@ -1535,9 +1471,7 @@ class FusedMultiHeadAttentionPrefillD256:
         stats_c_layout = cute.composition(
             tScS_slice.layout, cute.make_layout((tScS_slice.shape[0], 2))
         )
-        tOtStats = cute.make_tensor(
-            tStS_slice.iterator + self.tilePlikeFP32, stats_layout
-        )
+        tOtStats = cute.make_tensor(tStS_slice.iterator + self.tilePlikeFP32, stats_layout)
         tOcStats = cute.make_tensor(tScS_slice.iterator, stats_c_layout)
         tmem_load_stats_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(2)),
@@ -1547,9 +1481,7 @@ class FusedMultiHeadAttentionPrefillD256:
         thr_tmem_load_stats = tiled_tmem_load_stats.get_slice(thread_idx)
         tTMEM_LOADtStats = thr_tmem_load_stats.partition_S(tOtStats)
         tTMEM_LOADcStats = thr_tmem_load_stats.partition_D(tOcStats)
-        tTMEM_LOADrStats = cute.make_rmem_tensor(
-            tTMEM_LOADcStats.shape, self.qk_acc_dtype
-        )
+        tTMEM_LOADrStats = cute.make_rmem_tensor(tTMEM_LOADcStats.shape, self.qk_acc_dtype)
         cute.copy(tiled_tmem_load_stats, tTMEM_LOADtStats, tTMEM_LOADrStats)
 
         scale = scale_softmax_log2 * (tTMEM_LOADrStats[0] - tTMEM_LOADrStats[1])
@@ -1583,9 +1515,7 @@ class FusedMultiHeadAttentionPrefillD256:
             tTMrO = cute.make_rmem_tensor_like(
                 cute.append(
                     cute.make_layout(tTMEM_LOADcO[None, 0, 0].shape),
-                    cute.make_layout(
-                        2, stride=cute.size(tTMEM_LOADcO[None, 0, 0].shape)
-                    ),
+                    cute.make_layout(2, stride=cute.size(tTMEM_LOADcO[None, 0, 0].shape)),
                 ),
                 self.pv_acc_dtype,
             )
@@ -1600,13 +1530,9 @@ class FusedMultiHeadAttentionPrefillD256:
                 ):
                     tTMrO[j, (i - 1) % 2] = tTMrO[j, (i - 1) % 2] * scale
                 tTMEM_STOREtO_prev_i = tTMEM_STOREtO[None, i - 1, 0]
-                cute.copy(
-                    tmem_store_atom, tTMrO[None, (i - 1) % 2], tTMEM_STOREtO_prev_i
-                )
+                cute.copy(tmem_store_atom, tTMrO[None, (i - 1) % 2], tTMEM_STOREtO_prev_i)
 
-            for j in cutlass.range(
-                cute.size(tTMrO, mode=[0]), unroll_full=True, vectorize=True
-            ):
+            for j in cutlass.range(cute.size(tTMrO, mode=[0]), unroll_full=True, vectorize=True):
                 tTMrO[j, (iter_num - 1) % 2] = tTMrO[j, (iter_num - 1) % 2] * scale
             cute.copy(
                 tmem_store_atom,
@@ -1672,13 +1598,9 @@ class FusedMultiHeadAttentionPrefillD256:
                 tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
                 tTMEM_LOADgO_i = tTMEM_LOADgO[None, i, 0]
                 tTMEM_LOADcO_i = tTMEM_LOADcO[None, i, 0]
-                tTMrO = cute.make_rmem_tensor(
-                    tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype
-                )
+                tTMrO = cute.make_rmem_tensor(tTMEM_LOADcO[None, 0, i].shape, self.pv_acc_dtype)
                 cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-                for j in cutlass.range(
-                    cute.size(tTMrO), unroll_full=True, vectorize=True
-                ):
+                for j in cutlass.range(cute.size(tTMrO), unroll_full=True, vectorize=True):
                     tTMrO[j] = tTMrO[j] * scale
                 tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
                 o_vec = tTMrO.load()
@@ -1726,9 +1648,7 @@ class FusedMultiHeadAttentionPrefillD256:
         """
         try:
             if q_dtype not in {cutlass.BFloat16, cutlass.Float8E4M3FN}:
-                raise testing.CantImplementError(
-                    "Unsupported q_dtype (need bf16 or e4m3)"
-                )
+                raise testing.CantImplementError("Unsupported q_dtype (need bf16 or e4m3)")
             if kv_dtype is not q_dtype:
                 raise testing.CantImplementError(
                     "Unsupported kv_dtype (uniform precision: must equal q_dtype)"
@@ -1744,9 +1664,7 @@ class FusedMultiHeadAttentionPrefillD256:
             b, h_q, s_q, d = q_shape
             b_, h_k, s_k, d_ = k_shape
             if b <= 0 or h_q <= 0 or h_k <= 0 or s_q <= 0 or s_k <= 0:
-                raise testing.CantImplementError(
-                    "batch, head, and sequence sizes must be positive"
-                )
+                raise testing.CantImplementError("batch, head, and sequence sizes must be positive")
             if b != b_:
                 raise testing.CantImplementError("q & k must share batch size")
             if d != d_ or d != 256:

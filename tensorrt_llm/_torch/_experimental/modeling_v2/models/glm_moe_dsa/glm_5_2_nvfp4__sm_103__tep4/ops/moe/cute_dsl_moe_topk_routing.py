@@ -342,9 +342,7 @@ class CuteDslMoeTopkRouting(OpWrapper):
         Cell(why="128 rows, the 4-warp histogram's last count", spec=dict(rows=128, offset=64)),
         Cell(why="129 rows, the 8-warp histogram's first", spec=dict(rows=129, offset=128)),
         Cell(why="512 rows, the 8-warp histogram's last", spec=dict(rows=512, offset=192)),
-        Cell(
-            why="513 rows, the 16-warp (noraw) histogram's first", spec=dict(rows=513, offset=0)
-        ),
+        Cell(why="513 rows, the 16-warp (noraw) histogram's first", spec=dict(rows=513, offset=0)),
         Cell(
             why="7310 rows, a served context step on the noraw histogram",
             spec=dict(rows=7310, offset=128),

@@ -23,12 +23,10 @@ decode kernels do not cover (the MTP module's context steps).
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream
-
 
 EXPERTS = 256
 TOP_K = 8
@@ -64,7 +62,9 @@ def _topk_kernel(
         for k in cutlass.range_constexpr(_PER_LANE):
             e = lane * _PER_LANE + k
             x = logits[row, e]
-            r = cutlass.Float32(0.5) * cute.math.tanh(cutlass.Float32(0.5) * x) + cutlass.Float32(0.5)
+            r = cutlass.Float32(0.5) * cute.math.tanh(cutlass.Float32(0.5) * x) + cutlass.Float32(
+                0.5
+            )
             raw[k] = r
             sel[k] = r + bias[e]
         total = cutlass.Float32(0.0)
@@ -119,15 +119,23 @@ def _swiglu_kernel(src: cute.Tensor, out: cute.Tensor, col_tiles: cutlass.Int32)
 
 
 @cute.jit
-def _launch_topk(logits, bias, weights, ids, rows: cutlass.Int32, scale: cutlass.Float32, stream: cuda.CUstream):
+def _launch_topk(
+    logits, bias, weights, ids, rows: cutlass.Int32, scale: cutlass.Float32, stream: cuda.CUstream
+):
     _topk_kernel(logits, bias, weights, ids, rows, scale).launch(
-        grid=((rows + _ROWS_PER_CTA - 1) // _ROWS_PER_CTA, 1, 1), block=(_THREADS, 1, 1), stream=stream
+        grid=((rows + _ROWS_PER_CTA - 1) // _ROWS_PER_CTA, 1, 1),
+        block=(_THREADS, 1, 1),
+        stream=stream,
     )
 
 
 @cute.jit
-def _launch_swiglu(src, out, col_tiles: cutlass.Int32, num_ctas: cutlass.Int32, stream: cuda.CUstream):
-    _swiglu_kernel(src, out, col_tiles).launch(grid=(num_ctas, 1, 1), block=(_SWIGLU_THREADS, 1, 1), stream=stream)
+def _launch_swiglu(
+    src, out, col_tiles: cutlass.Int32, num_ctas: cutlass.Int32, stream: cuda.CUstream
+):
+    _swiglu_kernel(src, out, col_tiles).launch(
+        grid=(num_ctas, 1, 1), block=(_SWIGLU_THREADS, 1, 1), stream=stream
+    )
 
 
 def compile_topk() -> CompiledKernel:
@@ -135,10 +143,16 @@ def compile_topk() -> CompiledKernel:
         r = cute.sym_int32()
         _COMPILED["topk"] = cute.compile(
             _launch_topk,
-            make_fake_compact_tensor(cutlass.Float32, (r, EXPERTS), stride_order=(1, 0), assumed_align=16),
+            make_fake_compact_tensor(
+                cutlass.Float32, (r, EXPERTS), stride_order=(1, 0), assumed_align=16
+            ),
             make_fake_compact_tensor(cutlass.Float32, (EXPERTS,), assumed_align=16),
-            make_fake_compact_tensor(cutlass.Float32, (cute.sym_int32(), TOP_K), stride_order=(1, 0), assumed_align=16),
-            make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(), TOP_K), stride_order=(1, 0), assumed_align=16),
+            make_fake_compact_tensor(
+                cutlass.Float32, (cute.sym_int32(), TOP_K), stride_order=(1, 0), assumed_align=16
+            ),
+            make_fake_compact_tensor(
+                cutlass.Int32, (cute.sym_int32(), TOP_K), stride_order=(1, 0), assumed_align=16
+            ),
             cutlass.Int32(1),
             cutlass.Float32(1.0),
             make_fake_stream(),
@@ -152,10 +166,16 @@ def compile_swiglu() -> CompiledKernel:
         _COMPILED["swiglu"] = cute.compile(
             _launch_swiglu,
             make_fake_compact_tensor(
-                cutlass.BFloat16, (cute.sym_int32(), cute.sym_int32()), stride_order=(1, 0), assumed_align=16
+                cutlass.BFloat16,
+                (cute.sym_int32(), cute.sym_int32()),
+                stride_order=(1, 0),
+                assumed_align=16,
             ),
             make_fake_compact_tensor(
-                cutlass.BFloat16, (cute.sym_int32(), cute.sym_int32()), stride_order=(1, 0), assumed_align=16
+                cutlass.BFloat16,
+                (cute.sym_int32(), cute.sym_int32()),
+                stride_order=(1, 0),
+                assumed_align=16,
             ),
             cutlass.Int32(1),
             cutlass.Int32(1),

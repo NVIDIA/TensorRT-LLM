@@ -45,15 +45,10 @@ from collections.abc import Callable
 from typing import Union
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
 from . import self_attn_prefill_projections_mxf8 as _proj
@@ -102,9 +97,7 @@ def silu_nr(g: cutlass.Float32) -> cutlass.Float32:
     q0 = g * r
     rem = cute.math.fma(-d, q0, g)
     q = cute.math.fma(rem, r, q0)
-    q = cutlass.Float32(
-        cutlass.select_(d == cutlass.Float32(_INF), g * cutlass.Float32(0.0), q)
-    )
+    q = cutlass.Float32(cutlass.select_(d == cutlass.Float32(_INF), g * cutlass.Float32(0.0), q))
     q = cutlass.Float32(cutlass.select_(g == cutlass.Float32(_INF), g, q))
     q = cutlass.Float32(cutlass.select_(g == cutlass.Float32(0.0), g, q))
     return q
@@ -155,9 +148,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         stream: cuda.CUstream,
     ):
         self._swiglu_out = out
-        _proj.GlmMxf8Gemm.__call__(
-            self, a, b, sfa, sfb, out, m, n, k, max_active_clusters, stream
-        )
+        _proj.GlmMxf8Gemm.__call__(self, a, b, sfa, sfb, out, m, n, k, max_active_clusters, stream)
 
     def kernel(self, *args):
         """The base ``__call__``'s launch, with the SwiGLU output appended."""
@@ -215,12 +206,8 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         block_in_cluster_coord_sfb_vmnk = cluster_layout_sfb_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
@@ -250,9 +237,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         # Initialize acc_pipeline (barrier) and states
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = (
-            self.threads_per_warp
-            * len(self.epilog_warp_id)
-            * (2 if use_2cta_instrs else 1)
+            self.threads_per_warp * len(self.epilog_warp_id) * (2 if use_2cta_instrs else 1)
         )
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_acc_consumer_threads
@@ -282,17 +267,11 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         # Setup smem tensor A/B/SFA/SFB/C
         #
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
-        sC = storage.sC.get_tensor(
-            c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner
-        )
+        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
         # (MMA, MMA_M, MMA_K, STAGE)
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
-        )
+        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
-        )
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         # (MMA, MMA_M, MMA_K, STAGE)
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         # (MMA, MMA_N, MMA_K, STAGE)
@@ -366,9 +345,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
         # Partition global/shared tensor for TMA load A/B
         #
         # TMA load A partition_S/D
-        a_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-        )
+        a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestM, RestK, RestL)
         tAsA, tAgA = cpasync.tma_partition(
@@ -379,9 +356,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
             cute.group_modes(tCgA, 0, 3),
         )
         # TMA load B partition_S/D
-        b_cta_layout = cute.make_layout(
-            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-        )
+        b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestN, RestK, RestL)
         tBsB, tBgB = cpasync.tma_partition(
@@ -451,9 +426,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
             )
         else:
             # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_fake = tiled_mma.make_fragment_C(
-                cute.append(acc_shape, self.num_acc_stage)
-            )
+            tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, self.num_acc_stage))
 
         #
         # Cluster wait before tensor memory alloc
@@ -489,18 +462,12 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), RestK)
-                tAgA_slice = tAgA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
                 # ((atom_v, rest_v), RestK)
-                tBgB_slice = tBgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
-                ]
+                tBgB_slice = tBgB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
                 # ((atom_v, rest_v), RestK)
-                tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                tAgSFA_slice = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
 
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
@@ -512,17 +479,13 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
-                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(
-                        ab_producer_state
-                    )
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
                 #
                 # Tma load loop
                 #
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
-                    ab_pipeline.producer_acquire(
-                        ab_producer_state, peek_ab_empty_status
-                    )
+                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
                     # TMA load A/B/SFA/SFB
                     cute.copy(
@@ -558,9 +521,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
-                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(
-                            ab_producer_state
-                        )
+                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                 #
                 # Advance to next tile
@@ -669,9 +630,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
-                    peek_ab_full_status = ab_pipeline.consumer_try_wait(
-                        ab_consumer_state
-                    )
+                    peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 #
                 # Wait for accumulator buffer empty
@@ -703,9 +662,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                 for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
-                        ab_pipeline.consumer_wait(
-                            ab_consumer_state, peek_ab_full_status
-                        )
+                        ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
 
                         #  Copy SFA/SFB from smem to tmem
                         s2t_stage_coord = (
@@ -747,9 +704,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                     peek_ab_full_status = cutlass.Boolean(1)
                     if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
-                            peek_ab_full_status = ab_pipeline.consumer_try_wait(
-                                ab_consumer_state
-                            )
+                            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 #
                 # Async arrive accumulator buffer full
@@ -809,9 +764,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
             # (EPI_N == the subtile width is checked by ``compile_gemm`` after the compile.)
             thr_copy_t2r = tiled_copy_t2r.get_slice(epi_tidx)
             # (EPI_M, EPI_N, #EPI_M, #EPI_N, RestM, RestN, RestL): C coordinates
-            gC_mnl_epi = cute.flat_divide(
-                tCgC[((None, None), 0, 0, None, None, None)], epi_tile
-            )
+            gC_mnl_epi = cute.flat_divide(tCgC[((None, None), 0, 0, None, None, None)], epi_tile)
             # (T2R, T2R_M, T2R_N, #EPI_M, #EPI_N, RestM, RestN, RestL)
             tTR_gC_base = thr_copy_t2r.partition_D(gC_mnl_epi)
             out_rows = cute.size(mOut, mode=[0])
@@ -838,9 +791,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                     cur_tile_coord[2],
                 )
                 # (T2R, T2R_M, T2R_N, #EPI_M, #EPI_N)
-                tTR_gC = tTR_gC_base[
-                    (None, None, None, None, None, *mma_tile_coord_mnl)
-                ]
+                tTR_gC = tTR_gC_base[(None, None, None, None, None, *mma_tile_coord_mnl)]
 
                 # Get accumulator stage index
                 if cutlass.const_expr(self.overlapping_accum):
@@ -851,9 +802,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
 
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
-                tTR_tAcc = tTR_tAcc_base[
-                    (None, None, None, None, None, acc_stage_index)
-                ]
+                tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
 
                 #
                 # Wait for accumulator buffer full
@@ -869,9 +818,7 @@ class GlmMxf8SwigluGemm(_proj.GlmMxf8Gemm):
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = (
-                                self.cta_tile_shape_mnk[1] // self.epi_tile_n
-                                - 1
-                                - subtile_idx
+                                self.cta_tile_shape_mnk[1] // self.epi_tile_n - 1 - subtile_idx
                             )
                     #
                     # Load accumulator from tensor memory buffer to register
@@ -997,9 +944,7 @@ def compile_gemm(
         gemm.kernel_swiglu.set_name_prefix(
             "glm52_ctx_proj_mxf8_shared_up_swiglu", remove_cutlass_symbol=True
         )
-        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            cluster[0] * cluster[1]
-        )
+        mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         _COMPILED[key] = cute.compile(
             gemm,
             make_fake_tensor(
@@ -1046,15 +991,8 @@ def interleave_gate_up(weight: torch.Tensor) -> torch.Tensor:
     Quantize the result with ``self_attn_prefill_projections_mxf8.quantize_weight``."""
     n, k = weight.shape
     if n != GATE_UP:
-        raise ValueError(
-            f"interleave_gate_up: [{GATE_UP}, K] expected, got {tuple(weight.shape)}"
-        )
-    return (
-        weight.reshape(2, OUT // HALF, HALF, k)
-        .permute(1, 0, 2, 3)
-        .reshape(n, k)
-        .contiguous()
-    )
+        raise ValueError(f"interleave_gate_up: [{GATE_UP}, K] expected, got {tuple(weight.shape)}")
+    return weight.reshape(2, OUT // HALF, HALF, k).permute(1, 0, 2, 3).reshape(n, k).contiguous()
 
 
 # Largest row count on SMALL_TILE (256x128): the fused epilogue makes the 2-accumulator-stage
@@ -1085,9 +1023,7 @@ class Mxf8SwigluProjection:
         self.small_max_rows = small_max_rows
         self.tiles = (_proj.SMALL_TILE, _proj.DEFAULT_TILE)
         self._quant = _quant.compile_quant(device_index)
-        self._gemms = {
-            t: compile_gemm(t, device_index, crd_mn, False, divmode) for t in self.tiles
-        }
+        self._gemms = {t: compile_gemm(t, device_index, crd_mn, False, divmode) for t in self.tiles}
         self.choice_hits = {t: 0 for t in self.tiles}
         self.pre_hits = 0
 
@@ -1137,9 +1073,7 @@ class Mxf8SwigluProjection:
             self.pre_hits += 1
         else:
             xq = torch.empty(rows, HIDDEN, dtype=torch.uint8, device=x.device)
-            sfa = torch.empty(
-                _quant.sf_bytes(rows, HIDDEN), dtype=torch.uint8, device=x.device
-            )
+            sfa = torch.empty(_quant.sf_bytes(rows, HIDDEN), dtype=torch.uint8, device=x.device)
             _quant.quantize(self._quant, x, xq, sfa)
         tile = self.tile_for(rows)
         self.choice_hits[tile] += 1
@@ -1155,4 +1089,3 @@ class Mxf8SwigluProjection:
             torch.cuda.current_stream(x.device).cuda_stream,
         )
         return out
-

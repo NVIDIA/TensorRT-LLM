@@ -69,9 +69,7 @@ def test_certified_cells(cell, compiled, compiled_plain, certifying) -> None:  #
     assert_within_ulp(parent[:, _Q : _Q + _KV], ref_kv, element_ulp=2.0, rms_ulp=0.5)
     # The bf16 rows are the plain entry's bytes, the kv half too.
     tq, tkv, _ = torch.split(twin, [_Q, _KV, _ROW - _Q - _KV], -1)
-    q_plain, _ = plain.cute_dsl_qkv_a_rmsnorm(
-        tq, q_w, tkv, kv_w, _EPS, compiled_plain
-    )
+    q_plain, _ = plain.cute_dsl_qkv_a_rmsnorm(tq, q_w, tkv, kv_w, _EPS, compiled_plain)
     torch.cuda.synchronize()
     assert torch.equal(q_a[store_from:], q_plain[store_from:]), "bf16 q rows differ"
     assert torch.equal(parent[:, _Q : _Q + _KV], twin[:, _Q : _Q + _KV]), "kv rows differ"
@@ -91,3 +89,55 @@ def test_is_valid_refuses_a_partial_decode_operand(compiled) -> None:
     with pytest.raises(AssertionError, match="every row"):
         with validating(op):
             op(q_raw, q_w, ckv_raw, kv_w, _EPS, q8, sf, compiled)
+
+
+#: Context row counts of the ILP build: a first warp-row count past 512, mid-size and served
+#: steps, the token budget and twice it.
+_ILP_ROWS = (513, 4128, 7340, 8192, 16448)
+
+
+@pytest.fixture(scope="module")
+def compiled_plain_ctx():
+    """The q_store_from variant without the ILP build: the one it replaces."""
+    return entry.compile(torch.cuda.current_device(), _EPS, ilp=False)
+
+
+def _ctx_call(handle, rows: int, seed: int):
+    parent, q_raw, q_w, ckv_raw, kv_w = _build(rows, seed)
+    q8, sf = entry.operand(rows - 16, q_raw.device)
+    store_from = rows - 16 - 64
+    q_a = op(q_raw, q_w, ckv_raw, kv_w, _EPS, q8, sf, handle, q_store_from=store_from)
+    return q_a[store_from:], parent[:, _Q : _Q + _KV], q8, sf
+
+
+@pytest.mark.parametrize("rows", _ILP_ROWS)
+def test_ilp_build_is_the_plain_build_bitwise(rows, compiled, compiled_plain_ctx) -> None:
+    assert compiled.ilp and not compiled_plain_ctx.ilp
+    got = _ctx_call(compiled, rows, seed=rows)
+    want = _ctx_call(compiled_plain_ctx, rows, seed=rows)
+    torch.cuda.synchronize()
+    for g, w, name in zip(got, want, ("q rows", "kv rows", "q8", "scales")):
+        assert torch.equal(g, w), f"{name}: the ILP build differs at {rows} rows"
+
+
+def test_ilp_build_graph_replay_is_eager(compiled) -> None:
+    rows = 7340
+    eager = _ctx_call(compiled, rows, seed=7)
+    parent, q_raw, q_w, ckv_raw, kv_w = _build(rows, seed=7)
+    pristine = parent.clone()
+    q8, sf = entry.operand(rows - 16, q_raw.device)
+    store_from = rows - 16 - 64
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(q_raw, q_w, ckv_raw, kv_w, _EPS, q8, sf, compiled, q_store_from=store_from)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        q_a = op(q_raw, q_w, ckv_raw, kv_w, _EPS, q8, sf, compiled, q_store_from=store_from)
+    parent.copy_(pristine)  # the kv half is normalized in place: restore it, then replay
+    graph.replay()
+    torch.cuda.synchronize()
+    got = (q_a[store_from:], parent[:, _Q : _Q + _KV], q8, sf)
+    for g, w, name in zip(got, eager, ("q rows", "kv rows", "q8", "scales")):
+        assert torch.equal(g, w), f"{name}: graph replay differs from eager"

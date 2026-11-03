@@ -39,15 +39,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 _VEC = 8  # BF16 elements per thread
 _THREADS_PER_ROW = 16  # 128 columns per CTA tile
@@ -124,11 +119,7 @@ def mxf8_code_and_inv_scale(block_max: cutlass.Float32):
 def mxf8_sf_offset(m: cutlass.Int64, kf: cutlass.Int64, k_tiles: cutlass.Int64):
     """Byte offset of row ``m``, scale column ``kf`` (= column // 32) in the blocked layout."""
     return (
-        (m % 32) * 16
-        + ((m // 32) % 4) * 4
-        + kf % 4
-        + (kf // 4) * 512
-        + (m // 128) * 512 * k_tiles
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + kf % 4 + (kf // 4) * 512 + (m // 128) * 512 * k_tiles
     )
 
 
@@ -157,16 +148,12 @@ def mxf8_quant_store_x8(
         q8 = cute.make_rmem_tensor((_VEC,), cutlass.Float8E4M3FN)
         q8.store((vals.load() * inv_scale).to(cutlass.Float8E4M3FN))
         dst = cute.make_tensor(
-            cute.recast_ptr(
-                q_base + cute.assume(q_off, _VEC), dtype=cutlass.Float8E4M3FN
-            ),
+            cute.recast_ptr(q_base + cute.assume(q_off, _VEC), dtype=cutlass.Float8E4M3FN),
             cute.make_layout((_VEC,)),
         )
         cute.autovec_copy(q8, dst)
         if (col % _SF_VEC) == cutlass.Int64(0):
-            (sf_base + mxf8_sf_offset(m, col // _SF_VEC, k_tiles)).store(
-                cutlass.Uint8(code)
-            )
+            (sf_base + mxf8_sf_offset(m, col // _SF_VEC, k_tiles)).store(cutlass.Uint8(code))
 
 
 @cute.jit
@@ -185,9 +172,7 @@ def mxf8_fill_pad_scales(
     while i < count:
         m = cutlass.Int64(rows + i // kfs)
         kf = cutlass.Int64(i % kfs)
-        (sf_base + mxf8_sf_offset(m, kf, cutlass.Int64(k_tiles))).store(
-            cutlass.Uint8(127)
-        )
+        (sf_base + mxf8_sf_offset(m, kf, cutlass.Int64(k_tiles))).store(cutlass.Uint8(127))
         i = i + stride
 
 
@@ -258,8 +243,7 @@ def glm52_prefill_act_quant_mxf8_kernel(
             q8.store((vals.load() * inv_scale).to(cutlass.Float8E4M3FN))
             dst = cute.make_tensor(
                 cute.recast_ptr(
-                    q.iterator
-                    + cute.assume(cutlass.Int64(m) * q_row_stride + col, _VEC),
+                    q.iterator + cute.assume(cutlass.Int64(m) * q_row_stride + col, _VEC),
                     dtype=cutlass.Float8E4M3FN,
                 ),
                 cute.make_layout((_VEC,)),
@@ -271,19 +255,13 @@ def glm52_prefill_act_quant_mxf8_kernel(
                 packed = cutlass.Int32(0)
                 for j in cutlass.range_constexpr(4):
                     byte = (
-                        (vals[w * 4 + j] * inv_scale)
-                        .to(cutlass.Float8E4M3FN)
-                        .bitcast(cutlass.Int8)
+                        (vals[w * 4 + j] * inv_scale).to(cutlass.Float8E4M3FN).bitcast(cutlass.Int8)
                     )
-                    packed = packed | (
-                        (cutlass.Int32(byte) & cutlass.Int32(0xFF)) << (8 * j)
-                    )
+                    packed = packed | ((cutlass.Int32(byte) & cutlass.Int32(0xFF)) << (8 * j))
                 words[w] = packed
             base = cutlass.Int64(m) * q_row_stride + col
             for w in cutlass.range_constexpr(2):
-                ptr = cute.recast_ptr(
-                    (q.iterator + base + w * 4).align(4), dtype=cutlass.Int32
-                )
+                ptr = cute.recast_ptr((q.iterator + base + w * 4).align(4), dtype=cutlass.Int32)
                 ptr.store(words[w])
         if chunk % 4 == 0:
             sf_code = code
@@ -362,9 +340,9 @@ def _launch_rows(
     row_tiles: cutlass.Int32,
     stream: cuda.CUstream,
 ) -> None:
-    glm52_prefill_act_quant_mxf8_rows_kernel(
-        x, q, sf, row0, rows, k_tiles, x_row_stride
-    ).launch(grid=(row_tiles, k_tiles, 1), block=(_THREADS, 1, 1), stream=stream)
+    glm52_prefill_act_quant_mxf8_rows_kernel(x, q, sf, row0, rows, k_tiles, x_row_stride).launch(
+        grid=(row_tiles, k_tiles, 1), block=(_THREADS, 1, 1), stream=stream
+    )
 
 
 @cute.jit
@@ -383,9 +361,7 @@ def _launch(
 ) -> None:
     glm52_prefill_act_quant_mxf8_kernel(
         x, q, sf, rows, k_tiles, x_row_stride, passes, vec_cvt, pdl
-    ).launch(
-        grid=(row_tiles, k_tiles, 1), block=(_THREADS, 1, 1), stream=stream, use_pdl=pdl
-    )
+    ).launch(grid=(row_tiles, k_tiles, 1), block=(_THREADS, 1, 1), stream=stream, use_pdl=pdl)
 
 
 @dataclass(frozen=True)
@@ -406,9 +382,7 @@ def compile_quant(
     K // 128, x_pitch, padded_rows(R) // rows_per_cta, stream)``.  ``pdl``: launched as a
     programmatic dependent that releases its own dependent at entry (decode chains)."""
     if passes not in PASSES_CHOICES:
-        raise ValueError(
-            f"act quant mxf8: passes must be one of {PASSES_CHOICES}, got {passes}"
-        )
+        raise ValueError(f"act quant mxf8: passes must be one of {PASSES_CHOICES}, got {passes}")
     key = (device_index, passes, vec_cvt, pdl)
     if key not in _COMPILED:
         z32, z64 = cutlass.Int32(0), cutlass.Int64(0)
@@ -495,10 +469,7 @@ def quantize_rows(
         or x.dtype != torch.bfloat16
         or x.ndim != 2
         or x.stride(1) != 1
-        or (
-            rows > 0
-            and (x.stride(0) % _VEC != 0 or x.data_ptr() % _ALIGNMENT_BYTES != 0)
-        )
+        or (rows > 0 and (x.stride(0) % _VEC != 0 or x.data_ptr() % _ALIGNMENT_BYTES != 0))
         or k % _COLS_PER_CTA != 0
         or q.dtype != torch.uint8
         or q.ndim != 2
@@ -576,9 +547,7 @@ def quantize(
         or sf.data_ptr() % _ALIGNMENT_BYTES != 0
         or q.data_ptr() % _ALIGNMENT_BYTES != 0
     ):
-        raise ValueError(
-            "act quant mxf8: q must be uint8 [R, K] contiguous; sf uint8 >= sf_bytes"
-        )
+        raise ValueError("act quant mxf8: q must be uint8 [R, K] contiguous; sf uint8 >= sf_bytes")
     fn.fn(
         x,
         q,
@@ -600,9 +569,7 @@ def reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     amax = xf.abs().amax(-1).clamp_min(_MIN_AMAX)
     scale = amax * torch.tensor(_INV_E4M3_MAX, dtype=torch.float32, device=x.device)
     bits = scale.view(torch.int32)
-    exp_bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(
-        torch.int32
-    ) * 0x00800000
+    exp_bits = (bits & 0x7F800000) + ((bits & 0x007FFFFF) != 0).to(torch.int32) * 0x00800000
     code = (exp_bits >> 23).to(torch.int32)
     inv = 1.0 / exp_bits.view(torch.float32)
     q = (xf * inv[..., None]).to(torch.float8_e4m3fn).view(torch.uint8).reshape(rows, k)
@@ -612,11 +579,7 @@ def reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     m = torch.arange(rp, device=x.device)[:, None]
     f = torch.arange(kf, device=x.device)[None, :]
     off = (
-        (m % 32) * 16
-        + ((m // 32) % 4) * 4
-        + f % 4
-        + (f // 4) * 512
-        + (m // 128) * 512 * (k // 128)
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + f % 4 + (f // 4) * 512 + (m // 128) * 512 * (k // 128)
     )
     sf = torch.empty(rp * kf, dtype=torch.uint8, device=x.device)
     sf[off.flatten()] = full.flatten().to(torch.uint8)
@@ -629,11 +592,7 @@ def dequantize(q: torch.Tensor, sf: torch.Tensor, rows: int, k: int) -> torch.Te
     m = torch.arange(rows, device=q.device)[:, None]
     f = torch.arange(kf, device=q.device)[None, :]
     off = (
-        (m % 32) * 16
-        + ((m // 32) % 4) * 4
-        + f % 4
-        + (f // 4) * 512
-        + (m // 128) * 512 * (k // 128)
+        (m % 32) * 16 + ((m // 32) % 4) * 4 + f % 4 + (f // 4) * 512 + (m // 128) * 512 * (k // 128)
     )
     code = sf[off].to(torch.int32)
     s = torch.exp2((code - 127).float())

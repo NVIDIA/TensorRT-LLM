@@ -38,15 +38,10 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 from ..common import self_attn_prefill_act_quant_mxf8 as _quant
 
@@ -136,9 +131,7 @@ def glm52_mtp_eh_norm_q8_kernel(
             f = values[v][k].to(cutlass.Float32) * inv_rms
             # the served kernel's BF16 output value, as the act quant reads it back
             vals[k] = (
-                (f * weights[v][k].to(cutlass.Float32))
-                .to(cutlass.BFloat16)
-                .to(cutlass.Float32)
+                (f * weights[v][k].to(cutlass.Float32)).to(cutlass.BFloat16).to(cutlass.Float32)
             )
         _quant.mxf8_quant_store_x8(
             vals,
@@ -241,12 +234,7 @@ def _rows_ok(t: torch.Tensor) -> bool:
 def supports(x0: torch.Tensor, x1: torch.Tensor) -> bool:
     """Whether ``e`` / ``h`` are row blocks this kernel takes: CUDA BF16 ``[T, 6144]`` on one
     device, the same T, inner dimension contiguous, 16-byte-aligned rows."""
-    return (
-        _rows_ok(x0)
-        and _rows_ok(x1)
-        and x0.shape[0] == x1.shape[0]
-        and x0.device == x1.device
-    )
+    return _rows_ok(x0) and _rows_ok(x1) and x0.shape[0] == x1.shape[0] and x0.device == x1.device
 
 
 def norm_cat_q8(
@@ -275,16 +263,12 @@ def norm_cat_q8(
             or w.device != x0.device
             or w.data_ptr() % _ALIGNMENT_BYTES != 0
         ):
-            raise ValueError(
-                "mtp eh norm cat q8: weights must be BF16 [6144] contiguous"
-            )
+            raise ValueError("mtp eh norm cat q8: weights must be BF16 [6144] contiguous")
     rows = int(x0.shape[0])
     if q is None:
         q = torch.empty(rows, K_TOTAL, dtype=torch.uint8, device=x0.device)
     if sf is None:
-        sf = torch.empty(
-            _quant.sf_bytes(rows, K_TOTAL), dtype=torch.uint8, device=x0.device
-        )
+        sf = torch.empty(_quant.sf_bytes(rows, K_TOTAL), dtype=torch.uint8, device=x0.device)
     if (
         q.dtype != torch.uint8
         or tuple(q.shape) != (rows, K_TOTAL)
@@ -324,8 +308,8 @@ def reference(x0, w0, x1, w1, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
 
     def norm(x, w):
         xf = x.float()
-        return (
-            xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()
-        ).to(torch.bfloat16)
+        return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()).to(
+            torch.bfloat16
+        )
 
     return _quant.reference(torch.cat([norm(x0, w0), norm(x1, w1)], -1))

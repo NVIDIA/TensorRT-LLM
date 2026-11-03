@@ -31,12 +31,12 @@ from cutlass.experimental import primitives as prims
 
 from .moe_prefill_topk_routing import partial_prefix_kernel, partial_scatter_kernel
 from .moe_topk_routing import (
+    _EXPERTS,
     _FULL_MASK,
     _LOCAL_EXPERTS,
     _TOP_K,
     _VEC_SIZE,
     _WARP,
-    _EXPERTS,
     _pack_score_index,
     _select_topk_and_count,
     _sort8_key_desc,
@@ -104,57 +104,41 @@ def _select_noraw_and_count(
     for v in cutlass.range_constexpr(_VEC_SIZE):
         keys[v] = cutlass.Uint64(0)
     if valid_token:
-        row = (
-            cutlass.Int64(token) * cutlass.Int64(_EXPERTS) * cutlass.Int64(logit_splits)
-        )
+        row = cutlass.Int64(token) * cutlass.Int64(_EXPERTS) * cutlass.Int64(logit_splits)
         for v in cutlass.range_constexpr(_VEC_SIZE):
             expert = lane + cutlass.Int32(v * _WARP)
             logit = cutlass.Float32(logits[row + cutlass.Int64(expert)])
             for split in cutlass.range_constexpr(1, logit_splits):
                 logit = logit + cutlass.Float32(
-                    logits[
-                        row + cutlass.Int64(split * _EXPERTS) + cutlass.Int64(expert)
-                    ]
+                    logits[row + cutlass.Int64(split * _EXPERTS) + cutlass.Int64(expert)]
                 )
             raw = cutlass.Float32(0.5) * cute.math.tanh(
                 cutlass.Float32(0.5) * logit
             ) + cutlass.Float32(0.5)
-            keys[v] = _pack_score_index(
-                raw + cutlass.Float32(routing_bias[expert]), expert
-            )
+            keys[v] = _pack_score_index(raw + cutlass.Float32(routing_bias[expert]), expert)
         _sort8_key_desc(keys)
         for k in cutlass.range_constexpr(_TOP_K):
             score_key = cutlass.Uint32(keys[0] >> cutlass.Uint64(32))
             warp_score_key = cutlass.Uint32(
-                prims.redux_sync(
-                    cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK
-                )
+                prims.redux_sync(cutlass.Int32(score_key), prims.ReductionKind.UMAX, _FULL_MASK)
             )
             inverse_idx = cutlass.Uint32(0)
             if score_key == warp_score_key:
                 inverse_idx = cutlass.Uint32(keys[0] & cutlass.Uint64(0xFFFF))
             winner_inverse_idx = cutlass.Uint32(
-                prims.redux_sync(
-                    cutlass.Int32(inverse_idx), prims.ReductionKind.UMAX, _FULL_MASK
-                )
+                prims.redux_sync(cutlass.Int32(inverse_idx), prims.ReductionKind.UMAX, _FULL_MASK)
             )
             if score_key == warp_score_key and inverse_idx == winner_inverse_idx:
                 for v in cutlass.range_constexpr(_VEC_SIZE - 1):
                     keys[v] = keys[v + 1]
                 keys[_VEC_SIZE - 1] = cutlass.Uint64(0)
             if lane == cutlass.Int32(k):
-                my_selected_idx = cutlass.Int32(65535) - cutlass.Int32(
-                    winner_inverse_idx
-                )
+                my_selected_idx = cutlass.Int32(65535) - cutlass.Int32(winner_inverse_idx)
         if lane < cutlass.Int32(_TOP_K):
             logit = cutlass.Float32(logits[row + cutlass.Int64(my_selected_idx)])
             for split in cutlass.range_constexpr(1, logit_splits):
                 logit = logit + cutlass.Float32(
-                    logits[
-                        row
-                        + cutlass.Int64(split * _EXPERTS)
-                        + cutlass.Int64(my_selected_idx)
-                    ]
+                    logits[row + cutlass.Int64(split * _EXPERTS) + cutlass.Int64(my_selected_idx)]
                 )
             my_raw = cutlass.Float32(0.5) * cute.math.tanh(
                 cutlass.Float32(0.5) * logit
@@ -198,9 +182,7 @@ def partial_histogram_noraw_kernel(
     blocks, _, _ = cute.arch.grid_dim()
     lane = tid & cutlass.Int32(31)
     warp = tid >> cutlass.Int32(5)
-    counts = cutlass.Array(
-        cutlass.Int32, 64, space=cutlass.AddressSpace.smem, alignment=128
-    )
+    counts = cutlass.Array(cutlass.Int32, 64, space=cutlass.AddressSpace.smem, alignment=128)
     if tid < cutlass.Int32(64):
         counts.subview(tid).store(cutlass.Int32(0))
     prims.barrier_cta_sync(0)

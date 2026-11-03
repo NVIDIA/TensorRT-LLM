@@ -29,16 +29,10 @@ Shape: Runtime M rows x W bytes (W % 16 == 0)
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import (
-    make_fake_compact_tensor,
-    make_fake_stream,
-    make_fake_tensor,
-)
-
+import torch
+from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
 
 _THREADS = 256
 # One vector = four Int32 = 16 bytes.
@@ -121,9 +115,7 @@ def compile_select(scatter: bool = False) -> CompiledKernel:
         _COMPILED[key] = cute.compile(
             _launch_select,
             _fake_rows(),
-            make_fake_compact_tensor(
-                cutlass.Int32, (cute.sym_int32(),), assumed_align=4
-            ),
+            make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=4),
             _fake_rows(),
             cutlass.Int32(_VEC),
             cutlass.Int32(_VEC),
@@ -179,9 +171,7 @@ def _check(x: torch.Tensor, rows: torch.Tensor, y: torch.Tensor):
     return xw, yw
 
 
-def gather(
-    fn: CompiledKernel, x: torch.Tensor, rows: torch.Tensor, y: torch.Tensor
-) -> None:
+def gather(fn: CompiledKernel, x: torch.Tensor, rows: torch.Tensor, y: torch.Tensor) -> None:
     """``y[i] = x[rows[i]]`` for ``i < len(rows)`` (``fn`` from ``compile_select(False)``)."""
 
     xw, yw = _check(x, rows, y)
@@ -199,9 +189,7 @@ def gather(
         )
 
 
-def scatter(
-    fn: CompiledKernel, x: torch.Tensor, rows: torch.Tensor, y: torch.Tensor
-) -> None:
+def scatter(fn: CompiledKernel, x: torch.Tensor, rows: torch.Tensor, y: torch.Tensor) -> None:
     """``y[rows[i]] = x[i]`` for ``i < len(rows)`` (``fn`` from ``compile_select(True)``)."""
 
     xw, yw = _check(x, rows, y)

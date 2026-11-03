@@ -28,12 +28,10 @@ vectors, so a row is read once with full-width loads.
 from collections.abc import Callable
 
 import cuda.bindings.driver as cuda
-import torch
-
 import cutlass
 import cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
-
 
 HIDDEN = 6144
 _THREADS = 256
@@ -226,12 +224,17 @@ def _fake_rows():
 
     rows = cute.sym_int32()
     pitch = cute.sym_int32(divisibility=_VEC)
-    return make_fake_tensor(cutlass.BFloat16, (rows, HIDDEN), stride=(pitch, 1), assumed_align=_ALIGNMENT_BYTES)
+    return make_fake_tensor(
+        cutlass.BFloat16, (rows, HIDDEN), stride=(pitch, 1), assumed_align=_ALIGNMENT_BYTES
+    )
 
 
 def _fake_out():
     return make_fake_compact_tensor(
-        cutlass.BFloat16, (cute.sym_int32(), HIDDEN), stride_order=(1, 0), assumed_align=_ALIGNMENT_BYTES
+        cutlass.BFloat16,
+        (cute.sym_int32(), HIDDEN),
+        stride_order=(1, 0),
+        assumed_align=_ALIGNMENT_BYTES,
     )
 
 
@@ -241,7 +244,9 @@ def compile_rmsnorm(use_pdl: bool = False, gathered: bool = False) -> CompiledKe
 
     key = ("rmsnorm", use_pdl, gathered)
     if key not in _COMPILED:
-        weight = make_fake_compact_tensor(cutlass.BFloat16, (HIDDEN,), assumed_align=_ALIGNMENT_BYTES)
+        weight = make_fake_compact_tensor(
+            cutlass.BFloat16, (HIDDEN,), assumed_align=_ALIGNMENT_BYTES
+        )
         rows = make_fake_compact_tensor(cutlass.Int64, (cute.sym_int32(),), assumed_align=8)
         _COMPILED[key] = cute.compile(
             _launch_rmsnorm,
@@ -358,7 +363,15 @@ def rmsnorm(fn: CompiledKernel, x: torch.Tensor, weight: torch.Tensor, eps: floa
     ):
         raise ValueError("rmsnorm: unsupported operands")
     y = torch.empty((x.shape[0], HIDDEN), dtype=torch.bfloat16, device=x.device)
-    fn(x, weight, y, _no_rows(x.device), x.stride(0), float(eps), torch.cuda.current_stream(x.device).cuda_stream)
+    fn(
+        x,
+        weight,
+        y,
+        _no_rows(x.device),
+        x.stride(0),
+        float(eps),
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
     return y
 
 

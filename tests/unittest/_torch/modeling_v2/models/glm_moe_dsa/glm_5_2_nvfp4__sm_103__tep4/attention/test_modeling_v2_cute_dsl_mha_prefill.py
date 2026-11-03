@@ -48,7 +48,7 @@ def _build(spec, seed):
         # As the target quantizes them: power-of-two scales, per tensor for q, per head
         # for k and v, so every value fits e4m3. A sharper q than the bf16 cells' makes
         # the softmax peaked enough for the e4m3 P to matter.
-        q, k = q * 3.0, k * 0.7
+        q, k = q * spec.get("q_scale", 3.0), k * 0.7
         s_q = _pow2(q.abs().amax())
         s_k, s_v = _pow2(k.abs().amax(dim=(0, 2))), _pow2(v.abs().amax(dim=(0, 2)))
         q = (q / s_q).to(torch.float8_e4m3fn)
@@ -166,3 +166,68 @@ def test_fp8_handle_refuses_a_call_without_head_scales() -> None:
     with pytest.raises(AssertionError, match="head_scales"):
         with validating(op):
             op(**args, compiled=_compiled(True))
+
+
+_NO_OFFLOAD: dict = {}
+
+
+def _q8_handle_without_offload():
+    """The MXF8-O handle without the offloaded epilogue: the build it replaces."""
+    if "h" not in _NO_OFFLOAD:
+        _NO_OFFLOAD["h"] = entry.compile(
+            torch.cuda.current_device(), fp8=True, q8=True, epi_offload=False
+        )
+    return _NO_OFFLOAD["h"]
+
+
+#: The q8 cells' shapes, and a peaked softmax (a much sharper q: a few keys take nearly all of
+#: each row's weight, so the e4m3 P rounding and the row sums are at their extremes).
+_OFFLOAD_SPECS = [c.spec for c in op.CELLS if c.spec.get("q8")] + [
+    dict(new=[987] * 8, cached=[0] * 8, fp8=True, q8=True, q_scale=24.0),
+    dict(new=[300, 40, 1], cached=[17, 64, 300], fp8=True, q8=True, q_scale=24.0),
+]
+
+
+def _q8_run(args, handle):
+    t = int(args["q"].shape[0])
+    q8 = torch.full((t, HEADS * DIM), 0x5A, dtype=torch.uint8, device="cuda")
+    sf = torch.zeros(entry.sf_bytes(t), dtype=torch.uint8, device="cuda")
+    op(**{**args, "out": torch.full_like(args["out"], float("nan"))}, compiled=handle,
+       q8_out=(q8, sf))  # fmt: skip
+    return q8, sf
+
+
+@pytest.mark.parametrize("spec", _OFFLOAD_SPECS, ids=range(len(_OFFLOAD_SPECS)))
+def test_offloaded_epilogue_is_the_plain_q8_build_bitwise(spec) -> None:
+    args = _build(spec, seed=31 + sum(spec["new"]))
+    got = _q8_run(args, _compiled(True, True))
+    want = _q8_run(args, _q8_handle_without_offload())
+    torch.cuda.synchronize()
+    assert torch.equal(got[0], want[0]), "MXF8 O bytes differ from the build without the offload"
+    assert torch.equal(got[1], want[1]), "block scales differ from the build without the offload"
+
+
+def test_offloaded_epilogue_graph_replay_is_eager() -> None:
+    spec = dict(new=[987] * 8, cached=[0] * 8, fp8=True, q8=True)
+    args = _build(spec, seed=5)
+    handle = _compiled(True, True)
+    eager = _q8_run(args, handle)
+    t = int(args["q"].shape[0])
+    q8 = torch.full((t, HEADS * DIM), 0x5A, dtype=torch.uint8, device="cuda")
+    sf = torch.zeros(entry.sf_bytes(t), dtype=torch.uint8, device="cuda")
+    out = torch.full_like(args["out"], float("nan"))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        op(**{**args, "out": out}, compiled=handle, q8_out=(q8, sf))
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        op(**{**args, "out": out}, compiled=handle, q8_out=(q8, sf))
+    q8.fill_(0x5A)
+    sf.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(q8, eager[0]) and torch.equal(sf, eager[1]), (
+        "graph replay differs from eager"
+    )
