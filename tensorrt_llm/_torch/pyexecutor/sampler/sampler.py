@@ -1125,11 +1125,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         watermark = self._watermark
         if watermark is not None:
-            slot_modes = self._slot_params.modes
             watermark.observe(
                 [request for request in requests if not request.is_dummy],
-                lambda request: slot_modes[cast(int, request.py_seq_slot)] is SamplingMode.SAMPLING,
-                self._watermark_row_is_neutral,
+                is_neutral=self._watermark_row_is_neutral,
             )
             flags = [watermark.is_enabled(slot) for slot in live_slots_per_row]
             flags += [False] * (num_rows - live_rows)
@@ -2046,13 +2044,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         self._seed_manager.observe(requests)
         if self._watermark is not None:
-            slot_modes = self._slot_params.modes
-            self._watermark.observe(
-                requests,
-                lambda request: request.py_seq_slot is not None
-                and slot_modes[request.py_seq_slot] is SamplingMode.SAMPLING,
-                self._watermark_row_is_neutral,
-            )
+            self._watermark.observe(requests, is_neutral=self._watermark_row_is_neutral)
 
         seq_slots_list = seq_slots.tolist()
         groups = self._group_requests(requests, seq_slots_list)
