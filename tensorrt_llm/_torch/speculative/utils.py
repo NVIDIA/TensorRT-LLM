@@ -20,7 +20,7 @@ from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
                                        match_nemotron_h_layer_types)
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
-from .dflash import DFlashSpecMetadata, DFlashWorker
+from .dflash import DFlashPromptTracker, DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .dspark import DSparkSpecMetadata, DSparkWorker, DSv4DSparkWorker
@@ -458,6 +458,7 @@ def _build_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
+            spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
@@ -640,6 +641,10 @@ def get_spec_resource_manager(model_engine):
                                           max_num_requests,
                                           max_seq_len,
                                           num_seq_slots=num_seq_slots)
+        if spec_dec_mode.is_dflash():
+            # Lets the dense drafter arena resume a prefix-cache hit from a
+            # slot that holds the reused prefix. No GPU memory.
+            return DFlashPromptTracker(max_num_requests)
         return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
