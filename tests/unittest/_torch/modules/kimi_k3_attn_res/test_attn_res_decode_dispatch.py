@@ -193,7 +193,8 @@ class _PlainKdaMixer:
 class _FakeMoE(nn.Module):
     """Stands in for ``KimiK3MoERuntime``: routed/shared outputs derived from the input."""
 
-    def forward_parts(self, hidden_states, all_rank_num_tokens=None):
+    def forward(self, hidden_states, all_rank_num_tokens=None, return_parts=False):
+        assert return_parts
         routed = (hidden_states.float() * 0.5).to(torch.bfloat16)
         shared = (hidden_states.float() * -0.25).to(torch.bfloat16)
         return routed, shared

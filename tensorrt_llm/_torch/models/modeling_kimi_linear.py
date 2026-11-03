@@ -1913,15 +1913,27 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
-    def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
-        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
-        routed_out, shared_out = self.forward_parts(hidden_states, all_rank_num_tokens)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        return_parts: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """``hidden_states``: ``[num_tokens, hidden_size]`` bf16.
+
+        Returns the BF16 sum of the routed and the shared experts' outputs, or with
+        ``return_parts`` the two outputs ``(routed, shared)`` (the decoder layer leaves their sum
+        to the residual update it may defer).
+        """
+        routed_out, shared_out = self._forward_parts(hidden_states, all_rank_num_tokens)
+        if return_parts:
+            return routed_out, shared_out
         return routed_out + shared_out
 
-    def forward_parts(
-        self, hidden_states: torch.Tensor, all_rank_num_tokens=None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The routed and the shared experts' outputs, whose BF16 sum :meth:`forward` returns."""
+    def _forward_parts(
+        self, hidden_states: torch.Tensor, all_rank_num_tokens: Optional[List[int]] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The routed and the shared experts' outputs."""
         identity = hidden_states
         projected_input = None
         early_routed_in = None
@@ -2561,11 +2573,12 @@ class KimiLinearDecoderLayer(nn.Module):
                 self.post_attention_layernorm,
             )
         if self.is_moe:
-            routed, shared = self.block_sparse_moe.forward_parts(
+            routed, shared = self.block_sparse_moe(
                 hidden_states,
                 sliced.all_rank_num_tokens(num_tokens)
                 if sliced is not None
                 else getattr(attn_metadata, "all_rank_num_tokens", None),
+                return_parts=True,
             )
             residual_update = _DeferredMoEResidual(prefix_sum, routed, shared)
             if defer_moe_residual and _defers_moe_residual(prefix_sum, num_snapshots + 1):
