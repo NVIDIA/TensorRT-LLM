@@ -30,6 +30,7 @@ Winograd sums run in table index order.
 from __future__ import annotations
 
 import functools
+import inspect
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -1105,56 +1106,72 @@ class VaeNormKernel:
         return out
 
 
-_POINTER_ARGS = (
-    "x",
-    "m",
-    "d",
-    "residual",
-    "in_bias",
-    "cache",
-    "gamma",
-    "bias",
-    "sum",
-    "y_tail",
-    "y",
-    "halo_l",
-    "halo_r",
+# The kernel arguments in the order of ``VaeNormKernel.wrapper``'s signature (pointer
+# parameters carry a ``_ptr`` suffix there), each with its type: ``_PTR`` for a global-memory
+# pointer (element type from :func:`_pointer_dtypes`), else the scalar type. The compile
+# placeholders and the launch arguments are both built from this one list.
+_PTR = "ptr"
+_ARGS = (
+    ("x", _PTR),
+    ("m", _PTR),
+    ("d", _PTR),
+    ("residual", _PTR),
+    ("in_bias", _PTR),
+    ("cache", _PTR),
+    ("gamma", _PTR),
+    ("bias", _PTR),
+    ("sum", _PTR),
+    ("y_tail", _PTR),
+    ("y", _PTR),
+    ("halo_l", _PTR),
+    ("halo_r", _PTR),
+    ("comp_vecs", Int64),
+    ("in_comp_vecs", Int64),
+    ("in_frame", Int64),
+    ("out_frame", Int64),
+    ("halo_frame_l", Int64),
+    ("halo_frame_r", Int64),
+    ("halo_comp_l", Int64),
+    ("halo_comp_r", Int64),
+    ("positions", Int32),
+    ("frames", Int32),
+    ("cache_frames", Int32),
+    ("height", Int32),
+    ("width", Int32),
+    ("pad_h", Int32),
+    ("pad_w", Int32),
+    ("in_w", Int32),
+    ("in_off", Int32),
+    ("out_w", Int32),
+    ("out_off", Int32),
+    ("halo_step_l", Int32),
+    ("halo_step_r", Int32),
+    ("halo_axis", Int32),
+    ("has_l", Int32),
+    ("has_r", Int32),
+    ("scale", Float32),
+    ("eps", Float32),
 )
-_INT64_ARGS = (
-    "comp_vecs",
-    "in_comp_vecs",
-    "in_frame",
-    "out_frame",
-    "halo_frame_l",
-    "halo_frame_r",
-    "halo_comp_l",
-    "halo_comp_r",
-)
-_INT32_ARGS = (
-    "positions",
-    "frames",
-    "cache_frames",
-    "height",
-    "width",
-    "pad_h",
-    "pad_w",
-    "in_w",
-    "in_off",
-    "out_w",
-    "out_off",
-    "halo_step_l",
-    "halo_step_r",
-    "halo_axis",
-    "has_l",
-    "has_r",
-)
-_FLOAT_ARGS = ("scale", "eps")
+# Host value of each argument type at launch (TVM-FFI takes raw addresses and Python scalars).
+_HOST_VALUE = {_PTR: lambda v: v, Int64: int, Int32: int, Float32: float}
+
+
+def _check_arg_order() -> None:
+    """``_ARGS`` matches the wrapper's parameters (name and order) up to the grid size and
+    the stream."""
+    params = list(inspect.signature(VaeNormKernel.wrapper).parameters)[1:]  # without self
+    names = [name + "_ptr" if kind is _PTR else name for name, kind in _ARGS]
+    if params != [*names, "blocks", "stream"]:
+        raise RuntimeError("kernels.norm: _ARGS does not match VaeNormKernel.wrapper")
+
+
+_check_arg_order()
 
 
 def _pointer_dtypes(p: _Plan) -> dict:
-    """Element type of each pointer argument, keyed by its name in :data:`_POINTER_ARGS`."""
+    """Element type of each pointer argument, keyed by its name in :data:`_ARGS`."""
     halo = p.row_dtype if p.v.out == OUT_ROWS else p.winograd_dtype
-    dtypes = dict.fromkeys(_POINTER_ARGS, p.row_dtype)
+    dtypes = {name: p.row_dtype for name, kind in _ARGS if kind is _PTR}
     dtypes.update(m=p.winograd_dtype, d=p.winograd_dtype, halo_l=halo, halo_r=halo)
     return dtypes
 
@@ -1175,18 +1192,18 @@ def _compile(device: int, variant: Variant, has_sum: bool):
 
     def compile_fn():
         dtypes = _pointer_dtypes(kernel.p)
-        ptrs = [
+        placeholders = [
             make_ptr(dtypes[name], 16, cute.AddressSpace.gmem, assumed_align=16)
-            for name in _POINTER_ARGS
+            if kind is _PTR
+            else kind(0)
+            for name, kind in _ARGS
         ]
-        scalars = (
-            [Int64(0)] * len(_INT64_ARGS)
-            + [Int32(0)] * len(_INT32_ARGS)
-            + [Float32(0.0)] * len(_FLOAT_ARGS)
-            + [Int32(1)]
-        )
         return cute.compile(
-            kernel.wrapper, *ptrs, *scalars, current_stream(device), options="--enable-tvm-ffi"
+            kernel.wrapper,
+            *placeholders,
+            Int32(1),  # blocks
+            current_stream(device),
+            options="--enable-tvm-ffi",
         )
 
     from .. import jit_norm, wino_vae_kernels
@@ -1206,10 +1223,7 @@ def launch(
     fn, blocks_per_sm = _compile(device, variant, has_sum)
     args = dict(args, has_l=int(bool(args["halo_l"])), has_r=int(bool(args["halo_r"])))
     fn(
-        *(args[k] for k in _POINTER_ARGS),
-        *(int(args[k]) for k in _INT64_ARGS),
-        *(int(args[k]) for k in _INT32_ARGS),
-        *(float(args[k]) for k in _FLOAT_ARGS),
+        *(_HOST_VALUE[kind](args[name]) for name, kind in _ARGS),
         int(min(steps, sm_count * blocks_per_sm)),
         stream,
     )
