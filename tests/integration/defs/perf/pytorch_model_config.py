@@ -108,6 +108,32 @@ def get_model_yaml_config(model_label: str,
     # This allows for flexible configuration of models based on naming patterns
     pattern_configs = [
         {
+            'patterns': ['muse_spark_open_nvfp4-serve-pytorch'],
+            'config': {
+                'disable_mm_encoder': True,
+                'enable_attention_dp': False,
+                'enable_chunked_prefill': True,
+                'disable_overlap_scheduler': False,
+                'attn_backend': 'TRTLLM',
+                'allreduce_strategy': 'NCCL',
+                'max_seq_len': 49152,
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 256,
+                },
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'enable_block_reuse': True,
+                    'enable_partial_reuse': True,
+                    'free_gpu_memory_fraction': 0.8,
+                    'use_kv_cache_manager_v2': True,
+                },
+                'moe_config': {
+                    'backend': 'TRTLLM',
+                },
+            }
+        },
+        {
             'patterns': ['deepseek_v41_flash_nvfp4'],
             'config': {
                 'gpus_per_node': 4,

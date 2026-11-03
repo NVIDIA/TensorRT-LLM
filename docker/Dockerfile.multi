@@ -113,6 +113,8 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=secret,id=github_clone_token \
     . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
+    bash /opt/docker/common/install_efa_installer.sh && \
+    bash /opt/docker/common/install_gdrcopy.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
