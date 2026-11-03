@@ -829,3 +829,154 @@ class TestModelingV2Glm52Nvfp4Sm107LowLatency(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     def test_tp8_mtp7_gsm8k_and_acceptance(self, tmp_path: Path) -> None:
         run_accuracy_case(POINT04, tmp_path)
+
+
+_HIGH_THROUGHPUT_POINTS = (
+    pytest.param(7, 7, id="p05_tp16_ep16_b7_k7"),
+    pytest.param(10, 5, id="p06_tp16_ep16_b10_k5"),
+    pytest.param(20, 5, id="p07_tp16_ep16_b20_k5"),
+)
+# Populated from full-corpus stock runs of the matching ADP configurations.
+# A synthetic acceptance setting from a throughput run is not an AL reference.
+_HIGH_THROUGHPUT_AL_REFERENCE: dict[tuple[int, int], float] = {}
+_HIGH_THROUGHPUT_ENV = {
+    **_RANK_ENV,
+    "TLLM_METRICS_ALL_RANKS": "1",
+    "TRTLLM_ENABLE_PDL": "1",
+}
+
+
+def _high_throughput_engine_kwargs(batch_size: int, draft_len: int) -> dict:
+    kwargs = _engine_kwargs()
+    kwargs.update(
+        moe_expert_parallel_size=16,
+        enable_attention_dp=True,
+        enable_lm_head_tp_in_adp=True,
+        max_batch_size=batch_size,
+        cuda_graph_config=CudaGraphConfig(
+            batch_sizes=list(range(1, batch_size + 1)), enable_padding=True
+        ),
+        kv_cache_config=KvCacheConfig(
+            dtype="nvfp4",
+            tokens_per_block=64,
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+            free_gpu_memory_fraction=0.8,
+            max_tokens=batch_size * 16384,
+            host_cache_size=0,
+        ),
+        moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL", use_low_precision_moe_combine=True),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            enable_heuristic_topk=True,
+            use_cute_dsl_paged_mqa_logits=True,
+        ),
+        env_overrides=dict(_HIGH_THROUGHPUT_ENV),
+    )
+    kwargs["speculative_config"].max_draft_len = draft_len
+    return kwargs
+
+
+def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) -> int:
+    """Exercise every ADP owner after capture, with enough requests to fill its batch."""
+    prompts = [
+        f"Exercise {index}: explain step by step how to multiply two three-digit numbers."
+        for index in range(2 * _TP_SIZE * batch_size)
+    ]
+    trace_dir.mkdir(parents=True)
+    llm.start_profile(output_dir=str(trace_dir), num_steps=8, start_step=8, activities=["GPU"])
+    try:
+        outputs = llm.generate(
+            prompts,
+            SamplingParams(temperature=0.0, top_p=1.0, max_tokens=128, ignore_eos=True),
+            use_tqdm=False,
+        )
+        assert len(outputs) == len(prompts)
+        assert all(len(output.outputs[0].token_ids) == 128 for output in outputs)
+    finally:
+        llm.stop_profile()
+    traces = list(trace_dir.glob("trtllm-trace-*-rank-*.json"))
+    assert len(traces) == _TP_SIZE, f"Expected {_TP_SIZE} GPU traces, found {traces}"
+    for rank in range(_TP_SIZE):
+        rank_traces = [path for path in traces if path.name.endswith(f"-rank-{rank}.json")]
+        assert len(rank_traces) == 1, f"Missing or duplicate trace for rank {rank}"
+        events = json.loads(rank_traces[0].read_text())["traceEvents"]
+        names = [event["name"] for event in events if event.get("cat") == "kernel"]
+        for kernel in (
+            "publishOwnerMembersKernel",
+            "glmRubinNoAuxTcFp4QuantKernel",
+            "_glm_rubin_mtp_tail_scatter_kernel",
+        ):
+            assert any(kernel in name for name in names), f"Rank {rank} did not execute {kernel}"
+    return len(prompts)
+
+
+class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
+    @skip_no_rubin
+    @pytest.mark.skip_less_mpi_world_size(_TP_SIZE)
+    @pytest.mark.parametrize("batch_size,draft_len", _HIGH_THROUGHPUT_POINTS)
+    def test_gsm8k_and_acceptance(
+        self, batch_size: int, draft_len: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ):
+        assert os.environ.get("INTEGRATION_TEST") != "1", "This guard requires all 1319 samples"
+        monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", str(_TP_SIZE * batch_size))
+        monkeypatch.setenv("TLLM_EVAL_PARTIAL_SCORES_EVERY", "100")
+        with (
+            scoped_env_overrides(_HIGH_THROUGHPUT_ENV),
+            LLM(_MODEL_PATH, **_high_throughput_engine_kwargs(batch_size, draft_len)) as llm,
+        ):
+            probe_requests = _assert_high_throughput_paths(
+                llm, batch_size, tmp_path / "optimized-path-traces"
+            )
+            _request_stats(llm, probe_requests)
+            evaluator = GSM8KInferenceX(
+                dataset_path=_DATASET_PATH,
+                num_samples=_NUM_SAMPLES,
+                num_fewshot=5,
+                random_seed=0,
+                apply_chat_template=True,
+                fewshot_as_multiturn=False,
+                shuffle_dataset=False,
+                fewshot_random_seed=1234,
+                log_samples=True,
+                output_path=str(tmp_path),
+            )
+            evaluator.evaluate(
+                llm,
+                sampling_params=SamplingParams(
+                    temperature=0.0, top_p=1.0, max_tokens=12288, truncate_prompt_tokens=4096
+                ),
+                streaming=False,
+                sampling_override=True,
+                scores_filter="exact_match,strict-match",
+            )
+            stats = _request_stats(llm, _NUM_SAMPLES)
+
+        rank_ids = {stat["rank"] for stat in stats}
+        assert rank_ids == set(range(_TP_SIZE)), f"Incomplete ADP statistics: {rank_ids}"
+        spec_stats = [
+            stat["specDecodingStats"]
+            for stat in stats
+            if stat.get("specDecodingStats") and stat["specDecodingStats"]["numDraftTokens"] > 0
+        ]
+        assert spec_stats, "Missing real speculative iteration statistics"
+        assert max(stat["numRequestsWithDraftTokens"] for stat in spec_stats) == batch_size
+        acceptance_length = acceptance_length_from_iteration_stats(stats)
+        scores = _full_accuracy_scores(tmp_path / f"samples_{_TASK_NAME}.json")
+        metrics = {
+            **scores,
+            "batch_size": batch_size,
+            "draft_len": draft_len,
+            "acceptance_length": acceptance_length,
+            "accepted_draft_tokens": sum(stat["numAcceptedTokens"] for stat in spec_stats),
+            "drafted_tokens": sum(stat["numDraftTokens"] for stat in spec_stats),
+            "speculative_request_steps": sum(
+                stat["numRequestsWithDraftTokens"] for stat in spec_stats
+            ),
+            "completed_requests": sum(stat["numCompletedRequests"] for stat in stats),
+        }
+        (tmp_path / "glm_metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+        (tmp_path / "iteration_stats.json").write_text(json.dumps(stats) + "\n")
+        print(f"[GLM high throughput] {json.dumps(metrics)}")
+        assert all(_ACCURACY_FLOOR <= score <= 100.0 for score in scores.values())
+        reference = _HIGH_THROUGHPUT_AL_REFERENCE[(batch_size, draft_len)]
+        assert 0.95 * reference <= acceptance_length <= draft_len + 1
