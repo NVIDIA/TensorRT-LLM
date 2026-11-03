@@ -31,7 +31,7 @@ from __future__ import annotations
 import math
 import os
 from types import SimpleNamespace
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 from torch import nn
@@ -77,6 +77,7 @@ from .ops.attention import cute_dsl_mla_rope_generation as _mla_rope_op
 from .ops.attention import cute_dsl_sparse_mla_decode as _fmha_dec_op
 from .ops.attention import cute_dsl_sparse_mla_prefill as _fmha_pre_op
 from .ops.attention.convert_req_index_to_global import convert_req_index_to_global
+from .ops.attention.cute_dsl_fp8_paged_mqa_logits import ATOM_SPLIT as _MQA_ATOM_SPLIT
 from .ops.attention.cute_dsl_fp8_paged_mqa_logits import cute_dsl_fp8_paged_mqa_logits
 from .ops.attention.cute_dsl_indexer_k_cache_update import build as build_ix_k_cache
 from .ops.attention.cute_dsl_indexer_k_cache_update import cute_dsl_indexer_k_cache_update
@@ -99,6 +100,7 @@ from .ops.attention.cute_dsl_sparse_mla_decode import (
     INDEX_KIND_BASE_WITH_LAYER_OFFSET,
     INDEX_KIND_GLOBAL,
     cute_dsl_sparse_mla_decode,
+    cute_dsl_sparse_mla_decode_union,
 )
 from .ops.attention.cute_dsl_sparse_mla_prefill import cute_dsl_sparse_mla_prefill
 from .ops.attention.fp8_mqa_logits import fp8_mqa_logits
@@ -153,6 +155,7 @@ from .ops.moe import cute_dsl_moe_routing as _moe_routing_op
 from .ops.moe import cute_dsl_moe_sigmoid_topk as _topk_rows_op
 from .ops.moe import cute_dsl_moe_topk_routing as _moe_topk_op
 from .ops.moe import cute_dsl_moe_topk_routing_rep as _moe_topk_rep_op
+from .ops.moe import cute_dsl_moe_topk_routing_wide_rep as _moe_topk_wide_rep_op
 from .ops.moe import cute_dsl_moe_zero as _moe_zero_op
 from .ops.moe import cute_dsl_mtp_moe_experts as _mtp_experts_op
 from .ops.moe.cute_dsl_moe_l2_prefetch import cute_dsl_moe_l2_prefetch
@@ -164,13 +167,16 @@ from .ops.moe.cute_dsl_moe_routing import cute_dsl_moe_routing
 from .ops.moe.cute_dsl_moe_sigmoid_topk import cute_dsl_moe_sigmoid_topk
 from .ops.moe.cute_dsl_moe_topk_routing import cute_dsl_moe_topk_routing
 from .ops.moe.cute_dsl_moe_topk_routing_rep import cute_dsl_moe_topk_routing_rep
+from .ops.moe.cute_dsl_moe_topk_routing_wide_rep import cute_dsl_moe_topk_routing_wide_rep
 from .ops.moe.cute_dsl_moe_zero import cute_dsl_moe_zero
 from .ops.moe.cute_dsl_mtp_moe_experts import cute_dsl_mtp_moe_experts
 from .ops.moe.noaux_tc_op import noaux_tc_op
+from .ops.norm import cute_dsl_hidden_add_rmsnorm as _hidden_add_norm_op
 from .ops.norm import cute_dsl_hidden_rmsnorm as _hidden_norm_op
 from .ops.norm import cute_dsl_mtp_eh_norm_cat_mxf8 as _eh8_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm as _qkv_a_norm_op
 from .ops.norm import cute_dsl_qkv_a_rmsnorm_q8 as _qkv_a_norm8_op
+from .ops.norm.cute_dsl_hidden_add_rmsnorm import cute_dsl_hidden_add_rmsnorm
 from .ops.norm.cute_dsl_hidden_rmsnorm import cute_dsl_hidden_rmsnorm
 from .ops.norm.cute_dsl_mtp_eh_norm_cat_mxf8 import cute_dsl_mtp_eh_norm_cat_mxf8
 from .ops.norm.cute_dsl_mtp_norm_shard import compile as compile_mtp_norm_shard
@@ -222,11 +228,25 @@ _MOE_MAX_T = 8192
 # How often rank 0 logs the route counters, in decode forwards (eager forwards and graph
 # captures: a replay does not re-enter Python). Context steps always report.
 _ROUTE_REPORT_EVERY = 16
-# The MTP width the specialised MLA rope kernel and the base-row index kind are built for.
+# The MTP width the specialised MLA rope kernel and the base-row index kind are built for at
+# MTP1; MTP3 / MTP5 add max_draft_len + 1 (`mtp_widths`).
 _MLA_ROPE_MTP_WIDTH = 2
 # The decode kernels' widest compiled row count. Above it a projection with no compiled runner
 # takes the prefill GEMM; at or below it, cuBLAS.
 _DECODE_MAX_ROWS = 64
+#: `slots_of`'s generation index kind on a pure decode step whose attention takes the
+#: union kernel: the slots are the step's request-local selection (`_UnionSlots`).
+_UNION_POSITIONS = "union_positions"
+
+
+class _UnionSlots(NamedTuple):
+    """A pure decode step's generation selection as the union attention takes it: the
+    request-local top-k positions `[rows, 2048]` and each row's block-table row."""
+
+    positions: torch.Tensor
+    req_idx: torch.Tensor
+
+
 # The fp8 context attention's dequantization scales are powers of two from strict bounds on
 # its operands (`_mha_fp8_scales`); the bound's margin covers bf16 rounding of the normalized
 # inputs and the e4m3 cached-prefix rows (each within 1/16 of its bf16 value).
@@ -289,6 +309,16 @@ _MOE_PAIR_EXACT_FROM = 513
 # NVFP4: one e4m3 scale per 16 elements; the shared expert's per-rank intermediate.
 _MOE_SF_VEC = 16
 _SHARED_INTER = 512
+# The widest exact decode step (`_moe_decode_exact`) whose pre-MoE collective also writes the
+# routed experts' NVFP4 input (`_moe_prequant`): the quant entry's widest certified cell. MTP3
+# / MTP5 at batch 32 step 128 / 192 rows.
+_MOE_PREQUANT_WIDE_MAX = 256
+# The widest wide decode step that takes the expert replicas (`_build_moe_wide_rep`): the wide
+# top-k's 65..128 range. 4-GPU decode chain with the real all-reduce on real routing (two trunk
+# MoE layers with replicas): -6.5 / -5.8 us per step at 128 rows (MTP3), -8.1 / -6.4 / -4.2 us at
+# 68 / 96 / 126; at 192 rows (MTP5) -2.7 / +2.8 / +0.4 us over 320 / 800 / 1600 replays a side,
+# no gain past the replica top-k's +0.7 us, so 129..256 keep the wide top-k.
+_WIDE_REP_MAX_ROWS = 128
 
 
 def _pow2(rows: int) -> int:
@@ -427,6 +457,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # twins of their kernels; the context rope/append and the generation sparse MLA launch a
         # call signature their `prepare_runner` passed before without its contract walk.
         self._ctx_host_diet = os.environ.get("TRTLLM_GLM52_CTX_HOST_DIET", "1") == "1"
+        # TRTLLM_GLM52_FMHA_UNION (default 1): MTP3 / MTP5 pure decode steps take the
+        # union decode attention (`cute_dsl_sparse_mla_decode_union`); 0 keeps the per-row one.
+        self._union_on = os.environ.get("TRTLLM_GLM52_FMHA_UNION", "1") == "1"
 
         self.num_layers = cfg.num_hidden_layers
         self.eps = cfg.rms_norm_eps
@@ -484,6 +517,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 "TRTLLM_GLM52_CTX_EXPERT_REPLICAS must be in 0..TRTLLM_GLM52_DEC_EXPERT_REPLICAS "
                 f"({self.dec_replicas}), got {self.ctx_replicas}"
             )
+        # Wide decode expert replicas (`TRTLLM_GLM52_WIDE_DEC_EXPERT_REPLICAS`: "1", the
+        # default, or "0"): an MTP3 / MTP5 decode step of 65..256 rows moves each trunk MoE
+        # layer's active hot experts whole to the least loaded EP ranks, on the context
+        # replicas' slots, prefill pair and hot ids (`_build_moe_wide_rep`; needs
+        # `ctx_replicas` > 0).
+        self.wide_dec_replicas = os.environ.get("TRTLLM_GLM52_WIDE_DEC_EXPERT_REPLICAS", "1") == "1"
         self.mtp_enabled = getattr(model_config, "spec_config", None) is not None
         # The routed experts' FC1 weight layout (`TRTLLM_GLM52_MOE_FC1_KBLK`, `moe_fc1_kblock`),
         # read once here: the loader (`weights._fc1_w`), the MTP layer's quantized experts and
@@ -492,6 +531,43 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # The same for FC2 (`TRTLLM_GLM52_MOE_FC2_KBLK`): the loader (`weights._fc2_w`), the
         # MTP layer's quantized FC2 and every compiled FC2 kernel follow this one value.
         self.fc2_kblk = _fc1_kblock.fc2_enabled()
+        # Draft tokens per step (MTP-Eagle linear chain: 1, 3 or 5, see routing.py); 0 without
+        # speculation. A generation step carries max_draft_len + 1 query rows per sequence.
+        self.max_draft_len = (
+            int(getattr(model_config.spec_config, "max_draft_len", None) or 1)
+            if self.mtp_enabled
+            else 0
+        )
+        # The generation widths (query rows per sequence) the width-specialised decode builds
+        # serve: MTP1's 2, plus max_draft_len + 1 at MTP3 / MTP5 (verify and draft step 0).
+        # Draft steps 1..D-1 carry 1 row per sequence.
+        self.mtp_widths = (_MLA_ROPE_MTP_WIDTH,) + (
+            (self.max_draft_len + 1,) if self.max_draft_len > 1 else ()
+        )
+        # Whether the MTP layer returns its head-normalized output. The engine's linear draft
+        # loop feeds the MTP layer's return value back in as the next draft step's hidden state,
+        # and stock's MTP layer returns `shared_head.norm(...)`: an un-normalized feed-back
+        # collapsed MTP3 / MTP5 acceptance at draft positions 2.. (3.27 vs stock 3.98 at MTP3).
+        # MTP1 never feeds back, so it keeps the norm inside `shared_head` (unchanged bytes).
+        self._mtp_out_normed = self.max_draft_len > 1
+        # Whether the running step is a decode step of an engine drafting more than one token
+        # (`_select_target` sets it): its rows above 64 (verify and draft step 0 carry 32 x
+        # (max_draft_len + 1)) are decode rows, which keep the numerics of the 64-row decode
+        # paths (bf16 on the MTP decode cells; MXF8 where the decode path is the decode MXF8
+        # GEMM, the trunk o_proj) rather than take the context paths a row count above 64
+        # otherwise means.
+        self._wide_decode = False
+        # Such a step's rows without an MTP cell of their own (a batch of fewer than 32
+        # sequences: 65..191 rows, 96 / 144 at 24 requests) run on the next cell up at their
+        # exact row count (`_wide_cell`); False sends them to the bf16 fallbacks instead.
+        # `_wide_rag` holds the re-pinned runners, by (call, rows); built in the forward,
+        # nothing in them compiles.
+        self._wide_bucket = True
+        self._wide_rag: dict[tuple[str, int], object] = {}
+        self._ix_pre_split_rag = None
+        # The MTP3 / MTP5 decode cells' K-B writing the e4m3 q-base beside the rope kernel
+        # (`_attn_gen`), by row count; empty keeps the bf16 K-B and the full rope there.
+        self._kb8_mtp: dict = {}
 
         self.w = _weights.MODEL_WEIGHTS.declare(_weights.MODEL_WEIGHTS.dims(self))
 
@@ -517,7 +593,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._q8 = None
         # qkva / o_proj in MXF8 for the context rows (`_build_proj_mxf8`).
         self._proj_mxf8: dict = {}
+        # MTP3 / MTP5: the trunk o_proj's wide decode MXF8 GEMM and the V-B writing its
+        # operand (`_build_dec_mxf8`); empty keeps those rows on the context MXF8 GEMM.
+        self._dec8w: dict = {}
+        self._vb8w: dict = {}
         self._fmha_dec_compiled: _fmha_dec_op.CompiledSparseMlaDecode | None = None
+        # MTP3 / MTP5 only: the decode attention's grid for max_draft_len + 1 rows per sequence.
+        self._fmha_dec_wide: _fmha_dec_op.CompiledSparseMlaDecode | None = None
+        # MTP3 / MTP5 pure decode: the union decode attention's handle (None: per-row only).
+        self._fmha_union: _fmha_dec_op.CompiledSparseMlaDecodeUnion | None = None
         # The routed experts' operand slots: two of each buffer, alternating per layer (trunk)
         # or per call (MTP). See `_build_moe`.
         self._moe_slot = 0
@@ -530,7 +614,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # The row ops outside the fused kernels and the logits head's local GEMM, built in
         # `post_load_weights` and `build_logits_head`; None keeps a call site's stock op.
         self._rows = SimpleNamespace(
-            norm=None, add=None, gather=None, topk=None, swiglu=None, copy=None, argmax=None
+            norm=None,
+            add=None,
+            add_norm=None,
+            gather=None,
+            topk=None,
+            swiglu=None,
+            copy=None,
+            argmax=None,
         )
         self._lm_head = None
         self._lm_head_runners: dict = {}
@@ -721,9 +812,18 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         decode step neither GEMM has an activation quant launch in front of it: the q_a
         norm's decode kernel (`cute_dsl_qkv_a_rmsnorm_q8`) for q_b, and the V-B GEMM's side
         output (`build_v_b_mxf8_side`, the o_proj operand's addresses compiled in) for
-        o_proj. The MTP layer and a mixed step's generation rows keep the bf16 cells."""
+        o_proj. The MTP layer and a mixed step's generation rows keep the bf16 cells.
+
+        MTP3 / MTP5 (`max_draft_len > 1`): the trunk o_proj's decode rows above 64 (up to
+        192) on the wide decode MXF8 GEMM (`_dec8w`, `_dec8_op.build_wide`), its operand
+        written by the MTP group's V-B side output (`_vb8w`). Same e4m3 operands and K order
+        as the context MXF8 GEMM those rows took before (`_mxf8_takes`): bitwise its output,
+        without the act-quant launch, the weight streamed before the PDL wait.
+        TRTLLM_GLM52_WIDE_OPROJ_DEC8=0 keeps those rows on the context MXF8 GEMM."""
         self._dec8: dict = {}
         self._vb8: dict = {}
+        self._dec8w: dict = {}
+        self._vb8w: dict = {}
         trunk = range(self.num_layers)
         if "o_proj" in self._proj_mxf8:
             runner = _try_build(
@@ -758,6 +858,25 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     self._vb8 = {}
                     break
                 self._vb8.update(dict.fromkeys(vb8.rows, vb8))
+        if (
+            "o_proj" in self._dec8
+            and self.max_draft_len > 1
+            and os.environ.get("TRTLLM_GLM52_WIDE_OPROJ_DEC8", "1") == "1"
+        ):
+            runner = _try_build(
+                "wide decode MXF8 o_proj",
+                lambda: _dec8_op.build_wide("o_proj", self._attn[0].o8),
+            )
+            if runner is not None:
+                self._dec8w["o_proj"] = runner
+                vb8 = _try_build(
+                    "MTP V-B with the wide o_proj's MXF8 operand",
+                    lambda: _absorbed_bmm_op.build_v_b_mxf8_side(
+                        _absorbed_bmm_op.MTP_GROUPS[0], dev, runner.operand
+                    ),
+                )
+                if vb8 is not None:
+                    self._vb8w = dict.fromkeys(vb8.rows, vb8)
 
     def _build_context_mha(self, dev) -> None:
         """The non-absorbed context attention of dense-causal steps: the causal varlen MHA,
@@ -1209,6 +1328,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 m: _projection_op.with_eager_twin(r, qb_w) if m <= _DECODE_MAX_ROWS else r
                 for m, r in self._proj["q_b"].items()
             }
+        # MTP3 / MTP5: the decode cells above 64 rows, taken on `_wide_decode` steps only (a
+        # context step of the same row count keeps the paths below); empty for one draft token.
+        wide = self.max_draft_len > 1
+        self._proj_mtp = {
+            name: _projection_op.build_all(name, w_colmajor.t(), _projection_op.MTP_ROWS[name])
+            for name, w_colmajor in proj_weights.items()
+            if wide and _projection_op.MTP_ROWS[name]
+        }
         if self.mtp_enabled:
             proj_weights["mtp_eh"] = self._mtp["eh"]
         self._proj_pre = _projection_op.build_prefill_all(
@@ -1236,6 +1363,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._shared_gu_swiglu = _shared_gu_swiglu_op.build_all(
             self._shared_gu_il[self.dense_layers]
         )
+        self._shared_gu_swiglu_mtp = (
+            _shared_gu_swiglu_op.build_all(
+                self._shared_gu_il[self.dense_layers], _shared_gu_swiglu_op.MTP_ROWS
+            )
+            if wide
+            else {}
+        )
         self._embedding = build_embedding(self.w["embed"])
         # One compiled object per row-count group serves (2, 4, 8) or (16, 32, 48, 64); the
         # prefill kernel every other row count up to 8192, the 1..63 generation rows of a
@@ -1248,6 +1382,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._absorb_pre = {
             kind: _absorbed_bmm_op.build_prefill(kind, dev) for kind in self._absorb
         }
+        # The MTP3 / MTP5 decode row counts (128, 192), plain bf16 cells, `_wide_decode` only.
+        self._absorb_mtp: dict[str, dict] = {"k_b": {}, "v_b": {}}
+        for kind, runners in self._absorb_mtp.items():
+            for group in _absorbed_bmm_op.MTP_GROUPS if wide else ():
+                runner = _absorbed_bmm_op.build(kind, group, dev)
+                runners.update(dict.fromkeys(runner.rows, runner))
         # The context step's K-B with the e4m3 q-base epilogue: on the context rope kernel's
         # path it writes the FMHA's fp8 query bytes itself. None keeps the bf16 K-B there.
         self._kb_fp8_pre = _try_build(
@@ -1265,7 +1405,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 self._kb8 = {}
                 break
             self._kb8.update(dict.fromkeys(runner.rows, runner))
+        # The same at the MTP3 / MTP5 decode rows (128 / 192, and the rows between on the next
+        # one up), `_wide_decode` only: the rope kernel of widths 4 / 6 then runs beside it.
+        self._kb8_mtp = {}
+        for group in _absorbed_bmm_op.MTP_GROUPS if wide and self._kb8 else ():
+            runner = _try_build(
+                f"decode fp8 q-base K-B {group}",
+                lambda group=group: _absorbed_bmm_op.build_decode_fp8_q_base(group, dev),
+            )
+            if runner is not None:
+                self._kb8_mtp.update(dict.fromkeys(runner.rows, runner))
         self._ix_pre_split = _ix_pre_split_op.compile_all(dev)
+        self._ix_pre_split_mtp = (
+            _ix_pre_split_op.compile_all(dev, _ix_pre_split_op.MTP_ROWS) if wide else {}
+        )
+        # The same kernel on a symbolic row count, for the decode row counts in 65..191
+        # without a handle above (`_indexer_project`). None keeps them on the prefill split.
+        self._ix_pre_split_rag = (
+            _try_build("indexer split at runtime M", lambda: _ix_pre_split_op.compile_ragged(dev))
+            if wide
+            else None
+        )
+        # Runners re-pinned from the cells built above, if a load ran before (`_wide_cell`).
+        self._wide_rag = {}
         # The same split at the context row counts, on the prefill GEMM against the decode
         # handles' bf16 weight; every indexer layer shares it. None keeps the fp32 projection.
         try:
@@ -1293,9 +1455,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._ix_topk_pre_compiled = build_ix_topk_prefill(
             dev, top_k=self.idx_topk, max_columns=_MOE_MAX_T
         )
-        # The MLA rope kernel is keyed by the block-table width, an engine value: built per
-        # width in `_derive_first_step` (the trunk's) and at the first eager use of another.
-        self._mla_rope_compiled: dict[int, _mla_rope_op.CompiledMlaRopeGeneration] = {}
+        # The MLA rope kernel is keyed by the block-table width, an engine value, and the MTP
+        # width: built per pair in `_derive_first_step` (the trunk's) and at the first eager use
+        # of another.
+        self._mla_rope_compiled: dict[tuple[int, int], _mla_rope_op.CompiledMlaRopeGeneration] = {}
         # The context kernel in both modes and its two scale arrays, built here because a
         # first compile inside a CUDA-graph capture is a broken graph.
         self._fmha_pre_compiled = _fmha_pre_op.compile(device_index=dev)
@@ -1327,9 +1490,16 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )
         self._build_moe(dev)
         # The peer buffers are sized for the whole token budget, so every collective shares
-        # one workspace.
+        # one workspace. `wide`: MTP3 / MTP5 decode steps (above 64 rows) open their MoE
+        # layers on the two-shot build of the AR + norm + NVFP4 (`QUANT_TWOSHOT_ABOVE`); an
+        # MTP1 or non-speculative engine builds and runs exactly what it did.
         self._lamport = build_lamport_workspace(
-            self.w["embed"].shape[1], self.eps, _MOE_MAX_T, self.tp_rank, self.tp_size
+            self.w["embed"].shape[1],
+            self.eps,
+            _MOE_MAX_T,
+            self.tp_rank,
+            self.tp_size,
+            wide=self.max_draft_len > 1,
         )
         # The row ops the fused kernels leave over: layer 0's input norm, the MTP module's
         # norms and output adds, the logits rows' lookup, the forward's copies, routing and
@@ -1338,6 +1508,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._rows = SimpleNamespace(
             norm=_try_build("hidden RMSNorm", _hidden_norm_op.compile),
             add=_try_build("hidden add", _hidden_add_op.compile),
+            # The MTP module's residual add + head norm in one launch (`_add_rmsnorm`): only an
+            # engine drafting more than one token returns the module's output normed.
+            add_norm=(
+                _try_build("hidden add + RMSNorm", _hidden_add_norm_op.compile)
+                if self.max_draft_len > 1
+                else None
+            ),
             gather=_try_build("hidden row gather", _row_gather_op.compile),
             topk=_try_build("sigmoid top-k", _topk_rows_op.compile),
             swiglu=_try_build("SwiGLU rows", _swiglu_rows_op.compile),
@@ -1425,6 +1602,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             ns.c = _moe_experts_op.allocate_decode_c(rows, inter, dev)
             ns.sfc = _moe_experts_op.allocate_sfc(rows, inter, dev, self.ctx_replicas)
             ns.router_x = torch.zeros((_DECODE_MAX_ROWS, hidden), **bf16)
+            if self.max_draft_len > 1:
+                # The wide decode router's `[rows, 4, 256]` partials (MTP3 / MTP5 only).
+                ns.router_wide_out = torch.zeros(
+                    _moe_router_op.output_shape(_moe_router_op.WIDE_MAX_ROWS, wide=True), **f32
+                )
             ns.logits = torch.zeros((rows, 1, self.num_experts), **f32)
             ns.topk_scratch = _moe_topk_op.allocate_prefill_scratch(dev)
             if self.ctx_replicas:
@@ -1558,6 +1740,27 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 for i, ids in self.dec_hot.items()
             }
             self._dec_hot_none = torch.full((self.dec_replicas,), -1, dtype=torch.int32, device=dev)
+        # The MTP3 / MTP5 decode widths' front end (`_moe_decode_exact`, 65..256 rows): the
+        # wide decode router's split-K partials, and the fused top-k summing them, one handle
+        # per row range, writing the L2 prefetch's counts. MTP1 and no speculation build
+        # neither. The partials need the wide top-k: without it the router is dropped too
+        # (the prefill router and top-k serve those steps); without the router the top-k
+        # reads the prefill router's one plane.
+        k.router_wide = None
+        k.topk_wide = {}
+        if self.max_draft_len > 1 and k.topk_pre is not None:
+            k.router_wide = optional(lambda: _moe_router_op.build_wide(dev))
+            splits = _moe_router_op.SPLIT_K if k.router_wide is not None else 1
+            wide = optional(
+                lambda: {
+                    r: _moe_topk_op.build_wide(r[1], splits, dev, expert_hist=self._pf is not None)
+                    for r in _moe_topk_op.WIDE_RANGES
+                }
+            )
+            if wide is None:
+                k.router_wide = None
+            k.topk_wide = wide or {}
+        self._build_moe_wide_rep(k, dev)
         # Shared with the MTP layer's front end: the same compiled kernel per row count.
         k.router = _moe_router_op.build_all(dev)
         self._moe_k = k
@@ -1592,8 +1795,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         One host-side integer read and nothing else: a decode-only CUDA graph is a
         per-capture constant environment. A mixed batch goes to prefill, so prefill is the
         general case and decode the specialization that may assume it has no context rows.
+        The phase is also recorded for the projections (`_wide_decode`): with more than one
+        draft token a decode step's rows reach 32 x (max_draft_len + 1), past the 64 rows
+        that otherwise tell a decode row count from a context one.
         """
-        return self._decode if attn_metadata.num_contexts == 0 else self._prefill
+        decode = attn_metadata.num_contexts == 0
+        self._wide_decode = decode and self.max_draft_len > 1
+        return self._decode if decode else self._prefill
 
     def forward(
         self,
@@ -1661,8 +1869,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # a replay whose sequences outgrew a batch maximum would read unwritten columns.
         self._max_ctx_len = md.max_seq_len
         # A width with no handle takes the trtllm op: max_seq_len <= index_topk, or a failed build.
+        # The 1-row steps, MTP1's 2, and MTP3 / MTP5's max_draft_len + 1.
         self._ix_topk_dec_compiled = {}
-        for next_n in (1, _MLA_ROPE_MTP_WIDTH):
+        for next_n in (1, *self.mtp_widths):
             try:
                 self._ix_topk_dec_compiled[next_n] = build_ix_topk_decode(
                     dev, max_columns=md.max_seq_len, top_k=self.idx_topk, next_n=next_n
@@ -1673,7 +1882,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     f"({e}); using the trtllm op"
                 )
         if self.mtp_enabled:
-            self._mla_rope_handle(int(md.kv_cache_block_offsets.shape[-1]), dev)
+            # MTP3 / MTP5 also width 1: the MTP layer's 1-token draft steps
+            # (`_mtp_rope_specialised`). A separate draft pool's block-table width compiles at
+            # the first eager draft step, as width max_draft_len + 1 does.
+            for p in self.mtp_widths + ((1,) if self.max_draft_len > 1 else ()):
+                self._mla_rope_handle(int(md.kv_cache_block_offsets.shape[-1]), dev, p)
         # The context rope/append kernel is keyed by the page size. None keeps the stock op.
         try:
             self._ctx_rope_compiled = _ctx_rope_op.compile(
@@ -1706,9 +1919,34 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # both index kinds. `max_num_requests` is the engine's max_batch_size, in every
         # metadata it hands over (a CUDA-graph copy keeps it): no step schedules more
         # sequences, and a CUDA-graph batch is padded only up to a captured size no larger.
+        # Its grid holds the kernel's default 2 query rows per sequence (MTP1, and the 1-row
+        # steps). MTP3 / MTP5 add a second grid for max_draft_len + 1 rows (4 / 6), used only by
+        # steps that wide: the split-K pick divides the SMs by sequences x grid width, so a
+        # 1-row draft step on the wide grid would take fewer split-K CTAs per sequence (at 32
+        # sequences one where the width-2 grid takes two) and leave 3 or 5 of every 4 / 6 query
+        # CTAs idle. The variants are keyed by split and reducer only, so most are shared.
         self._fmha_dec_compiled = _fmha_dec_op.compile(
             max_batch_size=int(md.max_num_requests), device_index=dev
         )
+        if self.max_draft_len > 1:
+            self._fmha_dec_wide = _fmha_dec_op.compile(
+                max_batch_size=int(md.max_num_requests),
+                device_index=dev,
+                max_sq=self.max_draft_len + 1,
+            )
+            # The trunk's pure decode steps at that width read the indexer's positions
+            # directly (one gather of a pool row per group of rows that selected it); the MTP
+            # layer and mixed steps keep the per-row handle above.
+            if (
+                self._union_on
+                and self.max_draft_len + 1 in _fmha_dec_op.UNION_ROWS_PER_GROUP
+                and int(md.tokens_per_block) == _fmha_dec_op.LAYER_ROW_STRIDE
+            ):
+                self._fmha_union = _fmha_dec_op.compile_union(
+                    max_batch_size=int(md.max_num_requests),
+                    device_index=dev,
+                    max_sq=self.max_draft_len + 1,
+                )
         self._derive_pending = False
         self._derived_for = md.kv_cache_manager
 
@@ -1750,6 +1988,22 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return cute_dsl_hidden_add(a, b, rows.add)
         return torch.add(a, b)
 
+    def _add_rmsnorm(self, a, b, weight):
+        """`_rmsnorm(_add(a, b), weight)`; the sum is not kept. One CuTe DSL launch where its
+        kernel built and the two calls would both take their CuTe DSL kernels (the pair it
+        is bit for bit), else the two calls."""
+        rows = self._rows
+        hit = (
+            rows.add_norm is not None
+            and rows.add is not None
+            and rows.norm is not None
+            and _hidden_add_norm_op.takes(a, b, weight)
+        )
+        self._count("hidden_add_norm", hit)
+        if hit:
+            return cute_dsl_hidden_add_rmsnorm(a, b, weight, self.eps, rows.add_norm)
+        return self._rmsnorm(self._add(a, b), weight)
+
     def _copy_into(self, dst, src):
         """`dst.copy_(src)`: the CuTe DSL copy/convert kernel for the pairs it takes."""
         rows = self._rows
@@ -1786,32 +2040,62 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             logger.warning("modeling_v2 GLM-5.2: lm_head not on the gathered fast path")
             return
         self._lm_head = lm_head
-        self._lm_head_runners = _projection_op.build_all("lm_head", w)
+        # MTP3 / MTP5 add their decode row counts with a schedule of their own (MTP5's 192).
+        rows = _projection_op.ROWS["lm_head"] + (
+            _projection_op.MTP_ROWS["lm_head"] if self.max_draft_len > 1 else ()
+        )
+        self._lm_head_runners = _projection_op.build_all("lm_head", w, rows)
         if self.tp_rank == 0:
             logger.info(
                 f"modeling_v2 GLM-5.2 lm_head: {len(self._lm_head_runners)} of "
-                f"{len(_projection_op.ROWS['lm_head'])} row counts on the CuTe DSL GEMM"
+                f"{len(rows)} row counts on the CuTe DSL GEMM"
             )
 
     def logits(self, x, lm_head, logits_processor, attn_metadata):
         """Full-vocabulary fp32 logits for the hidden rows `x`, every one of them (what
         `LogitsProcessor.forward` returns with `return_context_logits=True`): the local
         GEMM on its CuTe DSL kernel, then one Lamport launch that gathers the four shards
-        and widens them. Any other head, row count or layout keeps `logits_processor`."""
+        and widens them. Any other head, row count or layout keeps `logits_processor`.
+
+        MTP3 / MTP5 only: a count of 65..255 rows without its own schedule (mixed steps,
+        and decode steps of fewer than 32 sequences; MTP5's 192 verify rows have one) runs
+        on the next compiled bucket (128, 192 or 256): that instance launched at the exact
+        rows (`_projection_op.at_rows`), each row bitwise what the padded launch wrote for
+        it; with `_wide_bucket` off (or a bucket compiled for one M), on zero rows past
+        `rows`, returning the first `rows`. MTP1 keeps the path above."""
         rows = int(x.shape[0])
         runner = self._lm_head_runners.get(rows) if lm_head is self._lm_head else None
+        padded = rows
+        if runner is None and lm_head is self._lm_head and self.max_draft_len > 1 and rows < 256:
+            padded = min((m for m in self._lm_head_runners if m > rows), default=rows)
+            runner = self._lm_head_runners.get(padded) if padded <= 256 else None
+            if runner is not None and self._wide_bucket:
+                key = ("lm_head", rows)
+                if key not in self._wide_rag:
+                    self._wide_rag[key] = _projection_op.at_rows(runner, rows)
+                if self._wide_rag[key] is not None:
+                    runner, padded = self._wide_rag[key], rows
+                    self._count("logits_at_rows", True)
         if (
             runner is not None
             and x.dtype is torch.bfloat16
             and x.is_contiguous()
             and x.data_ptr() % 128 == 0
-            and rows * _allgather_op.SHARD_N <= self._lamport.max_rows * self._lamport.hidden
+            and padded * _allgather_op.SHARD_N <= self._lamport.max_rows * self._lamport.hidden
         ):
             self._count("logits", True)
-            local = torch.empty([rows, runner.n], dtype=torch.bfloat16, device=x.device)
+            if padded != rows:
+                self._count("logits_pad", True)
+                xp = torch.zeros([padded, x.shape[1]], dtype=x.dtype, device=x.device)
+                xp[:rows].copy_(x)
+                x = xp
+            local = torch.empty([padded, runner.n], dtype=torch.bfloat16, device=x.device)
             cute_dsl_projection(x, lm_head.weight, local, runner)
-            out = torch.empty([rows, self.tp_size * runner.n], dtype=torch.float32, device=x.device)
-            return cute_dsl_allgather_widen(local, out, self._lamport)
+            out = torch.empty(
+                [padded, self.tp_size * runner.n], dtype=torch.float32, device=x.device
+            )
+            out = cute_dsl_allgather_widen(local, out, self._lamport)
+            return out if padded == rows else out[:rows]
         self._count("logits", False)
         return logits_processor.forward(x, lm_head, attn_metadata, True)
 
@@ -1863,18 +2147,63 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             and x.data_ptr() % 16 == 0
         )
 
-    def _mxf8_takes(self, name: str, x, w8) -> bool:
-        """Whether `_project` sends `x` to the MXF8 GEMM: its runner built, `w8` given, a
-        context row count, and an activation the quant kernel reads."""
+    def _dec8w_takes(self, name: str, x, wd8) -> bool:
+        """Whether `_project` sends `x` to the wide decode MXF8 GEMM: a `_wide_decode` step's
+        rows above 64 (up to 192) of a call whose decode path is the decode MXF8 GEMM (`wd8`:
+        the trunk o_proj), its wide runner built, and an activation its quant reads."""
         return (
-            name in self._proj_mxf8
-            and w8 is not None
-            and int(x.shape[0]) > _DECODE_MAX_ROWS
+            self._wide_decode
+            and wd8 is not None
+            and name in self._dec8w
+            and _DECODE_MAX_ROWS < int(x.shape[0]) <= _dec8_op.WIDE_ROWS[1]
             and x.dtype == torch.bfloat16
             and x.stride(-1) == 1
             and x.stride(0) % 8 == 0
             and x.data_ptr() % 16 == 0
         )
+
+    def _mxf8_takes(self, name: str, x, w8, wd8=None) -> bool:
+        """Whether `_project` sends `x` to the MXF8 GEMM: its runner built, `w8` given, a
+        row count above the decode cells', and an activation the quant kernel reads. On a
+        `_wide_decode` step only where the call's decode path is MXF8 as well (`wd8` and its
+        decode runner: the trunk o_proj) and its wide decode GEMM (`_dec8w_takes`) did not
+        build, so decode rows keep that path's numerics -- the same e4m3 operands, block
+        scales and K order (B300: the two GEMMs' outputs are bitwise equal at 64 rows)."""
+        return (
+            name in self._proj_mxf8
+            and w8 is not None
+            and int(x.shape[0]) > _DECODE_MAX_ROWS
+            and (not self._wide_decode or (wd8 is not None and name in self._dec8))
+            and x.dtype == torch.bfloat16
+            and x.stride(-1) == 1
+            and x.stride(0) % 8 == 0
+            and x.data_ptr() % 16 == 0
+        )
+
+    def _wide_cell(self, call: str, cells: dict, rows: int, at_rows=None):
+        """The MTP decode cell for `rows` (above 64) of a `_wide_decode` step: the cell built
+        at `rows` (128 / 192), else the smallest cell above `rows` launched on the exact rows
+        -- a batch of fewer than 32 sequences (96 / 144 rows at 24 requests, any count in
+        65..191 eagerly). A row's output is then bitwise that cell's for it: the cells are
+        compiled on dynamic layouts, so the tiles past the last row load zeros and store
+        nothing; no padding, no copy. `at_rows(cell, rows)` re-pins a runner pinned to its
+        own count (None: the cell's runner takes any count up to its own). Returns None (the
+        call's bf16 fallback runs) when no cell is above `rows`, or with `_wide_bucket` off.
+        The re-pinned runner is kept per (`call`, rows): built in the forward, it compiles
+        nothing, so a first one inside a CUDA-graph capture is safe."""
+        cell = cells.get(rows)
+        if cell is not None or not self._wide_bucket:
+            return cell
+        key = (call, rows)
+        if key not in self._wide_rag:
+            bucket = min((m for m in cells if m > rows), default=None)
+            cell = None
+            if bucket is not None:
+                cell = cells[bucket] if at_rows is None else at_rows(cells[bucket], rows)
+            self._wide_rag[key] = cell
+        cell = self._wide_rag[key]
+        self._count("dec_wide_rows", cell is not None)
+        return cell
 
     def _project(
         self,
@@ -1897,20 +2226,27 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         producer: the GEMM then skips its activation quant. A caller passes it only where
         `_mxf8_takes` holds (o_proj's bf16 context rows are not written when it does). `wd8`
         is the layer's decode MXF8 weight (q_b / o_proj): decode rows take the decode MXF8
-        GEMM; `dec_pre` says its producer wrote the operand (`_dec8_takes` must hold)."""
+        GEMM; `dec_pre` says its producer wrote the operand (`_dec8_takes` or `_dec8w_takes`
+        must hold). On a `_wide_decode` step, rows above 64 keep the numerics of the call's
+        decode path: where that is the decode MXF8 GEMM, the wide decode MXF8 GEMM
+        (`_dec8w_takes`) or the context MXF8 GEMM (`_mxf8_takes`), bitwise the same output;
+        else the projection's MTP decode cell at its row count or the next one up
+        (`_wide_cell`), else the bf16 prefill GEMM (or cuBLAS)."""
         rows = int(x.shape[0])
+        wide8 = self._dec8w_takes(name, x, wd8)
         if (
-            self._dec8_takes(name, x, wd8)
+            (wide8 or self._dec8_takes(name, x, wd8))
             and out_dtype in (None, torch.bfloat16)
             and (out is None or (out.dtype == torch.bfloat16 and out.is_contiguous()))
         ):
-            runner = self._dec8[name]
+            runner = self._dec8w[name] if wide8 else self._dec8[name]
             if out is None:
                 out = torch.empty([rows, runner.n], dtype=torch.bfloat16, device=x.device)
-            self._count("dec_proj_mxf8_pre" if dec_pre else "dec_proj_mxf8", True)
+            tag = "dec_proj_mxf8w" if wide8 else "dec_proj_mxf8"
+            self._count(f"{tag}_pre" if dec_pre else tag, True)
             return cute_dsl_projection_mxf8_decode(x, wd8, out, runner, pre=dec_pre)
         assert not dec_pre, f"{name}: a producer's decode operand reached another path"
-        if self._mxf8_takes(name, x, w8) and (
+        if self._mxf8_takes(name, x, w8, wd8) and (
             out_dtype in (None, torch.bfloat16)
             and (out is None or (out.dtype == torch.bfloat16 and out.is_contiguous()))
         ):
@@ -1923,6 +2259,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return cute_dsl_projection_mxf8(x, w8, out, mx, pre=pre)
         assert pre is None, f"{name}: a producer's MXF8 operand reached a non-MXF8 path"
         runner = self._proj.get(name, {}).get(rows)
+        if self._wide_decode and rows > _DECODE_MAX_ROWS:
+            runner = self._wide_cell(
+                f"proj:{name}", self._proj_mtp.get(name, {}), rows, _projection_op.at_rows
+            )
+            self._count("dec_wide", runner is not None)
         prefill = self._proj_pre.get(name)
         if (
             runner is None
@@ -1945,10 +2286,14 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
 
     def _absorbed_bmm(self, kind: str, x_t, w_kn, w_nk, out_t) -> None:
         """An absorbed-MLA BMM ("k_b" or "v_b") into `out_t`: the decode kernel at its row
-        counts (2..64), the prefill kernel at any other up to 8192, else `bmm_out`, which takes
-        the `[H, K, N]` operand instead of `[H, N, K]`."""
+        counts (2..64, and 65..192 on a `_wide_decode` step: the 128 / 192 cells' object,
+        which launches at any of them), the prefill kernel at any other up to 8192, else
+        `bmm_out`, which takes the `[H, K, N]` operand instead of `[H, N, K]`."""
         rows = int(x_t.shape[1])
         runner = self._absorb[kind].get(rows)
+        if self._wide_decode and rows > _DECODE_MAX_ROWS:
+            runner = self._wide_cell(kind, self._absorb_mtp[kind], rows)
+            self._count("dec_wide", runner is not None)
         if runner is None and rows <= _absorbed_bmm_op.PREFILL_MAX_ROWS:
             runner = self._absorb_pre[kind]
         if runner is None:
@@ -1996,11 +2341,22 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return out, x8
         return self._reduce_norm(partial, residual, weight), None
 
-    def _reduce_norm_quant(self, partial, residual, weight, g1, rows):
-        """`_reduce_norm`, plus the routed experts' NVFP4 input when the MoE would quantize
-        on its own kernel (a decode width): into the layer's `xq` / `xsf`, exactly the rows
-        it would quantize. Returns `(out, prequantized)`."""
-        if rows > _DECODE_MAX_ROWS:
+    def _moe_prequant(self, rows: int, exact: bool) -> bool:
+        """Whether a trunk MoE layer's pre-MoE collective also writes the routed experts'
+        NVFP4 input (`_reduce_norm_quant`): at a decode width (1..64 rows), and on a wide
+        decode step that runs the routed experts on its exact rows (`exact`, see
+        `_moe_decode_exact`: MTP3 / MTP5 only) up to `_MOE_PREQUANT_WIDE_MAX`. There the
+        routed experts then skip their stage copy and quantize: the collective's bytes are
+        their quantize's bit for bit. Every other row count -- context steps, and MTP1 and
+        no speculation, whose decode steps stay within 64 rows -- keeps the plain collective
+        and the routed experts' own quantize."""
+        return rows <= _DECODE_MAX_ROWS or (exact and rows <= _MOE_PREQUANT_WIDE_MAX)
+
+    def _reduce_norm_quant(self, partial, residual, weight, g1, rows, exact=False):
+        """`_reduce_norm`, plus the routed experts' NVFP4 input where `_moe_prequant` says
+        the collective writes it: into the layer's `xq` / `xsf`, exactly the rows the routed
+        experts would quantize. Returns `(out, prequantized)`."""
+        if not self._moe_prequant(rows, exact):
             return self._reduce_norm(partial, residual, weight), False
         self._check_rows(partial)
         xq, xsf = self._moe_xq[:rows], self._moe_xsf[:rows]
@@ -2010,13 +2366,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )
         return out, True
 
-    def _mla_rope_handle(self, width: int, dev: int) -> "_mla_rope_op.CompiledMlaRopeGeneration":
-        """The MLA rope kernels for a block table `width` columns wide. The operand layout is
-        this target's: `q_pe` the rope half of the `[T, heads, qk_dim]` q_b output, the latent
-        the tail of the `[T, q_lora + lat_dim]` kv_a output. A width not seen yet compiles
-        here, which is the first eager forward that uses it (the trunk's is built in
-        `_derive_first_step`)."""
-        handle = self._mla_rope_compiled.get(width)
+    def _mla_rope_handle(
+        self, width: int, dev: int, p: int = _MLA_ROPE_MTP_WIDTH
+    ) -> "_mla_rope_op.CompiledMlaRopeGeneration":
+        """The MLA rope kernels for a block table `width` columns wide and `p` new tokens per
+        sequence (one of `mtp_widths`, or 1 for MTP3 / MTP5's 1-token draft steps,
+        `_mtp_rope_specialised`). The operand layout is this target's: `q_pe` the rope
+        half of the `[T, heads, qk_dim]` q_b output, the latent the tail of the
+        `[T, q_lora + lat_dim]` kv_a output. A pair not seen yet compiles here, which is the
+        first eager forward that uses it (the trunk's are built in `_derive_first_step`).
+        Both q-base variants are built: a step whose rows a decode K-B cell serves (2..64)
+        takes the q-base from that GEMM, any wider one (MTP3 / MTP5's 128 / 192 rows: the
+        prefill K-B) has the rope kernel emit it."""
+        handle = self._mla_rope_compiled.get((width, p))
         if handle is None:
             handle = _mla_rope_op.compile(
                 max_blocks_per_seq=width,
@@ -2024,10 +2386,21 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 q_pe_token_stride=self.heads * self.qk_dim,
                 latent_row_stride=self.q_lora + self.lat_dim,
                 device_index=dev,
+                predicted_tokens_per_seq=p,
                 q_base_from_kb=bool(self._kb8),
             )
-            self._mla_rope_compiled[width] = handle
+            self._mla_rope_compiled[(width, p)] = handle
         return handle
+
+    def _mtp_rope_specialised(self, gen_p: int) -> bool:
+        """Whether the MTP layer's decode rows of `gen_p` per sequence take the specialised
+        MLA rope kernel (`_attn_gen`): at `mtp_widths`, as the trunk; and on an engine
+        drafting more than one token also on its 1-token draft steps (draft steps
+        1..max_draft_len-1, `gen_p` 1), where the stock op needed the strided latent packed
+        first (a `[rows, 576]` copy per draft step). The kernel writes the same bytes as the
+        stock op there (query, latent row, prefix arrays, scheduler counter, FMHA scales);
+        the K-B then takes its decode fp8 q-base cell, as at MTP1's width 2."""
+        return gen_p in self.mtp_widths or (gen_p == 1 and self.max_draft_len > 1)
 
     def _qkv(self, x, a, q_b: bool = True, x8=None, q8_rows: int = 0, q_store_from: int = 0):
         """`(q, q_a, latent, q8)`. The kv norm writes in place, so the latent `[ckv | k_pe]` is
@@ -2142,6 +2515,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         hi, di = self.idx_heads, self.idx_dim
         dev = x.device
         split = self._ix_pre_split.get(rows)
+        if self._wide_decode and rows > _DECODE_MAX_ROWS:
+            # Rows without a handle of their own take the runtime-M handle (the same kernel).
+            rag = self._ix_pre_split_rag
+            if rag is not None and rows > rag.max_m:
+                rag = None
+            split = self._wide_cell("ix_split", self._ix_pre_split_mtp, rows, lambda h, r: rag)
+            self._count("dec_wide", split is not None)
         pre = self._ix_pre_split_pre
         if (
             split is None
@@ -2203,22 +2583,56 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._idx_k_checked = True
 
     def _indexer_decode(
-        self, md, k_pool, q_fp8, weights, topk_buf, ctx: int, seqs: int, gen_p: int
+        self,
+        md,
+        k_pool,
+        q_fp8,
+        weights,
+        topk_buf,
+        ctx: int,
+        seqs: int,
+        gen_p: int,
+        split_memo: dict | None = None,
     ):
         """Score the generation rows against the paged K cache and select `index_topk`.
-        `ctx` is the number of context sequences ahead of them in the batch."""
+        `ctx` is the number of context sequences ahead of them in the batch. `split_memo`
+        holds the MTP5 atom split's metadata across one step's indexer layers (per call
+        without it)."""
         # Cached plus all `gen_p` of this step's tokens; both consumers take the same vector,
         # which keeps the selector's causal bound inside the columns the scorer wrote.
         kv_lens = md.kv_lens_cuda_runtime[ctx : ctx + seqs]
-        logits = cute_dsl_fp8_paged_mqa_logits(
-            torch.reshape(q_fp8, [seqs, gen_p, self.idx_heads, self.idx_dim]),
-            k_pool,
-            weights,
-            kv_lens,
-            md.indexer_k_cache_block_offsets[ctx : ctx + seqs],
-            md.scheduler_metadata_buffer,
-            self._max_ctx_len,
-        )
+        atom = _MQA_ATOM_SPLIT.get(gen_p)
+        if atom is None:
+            logits = cute_dsl_fp8_paged_mqa_logits(
+                torch.reshape(q_fp8, [seqs, gen_p, self.idx_heads, self.idx_dim]),
+                k_pool,
+                weights,
+                kv_lens,
+                md.indexer_k_cache_block_offsets[ctx : ctx + seqs],
+                md.scheduler_metadata_buffer,
+                self._max_ctx_len,
+            )
+        else:
+            # MTP5's 6 rows of a sequence as two pseudo-sequences of 3 (the kernel spills at
+            # 6): the same logits rows, bit for bit. Lengths, table and schedule depend only
+            # on the step, so one build serves every indexer layer of the step.
+            factor = gen_p // atom
+            key = (ctx, seqs, gen_p)
+            meta = None if split_memo is None else split_memo.get(key)
+            if meta is None:
+                meta = cute_dsl_fp8_paged_mqa_logits.split_metadata(
+                    kv_lens, md.indexer_k_cache_block_offsets[ctx : ctx + seqs], factor
+                )
+                if split_memo is not None:
+                    split_memo[key] = meta
+            self._count("mqa_atom_split", True)
+            logits = cute_dsl_fp8_paged_mqa_logits(
+                torch.reshape(q_fp8, [seqs * factor, atom, self.idx_heads, self.idx_dim]),
+                k_pool,
+                weights,
+                *meta,
+                self._max_ctx_len,
+            )
         compiled = self._ix_topk_dec_compiled.get(gen_p)
         if compiled is None:
             indexer_topk_decode(
@@ -2229,6 +2643,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             cute_dsl_indexer_topk_decode(
                 logits, kv_lens, topk_buf, top_k=self.idx_topk, next_n=gen_p, compiled=compiled
             )
+
+    def _fmha_dec_handle(self, gen_p: int) -> "_fmha_dec_op.CompiledSparseMlaDecode":
+        """The decode attention's handle for `gen_p` rows per sequence: the width-2 grid up to
+        2 (MTP1, no speculation, MTP3 / MTP5's 1-row draft steps), the MTP3 / MTP5 grid above."""
+        if gen_p <= self._fmha_dec_compiled.max_sq:
+            return self._fmha_dec_compiled
+        return self._fmha_dec_wide
 
     def _attn_gen(
         self,
@@ -2248,9 +2669,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         o8_side: bool = False,
     ) -> bool:
         """Sparse MLA over the generation rows, absorbed form, into `out`. With `o8_side`
-        (a pure decode step whose o_proj takes the decode MXF8 GEMM next) the V-B GEMM also
-        writes `out` as that GEMM's operand where a side-output cell serves the row count;
-        returns whether it did."""
+        (a pure decode step whose o_proj takes the decode MXF8 GEMM next, or the wide one
+        above 64 rows) the V-B GEMM also writes `out` as that GEMM's operand where a
+        side-output cell serves the row count (above 64: where `_wide_cell` gives the plain
+        MTP cell, so the bf16 `out` is that cell's); returns whether it did."""
         heads, dev, dt = self.heads, q.device, q.dtype
         q_nope, q_pe = torch.split(
             torch.reshape(q, [gen, heads, self.qk_dim]), [self.nope, self.rope_dim], -1
@@ -2263,6 +2685,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # once: the rope skips the q-base and waits for the K-B only at its end, so the two
         # run concurrently and the decode MLA's wait on the rope still covers the K-B.
         kb8 = self._kb8.get(gen) if specialised_rope else None
+        if specialised_rope and self._wide_decode and gen > _DECODE_MAX_ROWS and self._kb8_mtp:
+            # MTP3 / MTP5 decode rows: the MTP cells' fp8 q-base K-B, at its cell or on the
+            # next one up at the exact rows (the rope handles of widths 4 / 6 carry the
+            # `q_base_from_kb` variants whenever the decode K-B built).
+            kb8 = self._wide_cell("k_b_fp8", self._kb8_mtp, gen)
         if kb8 is not None:
             q_base = torch.split(quant_q.view(torch.uint8), [self.kv_lora, self.rope_dim], -1)[0]
             cute_dsl_absorbed_bmm(
@@ -2286,6 +2713,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         bmm2 = torch.empty([1], dtype=torch.float32, device=dev)
         rope = self._rope
         if specialised_rope:
+            if gen_p == 1:
+                self._count("mla_rope_draft1", True)
+            elif gen_p != _MLA_ROPE_MTP_WIDTH:
+                self._count("mla_rope_wide", True)
             # The specialised kernel takes the stock op's earlier positional ABI.
             cute_dsl_mla_rope_generation(
                 fused_q, q_pe, latent, rope["rotary_cos_sin"], cu_q, cu_kv, counter, bmm1, bmm2,
@@ -2294,7 +2725,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 md.host_kv_cache_pool_mapping, None, None, None, None, [None, None], gen_p, layer,
                 heads, 1, self.lat_dim, md.tokens_per_block, md.max_seq_len, 1, self.quant_mode,
                 1.0, self.q_lora, self.kv_lora, self.nope, self.rope_dim, self.kv_lora, True,
-                compiled=self._mla_rope_handle(int(md.kv_cache_block_offsets.shape[-1]), dev.index),
+                compiled=self._mla_rope_handle(
+                    int(md.kv_cache_block_offsets.shape[-1]), dev.index, gen_p
+                ),
                 q_base_from_kb=kb8 is not None,
             )  # fmt: skip
         else:
@@ -2343,22 +2776,45 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             )
         lat_out = torch.empty([gen, heads * self.kv_lora], dtype=dt, device=dev)
         seqs = gen // gen_p
-        cute_dsl_sparse_mla_decode(
-            quant_q,
-            md.kv_cache_manager.get_unique_primary_pool(),
-            slots,
-            lat_out,
-            cu_q[: seqs + 1],
-            md.kv_lens_cuda_runtime[ctx : ctx + seqs],
-            bmm1,
-            bmm2,
-            slot_kind,
-            slot_layer,
-            compiled=self._fmha_dec_compiled,
-        )
+        if slot_kind == _UNION_POSITIONS:
+            self._count("fmha_dec_union", True)
+            cute_dsl_sparse_mla_decode_union(
+                quant_q,
+                md.kv_cache_manager.get_unique_primary_pool(),
+                slots.positions,
+                md.block_table,
+                slots.req_idx,
+                lat_out,
+                cu_q[: seqs + 1],
+                md.kv_lens_cuda_runtime[ctx : ctx + seqs],
+                slot_layer,
+                self._stride_factor,
+                compiled=self._fmha_union,
+            )
+        else:
+            fmha = self._fmha_dec_handle(gen_p)
+            if fmha is self._fmha_dec_wide:
+                self._count("fmha_dec_wide", True)
+            cute_dsl_sparse_mla_decode(
+                quant_q,
+                md.kv_cache_manager.get_unique_primary_pool(),
+                slots,
+                lat_out,
+                cu_q[: seqs + 1],
+                md.kv_lens_cuda_runtime[ctx : ctx + seqs],
+                bmm1,
+                bmm2,
+                slot_kind,
+                slot_layer,
+                compiled=fmha,
+            )
         lat_t = torch.transpose(torch.reshape(lat_out, [gen, heads, self.kv_lora]), 0, 1)
         out_t = torch.transpose(torch.reshape(out, [gen, heads, self.v_dim]), 0, 1)
-        vb8 = self._vb8.get(gen) if o8_side else None
+        vb8 = None
+        if o8_side and gen <= _DECODE_MAX_ROWS:
+            vb8 = self._vb8.get(gen)
+        elif o8_side and self._vb8w:
+            vb8 = self._wide_cell("v_b_x8", self._vb8w, gen)
         if vb8 is not None:
             cute_dsl_absorbed_bmm(lat_t, a.v_b_nk, out_t, vb8)
             return True
@@ -2392,16 +2848,45 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         act = cute_dsl_dense_swiglu(self._project("dense_gate_up", o, gu), self._dense_swiglu)
         return self._project("dense_down", act, dn)
 
+    def _shared_after_collective(self) -> None:
+        """On an MTP3 / MTP5 wide decode step (`_moe_decode_exact`), called on the side
+        stream right after its fork, ahead of the shared expert: one plain (non-PDL) kernel,
+        a 1-element fill, so the shared expert's first kernel no longer hangs off the pre-MoE
+        collective by a programmatic edge. In the captured decode graph both the router (main
+        stream) and the shared expert (side stream) are that collective's PDL dependents, and
+        only one of them launches at its early release: at 192 rows the shared up GEMM took
+        it and the router started only when the collective ended; at 128 rows both launched
+        before it ended and the shared GEMM slowed the router (2-3x). Behind this node the
+        router always takes the early launch and the shared expert starts once the collective
+        completes, in the shadow of the top-k and FC1 (it only has to finish before FC2).
+        4-GPU decode-step chain (real AR, 3 MoE layers per step, 280 alternating replays):
+        -30.6 us per step at 128 rows, -17.9 us at 192. Ordering only: every byte is the
+        same. MTP1 and context steps never call it."""
+        torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
+        self._count("moe_shared_after_ar", True)
+
     def _shared_mlp(self, x, gu, gu_il, dn, out=None, trunk=False, x8=None, w8=None):
         """The shared expert, this rank's slice, a partial sum. `gu_il` is this layer's
         interleaved gate/up weight; `out` is the routed experts' output buffer when FC2 will
         accumulate onto it. A trunk layer's context rows take the prefill shared kernels
         when they built; the MTP layer's keep the two-launch path. With `x8` (`x`'s MXF8
         operand from the pre-MoE collective) and `w8` (the layer's MXF8 gate|up) the prefill
-        gate|up + SwiGLU runs as the MXF8 GEMM with the SwiGLU in its epilogue."""
+        gate|up + SwiGLU runs as the MXF8 GEMM with the SwiGLU in its epilogue. A
+        `_wide_decode` step's rows above 64 take the MTP decode cells, trunk and MTP layer:
+        at 128 / 192, else on the next one up (`_wide_cell`; the gate|up cells take any row
+        count, the down cell is re-pinned)."""
         rows = int(x.shape[0])
         k = self._moe_k
-        if trunk and k.shared_down_pre is not None and _MOE_PREFILL_MIN <= rows <= _MOE_MAX_T:
+        wide = None
+        if self._wide_decode and rows > _DECODE_MAX_ROWS:
+            wide = self._wide_cell("shared_gu", self._shared_gu_swiglu_mtp, rows)
+            self._count("dec_wide", wide is not None)
+        if (
+            trunk
+            and wide is None
+            and k.shared_down_pre is not None
+            and _MOE_PREFILL_MIN <= rows <= _MOE_MAX_T
+        ):
             xs = x if _direct_ok(x, torch.bfloat16) else x.contiguous()
             # The prefill kernels take 128-byte aligned rows; a contiguous view that is not
             # takes the two-launch path.
@@ -2416,7 +2901,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 else:
                     cute_dsl_shared_gate_up_swiglu(xs, gu_il, mid, k.shared_up_pre)
                 return cute_dsl_projection(mid, dn.t(), res, k.shared_down_pre)
-        runner = self._shared_gu_swiglu.get(rows)
+        runner = self._shared_gu_swiglu.get(rows) if wide is None else wide
         if runner is None:
             gate_up = self._project("shared_gate_up", x, gu)
             swiglu = self._rows.swiglu
@@ -2438,39 +2923,71 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         decode kernels' 64."""
         return self._moe_k.pair is not None and _MOE_PREFILL_MIN <= rows <= _MOE_MAX_T
 
-    def _moe_padded_rows(self, rows: int) -> int:
+    def _moe_decode_exact(self, rows: int) -> bool:
+        """Whether a decode step's routed experts run `rows` unpadded below 513: the MTP3 /
+        MTP5 decode widths (`max_draft_len > 1`; 65..192 rows at batch 32), on the prefill
+        front end and pair. The prefill top-k writes the maps for any row count, so nothing
+        is padded, re-routed, cleared or merged: 192 rows ran as 256 (a third more M, the
+        top-k's maps discarded for a routing launch, a clear and a merge). MTP1 and no
+        speculation never ask (their decode steps stay within 64 rows); context steps keep
+        the power-of-two padding."""
+        return (
+            self.max_draft_len > 1
+            and _MOE_PREFILL_MIN <= rows < _MOE_PAIR_EXACT_FROM
+            and self._moe_k.topk_pre is not None
+            and self._moe_pair_ok(rows)
+        )
+
+    def _moe_topk_wide(self, rows: int):
+        """The wide decode top-k handle for `rows` (65..256), or None (not built: MTP1, no
+        speculation, or a failed build; or rows outside its domain)."""
+        if not _moe_topk_op.WIDE_MIN_ROWS <= rows <= _moe_topk_op.WIDE_MAX_ROWS:
+            return None
+        return self._moe_k.topk_wide.get(_moe_topk_op.wide_range(rows))
+
+    def _moe_padded_rows(self, rows: int, exact: bool = False) -> int:
         """The row count routing and the grouped GEMMs see for `rows`: a power of two, or the
-        exact count on the prefill pair from `_MOE_PAIR_EXACT_FROM` up. `_moe_begin_layer`
-        and `_moe_experts` both ask here, so the shared expert's rows and FC2's agree."""
-        if rows >= _MOE_PAIR_EXACT_FROM and self._moe_pair_ok(rows):
+        exact count on the prefill pair from `_MOE_PAIR_EXACT_FROM` up, or on a wide decode
+        step (`exact`, see `_moe_decode_exact`). `_moe_begin_layer` and `_moe_experts` both
+        ask here, so the shared expert's rows and FC2's agree."""
+        if (exact or rows >= _MOE_PAIR_EXACT_FROM) and self._moe_pair_ok(rows):
             return rows
         return _pow2(rows)
 
-    def _moe_begin_layer(self, rows: int):
+    def _moe_begin_layer(self, rows: int, exact: bool = False):
         """Open one layer: advance the slot for the router, top-k and grouped GEMMs, and
         return the routed output rows for the shared expert to write into, or None. Only at
         a width the GEMMs do not pad: a power of two, or any count on the prefill pair from
-        513. Called before the shared branch forks, so the shared expert writes the slot
-        FC2 accumulates into."""
+        513 (or on a wide decode step, `exact`). Called before the shared branch forks, so
+        the shared expert writes the slot FC2 accumulates into."""
         self._moe_slot ^= 1
-        if self._moe_padded_rows(rows) != rows or rows > _MOE_MAX_T:
+        if self._moe_padded_rows(rows, exact) != rows or rows > _MOE_MAX_T:
             return None
         return self._moe_slots[self._moe_slot].out[:rows]
 
-    def _moe_router(self, x, m, slot):
+    def _moe_router(self, x, m, slot, exact: bool = False):
         """Router logits in the slot's buffer, or None (the stock projection then runs it).
         Up to 64 rows on the decode router, where above 5 rows these are `[rows, 4, 256]`
-        partials only the fused top-k reads; above, on the prefill router (`[rows, 256]`)."""
+        partials only the fused top-k reads; on a wide decode step (`exact`) the same
+        partials from the wide decode router when it and the wide top-k built; above, on the
+        prefill router (`[rows, 256]`)."""
         rows = int(x.shape[0])
         s = self._moe_slots[slot]
         if rows > _DECODE_MAX_ROWS:
-            pre = self._moe_k.router_pre
-            if pre is None or rows > _MOE_MAX_T:
+            k = self._moe_k
+            pre = k.router_pre
+            wide = exact and k.router_wide is not None and self._moe_topk_wide(rows) is not None
+            if (pre is None and not wide) or rows > _MOE_MAX_T:
                 return None
             if not _direct_ok(x, torch.bfloat16):
                 x = x.contiguous()
             if x.dtype is not torch.bfloat16 or x.data_ptr() % 16:
                 return None
+            if wide:
+                out = s.router_wide_out[:rows]
+                cute_dsl_moe_router(x, m.router, out, k.router_wide)
+                self._count("moe_router_wide", True)
+                return out
             out = s.logits[:rows]
             cute_dsl_moe_router(x, m.router, out, pre)
             return out.view(rows, -1)
@@ -2487,13 +3004,63 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         cute_dsl_moe_router(xs, m.router, out, self._moe_k.router[rows])
         return out
 
-    def _moe_topk(self, logits, in_slot: bool, m, slot, layer: int):
+    def _build_moe_wide_rep(self, k, dev) -> None:
+        """The MTP3 / MTP5 wide decode steps' expert replicas: `k.topk_wide_rep`, one handle per
+        wide row range (keyed as `k.topk_wide`).
+
+        At 65..256 decode rows the prefill pair streams one expert's weights per active local
+        expert, so a rank's routed time follows its count of distinct active experts and the
+        post-MoE all-reduce waits for the busiest rank (real routing, 75 layers: 2.66 / 2.09
+        experts above the mean at 128 / 192 rows). The wide replica top-k moves each active hot
+        expert whole to the EP rank with the fewest active experts (the decode replicas'
+        greedy), on the context replicas' slots: the `64 + R` deep prefill pair (`k.pair_rep`)
+        and each trunk layer's hot ids (`_ctx_hot_ids`); the MTP layer has none and keeps the
+        wide top-k. Built only with the wide top-k (MTP3 / MTP5), the context replicas and
+        `wide_dec_replicas`, and only for the ranges up to `_WIDE_REP_MAX_ROWS` (65..128); a
+        failed build leaves every step on the wide top-k."""
+        k.topk_wide_rep = {}
+        if not (
+            self.wide_dec_replicas
+            and k.topk_wide
+            and k.pair_rep is not None
+            and self.ctx_replicas
+            and self._ctx_hot_ids
+        ):
+            return
+        splits = next(iter(k.topk_wide.values())).logit_splits
+        built = _try_build(
+            "MoE wide decode replica top-k",
+            lambda: {
+                r: _moe_topk_wide_rep_op.build_wide_rep(
+                    r[1], splits, self.ctx_replicas, dev, expert_hist=h.expert_hist
+                )
+                for r, h in k.topk_wide.items()
+                if r[1] <= _WIDE_REP_MAX_ROWS
+            },
+        )
+        k.topk_wide_rep = built or {}
+
+    def _moe_topk_wide_rep(self, rows: int, layer: int):
+        """`(handle, hot ids)` of the wide replica top-k for a wide decode step's `rows` at trunk
+        MoE layer `layer`, or None: not built (MTP1, no speculation, replicas off) or a layer
+        without hot ids (the MTP layer)."""
+        reps = getattr(self._moe_k, "topk_wide_rep", None)
+        hot = self._ctx_hot_ids.get(layer) if reps else None
+        if hot is None:
+            return None
+        handle = reps.get(_moe_topk_op.wide_range(rows))
+        return None if handle is None else (handle, hot)
+
+    def _moe_topk(self, logits, in_slot: bool, m, slot, layer: int, exact: bool = False):
         """Sigmoid top-k with bias correction, writing this layer's tile maps: `(weights,
         ids, maps)` in the slot's buffers, or None (`noaux_tc_op` then selects). Up to 64 rows
-        on the decode kernel, above on the prefill one. `in_slot`: the logits are the slot's
-        router output, read in place; others are staged into it first. Matches
-        `noaux_tc_op` on this ungrouped routing: same sets, weights to 6e-8. A decode handle
-        built with `expert_hist` also writes `layer`'s row of the L2 prefetch's counts."""
+        on the decode kernel; above, on the wide decode kernel for a wide decode step
+        (`exact`, 65..256 rows, same ids, weights and tile layout as the prefill kernel's;
+        a trunk layer with hot ids on its replica variant, `_moe_topk_wide_rep`) and on the
+        prefill one otherwise. `in_slot`: the logits are the slot's router output,
+        read in place; others are staged into it first. Matches `noaux_tc_op` on this
+        ungrouped routing: same sets, weights to 6e-8. A decode or wide handle built with
+        `expert_hist` also writes `layer`'s row of the L2 prefetch's counts."""
         rows = int(logits.shape[0])
         s = self._moe_slots[slot]
         k = self._moe_k
@@ -2531,9 +3098,35 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             lg = s.logits[:rows].view(rows, -1)
             self._copy_into(lg, logits.reshape(rows, -1))
             logits = lg
+        wide = self._moe_topk_wide(rows) if exact else None
+        planes = 1 if logits.dim() == 2 else int(logits.shape[1])
+        if wide is not None and wide.logit_splits == planes:
+            rep = self._moe_topk_wide_rep(rows, layer)
+            if rep is not None and rep[0].logit_splits == planes:
+                # Wide decode expert replicas: the same selection, maps over this rank's home
+                # and replica slots; `_moe_experts` runs them on the replica pair. Every rank
+                # takes this branch for the same rows and layer.
+                handle, hot = rep
+                self._count("moe_wide_replica", True)
+                outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.maps}
+                selected = cute_dsl_moe_topk_routing_wide_rep(
+                    logits, m.router_bias, hot, self.expert_offset, self.routed_scale, outputs,
+                    handle, expert_hist=self._pf.hist[layer] if handle.expert_hist else None,
+                )  # fmt: skip
+                self._moe_rep_maps = selected[2]
+                return selected
+            # One fused launch for the three of the prefill top-k (histogram, prefix,
+            # scatter); the maps it writes are FC1's as they stand.
+            self._count("moe_topk_wide", True)
+            outputs = {"topk_weights": s.w, "topk_indices": s.sel, **s.maps}
+            return cute_dsl_moe_topk_routing(
+                logits, m.router_bias, self.expert_offset, self.routed_scale, outputs, None, wide,
+                expert_hist=self._pf.hist[layer] if wide.expert_hist else None,
+            )  # fmt: skip
         hot = self._ctx_hot_ids.get(layer) if k.topk_pre_rep is not None else None
         if (
             hot is not None
+            and not exact
             and _moe_topk_pre_rep_op.serves(rows)
             and self._moe_padded_rows(rows) == rows
             and self._moe_pair_ok(rows)
@@ -2554,7 +3147,19 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )
 
     def _moe_experts(
-        self, x, topk_ids, topk_w, topk_maps, m, rows: int, prequantized, join, began, acc, layer
+        self,
+        x,
+        topk_ids,
+        topk_w,
+        topk_maps,
+        m,
+        rows: int,
+        prequantized,
+        join,
+        began,
+        acc,
+        layer,
+        exact=False,
     ):
         """One chunk's routed round trip; returns the slot's output rows.
 
@@ -2567,15 +3172,17 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         partial, waited on between FC1 and FC2 so the shared branch overlaps router, top-k
         and FC1. `layer` is this call site's slot of the decode FC2's tile counter: a launch
         of up to 64 tokens assigns its tiles dynamically, each layer once per forward.
+        `exact`: a wide decode step (`_moe_decode_exact`), unpadded below 513 rows.
         """
         k = self._moe_k
         dev = x.device
         # Pad to a power of two below 513 rows: the routing schedule is keyed by
         # `ceil(rows / 32)` there, and arbitrary widths would compile about twenty. Padding
         # rows route to a non-local expert at weight 0 (`pad_expert_id`), so routing drops
-        # them, and are sliced off. The prefill pair takes 513 rows and up exactly.
+        # them, and are sliced off. The prefill pair takes 513 rows and up exactly, and a
+        # wide decode step any count: its prefill top-k's maps need no routing launch.
         use_pair = self._moe_pair_ok(rows)
-        padded = self._moe_padded_rows(rows)
+        padded = self._moe_padded_rows(rows, exact)
         if padded != rows:
             pad = padded - rows
             if not prequantized:
@@ -2674,17 +3281,18 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )  # fmt: skip
         return out[:rows]
 
-    def _pf_fork(self, layer: int, m, rows: int) -> None:
+    def _pf_fork(self, layer: int, m, rows: int, exact: bool = False) -> None:
         """Fork the L2 prefetch stream at a decode MoE layer's o_proj end and prefetch the FC1
         slices of the experts this layer's previous decode step routed the most tokens to.
-        The routed call joins it before FC2 (`_moe_experts`). Only on the push top-k's widths:
-        the row bound is checked first, as the context steps call this too."""
+        The routed call joins it before FC2 (`_moe_experts`). Only on the push top-k's widths
+        (1..64 rows): the row bound is checked first, as the context steps call this too.
+        Not on the MTP3 / MTP5 wide decode steps (`exact`): there the prefetch costs time
+        (4-GPU chain with the real all-reduce, 2 prefetched MoE layers: +4.3 us at 128 rows,
+        +2.6 us at 192, 200 alternating replays each)."""
         pf = self._pf
-        if (
-            pf is None
-            or not 1 <= rows <= _DECODE_MAX_ROWS
-            or not self._moe_k.topk[rows].expert_hist
-        ):
+        if pf is None or exact:
+            return
+        if not 1 <= rows <= _DECODE_MAX_ROWS or not self._moe_k.topk[rows].expert_hist:
             return
         pf.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(pf.stream):
@@ -2709,12 +3317,21 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         )
 
     def _routed(
-        self, x, m, rows: int, prequantized: bool, join, began: bool, acc: bool, layer: int
+        self,
+        x,
+        m,
+        rows: int,
+        prequantized: bool,
+        join,
+        began: bool,
+        acc: bool,
+        layer: int,
+        exact: bool = False,
     ):
         """This rank's 64-expert window. Router and top-k run on replicated hidden states,
         so every rank selects the same experts and the four windows tile the routing space
         once. No stock fallback for the grouped GEMMs: the weights are packed for these
-        kernels alone.
+        kernels alone. `exact`: a wide decode step, unpadded (`_moe_decode_exact`).
 
         Each chunk's result is a view of a slot's output buffer, and the slots alternate per
         chunk, so with more than one chunk each result is copied out before a later chunk
@@ -2739,19 +3356,20 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 self._count("moe_quant_first", True)
             # fp32 logits: FC2 reads `token_final_scales` as fp32 and noaux_tc_op's weight
             # dtype follows its logits. bf16 runs clean on garbage.
-            logits = self._moe_router(chunk, m, slot)
+            logits = self._moe_router(chunk, m, slot, exact)
             in_slot = logits is not None
             if logits is None:
                 logits = self._project("router", chunk, m.router_t, torch.float32)
-            selected = self._moe_topk(logits, in_slot, m, slot, layer)
+            selected = self._moe_topk(logits, in_slot, m, slot, layer, exact)
             if selected is None:
                 topk_w, topk_ids = self._route(logits, m.router_bias)
                 maps = None
             else:
                 topk_w, topk_ids, maps = selected
             part = self._moe_experts(
-                chunk, topk_ids, topk_w, maps, m, n, prequantized or first, join, began, acc, layer
-            )
+                chunk, topk_ids, topk_w, maps, m, n, prequantized or first, join, began, acc,
+                layer, exact,
+            )  # fmt: skip
             if result is None:
                 return part
             self._copy_into(result[start : start + n], part)
@@ -2759,14 +3377,15 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         return result
 
     def _mlp_and_close(
-        self, attn_out, residual, i: int, rows: int, o8=None, o_pre=False, main=None
+        self, attn_out, residual, i: int, rows: int, o8=None, o_pre=False, main=None, decode=False
     ):
         """o_proj, the layer's MLP, and the closing collective normed for the next layer.
         `o8` is `attn_out`'s MXF8 operand when the context attention wrote it (o_proj then
         reads it instead of `attn_out`). Returns `(x, x8)`: the next layer's input and, on a
         two-shot context step, its MXF8 operand for the next layer's qkva (else None).
         `o_pre`: the V-B GEMM wrote `attn_out`'s decode MXF8 operand (`_attn_gen`). `main`: the
-        stream the step runs on, when the caller already holds it (else read here)."""
+        stream the step runs on, when the caller already holds it (else read here).
+        `decode`: the caller is the decode target (`_moe_decode_exact`)."""
         a = self._attn[i]
         partial = self._project(
             "o_proj", attn_out, a.o, w8=a.o8, pre=o8, wd8=a.o_dec8, dec_pre=o_pre
@@ -2778,30 +3397,40 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             o, x8 = self._reduce_norm_x8(partial, residual, a.norm2, w8 is not None)
             mlp_out = self._dense_mlp(o, gu, dn, w8, x8)
         else:
+            exact = decode and self._moe_decode_exact(rows)
+            if exact:
+                self._count("moe_dec_exact", True)
             # The decode L2 prefetch of this layer's routed FC1 weights (decode widths only).
-            self._pf_fork(i, m, rows)
+            self._pf_fork(i, m, rows, exact)
             x8 = None
             w8 = self._shared_w8[i]
-            if rows > _DECODE_MAX_ROWS:
+            if not self._moe_prequant(rows, exact):
                 # The routed experts quantize context rows themselves: the collective writes
-                # the shared expert's MXF8 operand instead.
+                # the shared expert's MXF8 operand instead (two-shot rows only, above 512).
                 o, x8 = self._reduce_norm_x8(partial, residual, a.norm2, w8 is not None)
                 prequant = False
             else:
-                o, prequant = self._reduce_norm_quant(partial, residual, a.norm2, m.g1, rows)
+                # A decode width, or an MTP3 / MTP5 decode step's exact rows: the collective
+                # writes the routed experts' NVFP4 input, and they skip stage copy + quantize.
+                o, prequant = self._reduce_norm_quant(partial, residual, a.norm2, m.g1, rows, exact)
+                if rows > _DECODE_MAX_ROWS:
+                    self._count("moe_dec_prequant", prequant)
             began = rows <= _MOE_MAX_T
-            acc = self._moe_begin_layer(rows) if began else None
+            acc = self._moe_begin_layer(rows, exact) if began else None
             if main is None:
                 main = torch.cuda.current_stream()
             side = self._side_stream
             side.wait_stream(main)
             with torch.cuda.stream(side):
+                if exact:
+                    self._shared_after_collective()
                 shared = self._shared_mlp(
                     o, gu, self._shared_gu_il[i], dn, out=acc, trunk=True, x8=x8, w8=w8
                 )
             routed = self._routed(
-                o, m, rows, prequant, side if acc is not None else None, began, acc is not None, i
-            )
+                o, m, rows, prequant, side if acc is not None else None, began, acc is not None, i,
+                exact,
+            )  # fmt: skip
             if acc is None:
                 main.wait_stream(side)
                 merge = self._moe_k.merge
@@ -2828,18 +3457,34 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
     def _mtp_front(self, e, h, rows: int):
         """`eh_proj(concat(enorm(e), hnorm(h)))`. At the specialised row counts each rank norms
         one 3072-wide quarter of the concat -- ranks 0-1 halves of `e`, ranks 2-3 halves of
-        `h` -- and the projection's K-split partials are summed by the collective."""
+        `h` -- and the projection's K-split partials are summed by the collective. MTP5's
+        192 draft-step-0 rows take it on a `_wide_decode` step only, and so do that step's
+        other row counts in 65..191 (a batch of fewer than 32 sequences), on the next
+        instance up (128 / 192) at their exact rows (`_wide_cell`); with `_wide_bucket` off
+        they keep bf16 (the replicated GEMM below), never the MXF8 context path."""
         mw = self._mtp
         k = _mtp_eh.LOCAL_INPUT_SIZE
-        if rows in _mtp_eh.SUPPORTED_M_VALUES and e.is_contiguous() and h.is_contiguous():
+        wide = self._wide_decode and rows in _mtp_eh.MTP_ROWS
+        runner = mw["ehproj"]
+        ksplit = rows in _mtp_eh.SUPPORTED_M_VALUES or wide
+        if not ksplit and self._wide_decode and rows > _DECODE_MAX_ROWS:
+            cells = dict.fromkeys(_mtp_eh.WIDE_ROWS, runner)
+            runner = self._wide_cell("mtp_eh", cells, rows, _mtp_eh.at_rows)
+            ksplit = runner is not None
+        if ksplit and e.is_contiguous() and h.is_contiguous():
             src, nw = (e, mw["enorm"]) if self.tp_rank < 2 else (h, mw["hnorm"])
             local = torch.empty([rows, k], dtype=e.dtype, device=e.device)
             cute_dsl_mtp_norm_shard(
                 src, nw, local, (self.tp_rank % 2) * k, self.eps, mw["norm_shard"]
             )
-            return self._reduce(cute_dsl_mtp_eh_proj(local, mw["eh_local"], mw["ehproj"]))
+            return self._reduce(cute_dsl_mtp_eh_proj(local, mw["eh_local"], runner))
         eh8 = self._mtp_eh8
-        if eh8 is not None and rows > _DECODE_MAX_ROWS and _eh8_op.supports(e, h):
+        if (
+            eh8 is not None
+            and rows > _DECODE_MAX_ROWS
+            and not self._wide_decode
+            and _eh8_op.supports(e, h)
+        ):
             # The two norms write the MXF8 GEMM's operand halves: no bf16 norms, no concat
             # copies, no activation quant.
             q8 = _eh8_op.operand(rows, e.device)
@@ -2943,27 +3588,42 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             start += n
         return result
 
-    def _mtp_close(self, attn_out, residual, rows: int):
+    def _mtp_close(self, attn_out, residual, rows: int, decode=False):
         """The MTP layer's o_proj and MoE: its routed experts on the trunk's NVFP4 path
         (`_mtp_moe_fp4`) at layer slot `num_layers`, else on its bf16 pair. Returns the
-        un-normalized hidden state: the module's own head norm is applied by
-        `shared_head`."""
+        hidden state after the module's own head norm when the engine drafts more than one
+        token (`_mtp_out_normed`: it is fed back into the next draft step, as stock's), else
+        un-normalized with the norm applied by `shared_head`. `decode`: the caller is the
+        decode target (`_moe_decode_exact`); there the residual add and the head norm run
+        as one launch (`_add_rmsnorm`, bit for bit the two)."""
         j = self.num_layers
         a = self._attn[j]
         o = self._reduce_norm(self._project("o_proj", attn_out, a.o), residual, a.norm2)
         gu, dn = self._mlp[j]
+        exact = self._mtp_fp4 is not None and decode and self._moe_decode_exact(rows)
         main = torch.cuda.current_stream()
         side = self._side_stream
         side.wait_stream(main)
         with torch.cuda.stream(side):
+            if exact:
+                self._shared_after_collective()
             shared = self._shared_mlp(o, gu, self._shared_gu_il[j], dn)
         if self._mtp_fp4 is not None:
             self._count("mtp_moe_fp4", True)
-            routed = self._routed(o, self._mtp_fp4, rows, False, None, False, False, j)
+            if exact:
+                self._count("moe_dec_exact", True)
+            routed = self._routed(o, self._mtp_fp4, rows, False, None, False, False, j, exact)
         else:
             routed = self._mtp_routed(o, rows)
         main.wait_stream(side)
-        return self._add(residual, self._reduce(self._add(routed, shared)))
+        reduced = self._reduce(self._add(routed, shared))
+        if self._mtp_out_normed and decode:
+            # MTP3 / MTP5 decode: the module's output is only ever read normed.
+            return self._add_rmsnorm(residual, reduced, self._mtp["head_norm"])
+        out = self._add(residual, reduced)
+        if self._mtp_out_normed:
+            return self._rmsnorm(out, self._mtp["head_norm"])
+        return out
 
 
 class PrefillTarget:
@@ -3619,12 +4279,14 @@ class PrefillTarget:
         dc=None,
         x8=None,
         ctx_last=None,
+        split_memo=None,
     ):
         """One layer's attention block, both phases, into `attn_out`. `slots_of(topk_buf, fresh)`
         maps the request-local selection to this layer's pool rows, `(context, generation,
         generation index kind, its layer)` (`fresh`: this layer selected anew); the context half
         is None under the dense-causal context attention (`dc`). `x8` is `x`'s
-        MXF8 operand (the closing all-reduce of the layer before wrote it).
+        MXF8 operand (the closing all-reduce of the layer before wrote it). `split_memo` is the
+        step's store for the decode indexer's MTP5 atom split metadata.
 
         Returns o_proj's MXF8 operand `(q8, sf)` when the fp8 context attention wrote the
         context rows' attention into it (their bf16 rows of `attn_out` are then not written:
@@ -3700,8 +4362,9 @@ class PrefillTarget:
                     )
             if gen and not skip_gen:
                 core._indexer_decode(
-                    md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p
-                )
+                    md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p,
+                    split_memo,
+                )  # fmt: skip
         slots_ctx, slots_gen, gen_kind, gen_layer = slots_of(topk_buf, ix is not None)
         if mha8:
             q_ctx = core._q_b_e4m3(q_a[:tc], a, pre=qa8)
@@ -3825,6 +4488,8 @@ class PrefillTarget:
         # conversion per layer (78 launches per mixed step).
         mixed_base = core._mixed_base and slot_lo == tc and gen > 0 and gen_p == _MLA_ROPE_MTP_WIDTH
         base = None
+        # The generation rows' MTP5 atom split metadata, built by the first indexer layer.
+        split_memo: dict = {}
 
         x = core._rmsnorm(h, core._attn[0].norm1)
         x8 = None
@@ -3853,7 +4518,7 @@ class PrefillTarget:
 
             o8 = self._layer_attention(
                 md, step, x, pos, attn_out, i, i, slots_of, topk_buf, rows, tc, gen, gen_p, ctx,
-                need_q, skip_ctx, skip_gen, ctx_rope, dc, x8,
+                need_q, skip_ctx, skip_gen, ctx_rope, dc, x8, split_memo=split_memo,
             )  # fmt: skip
             x, x8 = core._mlp_and_close(attn_out, residual, i, rows, o8, main=step.get("diet_main"))
         return x
@@ -3862,6 +4527,10 @@ class PrefillTarget:
     #: downstream has (the routed MoE takes powers of two only; anything else it would pad
     #: with torch ops). Above 64 the plan declines and every row is computed.
     MTP_LAST_CELLS = (2, 4, 8, 16, 32, 64)
+    #: MTP3 / MTP5 only: 4 / 6 generation rows per request pass 64 selected rows from 17 / 11
+    #: generation requests on, so the plan also pads to these (prefill kernels downstream, the
+    #: routed MoE's pair at a power of two), while that is still fewer rows than the step's.
+    MTP_LAST_WIDE_CELLS = (128, 256)
 
     def _mtp_last_plan(self, md, step, ctx: int, tc: int, gen: int, layer: int, stride: int):
         """The MTP layer's selected rows on a context step, or None (every row computed).
@@ -3877,6 +4546,11 @@ class PrefillTarget:
         core = self.core
         pool_ptrs = step["host_kv_cache_pool_pointers"]
         mapping = step["host_kv_cache_pool_mapping"][layer]
+        cells = self.MTP_LAST_CELLS
+        if core.max_draft_len > 1:
+            cells = cells + self.MTP_LAST_WIDE_CELLS
+        r = ctx + gen
+        r_pad = next((c for c in cells if c >= r), None)
         why = (
             "selection"
             if not bool(md.skip_indexer_for_ctx_reqs)
@@ -3887,7 +4561,7 @@ class PrefillTarget:
             or int(pool_ptrs[int(mapping[0]), 1]) != 0
             or core._ctx_rope_compiled is None
             else "rows"
-            if ctx + gen > self.MTP_LAST_CELLS[-1]
+            if r_pad is None or (r_pad > self.MTP_LAST_CELLS[-1] and r_pad >= tc + gen)
             else None
         )
         host_cu = step["host_ctx_uncached_token_indptr"][: ctx + 1].to(torch.int64)
@@ -3906,8 +4580,8 @@ class PrefillTarget:
             core.mtp_last_declines[why] = core.mtp_last_declines.get(why, 0) + 1
             return None
         core._count("mtp_ctx_last", True)
-        r = ctx + gen
-        r_pad = next(c for c in self.MTP_LAST_CELLS if c >= r)
+        if r_pad > self.MTP_LAST_CELLS[-1]:
+            core._count("mtp_ctx_last_wide", True)
         n_pad = r_pad - gen
         last = (host_cu[1:] - 1).to(torch.int32)
         # One pinned block: rows [r_pad] | ke [n_pad] | req [n_pad] | groups [n_pad, 2] | ks [n_pad]
@@ -4029,9 +4703,9 @@ class PrefillTarget:
 class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
-    Two paths only this target takes, both at the MTP width of 2: the specialised MLA rope
-    kernel, and pool rows computed once per selection rather than once per layer (the decode
-    kernel adds `layer * 32` itself).
+    Two paths only this target takes, both at the MTP widths they are built for (`mtp_widths`:
+    2, and 4 / 6 at MTP3 / MTP5): the specialised MLA rope kernel, and pool rows computed once
+    per selection rather than once per layer (the decode kernel adds `layer * 32` itself).
     """
 
     def __init__(self, core: "GlmMoeDsaTep4ModelingV2") -> None:
@@ -4078,6 +4752,7 @@ class DecodeTarget:
         gen_p,
         skip_gen,
         specialised_rope,
+        split_memo: dict | None = None,
     ):
         core = self.core
         a = core._attn[i]
@@ -4088,10 +4763,16 @@ class DecodeTarget:
             k_pool = md.kv_cache_manager.get_indexer_k_cache_buffers(i)
             core._indexer_write_k(md, k_pool, k_pre, rows)
             if not skip_gen:
-                core._indexer_decode(md, k_pool, q_fp8, weights, topk_buf, 0, rows // gen_p, gen_p)
+                core._indexer_decode(
+                    md, k_pool, q_fp8, weights, topk_buf, 0, rows // gen_p, gen_p, split_memo
+                )
         slots, slot_kind, slot_layer = slots_of(topk_buf, ix is not None)
-        # A trunk layer whose o_proj takes the decode MXF8 GEMM: the V-B writes its operand.
-        o8_side = i < core.num_layers and core._dec8_takes("o_proj", attn_out, a.o_dec8)
+        # A trunk layer whose o_proj takes the decode MXF8 GEMM (or at MTP3 / MTP5 decode
+        # rows above 64 the wide one): the V-B writes its operand.
+        o8_side = i < core.num_layers and (
+            core._dec8_takes("o_proj", attn_out, a.o_dec8)
+            or core._dec8w_takes("o_proj", attn_out, a.o_dec8)
+        )
         return core._attn_gen(
             a, pool_layer, q, latent, attn_out, slots, rows, gen_p, 0, md, slot_kind, slot_layer,
             specialised_rope, o8_side,
@@ -4118,8 +4799,22 @@ class DecodeTarget:
         pos = torch.reshape(position_ids, [-1])
         req_idx = md.req_idx_per_token[:rows]
         attn_out = torch.empty([rows, core.heads * core.v_dim], dtype=h.dtype, device=h.device)
-        mtp_width = gen_p == _MLA_ROPE_MTP_WIDTH
+        specialised_rope = gen_p in core.mtp_widths
+        # Base rows at every width with its own decode attention handle that takes them; the
+        # rope flag is a separate choice.
+        base_rows = (
+            gen_p in core.mtp_widths
+            and INDEX_KIND_BASE_WITH_LAYER_OFFSET in core._fmha_dec_handle(gen_p).index_kinds
+        )
         base = None
+        # MTP3 / MTP5: the union decode attention takes the selection itself.
+        union = (
+            core._fmha_union is not None
+            and _MLA_ROPE_MTP_WIDTH < gen_p <= core._fmha_union.max_sq
+            and md.num_seqs in core._fmha_union.plans
+        )
+        # The MTP5 atom split's indexer metadata, built by the first indexer layer for all.
+        split_memo: dict = {}
 
         x = core._rmsnorm(h, core._attn[0].norm1)
         residual = h
@@ -4128,7 +4823,9 @@ class DecodeTarget:
 
             def slots_of(buf, fresh, layer_id=layer_id):
                 nonlocal base
-                if not mtp_width:
+                if union:
+                    return _UnionSlots(buf, req_idx), _UNION_POSITIONS, layer_id
+                if not base_rows:
                     rows_ = cute_dsl_req_index_to_global(
                         req_idx, md.block_table, buf, md.tokens_per_block, core._stride_factor,
                         layer_id, compiled=core._req_global_compiled,
@@ -4143,9 +4840,10 @@ class DecodeTarget:
                 return base, INDEX_KIND_BASE_WITH_LAYER_OFFSET, layer_id
 
             o_pre = self._layer_attention(
-                md, x, pos, attn_out, i, i, slots_of, topk_buf, rows, gen_p, skip_gen, mtp_width
-            )
-            x, _ = core._mlp_and_close(attn_out, residual, i, rows, o_pre=o_pre)
+                md, x, pos, attn_out, i, i, slots_of, topk_buf, rows, gen_p, skip_gen,
+                specialised_rope, split_memo,
+            )  # fmt: skip
+            x, _ = core._mlp_and_close(attn_out, residual, i, rows, o_pre=o_pre, decode=True)
         return x
 
     def mtp_forward(
@@ -4186,9 +4884,9 @@ class DecodeTarget:
         attn_out = torch.empty([rows, core.heads * core.v_dim], dtype=x.dtype, device=x.device)
         self._layer_attention(
             md, xn, torch.reshape(position_ids, [-1]), attn_out, j, local, slots_of, topk_buf,
-            rows, gen_p, skip_gen, gen_p == _MLA_ROPE_MTP_WIDTH,
+            rows, gen_p, skip_gen, core._mtp_rope_specialised(gen_p),
         )  # fmt: skip
-        return core._mtp_close(attn_out, residual, rows)
+        return core._mtp_close(attn_out, residual, rows, decode=True)
 
 
 class Glm52MTPEagleWorker(MTPEagleWorker):
@@ -4257,8 +4955,10 @@ class MTPLayer:
     """The checkpoint's MTP module at layer `num_hidden_layers`, replayed once per draft step.
 
     It differs from a trunk layer in three ways: an `eh_proj` front end mixing the next token's
-    embedding into `h`, bf16 experts, and an output returned un-normalized (`shared_head`
-    applies the module's own norm and the runtime feeds the un-normalized tensor back in).
+    embedding into `h`, bf16 experts, and its own head norm. The runtime feeds the returned
+    tensor back in as the next draft step's hidden state, so above one draft token it is
+    returned head-normalized, as stock's MTP layer returns it (`_mtp_out_normed`); MTP1 never
+    feeds back and keeps the norm in `shared_head`.
     Not an `nn.Module`: every weight it reads lives in the core's ParameterDict.
     """
 
@@ -4272,10 +4972,13 @@ class MTPLayer:
     def shared_head(
         self, hidden_states, lm_head, attn_metadata, return_context_logits
     ) -> torch.Tensor:
-        """The module's own norm (a distinct parameter from `model.norm`), then the trunk's
-        `lm_head`."""
+        """The module's own norm (a distinct parameter from `model.norm`; already applied by
+        `_mtp_close` when `_mtp_out_normed`), then the trunk's `lm_head`."""
         core = self.core
-        x = core._rmsnorm(hidden_states, core._mtp["head_norm"])
+        if core._mtp_out_normed:
+            x = hidden_states
+        else:
+            x = core._rmsnorm(hidden_states, core._mtp["head_norm"])
         if return_context_logits:
             return core.logits(x, lm_head, self.logits_processor, attn_metadata)
         return self.logits_processor.forward(x, lm_head, attn_metadata, return_context_logits)

@@ -16,6 +16,9 @@ _THREADS = 256
 _DEFAULT_ROWS_PER_CTA = 1
 _HIDDEN = 6144
 _BF16_PER_STORE = 8
+# One 256-thread row group per row and the row count compiled in: up to 64 for MTP1 decode,
+# 65..512 for the MTP3 / MTP5 decode widths.
+_MAX_TOKENS = 512
 
 ZeroFn = Callable[..., None]
 _CACHE: dict[tuple[int, int, bool, int], ZeroFn] = {}
@@ -88,8 +91,8 @@ def compile_zero_rows(
     """Compile or retrieve an exact-T output-zero variant."""
     if output.ndim != 2 or output.shape[1] != _HIDDEN:
         raise ValueError(f"output must have shape [T,{_HIDDEN}], got {tuple(output.shape)}")
-    if not 1 <= output.shape[0] <= 64:
-        raise ValueError(f"output T must be in [1,64], got {output.shape[0]}")
+    if not 1 <= output.shape[0] <= _MAX_TOKENS:
+        raise ValueError(f"output T must be in [1,{_MAX_TOKENS}], got {output.shape[0]}")
     if output.dtype != torch.bfloat16:
         raise TypeError("output must be BF16")
     if not output.is_contiguous():

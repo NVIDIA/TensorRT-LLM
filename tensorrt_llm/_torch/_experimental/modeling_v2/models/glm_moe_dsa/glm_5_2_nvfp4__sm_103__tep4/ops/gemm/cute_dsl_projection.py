@@ -84,9 +84,20 @@ def shape_of(kernel: str) -> ProjectionShape:
     )
 
 
-#: Every row count each kernel has a schedule for. `build_all` compiles these.
+#: The decode row counts above 64 each kernel has a schedule for (its module's
+#: `MTP_DECODE_M_VALUES`): an MTP3 / MTP5 verify or draft-step-0 batch of 32 sequences
+#: at 4 or 6 rows each. Built only on request (`build_all(..., rows=MTP_ROWS[kernel])`):
+#: the target builds them for an engine drafting more than one token, and sends them
+#: decode rows only.
+MTP_ROWS: dict[str, tuple[int, ...]] = {
+    name: tuple(getattr(module, "MTP_DECODE_M_VALUES", ())) for name, module in _MODULES.items()
+}
+
+#: Every other row count each kernel has a schedule for. `build_all` compiles these.
 ROWS: dict[str, tuple[int, ...]] = {
-    name: IX_FUSED_ROWS if name == "ix_fused" else tuple(module.SUPPORTED_M_VALUES)
+    name: IX_FUSED_ROWS
+    if name == "ix_fused"
+    else tuple(m for m in module.SUPPORTED_M_VALUES if m not in MTP_ROWS[name])
     for name, module in _MODULES.items()
 }
 
@@ -118,13 +129,16 @@ def build(kernel: str, rows: int, weight: torch.Tensor) -> ProjectionRunner:
 
     Costs one CuTe DSL compile (the kernel module caches it per device and
     row count, so a second `build` of the same pair is free) and one launch
-    on a zero input. Raises if `rows` is not in `ROWS[kernel]` or the
-    compile fails.
+    on a zero input. Raises if `rows` is in neither `ROWS[kernel]` nor
+    `MTP_ROWS[kernel]`, or the compile fails.
     """
     shape = shape_of(kernel)
     rows = int(rows)
-    if rows not in ROWS[kernel]:
-        raise ValueError(f"{kernel}: no schedule for {rows} rows; compiled rows are {ROWS[kernel]}")
+    if rows not in ROWS[kernel] + MTP_ROWS[kernel]:
+        raise ValueError(
+            f"{kernel}: no schedule for {rows} rows; compiled rows are "
+            f"{ROWS[kernel] + MTP_ROWS[kernel]}"
+        )
     x = torch.zeros([rows, shape.k], dtype=shape.in_dtype, device=weight.device)
     out = torch.empty([rows, shape.n], dtype=shape.out_dtype, device=weight.device)
     with torch.cuda.device(weight.device):
@@ -133,10 +147,33 @@ def build(kernel: str, rows: int, weight: torch.Tensor) -> ProjectionRunner:
     return ProjectionRunner(kernel, rows, shape.n, shape.k, shape.in_dtype, shape.out_dtype, launch)
 
 
+def at_rows(runner: ProjectionRunner, rows: int) -> ProjectionRunner | None:
+    """`runner`'s compiled kernel launched on `rows` rows, at most the count it was built
+    for: a runner pinned to `rows` that runs the cell's own instance (same schedule, same
+    tiles, same K order) on the step's exact rows, so each output row is bitwise the cell's
+    for that row -- no padding, no copy. For an MTP3 / MTP5 decode row count without a cell
+    (`MTP_ROWS` holds 128 and 192; a 24-request batch is 96 or 144 rows): the smallest cell
+    above it serves it.
+
+    None where the cell's backend is compiled for one M (the tcgen05 cells, M <= 64) or
+    `rows` is outside `1..runner.rows`. Builds nothing: the instance compiled and launched
+    when `runner` was built, so this is safe inside a CUDA-graph capture.
+    """
+    launch = getattr(runner.launch, "at_rows", None)
+    takes = getattr(runner.launch, "takes_rows", None)
+    rows = int(rows)
+    if launch is None or takes is None or not takes() or not 0 < rows <= runner.rows:
+        return None
+    return ProjectionRunner(
+        runner.kernel, rows, runner.n, runner.k, runner.in_dtype, runner.out_dtype, launch
+    )
+
+
 def build_all(
     kernel: str, weight: torch.Tensor, rows: tuple[int, ...] | None = None
 ) -> dict[int, ProjectionRunner]:
-    """`build` at every row count in `rows` (default `ROWS[kernel]`).
+    """`build` at every row count in `rows` (default `ROWS[kernel]`, which leaves out
+    `MTP_ROWS[kernel]`).
 
     Returns `{rows: runner}` for the row counts that compiled. A row count
     whose compile raises is left out rather than raised: the large prefill
@@ -605,6 +642,16 @@ class CuteDslProjection(OpWrapper):
             spec=dict(kernel="shared_down", rows=8192, shared_prefill=True),
         ),
     )
+    # MTP3 / MTP5: every decode cell above 64 rows (`MTP_ROWS`), one per kernel and row
+    # count; the backend each takes is its kernel module's measured table.
+    CELLS += tuple(
+        Cell(
+            why=f"{kernel} at {rows} rows: 32 sequences x MTP{rows // 32 - 1} width {rows // 32}",
+            spec=dict(kernel=kernel, rows=rows),
+        )
+        for kernel, mtp_rows in MTP_ROWS.items()
+        for rows in mtp_rows
+    )
 
     note = """
     The target compiles, per kernel, the row counts in `ROWS` (the kernel's
@@ -616,6 +663,12 @@ class CuteDslProjection(OpWrapper):
     `build_all`, which leaves out a row count that fails to compile. Every
     other row count, and any that was left out, goes to `cublas_mm` at the
     target's call site; the op only ever runs its own kernel.
+
+    `MTP_ROWS` (the kernel modules' `MTP_DECODE_M_VALUES`) are decode cells above
+    64 rows: 32 sequences at MTP3 (128) or MTP5 (192). `build_all` leaves them out
+    unless asked; the target builds them only for an engine drafting more than one
+    token and sends them a decode step's rows only, so a context step of the same
+    row count keeps the paths below.
 
     Above 64 rows, a row count with no decode runner goes to the prefill GEMM
     when `build_prefill` built that projection's entry (`build_prefill_all` leaves
@@ -631,8 +684,11 @@ class CuteDslProjection(OpWrapper):
     GEMM accumulates onto; the MTP layer's shared expert keeps `_project`.
 
     A decode runner is pinned to the row count it was built for and raises on
-    any other; the prefill runners take any count in their range. No runner
-    binds the weight: one runner serves every layer.
+    any other; the prefill runners take any count in their range. `at_rows`
+    re-pins an MTP cell's runner to fewer rows: the same compiled instance at a
+    runtime row count, each row bitwise the cell's (the target's other MTP3 /
+    MTP5 decode row counts, 65..191, on the next cell up). No runner binds the
+    weight: one runner serves every layer.
 
     The bf16 kernels check their operands' layout on the first call only (the
     one `build` makes). A later call with a non-contiguous or misaligned

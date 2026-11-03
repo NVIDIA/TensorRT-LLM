@@ -13,9 +13,11 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     )
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
+    MTP_ROWS,
     PREFILL_MAX_ROWS,
     PrefillSplitHandle,
     build_prefill,
+    compile_ragged,
     project_unsplit,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_indexer_pre_proj_split import (  # noqa: E402, E501
@@ -101,6 +103,80 @@ def test_a_handle_refuses_another_row_count() -> None:
     compiled = compile_handle(torch.cuda.current_device(), 2)
     with pytest.raises(ValueError, match="compiled for M=2"):
         op(*_build(4, seed=4), compiled)
+
+
+@pytest.mark.parametrize("rows", MTP_ROWS)
+def test_mtp_rows_replay_bitwise_in_a_cuda_graph(rows) -> None:
+    """The MTP3 / MTP5 handles run inside the decode CUDA graph: a replay writes the eager
+    launch's bytes, and a replay after new operands are copied into the captured buffers
+    writes the eager launch's product on them."""
+    compiled = compile_handle(torch.cuda.current_device(), rows)
+    x, weight, key, head_weights = _build(rows, seed=rows)
+    op(x, weight, key, head_weights, compiled)
+    eager = (key.clone(), head_weights.clone())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(x, weight, key, head_weights, compiled)
+    key.fill_(float("nan"))
+    head_weights.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(key, eager[0]) and torch.equal(head_weights, eager[1])
+    x2, weight2, key2, head_weights2 = _build(rows, seed=rows + 1)
+    x.copy_(x2)
+    weight.copy_(weight2)
+    op(x, weight, key2, head_weights2, compiled)
+    key.fill_(float("nan"))
+    head_weights.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(key, key2) and torch.equal(head_weights, head_weights2)
+    assert not torch.equal(key, eager[0]), "the new operands did not change the product"
+    _compare(key, head_weights, *op.reference(x, weight, key, head_weights, compiled))
+
+
+#: MTP3 / MTP5 decode row counts without a handle: each bucket's edges, the 24-request
+#: batches (96, 144) and partial batches at widths 4 / 6.
+WIDE_ROWS = (65, 66, 68, 84, 96, 100, 126, 127, 129, 144, 150, 190, 191)
+
+
+def test_runtime_m_handle_is_the_compiled_handles_bitwise() -> None:
+    """`compile_ragged`: the kernel compiled once on a symbolic row count, for the MTP3 /
+    MTP5 decode row counts without a handle of their own. At 128 and 192 rows it writes the
+    compiled handles' bytes; at every other wide row count each row is bitwise what the
+    next compiled handle up writes for it with the input padded by other (random) rows;
+    within the fp64 reference band; a captured launch replays bitwise on new operands; and
+    it refuses more rows than it was built for."""
+    dev = torch.cuda.current_device()
+    rag = compile_ragged(dev)
+    cells = {m: compile_handle(dev, m) for m in MTP_ROWS}
+    for rows in (*MTP_ROWS, *WIDE_ROWS):
+        x, weight, key, head_weights = _build(rows, seed=rows)
+        with validating(op):
+            op(x, weight, key, head_weights, rag)
+        cell = min(m for m in cells if m >= rows)
+        xp, _, kp, wp = _build(cell, seed=rows + 1000)
+        xp[:rows] = x
+        op(xp, weight, kp, wp, cells[cell])
+        torch.cuda.synchronize()
+        assert torch.equal(key, kp[:rows]) and torch.equal(head_weights, wp[:rows]), (
+            f"{rows} rows: not the {cell}-row handle's"
+        )
+        _compare(key, head_weights, *op.reference(x, weight, key, head_weights, rag))
+    x, weight, key, head_weights = _build(96, seed=96)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(x, weight, key, head_weights, rag)
+    x2, _, key2, head_weights2 = _build(96, seed=97)
+    x.copy_(x2)
+    op(x, weight, key2, head_weights2, rag)
+    key.fill_(float("nan"))
+    head_weights.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(key, key2) and torch.equal(head_weights, head_weights2)
+    with pytest.raises(ValueError, match="M=1..192"):
+        op(*_build(193, seed=5), rag)
 
 
 def test_guard_refuses_bf16_head_weights_on_the_prefill_handle() -> None:

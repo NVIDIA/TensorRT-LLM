@@ -11,11 +11,14 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("cute_dsl_projection runs sm_103 CuTe DSL kernels", allow_module_level=True)
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_projection import (  # noqa: E402, E501
+    MTP_ROWS,
     PREFILL_MAX_ROWS,
+    ROWS,
     SHARED_DOWN_PREFILL_MIN_ROWS,
     PrefillProjectionRunner,
     ProjectionRunner,
     SharedDownPrefillRunner,
+    at_rows,
     build,
     build_prefill,
     build_shared_down_prefill,
@@ -261,3 +264,114 @@ def test_the_shared_prefill_down_refuses_bad_operands_loudly() -> None:
     assert out.data_ptr() % 32 == 0 and out.data_ptr() % 128 != 0
     with pytest.raises(ValueError, match="alignment"):
         op(x, w, out, runner)
+
+
+def test_the_mtp_rows_are_decode_rows_left_out_by_default() -> None:
+    """An engine drafting one token builds exactly `ROWS`, as before the MTP3 / MTP5
+    cells existed: they sit above the decode row counts and outside the default set."""
+    for kernel, rows in MTP_ROWS.items():
+        assert all(m > 64 for m in rows), (kernel, rows)
+        assert not set(rows) & set(ROWS[kernel]), (kernel, rows)
+
+
+_MTP_CELLS = [c for c in op.CELLS if c.spec["rows"] in MTP_ROWS.get(c.spec["kernel"], ())]
+
+
+@pytest.mark.parametrize("cell", _MTP_CELLS, ids=[c.why[:44] for c in _MTP_CELLS])
+def test_mtp_cells_replay_bitwise_in_a_cuda_graph(cell) -> None:
+    """The MTP3 / MTP5 cells run inside the decode CUDA graph. A replay writes the eager
+    launch's bytes, and a replay after new operands are copied into the captured buffers
+    writes the new product, bitwise the eager launch's on them: nothing but the buffers'
+    addresses is baked into the graph."""
+    kernel, rows = cell.spec["kernel"], cell.spec["rows"]
+    s = shape_of(kernel)
+    g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    weight = _weight(kernel, g)
+    runner = build(kernel, rows, weight)
+    x = torch.randn(rows, s.k, generator=g, device="cuda").to(s.in_dtype)
+    out = torch.empty(rows, s.n, dtype=s.out_dtype, device="cuda")
+    op(x, weight, out, runner)
+    eager = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(x, weight, out, runner)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager), "the replay differs from the eager launch"
+    x.copy_(torch.randn(rows, s.k, generator=g, device="cuda").to(s.in_dtype))
+    weight.copy_(_weight(kernel, g))
+    again = torch.empty_like(out)
+    op(x, weight, again, runner)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, again), "the replay on new operands differs from the eager launch"
+    assert not torch.equal(again, eager), "the new operands did not change the product"
+    _compare(kernel, out, op.reference(x, weight, out, runner))
+
+
+#: MTP3 / MTP5 decode row counts without a cell: each bucket's edges (65, 127 / 129, 191),
+#: the 24-request batches (96, 144) and partial batches at widths 4 / 6.
+WIDE_ROWS = (65, 66, 68, 84, 96, 100, 126, 127, 129, 144, 150, 190, 191)
+#: What `out`'s storage past its last row holds before the call; it must hold it after.
+CANARY = -7.0
+
+
+@pytest.mark.parametrize("kernel", [k for k, rows in MTP_ROWS.items() if rows])
+def test_mtp_cells_at_fewer_rows_are_the_cells_bitwise(kernel) -> None:
+    """`at_rows` re-pins an MTP cell to fewer rows: the target's MTP3 / MTP5 decode row
+    counts without a cell run on the next cell up at their exact rows. Every row is bitwise
+    what the cell writes for it at its own row count with the input padded by other
+    (random) rows, nothing is written past the last row, the product is within the band of
+    the fp32 reference, and a captured launch replays bitwise the eager one on new operands.
+    """
+    s = shape_of(kernel)
+    g = torch.Generator(device="cuda").manual_seed(zlib.crc32(kernel.encode()) % 2**31)
+    weight = _weight(kernel, g)
+    # lm_head's 65..127 logits rows take its 128-row (context) instance, the next one up.
+    extra = (128,) if kernel == "lm_head" else ()
+    cells = {m: build(kernel, m, weight) for m in MTP_ROWS[kernel] + extra}
+    graphed = set()
+    for rows in WIDE_ROWS:
+        cell = min((m for m in cells if m > rows), default=None)
+        if cell is None:
+            continue
+        runner = at_rows(cells[cell], rows)
+        assert runner is not None and (runner.rows, runner.n) == (rows, s.n)
+        x = torch.randn(rows, s.k, generator=g, device="cuda").to(s.in_dtype)
+        parent = torch.full((rows + 8, s.n), CANARY, dtype=s.out_dtype, device="cuda")
+        out = parent[:rows]
+        with validating(op):
+            assert op(x, weight, out, runner) is out
+        padded = torch.randn(cell, s.k, generator=g, device="cuda").to(s.in_dtype)
+        padded[:rows] = x
+        full = torch.empty(cell, s.n, dtype=s.out_dtype, device="cuda")
+        op(padded, weight, full, cells[cell])
+        torch.cuda.synchronize()
+        assert torch.equal(out, full[:rows]), f"{rows} rows on the {cell}-row cell: not the cell's"
+        assert bool((parent[rows:] == CANARY).all()), f"{rows} rows: wrote past the last row"
+        _compare(kernel, out, op.reference(x, weight, out, runner))
+        if cell in graphed:
+            continue
+        graphed.add(cell)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(x, weight, out, runner)
+        x.copy_(torch.randn(rows, s.k, generator=g, device="cuda").to(s.in_dtype))
+        eager = torch.empty_like(out)
+        op(x, weight, eager, runner)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), f"{rows} rows: the replay differs from the eager launch"
+        assert bool((parent[rows:] == CANARY).all()), f"{rows} rows: the replay wrote past"
+
+
+def test_at_rows_refuses_more_rows_and_a_cell_compiled_for_one_m() -> None:
+    """More rows than the cell's would read and write past the operands; the tcgen05
+    decode cells (q_b at 64 rows) are compiled for their M and cannot take another."""
+    weight = _weight("q_b", torch.Generator(device="cuda").manual_seed(3))
+    assert at_rows(build("q_b", 128, weight), 129) is None
+    assert at_rows(build("q_b", 128, weight), 0) is None
+    assert at_rows(build("q_b", 64, weight), 48) is None

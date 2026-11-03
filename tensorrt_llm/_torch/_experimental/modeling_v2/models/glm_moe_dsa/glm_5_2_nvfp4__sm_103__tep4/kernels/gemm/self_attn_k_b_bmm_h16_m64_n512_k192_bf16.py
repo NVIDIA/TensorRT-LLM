@@ -601,10 +601,11 @@ def make_build(
 # ---------------------------------------------------------------------------
 
 # Compiled cells: the padded decode row counts of the serving config
-# (CUDA-graph buckets 1/2/4/8/16/24/32 requests x MTP 2 rows).  ``active_m`` is
+# (CUDA-graph buckets 1/2/4/8/16/24/32 requests x MTP 2 rows), plus 128 / 192
+# (32 requests x MTP3 / MTP5 widths 4 / 6).  ``active_m`` is
 # the GEMM's N in the swapped orientation; the schedule, PDL role, epilogue and
 # every other option are the same object at every cell.
-ACTIVE_M_CELLS: tuple[int, ...] = (2, 4, 8, 16, 32, 48, 64)
+ACTIVE_M_CELLS: tuple[int, ...] = (2, 4, 8, 16, 32, 48, 64, 128, 192)
 _FORMAL_ACTIVE_M = 64
 
 
@@ -636,9 +637,22 @@ def make_abi(active_m: int) -> BatchedGemmAbi:
 # schedule serves its whole row range (``SCHEDULE_GROUPS``).
 SCHEDULE_SMALL_M = GemmSchedule(False, (128, 8), (1, 1), raster_along="n")
 SCHEDULE_LARGE_M = GemmSchedule(False, (128, 32), (1, 1), raster_along="n")
+# MTP3 / MTP5 (128 / 192 rows): (128, 64). B300, cold weights: 2.80 / 3.13 us, against
+# 4.24 us on the prefill K-B those rows took; (128, 32) 2.92 / 3.25, (64, 64) 2.84 / 3.09,
+# (128, 128) 3.15 / 3.16. The target also builds it with the fp8 q-base epilogue and the
+# early signal (`build_decode_fp8_q_base`): the rope kernel of widths 4 / 6 runs beside it.
+SCHEDULE_MTP_M = GemmSchedule(False, (128, 64), (1, 1), raster_along="n")
 # (upper row bound inclusive, group name) in ascending order.
-SCHEDULE_GROUPS: tuple[tuple[int, str], ...] = ((8, "m_le_8"), (64, "m_ge_16"))
-_SCHEDULE_BY_GROUP = {"m_le_8": SCHEDULE_SMALL_M, "m_ge_16": SCHEDULE_LARGE_M}
+SCHEDULE_GROUPS: tuple[tuple[int, str], ...] = (
+    (8, "m_le_8"),
+    (64, "m_ge_16"),
+    (192, "m_ge_128"),
+)
+_SCHEDULE_BY_GROUP = {
+    "m_le_8": SCHEDULE_SMALL_M,
+    "m_ge_16": SCHEDULE_LARGE_M,
+    "m_ge_128": SCHEDULE_MTP_M,
+}
 
 
 def schedule_group_for_m(active_m: int) -> str:
@@ -659,6 +673,18 @@ def rows_of_group(group: str) -> tuple[int, ...]:
     return tuple(m for m in ACTIVE_M_CELLS if schedule_group_for_m(m) == group)
 
 
+#: The MTP group's compiled object (built at 192 rows) also serves every other MTP3 / MTP5
+#: decode row count above 64 at runtime M (a batch of fewer than 32 sequences: 65..191
+#: rows). The layouts are dynamic and the epilogue is the TMA store, which clips the last
+#: tile, so each row is bitwise what 128 / 192 compute for it.
+MTP_GROUP_RUNTIME_ROWS: tuple[int, ...] = tuple(range(65, 193))
+
+
+def rows_allowed(group: str) -> tuple[int, ...]:
+    """The row counts one compiled object of ``group`` accepts at launch."""
+    return MTP_GROUP_RUNTIME_ROWS if group == "m_ge_128" else rows_of_group(group)
+
+
 @lru_cache(maxsize=None)
 def _build_factory(emit_fp8_q_base: bool, group: str, early_signal: bool = False):
     rows = rows_of_group(group)
@@ -671,7 +697,7 @@ def _build_factory(emit_fp8_q_base: bool, group: str, early_signal: bool = False
             else WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
         ),
         emit_fp8_q_base=emit_fp8_q_base,
-        m_rows_allowed=rows,
+        m_rows_allowed=rows_allowed(group),
     )
 
 

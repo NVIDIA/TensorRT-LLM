@@ -15,6 +15,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nv
 )  # noqa: E402, E501
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.gemm.cute_dsl_absorbed_bmm import (  # noqa: E402, E501
     LAYOUTS,
+    MTP_GROUPS,
+    MTP_RUNTIME_ROWS,
     PREFILL_MAX_ROWS,
     AbsorbedBmmRunner,
     build,
@@ -47,7 +49,7 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 
 def _group(rows: int) -> str:
-    return "m_le_8" if rows <= 8 else "m_ge_16"
+    return "m_le_8" if rows <= 8 else "m_ge_16" if rows <= 64 else "m_ge_128"
 
 
 def _build(kernel: str, rows: int, seed: int):
@@ -120,34 +122,52 @@ def _check_fp8_cell(rows: int, seed: int, decode: bool = False) -> None:
     assert bool((quant[rows:] == SENTINEL_BYTE).all()), "the kernel wrote past the last row"
 
 
-#: o_proj's decode operand the V-B side output writes, one for the module: the kernels bake
-#: its addresses in, so it must outlive them.
+#: o_proj's decode operands the V-B side output writes, one per held row count for the module
+#: (64: the decode groups; 192: the MTP group, the wide decode o_proj's): the kernels bake
+#: their addresses in, so they must outlive them.
 _X8: dict = {}
+
+
+def _x8_operand(held: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.zeros(held, 4096, dtype=torch.uint8, device="cuda"),
+        torch.full((quant.sf_bytes(held, 4096),), 127, dtype=torch.uint8, device="cuda"),
+    )
 
 
 def _check_x8_cell(rows: int, seed: int) -> None:
     """The V-B's bf16 output is the plain decode cell's, bit for bit, and its side output is
-    the activation quant's bytes of that output read token-major as `[M, 4096]`."""
+    the activation quant's bytes of that output read token-major as `[M, 4096]` (rows and
+    scales of rows < M; the wide operand's rows were NaN bytes before the call)."""
     dev = torch.cuda.current_device()
-    if not _X8:
-        _X8["operand"] = (
-            torch.zeros(64, 4096, dtype=torch.uint8, device="cuda"),
-            torch.full((quant.sf_bytes(64, 4096),), 127, dtype=torch.uint8, device="cuda"),
-        )
-        _X8.update({g: build_v_b_mxf8_side(g, dev, _X8["operand"]) for g in ("m_le_8", "m_ge_16")})
+    group = _group(rows)
+    if group not in _X8:
+        held = 192 if group in MTP_GROUPS else 64
+        operand = _X8.setdefault(held, _x8_operand(held))
+        _X8[group] = build_v_b_mxf8_side(group, dev, operand)
+    xq, sf = _X8[192 if group in MTP_GROUPS else 64]
+    xq.fill_(0x7F)
     a, weight, out, parent = _build("v_b", rows, seed)
     with validating(op):
-        assert op(a, weight, out, _X8[_group(rows)]) is out
+        assert op(a, weight, out, _X8[group]) is out
     plain = torch.empty_like(parent)
-    op(a, weight, plain[:rows, :, :256].transpose(0, 1), build("v_b", _group(rows), dev))
+    op(a, weight, plain[:rows, :, :256].transpose(0, 1), build("v_b", group, dev))
     torch.cuda.synchronize()
     assert torch.equal(parent[:rows], plain[:rows]), "the bf16 output differs from the plain cell"
+    assert bool((parent[rows:] == SENTINEL).all()), "the kernel wrote past the last row"
     act = parent[:rows].reshape(rows, 4096).contiguous()
     want_q, want_sf = quant.reference(act)
-    xq, sf = _X8["operand"]
     assert torch.equal(xq[:rows], want_q), f"{int((xq[:rows] != want_q).sum())} bytes differ"
     got = quant.dequantize(xq[:rows].contiguous(), sf, rows, 4096)
     assert torch.equal(got, quant.dequantize(want_q, want_sf, rows, 4096)), "scales differ"
+
+
+@pytest.mark.parametrize("rows", (65, 96, 127, 144, 191))
+def test_mtp_group_side_output_at_other_wide_row_counts(rows) -> None:
+    """The MTP group's side-output V-B launches at every MTP3 / MTP5 decode row count above 64
+    (a batch of fewer than 32 sequences): the bf16 output is the plain MTP cell's and the
+    side operand the activation quant's bytes of it, as at 128 / 192."""
+    _check_x8_cell(rows, seed=rows + 31)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -193,6 +213,149 @@ def test_the_prefill_runner_refuses_rows_past_its_ceiling(kernel) -> None:
     a, weight, out, _ = _build(kernel, PREFILL_MAX_ROWS + 1, seed=1)
     with pytest.raises(ValueError, match="T <="):
         op(a, weight, out, _prefill(kernel))
+
+
+@pytest.mark.parametrize("kernel", ["k_b", "v_b"])
+@pytest.mark.parametrize("group", MTP_GROUPS)
+def test_mtp_group_replays_bitwise_in_a_cuda_graph(kernel, group) -> None:
+    """The MTP3 / MTP5 cells run inside the decode CUDA graph: a replay writes the eager
+    launch's bytes at each row count of the group, and a replay after new operands are
+    copied into the captured buffers writes the eager launch's product on them."""
+    n = LAYOUTS[kernel].n
+    runner = build(kernel, group, torch.cuda.current_device())
+    for rows in runner.rows:
+        a, weight, out, parent = _build(kernel, rows, seed=rows)
+        op(a, weight, out, runner)
+        eager = parent.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(a, weight, out, runner)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(parent, eager), f"{rows} rows: the replay differs from eager"
+        a2, weight2, _, _ = _build(kernel, rows, seed=rows + 1)
+        a.copy_(a2)
+        weight.copy_(weight2)
+        again = torch.empty_like(parent)
+        op(a, weight, again[:rows, :, :n].transpose(0, 1), runner)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(parent[:rows, :, :n], again[:rows, :, :n]), (
+            f"{rows} rows: the replay on new operands differs from eager"
+        )
+        assert not torch.equal(parent, eager), "the new operands did not change the product"
+        _compare(out, op.reference(a, weight, out, runner))
+
+
+#: MTP3 / MTP5 decode row counts without a cell: each bucket's edges, the 24-request batches
+#: (96, 144) and partial batches at widths 4 / 6.
+WIDE_ROWS = (65, 66, 68, 84, 96, 100, 126, 127, 129, 144, 150, 190, 191)
+
+
+@pytest.mark.parametrize("kernel", ["k_b", "v_b"])
+def test_mtp_group_at_other_wide_row_counts_is_its_cells_bitwise(kernel) -> None:
+    """The MTP group's object launches at every MTP3 / MTP5 decode row count above 64
+    (`MTP_RUNTIME_ROWS`; the target sends a batch of fewer than 32 sequences there): each
+    row is bitwise what it writes at 192 rows with the input padded by other (random) rows,
+    nothing is written past N or past the last row, within the band of the fp32 reference;
+    a captured launch at 96 rows replays bitwise on new operands. 64 and 193 still raise."""
+    n = LAYOUTS[kernel].n
+    runner = build(kernel, MTP_GROUPS[0], torch.cuda.current_device())
+    assert tuple(runner.rows) == (128, 192), "the cells stay 128 / 192"
+    assert set(WIDE_ROWS) <= set(MTP_RUNTIME_ROWS) and min(MTP_RUNTIME_ROWS) == 65
+    for rows in WIDE_ROWS:
+        a, weight, out, parent = _build(kernel, rows, seed=rows)
+        with validating(op):
+            assert op(a, weight, out, runner) is out
+        a_full, _, out_full, _ = _build(kernel, 192, seed=rows + 1000)
+        a_full[:, :rows].copy_(a)
+        op(a_full, weight, out_full, runner)
+        torch.cuda.synchronize()
+        assert torch.equal(out, out_full[:, :rows]), f"{rows} rows: not the 192-row launch's"
+        assert bool((parent[:rows, :, n:] == SENTINEL).all()), "the kernel wrote past N"
+        assert bool((parent[rows:] == SENTINEL).all()), "the kernel wrote past the last row"
+        _compare(out, op.reference(a, weight, out, runner))
+    rows = 96
+    a, weight, out, parent = _build(kernel, rows, seed=7)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(a, weight, out, runner)
+    a2, _, _, _ = _build(kernel, rows, seed=8)
+    a.copy_(a2)
+    again = torch.full_like(parent, SENTINEL)
+    op(a, weight, again[:rows, :, :n].transpose(0, 1), runner)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(parent, again), "the replay on new operands differs from eager"
+    for rows in (64, 193):
+        a, weight, out, _ = _build(kernel, rows, seed=rows)
+        with pytest.raises(ValueError, match="rows"):
+            op(a, weight, out, runner)
+
+
+def test_mtp_group_fp8_q_base_at_other_wide_row_counts() -> None:
+    """The MTP group's fp8 q-base K-B launches at every MTP3 / MTP5 decode row count above
+    64, as its plain cells do: at each its e4m3 bytes are the plain MTP cell's bf16 output
+    converted (nearest, saturating), nothing is written past N or past the last row, and a
+    captured launch at 96 rows replays the eager launch's bytes on new operands. 64 and 193
+    still raise."""
+    lay = LAYOUTS["k_b"]
+    dev = torch.cuda.current_device()
+    runner = build_decode_fp8_q_base(MTP_GROUPS[0], dev)
+    plain = build("k_b", MTP_GROUPS[0], dev)
+    assert tuple(runner.rows) == (128, 192), "the cells stay 128 / 192"
+
+    def quant_view(rows):
+        quant = torch.full(
+            (rows + CANARY_ROWS, lay.heads, lay.out_row), SENTINEL_BYTE, dtype=torch.uint8,
+            device="cuda",
+        )  # fmt: skip
+        return quant, quant[:rows, :, : lay.n].transpose(0, 1)
+
+    for rows in WIDE_ROWS:
+        a, weight, out_bf16, _ = _build("k_b", rows, seed=rows)
+        op(a, weight, out_bf16, plain)
+        quant, out = quant_view(rows)
+        with validating(op):
+            assert op(a, weight, out, runner) is out
+        torch.cuda.synchronize()
+        want = out_bf16.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
+        bad = int((out != want).sum())
+        assert bad == 0, f"{rows} rows: {bad} e4m3 bytes differ from e4m3(bf16 MTP cell)"
+        assert bool((quant[:rows, :, lay.n :] == SENTINEL_BYTE).all()), "the kernel wrote past N"
+        assert bool((quant[rows:] == SENTINEL_BYTE).all()), "the kernel wrote past the last row"
+    rows = 96
+    a, weight, _, _ = _build("k_b", rows, seed=7)
+    quant, out = quant_view(rows)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(a, weight, out, runner)
+    a2, _, _, _ = _build("k_b", rows, seed=8)
+    a.copy_(a2)
+    again, again_out = quant_view(rows)
+    op(a, weight, again_out, runner)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(quant, again), "the replay on new operands differs from eager"
+    assert int(quant[:rows, :, : lay.n].count_nonzero()) > rows * lay.heads * lay.n // 2
+    for rows in (64, 193):
+        a, weight, _, _ = _build("k_b", rows, seed=rows)
+        _, out = quant_view(rows)
+        with pytest.raises(ValueError, match="rows"):
+            op(a, weight, out, runner)
+
+
+@pytest.mark.parametrize("group", MTP_GROUPS)
+def test_the_mtp_groups_side_output_needs_the_wide_operand(group) -> None:
+    """The V-B MXF8 side output of the MTP group takes the wide o_proj's 192-row operand
+    only, and a decode group takes the 64-row one only: either other operand refuses."""
+    dev = torch.cuda.current_device()
+    with pytest.raises(ValueError, match=r"\[192, 4096\]"):
+        build_v_b_mxf8_side(group, dev, _x8_operand(64))
+    with pytest.raises(ValueError, match=r"\[64, 4096\]"):
+        build_v_b_mxf8_side("m_ge_16", dev, _x8_operand(192))
 
 
 def test_guard_refuses_the_bmm_out_view_of_a_weight() -> None:

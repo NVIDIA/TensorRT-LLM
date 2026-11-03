@@ -189,18 +189,30 @@ SMALL_TILE_MAX_ROWS: dict[str, int] = {
 }
 
 Compiled = Callable[..., object]
-_COMPILED: dict[tuple[str, str, int], Compiled] = {}
+_COMPILED: dict[tuple[str, str, int, bool], Compiled] = {}
 
 
-def compile_gemm(op: str, tile: str = DEFAULT_TILE, device_index: int = 0) -> Compiled:
-    """``fn(a[M,K] u8, b[N,K] u8, sfa u8, sfb u8, c[M,N] bf16|u8, M, N, K, stream)``."""
-    key = (op, tile, device_index)
+def compile_gemm(
+    op: str, tile: str = DEFAULT_TILE, device_index: int = 0, pdl: bool = False
+) -> Compiled:
+    """``fn(a[M,K] u8, b[N,K] u8, sfa u8, sfb u8, c[M,N] bf16|u8, M, N, K, stream)``.
+
+    ``pdl``: the instance launched as a programmatic dependent that issues its weight (B /
+    SFB) boxes of every pipeline stage before ``griddepcontrol.wait`` (``pdl_weights_first``;
+    same MMAs, bitwise the plain instance's output), named ``..._pdl``: for a decode chain
+    whose predecessor writes A. The context path keeps the plain instance."""
+    key = (op, tile, device_index, pdl)
     if key not in _COMPILED:
         abi = ABIS[op]
+        if pdl and abi.n_split_k is not None:
+            raise ValueError(f"{op}: the PDL instance does not take n_split_k")
         tiler, cluster = TILES[tile]
         gemm = GlmMxf8Gemm(_SF_VEC, tiler, cluster)
         gemm.n_split_k = abi.n_split_k
-        gemm.kernel.set_name_prefix(f"glm52_ctx_proj_mxf8_{op}", remove_cutlass_symbol=True)
+        gemm.pdl_weights_first = pdl
+        gemm.kernel.set_name_prefix(
+            f"glm52_ctx_proj_mxf8_{op}" + ("_pdl" if pdl else ""), remove_cutlass_symbol=True
+        )
         mac = cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
         c_dtype = cutlass.Uint8 if abi.out_e4m3 else cutlass.BFloat16
         _COMPILED[key] = cute.compile(

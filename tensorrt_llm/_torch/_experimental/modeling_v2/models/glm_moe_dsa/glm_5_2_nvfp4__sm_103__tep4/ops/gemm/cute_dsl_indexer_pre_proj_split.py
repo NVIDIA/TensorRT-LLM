@@ -17,6 +17,9 @@ from ...kernels.gemm import self_attn_prefill_projections_bf16 as _prefill
 
 #: Decode row counts the target compiles this entry for.
 ROWS = (1, 2, 4, 8, 16, 32, 48, 64)
+#: The MTP3 / MTP5 decode row counts (32 sequences x 4 / 6): the same kernel over two or
+#: three 64-row tiles, compiled only for an engine drafting more than one token.
+MTP_ROWS = (128, 192)
 
 #: Hidden 6144; 128 key columns, then 32 head-weight columns.
 _K, _KEY, _HEADS = _kernel.K, _kernel.INDEXER_K_DIM, _kernel.INDEXER_WEIGHT_DIM
@@ -55,6 +58,28 @@ def compile(device_id: int, rows: int) -> _kernel.CompiledSplitOutputs:
     with torch.cuda.device(device_id):
         compiled = _kernel.compile_split_outputs(rows, "bf16")
         _kernel.run_split_outputs(compiled, x, weight, key, head_weights)
+    return compiled
+
+
+def compile_ragged(device_id: int, max_rows: int = MTP_ROWS[-1]) -> _kernel.CompiledSplitOutputs:
+    """Compile the same kernel once on a symbolic row count: one handle for every row count
+    in `1..max_rows`, each row bitwise what a handle compiled for that count (or for 128 /
+    192 on a padded input) writes for it. For an engine drafting more than one token: its
+    decode row counts above 64 without an `MTP_ROWS` handle (a batch of fewer than 32
+    sequences, e.g. 96 / 144 rows at 24 requests).
+
+    Costs one CuTe DSL compile and two launches on zeros (`max_rows` and 65 rows), so the
+    module is loaded before any CUDA graph capture. Raises if the compile fails.
+    """
+    dev = torch.device("cuda", device_id)
+    with torch.cuda.device(device_id):
+        compiled = _kernel.compile_split_outputs_runtime_m(int(max_rows), "bf16")
+        weight = torch.zeros([_KEY + _HEADS, _K], dtype=torch.bfloat16, device=dev)
+        for rows in (int(max_rows), min(int(max_rows), 65)):
+            x = torch.zeros([rows, _K], dtype=torch.bfloat16, device=dev)
+            key = torch.empty([rows, _KEY], dtype=torch.bfloat16, device=dev)
+            head_weights = torch.empty([rows, _HEADS], dtype=torch.float32, device=dev)
+            _kernel.run_split_outputs(compiled, x, weight, key, head_weights)
     return compiled
 
 
@@ -121,6 +146,8 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
         Cell(why="MTP width 2, one sequence", spec=dict(rows=2)),
         Cell(why="a mid decode row count, a quarter of the tile", spec=dict(rows=16)),
         Cell(why="the full decode batch, one whole 64-row tile", spec=dict(rows=64)),
+        Cell(why="MTP3's decode batch, 32 x 4 rows: two 64-row tiles", spec=dict(rows=128)),
+        Cell(why="MTP5's decode batch, 32 x 6 rows: three 64-row tiles", spec=dict(rows=192)),
         Cell(
             why="prefill, 65 rows: the first context row count, one partial 128-row tile",
             spec=dict(rows=65, prefill=True),
@@ -134,7 +161,9 @@ class CuteDslIndexerPreProjSplit(OpWrapper):
 
     note = """
     The target compiles one decode handle per row count in `ROWS` (1, 2, 4, 8,
-    16, 32, 48, 64) and one prefill handle, which it uses above 64 rows. If the
+    16, 32, 48, 64) and one prefill handle, which it uses above 64 rows; an engine
+    drafting more than one token also compiles `MTP_ROWS` (128, 192) and uses them
+    for a decode step's rows only (a context step keeps the prefill handle). If the
     prefill build failed, those rows go to the fp32 `cute_dsl_projection`
     "ix_fused" kernel (or cuBLAS past it) at the target's call site.
 

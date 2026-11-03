@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2's sigmoid top-k with the routing maps fused in: the selected experts, their
 weights and the grouped GEMMs' six tile maps in one CuTe DSL op. A decode kernel per row
-count (1..64) and a three-stage prefill kernel (65..8192)."""
+count (1..64), a wide decode kernel per row range for the MTP3 / MTP5 decode widths
+(65..256), and a three-stage prefill kernel (65..8192)."""
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from ...kernels.moe import moe_prefill_topk_routing as _prefill
 from ...kernels.moe import moe_prefill_topk_routing_noraw as _prefill_noraw
 from ...kernels.moe import moe_topk_routing as _decode
 from ...kernels.moe import moe_topk_routing_push as _push
+from ...kernels.moe import moe_topk_routing_push_wide as _wide
 from .cute_dsl_moe_routing import (
     LOCAL_EXPERTS,
     MAP_KEYS,
@@ -48,6 +50,18 @@ uses_push_path = _push.uses_push_path
 DECODE_OUTPUTS = _decode.OUTPUT_ORDER
 #: What a prefill `outputs` set holds: the top-k pair, the histogram scratch, the maps.
 PREFILL_OUTPUTS = ("topk_weights", "topk_indices", "partial_counts", "expert_bases", *MAP_KEYS)
+#: The wide decode kernel's row domain (MTP3 / MTP5 decode widths): one 8-CTA cluster of 16,
+#: 24 or 32 token-warps per CTA, one compile per row range (`WIDE_RANGES`), the row count a
+#: runtime argument. Its `outputs` are the decode kernel's eight, sized like a prefill set's.
+WIDE_MIN_ROWS = _wide.MIN_TOKENS
+WIDE_MAX_ROWS = _wide.MAX_TOKENS
+WIDE_RANGES = tuple((8 * (w - 8) + 1, 8 * w) for w in _wide.WARP_COUNTS)
+
+
+def wide_range(rows: int) -> tuple[int, int]:
+    """The `(first, last)` row range of the wide handle serving `rows` (65..256)."""
+    w = _wide.warps_for_tokens(int(rows))
+    return 8 * (w - 8) + 1, 8 * w
 
 
 def allocate_decode_outputs(rows: int, device) -> dict[str, torch.Tensor]:
@@ -72,8 +86,10 @@ class CompiledTopkRouting:
     """A compiled top-k/routing kernel.
 
     Decode: `rows` is the exact row count, `logit_splits` the K partials it sums (1, or the
-    router's 4), and the PDL roles and zero plane are compiled in. Prefill: `rows` None
-    (any count in 65..8192), one logit plane, PDL as the engine sets it, no zero plane.
+    router's 4), and the PDL roles and zero plane are compiled in. Wide: `rows` is the last
+    row count of its range (`wide_range`), any count of which it runs; no zero plane.
+    Prefill: `rows` None (any count in 65..8192), one logit plane, PDL as the engine sets
+    it, no zero plane.
     `launch(logits, bias, local_expert_offset, routed_scale, outputs, zero_output,
     expert_hist)` is the kernel call; `expert_hist` is the int32 `[64]` row a handle built
     with `expert_hist=True` also writes (None otherwise).
@@ -169,6 +185,77 @@ def build_decode(
         signal,
         bool(fuse_zero),
         _decode_launch(compiled, fuse_zero, push, bool(expert_hist)),
+        bool(expert_hist),
+    )
+
+
+def _wide_launch(compiled, hist: bool) -> Callable[..., None]:
+    as_t = _decode._as_tensor
+
+    def launch(
+        logits, bias, local_expert_offset, routed_scale, outputs, zero_output, expert_hist=None
+    ):
+        # Flat views: the kernel indexes every output linearly, and the slot's weight
+        # buffer is 2-D.
+        compiled(
+            as_t(logits.reshape(-1), assumed_align=16),
+            as_t(bias),
+            *(as_t(outputs[name].reshape(-1)) for name in DECODE_OUTPUTS),
+            cutlass.Int32(int(logits.shape[0])),
+            cutlass.Int32(local_expert_offset),
+            cutlass.Float32(routed_scale),
+            cutlass_torch.current_stream(),
+            *((as_t(expert_hist, assumed_align=16),) if hist else ()),
+        )
+
+    return launch
+
+
+def build_wide(
+    rows: int,
+    logit_splits: int,
+    device,
+    *,
+    signal_gg1: bool = False,
+    expert_hist: bool = False,
+) -> CompiledTopkRouting:
+    """Compile the wide decode top-k for the row range holding `rows` (65..128, 129..192 or
+    193..256, `wide_range`) reading `logit_splits` planes (1: the prefill router's logits; 2,
+    4 or 8 K partials). Call at load. Compiles only; nothing is launched.
+
+    It waits for the router as its PDL dependent; `signal_gg1` releases the next grouped GEMM
+    early (see `note`). `expert_hist`: also write the step's token count per local expert
+    into an int32 `[64]` row (the L2 prefetch's, as the push widths do). Ids, weights and
+    per-expert counts are the decode and prefill kernels' bit for bit; experts past 128 rows
+    take two adjacent tiles.
+    """
+    _, hi = wide_range(rows)
+    shape = (hi, EXPERTS) if logit_splits == 1 else (hi, int(logit_splits), EXPERTS)
+    logits = torch.zeros(shape, dtype=torch.float32, device=device)
+    bias = torch.zeros(EXPERTS, dtype=torch.float32, device=device)
+    outputs = {
+        "topk_weights": torch.zeros(hi * TOP_K, dtype=torch.float32, device=device),
+        "topk_indices": torch.zeros(hi * TOP_K, dtype=torch.int32, device=device),
+        **allocate_maps(hi, device),
+    }
+    hist = torch.zeros(64, dtype=torch.int32, device=device) if expert_hist else None
+    signal = bool(_USE_PDL and signal_gg1)
+    with torch.cuda.device(device):
+        compiled = _wide.compile_fused_topk_routing_wide(
+            logits,
+            bias,
+            outputs,
+            wait_for_router_pdl=_USE_PDL,
+            signal_gg1_pdl=signal,
+            expert_hist=hist,
+        )
+    return CompiledTopkRouting(
+        "wide",
+        hi,
+        int(logit_splits),
+        signal,
+        False,
+        _wide_launch(compiled, bool(expert_hist)),
         bool(expert_hist),
     )
 
@@ -286,6 +373,8 @@ class CuteDslMoeTopkRouting(OpWrapper):
     increasing split order), `bias` fp32 `[256]`. `outputs` is the kernel's output set:
 
       decode   `allocate_decode_outputs(rows)`: the kernel's eight flat tensors.
+      wide     `topk_weights` / `topk_indices` (>= rows * 8, flat or 2-D) and a map set
+               from `allocate_maps` (other keys, a prefill set's scratch, are not read).
       prefill  `topk_weights` / `topk_indices` (>= rows * 8, flat or 2-D), the histogram
                scratch of `allocate_prefill_scratch`, and a map set from `allocate_maps`.
 
@@ -297,8 +386,10 @@ class CuteDslMoeTopkRouting(OpWrapper):
 
     # Decode: the block kernel (<= 8 rows) and the 8-CTA cluster at 64, the SIMT
     # router's 2-D logits and the tensor-core router's four partials, a width that does
-    # not signal the grouped GEMM, and the MTP layer's zero-fusing variant. Prefill: each
-    # histogram width at both edges of its row range, and the token budget.
+    # not signal the grouped GEMM, and the MTP layer's zero-fusing variant. Wide: each
+    # token-warp count at its row range's edges, MTP3's 128 and MTP5's 192 verify rows with
+    # the per-expert counts, one and four logit planes, and a hot expert past 128 rows (two
+    # tiles). Prefill: each histogram width at both edges of its row range, and the budget.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one decode row from the SIMT router's logits",
@@ -337,6 +428,34 @@ class CuteDslMoeTopkRouting(OpWrapper):
             spec=dict(rows=64, splits=4, signal_gg1=True, fuse_zero=True, offset=0),
         ),
         Cell(
+            why="65 rows, the wide kernel's first: 16 token-warps per CTA",
+            spec=dict(rows=65, splits=1, wide=True, offset=0),
+        ),
+        Cell(
+            why="127 rows on the wide kernel summing four K partials",
+            spec=dict(rows=127, splits=4, wide=True, offset=128),
+        ),
+        Cell(
+            why="MTP3's 128 verify rows on the wide kernel writing the per-expert counts",
+            spec=dict(rows=128, splits=1, wide=True, offset=64, expert_hist=True, hot=True),
+        ),
+        Cell(
+            why="129 rows, 24 token-warps: a hot expert over two tiles",
+            spec=dict(rows=129, splits=1, wide=True, offset=192, hot=True),
+        ),
+        Cell(
+            why="MTP5's 192 verify rows on the wide kernel writing the per-expert counts",
+            spec=dict(rows=192, splits=1, wide=True, offset=0, expert_hist=True, hot=True),
+        ),
+        Cell(
+            why="200 rows on the wide kernel: 32 token-warps per CTA",
+            spec=dict(rows=200, splits=4, wide=True, offset=64),
+        ),
+        Cell(
+            why="256 rows, the wide kernel's ceiling, a hot expert over two tiles",
+            spec=dict(rows=256, splits=1, wide=True, offset=128, hot=True),
+        ),
+        Cell(
             why="65 rows, the first prefill count: 4-warp histogram", spec=dict(rows=65, offset=0)
         ),
         Cell(why="128 rows, the 4-warp histogram's last count", spec=dict(rows=128, offset=64)),
@@ -358,7 +477,9 @@ class CuteDslMoeTopkRouting(OpWrapper):
     The MTP layer builds one per power-of-two width with `fuse_zero`. Only the trunk
     builds a prefill handle. The MTP layer's context rows, and the trunk's when that
     build failed, select with `noaux_tc_op` at the call site and build the maps with
-    `cute_dsl_moe_routing`.
+    `cute_dsl_moe_routing`. At MTP3 / MTP5 (`max_draft_len > 1`) the target also builds
+    one wide handle per row range, one logit plane (the prefill router's), which a decode
+    step of 65..256 rows takes instead of the prefill handle; MTP1 builds none.
 
     The returned maps belong to these exact rows: the grouped GEMMs given maps built for
     another row count read an illegal address rather than return a wrong answer, so the
@@ -458,6 +579,38 @@ class CuteDslMoeTopkRouting(OpWrapper):
                 assert zero_output.data_ptr() % _ZERO_ALIGN == 0, "zero plane: 16-byte aligned"
             else:
                 assert zero_output is None, "this handle has no zero plane"
+        elif compiled.kind == "wide":
+            # One handle per row range: a count outside it runs too few token-warps (rows
+            # dropped) or more than the slab it was compiled for.
+            lo, hi = wide_range(compiled.rows)
+            assert lo <= rows <= hi, f"this wide handle serves {lo}..{hi} rows, got {rows}"
+            assert zero_output is None, "the wide top-k has no zero plane"
+            assert logits.data_ptr() % 16 == 0, "logits: 16-byte aligned (128-bit loads)"
+            n, q = rows * TOP_K, _wide.max_tiles(rows)
+            need = {
+                "topk_weights": (n, torch.float32),
+                "topk_indices": (n, torch.int32),
+                "tile_idx_to_expert_idx": (q, torch.int32),
+                "tile_idx_to_mn_limit": (q, torch.int32),
+                "expanded_idx_to_permuted_idx": (n, torch.int32),
+                "permuted_idx_to_expanded_idx": (q * TILE, torch.int32),
+                "total_num_padded_tokens": (1, torch.int32),
+                "num_non_exiting_tiles": (1, torch.int32),
+            }
+            for name, (size, dtype) in need.items():
+                t = outputs[name]
+                assert t.dtype == dtype and t.is_contiguous(), f"{name} must be contiguous {dtype}"
+                assert t.numel() >= size, f"{name} holds {t.numel()}; {rows} rows write {size}"
+            if compiled.expert_hist:
+                assert (
+                    expert_hist is not None
+                    and expert_hist.dtype == torch.int32
+                    and tuple(expert_hist.shape) == (64,)
+                    and expert_hist.is_contiguous()
+                    and expert_hist.data_ptr() % 16 == 0
+                ), "this handle writes expert_hist: a contiguous 16-byte aligned int32 [64]"
+            else:
+                assert expert_hist is None, "this handle writes no expert counts"
         else:
             assert PREFILL_MIN_ROWS <= rows <= PREFILL_MAX_ROWS, (
                 f"the prefill top-k serves {PREFILL_MIN_ROWS}..{PREFILL_MAX_ROWS} rows"

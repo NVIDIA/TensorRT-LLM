@@ -3,7 +3,8 @@
 """Decode rows (1..64) of q_b and o_proj on the MXF8 weights the context path keeps: a PDL
 activation quant into a persistent 64-row operand and a tcgen05 block-scaled GEMM that
 streams its weight before its PDL wait, or the GEMM alone when the producer wrote the
-operand."""
+operand. `build_wide`: the same for o_proj at the MTP3 / MTP5 decode rows (65..192), on a
+192-row operand."""
 
 from __future__ import annotations
 
@@ -20,23 +21,32 @@ from ...kernels.gemm import self_attn_decode_projections_mxf8 as _kernel
 ENTRIES: dict[str, str] = {"q_b": "q_b_proj", "o_proj": "o_proj"}
 #: The largest row count: the decode CUDA graphs' batch.
 ROWS_MAX = _kernel.ROWS_MAX
+#: The entries `build_wide` serves, and the row counts (inclusive) of the MTP3 / MTP5 decode
+#: steps they take: 32 sequences x widths 4 / 6 and the ragged batches of fewer sequences.
+WIDE_ENTRIES: tuple[str, ...] = tuple(_kernel.WIDE_CONFIGS)
+WIDE_ROWS = (_kernel.WIDE_ROWS_MIN, _kernel.WIDE_ROWS_MAX)
 QuantizedWeight = _kernel.QuantizedWeight
 
 
 @dataclass(frozen=True)
 class DecodeMxf8Runner:
-    """One entry's launcher. `operand` is its `(xq [64, K] uint8, sfa)`: the activation the
-    GEMM reads, written by the launcher's quant or by a producer (allocated once, fixed
-    addresses a producer kernel may bake in)."""
+    """One entry's launcher. `operand` is its `(xq [R, K] uint8, sfa)` (R = 64, or 192 for a
+    wide runner): the activation the GEMM reads, written by the launcher's quant or by a
+    producer (allocated once, fixed addresses a producer kernel may bake in)."""
 
     kernel: str
     n: int
     k: int
-    launch: _kernel.DecodeMxf8Projection
+    launch: _kernel.DecodeMxf8Projection | _kernel.WideDecodeMxf8Projection
 
     @property
     def operand(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.launch.xq, self.launch.sfa
+
+    @property
+    def rows(self) -> tuple[int, int]:
+        """The row counts the launcher serves, inclusive."""
+        return self.launch.rows_min, self.launch.rows_max
 
 
 def build(kernel: str, weight: QuantizedWeight) -> DecodeMxf8Runner:
@@ -46,6 +56,21 @@ def build(kernel: str, weight: QuantizedWeight) -> DecodeMxf8Runner:
     launch = _kernel.build(ENTRIES[kernel], dev.index)
     with torch.cuda.device(dev):
         for rows in (ROWS_MAX, 1):
+            x = torch.zeros(rows, launch.k, dtype=torch.bfloat16, device=dev)
+            launch(x, weight, torch.empty(rows, launch.n, dtype=torch.bfloat16, device=dev))
+        torch.cuda.synchronize(dev)
+    launch.hits = launch.pre_hits = 0
+    return DecodeMxf8Runner(kernel, launch.n, launch.k, launch)
+
+
+def build_wide(kernel: str, weight: QuantizedWeight) -> DecodeMxf8Runner:
+    """`kernel`'s launcher for the MTP3 / MTP5 decode rows (`WIDE_ROWS`): compile its quant
+    and GEMM instances and launch them at 192 and 128 rows (every instance once), so no
+    decode step or graph capture meets a first module load. `weight` is any layer's weight."""
+    dev = weight.q.device
+    launch = _kernel.build_wide(ENTRIES[kernel], dev.index)
+    with torch.cuda.device(dev):
+        for rows in (launch.rows_max, 128):
             x = torch.zeros(rows, launch.k, dtype=torch.bfloat16, device=dev)
             launch(x, weight, torch.empty(rows, launch.n, dtype=torch.bfloat16, device=dev))
         torch.cuda.synchronize(dev)
@@ -64,8 +89,9 @@ def shift_scales(w: QuantizedWeight, exponent: int) -> QuantizedWeight:
 
 
 class CuteDslProjectionMxf8Decode(OpWrapper):
-    """`out = x @ W^T` for `x` bf16 `[M, K]`, M in 1..64, both operands MXF8 (the
-    activation quant's rule), fp32 accumulation, bf16 out.
+    """`out = x @ W^T` for `x` bf16 `[M, K]`, M in the runner's `rows` (1..64; 65..192 for
+    a `build_wide` runner), both operands MXF8 (the activation quant's rule), fp32
+    accumulation in K order, bf16 out.
 
     `x` needs a unit inner stride, a row pitch that is a multiple of 8 and 16-byte
     alignment; `weight` is the `[N, K]` `QuantizedWeight` (128-byte aligned); `out` a
@@ -95,6 +121,25 @@ class CuteDslProjectionMxf8Decode(OpWrapper):
             why="o_proj at 48 rows on the V-B GEMM's side output",
             spec=dict(kernel="o_proj", rows=48, pre=True),
         ),
+        # The wide runner (MTP3 / MTP5 decode rows): the template (up to 128 rows) and the
+        # context PDL GEMM (above), the first wide count, a ragged batch, through its own quant
+        # and on the V-B's side output.
+        Cell(
+            why="wide o_proj at 128 rows, MTP3's 32 x 4, on the V-B side output",
+            spec=dict(kernel="o_proj", rows=128, pre=True, wide=True),
+        ),
+        Cell(
+            why="wide o_proj at 192 rows, MTP5's 32 x 6, on the V-B side output",
+            spec=dict(kernel="o_proj", rows=192, pre=True, wide=True),
+        ),
+        Cell(
+            why="wide o_proj at 65 rows, the first wide count, through its quant",
+            spec=dict(kernel="o_proj", rows=65, wide=True),
+        ),
+        Cell(
+            why="wide o_proj at 150 rows, 25 x 6 on the context PDL instance",
+            spec=dict(kernel="o_proj", rows=150, wide=True),
+        ),
     )
 
     note = """
@@ -106,6 +151,11 @@ class CuteDslProjectionMxf8Decode(OpWrapper):
     GEMM runs alone. Rows of a mixed step and the MTP layer keep the bf16 decode cells.
     On B300 behind a PDL predecessor: o_proj 11.69 -> 9.11 us, q_b 6.12 -> 5.65 us per layer
     at 64 rows, and 2.3 us per launch more where the producer writes the operand.
+
+    An engine drafting more than one token also builds the wide o_proj runner
+    (`build_wide`) and takes it for an MTP3 / MTP5 decode step's trunk o_proj rows above 64,
+    on the operand the MTP group's V-B side output writes. Its K order and operands are the
+    context MXF8 GEMM's, which those rows took before: the output is that GEMM's, bitwise.
     """
 
     def __call__(
@@ -150,7 +200,8 @@ class CuteDslProjectionMxf8Decode(OpWrapper):
         pre: bool = False,
     ) -> None:
         rows = int(x.shape[0])
-        assert 1 <= rows <= ROWS_MAX, f"rows must be in 1..{ROWS_MAX}, got {rows}"
+        lo, hi = runner.rows
+        assert lo <= rows <= hi, f"rows must be in {lo}..{hi}, got {rows}"
         if not pre:
             runner.launch.check(x, weight, out)
             return

@@ -36,8 +36,9 @@ class CompiledZero:
 
 
 def build_decode(rows: int, device) -> CompiledZero:
-    """Compile the exact-row clear for `rows` rows (1..64), no PDL role. Call at load.
-    Compiles only (cached per process by the kernel module)."""
+    """Compile the exact-row clear for `rows` rows (1..64; 65..512 for the MTP3 / MTP5
+    decode widths), no PDL role. Call at load. Compiles only (cached per process by the
+    kernel module)."""
     out = torch.zeros(int(rows), HIDDEN, dtype=torch.bfloat16, device=device)
     with torch.cuda.device(device):
         compiled = _decode.compile_zero_rows(out)
@@ -71,6 +72,8 @@ class CuteDslMoeZero(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="a 4-row decode width, one CTA per row", spec=dict(rows=4)),
         Cell(why="the full decode batch", spec=dict(rows=64)),
+        Cell(why="MTP3's 128 decode rows on the exact-row clear", spec=dict(rows=128, decode=True)),
+        Cell(why="MTP5's 192 decode rows on the exact-row clear", spec=dict(rows=192, decode=True)),
         Cell(why="65 rows, the first prefill count of the byte clear", spec=dict(rows=65)),
         Cell(why="8192 rows: the byte clear capped at eight CTA waves", spec=dict(rows=8192)),
     )
@@ -80,7 +83,9 @@ class CuteDslMoeZero(OpWrapper):
     first: at a padded width. Decode widths there are powers of two up to 64 (the
     target builds 1, 2, ..., 64); context steps take the prefill clear, or `zero_()` at
     the call site when it did not build. The MTP layer clears through the fused top-k's
-    zero plane at decode widths and `zero_()` on context steps.
+    zero plane at decode widths and `zero_()` on context steps. The exact-row clear also
+    takes 65..512 rows (certified at MTP3's 128 and MTP5's 192); the target does not build
+    those yet (a wide decode step clears on the prefill clear when it clears at all).
 
     The decode clear runs with no PDL role; the prefill one waits for its predecessor and
     releases its dependent after its stores.

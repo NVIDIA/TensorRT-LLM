@@ -11,12 +11,15 @@ slot, so a kernel that reads its valid prefix one short drops the key that
 dominates the softmax.
 
 The handle is built the way the target builds it, for every batch up to a
-bound, and the bound is the largest batch any cell drives. A `gmem_split` cell
+bound, and the bound is the largest batch any cell drives. A cell of up to 2
+rows per sequence runs on the width-2 handle and a wider one on a handle built
+at its own `max_sq`, as MTP3 / MTP5 build theirs. A `gmem_split` cell
 takes the smallest batch whose kernel pick on this device is that split with
 the global-memory reducer; the device's SM count and cluster occupancy decide
 it, so it is found here rather than written into the cell.
 """
 
+import dataclasses
 import math
 import zlib
 
@@ -34,6 +37,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 op = entry.cute_dsl_sparse_mla_decode
+union_op = entry.cute_dsl_sparse_mla_decode_union
 HEADS, LATENT, V_DIM, TOP_K = entry.NUM_HEADS, entry.LATENT_DIM, entry.KV_LORA_RANK, entry.TOP_K
 PAGE = entry.LAYER_ROW_STRIDE
 LAYERS = 3
@@ -51,16 +55,19 @@ P_SUBNORMAL = 2.0**-10 / 448.0
 
 
 def _band(q, pool, rows, scale):
-    """`(A, Q2, S)` per output element, in fp64, from the operands.
+    """`(A, Q2, S, D)` per output element, in fp64, from the operands.
 
     `A = sum_r p_r |v_r|`, `Q2 = sum_r p_r**2 v_r**2`, and `S` bounds the
     subnormal-probability error, `P_SUBNORMAL * max_r p_r * sum_r |v_r|`
     (the max undoes the normalization: unnormalized, the top key is 1).
+    `D` is how far dropping the row and head's top-probability key would move
+    the output: `p / (1 - p) * |v_top - o|`, with `o = sum_r p_r v_r`, or `|o|`
+    when that key is the only one (no key left: the output is 0).
     """
     qd = q.view(torch.uint8).view(torch.float8_e4m3fn).float().double()
     kv = pool.reshape(-1).view(torch.uint8).reshape(-1, LATENT)
     shape = (qd.shape[0], HEADS, V_DIM)
-    a, q2, s_ = (torch.zeros(shape, dtype=torch.float64, device=q.device) for _ in range(3))
+    a, q2, s_, d = (torch.zeros(shape, dtype=torch.float64, device=q.device) for _ in range(4))
     for lo in range(0, qd.shape[0], 8):
         hi = min(lo + 8, qd.shape[0])
         r = rows[lo:hi]
@@ -68,11 +75,38 @@ def _band(q, pool, rows, scale):
         k = kv[r.clamp(min=0)].view(torch.float8_e4m3fn).float().double()
         s = torch.einsum("thd,tkd->thk", qd[lo:hi], k) * scale
         p = torch.softmax(s.masked_fill(~valid[:, None, :], float("-inf")), -1).nan_to_num(0.0)
-        v = k[..., :V_DIM].abs() * valid[..., None]
+        signed = k[..., :V_DIM] * valid[..., None]
+        v = signed.abs()
         a[lo:hi] = torch.einsum("thk,tkd->thd", p, v)
         q2[lo:hi] = torch.einsum("thk,tkd->thd", p * p, v * v)
         s_[lo:hi] = P_SUBNORMAL * p.amax(-1, keepdim=True) * v.sum(1)[:, None, :]
-    return a, q2, s_
+        top_p, top = p.max(-1)
+        v_top = torch.gather(signed, 1, top[..., None].expand(-1, -1, V_DIM))
+        o = torch.einsum("thk,tkd->thd", p, signed)
+        rest = 1.0 - top_p
+        moved = (top_p / rest.clamp_min(1e-300))[..., None] * (v_top - o).abs()
+        d[lo:hi] = torch.where((valid.sum(-1) == 1)[:, None, None], o.abs(), moved)
+    return a, q2, s_, d
+
+
+def _bound(band):
+    """The per-element gate of `_compare`."""
+    a, _, s, _ = band
+    return (P_ROUND + 2.0**-8 + 2.0**-12) * a + s
+
+
+def _assert_discriminative(band) -> None:
+    """The reference can tell a dropped key: in every query row, some head's
+    output would leave the band if its top-probability key were dropped (the
+    construction puts a row's top key at its last valid slot, which a prefix one
+    short skips). A flat softmax would pass a kernel that drops keys."""
+    a, _, _, d = band
+    assert float(a.amax()) > 0.0, "the reference output is all zero"
+    caught = (d > _bound(band)).any(-1).any(-1)
+    assert bool(caught.all()), (
+        f"{int((~caught).sum())} of {caught.numel()} query rows would not notice a "
+        "dropped top key: the softmax is too flat to certify the valid prefix"
+    )
 
 
 def _compare(out, ref, band) -> None:
@@ -91,10 +125,10 @@ def _compare(out, ref, band) -> None:
     square of at most `2**-8 Q2`, gated with a factor 2 on the root. A kernel
     reading a wrong row, a wrong prefix or a wrong scale misses by O(A).
     """
-    a, q2, s = band
+    a, q2, s, _ = band
     assert bool(torch.isfinite(out).all()), "an output element is not finite (unwritten?)"
     err = out.double().reshape(a.shape) - ref.double().reshape(a.shape)
-    bound = (P_ROUND + 2.0**-8 + 2.0**-12) * a + s
+    bound = _bound(band)
     over = err.abs() > bound
     assert not bool(over.any()), (
         f"{int(over.sum())} elements outside the band; worst |err| / bound = "
@@ -155,20 +189,27 @@ def _build(spec, seed):
         mla_bmm1_scale=torch.tensor(SCALES, dtype=torch.float32, device="cuda"),
         mla_bmm2_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         index_kind=kind,
-        local_layer_idx=layer if shift else None,
+        # Base rows take their layer even at layer 0 (no shift); global rows take none.
+        local_layer_idx=layer if kind == entry.INDEX_KIND_BASE_WITH_LAYER_OFFSET else None,
     )
     return args, rows
 
 
-def _gmem_batch(split: int) -> int | None:
-    """The smallest batch whose kernel pick on this device is `split` CTAs with
-    the global-memory reducer, or None when every batch of that split fits in
-    one occupancy wave. A split above 1 needs at least `2 * max_sq * batch`
-    SMs, so the search stops at the SM count."""
+def _width(p: int) -> int:
+    """The `max_sq` of the handle the target passes for `p` rows per sequence."""
+    return max(entry.MAX_SQ, p)
+
+
+def _gmem_batch(split: int, max_sq: int) -> int | None:
+    """The smallest batch whose kernel pick on this device, on a grid of
+    `max_sq` rows per sequence, is `split` CTAs with the global-memory reducer,
+    or None when every batch of that split fits in one occupancy wave. A split
+    above 1 needs at least `2 * max_sq * batch` SMs, so the search stops at the
+    SM count."""
     dev = torch.cuda.current_device()
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     for batch in range(1, sms + 1):
-        if entry.split_k_variant(batch, device_index=dev) == (split, True):
+        if entry.split_k_variant(batch, device_index=dev, max_sq=max_sq) == (split, True):
             return batch
     return None
 
@@ -179,7 +220,7 @@ def _resolve(spec) -> dict | None:
     device never selects it."""
     if "lens" in spec:
         return dict(spec)
-    batch = _gmem_batch(spec["gmem_split"])
+    batch = _gmem_batch(spec["gmem_split"], _width(spec["p"]))
     if batch is None:
         return None
     return dict(spec, lens=[spec["p"] + (347 * i) % 3000 for i in range(batch)])
@@ -187,10 +228,18 @@ def _resolve(spec) -> dict | None:
 
 @pytest.fixture(scope="module")
 def compiled():
-    """The handle as the target builds it, both index kinds, for every batch up
-    to the largest any cell drives."""
-    bound = max(len(r["lens"]) for c in op.CELLS if (r := _resolve(c.spec)) is not None)
-    return entry.compile(max_batch_size=bound, device_index=torch.cuda.current_device())
+    """The handles as the target builds them, by `max_sq`: both index kinds, for
+    every batch up to the largest any cell of that width drives."""
+    bounds: dict[int, int] = {}
+    for c in op.CELLS:
+        r = _resolve(c.spec)
+        if r is not None:
+            w = _width(r["p"])
+            bounds[w] = max(bounds.get(w, 0), len(r["lens"]))
+    dev = torch.cuda.current_device()
+    return {
+        w: entry.compile(max_batch_size=b, device_index=dev, max_sq=w) for w, b in bounds.items()
+    }
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -203,29 +252,199 @@ def test_certified_cells(cell, compiled, certifying) -> None:  # noqa: F811 — 
             "global-memory reducer on this device; the target never reaches it here"
         )
     certifying(op)
+    handle = compiled[_width(spec["p"])]
     args, rows = _build(spec, zlib.crc32(cell.why.encode()) % 2**31)
-    out = op(**args, compiled=compiled)
+    out = op(**args, compiled=handle)
     torch.cuda.synchronize()
-    ref = op.reference(**args, compiled=compiled)
-    _compare(out, ref, _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0]))
+    ref = op.reference(**args, compiled=handle)
+    band = _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0])
+    _assert_discriminative(band)
+    _compare(out, ref, band)
 
 
-def test_handle_covers_every_batch_up_to_a_large_bound() -> None:
-    """The target builds its handle for the engine's max_batch_size, whatever
+#: One cell per handle width the target passes: MTP1, and MTP3 / MTP5 verify on base rows;
+#: on B300, MTP5 at 32 (base rows), 31 (global rows) and 25 (base rows) sequences run
+#: split-K 2 with the cluster reducer.
+_REPLAY = {
+    "mtp1": dict(p=2, lens=[2049, 40, 3000], index_kind="global", layer=1),
+    "mtp3": dict(
+        p=4, lens=[4 + 271 * i for i in range(32)], index_kind="base_with_layer_offset", layer=2
+    ),
+    "mtp5": dict(
+        p=6, lens=[6 + 263 * i for i in range(32)], index_kind="base_with_layer_offset", layer=0
+    ),
+    "mtp5_b31": dict(p=6, lens=[9 + 211 * i for i in range(31)], index_kind="global", layer=2),
+    "mtp5_b25": dict(
+        p=6, lens=[6 + 337 * i for i in range(25)], index_kind="base_with_layer_offset", layer=1
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_REPLAY))
+def test_graph_replay_is_bitwise_eager(name, compiled) -> None:
+    """The target captures this op in its decode graph: a replay must write the
+    eager call's bytes, and a second replay on new inputs copied into the same
+    buffers must write that call's bytes (the runner binds addresses, not
+    values)."""
+    spec = _REPLAY[name]
+    handle = compiled[_width(spec["p"])]
+    args, _ = _build(spec, 41)
+    fresh, _ = _build(spec, 42)
+    eager = op(**args, compiled=handle).clone()
+    eager_fresh = op(**fresh, compiled=handle).clone()
+    args["output"].fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(**args, compiled=handle)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager.view(torch.int16))
+    for key in ("quant_q_buffer", "kv_pool_view", "sparse_attn_indices", "sequence_length"):
+        args[key].copy_(fresh[key])
+    args["output"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager_fresh.view(torch.int16))
+
+
+@pytest.mark.parametrize("max_sq", [entry.MAX_SQ, 4, 6], ids=["mtp1", "mtp3", "mtp5"])
+def test_handle_covers_every_batch_up_to_a_large_bound(max_sq) -> None:
+    """The target builds its handles for the engine's max_batch_size, whatever
     it is: every batch up to that bound must find its pick in the handle, for
     both index kinds, and the compile count must stay bounded. Picks the cells
     already built come from the compile cache."""
     dev = torch.cuda.current_device()
     bound = 2048
-    handle = entry.compile(max_batch_size=bound, device_index=dev)
+    handle = entry.compile(max_batch_size=bound, device_index=dev, max_sq=max_sq)
     built = {(k.num_ctas_kv, k.use_gmem_reduction, k.index_kind) for k in handle.kernels}
     kinds = (entry.INDEX_KIND_GLOBAL, entry.INDEX_KIND_BASE_WITH_LAYER_OFFSET)
     for batch in range(1, bound + 1):
-        variant = entry.split_k_variant(batch, device_index=dev)
+        variant = entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
         for kind in kinds:
             assert (*variant, kind) in built, (batch, variant, kind)
     # Splits 8, 4 and 2, each with or without the global-memory reducer, and 1.
     assert len(built) <= 7 * len(kinds), sorted(built)
+
+
+def _kernel_pick(batch: int, max_sq: int) -> tuple[int, bool]:
+    """The kernel's own split-K rule, as its runner applies it when not told."""
+    kernel = entry._kernel
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    ctas = kernel._select_num_ctas_kv(
+        batch_size=batch, max_sq=max_sq, max_seq_len_kv=TOP_K, multiprocessor_count=sms
+    )
+    gmem = ctas > 1 and kernel._select_gmem_reduction(
+        batch_size=batch, max_sq=max_sq, max_active_clusters=kernel._max_active_clusters(dev, ctas)
+    )
+    return ctas, bool(gmem)
+
+
+def test_only_the_wide_handle_overrides_the_kernel_pick(monkeypatch) -> None:
+    """MTP1 keeps the kernel's own split-K picks: the width-2 handle overrides no batch up to
+    2048. A wide handle overrides only its `SPLIT2_CLUSTER_BATCHES` (on a 148-SM B300: none
+    at max_sq 4, 25..32 sequences at max_sq 6), with split-K 2 and the cluster
+    reducer, and the op hands the runner exactly that pick there and None (the kernel's
+    rule) elsewhere."""
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    for max_sq in (entry.MAX_SQ, 4, 6):
+        want = entry.SPLIT2_CLUSTER_BATCHES.get((sms, max_sq), frozenset())
+        if max_sq == entry.MAX_SQ:
+            assert not want
+        for batch in range(1, 2049):
+            pick = entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
+            assert pick == ((2, False) if batch in want else _kernel_pick(batch, max_sq)), (
+                max_sq,
+                batch,
+            )
+    if sms == 148:
+        assert not entry.SPLIT2_CLUSTER_BATCHES.get((148, 4))
+        assert entry.SPLIT2_CLUSTER_BATCHES[(148, 6)] == set(range(25, 33))
+    seen = []
+    # The base module keeps only the shared parts (no runner since the base kernel's removal):
+    # spying on the wide module alone still proves no call reaches another kernel.
+    for module in (entry._wide_kernel,):
+
+        def spy(*args, _real=module.prepare_runner, _module=module, **kwargs):
+            runner = _real(*args, **kwargs)
+            seen.append(
+                (
+                    kwargs["num_ctas_kv"],
+                    kwargs["use_gmem_reduction"],
+                    runner.specialization,
+                    _module,
+                )
+            )
+            return runner
+
+        monkeypatch.setattr(module, "prepare_runner", spy)
+    for max_sq, batch in ((entry.MAX_SQ, 32), (4, 19), (4, 32), (6, 24), (6, 25), (6, 32)):
+        handle = entry.compile(max_batch_size=32, device_index=dev, max_sq=max_sq)
+        assert handle.split2_cluster_batches == {
+            b for b in entry.SPLIT2_CLUSTER_BATCHES.get((sms, max_sq), ()) if b <= 32
+        }
+        spec = dict(p=max_sq, lens=[3000 + 7 * i for i in range(batch)], index_kind="global")
+        args, _ = _build(dict(spec, layer=0), 11)
+        op(**args, compiled=handle)
+        forced, gmem, specialization, module = seen[-1]
+        # Every handle, MTP1's included, runs the V-reuse kernel.
+        assert module is entry._wide_kernel
+        if batch in handle.split2_cluster_batches:
+            assert (forced, gmem) == (2, False)
+        else:
+            assert (forced, gmem) == (None, None)
+        got = (specialization.num_ctas_kv, specialization.use_gmem_reduction)
+        assert got == entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
+
+
+def test_a_split2_batch_never_takes_the_steady_state_launch(monkeypatch) -> None:
+    """CTX-HOST-DIET's steady-state launch (`run_accepted`) replays what it recorded for a call
+    signature, and the signature does not name a wide handle's split-K 2 override: the op
+    records only the kernel's own pick and sends an override batch to `prepare_runner` on every
+    call. A handle without the override keeps the kernel's pick on its second (steady-state)
+    call, and the served handle keeps split-K 2 on both, in either order."""
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    if 25 not in entry.SPLIT2_CLUSTER_BATCHES.get((sms, 6), ()):
+        pytest.skip("no MTP5 split-K 2 override at 25 sequences on this device")
+    monkeypatch.setattr(entry, "_HOST_DIET", True)
+    monkeypatch.setattr(entry._wide_kernel, "_ACCEPTED", {})
+    served = entry.compile(max_batch_size=25, device_index=dev, max_sq=6)
+    assert 25 in served.split2_cluster_batches
+    plain = dataclasses.replace(served, split2_cluster_batches=frozenset())
+    spec = dict(p=6, lens=[6 + 307 * i for i in range(25)], index_kind="global", layer=0)
+    args, _ = _build(spec, 5)
+    want = {}
+    for name, forced in (("served", 2), ("plain", None)):
+        out = torch.full_like(args["output"], float("nan"))
+        runner = entry._wide_kernel.prepare_runner(
+            args["quant_q_buffer"],
+            args["kv_pool_view"],
+            args["sparse_attn_indices"],
+            out,
+            args["cu_q_seqlens"],
+            args["sequence_length"],
+            mla_bmm1_scale=args["mla_bmm1_scale"],
+            mla_bmm2_scale=args["mla_bmm2_scale"],
+            all_sparse_indices_valid=served.all_sparse_indices_valid,
+            max_sq=6,
+            num_ctas_kv=forced,
+            use_gmem_reduction=False if forced else None,
+            index_kind=spec["index_kind"],
+        )
+        runner.compiled = served.kernels[runner.specialization]
+        runner()
+        want[name] = out
+    torch.cuda.synchronize()
+    assert not torch.equal(want["served"].view(torch.int16), want["plain"].view(torch.int16))
+    for name, handle in (("plain", plain), ("served", served)) * 2:
+        out = torch.full_like(args["output"], float("nan"))
+        op(**dict(args, output=out), compiled=handle)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), want[name].view(torch.int16)), name
+    # One record: the plain handle's signature (its second call took the steady state).
+    assert len(entry._wide_kernel._ACCEPTED) == 1
 
 
 def test_a_batch_above_the_handle_raises_rather_than_compiling() -> None:
@@ -296,3 +515,245 @@ def test_is_valid_refuses_a_row_past_the_pool() -> None:
     args["sparse_attn_indices"][1, 0] = pool_rows
     with pytest.raises(AssertionError, match="past the pool"):
         op.is_valid(**args, compiled=_handle())
+
+
+# ---------------------------------------------------------------------------
+# The MTP3 / MTP5 union attention (`cute_dsl_sparse_mla_decode_union`)
+# ---------------------------------------------------------------------------
+
+
+def _build_union(spec, seed):
+    """`(args, rows)` for the union op: `_build`'s pool, query and selections (each row a
+    random 2048 of its causal prefix, top key last), passed as request-local positions with
+    the sequences' block table; `rows` the global pool rows they name, -1 past the prefix.
+    `widths` (optional) gives each sequence's row count (a runtime partial batch)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    cpu = torch.Generator().manual_seed(seed)
+    p, lens, layer = spec["p"], spec["lens"], spec["layer"]
+    widths = spec.get("widths", [p] * len(lens))
+    pages = [max(math.ceil(n / PAGE), 1) for n in lens]
+    num_pages = sum(pages) + 1
+    order = torch.randperm(num_pages, generator=cpu)
+    pool = (torch.randn(num_pages, LAYERS, PAGE, LATENT, generator=g, device="cuda") * SIGMA).to(
+        torch.float8_e4m3fn
+    )
+    total_q = sum(widths)
+    q = (torch.randn(total_q, HEADS, LATENT, generator=g, device="cuda") * SIGMA).to(
+        torch.float8_e4m3fn
+    )
+    kv = pool.reshape(-1).view(torch.uint8).reshape(-1, LATENT)
+    positions = torch.full((total_q, TOP_K), -1, dtype=torch.int32)
+    rows = torch.full((total_q, TOP_K), -1, dtype=torch.int64)
+    max_blocks = max(pages) + 2
+    table = torch.full((len(lens), max_blocks), -1, dtype=torch.int32)
+    req_idx = torch.empty(total_q, dtype=torch.int32)
+    used = qi = 0
+    for b, (n, w) in enumerate(zip(lens, widths)):
+        tab = order[used : used + pages[b]]
+        used += pages[b]
+        table[b, : pages[b]] = tab.to(torch.int32)
+        for t in range(w):
+            req_idx[qi] = b
+            causal = n - w + t + 1
+            valid = min(max(causal, 0), TOP_K)
+            if valid > 0:
+                pos = torch.randperm(causal, generator=cpu)[:valid]
+                sel = tab[pos // PAGE] * (LAYERS * PAGE) + layer * PAGE + pos % PAGE
+                k = kv[sel.cuda()].view(torch.float8_e4m3fn).float()
+                best = int((q[qi].float() @ k.t()).amax(0).argmax())
+                pos[[best, valid - 1]] = pos[[valid - 1, best]]
+                sel[[best, valid - 1]] = sel[[valid - 1, best]]
+                positions[qi, :valid] = pos.to(torch.int32)
+                rows[qi, :valid] = sel
+            qi += 1
+    cu = torch.tensor([0] + torch.tensor(widths).cumsum(0).tolist(), dtype=torch.int32) * HEADS
+    args = dict(
+        quant_q_buffer=q,
+        kv_pool_view=pool,
+        topk_positions=positions.cuda(),
+        block_table=table.cuda(),
+        req_idx=req_idx.cuda(),
+        output=torch.full(
+            (total_q, HEADS * V_DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+        ),
+        cu_q_seqlens=cu.cuda(),
+        sequence_length=torch.tensor(lens, dtype=torch.int32, device="cuda"),
+        layer_id=layer,
+        stride_factor=LAYERS * PAGE,
+    )
+    return args, rows.cuda()
+
+
+@pytest.fixture(scope="module")
+def compiled_union():
+    """Union handles by `max_sq` with a plan for every batch up to the largest any union cell
+    of that width drives, served by the target or not (the kernel answers every batch; which
+    ones the target sends it is a speed choice, `union_batches`)."""
+    bounds: dict[int, int] = {}
+    for c in union_op.CELLS:
+        bounds[c.spec["p"]] = max(bounds.get(c.spec["p"], 0), len(c.spec["lens"]))
+    dev = torch.cuda.current_device()
+    return {
+        w: entry.compile_union(
+            max_batch_size=b, device_index=dev, max_sq=w, batches=range(1, b + 1)
+        )
+        for w, b in bounds.items()
+    }
+
+
+@pytest.mark.parametrize("cell", union_op.CELLS, ids=[c.why[:44] for c in union_op.CELLS])
+def test_union_certified_cells(cell, compiled_union, certifying) -> None:  # noqa: F811
+    certifying(union_op)
+    spec = cell.spec
+    handle = compiled_union[spec["p"]]
+    args, rows = _build_union(spec, zlib.crc32(cell.why.encode()) % 2**31)
+    out = union_op(**args, compiled=handle)
+    torch.cuda.synchronize()
+    ref = union_op.reference(**args, compiled=handle)
+    band = _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0])
+    # Rows with no selection at all (a sequence shorter than its row's causal offset) have
+    # no key to drop: certify the rows that have one.
+    has_key = (rows >= 0).any(-1)
+    a, q2, s_, d = band
+    _assert_discriminative((a[has_key], q2[has_key], s_[has_key], d[has_key]))
+    _compare(out, ref, band)
+
+
+#: MTP3 / MTP5 at 32 sequences (the census batch), and MTP5 at 3 (the widest cluster split).
+_UNION_REPLAY = {
+    "mtp3": dict(p=4, lens=[4 + 271 * i for i in range(32)], layer=2),
+    "mtp5": dict(p=6, lens=[6 + 263 * i for i in range(32)], layer=0),
+    "mtp5_b3": dict(p=6, lens=[9, 2050, 3333], layer=1),
+}
+
+
+@pytest.mark.parametrize("name", list(_UNION_REPLAY))
+def test_union_graph_replay_is_bitwise_eager(name, compiled_union) -> None:
+    """Captured in the decode graph: a replay writes the eager call's bytes, and a replay on new
+    inputs copied into the same buffers writes that call's bytes."""
+    spec = _UNION_REPLAY[name]
+    handle = compiled_union[spec["p"]]
+    args, _ = _build_union(spec, 41)
+    fresh, _ = _build_union(spec, 42)
+    eager = union_op(**args, compiled=handle).clone()
+    eager_fresh = union_op(**fresh, compiled=handle).clone()
+    again = union_op(**args, compiled=handle).clone()
+    assert torch.equal(again.view(torch.int16), eager.view(torch.int16)), "not deterministic"
+    args["output"].fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        union_op(**args, compiled=handle)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager.view(torch.int16))
+    for key in (
+        "quant_q_buffer",
+        "kv_pool_view",
+        "topk_positions",
+        "block_table",
+        "req_idx",
+        "sequence_length",
+    ):
+        args[key].copy_(fresh[key])
+    args["output"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager_fresh.view(torch.int16))
+
+
+@pytest.mark.parametrize("max_sq", [4, 6], ids=["mtp3", "mtp5"])
+def test_union_handle_covers_every_batch_up_to_a_large_bound(max_sq) -> None:
+    """Every batch the union kernel serves on this device (`union_batches`) up to the engine's
+    bound finds its compiled pick, and no other batch has one (it takes the per-row kernel);
+    the picks keep every group's cluster in one occupancy wave and use at most 8 chunks."""
+    dev = torch.cuda.current_device()
+    handle = entry.compile_union(max_batch_size=256, device_index=dev, max_sq=max_sq)
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    served = entry.union_batches(dev, max_sq, 256)
+    assert set(handle.plans) == set(served)
+    for batch in sorted(served):
+        rg, chunks = handle.plans[batch]
+        assert (rg, chunks) == entry.union_plan(batch, device_index=dev, max_sq=max_sq)
+        groups = (max_sq + rg - 1) // rg
+        assert 1 <= chunks <= 8 and (chunks == 1 or batch * groups * chunks <= sms), (
+            batch,
+            rg,
+            chunks,
+        )
+    assert len(set(handle.plans.values())) <= 10
+
+
+def test_union_serves_the_measured_batches_on_b300() -> None:
+    """On a 148-SM B300 the target sends MTP5 at 13..15 and 24..32 sequences and MTP3 at
+    19..22 to the union kernel (`UNION_SERVED`); the census batch, MTP5 at 32, takes 3-row
+    groups on 2-chunk clusters, MTP5 at 14 and MTP3 at 21 2-row groups on 3-chunk ones."""
+    dev = torch.cuda.current_device()
+    if torch.cuda.get_device_properties(dev).multi_processor_count != 148:
+        pytest.skip("the served batches were measured on a 148-SM B300")
+    assert entry.union_batches(dev, 6, 32) == frozenset([13, 14, 15, *range(24, 33)])
+    assert entry.union_batches(dev, 4, 32) == frozenset(range(19, 23))
+    assert entry.union_plan(32, device_index=dev, max_sq=6) == (3, 2)
+    assert entry.union_plan(14, device_index=dev, max_sq=6) == (2, 3)
+    assert entry.union_plan(21, device_index=dev, max_sq=4) == (2, 3)
+
+
+def test_union_matches_the_per_row_kernel_within_the_band(compiled_union, compiled) -> None:
+    """The same selections through both MTP5 paths: each within the band of the fp64
+    reference (the union kernel sums the rows in another order, so not bitwise)."""
+    spec = dict(p=6, lens=[2850 + 7 * i for i in range(32)], layer=1)
+    args, rows = _build_union(spec, 5)
+    out_u = union_op(**args, compiled=compiled_union[6]).clone()
+    per_row = dict(
+        quant_q_buffer=args["quant_q_buffer"],
+        kv_pool_view=args["kv_pool_view"],
+        sparse_attn_indices=rows.to(torch.int32),
+        output=torch.full_like(args["output"], float("nan")),
+        cu_q_seqlens=args["cu_q_seqlens"],
+        sequence_length=args["sequence_length"],
+        mla_bmm1_scale=torch.tensor(SCALES, dtype=torch.float32, device="cuda"),
+        mla_bmm2_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
+        index_kind=entry.INDEX_KIND_GLOBAL,
+        local_layer_idx=None,
+    )
+    out_w = op(**per_row, compiled=compiled[6]).clone()
+    band = _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0])
+    ref = union_op.reference(**args, compiled=compiled_union[6])
+    _compare(out_u, ref, band)
+    _compare(out_w, ref, band)
+
+
+_UNION_GUARD = dict(p=4, lens=[40, 3000], layer=0)
+
+
+def _union_handle() -> "entry.CompiledSparseMlaDecodeUnion":
+    return entry.CompiledSparseMlaDecodeUnion(
+        device_index=torch.cuda.current_device(), max_batch_size=32, max_sq=4, plans={}
+    )
+
+
+def test_union_is_valid_admits_a_well_formed_call() -> None:
+    args, _ = _build_union(_UNION_GUARD, 1)
+    union_op.is_valid(**args, compiled=_union_handle())
+
+
+def test_union_is_valid_refuses_a_repeated_position() -> None:
+    """The union counts a position once; the per-row reference would count it twice."""
+    args, _ = _build_union(_UNION_GUARD, 2)
+    args["topk_positions"][1, 5] = args["topk_positions"][1, 6]
+    with pytest.raises(AssertionError, match="repeated position"):
+        union_op.is_valid(**args, compiled=_union_handle())
+
+
+def test_union_is_valid_refuses_a_position_in_the_tail() -> None:
+    """A sequence_length one short of the selection: the kernel ignores the row's last entry."""
+    args, _ = _build_union(_UNION_GUARD, 3)
+    args["sequence_length"][0] -= 1
+    with pytest.raises(AssertionError, match="after the row's valid prefix"):
+        union_op.is_valid(**args, compiled=_union_handle())
+
+
+def test_union_is_valid_refuses_a_position_past_the_sequence() -> None:
+    args, _ = _build_union(_UNION_GUARD, 4)
+    args["topk_positions"][2, 0] = int(args["sequence_length"][0])
+    with pytest.raises(AssertionError, match="outside"):
+        union_op.is_valid(**args, compiled=_union_handle())

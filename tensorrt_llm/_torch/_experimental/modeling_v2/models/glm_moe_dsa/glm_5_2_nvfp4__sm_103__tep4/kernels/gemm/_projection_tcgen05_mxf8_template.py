@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Primitive-level tcgen05 MXF8 projection GEMM for GLM-5.2 decode rows (M <= 64).
+"""Primitive-level tcgen05 MXF8 projection GEMM for GLM-5.2 decode rows (M <= 64; with
+``rows_max`` 128 / 192, the MTP3 / MTP5 decode rows).
 
 ``C[M, N] = (A_q * SFA) @ (W_q * SFW)^T`` with e4m3 operands and e8m0 scales per 32
 elements of K (tcgen05 ``kind::mxf8f6f4`` block scaling), FP32 accumulation, BF16 out.
@@ -9,6 +10,12 @@ A is the decode rows' activation quantized by ``self_attn_prefill_act_quant_mxf8
 context path already keeps resident (``self_attn_prefill_projections_mxf8.QuantizedWeight``:
 e4m3 ``[N, K]`` and the same blocked scale layout over N).  At decode sizes the BF16
 projections are weight-read bound, so reading half the bytes is the point.
+
+Wide decode rows (``Mxf8ProjectionConfig.rows_max`` 128 or 192, split-K 1): the activation
+box carries all ``rows_max`` rows; each 128-row block of them is its own ``M=128`` MMA
+into its own TMEM accumulator (``m_blocks`` = 1 or 2) with its own scale atom, issued
+in the same K order, and all four epilogue warps drain every block.  At ``rows_max`` 64
+(the default) the kernel is the M <= 64 one, unchanged.
 
 Schedule (one CTA per ``mma_n`` output columns and K slice; split-K ranks form a
 cluster along z and reduce through DSMEM, as ``_projection_tcgen05_template``):
@@ -100,8 +107,25 @@ class Mxf8ProjectionConfig:
     # TMA issues per byte.
     k_sub: int = 2
     kernel_name_prefix: str = ""
+    # Activation rows the operand scratch holds (the TMA's global row count): 64 for the
+    # M <= 64 decode rows, 128 / 192 for the MTP3 / MTP5 decode rows (``a_box_rows`` then
+    # equals it and ``split_k`` is 1).
+    rows_max: int = ROWS_MAX
 
     def __post_init__(self) -> None:
+        if self.rows_max not in (ROWS_MAX, 128, 192):
+            raise ValueError(
+                f"{self.module_name}: rows_max must be {ROWS_MAX}, 128 or 192, got {self.rows_max}"
+            )
+        if self.wide and (self.a_box_rows != self.rows_max or self.split_k != 1):
+            raise ValueError(
+                f"{self.module_name}: rows_max={self.rows_max} needs a_box_rows={self.rows_max} "
+                f"and split_k=1, got {self.a_box_rows} / {self.split_k}"
+            )
+        if not self.wide and self.a_box_rows not in (64, 128):
+            raise ValueError(
+                f"{self.module_name}: a_box_rows must be 64 or 128, got {self.a_box_rows}"
+            )
         if self.prefetch_w not in ("none", "rest", "all"):
             raise ValueError(
                 f"{self.module_name}: prefetch_w must be none/rest/all, got {self.prefetch_w!r}"
@@ -111,10 +135,6 @@ class Mxf8ProjectionConfig:
         if self.local_k_steps % self.k_sub:
             raise ValueError(
                 f"{self.module_name}: per-rank K tiles {self.local_k_steps} not a multiple of k_sub={self.k_sub}"
-            )
-        if self.a_box_rows not in (64, 128):
-            raise ValueError(
-                f"{self.module_name}: a_box_rows must be 64 or 128, got {self.a_box_rows}"
             )
         if self.mma_n not in (64, 128):
             raise ValueError(f"{self.module_name}: mma_n must be 64 or 128, got {self.mma_n}")
@@ -173,8 +193,29 @@ class Mxf8ProjectionConfig:
         return self.stages if self.sf_per_stage else 1
 
     @property
+    def wide(self) -> bool:
+        """MTP3 / MTP5 decode rows (``rows_max`` above 64)."""
+        return self.rows_max > ROWS_MAX
+
+    @property
+    def m_blocks(self) -> int:
+        """128-row MMA blocks of the activation (one TMEM accumulator and scale atom each)."""
+        return _ceil_div(self.rows_max, MMA_M)
+
+    @property
+    def owner_warps(self) -> int:
+        """Epilogue warps holding activation rows: TMEM subpartitions 0..owner_warps-1."""
+        return min(self.rows_max, MMA_M) // WARP_THREADS
+
+    @property
     def tmem_cols_alloc(self) -> int:
-        return 1 << (self.mma_n + 2 * SF_TMEM_COLS * self.k_sub * self.sf_bufs - 1).bit_length()
+        # m_blocks accumulators, then per scale buffer m_blocks activation and one weight
+        # scale atom per 128-K box (m_blocks = 1: the M <= 64 kernel's columns).
+        cols = (
+            self.m_blocks * self.mma_n
+            + (self.m_blocks + 1) * SF_TMEM_COLS * self.k_sub * self.sf_bufs
+        )
+        return 1 << (cols - 1).bit_length()
 
     @property
     def stage_ab_bytes(self) -> int:
@@ -218,7 +259,7 @@ class Mxf8ProjectionConfig:
 
     @property
     def smem_total_bytes(self) -> int:
-        stage = self.stage_ab_bytes + 2 * SF_ATOM_BYTES * self.k_sub
+        stage = self.stage_ab_bytes + (self.m_blocks + 1) * SF_ATOM_BYTES * self.k_sub
         return self.stages * stage + self.mailbox_values * 4 + 8 * (2 * self.stages + 2) + 4 + 1024
 
     @property
@@ -252,15 +293,24 @@ def kernel(
     sf_bufs: cutlass.Constexpr[int],
     a_box_rows: cutlass.Constexpr[int],
     k_sub: cutlass.Constexpr[int],
+    m_blocks: cutlass.Constexpr[int],
+    owner_warps: cutlass.Constexpr[int],
+    wide: cutlass.Constexpr[bool],
 ) -> None:
     # Stage pool: [A_0 .. A_{k_sub-1} | W_0 .. W_{k_sub-1}], one box per 128 of K. With a
     # 64-row A box the MMA's 128-row A operand of chunk j runs on into the next box (rows
-    # 64..127 only feed accumulator rows that are never stored).
+    # 64..127 only feed accumulator rows that are never stored); likewise the second
+    # 128-row block of a 192-row box (rows 192..255).
     A_BOX: cutlass.Constexpr[int] = a_box_rows * TILE_K
     W_BOX: cutlass.Constexpr[int] = mma_n * TILE_K
     STAGE_AB: cutlass.Constexpr[int] = (A_BOX + W_BOX) * k_sub
     W_OFF: cutlass.Constexpr[int] = A_BOX * k_sub
+    # Scale atoms per stage: [block 0: k_sub atoms | block 1: k_sub atoms] of the activation,
+    # k_sub atoms of the weight.
     SF_STAGE: cutlass.Constexpr[int] = SF_ATOM_BYTES * k_sub
+    SFA_STAGE: cutlass.Constexpr[int] = SF_STAGE * m_blocks
+    # A descriptor step between 128-row MMA blocks: 128 rows of 128 B (16-byte units).
+    A_MBLOCK_STEP: cutlass.Constexpr[int] = (MMA_M * TILE_K) >> 4
     stage_steps: cutlass.Constexpr[int] = local_k_steps // k_sub
     smem_ab = cutlass.Array(
         cutlass.Int8,
@@ -269,7 +319,7 @@ def kernel(
         alignment=SWIZZLED_SMEM_ALIGNMENT,
     )
     smem_sfa = cutlass.Array(
-        cutlass.Int8, stages * SF_STAGE, space=cutlass.AddressSpace.smem, alignment=128
+        cutlass.Int8, stages * SFA_STAGE, space=cutlass.AddressSpace.smem, alignment=128
     )
     smem_sfw = cutlass.Array(
         cutlass.Int8, stages * SF_STAGE, space=cutlass.AddressSpace.smem, alignment=128
@@ -340,7 +390,7 @@ def kernel(
 
     tx_bytes = (
         (tma_a.global_tx_bytes() + tma_w.global_tx_bytes()) * k_sub
-        + tma_sfa.global_tx_bytes()
+        + tma_sfa.global_tx_bytes() * m_blocks
         + tma_sfw.global_tx_bytes()
     )
 
@@ -382,12 +432,13 @@ def kernel(
                         ),
                         full_bar.subview(s),
                     )
-                prims.cp_async_bulk_tensor_shared_cta_global(
-                    smem_sfa.subview(s * SF_STAGE),
-                    sfa_desc,
-                    (cutlass.Int32(0), kt),
-                    full_bar.subview(s),
-                )
+                for mb in cutlass.range_constexpr(m_blocks):
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        smem_sfa.subview(s * SFA_STAGE + mb * SF_STAGE),
+                        sfa_desc,
+                        (cutlass.Int32(0), kt if mb == 0 else kt + cutlass.Int32(mb * k_tiles)),
+                        full_bar.subview(s),
+                    )
         if cutlass.const_expr(stage_steps > stages):
             # Stage / phase counters, not ``k % stages``: a non-power-of-two divide per
             # iteration is a long integer sequence on the issue-bound producer.
@@ -423,12 +474,16 @@ def kernel(
                         (cutlass.Int32(0), sfw_atom_base + k * cutlass.Int32(k_sub)),
                         full_bar.subview(stage),
                     )
-                    prims.cp_async_bulk_tensor_shared_cta_global(
-                        smem_sfa.subview(stage * SF_STAGE),
-                        sfa_desc,
-                        (cutlass.Int32(0), kt),
-                        full_bar.subview(stage),
-                    )
+                    for mb in cutlass.range_constexpr(m_blocks):
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            smem_sfa.subview(stage * SFA_STAGE + mb * SF_STAGE),
+                            sfa_desc,
+                            (
+                                cutlass.Int32(0),
+                                kt if mb == 0 else kt + cutlass.Int32(mb * k_tiles),
+                            ),
+                            full_bar.subview(stage),
+                        )
                 stage = stage + cutlass.Int32(1)
                 if stage == cutlass.Int32(stages):
                     stage = cutlass.Int32(0)
@@ -457,7 +512,10 @@ def kernel(
         s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
         base_col = tmem_base_raw & 0xFFFF
         base_row = tmem_base_raw >> 16
-        sf0 = (base_row << 16) | (base_col + cutlass.Int32(mma_n))
+        # Scale columns after the m_blocks accumulators: per buffer and 128-K box j, the
+        # activation atom of block mb at (mb * k_sub + j), the weight atom at
+        # (m_blocks * k_sub + j), 4 columns each.
+        sf0 = (base_row << 16) | (base_col + cutlass.Int32(mma_n * m_blocks))
         # Stage-0 descriptors, built once; a stage / chunk / K-block is an offset in 16-byte
         # descriptor units.
         desc_ab0 = _compat48.tcgen05_smem_desc(
@@ -494,22 +552,28 @@ def kernel(
             if prims.elect_sync():
                 off_ab = stage * cutlass.Int32(STAGE_AB >> 4)
                 off_sf = stage * cutlass.Int32(SF_STAGE >> 4)
+                off_sfa = off_sf
+                if cutlass.const_expr(m_blocks > 1):
+                    off_sfa = stage * cutlass.Int32(SFA_STAGE >> 4)
                 sf_col = sf0
                 if cutlass.const_expr(sf_bufs > 1):
-                    sf_col = sf0 + stage * cutlass.Int32(2 * SF_TMEM_COLS * k_sub)
+                    sf_col = sf0 + stage * cutlass.Int32((m_blocks + 1) * SF_TMEM_COLS * k_sub)
                 for j in cutlass.range_constexpr(k_sub):
+                    for mb in cutlass.range_constexpr(m_blocks):
+                        prims.tcgen05_cp(
+                            s2t_shape,
+                            cutlass.inttoptr(
+                                sf_col + cutlass.Int32((mb * k_sub + j) * SF_TMEM_COLS),
+                                6,
+                                cutlass.Int32,
+                            ),
+                            desc_sfa0 + off_sfa + ((mb * k_sub + j) * SF_ATOM_BYTES >> 4),
+                            multicast=s2t_multicast,
+                        )
                     prims.tcgen05_cp(
                         s2t_shape,
                         cutlass.inttoptr(
-                            sf_col + cutlass.Int32(j * SF_TMEM_COLS), 6, cutlass.Int32
-                        ),
-                        desc_sfa0 + off_sf + (j * SF_ATOM_BYTES >> 4),
-                        multicast=s2t_multicast,
-                    )
-                    prims.tcgen05_cp(
-                        s2t_shape,
-                        cutlass.inttoptr(
-                            sf_col + cutlass.Int32((k_sub + j) * SF_TMEM_COLS),
+                            sf_col + cutlass.Int32((m_blocks * k_sub + j) * SF_TMEM_COLS),
                             6,
                             cutlass.Int32,
                         ),
@@ -517,11 +581,10 @@ def kernel(
                         multicast=s2t_multicast,
                     )
                 for j in cutlass.range_constexpr(k_sub):
-                    sfa_ptr = cutlass.inttoptr(
-                        sf_col + cutlass.Int32(j * SF_TMEM_COLS), 6, cutlass.Int32
-                    )
                     sfw_ptr = cutlass.inttoptr(
-                        sf_col + cutlass.Int32((k_sub + j) * SF_TMEM_COLS) + sfw_col_offset,
+                        sf_col
+                        + cutlass.Int32((m_blocks * k_sub + j) * SF_TMEM_COLS)
+                        + sfw_col_offset,
                         6,
                         cutlass.Int32,
                     )
@@ -530,17 +593,29 @@ def kernel(
                         w_step: cutlass.Constexpr[int] = ((W_OFF + j * W_BOX) >> 4) + (
                             INST_K >> 4
                         ) * kb
-                        prims.tcgen05_mma_block_scale(
-                            prims.MMABlockScaleKind.MXF8F6F4,
-                            prims.CTAGroup.CTA_1,
-                            tmem_ptr,
-                            desc_ab0 + off_ab + a_step,
-                            desc_ab0 + off_ab + w_step,
-                            idesc_k[kb],
-                            (k > 0) if (j == 0 and kb == 0) else True,
-                            sfa_ptr,
-                            sfw_ptr,
-                        )
+                        for mb in cutlass.range_constexpr(m_blocks):
+                            # Block mb: its rows of the A box, its accumulator, its scales.
+                            sfa_ptr = cutlass.inttoptr(
+                                sf_col + cutlass.Int32((mb * k_sub + j) * SF_TMEM_COLS),
+                                6,
+                                cutlass.Int32,
+                            )
+                            acc_ptr = tmem_ptr
+                            if cutlass.const_expr(mb > 0):
+                                acc_ptr = cutlass.inttoptr(
+                                    tmem_base_raw + cutlass.Int32(mb * mma_n), 6, cutlass.Float32
+                                )
+                            prims.tcgen05_mma_block_scale(
+                                prims.MMABlockScaleKind.MXF8F6F4,
+                                prims.CTAGroup.CTA_1,
+                                acc_ptr,
+                                desc_ab0 + off_ab + (a_step + mb * A_MBLOCK_STEP),
+                                desc_ab0 + off_ab + w_step,
+                                idesc_k[kb],
+                                (k > 0) if (j == 0 and kb == 0) else True,
+                                sfa_ptr,
+                                sfw_ptr,
+                            )
                 prims.tcgen05_commit(empty_bar.subview(stage), group=prims.CTAGroup.CTA_1)
             stage = stage + cutlass.Int32(1)
             if stage == cutlass.Int32(stages):
@@ -553,89 +628,127 @@ def kernel(
     while not prims.mbarrier_try_wait_parity(acc_mbar, 0, time_limit=10_000_000):
         pass
 
-    # ---- drain TMEM: rows 0..63 = lanes of subpartitions 0 and 1 ------------
     sp = warp_idx % cutlass.Int32(4)
-    is_owner = (warp_idx >= EPI_WARP0) & (sp < cutlass.Int32(2))
     owner_id = sp * cutlass.Int32(WARP_THREADS) + lane
     tmem_base = prims.TmemAddr(tmem_base_raw)
     acc = cutlass.Array(cutlass.Float32, mma_n, alignment=32)
-    if is_owner:
-        for sub in cutlass.range_constexpr(tmem_subs):
-            tsub = prims.TmemAddr.from_row_col(
-                tmem_base.row_id + sp * cutlass.Int32(WARP_THREADS),
-                tmem_base.col_id + sub * 32,
-            ).as_ptr(cutlass.Float32)
-            acc.store(prims.tcgen05_ld("32x32b", tsub, num=32), sub * 32)
-        prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
-
-    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-    prims.barrier_cta_sync(0)
-    if warp_idx == TMA_WARP:
-        prims.tcgen05_dealloc(tmem_ptr, tmem_cols_alloc, group="cta_1")
-
-    # ---- DSMEM split-K reduction (as _projection_tcgen05_template) -----------
-    if cutlass.const_expr(reduce_peers > 0):
-        prims.barrier_cluster_wait()
-        if is_owner:
-            for tgt in cutlass.range_constexpr(reducers):
-                if cta_rank != cutlass.Int32(tgt):
-                    slot = (
-                        cta_rank - cutlass.Int32(1) if cta_rank > cutlass.Int32(tgt) else cta_rank
-                    )
-                    base = slot * cutlass.Int32(
-                        OWNER_TOTAL * mailbox_stride
-                    ) + owner_id * cutlass.Int32(mailbox_stride)
-                    peer_full = prims.mapa(reduce_full, cutlass.Int32(tgt))
-                    for ch in cutlass.range_constexpr(chunk_cols // 4):
-                        src = tgt * chunk_cols + ch * 4
-                        payload = acc.load(src, vector_size=4, alignment=16).bitcast(cutlass.Int32)
-                        _compat48.store_async(
-                            prims.mapa(
-                                reduce_mailbox.data_ptr() + base + cutlass.Int32(ch * 4),
-                                cutlass.Int32(tgt),
-                            ),
-                            payload,
-                            peer_full,
-                        )
-        if cta_rank < cutlass.Int32(reducers):
-            while not prims.mbarrier_try_wait_parity(reduce_full, 0):
-                pass
-            cute.arch.fence_acq_rel_cta()
-            if is_owner:
-                for r in cutlass.range_constexpr(reducers):
-                    if cta_rank == cutlass.Int32(r):
-                        for peer in cutlass.range_constexpr(reduce_peers):
-                            base = cutlass.Int32(
-                                peer * OWNER_TOTAL * mailbox_stride
-                            ) + owner_id * cutlass.Int32(mailbox_stride)
-                            for ch in cutlass.range_constexpr(chunk_cols // 4):
-                                got = reduce_mailbox.subview(base + cutlass.Int32(ch * 4)).load(
-                                    vector_size=4, alignment=16
-                                )
-                                for i in cutlass.range_constexpr(4):
-                                    dst = r * chunk_cols + ch * 4 + i
-                                    acc[dst] = acc[dst] + got[i]
-
-    # ---- each reducer stores its column slice of the valid rows -------------
-    if cta_rank < cutlass.Int32(reducers):
+    if cutlass.const_expr(wide):
+        # ---- wide rows: every epilogue warp drains its 32 lanes of each 128-row block
+        # (row mb * 128 + lane), converts and stores them, then the TMEM dealloc.
+        is_owner = (warp_idx >= EPI_WARP0) & (sp < cutlass.Int32(owner_warps))
         if is_owner:
             gC = c_ptr.iterator.raw_ptr()
-            in_range = owner_id < rows
-            for r in cutlass.range_constexpr(reducers):
-                if cta_rank == cutlass.Int32(r):
-                    for off, width in store_plan:
-                        col = coord_n + cutlass.Int32(r * chunk_cols + off)
-                        out = (
-                            acc.load(r * chunk_cols + off, vector_size=width, alignment=16)
-                            .to(cutlass.BFloat16)
-                            .bitcast(cutlass.Int16)
+            for mb in cutlass.range_constexpr(m_blocks):
+                for sub in cutlass.range_constexpr(tmem_subs):
+                    tsub = prims.TmemAddr.from_row_col(
+                        tmem_base.row_id + sp * cutlass.Int32(WARP_THREADS),
+                        tmem_base.col_id + (mb * mma_n + sub * 32),
+                    ).as_ptr(cutlass.Float32)
+                    acc.store(prims.tcgen05_ld("32x32b", tsub, num=32), sub * 32)
+                prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+                row = owner_id + cutlass.Int32(mb * MMA_M)
+                in_range = row < rows
+                for off, width in store_plan:
+                    col = coord_n + cutlass.Int32(off)
+                    out = (
+                        acc.load(off, vector_size=width, alignment=16)
+                        .to(cutlass.BFloat16)
+                        .bitcast(cutlass.Int16)
+                    )
+                    if in_range:
+                        prims.store_ext(
+                            out,
+                            gC + row * cutlass.Int32(output_n) + col,
+                            evict=L1EvictKind.NOALLOCATE,
                         )
-                        if in_range:
-                            prims.store_ext(
-                                out,
-                                gC + owner_id * cutlass.Int32(output_n) + col,
-                                evict=L1EvictKind.NOALLOCATE,
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        prims.barrier_cta_sync(0)
+        if warp_idx == TMA_WARP:
+            prims.tcgen05_dealloc(tmem_ptr, tmem_cols_alloc, group="cta_1")
+    else:
+        # ---- drain TMEM: rows 0..63 = lanes of subpartitions 0 and 1 ------------
+        is_owner = (warp_idx >= EPI_WARP0) & (sp < cutlass.Int32(2))
+        if is_owner:
+            for sub in cutlass.range_constexpr(tmem_subs):
+                tsub = prims.TmemAddr.from_row_col(
+                    tmem_base.row_id + sp * cutlass.Int32(WARP_THREADS),
+                    tmem_base.col_id + sub * 32,
+                ).as_ptr(cutlass.Float32)
+                acc.store(prims.tcgen05_ld("32x32b", tsub, num=32), sub * 32)
+            prims.tcgen05_wait(prims.Tcgen05Wait.LOAD)
+
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        prims.barrier_cta_sync(0)
+        if warp_idx == TMA_WARP:
+            prims.tcgen05_dealloc(tmem_ptr, tmem_cols_alloc, group="cta_1")
+
+        # ---- DSMEM split-K reduction (as _projection_tcgen05_template) -----------
+        if cutlass.const_expr(reduce_peers > 0):
+            prims.barrier_cluster_wait()
+            if is_owner:
+                for tgt in cutlass.range_constexpr(reducers):
+                    if cta_rank != cutlass.Int32(tgt):
+                        slot = (
+                            cta_rank - cutlass.Int32(1)
+                            if cta_rank > cutlass.Int32(tgt)
+                            else cta_rank
+                        )
+                        base = slot * cutlass.Int32(
+                            OWNER_TOTAL * mailbox_stride
+                        ) + owner_id * cutlass.Int32(mailbox_stride)
+                        peer_full = prims.mapa(reduce_full, cutlass.Int32(tgt))
+                        for ch in cutlass.range_constexpr(chunk_cols // 4):
+                            src = tgt * chunk_cols + ch * 4
+                            payload = acc.load(src, vector_size=4, alignment=16).bitcast(
+                                cutlass.Int32
                             )
+                            _compat48.store_async(
+                                prims.mapa(
+                                    reduce_mailbox.data_ptr() + base + cutlass.Int32(ch * 4),
+                                    cutlass.Int32(tgt),
+                                ),
+                                payload,
+                                peer_full,
+                            )
+            if cta_rank < cutlass.Int32(reducers):
+                while not prims.mbarrier_try_wait_parity(reduce_full, 0):
+                    pass
+                cute.arch.fence_acq_rel_cta()
+                if is_owner:
+                    for r in cutlass.range_constexpr(reducers):
+                        if cta_rank == cutlass.Int32(r):
+                            for peer in cutlass.range_constexpr(reduce_peers):
+                                base = cutlass.Int32(
+                                    peer * OWNER_TOTAL * mailbox_stride
+                                ) + owner_id * cutlass.Int32(mailbox_stride)
+                                for ch in cutlass.range_constexpr(chunk_cols // 4):
+                                    got = reduce_mailbox.subview(base + cutlass.Int32(ch * 4)).load(
+                                        vector_size=4, alignment=16
+                                    )
+                                    for i in cutlass.range_constexpr(4):
+                                        dst = r * chunk_cols + ch * 4 + i
+                                        acc[dst] = acc[dst] + got[i]
+
+        # ---- each reducer stores its column slice of the valid rows -------------
+        if cta_rank < cutlass.Int32(reducers):
+            if is_owner:
+                gC = c_ptr.iterator.raw_ptr()
+                in_range = owner_id < rows
+                for r in cutlass.range_constexpr(reducers):
+                    if cta_rank == cutlass.Int32(r):
+                        for off, width in store_plan:
+                            col = coord_n + cutlass.Int32(r * chunk_cols + off)
+                            out = (
+                                acc.load(r * chunk_cols + off, vector_size=width, alignment=16)
+                                .to(cutlass.BFloat16)
+                                .bitcast(cutlass.Int16)
+                            )
+                            if in_range:
+                                prims.store_ext(
+                                    out,
+                                    gC + owner_id * cutlass.Int32(output_n) + col,
+                                    evict=L1EvictKind.NOALLOCATE,
+                                )
 
     prims.barrier_cta_sync(0)
     if tidx == 0:
@@ -672,13 +785,17 @@ def launch(
     sf_bufs: cutlass.Constexpr[int],
     a_box_rows: cutlass.Constexpr[int],
     k_sub: cutlass.Constexpr[int],
+    rows_max: cutlass.Constexpr[int],
+    m_blocks: cutlass.Constexpr[int],
+    owner_warps: cutlass.Constexpr[int],
+    wide: cutlass.Constexpr[bool],
 ) -> None:
     k_tiles: cutlass.Constexpr[int] = k_total // TILE_K
-    # The activation scratch holds ROWS_MAX rows; the 128-row box zero-fills the rest.
+    # The activation scratch holds rows_max rows; a 128-row box over 64 zero-fills the rest.
     tma_a = cuda_exp.create_tensor_map_tiled(
         global_address=a.iterator.toint(),
         dtype=cutlass.Float8E4M3FN,
-        global_dims=[k_total, ROWS_MAX],
+        global_dims=[k_total, rows_max],
         global_strides=[k_total // 16],
         box_dims=[TILE_K, a_box_rows],
         swizzle=cuda_exp.TensorMapSwizzle.s128b,
@@ -696,7 +813,7 @@ def launch(
     tma_sfa = cuda_exp.create_tensor_map_tiled(
         global_address=sfa.iterator.toint(),
         dtype=cutlass.Uint16,
-        global_dims=[SF_ATOM_BYTES // 2, k_tiles],
+        global_dims=[SF_ATOM_BYTES // 2, m_blocks * k_tiles],
         global_strides=[SF_ATOM_BYTES // 16],
         box_dims=[SF_ATOM_BYTES // 2, k_sub],
         swizzle=cuda_exp.TensorMapSwizzle.none,
@@ -734,6 +851,9 @@ def launch(
         sf_bufs,
         a_box_rows,
         k_sub,
+        m_blocks,
+        owner_warps,
+        wide,
     ).launch(
         grid=(n_ctas, 1, split_k),
         cluster=(1, 1, split_k),
@@ -747,13 +867,13 @@ CompiledKernel = Callable[..., object]
 
 
 def compile_projection(config: Mxf8ProjectionConfig) -> CompiledKernel:
-    """``fn(a_q [64, K] u8, w_q [N, K] u8, sfa u8, sfw u8, c [rows, N] bf16, rows)`` on the
-    TVM-FFI environment stream.  Build only -- no GPU tensors here."""
+    """``fn(a_q [rows_max, K] u8, w_q [N, K] u8, sfa u8, sfw u8, c [rows, N] bf16, rows)`` on
+    the TVM-FFI environment stream.  Build only -- no GPU tensors here."""
     fake = cute.runtime.make_fake_compact_tensor
     kernel.set_name_prefix(config.prefix, remove_cutlass_symbol=True)
     raw = cute.compile(
         launch,
-        fake(cutlass.Uint8, (ROWS_MAX, config.k), stride_order=(1, 0), assumed_align=128),
+        fake(cutlass.Uint8, (config.rows_max, config.k), stride_order=(1, 0), assumed_align=128),
         fake(cutlass.Uint8, (config.n, config.k), stride_order=(1, 0), assumed_align=128),
         fake(cutlass.Uint8, (cute.sym_int32(),), assumed_align=128),
         fake(cutlass.Uint8, (cute.sym_int32(),), assumed_align=128),
@@ -786,6 +906,10 @@ def compile_projection(config: Mxf8ProjectionConfig) -> CompiledKernel:
         sf_bufs=config.sf_bufs,
         a_box_rows=config.a_box_rows,
         k_sub=config.k_sub,
+        rows_max=config.rows_max,
+        m_blocks=config.m_blocks,
+        owner_warps=config.owner_warps,
+        wide=config.wide,
         options="--enable-tvm-ffi",
     )
     return raw

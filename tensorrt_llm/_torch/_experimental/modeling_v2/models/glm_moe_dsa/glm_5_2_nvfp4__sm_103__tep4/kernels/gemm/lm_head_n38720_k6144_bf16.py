@@ -8,7 +8,9 @@ contiguous BF16 ``input[M,6144]``, ``weight[38720,6144]`` and
 ``output[M,38720]``. The shard gather and the fp32 widening are the caller's.
 
 Every M from 1 to 64 has an instance (a decode step's request count can drain
-through any value), plus the context buckets 128 to 8192. The M=1..64 rows are
+through any value), plus the context buckets 128 to 8192 and MTP5's 192 verify
+rows (``MTP_DECODE_M_VALUES``, built only for an engine drafting more than one
+token). The M=1..64 rows are
 weight-read bound: each instance moves the 476 MB shard once, at the same
 76-85 us as cuBLAS. The swapped orientation writes the logical
 ``[38720, M]`` product through a column-major epilogue into the row-major
@@ -64,9 +66,19 @@ def _schedule(m: int) -> GemmSchedule:
     return _SMALL_M[min(b for b in _SMALL_M if b >= m)]
 
 
-SCHEDULE_BY_M = {m: persistent_instance(_schedule(m)) for m in range(1, 65)} | {
-    m: persistent_instance(s) for m, s in _CONTEXT_M.items()
-}
+# MTP5's verify rows (32 requests x 6): the 256 bucket's schedule at exactly 192 rows.
+# B300, cold weights: 88.4 us, against 93.8 us for the pad to 256 those rows took (zero
+# rows, a copy and the 256-row GEMM; the gather then also widens 64 padded rows), and
+# 92.4 / 94.6 / 98.8 / 105.5 us for (256, 192) direct, (128, 192), (256, 224) direct and
+# (128, 96).
+_MTP_M = {192: GemmSchedule(True, (256, 176), (2, 1), orientation="direct")}
+MTP_DECODE_M_VALUES = tuple(_MTP_M)
+
+SCHEDULE_BY_M = (
+    {m: persistent_instance(_schedule(m)) for m in range(1, 65)}
+    | {m: persistent_instance(s) for m, s in _CONTEXT_M.items()}
+    | {m: persistent_instance(s) for m, s in _MTP_M.items()}
+)
 SUPPORTED_M_VALUES = tuple(SCHEDULE_BY_M)
 
 build = make_build(ABI, SCHEDULE_BY_M)

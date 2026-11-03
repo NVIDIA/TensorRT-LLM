@@ -15,10 +15,14 @@ residual adds of the module's output.  Two kernels cover them:
   ``rows[i]`` of ``x`` for output row ``i`` (int64 ``rows``): the MTP head's
   norm of the gathered last-accepted-token rows, without the gather.
 * ``add``: ``y = bf16(float(a) + float(b))`` -- bitwise ``torch.add`` on BF16.
+* ``add_rmsnorm``: ``rmsnorm(add(a, b))`` in one launch, bit for bit the two
+  kernels in sequence (the sum rounded to BF16 as ``add`` stores it, then
+  ``rmsnorm``'s operations in its order); the sum is not stored.  The MTP
+  module's residual add and head norm on an MTP3 / MTP5 decode step.
 * ``gather_rows``: ``y[i] = x[rows[i]]`` (int32 or int64 ``rows``) -- the
   shell's hidden-state lookup for the logits rows, bitwise.
 
-Both take ``[M, 6144]`` rows with a runtime row pitch (inner dimension
+All take ``[M, 6144]`` rows with a runtime row pitch (inner dimension
 contiguous, 16-byte-aligned rows) and write compact ``[M, 6144]`` outputs.
 One 256-thread CTA per row; each thread owns three 8-element (16-byte)
 vectors, so a row is read once with full-width loads.
@@ -153,6 +157,67 @@ def _add_kernel(
 
 
 @cute.kernel
+def _add_rmsnorm_kernel(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    weight: cute.Tensor,
+    y: cute.Tensor,
+    a_row_stride: cutlass.Int32,
+    b_row_stride: cutlass.Int32,
+    eps: cutlass.Float32,
+) -> None:
+    """``_add_kernel`` then ``_rmsnorm_kernel`` on its output, fused: each thread forms the
+    BF16 sum of its own three vectors exactly as ``_add_kernel`` stores it, keeps it in
+    registers, and runs ``_rmsnorm_kernel``'s body on it unchanged (same vectors per thread,
+    same per-thread, warp-butterfly and warp-sum order, same ``rsqrt.approx``), so every
+    output bit is the two kernels'. No PDL, as the served ``compile_add`` /
+    ``compile_rmsnorm`` instances it replaces."""
+    row, _, _ = cute.arch.block_idx()
+    tidx, _, _ = cute.arch.thread_idx()
+    lane = tidx % _WARP_SIZE
+    warp = tidx // _WARP_SIZE
+    warp_sums = cutlass.Array(
+        cutlass.Float32, _WARPS, space=cutlass.AddressSpace.smem, alignment=_ALIGNMENT_BYTES
+    )
+
+    weights = []
+    for v in cutlass.range_constexpr(_VECS_PER_THREAD):
+        weights.append(_load8(weight.iterator, (v * _THREADS + tidx) * _VEC))
+
+    values = []
+    sum_sq = cutlass.Float32(0.0)
+    for v in cutlass.range_constexpr(_VECS_PER_THREAD):
+        col = (v * _THREADS + tidx) * _VEC
+        lhs = _load8(a.iterator, row * a_row_stride + col)
+        rhs = _load8(b.iterator, row * b_row_stride + col)
+        summed = cute.make_rmem_tensor((_VEC,), cutlass.BFloat16)
+        for k in cutlass.range_constexpr(_VEC):
+            summed[k] = (lhs[k].to(cutlass.Float32) + rhs[k].to(cutlass.Float32)).to(
+                cutlass.BFloat16
+            )
+        values.append(summed)
+        for k in cutlass.range_constexpr(_VEC):
+            f = summed[k].to(cutlass.Float32)
+            sum_sq = sum_sq + f * f
+    sum_sq = _warp_sum(sum_sq)
+    if lane == 0:
+        warp_sums[warp] = sum_sq
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS)
+    total = cutlass.Float32(0.0)
+    for w in cutlass.range_constexpr(_WARPS):
+        total = total + warp_sums[w]
+    inv_rms = cute.math.rsqrt(total / cutlass.Float32(HIDDEN) + eps, fastmath=True)
+
+    dst_base = cutlass.Int64(row) * HIDDEN
+    for v in cutlass.range_constexpr(_VECS_PER_THREAD):
+        out = cute.make_rmem_tensor((_VEC,), cutlass.BFloat16)
+        for k in cutlass.range_constexpr(_VEC):
+            f = values[v][k].to(cutlass.Float32) * inv_rms
+            out[k] = (f * weights[v][k].to(cutlass.Float32)).to(cutlass.BFloat16)
+        _store8(y.iterator, dst_base + (v * _THREADS + tidx) * _VEC, out)
+
+
+@cute.kernel
 def _gather_kernel(
     x: cute.Tensor,
     rows: cute.Tensor,
@@ -219,6 +284,22 @@ def _launch_add(
     )
 
 
+@cute.jit
+def _launch_add_rmsnorm(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    weight: cute.Tensor,
+    y: cute.Tensor,
+    a_row_stride: cutlass.Int32,
+    b_row_stride: cutlass.Int32,
+    eps: cutlass.Float32,
+    stream: cuda.CUstream,
+) -> None:
+    _add_rmsnorm_kernel(a, b, weight, y, a_row_stride, b_row_stride, eps).launch(
+        grid=(cute.size(y, mode=[0]), 1, 1), block=(_THREADS, 1, 1), stream=stream
+    )
+
+
 def _fake_rows():
     """[M, 6144] BF16 with a runtime row pitch, 16-byte-aligned."""
 
@@ -278,6 +359,30 @@ def compile_add(use_pdl: bool = False) -> CompiledKernel:
             cutlass.Int32(HIDDEN),
             make_fake_stream(),
             use_pdl,
+            options="--enable-tvm-ffi",
+        )
+    return _COMPILED[key]
+
+
+def compile_add_rmsnorm() -> CompiledKernel:
+    """``fn(a[M,6144], b[M,6144], weight[6144], y[M,6144], a_row_stride, b_row_stride,
+    eps, stream)``."""
+
+    key = ("add_rmsnorm",)
+    if key not in _COMPILED:
+        weight = make_fake_compact_tensor(
+            cutlass.BFloat16, (HIDDEN,), assumed_align=_ALIGNMENT_BYTES
+        )
+        _COMPILED[key] = cute.compile(
+            _launch_add_rmsnorm,
+            _fake_rows(),
+            _fake_rows(),
+            weight,
+            _fake_out(),
+            cutlass.Int32(HIDDEN),
+            cutlass.Int32(HIDDEN),
+            cutlass.Float32(1e-5),
+            make_fake_stream(),
             options="--enable-tvm-ffi",
         )
     return _COMPILED[key]
@@ -414,4 +519,34 @@ def add(fn: CompiledKernel, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         raise ValueError("add: unsupported operands")
     y = torch.empty((a.shape[0], HIDDEN), dtype=torch.bfloat16, device=a.device)
     fn(a, b, y, a.stride(0), b.stride(0), torch.cuda.current_stream(a.device).cuda_stream)
+    return y
+
+
+def add_rmsnorm(
+    fn: CompiledKernel, a: torch.Tensor, b: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """New compact ``[M, 6144]`` BF16 RMSNorm of ``a + b`` (``fn`` from
+    ``compile_add_rmsnorm``): bit for bit ``rmsnorm(add(a, b), weight, eps)``."""
+
+    if (
+        not supports(a, b)
+        or a.device != b.device
+        or a.shape != b.shape
+        or not _on_device_of(a, weight)
+        or weight.shape != (HIDDEN,)
+        or weight.dtype != torch.bfloat16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("add_rmsnorm: unsupported operands")
+    y = torch.empty((a.shape[0], HIDDEN), dtype=torch.bfloat16, device=a.device)
+    fn(
+        a,
+        b,
+        weight,
+        y,
+        a.stride(0),
+        b.stride(0),
+        float(eps),
+        torch.cuda.current_stream(a.device).cuda_stream,
+    )
     return y

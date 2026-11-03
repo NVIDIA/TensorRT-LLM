@@ -79,6 +79,40 @@ class CompiledPersistentGemm:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled_bmm(a, b, c, stream)
 
+    def launch_rows(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Launch on ``1..compiled M`` rows: the same compiled object at a runtime row count.
+
+        Every operand is a dynamic-layout view (``_make_runtime_arguments``), so the tile
+        scheduler and the TMA descriptors take the row count from the tensors: the tiles past
+        the last row load zeros and store nothing. A row computes exactly what it computes
+        at the compiled M (same tile, same K order), so the output rows are bitwise those of
+        the compiled M with the input padded by any rows. Feature dimensions and the weight
+        must match the compile.
+
+        :raises ValueError: If a feature dimension or the weight differs from the compile,
+            or the row count is outside ``1..compiled M``.
+        """
+        rows = int(input_tensor.shape[0])
+        if (
+            not 0 < rows <= int(self.input_shape[0])
+            or tuple(input_tensor.shape[1:]) != tuple(self.input_shape[1:])
+            or weight.shape != self.weight_shape
+            or tuple(output.shape) != (rows, int(self.output_shape[1]))
+        ):
+            raise ValueError(
+                "compiled projection runtime-M mismatch: compiled input/weight/output="
+                f"{(self.input_shape, self.weight_shape, self.output_shape)}, got "
+                f"{(input_tensor.shape, weight.shape, output.shape)}"
+            )
+        a, b, c = _make_runtime_arguments(input_tensor, weight, output, self.orientation)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.compiled_bmm(a, b, c, stream)
+
 
 def _check_glm_mma_tiler_and_cluster_shape(self) -> None:
     """Admit the measured SM103 BF16 MMA-N multiples of eight."""

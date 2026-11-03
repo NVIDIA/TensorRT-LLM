@@ -46,8 +46,9 @@ class CuteDslReqIndexToBase(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The target's decode step at MTP width 2 computes these once per fresh
-    # selection instead of once per layer: up to 32 sequences x 2 rows.
+    # The target's decode step computes these once per fresh selection instead
+    # of once per layer: up to 32 sequences x 2 rows at MTP1, x 4 / 6 at MTP3 /
+    # MTP5.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one sequence at MTP 2, a context longer than top-k",
@@ -68,13 +69,42 @@ class CuteDslReqIndexToBase(OpWrapper):
                 **_GLM, seq_rows=[2, 2], kv_lens=[33, 5000], max_blocks=64, pad_block_table=True
             ),
         ),
+        Cell(
+            why="MTP3, the full decode batch: 32 sequences x 4",
+            spec=dict(
+                **_GLM,
+                seq_rows=[4] * 32,
+                kv_lens=[4 + 257 * i for i in range(32)],
+                max_blocks=512,
+            ),
+        ),
+        Cell(
+            why="MTP5, the full decode batch: 32 sequences x 6",
+            spec=dict(
+                **_GLM,
+                seq_rows=[6] * 32,
+                kv_lens=[6 + 263 * i for i in range(32)],
+                max_blocks=512,
+            ),
+        ),
+        Cell(
+            why="MTP5 at 3 sequences: a context of 6 keys, positions past the table, unused pages",
+            spec=dict(
+                **_GLM,
+                seq_rows=[6] * 3,
+                kv_lens=[38, 6, 5000],
+                max_blocks=64,
+                pad_block_table=True,
+            ),
+        ),
     )
 
     note = """
     `build(device_id, topk=, max_blocks=)` compiles the launcher; the target
     builds it on its first forward next to `cute_dsl_req_index_to_global`'s and
-    passes it as `compiled`. Only the trunk's decode step at MTP width 2 calls
-    it; other widths take the per-layer entry. `block_size` must be 32.
+    passes it as `compiled`. Only the trunk's decode step calls it, at the MTP
+    widths whose decode attention handle takes base rows (2, and 4 / 6 at MTP3 /
+    MTP5); other widths take the per-layer entry. `block_size` must be 32.
     """
 
     def __call__(

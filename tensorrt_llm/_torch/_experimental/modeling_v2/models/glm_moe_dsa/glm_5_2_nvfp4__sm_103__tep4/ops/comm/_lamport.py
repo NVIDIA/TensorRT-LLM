@@ -49,6 +49,18 @@ _FUSED_OPTIONS = dict(
     rotate_peer_order=True,
     rotated_poll_order=True,
 )
+#: Above this many rows a workspace built `wide` (an engine drafting more than one token: MTP3 /
+#: MTP5 decode steps of 128 / 192 rows) runs the add+RMSNorm+NVFP4 entry on
+#: `fused_quant_twoshot`: the same kernel forming the sum two-shot. Ahead of an MoE layer every
+#: rank arrives at once (attention is balanced) and NVLink ingress is the bound: the one-shot
+#: takes in the three peers' whole partials, the two-shot a quarter of each (the slices it owns,
+#: which it sums and sends back as the bf16 residual) plus three quarters of the reduced rows,
+#: half the bytes for one more hop. Alone on 4x B300 (16 calls per graph, 60 alternating
+#: blocks), us per call one-shot unicast -> two-shot: 65 rows 10.2 -> 8.5, 128 rows 13.9 ->
+#: 10.9, 192 rows 17.7 -> 12.6, 256 rows 24.0 -> 18.3. The owner sums in rank order in fp32 and
+#: rounds once, as the one-shot: the outputs are bit for bit the one-shot kernel's. At 1..64 rows
+#: (MTP1, the 32-row draft steps) the one-shot multicast build stays.
+QUANT_TWOSHOT_ABOVE = 64
 #: Above this many rows the add+RMSNorm entry runs two-shot: one-shot has every rank pull
 #: the whole message from every peer. The two-shot is the push variant (each rank writes its
 #: partial rows straight into the owning rank's slot, readers clear what they consumed): it
@@ -146,19 +158,23 @@ class LamportWorkspace:
     #: The fused two-shot that also writes the normalized rows as an MXF8 operand (the next
     #: layer's qkva GEMM input), or None when the group did not build it.
     fused_twoshot_x8: object = None
+    #: `fused_quant` forming the sum two-shot, for rows above `QUANT_TWOSHOT_ABOVE`; None
+    #: unless the workspace was built `wide`.
+    fused_quant_twoshot: object = None
 
 
 def build_workspace(
-    hidden: int, eps: float, max_rows: int, rank: int, world: int
+    hidden: int, eps: float, max_rows: int, rank: int, world: int, wide: bool = False
 ) -> LamportWorkspace:
     """Bring up the group, pin the peer buffers, agree multicast, compile the kernels.
 
-    Collective: every rank of the group calls it, with the same `hidden`, `eps` and
-    `max_rows`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter of that
-    in int32 flags of symmetric memory per rank, and compiles six CuTe DSL kernels
+    Collective: every rank of the group calls it, with the same `hidden`, `eps`,
+    `max_rows` and `wide`. Allocates `3 * world * max_rows * hidden` bf16 plus a quarter
+    of that in int32 flags of symmetric memory per rank, and compiles six CuTe DSL kernels
     (pure, fused, fused+quant, fused two-shot, its MXF8-out variant, the lm_head
-    all-gather) for this rank on
-    the current device. Launches nothing beyond the buffer fills and the one-element
+    all-gather) for this rank on the current device, plus, `wide` (an engine whose decode
+    steps run above 64 rows: max_draft_len > 1), the two-shot fused+quant
+    `fused_quant_twoshot`. Launches nothing beyond the buffer fills and the one-element
     multicast and all-gather agreements.
 
     The multicast decision is agreed across the group: a rank compiling the multicast
@@ -223,6 +239,24 @@ def build_workspace(
         **_FUSED_OPTIONS,
         **common,
     )
+    # Every rank derives `wide` from the same engine config, so the whole group builds -- and
+    # at the same row counts selects -- the two-shot kernel. It publishes by unicast stores
+    # whether or not the fabric has multicast.
+    fused_quant_twoshot = None
+    if wide:
+        fused_quant_twoshot = _ar.compile_fused_out_quant_for_rank(
+            rank,
+            world,
+            dev.index,
+            hidden,
+            eps=eps,
+            pdl_release_policy=_FUSED_QUANT_PDL_POLICY,
+            prefetch_fused_inputs=True,
+            multicast_publish=False,
+            two_shot=True,
+            **_FUSED_OPTIONS,
+            **common,
+        )
     fused_twoshot = _ar.compile_fused_twoshot_for_rank(
         rank,
         world,
@@ -287,6 +321,7 @@ def build_workspace(
         fused_twoshot=fused_twoshot,
         gather=gather,
         fused_twoshot_x8=fused_twoshot_x8,
+        fused_quant_twoshot=fused_quant_twoshot,
     )
 
 

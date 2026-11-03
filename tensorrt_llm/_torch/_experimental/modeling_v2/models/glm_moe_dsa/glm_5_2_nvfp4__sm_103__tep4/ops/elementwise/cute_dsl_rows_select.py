@@ -56,7 +56,8 @@ class CuteDslRowsSelect(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # The MTP module's context step: the selected rows' e4m3 queries `[T, 16 x 576]`, the
-    # bf16 residual rows `[T, 6144]` and the output scattered back; one row, and a 64-row set.
+    # bf16 residual rows `[T, 6144]` and the output scattered back; one row, and a 64-row set
+    # (up to 256 at MTP3 / MTP5, whose mixed steps carry 4 / 6 generation rows per request).
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="gather 2 of 7300 fp8 query rows",
@@ -69,6 +70,18 @@ class CuteDslRowsSelect(OpWrapper):
         Cell(
             why="scatter 32 bf16 hidden rows back into 7300",
             spec=dict(src_rows=7300, sel=32, width=6144, dtype="bfloat16", scatter=True),
+        ),
+        Cell(
+            why="MTP3 / MTP5: gather 128 of 7300 fp8 query rows",
+            spec=dict(src_rows=7300, sel=128, width=9216, dtype="float8", scatter=False),
+        ),
+        Cell(
+            why="MTP5: gather 256 bf16 hidden rows, repeated indices included",
+            spec=dict(src_rows=900, sel=256, width=6144, dtype="bfloat16", scatter=False),
+        ),
+        Cell(
+            why="MTP5: scatter 256 bf16 hidden rows back into 7300",
+            spec=dict(src_rows=7300, sel=256, width=6144, dtype="bfloat16", scatter=True),
         ),
     )
 
