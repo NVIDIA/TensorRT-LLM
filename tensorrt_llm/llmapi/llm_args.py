@@ -2504,25 +2504,21 @@ class DecodingBaseConfig(StrictBaseModel):
         status="prototype",
         description=
         "Verification rule of rejection sampling (use_rejection_sampling=True). "
-        "'standard': token-level rejection sampling (Leviathan et al., 2023): "
-        "each draft is accepted with probability min(1, p/q) in order, and the "
-        "first rejection resamples from max(p - q, 0). 'block': block "
-        "verification (Sun et al., 2024, arXiv:2403.10444), which judges the "
-        "drafted block jointly; it is lossless, equals 'standard' for one "
-        "draft, and accepts at least as many tokens in expectation. Linear-chain "
-        "one-model paths only (not the dynamic tree, nor with relaxed thinking "
-        "acceptance); ragged (confidence-"
-        "scheduled) verification steps fall back to 'standard'.")
+        "'standard': token-level rejection sampling. 'block': block "
+        "verification (Sun et al., 2024), which judges the drafted block "
+        "jointly; lossless, and accepts at least as many tokens in expectation. "
+        "Linear-chain one-model paths only (not the dynamic tree, nor with "
+        "relaxed thinking acceptance); ragged (confidence-scheduled) "
+        "verification steps fall back to 'standard'.")
 
     draft_temperature_only: bool = Field(
         default=False,
         status="prototype",
-        description="If true, rejection-sampled draft tokens are drawn from the "
+        description="If true, rejection-sampled drafts are drawn from the "
         "temperature-scaled draft distribution without the request's top-k / "
-        "top-p / min-p filters, and that distribution is what verification "
-        "divides by (vLLM's 'probabilistic' drafting). Outputs stay lossless "
-        "either way; the setting changes the acceptance rate. Requires "
-        "use_rejection_sampling=True; not supported with the dynamic tree.")
+        "top-p / min-p filters; this changes the acceptance rate, not the "
+        "output distribution. Requires use_rejection_sampling=True; not "
+        "supported with the dynamic tree.")
 
     allow_advanced_sampling: bool = Field(
         default=False,
@@ -3911,22 +3907,16 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         default=0,
         description=
         "Prompt-tail tokens to recompute through the target forward when a "
-        "request takes a KV-cache prefix hit. A standalone DSpark drafter "
-        "builds its context K/V from target hidden states, which reused "
-        "tokens never produce. A draft KV pool paired with the target's block "
-        "reuse hands back the reused prefix's drafter K/V and needs no "
-        "recompute; anywhere else (the drafter's private context arena, or a "
-        "KV cache manager that does not pair the pools) a cache-hit request "
-        "drafts from only the uncached tail of its prompt unless this is set. "
-        "0 (the default) disables the recompute. None resolves from the draft "
-        "model config: the drafter's attention window when every layer's "
-        "context attention is windowed (recomputing the window reproduces the "
-        "no-reuse drafter inputs exactly; 4096 for MiniMax-M3.1), else -1. -1 "
-        "forces a full re-prefill on a hit. A smaller tail trades acceptance "
-        "length for TTFT. The embedded (DeepSeek-V4) drafter resolves to 0. "
-        "The V2 KV cache manager requires the all_reusable block-reuse policy; "
-        "the V1 manager requires chunked prefill and no sliding-window target "
-        "layers. The managers disable it with a warning otherwise.")
+        "request takes a KV-cache prefix hit, so a standalone DSpark drafter "
+        "gets context K/V for reused tokens; not needed when the draft KV "
+        "pool is paired with the target's block reuse. 0 (default) disables "
+        "it; -1 forces a full re-prefill on a hit; None resolves from the "
+        "draft model config to the drafter's attention window when every "
+        "layer's context attention is windowed, else -1 (0 for the embedded "
+        "drafter). A smaller tail trades acceptance length for TTFT. The V2 "
+        "KV cache manager requires the all_reusable block-reuse policy; the "
+        "V1 manager requires chunked prefill and no sliding-window target "
+        "layers; otherwise the managers disable it with a warning.")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
