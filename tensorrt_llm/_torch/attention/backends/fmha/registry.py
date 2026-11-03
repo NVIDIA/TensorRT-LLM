@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import os
 from typing import TypeAlias
 
@@ -23,6 +24,7 @@ from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
+from .sampling_shared_prefix import SamplingSharedPrefixFmha
 from .triton_custom_mask import TritonCustomMaskFmha
 
 FmhaCls: TypeAlias = type[Fmha]
@@ -70,6 +72,11 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # reports itself available for DSA layers whose cache uses the ``fp8rope`` NVFP4 layout,
         # and DSATrtllmAttention then hands it the records instead of gathered FP8 rows.
         "prims_ts_dsa_sparse_mla": PrimsTSDsaSparseMlaFmha,
+        # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+sampling_shared_prefix).
+        # It must precede flashinfer_trtllm_gen, which takes every generation
+        # batch it supports. It declines eager batches without a shared prefix
+        # but serves every n-sample batch a CUDA graph is captured for.
+        "sampling_shared_prefix": SamplingSharedPrefixFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -87,16 +94,22 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
 # Libraries left out of the default set and enabled explicitly through
-# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix is a
-# narrow-scope beam-search path.
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts", "beam_shared_prefix"})
+# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix and
+# sampling_shared_prefix are narrow-scope beam-search / n-sample paths.
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset(
+    {"prims_ts", "beam_shared_prefix", "sampling_shared_prefix"})
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
-    value = os.environ.get("TLLM_FMHA_LIBS")
+    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
+    """Parse a ``TLLM_FMHA_LIBS`` value; cached because per-step host code queries it."""
     if value is None or not value.strip():
         return DEFAULT_FMHA_LIBS
 
