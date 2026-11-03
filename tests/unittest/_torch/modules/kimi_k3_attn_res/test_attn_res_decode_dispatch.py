@@ -109,10 +109,10 @@ def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
 
 
 def test_fused_max_tokens_env(monkeypatch):
-    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default 64 (the decode
-    kernel's range); anything else fails loudly."""
+    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default the decode kernel's
+    range (192); anything else fails loudly."""
     monkeypatch.delenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
-    assert mkl._read_fused_attn_res_max_tokens() == 64 == _max_tokens()
+    assert mkl._read_fused_attn_res_max_tokens() == 192 == _max_tokens()
     monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "1")
     assert mkl._read_fused_attn_res_max_tokens() == 1
     for bad in ("0", "-3", "1.5", "all"):
@@ -133,7 +133,7 @@ def test_selector_token_ceiling(monkeypatch, persistent: bool):
     K = mkl._AttnResKernel
     above = K.PERSISTENT if persistent else K.UNFUSED
     monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
-    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.DECODE, K.DECODE, above]
+    assert [_kernel_for(m) for m in (1, 192, 193)] == [K.DECODE, K.DECODE, above]
     monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
     assert [_kernel_for(m) for m in (1, 2, 64)] == [K.DECODE, above, above]
     assert mkl._defers_moe_residual(_rows(1, HIDDEN), 5)
@@ -149,7 +149,7 @@ def test_selector_falls_back_to_cpp_per_token_ops(monkeypatch, persistent: bool)
     monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
     monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
     above = K.PERSISTENT if persistent else K.UNFUSED
-    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.PER_TOKEN, K.PER_TOKEN, above]
+    assert [_kernel_for(m) for m in (1, 192, 193)] == [K.PER_TOKEN, K.PER_TOKEN, above]
     assert _kernel_for(8, num_candidates=12) is K.PER_TOKEN
     assert not mkl._defers_moe_residual(_rows(8, HIDDEN), 5)
 
