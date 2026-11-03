@@ -607,7 +607,8 @@ def add_bias_and_residual(
     temporal Winograd products ``m`` turned into frames first (the output transform A^T along
     time: frame ``g*order + j`` is ``sum_k AT[j][k] m_k[g]``). ``products_geometry``: the
     products carry halo rows / columns around their ``height`` x ``width`` logical positions.
-    ``out``: a contiguous bf16 destination of the result's shape, written and returned."""
+    ``out``: a contiguous bf16 destination of the result's shape on the input's device,
+    written and returned."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     if products_geometry is not None and products_geometry.identity:
@@ -638,8 +639,13 @@ def add_bias_and_residual(
     shape = (frames, (height + pad_h) * (width + pad_w), channels)
     if out is None:
         y = torch.empty(shape, device=src.device, dtype=torch.bfloat16)
-    elif tuple(out.shape) != shape or out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError(f"out must be a contiguous bf16 {list(shape)} tensor")
+    elif (
+        tuple(out.shape) != shape
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or out.device != src.device
+    ):
+        raise ValueError(f"out must be a contiguous bf16 {list(shape)} tensor on {src.device}")
     else:
         y = out
     lanes, k = row_layout(channels, fold_single=True)
