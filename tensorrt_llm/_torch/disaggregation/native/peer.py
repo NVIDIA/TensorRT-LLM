@@ -83,6 +83,10 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._has_cross_node_peer = False
+        # ArenaPoolBindings of this rank's bound pools (copy-based rebalancing
+        # with several pools per pool group), set by TransferWorker; None when
+        # every pool uses its group's slot ids.
+        self.self_pool_bindings = None
         self._overlap_cache: dict[tuple[str, int, int], PeerOverlap] = {}
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
