@@ -3,192 +3,229 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Checkpoint Startup: State And Host-Contract Audit
+# Warm Startup: State Audit and Standalone Host Contract
 
-Status: initial review draft. This audit does not enable process restore or
-declare a supported profile. Items marked OPEN require implementation evidence or
-agreement with the host-runtime owner.
+Source-audit date: 2026-11-02. This document records findings and implementation
+decisions, not a supported Snapshot profile. The companion
+[native state findings](NATIVE_STATE_FINDINGS.md) contain 17 concrete findings
+with immutable source references. The [startup-owner findings](STARTUP_OWNER_FINDINGS.md)
+cover TP userbuffers, runner storage, startup IPC and process-tree containment.
+Runtime evidence belongs to
+[restore qualification #21481](https://github.com/NVIDIA/TensorRT-LLM/pull/21481).
 
-The objective is to reduce native `trtllm-serve` launch-to-first-correct-response
-latency by reusing a warmed process artifact. Neither Dynamo, Kubernetes nor GMS
-is a baseline requirement.
+The goal is a shorter native `trtllm-serve` launch-to-first-correct-response time
+through warm execution-state reuse. Dynamo, Kubernetes and GMS are not required.
 
 **Snapshot restores execution state. TensorRT-LLM establishes serving validity.**
 
-## Control And Evidence Boundaries
+## Decision and Scope
+
+Proceed with a WARP-owned experimental host adapter and an isolated, fixed-cohort
+MPI qualification harness. Start with dense, text-only Qwen3, TP1 and single-node
+TP2 as separate experiments. Keep weights and final CUDA graphs resident. Compare
+resident KV with discard/rematerialize KV using one matching Python/native build.
+Do not infer general model, transport or multi-node support from these profiles.
+
+The first profile excludes live user requests, prefix reuse, speculative models,
+HOST/DISK tiers, sparse caches, externally exposed KV and partial-rank recovery.
+These exclusions bound the initial experiment; they do not remove those resources
+from the audit or silently count them as qualified.
+
+| Decision | Evidence and consequence |
+| --- | --- |
+| Build the standalone adapter ourselves. | The pinned Snapshot node agent uses `rest.InClusterConfig`. Its internal executor can be reused with an implementation of `runtime.Runtime`; this is not a stable upstream standalone API. |
+| Keep resident capture independent of V2 sleep. | Retaining backing does not call release/wakeup. It still requires process/CUDA, graph, MPI and logical-state validation. |
+| Use native V2 sleep only for the compact experiment. | [#21221](https://github.com/NVIDIA/TensorRT-LLM/pull/21221), successor to [#20087](https://github.com/NVIDIA/TensorRT-LLM/pull/20087), supplies release/reconstruction primitives. It does not supply process restore or serving readiness. |
+| Prove no external exposure by construction. | An idle transceiver can already have registered memory. Exclude constructed transceivers, KV-moving connectors, attached lenders and plugin-published memory on every rank. |
+| Keep the supervisor outside the MPI job. | MPI abort can terminate the effective launcher job, not only the supplied communicator. A separate communicator is not a failure boundary. |
+| Fail closed for unqualified profiles. | Multi-node is unsupported by the Snapshot pin. External-transfer profiles require specific retirement/reconnect work. No blanket PACT dependency blocks the no-exposure experiment. |
+
+## Responsibilities and Readiness
 
 ```mermaid
 flowchart LR
-    C["External CPU coordinator<br/>outside worker checkpoint"]
-    H["Snapshot / host adapter<br/>capture and process/CUDA restore"]
-    E["TRTLLM cohort<br/>admission, scheduler and graphs"]
-    K["KV manager<br/>backing, ownership and metadata"]
-    T["Communication layer<br/>access retirement and registrations"]
-    C -->|"Order operation; confirm host result"| H
-    C -->|"Prepare; validate; activate"| E
+    C["WARP coordinator<br/>separate host process / MPI failure domain"]
+    H["Pinned Snapshot host adapter<br/>process + CUDA execution state"]
+    E["TRTLLM fixed MPI cohort<br/>scheduler + graphs + admission"]
+    K["KV owner<br/>backing, ownership, indices"]
+    T["Communication owners<br/>collectives, registrations, access retirement"]
+    M["Memory-ready"]
+    R["Runtime-ready"]
+    S["Serving-ready"]
+    C -->|"capture / restore: owned target + fresh attempt"| H
+    C -->|"prepare / validate / activate: all ranks"| E
     E --> K
     E --> T
-    H -.->|"Restored memory is not serving authority"| E
-    classDef control fill:#eeeeee,stroke:#555555,color:#111111
-    classDef host fill:#d9eafa,stroke:#2463a6,color:#111111
-    classDef engine fill:#dcf0df,stroke:#287a3e,color:#111111
-    class C control
-    class H host
-    class E,K,T engine
+    H --> M
+    M -.->|"TRTLLM checks and reconstruction required"| R
+    E --> R
+    R -.->|"private generation + cohort agreement required"| S
+    classDef coordinator fill:#eeeeee,stroke:#555555,color:#111111
+    classDef snapshot fill:#d9eafa,stroke:#2463a6,color:#111111
+    classDef trtllm fill:#dcf0df,stroke:#287a3e,color:#111111
+    classDef gate fill:#fff0cd,stroke:#946800,color:#111111
+    class C coordinator
+    class H snapshot
+    class E,K,T trtllm
+    class M,R,S gate
 ```
 
-Solid arrows identify responsibility, not implemented APIs. The dashed arrow
-identifies an evidence boundary. Gray is the coordinator; blue is the host
-runtime; green is TRTLLM and its subsystems.
+Gray identifies WARP control; blue identifies Snapshot execution; green identifies
+TRTLLM owners; amber identifies evidence boundaries. Solid arrows show ownership
+or messages. Dashed arrows show additional required validation, not implemented
+public APIs.
 
-Start with an aggregate, fixed-cohort MPI workload on one node. Use a local,
-immutable model and an isolated HTTP listener. Prove absence of external KV
-exposure, not just an empty request queue. Test one and multiple GPUs separately.
-Keep live-request preservation, partial-rank failover, membership policy, GMS and
-KV migration outside this audit.
+- **Memory-ready:** the host reports restored process/CUDA memory.
+- **Runtime-ready:** every rank has valid weights, graph references, KV ownership,
+  reconstructed indices and configured communication.
+- **Serving-ready:** fresh private generation matches the cold baseline; each
+  required rank replays its existing graph; validation work retires; the current
+  attempt and cohort agree before public admission opens.
 
-## Source Baseline
+`/memory_status` does not establish the last two boundaries. Native last-tag
+wakeup can return admission to RUNNING; a separate restore gate must prevent
+that state from opening public traffic.
 
-This review uses TRTLLM
-[`4fd6d1cc4521`](https://github.com/NVIDIA/TensorRT-LLM/tree/4fd6d1cc4521502a90f08df491af17ebac8e8fb1)
-and Snapshot
-[`4b1300a82c66`](https://github.com/ai-dynamo/snapshot/tree/4b1300a82c6676df020c201fa884cc602251e12e).
+## Audited Source Pins
 
-| Observation | Evidence | Qualification boundary |
+| Component | Exact input | Status |
 | --- | --- | --- |
-| Runtime memory controls exist. | [Sleep/wakeup guide](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/docs/source/features/sleep-wakeup.md), [#19016](https://github.com/NVIDIA/TensorRT-LLM/pull/19016) | In-process release/resume is not persistent process restore. |
-| Main rejects V2 KV sleep. | [`validate_sleep_tags`](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/tensorrt_llm/_torch/pyexecutor/py_executor.py) | Resident capture remains unqualified, not proven impossible. |
-| V2 has a reuse reset. | [`reset_reuse_state`](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py) | Clears reusable blocks, conversation/sharing metadata and streaming events; does not by itself prove scheduler or transfer quiescence. |
-| MNNVL has process-local checkpoint hooks. | [`_run_mnnvl_checkpoint_resources`](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/tensorrt_llm/_torch/pyexecutor/py_executor.py) | Do not treat these as a general external-KV reconnect contract. |
-| The upstream TRTLLM recipe uses an LLM wrapper. | [Snapshot guide](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/docs/guides/tensorrt-llm.md) | V1, disabled reuse and compact KV; not native HTTP/V2 qualification. |
-| Snapshot supports single-node workloads. | [Workload contract](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/docs/reference/workload-contract.md) | Multi-node is unsupported at this pin. Kubernetes packaging does not supply standalone delivery. |
-| New application-hook configuration is not enabled. | [Container settings](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/api/v1alpha1/container_config_types.go), [#734](https://github.com/ai-dynamo/snapshot/pull/734) | Do not use a test flag as proof of runtime support. Qualify the legacy file binding separately. |
+| TRTLLM base | [`4fd6d1cc4521502a90f08df491af17ebac8e8fb1`](https://github.com/NVIDIA/TensorRT-LLM/tree/4fd6d1cc4521502a90f08df491af17ebac8e8fb1) | Source-audited. V2 KV sleep is rejected. |
+| Native V2 candidate | [`b8b0ef930808b8e02ba4c99912b8e8f44d0c1145`](https://github.com/chienchunhung/TensorRT-LLM/tree/b8b0ef930808b8e02ba4c99912b8e8f44d0c1145) | Source-audited independently. Do not mix its wheel with base Python. |
+| Snapshot | [`4b1300a82c6676df020c201fa884cc602251e12e`](https://github.com/ai-dynamo/snapshot/tree/4b1300a82c6676df020c201fa884cc602251e12e) | Internal executor and workload contract inspected. |
+| Upstream reference | [TRTLLM recipe](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/docs/guides/tensorrt-llm.md) | LLM wrapper, V1, reuse disabled, compact KV. Not native HTTP/V2 qualification. |
 
-Candidate native V2 primitives are in
-[#21221](https://github.com/NVIDIA/TensorRT-LLM/pull/21221), successor to
-[#20087](https://github.com/NVIDIA/TensorRT-LLM/pull/20087). Pin the candidate SHA
-in each experiment. Its native sleep/wake tests do not qualify Snapshot restore.
-Do not stack this audit on that implementation: resident capture and the host
-audit can proceed independently.
+The base and candidate are independent pinned trees. Their whole-tree difference
+is not the change set of #21221. A matching candidate wheel may qualify that
+candidate profile, not the newer base.
 
-## Pool And Runtime Inventory
+## Native Findings and Required Changes
 
-Each row has two independent outcomes: **correctness** and **footprint**.
-Resident capture retains backing; compact capture releases selected disposable
-backing and reconstructs it after restore. A metadata reset does not reduce
-checkpoint bytes. Releasing backing does not establish valid references.
+Correctness and footprint are separate objectives. Clearing metadata does not
+reduce artifact bytes. Releasing backing does not prove reference validity.
 
-All process-restore outcomes below are OPEN, even where native primitives exist.
-
-| Resource / responsible subsystem | Capability and demonstrated boundary | Required evidence / follow-up |
+| Owner/resource | Verified native capability or limitation | Capture policy and required engineering evidence |
 | --- | --- | --- |
-| Model weights and transformed tensors / model engine | Loaded tensors can be part of the process artifact; no GMS prerequisite. | Record addresses, dtypes, weight digests and transform/load counts. Prove no repeated load or transform for the admitted profile. |
-| GPU KV pools / V2 storage manager | Main lacks KV sleep; #21221 supplies candidate release/materialization. | Inventory reservation and physical backing separately. Compare addresses, block handles, page slots, free lists and refcounts after process restore. |
-| HOST tier / V2 storage manager | Host backing has asynchronous readiness; native sleep correctness is a separate test. | Retire copies before release. Wait for backing readiness before access; measure captured host bytes and reconstruction cost. |
-| Disk/offload staging / offload managers | Independent staging can remain allocated after KV release. | List buffers, file descriptors and pending I/O. Measure retained bytes; require reopenable files and completion evidence. |
-| Batch/sparse arenas / V2 Batch and sparse cache | Rows, leases, scratch cells and page bindings have distinct lifetimes. | Preserve required held data or prove it disposable. Validate restored bindings and index refresh before graph replay. |
-| Prefix, conversation and sharing metadata / V2 wrapper | Existing reset invalidates reusable state. | Audit scheduler preconditions and attached lender holds. No stale prefix hit, owner, refcount or request association may survive. |
-| Mamba/SSM and model-specific caches / cache managers | State and index views can exist outside the main KV pool. | Enumerate each configured pool, alias and graph reference. Reject unsupported combinations explicitly. |
-| Graph dummy/padding allocations / model engine | Warmup allocations can remain valid with no user request. | Distinguish required dummy ownership from leaked user ownership. Prove replay without recapture for each admitted shape. |
-| Scheduler and output queues / executor | Memory status does not prove all work is retired. | Include queued/active requests, output callbacks and private validation work. Keep admission closed through validation. |
-| MPI/NCCL/MNNVL / communication owners | Process-local hooks and collectives are not cross-host support. | Record process tree, namespaces and fixed rank/GPU mapping. Test full-cohort restore and incomplete-rank rejection. |
-| External KV sessions and registrations / transceiver or connector | Request completion can precede physical access retirement. | Account for requestless incoming work, provider holds, late callbacks and deregistration before backing reuse. |
+| Executor/scheduler | `control_action(drain=True)` parks at a scoped step boundary; its context releases in `finally`. Sleep PREPARE/COMMIT is operation-scoped. | Add persistent, attempt-bound admission/quiescence protection. Include queued/active requests, overlap copies, outputs and callbacks. [F01-F03](NATIVE_STATE_FINDINGS.md#f01-the-executor-has-a-useful-scoped-barrier-not-a-capture-transaction). |
+| GPU KV backing | Reserved VMM addresses, mapped pages, logical owners and slot indices have separate lifetimes. Candidate release keeps reservations and reconstructs slots. | Resident: retain backing. Compact: use owner-ordered reconstruction and validate derived indices; do not require identical physical page handles. [F04](NATIVE_STATE_FINDINGS.md#f04-v2-gpu-pool-reservations-backing-and-logical-pages-are-different-resources). |
+| HOST tier | Capacity can be published before asynchronous fill makes backing usable. Range readiness is not a whole-tier capture fence. | Exclude initially. Add fill/copy retirement and materialization-ready evidence before extension; measure retained HOST bytes. |
+| DISK and staging | Disk pools use anonymous/unlinked FDs. Pinned/device staging and copy callbacks have independent lifetimes. | Exclude DISK initially. Qualify FD restoration or add reopenable ownership; do not assume a path already exists. Account for staging separately. |
+| Batch/sparse arenas | Batch publication, later device readers, row leases and sparse HOST backups are distinct. Preserve can move GPU bytes to HOST rather than remove them. | Inventory each arena and copy barrier; compare total CPU/GPU artifact bytes and reconstruction time. |
+| Reuse/lender metadata | `reset_reuse_state` clears native reusable state, clears conversation state, invalidates lender reuse naming and flushes events. Native clear requires no living cache, including dummies. | Do not blindly reset after graph warmup. Distinguish reset from transfer retirement and preserve graph-required ownership. |
+| Dummy/model-specific state | Main, draft, cross-KV, speculative and SSM managers can own graph-visible resources. Candidate SSM wake refreshes relocated slot indices. | First profile excludes optional model families. Later profiles enumerate all owners, aliases and index refresh before graph replay. |
+| Weights and graphs | Existing weight manifests hash content/layout/aliases. Graph pointer assertions inspect selected tensor attributes, not all references. | Record per-rank digests/addresses and final graph inventory; prove positive replay and unchanged load/transform/capture counts after source termination. |
+| Runner inputs and pinned staging | Graphs and metadata retain runner-owned storage. An input-copy event does not retire later GPU work. | Preserve storage and aliases in both policies; synchronize copies and device work. Compact KV must rebuild indices without replacing runner input storage. |
+| TP userbuffers and collective storage | UB singleton deallocation is incomplete; NCCL windows and MNNVL are separate owners. | Exclude UB, symmetric windows and MNNVL in the first profile with explicit per-rank guards. Ordinary NCCL still needs real restore qualification. |
+| Proxy IPC and process monitor | Queues and identity ACKs precede the capture boundary; READY and some RPC startup follow it. | Retain the whole process tree and internal peers; validate pidfds/cached identities and completion of startup. One container alone does not prove cohort containment. |
+| MPI/NCCL/MNNVL | Selected MNNVL checkpoint hooks exist. They are not a generic MPI/NCCL or external-KV restore contract. | Record rank/GPU mapping and launcher boundaries. Exercise TP2, fail a rank, and verify actual supervisor survival and cohort cleanup. |
+| Transfer/lender owners | `Attempt.quiesced()` and formal `Backend.shutdown(timeout)` provide per-attempt/per-instance evidence. Native `TransferWorker.shutdown()` can log deregistration errors and return without typed proof. | Add restartable cross-owner/cohort retirement and re-registration only for explicitly selected transfer profiles. Do not treat advisory cancellation, released leases or empty request queues as access-end proof. |
 
-For every experiment, expand applicable rows into records containing:
-`resource_id`, owning subsystem, native capability, demonstrated gap, GPU/HOST
-bytes, address constraints, capture policy, pending copies/holds, proposed
-change owner, exact test command, source/runtime pins and evidence location.
-A missing row or unknown resource is not a passing profile.
+The detailed audit gives source locations, capture-policy consequences, proposed
+owners and tests for each resource, including HOST fill, disk staging, Batch,
+sparse preservation, graph dummies, SSM relocation and failure containment.
 
-## Host Contract For Review
+## Standalone Host Binding
 
-The operations in this table describe responsibilities. They are not new public
-engine endpoints or a claim that Snapshot exports a standalone API.
+This is the experimental binding implemented by WARP in #21481. It is intentionally
+version-pinned. It does not introduce public engine endpoints or imply a supported
+Snapshot-team standalone SDK.
 
-| Operation | Proposed owner | Preconditions and result | Open agreement |
-| --- | --- | --- | --- |
-| Launch source | Standalone MPI/host adapter | Fresh private operation directory; fixed profile; coordinator outside captured tree; no public admission. | Process-tree boundary, namespaces, privilege and supervisor policy. |
-| Prepare capture | TRTLLM lifecycle with all required ranks | Close admission/exposure; drain or safely cancel all affected work; apply selected KV policy; latch safety evidence. | Native aggregation calls, deadline binding and evidence schema. |
-| Capture | Snapshot/host implementation | Consume current latched evidence; save process/CUDA state and resolved settings; publish a complete artifact. | Supported host calls, interposer ordering, atomic publication and failure cleanup. |
-| Restore isolated candidate | Snapshot/host implementation | Fresh destination/session; compatible manifest; inert destination; no competing cold process. | Supervision, final host-success result, partial-restore cleanup and control reachability. |
-| Validate runtime | TRTLLM and subsystem owners | Reconstruct deferred capacity, refresh references, validate ranks/peers, run private generation and retire it. | Evidence lifetime, graph coverage and required local checks. |
-| Activate | External authority and TRTLLM gate | Confirm host success and current validation evidence; obtain required rank acknowledgements before public admission. | Authentication, acknowledgement semantics and coordinator-loss policy. |
-| Abort before activation | Coordinator plus host adapter | Stop progression; keep admission closed; prove cleanup before resource reuse. | Cleanup evidence and containment scope; never infer safety from timeout alone. |
+| Operation | Concrete binding | Required protection and evidence |
+| --- | --- | --- |
+| Source launch | Docker-managed containerd, namespace `moby`; real `trtllm-serve` and its native MPI workers. | Full immutable image/container IDs; fresh private control mount; fixed GPU UUIDs; no public network; no auto-restart. |
+| Prepare | Experiment observer at final `PyExecutor.start_worker`, after profiling executor teardown and final graph capture. | No user request was admitted; all ranks confirm exact profile and owners. Compact uses native resource callbacks, not ad hoc pool deletion. Production scoped drain/latch remains later work. |
+| Capture | `executor.Checkpoint(ctx, runtime, logger, request, config)` inside the pinned Snapshot agent module. | Ready sentinel only after all-rank evidence. Preserve upstream CUDA/CRIU ordering. Source must terminate before artifact acceptance. |
+| Restore target | Fresh same-image Docker container with only `/bin/sleep infinity`. | Fresh ownership nonce and control mount; persistent single-use target record; no stale source/restore sentinels. |
+| Restore | Upstream `GatePreflight`, then `executor.Restore(..., WithoutProxy=true)` and upstream `GateInspect`. | Compare kernel, CPU features, limits, image, GPU and mounts. Do not skip compatibility. Use upstream `nsmount` rather than custom namespace shell commands. |
+| Host completion | Write `restore-complete` using `podcontract.FormatRestoreComplete`, including restored namespace PID. | This permits workload reconstruction only. It is not a serving-ready signal or an arbitrary nonce file. |
+| Validate | Fresh operation config plus per-rank memory/runtime observations, private HTTP generation and graph counters. | Match cold output and every rank; reject repeated load/transform/capture, missing ranks, stale evidence or incomplete reconstruction. |
+| Failure/cleanup | Outer host-process deadline; terminate owned immutable helper/workload containers; retain logs/artifacts. | Mark failed restore; never reuse a partially modified target. A killed workload is not proof of remote access fencing. |
 
-Resolve these questions with the Snapshot owner before enabling a binding:
+The adapter implements `runtime.Runtime` using Docker identity/ownership checks
+and containerd OCI/task inspection. Explicit GPU UUIDs avoid Kubernetes allocation
+lookup. Compile it inside the pinned Snapshot agent module to honor Go's internal
+package boundary. This is Docker-managed-containerd support, not generic runtime
+support. PageBroker is a separate matching host service.
 
-1. Which host operations and versions can be reused outside Kubernetes? Which
-   privileges, namespaces, container runtime and CUDA/interposer tools are required?
-2. How does the adapter bind a file or HTTP notification to a fresh attempt?
-   Specify authentication, marker isolation, retries and saved settings.
-3. What proves final host success, distinct from an early restore notification?
-   Test a lost notification response followed by host cleanup.
-4. How are fixed deadlines carried through retries and controller loss? Do not
-   restart a transfer retirement deadline or interpret expiry as cleanup.
-5. Does MPI fail-stop terminate co-launched peers outside the intended cohort?
-   Test the actual launcher failure domain before choosing containment.
-6. How are user probes and recovery budgets preserved? An ordinary health check,
-   Pod Ready, `/memory_status` or a rank barrier is not serving authority.
+### Security and Failure Domain
 
-## Transfer Dependencies
+The host helper is a trusted privileged component. Restrict execution to an
+authorized isolated host and actor; do not expose its JSON stdin interface as an
+unauthenticated network service. Docker-socket access is host-root authority.
+A label is target ownership evidence, not protection against a hostile host root.
 
-Use the existing [retirement arbitration](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/tensorrt_llm/_torch/disaggregation/lifecycle/README.md)
-and [backend access contract](https://github.com/NVIDIA/TensorRT-LLM/blob/4fd6d1cc4521502a90f08df491af17ebac8e8fb1/tensorrt_llm/_torch/disaggregation/base/backend.py).
-Do not introduce a second transfer-lifecycle or membership protocol.
+Required host access: host PID/cgroup namespaces, host procfs, writable cgroups,
+securityfs, the Docker/containerd sockets, actual runtime storage paths,
+Snapshot binary bundle, shared PageBroker control/staging and private checkpoint
+storage. Use read-only mounts where the executor permits them. Select only
+allocated GPU UUIDs; workload containers remain nonprivileged with private PID
+and network namespaces. Block io_uring as required by the pinned workload contract.
 
-| Profile | Evidence required before capture |
+Authenticate each operation by local process access and an immutable target
+allowlist. Bind it to a fresh attempt, image, profile, artifact and container ID.
+Serialize and consume target operations durably; reject reuse after failure.
+Keep deadlines outside checkpointed memory. A timeout must stop the owned helper
+and target and report uncertain cleanup instead of retrying against the same
+process. Preserve attempt evidence, including failed operations.
+
+The coordinator is a host process outside the worker's MPI launcher job. Confirm
+this with a real rank-abort test. Process-tree placement alone does not prove
+failure isolation. Kubernetes or Dynamo may later drive the same owner protocol;
+neither should become a prerequisite for the standalone contract.
+
+## Compatibility and Evidence Record
+
+Each experiment must bind the following fields, not merely record a successful
+HTTP response:
+
+| Record | Required fields |
 | --- | --- |
-| Clean aggregate, no external exposure | Prove no transfer-capable path has published memory; retire local/offload copies and user requests. No blanket dependency on external-transfer cancellation. |
-| Transfer-bearing natural drain | Per-transfer access-end evidence, retained protection records and registration/provider holds, aggregated over all affected work. Quiescence must stay latched. |
-| Coordinated cancellation | The same physical-safety evidence plus qualified cancellation support for that transport/profile. A cancellation acknowledgement is insufficient. |
-| Shared backing or requestless receive | Enumerate lender leases, incoming work and provider holds even without scheduler requests. Keep protection until every applicable owner releases it. |
+| Inputs | TRTLLM source/wheel hash, Snapshot source and agent/PageBroker image digests, experiment-script hashes, model-file hashes, complete serving config. |
+| Host | Kernel, CPU architecture/features, GPU model/UUID/order, driver and CUDA libraries, MIG state, MPI/NCCL versions, namespace/cgroup and CPU/memory limits. |
+| Attempt | Fresh source/restore IDs, immutable container IDs, artifact ID, cohort mapping, absolute external deadlines and terminal result. |
+| State | Per-rank weight content/layout/aliases/addresses, positive load/transform/capture counters, final graph inventory, logical KV owners, tier quotas/bytes, indices and exposure guards. |
+| Artifact | Manifest, logical and allocated file bytes, hashes, identifiable GPU device payloads, separately identified process/metadata bytes, total I/O and capture/restore timings. |
+| Validation | Source termination; memory/runtime/serving boundaries; exact cold/restore output comparison; real graph replay on every rank; no repeated startup work; cleanup status. |
 
-Record existing calls, missing evidence/aggregation APIs, exact transport/backing
-profile, owner and negative tests separately. For example,
-`has_retired_send_session` is not a bulk capture barrier. A returned lease does
-not prove deregistration; process termination is not remote fencing evidence.
+Do not label all CRIU process-image bytes as CPU-only: conventional CUDA offload
+can be embedded there. Report an unavailable CPU/GPU split as unavailable, with a
+reason. Measure observer/hash overhead separately; do not subtract guessed costs
+to claim a startup improvement.
 
-## Compatibility Manifest For Review
+## Verification and Remaining Agreement
 
-Use immutable values and reject missing identity. This is a proposed experiment
-record, not a committed serving-YAML schema or public API.
+Completed source work: 17 findings, 49 immutable source references across 30
+files, plus three startup-owner investigations, candidate/base separation,
+per-owner policies and explicit failure-domain analysis. A read-only Linux host audit observed kernel 6.8, B200 GPUs, driver
+615.71.10 and Docker 27/containerd 1.6. A first experimental adapter build compiled
+against the pinned Snapshot executor. Neither observation qualifies restore;
+subsequent adapter revisions and runtime experiments require their own results.
 
-| Field group | Required contents |
-| --- | --- |
-| Source | TRTLLM and Snapshot commit, build and wheel/container digests; dirty-source status. |
-| Model | Model ID, immutable weight revision/digest, tokenizer, quantization and transformed-weight configuration. |
-| CPU/runtime | Architecture, instruction features, OS/glibc, driver, CUDA, CRIU and interposer identities. |
-| Cohort | Node count, rank count and mapping, GPU model/UUID assignment, MPI/NCCL settings and transport. |
-| Cache/graphs | KV version, host tier and staging sizes, reuse policy, graph shapes, capture policy and resource inventory. |
-| Host/control | Namespace/volume layout, resolved control settings, supervisor and privilege policy, protocol version. |
-| Artifact | Artifact/template digest, completeness, capture evidence and permissions; no restored admission authority. |
-| Attempt | Fresh operation and restore-session IDs, monotonic budget, compatible profile/cohort digests and evidence paths. |
+The revised standalone adapter compiled and passed its Go unit tests against the
+pinned Snapshot module. A real reference attempt was rejected by the test
+cluster's policy before PageBroker could start: privileged containers are not
+allowed. No checkpoint or restore completed. This is a deployment prerequisite,
+not a reason to require Kubernetes or ask users to supply an adapter. Obtain an
+administrator-approved host or documented exception; do not bypass cluster policy.
 
-A template can contain credentials. Restrict artifact/control directories, avoid
-logging secrets and qualify credential renewal. Do not publish raw checkpoint
-contents or model inputs as routine CI artifacts.
-
-## Qualification Matrix And Exit
-
-| Case | Initial state | Acceptance evidence |
+| Item | WARP-owned decision/work | External agreement still needed |
 | --- | --- | --- |
-| Pinned upstream reference | UNTESTED locally | Reproduce its documented capture/restore with the pinned image; label wrapper/Kubernetes evidence separately. |
-| Native MPI, one GPU, resident | UNTESTED | Source terminated; restored fresh generation matches cold; no load/transform/graph recapture; all readiness boundaries observed. |
-| Native MPI, one node, multiple GPUs, resident | UNTESTED | Same checks on every rank, fixed topology, private validation and partial-rank failure injection. |
-| Matching compact profiles | BLOCKED pending candidate/host qualification | Independent correctness checks plus GPU/HOST artifact bytes, I/O, reconstruction and end-to-end comparison. |
-| Multi-node | UNSUPPORTED at Snapshot pin | Agree upstream support before running a qualification case; do not relabel a one-node pass. |
-| Transfer-bearing or cancellation | BLOCKED pending exact lifecycle/reconnect profile | Late access, retained registration, cancellation and containment negative tests. |
+| R1: host operations | Implement local Docker/containerd adapter around pinned executor; retain both compatibility gates and bounded cleanup. | Snapshot owners review use of internal executor interfaces, supported runtime assumptions and future API stability. |
+| R2: workload binding | Use current file protocol, inert destination and separate fresh-attempt evidence. Keep public admission closed. | Confirm supported lifecycle notification binding and migration path when new application-hook configuration is enabled. |
+| R3: execution/security | Trusted local actor, no remote service, isolated privileged host component, immutable targets and durable single-use attempts. | Deployment/security owners approve the privilege model and failure containment for production delivery. |
 
-Use PASS only for executed assertions, FAIL for an observed violation, UNTESTED
-for an unexecuted case, BLOCKED for a named prerequisite and UNSUPPORTED for a
-known product limit. Preserve attempted/failed counts and cold fallback results.
+S1 provides the completed source audit and concrete proposed host contract. It
+does **not** claim R1-R3 have external sign-off. S2 must supply actual runtime
+qualification or precise observed blockers. Later production work owns durable
+serving admission/lifecycle, host-controller packaging, KV-policy extensions and
+communication reconstruction. Keep these implementation responsibilities separate
+from the experiment's test-only boundary.
 
-Report p50/p95 launch-to-first-correct-response, capture time, artifact I/O,
-CPU/CUDA restore, KV reconstruction, validation/admission and steady-state
-throughput separately. Compare resident and compact policies on the same profile.
-Weight-byte transfer remains a cost.
+## Primary References
 
-The audit exits only when the host/security contract and first profile are
-agreed, separate KV/API and communication gaps have owners/tests, and actual
-restore evidence identifies a feasible path. Merging this initial inventory
-alone does not satisfy that exit.
+- [Snapshot workload contract](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/docs/reference/workload-contract.md).
+- [Checkpoint executor](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/agent/internal/executor/checkpoint.go) and [restore executor](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/agent/internal/executor/restore.go).
+- [Runtime interface](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/agent/internal/runtime/runtime.go), [compatibility gates](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/api/compat/checks.go), and [host deployment privileges](https://github.com/ai-dynamo/snapshot/blob/4b1300a82c6676df020c201fa884cc602251e12e/charts/snapshot/templates/daemonset.yaml).
+- [Application contract #437](https://github.com/ai-dynamo/snapshot/pull/437) is design history; the pinned implementation and current workload contract control this experiment.
+- [Native state findings and test handoff](NATIVE_STATE_FINDINGS.md).
+- [Startup-owner findings and explicit profile guards](STARTUP_OWNER_FINDINGS.md).
