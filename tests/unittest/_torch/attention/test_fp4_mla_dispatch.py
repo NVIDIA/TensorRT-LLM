@@ -2,8 +2,8 @@
 
 import pytest
 
-from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch as dp
 
 SM = 212
 ROWS_Q4, ROWS_Q2 = 512, 256
@@ -12,14 +12,29 @@ ROWS_Q4, ROWS_Q2 = 512, 256
 def _choose(num_requests, query_len, kv_capacity, *, live=None, four_x=True, **kw):
     rows = 128 * query_len
     return dp.choose_decode_strategy(
-        num_requests=num_requests, query_len=query_len, num_heads=128, rows_per_seq=rows, kv_capacity=kv_capacity,
-        sm_count=SM, envelope_reason=host_4x.envelope_reason_static, live_max_kv=live, four_x_enabled=four_x, **kw)
+        num_requests=num_requests,
+        query_len=query_len,
+        num_heads=128,
+        rows_per_seq=rows,
+        kv_capacity=kv_capacity,
+        sm_count=SM,
+        envelope_reason=host_4x.envelope_reason_static,
+        live_max_kv=live,
+        four_x_enabled=four_x,
+        **kw,
+    )
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for name in (dp.DECODE_PATH_ENV, dp.MIN_KV_4X_ENV, "TRTLLM_FP4_MLA_TWOSTREAM", "TRTLLM_FP4_MLA_TWOSTREAM_R2",
-                 host_4x.MIN_PAIRS_ENV, host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV):
+    for name in (
+        dp.DECODE_PATH_ENV,
+        dp.MIN_KV_4X_ENV,
+        "TRTLLM_FP4_MLA_TWOSTREAM",
+        "TRTLLM_FP4_MLA_TWOSTREAM_R2",
+        host_4x.MIN_PAIRS_ENV,
+        host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     # the measured table was taken with the internal 2x kernel; pin that calibration (the main tree defaults to 1.2)
     monkeypatch.setenv("TRTLLM_FP4_MLA_TWOSTREAM_T2_SCALE", "1.0")
@@ -51,7 +66,9 @@ def test_live_kv_long_in_big_capacity_bucket():
     assert s.path == dp.PATH_TWO_STREAM and s.r2 == 13 and s.kv_len_decision == 30080
 
 
-@pytest.mark.parametrize("num_requests,query_len,kv", [(64, 4, 30080), (32, 4, 30080), (128, 2, 16384), (46, 2, 30080)])
+@pytest.mark.parametrize(
+    "num_requests,query_len,kv", [(64, 4, 30080), (32, 4, 30080), (128, 2, 16384), (46, 2, 30080)]
+)
 def test_integral_waves_use_plain_4x(num_requests, query_len, kv):
     s = _choose(num_requests, query_len, kv)
     assert s.path == dp.PATH_4X and s.r2 == 0, s

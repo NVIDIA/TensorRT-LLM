@@ -31,7 +31,11 @@ def test_slower_2x_kernel_calibration(monkeypatch):
 
 def _plan(num_requests, rows, max_kv_len, **kw):
     return ts.plan_two_stream(
-        num_requests=num_requests, rows_per_request=rows, max_kv_len=max_kv_len, sm_count=SM_COUNT, **kw
+        num_requests=num_requests,
+        rows_per_request=rows,
+        max_kv_len=max_kv_len,
+        sm_count=SM_COUNT,
+        **kw,
     )
 
 
@@ -57,7 +61,10 @@ def test_b128_q4_two_stream_never_makes_2x_critical():
     assert plan.rounds_2x * t2 <= plan.waves_4x * t4
 
 
-@pytest.mark.parametrize("num_requests,rows,max_kv_len", [(64, ROWS_Q4, 30080), (128, ROWS_Q2, 16384), (23, ROWS_Q4, 30080), (46, ROWS_Q2, 30080)])
+@pytest.mark.parametrize(
+    "num_requests,rows,max_kv_len",
+    [(64, ROWS_Q4, 30080), (128, ROWS_Q2, 16384), (23, ROWS_Q4, 30080), (46, ROWS_Q2, 30080)],
+)
 def test_integral_waves_stay_on_plain_4x(num_requests, rows, max_kv_len):
     plan = _plan(num_requests, rows, max_kv_len)
     assert plan.r2 == 0, plan
@@ -101,5 +108,10 @@ def test_max_r2_cap(monkeypatch):
 
 def test_degenerate_inputs():
     assert _plan(1, ROWS_Q4, 30080).r2 == 0
-    assert ts.plan_two_stream(num_requests=128, rows_per_request=ROWS_Q4, max_kv_len=30080, sm_count=184).r2 == 0
+    assert (
+        ts.plan_two_stream(
+            num_requests=128, rows_per_request=ROWS_Q4, max_kv_len=30080, sm_count=184
+        ).r2
+        == 0
+    )
     assert _plan(128, 384, 30080).r2 == 0  # rows not a multiple of 256
