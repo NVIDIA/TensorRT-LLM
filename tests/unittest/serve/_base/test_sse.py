@@ -101,9 +101,7 @@ def test_frames_then_done_then_metrics(error_records):
     params = PostprocParams(post_processor=None, postproc_args=None)
 
     frames = asyncio.run(
-        _collect(
-            chat_stream_generator(_Promise(results), params, server=server, raw_request=raw_request)
-        )
+        _collect(chat_stream_generator(_Promise(results), params, server=server, ctx=raw_request))
     )
 
     assert frames == ["data: a\n\n", "data: b\n\n", "data: [DONE]\n\n"]
@@ -125,9 +123,7 @@ def test_in_process_post_processor_is_used():
     params = PostprocParams(post_processor=post_processor, postproc_args="the args")
 
     frames = asyncio.run(
-        _collect(
-            chat_stream_generator(_Promise(results), params, server=server, raw_request=raw_request)
-        )
+        _collect(chat_stream_generator(_Promise(results), params, server=server, ctx=raw_request))
     )
 
     assert frames == ["data: 1\n\n", "data: 2\n\n", "data: [DONE]\n\n"]
@@ -143,9 +139,7 @@ def test_a_failure_is_logged_and_raised(error_records):
 
     with pytest.raises(RuntimeError, match="boom"):
         asyncio.run(
-            _collect(
-                chat_stream_generator(promise, params, server=server, raw_request=_raw_request())
-            )
+            _collect(chat_stream_generator(promise, params, server=server, ctx=_raw_request()))
         )
 
     assert len(error_records) == 1, error_records

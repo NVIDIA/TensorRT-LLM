@@ -42,6 +42,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve import openai_server
 from tensorrt_llm.serve._base.errors import EngineFatalError, ServingError
+from tensorrt_llm.serve._base.request_context import RequestContext
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -267,7 +268,9 @@ def _request(**overrides) -> ChatCompletionRequest:
 
 
 def _run_core(server, request):
-    return asyncio.run(server.create_chat_completion(request, _raw_request()))
+    return asyncio.run(
+        server.create_chat_completion(request, RequestContext.from_http(_raw_request()))
+    )
 
 
 def test_typed_result_for_a_non_streaming_request(serve_env):
@@ -288,7 +291,9 @@ def test_stream_is_returned_as_sse_strings(serve_env):
     )
 
     async def run():
-        result = await server.create_chat_completion(_request(stream=True), _raw_request())
+        result = await server.create_chat_completion(
+            _request(stream=True), RequestContext.from_http(_raw_request())
+        )
         assert not isinstance(result, Response)
         return [frame async for frame in result]
 

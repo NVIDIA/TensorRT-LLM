@@ -94,6 +94,18 @@ CONTRACTS = (
         ),
     ),
     Contract(
+        name="the Anthropic package does not import a server",
+        importers=("tensorrt_llm.serve.api.anthropic",),
+        forbidden=(
+            "tensorrt_llm.serve.openai_server",
+            "tensorrt_llm.serve.openai_disagg_server",
+        ),
+        fix=(
+            "serve/api/anthropic/ serves both servers; take the chat backend and other "
+            "dependencies through constructors and never import a server module."
+        ),
+    ),
+    Contract(
         name="serve/api/ and serve/_base/ do not import the composition root",
         importers=("tensorrt_llm.serve.api", "tensorrt_llm.serve._base"),
         forbidden=("tensorrt_llm.serve.openai_server", "tensorrt_llm.serve.app"),

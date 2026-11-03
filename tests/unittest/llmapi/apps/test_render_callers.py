@@ -664,22 +664,25 @@ class TestCountTokens:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from tensorrt_llm.serve.openai_server import OpenAIServer
+        from tensorrt_llm.serve.api.anthropic.serving import AnthropicCountTokensServing
 
-        app = FastAPI()
-        server = object.__new__(OpenAIServer)
-        server.model = "m"
-        server.tokenizer = tokenizer
-        server.chat_template = chat_template
+        # What RenderResources.from_server reads off a server, as a namespace.
+        # Transitional: the resources get built directly once the server
+        # assembly stops reading them off the server per request.
+        ns = SimpleNamespace(model="m", tokenizer=tokenizer, chat_template=chat_template)
         if use_harmony:
-            server.use_harmony = True
-            server.model_config = SimpleNamespace(model_type="gpt_oss")
+            ns.use_harmony = True
+            ns.model_config = SimpleNamespace(model_type="gpt_oss")
         elif model_type is not None:
-            server.model_config = SimpleNamespace(model_type=model_type)
+            ns.model_config = SimpleNamespace(model_type=model_type)
         if input_processor is not None:
-            server.generator = SimpleNamespace(input_processor=input_processor)
+            ns.generator = SimpleNamespace(input_processor=input_processor)
+        serving = AnthropicCountTokensServing(
+            render_resources=lambda: RenderResources.from_server(ns)
+        )
+        app = FastAPI()
         app.add_api_route(
-            "/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"]
+            "/v1/messages/count_tokens", serving.anthropic_count_tokens, methods=["POST"]
         )
         return TestClient(app)
 
