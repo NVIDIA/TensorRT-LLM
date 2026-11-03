@@ -91,6 +91,7 @@ import os
 import threading
 import weakref
 from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -156,6 +157,8 @@ from ..moe.fused_moe import (
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
+from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks
+from ..speculative.spec_head_kernels import spec_decode_head
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -3179,6 +3182,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     architecture is registered by that wrapper, not here."""
 
     mamba_metadata_cls = KimiK3MambaMetadata
+
+    @property
+    def runtime_hooks(self) -> RuntimeHooks:
+        """The base hooks plus the speculative decode step head in one kernel."""
+        return replace(
+            super().runtime_hooks or DEFAULT_RUNTIME_HOOKS, decode_prologue=spec_decode_head
+        )
 
     def __init__(self, model_config: ModelConfig):
         mlp_fp8 = os.environ.get(_KIMI_K3_FP8_WEIGHT_READ_MOE_MLP_ENV, "0")

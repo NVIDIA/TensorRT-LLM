@@ -2899,6 +2899,19 @@ class DecoderInputPreparer:
             )
         return gathered[:, 0].tolist()
 
+    @property
+    def overlap_scheduler_enabled(self) -> bool:
+        """Whether the overlap scheduler runs, so preprocess_inputs corrects the step on device."""
+        return not self._config.disable_overlap_scheduler
+
+    @property
+    def spec_decode_offsets(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The previous step's per-token position and per-sequence KV-length corrections."""
+        return (
+            self._buffers.previous_pos_id_offsets_cuda,
+            self._buffers.previous_kv_lens_offsets_cuda,
+        )
+
     def preprocess_inputs(
         self, inputs: dict[str, Any], *, enable_spec_decode: bool, runtime_draft_len: int
     ) -> dict[str, Any]:
