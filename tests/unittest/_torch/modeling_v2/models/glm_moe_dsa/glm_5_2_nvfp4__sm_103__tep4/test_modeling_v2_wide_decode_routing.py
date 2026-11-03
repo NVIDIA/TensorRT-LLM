@@ -104,6 +104,10 @@ def core_for(monkeypatch):
         core._wide_bucket, core._wide_rag = True, {}
         # Set by `mtp_forward` around an eager draft step only.
         core._draft_eager, core._draft_rag = False, {}
+        # TRTLLM_GLM52_DEC_CELL_UP (default on), and the fused shared-expert cells an MTP3 /
+        # MTP5 engine builds at its small-batch decode counts (none here unless a test adds).
+        core._dec_cell_up = True
+        core._shared_gu_swiglu_up = {}
         core.route_hits, core.route_misses = {}, {}
         core._decode, core._prefill = "decode", "prefill"
         core.tp_rank, core.eps = 0, 1e-5
@@ -355,6 +359,131 @@ def test_draft_eager_rows(core_for, monkeypatch, max_draft_len, draft, rows, own
     # One `draft_cell` per eager call: 3 projections, the indexer split, eh_proj (1 row has
     # its own K-split instance).
     assert core.route_hits.get("draft_cell", 0) == (0 if not eager else 4 if rows == 1 else 5)
+
+
+@pytest.mark.parametrize("cell_up", [True, False], ids=["cell_up", "cell_up_off"])
+@pytest.mark.parametrize("rows", (6, 12, 18, 64))
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_captured_decode_rows_without_a_cell(
+    core_for, monkeypatch, max_draft_len, decode, rows, cell_up
+) -> None:
+    """An MTP3 / MTP5 decode step (graph-captured, `_wide_decode`) at a row count up to 64
+    without a decode cell -- MTP5 at 1-3 requests: 6 / 12 / 18 -- takes the eager draft
+    step's rule (`_cell_up`): each projection the next cell up at its exact rows (the MTP cell
+    where the decode cell is compiled for its own M), the indexer split the runtime-M handle
+    (not `x.float()` + cuBLAS), eh_proj the next K-split instance, the shared expert its fused
+    cell built at that count. 64 (a cell) is the control. No speculation, MTP1, context steps
+    and `TRTLLM_GLM52_DEC_CELL_UP=0` keep cuBLAS / the two-launch path there."""
+    core, calls = core_for(max_draft_len)
+    core._dec_cell_up = cell_up
+    # A decode cell at 16 that launches at runtime M for q_b; the rest of the 64-row cells are
+    # compiled for their own M (`at_rows` None): those go to the MTP cell (128).
+    core._proj["q_b"][16] = _runner("q_b@16")
+    monkeypatch.setattr(
+        M._projection_op,
+        "at_rows",
+        lambda r, rows: None if r.tag.endswith("@64") else _runner(f"{r.tag}@{rows}"),
+    )
+    if max_draft_len > 1:
+        core._shared_gu_swiglu_up = {
+            m: _runner(f"shared_gu@{m}:up") for m in {(max_draft_len + 1) * b for b in (1, 2, 3)}
+        }
+    _step(core, decode)
+    up = decode and max_draft_len > 1 and cell_up and rows != 64
+    x = _aligned(rows, 160)
+    w = torch.zeros(4, 160, dtype=BF16).t()
+    # dense_down's cells, as the other projections' (the fixture builds none for it).
+    core._proj["dense_down"] = {64: _runner("dense_down@64")}
+    core._proj_mtp["dense_down"] = {m: _runner(f"dense_down@{m}:mtp") for m in MTP_ROWS}
+    for name in ("qkva", "q_b", "ix_qb", "dense_gate_up", "dense_down"):
+        calls.clear()
+        core._project(name, x, w)
+        if rows == 64:
+            want = f"{name}@64"
+        elif not up or name in M._CELL_UP_KEEPS_CUBLAS:
+            # ix_qb and dense_down keep cuBLAS: there it is faster than their next cell up.
+            want = "cublas"
+        elif name == "q_b" and rows < 16:
+            want = f"q_b@16@{rows}"
+        else:
+            want = f"{name}@128:mtp@{rows}"
+        assert calls == [want], (name, rows, calls)
+
+    calls.clear()
+    ix = SimpleNamespace(fused_bf16=None, fused=None, kn_w=None, kn_b=None)
+    core._indexer_project(x, None, None, ix, rows, need_q=False)
+    want = "ix_split@64" if rows == 64 else "ix_split:rag" if up else "cublas"
+    assert calls == [want], calls
+
+    calls.clear()
+    e = torch.zeros(rows, 16, dtype=BF16)
+    core._mtp_front(e, e, rows)
+    if rows == 64:
+        want = ["norm_shard", "ksplit"]
+    else:
+        want = ["norm_shard", f"ksplit@{rows}"] if up else ["cublas"]
+    assert calls == want, calls
+
+    calls.clear()
+    xs = _aligned(rows, 16)
+    gu = torch.zeros(16, 1024, dtype=BF16)
+    dn = torch.zeros(512, 8, dtype=BF16)
+    core._shared_mlp(xs, gu, None, dn, trunk=True)
+    if rows == 64:
+        want = ["shared_gu@64", "shared_down@64"]
+    elif up and rows in core._shared_gu_swiglu_up:
+        want = [f"shared_gu@{rows}:up", f"shared_down@128:mtp@{rows}"]
+    elif up:
+        # No fused cell at this count (MTP3 at 6 / 18): the two-launch path on the cells.
+        want = [f"shared_gate_up@128:mtp@{rows}", f"shared_down@128:mtp@{rows}"]
+    else:
+        want = ["cublas", "cublas"]
+    assert calls == want, calls
+    # The same cells again: kept per (call, rows), frozen for the capture shape.
+    calls.clear()
+    core._project("qkva", x, w)
+    assert len(calls) == 1
+    assert core.route_hits.get("draft_cell", 0) == 0
+    if up:
+        assert core.route_hits.get("dec_cell_up", 0) > 0
+    else:
+        assert "dec_cell_up" not in core.route_hits
+
+
+@pytest.mark.parametrize("cell_up", [True, False], ids=["cell_up", "cell_up_off"])
+@pytest.mark.parametrize("rows", (6, 12, 18, 16))
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "context"])
+@pytest.mark.parametrize("max_draft_len", ENGINES)
+def test_absorbed_bmm_at_decode_rows_without_a_cell(
+    core_for, max_draft_len, decode, rows, cell_up
+) -> None:
+    """K-B / V-B at an MTP3 / MTP5 decode step's 12 / 18 rows (9..64 without a cell) take the
+    M >= 16 group's object, which launches at them, instead of the prefill BMM; so do the fp8
+    q-base K-B and the V-B that writes o_proj's MXF8 operand (`_absorb_cell`). 6 rows is below
+    that group (the prefill BMM as before); 16 is a cell (control). No speculation, MTP1,
+    context steps and `TRTLLM_GLM52_DEC_CELL_UP=0` keep the prefill BMM there."""
+    core, calls = core_for(max_draft_len)
+    core._dec_cell_up = cell_up
+    group = _runner("k_b@16..64")
+    core._absorb = {"k_b": {16: group, 64: group}}
+    core._kb8 = {m: _runner("k_b8@16..64") for m in (16, 32, 48, 64)}
+    core._vb8 = {m: _runner("v_b8@16..64") for m in (16, 32, 48, 64)}
+    _step(core, decode)
+    up = decode and max_draft_len > 1 and cell_up and 9 <= rows <= 64
+    calls.clear()
+    a = torch.zeros(16, rows, 8, dtype=BF16)
+    core._absorbed_bmm("k_b", a, None, None, a)
+    want = "k_b@16..64" if rows == 16 or up else "k_b:prefill"
+    assert calls == [want], calls
+    for cells, tag in ((core._kb8, "k_b8@16..64"), (core._vb8, "v_b8@16..64")):
+        got = core._absorb_cell(cells, rows)
+        assert (got.tag if got is not None else None) == (tag if rows == 16 or up else None), (
+            tag,
+            rows,
+            got,
+        )
+    assert core.route_hits.get("dec_cell_up", 0) == (3 if up and rows != 16 else 0)
 
 
 @pytest.mark.parametrize("bucket", [True, False], ids=["bucket", "no_bucket"])

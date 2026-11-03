@@ -158,3 +158,44 @@ def test_wide_rows_on_the_next_instance_are_its_rows_bitwise(projection) -> None
     assert torch.equal(out, again), "the replay on a new input differs from the eager launch"
     for rows in (64, 128, 192, 193):
         assert entry.at_rows(runner, rows) is None, rows
+
+
+#: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): captured decode row counts without
+#: an instance, which the target runs on the next instance up to 64 (`_cell_up`).
+DECODE_ROWS = (6, 12, 18)
+
+
+def test_decode_rows_on_the_next_instance_are_its_rows_bitwise(projection) -> None:
+    """`at_rows` at the MTP decode row counts up to 64 without an instance: the next
+    `SUPPORTED_M_VALUES` instance up at the exact rows, each row bitwise that instance's
+    with the input padded by other (random) rows, within the band; a captured launch replays
+    bitwise on a new input. A count with its own instance (16, the control) refuses."""
+    weight, runner = projection
+    g = torch.Generator(device="cuda").manual_seed(23)
+    for rows in DECODE_ROWS:
+        if rows in entry.SUPPORTED_M_VALUES:
+            continue
+        r = entry.at_rows(runner, rows)
+        bucket = min(m for m in entry.SUPPORTED_M_VALUES if rows < m <= 64)
+        assert r is not None and r.bucket == bucket and r.rows == rows
+        x = torch.randn(rows, K, generator=g, device="cuda").to(torch.bfloat16)
+        with validating(op):
+            out = op(x, weight, r)
+        padded = torch.randn(bucket, K, generator=g, device="cuda").to(torch.bfloat16)
+        padded[:rows] = x
+        full = op(padded, weight, runner)
+        torch.cuda.synchronize()
+        assert out.shape == (rows, N) and torch.equal(out, full[:rows]), (
+            f"{rows} rows: not the {bucket}-row instance's"
+        )
+        _compare(out, op.reference(x, weight, r))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = op(x, weight, r)
+        x.copy_(torch.randn(rows, K, generator=g, device="cuda").to(torch.bfloat16))
+        again = op(x, weight, r).clone()
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, again), f"{rows} rows: the replay differs"
+    assert 16 in entry.SUPPORTED_M_VALUES and entry.at_rows(runner, 16) is None

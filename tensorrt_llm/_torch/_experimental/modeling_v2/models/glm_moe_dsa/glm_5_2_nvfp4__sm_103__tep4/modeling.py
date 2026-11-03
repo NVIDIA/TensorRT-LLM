@@ -49,16 +49,19 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
     fp4_quantize,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.speculative import (
     MTPEagleWorker,
     get_spec_worker,
     should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.logger import logger
 
 from . import weights as _weights
@@ -291,11 +294,142 @@ _IX_PROJ_COLS = 160
 # fp8_mqa_logits allocates a `[q_rows, kv_rows]` fp32 score matrix per call; prefill chunks are
 # tiled to keep it under this many elements. Context steps are not captured.
 _PREFILL_LOGITS_BUDGET = 1 << 24
+# The fused shared-expert gate|up + SwiGLU kernel is compiled for one row count per runner
+# (`_shared_gu_swiglu_op`): an MTP3 / MTP5 engine also builds it at its decode row counts of
+# 1..`_SHARED_FUSED_UP_SEQS` sequences without a cell (MTP5 6 / 12 / 18, MTP3 12), served
+# where `_cell_up` holds. Wider counts take the two-launch path on the projection cells.
+_SHARED_FUSED_UP_SEQS = 3
+# Projections an MTP3 / MTP5 captured decode step's rows without a cell keep on cuBLAS instead
+# of the next cell up (`_cell_up`): there the cell is the slower one. Cold-weight CUDA-graph
+# timing on B300 (cuBLAS vs next cell up, us per call): ix_qb 12 rows 4.95 vs 6.11, 18 rows
+# 5.02 vs 5.42 (MTP 128 cell); dense_down 6 / 12 / 18 rows 8.15 / 8.25 / 8.29 vs 9.16 / 9.16
+# / 9.15. An eager draft step (`_draft_eager`) keeps its cells.
+_CELL_UP_KEEPS_CUBLAS = frozenset({"ix_qb", "dense_down"})
+# The decode logits width (the engine's max_seq_len) at or below which the generation rows keep our
+# decode top-k although the engine's config asks for GVR (`_dec_topk_gvr`;
+# `TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE`). Single-B300 CUDA graph of 20 calls (us per call, ours /
+# GVR, every set exact): GVR's tuning is frozen from the width, so on a 16384-wide engine at 192
+# rows (MTP5 x 32) it costs 5.2 / 12.5 at KV 2k / 4k against our 1.5 / 5.5, where a realtext
+# step (ISL 1k + OSL 8k) spends most of its decode; at 172032 GVR takes 8-17 (42 at 192 rows)
+# against our 58-95 at KV 160k. Only the width and the row count are fixed at capture.
+_DEC_TOPK_GVR_ABOVE = 16384
 
 
 def _tile_bounds(start: int, end: int, kv_rows: int) -> list[tuple[int, int]]:
     rows = max(1, _PREFILL_LOGITS_BUDGET // max(kv_rows, 1))
     return [(a, min(a + rows, end)) for a in range(start, end, rows)]
+
+
+# MTP draft-loop index share: the engine's DSA indexer semantics (`Indexer.sparse_attn_indexer`
+# with `mtp_index_share`), for the MTP layer's indexer, the only one a draft step runs.
+#
+# The engine's MTP-Eagle linear draft loop marks the metadata `in_mtp_draft_loop`, hands it the
+# trunk's accepted counts (`mtp_num_accepted`) and sets `indexer_skip_topk` from the second draft
+# step on (`eagle3._forward_linear_draft_loop`); it does so for every DSA metadata, and each
+# indexer's own `mtp_index_share` decides whether to act. With it on, draft step 0 stashes one
+# selection row per request in `shared_topk_indices` (a context request's last row, a generation
+# request's last accepted row), and the later steps copy those rows instead of scoring and
+# selecting. After step 0 the loop rewrites the metadata in place to one row per request in
+# request order (`num_contexts = 0`), so stash row `r` is request `r`'s: contexts first, then
+# generations. The keys still project and append on every step: the engine's
+# `pre_indexer_proj` and `_update_k_cache` run unconditionally.
+
+
+def _engine_sparse_params(model_config: ModelConfig, layer_idx: int | None):
+    """Layer `layer_idx`'s DSA sparse params as the engine's attention module builds them
+    (`to_sparse_params(pretrained_config, layer_idx)`), or None without a sparse config."""
+    sparse_cfg = getattr(model_config, "sparse_attention_config", None)
+    if sparse_cfg is None or not hasattr(sparse_cfg, "to_sparse_params"):
+        return None
+    return sparse_cfg.to_sparse_params(
+        pretrained_config=getattr(model_config, "pretrained_config", None), layer_idx=layer_idx
+    )
+
+
+def _engine_mtp_index_share(model_config: ModelConfig) -> bool:
+    """The engine's `mtp_index_share` for the MTP layer's indexer: its sparse params, i.e. the
+    LLM arg `index_share_for_mtp_iteration`, else the checkpoint's field of that name (GLM-5.2
+    NVFP4's config.json sets it true)."""
+    cfg = getattr(model_config, "pretrained_config", None)
+    params = _engine_sparse_params(model_config, getattr(cfg, "num_hidden_layers", None))
+    return bool(getattr(params, "mtp_index_share", False))
+
+
+def _dec_topk_gvr_serves(max_seq_len: int) -> bool:
+    """Whether the GVR decode top-k serves an engine of this logits width (`max_seq_len`, fixed
+    at capture): wider than `_DEC_TOPK_GVR_ABOVE` (`TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE`)."""
+    above = int(os.environ.get("TRTLLM_GLM52_DEC_TOPK_GVR_ABOVE", str(_DEC_TOPK_GVR_ABOVE)))
+    return max_seq_len > above
+
+
+def _dec_topk_gvr_choice(
+    params, index_topk: int, *, sm_version: int, dsl_available: bool, env: str | None
+) -> bool | None:
+    """The decode top-k engine of the generation rows: `gvr_deterministic_topk` where they take
+    the stock engine's self-sampling GVR top-k, None where they keep ours.
+
+    GVR where the stock DSA indexer would run it on this checkpoint's layers: the engine's
+    `enable_heuristic_topk` with the self-sampling engine (`use_self_sampling_gvr`: its
+    `use_self_sampling_topk`, CuTe DSL, sm_100 / sm_103, `index_topk` 2048 here, compress ratio
+    1). The temporal-hint engine (`use_self_sampling_topk=False`) needs the previous step's
+    selection as caller-owned state, which this target does not keep: ours there.
+    `TRTLLM_GLM52_DEC_TOPK_GVR=0` keeps ours for A/B (`env`)."""
+    if env == "0" or params is None or not getattr(params, "enable_heuristic_topk", False):
+        return None
+    if index_topk != 2048 or not use_self_sampling_gvr(
+        enable_heuristic_topk=True,
+        use_self_sampling_topk=bool(getattr(params, "use_self_sampling_topk", True)),
+        index_topk=index_topk,
+        compress_ratio=1,
+        is_cute_dsl_available=dsl_available,
+        sm_version=sm_version,
+    ):
+        return None
+    return bool(getattr(params, "gvr_deterministic_topk", False))
+
+
+def _mtp_share_reuses(md) -> bool:
+    """The engine's `reuse_topk` without the flag (the caller's): a draft step after the first,
+    with a stash to read."""
+    return bool(
+        getattr(md, "in_mtp_draft_loop", False)
+        and getattr(md, "indexer_skip_topk", False)
+        and getattr(md, "shared_topk_indices", None) is not None
+    )
+
+
+def _mtp_share_load(md, dst: torch.Tensor, seqs: int) -> None:
+    """A reusing draft step's selection: stash rows `[0, seqs)` into its `seqs` one-row
+    requests' rows, as the engine copies `shared_topk_indices[:num_generations]`."""
+    dst.copy_(md.shared_topk_indices[:seqs])
+
+
+def _mtp_share_store(md, topk_buf: torch.Tensor, ctx: int, tc: int, seqs: int, gen_p: int):
+    """Draft step 0's stash, as the engine writes it after the indexer: each context request's
+    last row of `topk_buf[:tc]`, then each generation request's last accepted row of
+    `topk_buf[tc:]` (row `gen_p - 1` without accepted counts), from stash row 0. A dense
+    (skipped) phase's rows are stashed too, as the engine does."""
+    rows = None
+    if seqs:
+        gen_topk = topk_buf[tc : tc + seqs * gen_p]
+        num_accepted = getattr(md, "mtp_num_accepted", None)
+        if num_accepted is None:
+            rows = gen_topk[gen_p - 1 :: gen_p]
+        else:
+            base = torch.arange(seqs, device=gen_topk.device, dtype=torch.long) * gen_p
+            offset = (num_accepted[ctx : ctx + seqs] - 1).clamp(0, gen_p - 1)
+            rows = gen_topk[base + offset]
+    if ctx:
+        ctx_last = torch.cumsum(md.seq_lens_cuda[:ctx].to(torch.long), dim=0) - 1
+        ctx_rows = topk_buf[ctx_last]
+        rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+    if rows is None:
+        return
+    shared = md.shared_topk_indices
+    if shared is None:
+        md.shared_topk_indices = rows.contiguous()
+    else:
+        shared[: rows.shape[0], : rows.shape[1]].copy_(rows)
 
 
 def _moe_chunk_sizes(total: int) -> list[int]:
@@ -564,6 +698,36 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # collapsed MTP3 / MTP5 acceptance at draft positions 2.. (3.27 vs stock 3.98 at MTP3).
         # MTP1 never feeds back, so it keeps the norm inside `shared_head` (unchanged bytes).
         self._mtp_out_normed = self.max_draft_len > 1
+        # The engine's draft-loop index share for the MTP layer's indexer (`_engine_mtp_index_share`;
+        # the GLM-5.2 checkpoint turns it on): draft steps after the first reuse draft step 0's
+        # selection (`_mtp_share_*`). Only a loop of more than one draft step reads the stash.
+        self.mtp_index_share = self.mtp_enabled and _engine_mtp_index_share(model_config)
+        self._mtp_share_stash = self.mtp_index_share and self.max_draft_len > 1
+        # The engine's sparse config asking for the GVR decode top-k (`enable_heuristic_topk`,
+        # `_dec_topk_gvr_choice`): the generation rows' top-k then runs the stock engine's
+        # self-sampling GVR engine through its `TopK` module, as the stock DSA indexer does,
+        # instead of our one-CTA-per-row kernel; None keeps ours. TRTLLM_GLM52_DEC_TOPK_GVR=0
+        # keeps ours under that config (A/B). `_derive_first_step` keeps ours on engines no wider
+        # than `_DEC_TOPK_GVR_ABOVE` (`_dec_topk_gvr_serves`) and warms GVR's launchers.
+        gvr_det = _dec_topk_gvr_choice(
+            _engine_sparse_params(model_config, 0),
+            self.idx_topk,
+            sm_version=get_sm_version(),
+            dsl_available=IS_CUTLASS_DSL_AVAILABLE,
+            env=os.environ.get("TRTLLM_GLM52_DEC_TOPK_GVR"),
+        )
+        # Whether it serves this engine's width (`_derive_first_step`).
+        self._dec_topk_gvr_live = False
+        self._dec_topk_gvr = (
+            None
+            if gvr_det is None
+            else TopK(
+                self.idx_topk,
+                decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+                gvr_self_sampling=True,
+                gvr_deterministic=gvr_det,
+            )
+        )
         # Whether the running step is a decode step of an engine drafting more than one token
         # (`_select_target` sets it): its rows above 64 (verify and draft step 0 carry 32 x
         # (max_draft_len + 1)) are decode rows, which keep the numerics of the 64-row decode
@@ -588,6 +752,21 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # re-pinned runners, by (call, rows).
         self._draft_eager = False
         self._draft_rag: dict[tuple[str, int], object] = {}
+        # TRTLLM_GLM52_DEC_CELL_UP (default 1; 0 restores cuBLAS there): an MTP3 / MTP5
+        # decode step's (`_wide_decode`, graph-captured) row counts up to 64 without a decode
+        # cell of their own (MTP5 at 1-3 requests: 6 / 12 / 18; MTP3 at 3: 12) take the same
+        # rule as an eager draft step (`_cell_up`): the next cell up at their exact rows.
+        # AI Hub job 948929 (MTP5 b=2, 12 rows): the indexer projection there ran as `x.float()`
+        # + an fp32 SIMT cuBLAS GEMM + split-K reduce + copies (27 us per indexer layer).
+        self._dec_cell_up = os.environ.get("TRTLLM_GLM52_DEC_CELL_UP", "1") == "1"
+        # TRTLLM_GLM52_MOE_ACC_PADDED (default 1; 0 restores the add after FC2): at a decode
+        # width up to 64 that routing pads to a power of two (MTP5 at 1-3 requests: 6 / 12 /
+        # 18 -> 8 / 16 / 32) the shared expert also writes the routed slot's first rows and
+        # FC2 accumulates onto them (`_moe_begin_layer`), as at the power-of-two widths: no
+        # clear, and no separate shared + routed add on the critical chain after FC2.
+        self._moe_acc_padded = os.environ.get("TRTLLM_GLM52_MOE_ACC_PADDED", "1") == "1"
+        # The fused shared-expert cells at those row counts (`_SHARED_FUSED_UP_SEQS`).
+        self._shared_gu_swiglu_up: dict = {}
         self._ix_pre_split_rag = None
         # The MTP3 / MTP5 decode cells' K-B writing the e4m3 q-base beside the rope kernel
         # (`_attn_gen`), by row count; empty keeps the bf16 K-B and the full rope there.
@@ -1480,6 +1659,21 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             if wide
             else {}
         )
+        # An MTP3 / MTP5 engine's decode row counts of 1..3 sequences without a cell
+        # (`_SHARED_FUSED_UP_SEQS`), each its own compile; taken where `_cell_up` holds.
+        up_rows = sorted(
+            {
+                (self.max_draft_len + 1) * seqs
+                for seqs in range(1, _SHARED_FUSED_UP_SEQS + 1)
+                if (self.max_draft_len + 1) * seqs <= _DECODE_MAX_ROWS
+            }
+            - set(self._shared_gu_swiglu)
+        )
+        self._shared_gu_swiglu_up = (
+            _shared_gu_swiglu_op.build_all(self._shared_gu_il[self.dense_layers], tuple(up_rows))
+            if wide and self._dec_cell_up
+            else {}
+        )
         self._embedding = build_embedding(self.w["embed"])
         # One compiled object per row-count group serves (2, 4, 8) or (16, 32, 48, 64); the
         # prefill kernel every other row count up to 8192, the 1..63 generation rows of a
@@ -2051,6 +2245,12 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     f"modeling_v2 GLM-5.2: indexer top-k decode build failed for next_n={next_n} "
                     f"({e}); using the trtllm op"
                 )
+        # GVR only where it serves this engine's width, warmed ahead of any capture.
+        self._dec_topk_gvr_live = self._dec_topk_gvr is not None and _dec_topk_gvr_serves(
+            int(md.max_seq_len)
+        )
+        if self._dec_topk_gvr_live:
+            self._warm_dec_topk_gvr(md)
         if self.mtp_enabled:
             # MTP3 / MTP5 also width 1: the MTP layer's 1-token draft steps
             # (`_mtp_rope_specialised`). A separate draft pool's block-table width compiles at
@@ -2132,6 +2332,29 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 )
         self._derive_pending = False
         self._derived_for = md.kv_cache_manager
+
+    def _warm_dec_topk_gvr(self, md) -> None:
+        """Compile the GVR decode top-k's launchers for every row count a decode step of this
+        engine can carry (1..max_batch_size sequences at each generation width), as the
+        engine's `warmup_selfsampling_topk` does for its own `next_n`: a launcher is keyed by the
+        exact row count and the logits row stride, and one first met inside a capture cannot
+        compile there (that graph then keeps ours, `_indexer_decode`). The scorer's rows are
+        the DSL paged-MQA arena's, `max_seq_len` rounded up to 256 columns."""
+        from tensorrt_llm._torch.kernels.blackwell.top_k import (
+            gvr_topk_decode_self_sampling_host as gvr_host,
+        )
+
+        seqs = int(md.max_num_requests)
+        for next_n in (1, *self.mtp_widths):
+            gvr_host.warmup_varlen(
+                self.idx_topk,
+                int(md.max_seq_len),
+                compress_ratio=1,
+                next_n=next_n,
+                num_rows_list=tuple(next_n * b for b in range(1, seqs + 1)),
+                row_stride=(int(md.max_seq_len) + 255) // 256 * 256,
+                deterministic=self._dec_topk_gvr.gvr_deterministic,
+            )
 
     # ---- blocks both targets run ----
 
@@ -2388,15 +2611,28 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._count("dec_wide_rows", cell is not None)
         return cell
 
+    def _cell_up(self, rows: int) -> bool:
+        """Whether a call's `rows` (at most 64) without a decode cell of their own run on the
+        next cell up at their exact rows (`_draft_cell`, the runtime-M indexer split, the next
+        eh_proj K-split instance, the fused shared-expert cells at MTP decode counts): an
+        eager draft step's (`_draft_eager`), and an MTP3 / MTP5 decode step's
+        (`_wide_decode`, `TRTLLM_GLM52_DEC_CELL_UP`). The latter is graph-captured: `rows`
+        is fixed per capture shape and the cell is kept per (call, rows), so each graph
+        freezes one choice with no host sync. Rows with a cell never ask."""
+        return rows <= _DECODE_MAX_ROWS and (
+            self._draft_eager or (self._wide_decode and self._dec_cell_up)
+        )
+
     def _draft_cell(self, call: str, rows: int, cells: dict, mtp_cells: dict, at_rows):
-        """The cell an eager draft step's `rows` (at most 64, no cell of their own; see
-        `_draft_eager`) run on at their exact rows: the smallest decode cell above `rows` up
-        to 64 that launches at a runtime row count, else the smallest such MTP cell (128 /
-        192). `at_rows(cell, rows)` re-pins as in `_wide_cell`; a None from it (a cell
-        compiled for its own M only) moves to the next cell up. The context-sized cells
-        (1099 rows and up) are never taken: their tiles past the last row would each read
-        the weight again. Each row is bitwise the serving cell's for it. None (the call's
-        fallback runs) when no cell qualifies. Kept per (`call`, rows); builds nothing."""
+        """The cell an eager draft step's or an MTP3 / MTP5 decode step's `rows` (at most 64,
+        no cell of their own; see `_cell_up`) run on at their exact rows: the smallest decode
+        cell above `rows` up to 64 that launches at a runtime row count, else the smallest
+        such MTP cell (128 / 192). `at_rows(cell, rows)` re-pins as in `_wide_cell`; a None
+        from it (a cell compiled for its own M only) moves to the next cell up. The
+        context-sized cells (1099 rows and up) are never taken: their tiles past the last row
+        would each read the weight again. Each row is bitwise the serving cell's for it. None
+        (the call's fallback runs) when no cell qualifies. Kept per (`call`, rows); builds
+        nothing, so a first call inside a CUDA-graph capture is safe."""
         key = (call, rows)
         if key not in self._draft_rag:
             cell = None
@@ -2408,7 +2644,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     break
             self._draft_rag[key] = cell
         cell = self._draft_rag[key]
-        self._count("draft_cell", cell is not None)
+        self._count("draft_cell" if self._draft_eager else "dec_cell_up", cell is not None)
         return cell
 
     def _project(
@@ -2470,7 +2706,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 f"proj:{name}", self._proj_mtp.get(name, {}), rows, _projection_op.at_rows
             )
             self._count("dec_wide", runner is not None)
-        if runner is None and self._draft_eager and rows <= _DECODE_MAX_ROWS:
+        if (
+            runner is None
+            and self._cell_up(rows)
+            and (self._draft_eager or name not in _CELL_UP_KEEPS_CUBLAS)
+        ):
             runner = self._draft_cell(
                 f"proj:{name}",
                 rows,
@@ -2498,13 +2738,26 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             out = torch.empty([rows, runner.n], dtype=runner.out_dtype, device=x.device)
         return cute_dsl_projection(x, w_colmajor.t(), out, runner)
 
+    def _absorb_cell(self, cells: dict, rows: int):
+        """`cells[rows]` (a decode K-B / V-B object by its cells' row counts), else, for a
+        count in 9..64 without a cell where `_cell_up` holds (MTP5 at 2 / 3 requests: 12 / 18
+        rows; MTP3 at 3: 12), the M >= 16 group's object, which launches at any of them
+        (`_absorbed_bmm_op.DECODE_RUNTIME_ROWS`). None otherwise. A dict lookup on host ints:
+        frozen per capture shape."""
+        cell = cells.get(rows)
+        if cell is None and rows in _absorbed_bmm_op.DECODE_RUNTIME_ROWS and self._cell_up(rows):
+            cell = cells.get(_DECODE_MAX_ROWS)
+            self._count("dec_cell_up", cell is not None)
+        return cell
+
     def _absorbed_bmm(self, kind: str, x_t, w_kn, w_nk, out_t) -> None:
         """An absorbed-MLA BMM ("k_b" or "v_b") into `out_t`: the decode kernel at its row
         counts (2..64, and 65..192 on a `_wide_decode` step: the 128 / 192 cells' object,
-        which launches at any of them), the prefill kernel at any other up to 8192, else
-        `bmm_out`, which takes the `[H, K, N]` operand instead of `[H, N, K]`."""
+        which launches at any of them; 9..64 where `_cell_up` holds: the M >= 16 group's
+        object, `_absorb_cell`), the prefill kernel at any other up to 8192, else `bmm_out`,
+        which takes the `[H, K, N]` operand instead of `[H, N, K]`."""
         rows = int(x_t.shape[1])
-        runner = self._absorb[kind].get(rows)
+        runner = self._absorb_cell(self._absorb[kind], rows)
         if self._wide_decode and rows > _DECODE_MAX_ROWS:
             runner = self._wide_cell(kind, self._absorb_mtp[kind], rows)
             self._count("dec_wide", runner is not None)
@@ -2805,12 +3058,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     rag = None
                 split = self._wide_cell("ix_split", self._ix_pre_split_mtp, rows, lambda h, r: rag)
                 self._count("dec_wide", split is not None)
-            elif split is None and self._draft_eager and rows <= _DECODE_MAX_ROWS:
-                # An eager draft step's count without a handle: the runtime-M handle (the
-                # same kernel) instead of the fp32 cuBLAS projection.
+            elif split is None and self._cell_up(rows):
+                # An eager draft step's or an MTP3 / MTP5 decode step's count without a
+                # handle: the runtime-M handle (the same kernel) instead of `x.float()` and
+                # the fp32 cuBLAS projection, its split-K reduce and two copies.
                 rag = self._ix_pre_split_rag
                 split = rag if rag is not None and rows <= rag.max_m else None
-                self._count("draft_cell", split is not None)
+                self._count("draft_cell" if self._draft_eager else "dec_cell_up", split is not None)
             pre = self._ix_pre_split_pre
             if (
                 split is None
@@ -2946,7 +3200,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 *meta,
                 self._max_ctx_len,
             )
+        # The stock engine's GVR decode top-k where the engine's sparse config asks for it.
+        gvr = self._dec_topk_gvr_live
+        if gvr and self._dec_topk_gvr_launch(md, logits, kv_lens, topk_buf, gen_p):
+            return
         compiled = self._ix_topk_dec_compiled.get(gen_p)
+        # Ours, or (a width without a handle) the trtllm op.
+        self._count("ix_topk_dec", compiled is not None)
         if compiled is None:
             indexer_topk_decode(
                 logits, kv_lens, topk_buf, gen_p, self.idx_topk,
@@ -2956,6 +3216,44 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             cute_dsl_indexer_topk_decode(
                 logits, kv_lens, topk_buf, top_k=self.idx_topk, next_n=gen_p, compiled=compiled
             )
+
+    def _dec_topk_gvr_launch(self, md, logits, kv_lens, topk_buf, gen_p: int) -> bool:
+        """The generation rows' top-k on the stock engine's self-sampling GVR engine, the call
+        the stock DSA indexer makes (`Indexer.sparse_attn_indexer`'s decode `self.top_k(...)`).
+        False where it did not launch: a launcher missing inside a capture (none JIT-compiles
+        there), which leaves that graph on ours.
+
+        Row `b * gen_p + t` selects among columns `[0, kv_lens[b] - gen_p + t + 1)` (`kv_lens`
+        counts this step's tokens, so the bound is the causal one our kernel uses); with `n`
+        that many, it writes the exact top-`min(n, 2048)` set (ties at the k-th score kept in
+        an unspecified order unless `gvr_deterministic_topk`), and a row with `n <= 2048` the
+        identity `0..n-1`, each followed by -1: the valid prefix the sparse MLA decode reads.
+        Tuning is frozen from `max_seq_len` (the scorer's width), with no host reads, so the
+        launch is CUDA-graph replay safe. The engine's `radix_aux_*` scratch serves only the
+        stock module's own fall-through (logits outside the engine's format gate)."""
+        try:
+            self._dec_topk_gvr(
+                logits,
+                topk_buf,
+                is_prefill=False,
+                sequence_lengths=kv_lens,
+                scan_lengths=kv_lens,
+                next_n=gen_p,
+                max_seq_len=self._max_ctx_len,
+                radix_aux_indices=md.radix_aux_indices,
+                radix_aux_logits=md.radix_aux_logits,
+            )
+        except RuntimeError as e:
+            if not torch.cuda.is_current_stream_capturing():
+                raise
+            # Raised before any launch, so the capture continues on ours.
+            logger.warning(
+                f"modeling_v2 GLM-5.2: GVR decode top-k not compiled for {kv_lens.shape[0]} x "
+                f"{gen_p} rows inside a capture ({e}); this graph keeps our decode top-k"
+            )
+            return False
+        self._count("ix_topk_dec_gvr", True)
+        return True
 
     def _fmha_dec_handle(self, gen_p: int) -> "_fmha_dec_op.CompiledSparseMlaDecode":
         """The decode attention's handle for `gen_p` rows per sequence: the width-2 grid up to
@@ -2997,7 +3295,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # itself (the bytes the rope kernel would convert) and releases the rope kernel at
         # once: the rope skips the q-base and waits for the K-B only at its end, so the two
         # run concurrently and the decode MLA's wait on the rope still covers the K-B.
-        kb8 = self._kb8.get(gen) if specialised_rope else None
+        kb8 = self._absorb_cell(self._kb8, gen) if specialised_rope else None
         if specialised_rope and self._wide_decode and gen > _DECODE_MAX_ROWS and self._kb8_mtp:
             # MTP3 / MTP5 decode rows: the MTP cells' fp8 q-base K-B, at its cell or on the
             # next one up at the exact rows (the rope handles of widths 4 / 6 carry the
@@ -3125,7 +3423,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         out_t = torch.transpose(torch.reshape(out, [gen, heads, self.v_dim]), 0, 1)
         vb8 = None
         if o8_side and gen <= _DECODE_MAX_ROWS:
-            vb8 = self._vb8.get(gen)
+            # 9..64 rows without a cell on an MTP3 / MTP5 decode step too (`_absorb_cell`):
+            # o_proj then skips its own act-quant there as well.
+            vb8 = self._absorb_cell(self._vb8, gen)
         elif o8_side and self._vb8w:
             vb8 = self._wide_cell("v_b_x8", self._vb8w, gen)
         if vb8 is not None:
@@ -3187,7 +3487,9 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         gate|up + SwiGLU runs as the MXF8 GEMM with the SwiGLU in its epilogue. A
         `_wide_decode` step's rows above 64 take the MTP decode cells, trunk and MTP layer:
         at 128 / 192, else on the next one up (`_wide_cell`; the gate|up cells take any row
-        count, the down cell is re-pinned)."""
+        count, the down cell is re-pinned). Rows up to 64 without a fused cell where
+        `_cell_up` holds: the fused cell built at that count (`_SHARED_FUSED_UP_SEQS`), else
+        the two-launch path on the projection cells next up."""
         rows = int(x.shape[0])
         k = self._moe_k
         wide = None
@@ -3215,6 +3517,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                     cute_dsl_shared_gate_up_swiglu(xs, gu_il, mid, k.shared_up_pre)
                 return cute_dsl_projection(mid, dn.t(), res, k.shared_down_pre)
         runner = self._shared_gu_swiglu.get(rows) if wide is None else wide
+        if runner is None and self._shared_gu_swiglu_up and self._cell_up(rows):
+            # An MTP3 / MTP5 decode count of 1..3 sequences: its own fused cell.
+            runner = self._shared_gu_swiglu_up.get(rows)
+            self._count("dec_cell_up", runner is not None)
         if runner is None:
             gate_up = self._project("shared_gate_up", x, gu)
             swiglu = self._rows.swiglu
@@ -3269,13 +3575,28 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
 
     def _moe_begin_layer(self, rows: int, exact: bool = False):
         """Open one layer: advance the slot for the router, top-k and grouped GEMMs, and
-        return the routed output rows for the shared expert to write into, or None. Only at
-        a width the GEMMs do not pad: a power of two, or any count on the prefill pair from
-        513 (or on a wide decode step, `exact`). Called before the shared branch forks, so
-        the shared expert writes the slot FC2 accumulates into."""
+        return the routed output rows for the shared expert to write into, or None. At a
+        width the GEMMs do not pad: a power of two, or any count on the prefill pair from
+        513 (or on a wide decode step, `exact`); and at a padded decode width up to 64
+        (`_moe_acc_padded`). Called before the shared branch forks, so the shared expert
+        writes the slot FC2 accumulates into.
+
+        A padded width is safe for the same reasons as the others: row `i` of the shared
+        expert is token `i`, and FC2 adds into `out[expanded_idx // top_k]` for the
+        selections the maps hold, nothing else. The padding tokens follow the real ones and
+        route to a non-local expert (`pad_expert_id`), so no tile scatters into their rows,
+        which are neither cleared nor written and are sliced off. The ordering is unchanged:
+        the shared expert writes on the side stream, which FC2 joins (`_moe_experts`), and
+        the slot alternates per layer as at every other width. What a padded width adds
+        (the staging copies, the routing kernel, the top-k's late FC1 release) does not
+        touch the output."""
         self._moe_slot ^= 1
-        if self._moe_padded_rows(rows, exact) != rows or rows > _MOE_MAX_T:
+        if rows > _MOE_MAX_T:
             return None
+        if self._moe_padded_rows(rows, exact) != rows:
+            if rows > _DECODE_MAX_ROWS or not self._moe_acc_padded:
+                return None
+            self._count("moe_acc_padded", True)
         return self._moe_slots[self._moe_slot].out[:rows]
 
     def _moe_router(self, x, m, slot, exact: bool = False):
@@ -3794,9 +4115,10 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             cells = dict.fromkeys(_mtp_eh.WIDE_ROWS, runner)
             runner = self._wide_cell("mtp_eh", cells, rows, _mtp_eh.at_rows)
             ksplit = runner is not None
-        elif not ksplit and self._draft_eager and rows <= _DECODE_MAX_ROWS:
-            # An eager draft step's count: the next supported instance up at its exact rows
-            # (`at_rows` picks the instance; one runner holds them all).
+        elif not ksplit and self._cell_up(rows):
+            # An eager draft step's or an MTP3 / MTP5 decode step's count: the next supported
+            # instance up at its exact rows (`at_rows` picks the instance; one runner holds
+            # them all).
             runner = self._draft_cell(
                 "mtp_eh", rows, {_DECODE_MAX_ROWS: runner}, {}, _mtp_eh.at_rows
             )
@@ -4695,6 +5017,15 @@ class PrefillTarget:
                     md, k_pool, q_fp8[tc:], weights[tc:], topk_buf[tc:], ctx, gen // gen_p, gen_p,
                     split_memo,
                 )  # fmt: skip
+            # Draft step 0 of a context or mixed step (the later steps have no context rows
+            # and take `DecodeTarget`): the MTP layer stashes its selection for them.
+            if (
+                i == core.num_layers
+                and core._mtp_share_stash
+                and md.in_mtp_draft_loop
+                and not _mtp_share_reuses(md)
+            ):
+                _mtp_share_store(md, topk_buf, ctx, tc, gen // gen_p if gen else 0, gen_p)
         slots_ctx, slots_gen, gen_kind, gen_layer = slots_of(topk_buf, ix is not None)
         if mha8:
             q_ctx = core._q_b_e4m3(q_a[:tc], a, pre=qa8)
@@ -5087,11 +5418,17 @@ class DecodeTarget:
         core = self.core
         a = core._attn[i]
         ix = core._idx[i]
+        # The MTP layer on a draft step after the first, with the engine's index share on: the
+        # selection is draft step 0's (`_mtp_share_load`), so the indexer's q side, scorer and
+        # top-k do not run; its keys still project and append. Draft step 0 stashes.
+        share = ix is not None and i == core.num_layers and core.mtp_index_share
+        share_reuse = share and _mtp_share_reuses(md)
+        select = not skip_gen and not share_reuse
         # MTP3 / MTP5 wide rows: the qkva projection and the indexer's key / head-weight
         # projection in one GEMM (None: the two GEMMs below).
         fold = core._qkva_ix_fold(x, i, rows) if ix is not None else None
         # And q_b with the indexer's wq_b in one GEMM where the step runs the indexer.
-        qbix = core._qb_ixqb_runner(i, rows) if ix is not None and not skip_gen else None
+        qbix = core._qb_ixqb_runner(i, rows) if ix is not None and select else None
         q, q_a, latent, _ = core._qkv(
             x, a, q_b=qbix is None, qkva=None if fold is None else fold[0]
         )
@@ -5101,15 +5438,20 @@ class DecodeTarget:
         if ix is not None:
             k_pool = md.kv_cache_manager.get_indexer_k_cache_buffers(i)
             q_fp8, weights, k_pre = core._indexer_project(
-                x, q_a, pos, ix, rows, not skip_gen, kw=None if fold is None else fold[1:],
+                x, q_a, pos, ix, rows, select, kw=None if fold is None else fold[1:],
                 ixq=ixq, kc=(md, k_pool),
             )  # fmt: skip
             if k_pre is not None:  # else written with the q side (`_ix_qk_handle`)
                 core._indexer_write_k(md, k_pool, k_pre, rows)
-            if not skip_gen:
+            if select:
                 core._indexer_decode(
                     md, k_pool, q_fp8, weights, topk_buf, 0, rows // gen_p, gen_p, split_memo
                 )
+            elif share_reuse and not skip_gen:
+                core._count("mtp_ix_share", True)
+                _mtp_share_load(md, topk_buf, rows)
+            if share and not share_reuse and core._mtp_share_stash and md.in_mtp_draft_loop:
+                _mtp_share_store(md, topk_buf, 0, 0, rows // gen_p, gen_p)
         slots, slot_kind, slot_layer = slots_of(topk_buf, ix is not None)
         # A trunk layer whose o_proj takes the decode MXF8 GEMM (or at MTP3 / MTP5 decode
         # rows above 64 the wide one): the V-B writes its operand.

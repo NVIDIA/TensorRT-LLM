@@ -179,6 +179,49 @@ def test_runtime_m_handle_is_the_compiled_handles_bitwise() -> None:
         op(*_build(193, seed=5), rag)
 
 
+#: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): captured decode row counts without
+#: a handle, which the target runs on the runtime-M handle (`_cell_up`) instead of `x.float()`
+#: and the fp32 cuBLAS projection. 16, a compiled handle, is the control.
+DECODE_ROWS = (6, 12, 18, 16)
+
+
+@pytest.mark.parametrize("rows", DECODE_ROWS)
+def test_runtime_m_handle_at_small_decode_rows(rows) -> None:
+    """At the small-batch MTP decode counts the runtime-M handle writes, row for row, what
+    the handle compiled for that count writes and what the next decode handle up (16 / 32)
+    writes for it with the input padded by other (random) rows; within the fp64 reference
+    band; and a captured launch replays bitwise on new operands."""
+    dev = torch.cuda.current_device()
+    rag = compile_ragged(dev)
+    up = min(m for m in (16, 32, 48, 64) if m >= rows)
+    own, cell = compile_handle(dev, rows), compile_handle(dev, up)
+    x, weight, key, head_weights = _build(rows, seed=rows)
+    with validating(op):
+        op(x, weight, key, head_weights, rag)
+    _, _, ko, wo = _build(rows, seed=rows + 500)
+    op(x, weight, ko, wo, own)
+    xp, _, kp, wp = _build(up, seed=rows + 1000)
+    xp[:rows] = x
+    op(xp, weight, kp, wp, cell)
+    torch.cuda.synchronize()
+    assert torch.equal(key, ko) and torch.equal(head_weights, wo), f"{rows}: not its own handle's"
+    assert torch.equal(key, kp[:rows]) and torch.equal(head_weights, wp[:rows]), (
+        f"{rows} rows: not the {up}-row handle's"
+    )
+    _compare(key, head_weights, *op.reference(x, weight, key, head_weights, rag))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(x, weight, key, head_weights, rag)
+    x2, _, key2, head_weights2 = _build(rows, seed=rows + 7)
+    x.copy_(x2)
+    op(x, weight, key2, head_weights2, rag)
+    key.fill_(float("nan"))
+    head_weights.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(key, key2) and torch.equal(head_weights, head_weights2)
+
+
 def test_guard_refuses_bf16_head_weights_on_the_prefill_handle() -> None:
     """The prefill path copies the fp32 product into the buffers, and a copy casts:
     bf16 head weights would round silently where the scorers expect fp32."""

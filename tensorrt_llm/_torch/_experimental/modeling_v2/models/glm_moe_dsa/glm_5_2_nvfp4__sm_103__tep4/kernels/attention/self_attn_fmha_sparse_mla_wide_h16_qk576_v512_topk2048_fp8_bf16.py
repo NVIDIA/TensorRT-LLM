@@ -287,6 +287,7 @@ def _fmha_sparse_mla_wide_kernel(
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         prims.barrier_cta_sync(0)
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, NUM_TMEM_COLS, group="cta_1")
         if tidx == 0:
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
@@ -890,6 +891,7 @@ def _fmha_sparse_mla_wide_kernel(
     if cutlass.const_expr(num_ctas_kv == 1 or use_gmem_reduction):
         prims.barrier_cta_sync(0)
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, NUM_TMEM_COLS, group="cta_1")
 
     if cutlass.const_expr(use_gmem_reduction):
@@ -936,6 +938,7 @@ def _fmha_sparse_mla_wide_kernel(
     prims.barrier_cta_sync(0)
     if cutlass.const_expr(num_ctas_kv > 1 and not use_gmem_reduction):
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, NUM_TMEM_COLS, group="cta_1")
     if tidx == 0:
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)

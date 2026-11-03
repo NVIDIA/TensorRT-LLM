@@ -34,6 +34,12 @@ MTP_GROUPS = ("m_ge_128",)
 #: count above 64, a batch of fewer than 32 sequences included; each row bitwise what the
 #: 128 / 192 cells compute for it. Its runner's `rows` stays (128, 192), the cells.
 MTP_RUNTIME_ROWS = _k_b.MTP_GROUP_RUNTIME_ROWS
+#: The row counts the M >= 16 group's object (`GROUPS[1]`) also launches at (runtime M):
+#: every decode row count in 9..64, each row bitwise what that group's cells compute for it.
+#: For the MTP3 / MTP5 decode counts without a cell (12 / 18); its runner's `rows` stays the
+#: cells (16, 32, 48, 64). The V-B MXF8 side output then writes those rows of o_proj's
+#: operand (and the zero-filled tail of the 32-row tile as quantized zeros).
+DECODE_RUNTIME_ROWS = _k_b.DECODE_GROUP_RUNTIME_ROWS
 #: The prefill kernels serve every row count 1..PREFILL_MAX_ROWS.
 PREFILL_MAX_ROWS = _prefill.MAX_ROWS
 
@@ -323,7 +329,9 @@ class CuteDslAbsorbedBmm(OpWrapper):
     site, with the `[16, K, N]` weight that op takes. An engine drafting more
     than one token also builds `MTP_GROUPS` (128 and 192 rows) and sends them a
     decode step's rows only; a context step of those row counts keeps the
-    prefill kernel.
+    prefill kernel. The M >= 16 group's objects also launch at every count in
+    9..64 (`DECODE_RUNTIME_ROWS`), which the target sends them only from the
+    rows without a cell of an MTP3 / MTP5 decode step (12 / 18) or eager draft.
 
     On the context step the target takes the fp8 q-base K-B (`build_prefill_fp8_q_base`)
     instead when the rows go on the context rope/append kernel: K-B then writes the FMHA's

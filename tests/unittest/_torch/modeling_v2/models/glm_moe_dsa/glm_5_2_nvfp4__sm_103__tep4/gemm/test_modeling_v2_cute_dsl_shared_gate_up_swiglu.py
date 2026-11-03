@@ -122,11 +122,17 @@ def test_certified_cells(cell) -> None:
     _compare(out, op.reference(x, prepared, out, runner))
 
 
-@pytest.mark.parametrize("rows", MTP_ROWS)
+#: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): the target builds the fused cell
+#: at these on an MTP3 / MTP5 engine (`_SHARED_FUSED_UP_SEQS`); 16, a decode cell, is the control.
+MTP_DECODE_ROWS = (6, 12, 18, 16)
+
+
+@pytest.mark.parametrize("rows", MTP_ROWS + MTP_DECODE_ROWS)
 def test_mtp_rows_replay_bitwise_in_a_cuda_graph(rows) -> None:
-    """The MTP3 / MTP5 runners run inside the decode CUDA graph: a replay writes the eager
-    launch's bytes, and a replay after new operands are copied into the captured buffers
-    writes the eager launch's product on them."""
+    """The MTP3 / MTP5 runners (128 / 192, and the fused cells at the small-batch decode
+    counts 6 / 12 / 18) run inside the decode CUDA graph: a replay writes the eager launch's
+    bytes, and a replay after new operands are copied into the captured buffers writes the
+    eager launch's product on them, within the band of the reference."""
     g = torch.Generator(device="cuda").manual_seed(rows)
     prepared = prepare_weight(_checkpoint_weight(g))
     runner = build(rows, prepared)

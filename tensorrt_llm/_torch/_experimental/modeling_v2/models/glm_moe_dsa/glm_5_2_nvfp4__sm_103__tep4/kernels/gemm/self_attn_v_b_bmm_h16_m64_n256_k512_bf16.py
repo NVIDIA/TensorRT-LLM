@@ -146,10 +146,14 @@ def rows_allowed(group: str, mxf8_side: Mxf8SideOutput | None = None) -> tuple[i
     """The row counts one compiled object of ``group`` accepts at launch: the MTP group's
     (built at 192 rows) also every other MTP3 / MTP5 decode row count above 64 at runtime
     M, each row bitwise what 128 / 192 compute for it (see the K-B module's
-    ``MTP_GROUP_RUNTIME_ROWS``). With an MXF8 side output (``rows_max`` >= 192) the rows
-    past M up to the last 64-row tile's end hold the quantized zero-filled tail."""
+    ``MTP_GROUP_RUNTIME_ROWS``); the M >= 16 group's (built at 64 rows) every count in
+    9..64 (``DECODE_GROUP_RUNTIME_ROWS``: MTP5's 12 / 18, MTP3's 12), the same way. With an
+    MXF8 side output (``rows_max`` >= 192, or 64 for the M >= 16 group) the rows past M up
+    to the last tile's end hold the quantized zero-filled tail."""
     if group == "m_ge_128":
         return _kbbmm.MTP_GROUP_RUNTIME_ROWS
+    if group == "m_ge_16":
+        return _kbbmm.DECODE_GROUP_RUNTIME_ROWS
     return rows_of_group(group)
 
 

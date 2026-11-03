@@ -679,10 +679,22 @@ def rows_of_group(group: str) -> tuple[int, ...]:
 #: tile, so each row is bitwise what 128 / 192 compute for it.
 MTP_GROUP_RUNTIME_ROWS: tuple[int, ...] = tuple(range(65, 193))
 
+#: The M >= 16 group's compiled object (built at 64 rows) also serves every decode row count
+#: in 9..64 at runtime M: the MTP3 / MTP5 decode counts without a cell (MTP5 at 2 / 3
+#: requests: 12 / 18 rows; MTP3 at 3: 12). Same reasoning as the MTP group: dynamic layouts,
+#: rows past M load zeros, and the TMA store clips the last tile. Its tile N is 32, so 16 and
+#: 48 rows were already partial tiles; 9..15 is one partial tile as 16 is. Each row is
+#: bitwise what the group's cells compute for it.
+DECODE_GROUP_RUNTIME_ROWS: tuple[int, ...] = tuple(range(9, 65))
+
 
 def rows_allowed(group: str) -> tuple[int, ...]:
     """The row counts one compiled object of ``group`` accepts at launch."""
-    return MTP_GROUP_RUNTIME_ROWS if group == "m_ge_128" else rows_of_group(group)
+    if group == "m_ge_128":
+        return MTP_GROUP_RUNTIME_ROWS
+    if group == "m_ge_16":
+        return DECODE_GROUP_RUNTIME_ROWS
+    return rows_of_group(group)
 
 
 @lru_cache(maxsize=None)

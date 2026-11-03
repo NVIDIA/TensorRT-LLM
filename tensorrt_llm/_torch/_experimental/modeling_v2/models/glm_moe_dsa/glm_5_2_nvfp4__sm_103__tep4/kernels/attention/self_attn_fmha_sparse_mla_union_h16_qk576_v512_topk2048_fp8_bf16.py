@@ -388,6 +388,7 @@ def _fmha_union_kernel(
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         prims.barrier_cta_sync(0)
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols, group="cta_1")
         if tidx == 0:
             prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
@@ -1175,6 +1176,7 @@ def _fmha_union_kernel(
     prims.barrier_cta_sync(0)
     if cutlass.const_expr(num_chunks == 1):
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols, group="cta_1")
     _reduce_union_output(
         cutlass.Pointer(sKv.data_ptr(), dtype=OUT_DTYPE),
@@ -1193,6 +1195,7 @@ def _fmha_union_kernel(
     prims.barrier_cta_sync(0)
     if cutlass.const_expr(num_chunks > 1):
         if warp_idx == W_MMA_PV:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             prims.tcgen05_dealloc(tmem_ptr, tmem_cols, group="cta_1")
     if tidx == 0:
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
