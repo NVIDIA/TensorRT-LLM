@@ -278,7 +278,7 @@ def test_disagg_without_shared_draft_kv_env_keeps_separate_cache(
 
 def test_dflash_with_different_tp_keeps_separate_cache(monkeypatch, tmp_path):
     spec = {"decoding_type": "DFlash"}
-    with pytest.raises(click.UsageError, match="same tensor_parallel_size and enable_attention_dp"):
+    with pytest.raises(click.UsageError, match="same attention tensor parallelism"):
         _launch_from_disagg_config(
             monkeypatch,
             tmp_path,
@@ -325,9 +325,14 @@ def test_shared_cache_requested_with_unsupported_layout_fails_at_startup():
     "context_servers,generation_servers,match",
     [
         (
-            {"enable_attention_dp": True},
-            {"enable_attention_dp": False},
-            "same tensor_parallel_size and enable_attention_dp",
+            {"tensor_parallel_size": 4, "enable_attention_dp": True},
+            {"tensor_parallel_size": 4, "enable_attention_dp": False},
+            "same attention tensor parallelism",
+        ),
+        (
+            {},
+            {"context_parallel_size": 8},
+            "context_parallel_size 1",
         ),
         (
             {"speculative_config": {"decoding_type": "DFlash", "attention_backend": "VANILLA"}},
@@ -340,7 +345,12 @@ def test_shared_cache_requested_with_unsupported_layout_fails_at_startup():
             "attention_backend TRTLLM",
         ),
     ],
-    ids=["mismatched_attention_dp", "vanilla_dflash_backend", "default_dflash_backend"],
+    ids=[
+        "mismatched_attention_dp",
+        "helix_generation",
+        "vanilla_dflash_backend",
+        "default_dflash_backend",
+    ],
 )
 def test_launcher_rejects_shared_cache_for_ineligible_config(
     monkeypatch, tmp_path, context_servers, generation_servers, match
@@ -363,6 +373,23 @@ def test_launcher_accepts_eligible_shared_cache_config(monkeypatch, tmp_path):
             {"speculative_config": spec, "enable_attention_dp": True},
             {"speculative_config": spec, "enable_attention_dp": True},
         )
+
+
+def test_launcher_shares_attention_dp_mla_drafter_across_tp(monkeypatch, tmp_path):
+    # Kimi K3 dep16: one-GPU context workers and a DEP16 generation worker hold
+    # every KV head per rank, as does a TP1 context worker without attention DP.
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "tensor_parallel_size": 1, "enable_attention_dp": True},
+            {"speculative_config": spec, "tensor_parallel_size": 16, "enable_attention_dp": True},
+        )
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "auto"
 
 
 @pytest.mark.parametrize(

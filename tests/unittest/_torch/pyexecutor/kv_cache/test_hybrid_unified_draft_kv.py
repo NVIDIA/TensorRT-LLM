@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
@@ -152,6 +153,29 @@ def test_plain_target_still_gets_target_and_draft_specs():
     )
 
 
+def test_k3_like_drafter_shares_the_hybrid_manager_in_disagg():
+    # NVFP4 target pages and FP8 draft pages: both K-only, so both transfer.
+    creator = _creator(is_disagg=True)
+
+    assert creator._dflash_unify_blocker() is None
+    assert creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize(
+    ("target", "draft", "compatible"),
+    [
+        # K-only latents move whole on every rank, whatever each side's dtype.
+        ((1, 576, DataType.NVFP4, True), (1, 576, DataType.FP8, True), True),
+        ((1, 576, DataType.NVFP4, True), (1, 576, DataType.BF16, True), True),
+        # Head-sliced NVFP4 views need an identical layout.
+        ((8, 128, DataType.NVFP4, False), (8, 128, DataType.BF16, False), False),
+        ((8, 128, DataType.FP8, False), (8, 128, DataType.BF16, False), True),
+    ],
+)
+def test_disagg_layout_compatibility(target, draft, compatible):
+    assert KvCacheCreator._dflash_disagg_layouts_compatible(target, draft) is compatible
+
+
 def _draft_spec(layer_id, dtype=DataType.FP8):
     return KVCacheLayerSpec(
         global_layer_id=layer_id,
@@ -220,6 +244,25 @@ def test_base_manager_hooks_read_appended_draft_specs():
     assert manager._get_buffer_roles_for_layer(2) == [Role.KEY]
     assert manager.get_layer_bytes_per_token(2, Role.ALL) == 576
     assert manager.get_layer_cache_spec(6) == _draft_spec(6)
+
+
+def test_fp4_mla_transfer_ids_of_appended_draft_layers():
+    # Target layer 0 is recurrent, 1 is FP4 MLA (HP ring at virtual layer 4),
+    # 2 is an FP8 fallback layer, local 3 is draft layer 6.
+    manager = SimpleNamespace(
+        pp_layers=[0, 1, 2, 6],
+        _appended_draft_layer_specs={3: _draft_spec(6)},
+        _cache_manager_layer_ids=[1],
+        _fp4_mla_compact_to_local=[1],
+        _fp8_mla_manager_layer_ids=[2],
+        _hp_manager_layer_ids=[4],
+    )
+    ids = [
+        Fp4MlaV2CacheLayoutPolicy._fp4_mla_disagg_global_layer_id(manager, layer)
+        for layer in range(5)
+    ]
+
+    assert ids == [None, 2, 4, 12, 3]
 
 
 @pytest.mark.parametrize(

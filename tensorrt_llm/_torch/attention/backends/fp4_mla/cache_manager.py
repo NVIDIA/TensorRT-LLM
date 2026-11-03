@@ -1090,9 +1090,12 @@ class Fp4MlaV2CacheLayoutPolicy:
 
         A model layer's latent cache (FP4 or FP8 fallback) maps to ``2 * L``
         and its HP-ring virtual layer to ``2 * L + 1``, where ``L`` is the
-        global model layer. Returns ``None`` for any other internal layer.
+        global model layer; an appended draft layer ``D`` maps to ``2 * D``.
+        Returns ``None`` for any other internal layer.
         """
         internal_layer = int(internal_layer)
+        if internal_layer in self._appended_draft_layer_specs:
+            return 2 * int(self.pp_layers[internal_layer])
         for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
             if int(layer_id) == internal_layer:
                 local_layer = self._fp4_mla_compact_to_local[compact_layer]

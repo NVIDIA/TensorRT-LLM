@@ -1471,3 +1471,45 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
 
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize(
+    ("self_kwargs", "peer_kwargs", "compatible"),
+    [
+        # GQA draft layers carry the target's per-rank heads, which differ here.
+        ({"tp_size": 1, "kv_heads_per_rank": 2}, {"tp_size": 2, "kv_heads_per_rank": 1}, False),
+        # Attention DP keeps every head on each rank at any TP size.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            {"tp_size": 4, "dp_size": 4, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            True,
+        ),
+        # A K-only (MLA) cache holds the whole latent on every rank.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 1, "is_mla": True},
+            {"tp_size": 4, "kv_heads_per_rank": 1, "is_mla": True},
+            True,
+        ),
+    ],
+    ids=["gqa_different_attention_tp", "attention_dp", "mla"],
+)
+def test_peer_registrar_shares_draft_layers_when_heads_per_rank_agree(
+    self_kwargs: dict, peer_kwargs: dict, compatible: bool
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local", **self_kwargs)
+    self_rankinfo.num_draft_layers = 5
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+        **peer_kwargs,
+    )
+    peer_ri.num_draft_layers = 5
+    if not compatible:
+        with pytest.raises(ValueError, match="same attention TP size"):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
