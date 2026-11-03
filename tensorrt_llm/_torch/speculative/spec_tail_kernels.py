@@ -25,6 +25,8 @@ produces the same values:
   DFlash generation step whose drafter context is a paged single-latent cache.
 * :func:`store_context_latents` -- the masked store of the context latents of
   every drafter layer into its page pool.
+* :func:`scatter_rows_to_pool` -- rows into a paged pool at given pages and
+  offsets.
 
 Launch shapes depend only on host batch sizes, so all of them are CUDA-graph
 capturable.
@@ -482,6 +484,63 @@ def store_context_latents(
         mask,
         head_dim,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        POOL_FP8=pool_fp8,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _scatter_rows_kernel(
+    src_ptr,
+    stride_src,
+    dst_ptr,
+    stride_dst_page,
+    stride_dst_off,
+    pages_ptr,
+    offsets_ptr,
+    width,
+    BLOCK_D: tl.constexpr,
+    POOL_FP8: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+    mask = offs < width
+    page = tl.load(pages_ptr + row)
+    off = tl.load(offsets_ptr + row)
+    vals = tl.load(src_ptr + row.to(tl.int64) * stride_src + offs, mask=mask)
+    if POOL_FP8:
+        # to_draft_fp8: saturated E4M3 at unit scale, round to nearest even.
+        vals = tl.minimum(tl.maximum(vals.to(tl.float32), -448.0), 448.0).to(tl.float8e4nv)
+    tl.store(dst_ptr + page * stride_dst_page + off * stride_dst_off + offs, vals, mask=mask)
+
+
+def scatter_rows_to_pool(
+    src: torch.Tensor,
+    pool: torch.Tensor,
+    pages: torch.Tensor,
+    offsets: torch.Tensor,
+) -> None:
+    """``pool[pages[i], offsets[i]] = src[i]`` for a ``[pages, page_size, D]`` pool view.
+
+    The same writes as the eager advanced-index assignment; an FP8 E4M3 pool
+    stores ``to_draft_fp8(src[i])``.
+    """
+    rows, width = src.shape
+    if rows == 0:
+        return
+    assert src.stride(-1) == 1 and pool.stride(-1) == 1 and pool.shape[-1] == width
+    pool_fp8 = pool.dtype == torch.float8_e4m3fn
+    assert pool_fp8 or pool.dtype == src.dtype
+    _scatter_rows_kernel[(rows,)](
+        src,
+        src.stride(0),
+        pool,
+        pool.stride(0),
+        pool.stride(1),
+        pages,
+        offsets,
+        width,
+        BLOCK_D=triton.next_power_of_2(width),
         POOL_FP8=pool_fp8,
         num_warps=4,
     )

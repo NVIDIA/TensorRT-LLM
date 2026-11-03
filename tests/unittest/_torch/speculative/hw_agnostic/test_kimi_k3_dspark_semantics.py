@@ -1209,7 +1209,7 @@ MLA_CTX_LEN = 40  # ceil((40 + MLA_BLOCK) / MLA_PAGE) = 2 pages
 MLA_SHORT_CTX_LEN = 20  # one page, and the block stays inside it
 
 
-def _run_mla_block_decode(drafter, requests, paged=False):
+def _run_mla_block_decode(drafter, requests, paged=False, fp8=False):
     """Drive one block decode over a BATCH, optionally through the paged cache.
 
     ``requests`` is a list of ``(captured, noise_embed)`` pairs with deliberately
@@ -1221,7 +1221,8 @@ def _run_mla_block_decode(drafter, requests, paged=False):
     ``paged=False`` keeps the dense arena the eager reference path uses.
     ``paged=True`` hands ``dflash_forward`` a page table, which is what selects
     the kernel paths -- without it ``use_kernel`` is False and every kernel
-    variant silently falls back to the same eager branch.
+    variant silently falls back to the same eager branch. ``fp8`` stores the
+    paged context as ``to_draft_fp8`` (the CuTe DSL decode then reads FP8).
     """
     dev = "cuda"
     batch = len(requests)
@@ -1277,6 +1278,10 @@ def _run_mla_block_decode(drafter, requests, paged=False):
         cols = pos % MLA_PAGE
         for layer_idx in range(MLA_LAYERS):
             pool[layer_idx][rows, 0, 0, cols] = latent[:, layer_idx, 0]
+    if fp8:
+        from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+        pool = [to_draft_fp8(p) for p in pool]
     page_table = torch.arange(batch * per_req, device=dev, dtype=torch.int32).view(batch, per_req)
     out = drafter.dflash_forward(
         ctx_k_cache=pool[0], ctx_kv_cache=pool, ctx_page_table=page_table, **kwargs
@@ -1478,6 +1483,52 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
     )
     diff = (out[0] - expected).abs().max().item()
     assert diff < 0.03, f"single-page parity failed: max abs diff {diff}"
+
+
+@needs_cuda
+@needs_absorbed_mla
+@pytest.mark.parametrize("context_kv_fp8", [False, True])
+def test_mla_dspark_fused_rope_is_bitwise(context_kv_fp8):
+    """The fused MLA RoPE kernels change launches, not values.
+
+    The per-layer block kernel (query rope half + block latent norm/rope +
+    pool store, through scratch rows for an FP8 pool) and the one-launch
+    context latents must reproduce the separate launches bit for bit: two
+    unequal requests through the paged cute-dsl block decode, and the
+    layer-major context latents against the per-layer ones.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights, dflash_attention_backend="CUTEDSL")
+    if not drafter._fused_mla_rope:
+        pytest.skip("the fused MLA RoPE kernels do not fit here")
+    g = torch.Generator().manual_seed(42)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    captured = requests[0][0].to("cuda", torch.bfloat16)
+    projected = drafter.project_target_hidden(captured)
+    positions = torch.arange(37, 37 + captured.shape[0], device="cuda")
+
+    drafter._fused_mla_rope = False
+    base = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
+    ctx_base, _ = drafter.precompute_context_kv(projected, positions)
+    drafter._fused_mla_rope = True
+    fused = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
+    ctx_fused, _ = drafter.precompute_context_kv(projected, positions)
+
+    assert torch.equal(fused.view(torch.int32), base.view(torch.int32))
+    assert torch.equal(ctx_fused.view(torch.int16), ctx_base.view(torch.int16))
 
 
 @needs_cuda
