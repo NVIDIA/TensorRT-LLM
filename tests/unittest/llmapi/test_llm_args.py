@@ -377,7 +377,8 @@ class TestMoeConfigPerLayerDynamicEplb:
         assert config.load_balancer.planner == "halo_r"
         assert config.backend == "MEGAMOE_CUTEDSL"
 
-    @pytest.mark.parametrize("mode", [None, "per_layer_resident", "shared_banks"])
+    @pytest.mark.parametrize("mode",
+                             [None, "per_layer_resident", "shared_banks"])
     def test_halo_r_accepts_both_helper_slot_modes(self,
                                                    mode: str | None) -> None:
         values = self._per_layer_dynamic()
@@ -509,7 +510,9 @@ class TestMoeConfigPerLayerDynamicEplb:
             pytest.param(6, 384, None, id="even-ep"),
             pytest.param(3, 384, "even EP size", id="odd-ep"),
             pytest.param(64, 384, "even EP size", id="ep-above-32"),
-            pytest.param(32, 96, "at least 4 experts per EP rank",
+            pytest.param(32,
+                         96,
+                         "at least 4 experts per EP rank",
                          id="three-experts-per-rank"),
         ],
     )
