@@ -392,7 +392,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
 
     # The history is already NVFP4 here; only the mixed-precision high layers are added.
     _supports_mixed_precision_kv = True
-    _mixed_precision_native_pool = True
+    _own_pool_is_mixed_precision_low = True
 
     def __init__(
         self,

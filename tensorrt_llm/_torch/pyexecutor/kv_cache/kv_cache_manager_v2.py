@@ -1790,7 +1790,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # A subclass opts in, and its own subclasses inherit that; the base class always supports it.
     _supports_mixed_precision_kv = False
     # True when the manager's own pool already holds the history in the mixed-precision low format.
-    _mixed_precision_native_pool = False
+    _own_pool_is_mixed_precision_low = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1899,39 +1899,31 @@ class KVCacheManagerV2(BaseResourceManager):
             if len(set(self.pp_layers)) != len(self.pp_layers):
                 raise ValueError(f"layer-spec global layer ids must be unique: {self.pp_layers}")
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
-        # MTP layers use mixed-precision KV like the target's; layers of other drafters do not.
-        # First model layer id of such a drafter (Eagle3, ...), or None when no layer is left out.
-        self._first_spec_layer_id: int | None = None
-        if (
-            spec_config is not None
-            and self.mixed_precision_low_dtype is not None
-            and not spec_config.spec_dec_mode.is_mtp_one_model()
-        ):
-            from tensorrt_llm._torch.speculative import get_num_spec_layers
-
-            if get_num_spec_layers(spec_config) > 0:
-                pretrained_config = kwargs.get("pretrained_config")
-                if pretrained_config is not None:
-                    self._first_spec_layer_id = pretrained_config.num_hidden_layers
-                elif layer_mask is None:
-                    # Draft layers are appended after the declared target layers.
-                    self._first_spec_layer_id = num_layers
-                else:
-                    raise ValueError(
-                        "Mixed-precision KV with a drafter that is not MTP needs pretrained_config "
-                        "to tell the drafter layers of a layer_mask apart."
-                    )
         self.is_draft = is_draft
+        # Draft layers follow the model's own layers; under a layer_mask only the model config tells
+        # where they start.
+        first_draft_layer = (
+            self._declared_target_layer_count
+            if layer_mask is None
+            else getattr(kwargs.get("pretrained_config"), "num_hidden_layers", None)
+        )
         self._legacy_draft_layer_ids = {
             global_layer_id
             for global_layer_id in self.pp_layers
             if is_draft
             or (
                 spec_config is not None
-                and layer_mask is None
-                and global_layer_id >= self._declared_target_layer_count
+                and first_draft_layer is not None
+                and global_layer_id >= first_draft_layer
             )
         }
+        # MTP layers use mixed-precision KV like the model's own layers; the layers that another
+        # drafter (Eagle3, ...) adds to this manager keep a plain cache.
+        self._plain_draft_layers = (
+            set()
+            if is_draft or spec_config is None or spec_config.spec_dec_mode.is_mtp_one_model()
+            else self._legacy_draft_layer_ids
+        )
         if self.layer_specs is not None:
             if is_draft and any(
                 layer.owner is not KVCacheLayerOwner.DRAFT for layer in self.layer_specs
@@ -4005,7 +3997,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mixed_precision_high_dtype = str_dtype_to_binding(mixed.high)
         # The model's KV dtype must be the mixed-precision high dtype, except on a manager whose
         # own pool already holds the mixed-precision low format.
-        if not self._mixed_precision_native_pool and dtype != self.mixed_precision_high_dtype:
+        if not self._own_pool_is_mixed_precision_low and dtype != self.mixed_precision_high_dtype:
             raise ValueError(
                 f"kv_cache_config.dtype={kv_cache_config.dtype!r} keeps the first/last tokens in "
                 f"{mixed.high}, but the model's KV cache dtype resolved to {dtype}."
@@ -4030,7 +4022,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and self.num_kv_heads_per_layer[local_layer_idx] > 0
             and self.max_attention_window_vec[local_layer_idx] is None
             and layer_id not in self._shared_kv_layers
-            and (self._first_spec_layer_id is None or layer_id < self._first_spec_layer_id)
+            and layer_id not in self._plain_draft_layers
         )
 
     def _mixed_precision_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
@@ -7422,10 +7414,10 @@ class KVCacheManagerV2(BaseResourceManager):
             return layer.bytes_per_token(data_role)
 
         # Size a mixed-precision layer's pool for the mixed-precision low format, unless the
-        # manager's pool already holds that format (_mixed_precision_native_pool).
+        # manager's own pool already holds that format.
         if (
             self._is_mixed_precision_layer(local_layer_idx)
-            and not self._mixed_precision_native_pool
+            and not self._own_pool_is_mixed_precision_low
         ):
             return self._mixed_precision_layer_bytes_per_token(local_layer_idx, data_role)
         if self.dtype not in (

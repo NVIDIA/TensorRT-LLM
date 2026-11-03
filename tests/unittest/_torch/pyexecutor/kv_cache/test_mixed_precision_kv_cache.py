@@ -261,7 +261,7 @@ def test_mixed_precision_rejects_custom_managers():
 
     # A manager whose pool already holds the mixed-precision low (NVFP4) history accepts any pool dtype.
     class _Native(_OptedIn):
-        _mixed_precision_native_pool = True
+        _own_pool_is_mixed_precision_low = True
 
     native = object.__new__(_Native)
     native._init_mixed_precision(
