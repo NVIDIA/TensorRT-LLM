@@ -337,6 +337,9 @@ def _grid_for_rows(rows: int) -> list[int]:
     return [1, 1, rows]
 
 
+_VISION_INPUT_FIELDS = {"pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"}}
+
+
 class _GroupedEncoderModel(MultimodalModelMixin):
     """Minimal model whose encoder serves image and video in one call.
 
@@ -357,21 +360,9 @@ class _GroupedEncoderModel(MultimodalModelMixin):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self._encode,
-                build_batched_input=self._build_batched_input,
+                input_fields=_VISION_INPUT_FIELDS,
             ),
         )
-
-    @staticmethod
-    def _build_batched_input(params: list[MultimodalParams]) -> dict:
-        # Per the EncoderGroup contract: all items of the first modality across
-        # requests, then all items of the second.
-        pixels = []
-        for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
-            for mp in params:
-                data = mp.multimodal_data.get(modality)
-                if data is not None:
-                    pixels.append(data[pixel_key])
-        return {"pixel_values": torch.cat(pixels, dim=0)}
 
     def _encode(self, pixel_values: torch.Tensor) -> torch.Tensor:
         self.encoder_calls.append(pixel_values.shape[0])
@@ -445,7 +436,7 @@ def test_qwen_profiling_dummy_supports_grouped_encoding(
     group = EncoderGroup(
         modalities=("image", "video"),
         encoder_fn=lambda pixel_values: pixel_values[::4],
-        build_batched_input=_GroupedEncoderModel._build_batched_input,
+        input_fields=_VISION_INPUT_FIELDS,
     )
     output = encode_multimodal_by_groups([group], [params])
     assert output.shape == (sum(expected_rows), HIDDEN)

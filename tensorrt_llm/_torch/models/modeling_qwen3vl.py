@@ -1359,40 +1359,16 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
 
-def _qwen3vl_build_batched_input(
-    multimodal_params: list[MultimodalParams],
-) -> dict[str, Any]:
-    """Cat image items then video items across requests (matching the
-    ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: list[torch.Tensor] = []
-    grids: list[torch.Tensor] = []
-    for m, pv_key, thw_key in (
-        ("image", "pixel_values", "image_grid_thw"),
-        ("video", "pixel_values_videos", "video_grid_thw"),
-    ):
-        for mp in multimodal_params:
-            bucket = mp.multimodal_data.get(m)
-            if bucket is not None:
-                if bucket[pv_key].dtype not in (
-                    torch.uint8,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                ):
-                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
-                pixel_values = bucket[pv_key]
-                if pixel_values.dtype == torch.uint8:
-                    # Normalize each raw bucket before concatenation can promote its dtype.
-                    shape = pixel_values.shape
-                    pixel_values = normalize_vision_pixels(
-                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
-                    ).view(shape)
-                pixels.append(pixel_values)
-                grids.append(bucket[thw_key])
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat(grids, dim=0),
-    }
+def normalize_qwen_vision_pixels(
+    pixel_values: torch.Tensor, vision_normalization: Optional[VisionNormalization]
+) -> torch.Tensor:
+    """Normalize raw uint8 patch rows, whose channels are contiguous blocks, on their device."""
+    if vision_normalization is None:
+        raise ValueError("Raw uint8 pixels require the processor's vision_normalization")
+    shape = pixel_values.shape
+    return normalize_vision_pixels(
+        pixel_values.view(-1, 3, shape[-1] // 3), vision_normalization
+    ).view(shape)
 
 
 class Qwen3VisionModelBase(nn.Module):
@@ -1460,11 +1436,18 @@ class Qwen3VisionModelBase(nn.Module):
         self,
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
+        vision_normalization: Optional[VisionNormalization] = None,
     ) -> torch.Tensor:
         """Run the ViT on one concat'd batch and fold deepstack streams into
         the hidden dim. Modality-agnostic — image and video items are
         distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
+
+        Raw uint8 pixels come with the processor's ``vision_normalization``
+        and are normalized on their device first. The encoder group encodes
+        them apart from host-normalized pixels.
         """
+        if pixel_values.dtype == torch.uint8:
+            pixel_values = normalize_qwen_vision_pixels(pixel_values, vision_normalization)
         if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"Unsupported pixel dtype: {pixel_values.dtype}")
         pixel_values = pixel_values.to(self.model_dtype)
@@ -1485,7 +1468,15 @@ class Qwen3VisionModelBase(nn.Module):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
+                # One ViT input carries both modalities, image rows first.
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"},
+                    "grid_thw": {"image": "image_grid_thw", "video": "video_grid_thw"},
+                    "vision_normalization": {
+                        "image": "vision_normalization",
+                        "video": "vision_normalization",
+                    },
+                },
             ),
         )
 

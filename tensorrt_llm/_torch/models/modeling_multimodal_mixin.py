@@ -28,6 +28,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -93,18 +94,26 @@ class EncoderGroup:
     splits the output back per-modality and reorders it into prompt order
     via each request's `MultimodalItemMetadata.item_refs` manifest.
 
-    Contract between `build_batched_input` and `encoder_fn`:
+    Contract between the encoder inputs and `encoder_fn`:
 
-    * `build_batched_input` must concatenate items across requests in
-      `modalities` order (all items for the first modality across requests,
-      then all items for the second modality, etc.).
-    * Within a modality, items must appear in the same per-request iteration
+    * Encoder inputs hold items across requests in `modalities` order (all
+      items for the first modality across requests, then all items for the
+      second modality, etc.).
+    * Within a modality, items appear in the same per-request iteration
       order that `_lengths_by_modality` uses (i.e. the order of
       `multimodal_params` passed in).
-    * `encoder_fn` must return one tensor whose rows correspond 1:1 to the
-      input layout produced by `build_batched_input`, so the framework can
-      split the output by `_lengths_by_modality` and reorder into prompt
-      order via each request's item manifest.
+    * `encoder_fn` must return one tensor whose rows correspond 1:1 to that
+      input layout, so the framework can split the output by
+      `_lengths_by_modality` and reorder into prompt order via each
+      request's item manifest.
+
+    A group declares its encoder inputs in exactly one way:
+
+    * `input_fields`: the framework joins the named payload fields across
+      requests in the layout above.
+    * `build_batched_input`: the model builds the `encoder_fn` kwargs itself,
+      for packing that is model policy (per-item transforms, or passing the
+      params through so `encoder_fn` packs them).
     """
 
     modalities: Tuple[str, ...]
@@ -113,7 +122,9 @@ class EncoderGroup:
     `modalities[0]`, then all items of `modalities[1]`, etc."""
 
     encoder_fn: Callable[..., torch.Tensor]
-    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
+    """Encoder call invoked as `encoder_fn(**inputs)`, with the inputs built
+    from `input_fields` or `build_batched_input`: once per group, or once per
+    distinct dtype signature or shared value of `input_fields`.
     Returns a single tensor with one row per embedding, laid out per the
     contract above. When those rows are already in prompt order, the
     framework may return a row slice of this tensor without a copy, so it
@@ -121,10 +132,151 @@ class EncoderGroup:
     graph's static output buffer); clone such outputs before returning
     them."""
 
-    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
-    """Builds the kwargs dict passed to `encoder_fn`. Responsible for
-    concatenating raw per-item tensors from `multimodal_data` across
-    requests in the order described in the class docstring."""
+    build_batched_input: Optional[Callable[[List[MultimodalParams]], Dict[str, Any]]] = None
+    """Model-owned packing. Receives the group's original `MultimodalParams`
+    objects in order (not copies) and returns the kwargs dict passed to
+    `encoder_fn`, laid out per the contract above."""
+
+    input_fields: Optional[Mapping[str, Mapping[str, str]]] = None
+    """Common packing: `encoder_fn` kwarg -> {modality: field of
+    `multimodal_data[modality]`}. Each kwarg names a field for every modality
+    in `modalities`. Values keep their device and dtype; casting belongs to
+    `encoder_fn`.
+
+    * Tensor fields hold items along dim 0
+      (`MultimodalItemPartition(item_axis=0)`) and are joined along dim 0 in
+      the layout above, even when only one request contributes. Fields whose
+      non-item dims differ are zero-padded (False for bool) at the end of
+      each such dim to the largest size, so encoders must ignore padded
+      positions via their masks.
+    * Payloads whose fields differ in dtype are encoded in separate calls,
+      one per distinct dtype signature, and the framework puts the outputs
+      back in the layout above.
+    * A field that is not a tensor (for example a normalization record) is
+      not joined: each call gets the one value its payloads share, and
+      payloads with different values (compared with `==`) are encoded in
+      separate calls the same way. Such values should be per-processor
+      constants, since a value that differs per request splits the group
+      into one call per request.
+    * A field missing from a payload reads as None and is treated as such a
+      shared value, so `encoder_fn` sees None for those payloads.
+    * Per-item values must be tensors; a list or tuple raises TypeError (a
+      NamedTuple record is allowed)."""
+
+    def __post_init__(self) -> None:
+        if (self.input_fields is None) == (self.build_batched_input is None):
+            raise TypeError("EncoderGroup takes exactly one of input_fields or build_batched_input")
+
+
+def _shared_input_key(value: Any) -> Tuple[Any]:
+    """Key of a non-tensor `input_fields` value, which the payloads of one call share."""
+    if type(value) in (list, tuple):
+        raise TypeError(
+            "EncoderGroup.input_fields values must be tensors or shared records; "
+            "emit per-item values as a tensor"
+        )
+    return (value,)
+
+
+def _join_input_field(values: List[Any]) -> Any:
+    """Join one kwarg's values across the payloads of one encoder call."""
+    first = values[0]
+    if not isinstance(first, torch.Tensor):
+        # The payloads of one call share this value.
+        return first
+    item_shape = first.shape[1:]
+    if all(value.shape[1:] == item_shape for value in values[1:]) or any(
+        value.dim() != first.dim() for value in values
+    ):
+        return torch.cat(values, dim=0)
+    # Pad each differing dim at its end to the largest size, then copy the values in.
+    sizes = [max(dims) for dims in zip(*(value.shape[1:] for value in values))]
+    joined = first.new_zeros((sum(value.shape[0] for value in values), *sizes))
+    start = 0
+    for value in values:
+        end = start + value.shape[0]
+        joined[(slice(start, end), *(slice(0, size) for size in value.shape[1:]))] = value
+        start = end
+    return joined
+
+
+def _input_field_calls(
+    group: EncoderGroup, multimodal_params: Sequence[MultimodalParams]
+) -> Tuple[List[Tuple[str, int]], List[Tuple[List[int], Dict[str, Any]]]]:
+    """Pack `group.input_fields` into `encoder_fn` calls.
+
+    Returns the present payloads as `(modality, request index)` in the group
+    layout, and for each call the positions of its payloads in that list and
+    its kwargs. There is one call unless payloads differ in a field's dtype or
+    shared value.
+    """
+    names = tuple(group.input_fields)
+    payloads: List[Tuple[str, int]] = []
+    payload_values: List[List[Any]] = []
+    for modality in group.modalities:
+        sources = None
+        for index, param in enumerate(multimodal_params):
+            data = param.multimodal_data.get(modality)
+            if data is None:
+                continue
+            if sources is None:
+                sources = [group.input_fields[name][modality] for name in names]
+            payloads.append((modality, index))
+            payload_values.append([data.get(source) for source in sources])
+    signatures: List[Tuple[Any, ...]] = []
+    members: List[List[int]] = []
+    for position, values in enumerate(payload_values):
+        # A tensor contributes its dtype; any other value contributes itself.
+        signature = tuple(
+            [
+                value.dtype if isinstance(value, torch.Tensor) else _shared_input_key(value)
+                for value in values
+            ]
+        )
+        for call, call_signature in enumerate(signatures):
+            if call_signature == signature:
+                members[call].append(position)
+                break
+        else:
+            signatures.append(signature)
+            members.append([position])
+    calls = [
+        (
+            call_members,
+            {
+                name: _join_input_field([payload_values[p][k] for p in call_members])
+                for k, name in enumerate(names)
+            },
+        )
+        for call_members in members
+    ]
+    return payloads, calls
+
+
+def _encode_input_fields(
+    group: EncoderGroup,
+    multimodal_params: Sequence[MultimodalParams],
+    item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
+) -> torch.Tensor:
+    """Encode `group.input_fields` and return the rows in the group layout."""
+    payloads, calls = _input_field_calls(group, multimodal_params)
+    if len(calls) == 1:
+        return group.encoder_fn(**calls[0][1])
+    # Split each call's rows per payload and put them back in the group layout.
+    rows = [
+        sum(
+            length
+            for (item_modality, _), length in zip(*item_layouts[index])
+            if item_modality == modality
+        )
+        for modality, index in payloads
+    ]
+    outputs: List[Optional[torch.Tensor]] = [None] * len(payloads)
+    for call_members, inputs in calls:
+        out = group.encoder_fn(**inputs)
+        for position, output in zip(call_members, out.split([rows[p] for p in call_members])):
+            outputs[position] = output
+    return torch.cat(outputs, dim=0)
 
 
 def _lengths_by_modality(
@@ -238,9 +390,10 @@ def encode_multimodal_by_groups(
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
 
-    For each group present in the batch, one encoder call is issued over all
-    items across all requests belonging to that group's modalities
-    (arithmetic-intensity win). The output is split back per-modality using
+    For each group present in the batch, the group's items across all
+    requests are encoded together: in one encoder call, or in one call per
+    distinct `input_fields` signature (see `EncoderGroup.input_fields`).
+    The output is split back per-modality using
     the prompt-ordered output lengths in `MultimodalItemMetadata`,
     then reordered by the same metadata's `item_refs`.
 
@@ -264,13 +417,20 @@ def encode_multimodal_by_groups(
                 group_layouts.append(layout)
         if not group_params:
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
+        if group.input_fields is not None:
+            out = _encode_input_fields(group, group_params, group_layouts)
+        else:
+            out = group.encoder_fn(**group.build_batched_input(group_params))
         lengths = _lengths_by_modality(group_layouts, group.modalities)
         cursor = 0
         for m in group.modalities:
             total = sum(lengths[m])
             per_modality_embeds[m] = out[cursor : cursor + total]
             cursor += total
+        if cursor != out.shape[0]:
+            raise MultimodalEncoderContractError(
+                f"MM encoder returned {out.shape[0]} rows, item metadata expects {cursor}"
+            )
         per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
 

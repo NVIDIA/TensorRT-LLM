@@ -23,6 +23,10 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    _input_field_calls,
+    encode_multimodal_by_groups,
+)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
@@ -30,13 +34,19 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
+    Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -658,6 +668,112 @@ def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
     )
 
     assert events == ["block_0", "deepstack_merger", "block_1", "final_merger"]
+
+
+def _main_qwen3vl_build_batched_input(multimodal_params: List[MultimodalParams]) -> dict:
+    """Verbatim copy of the Qwen3-VL builder that `input_fields` replaced."""
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
+    for m, pv_key, thw_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        for mp in multimodal_params:
+            bucket = mp.multimodal_data.get(m)
+            if bucket is not None:
+                pixels.append(bucket[pv_key])
+                grids.append(bucket[thw_key])
+    return {
+        "pixel_values": torch.cat(pixels, dim=0),
+        "grid_thw": torch.cat(grids, dim=0),
+    }
+
+
+def _qwen_vision_request(images=(), videos=(), pixel_device="cpu") -> MultimodalParams:
+    """Build one request payload; each item is `(marker, (t, h, w))`."""
+    data = {}
+    for modality, items, pixel_key, grid_key in (
+        ("image", images, "pixel_values", "image_grid_thw"),
+        ("video", videos, "pixel_values_videos", "video_grid_thw"),
+    ):
+        if items:
+            pixels = [torch.full((t * h * w, 3), float(marker)) for marker, (t, h, w) in items]
+            data[modality] = {
+                pixel_key: torch.cat(pixels).to(pixel_device),
+                grid_key: torch.tensor([grid for _, grid in items]),
+            }
+    return MultimodalParams(multimodal_data=data)
+
+
+def _assert_qwen3_vision_inputs_match_main(params: List[MultimodalParams]) -> None:
+    (group,) = Qwen3VisionModelBase.mm_encoder_groups.fget(
+        SimpleNamespace(encode_batched=lambda **inputs: inputs)
+    )
+    payloads, calls = _input_field_calls(group, params)
+    ((members, actual),) = calls
+    assert members == list(range(len(payloads)))
+    assert actual.pop("vision_normalization") is None
+    expected = _main_qwen3vl_build_batched_input(params)
+    assert actual.keys() == expected.keys()
+    for name, value in expected.items():
+        assert torch.equal(actual[name], value), name
+        assert actual[name].dtype == value.dtype, name
+        assert actual[name].device == value.device, name
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "requests",
+    [
+        [{"images": [(1, (1, 2, 2))]}],
+        [{"videos": [(1, (2, 2, 2))]}, {"videos": [(2, (1, 2, 4))]}],
+        [
+            {"images": [(1, (1, 2, 2)), (2, (1, 2, 4))], "videos": [(3, (2, 2, 2))]},
+            {"videos": [(4, (1, 2, 2))]},
+            {"images": [(5, (1, 4, 2))]},
+        ],
+        [{"videos": [(1, (2, 2, 2))]}, {"images": [(2, (1, 2, 2))]}],
+    ],
+    ids=["image_r1", "video_only", "mixed_r3", "video_first"],
+)
+def test_qwen3_vision_encoder_inputs_match_main_builder(requests: list) -> None:
+    _assert_qwen3_vision_inputs_match_main([_qwen_vision_request(**r) for r in requests])
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vision_encoder_inputs_match_main_builder_on_selected_items() -> None:
+    # Item scheduling and partial cache hits encode residual payloads whose
+    # fields are views of the request payload.
+    request = _qwen_vision_request(
+        images=[(1, (1, 2, 2)), (2, (1, 2, 4)), (3, (1, 2, 2))], videos=[(4, (2, 2, 2))]
+    )
+    image = request.multimodal_data["image"]
+    residual_image = {
+        "pixel_values": MultimodalItemPartition(item_lengths=(4, 8, 4)).select(
+            image["pixel_values"], [1, 2]
+        ),
+        "image_grid_thw": MultimodalItemPartition().select(image["image_grid_thw"], [1, 2]),
+    }
+    assert residual_image["pixel_values"].data_ptr() != image["pixel_values"].data_ptr()
+    assert (
+        residual_image["pixel_values"].untyped_storage().data_ptr()
+        == image["pixel_values"].untyped_storage().data_ptr()
+    )
+    residual = MultimodalParams(
+        multimodal_data={"image": residual_image, "video": request.multimodal_data["video"]}
+    )
+    _assert_qwen3_vision_inputs_match_main(
+        [residual, _qwen_vision_request(images=[(5, (1, 2, 2))])]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_qwen3_vision_encoder_inputs_keep_cpu_grids_with_cuda_pixels() -> None:
+    params = [
+        _qwen_vision_request(images=[(1, (1, 2, 2))], videos=[(2, (2, 2, 2))], pixel_device="cuda"),
+        _qwen_vision_request(images=[(3, (1, 2, 4))], pixel_device="cuda"),
+    ]
+    _assert_qwen3_vision_inputs_match_main(params)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1950,34 +2066,47 @@ def test_normalization_mixed_raw_and_float_batches(dtype: torch.dtype) -> None:
         "all_values", "video", dtype, False
     )
     grid = torch.tensor([[1, 2, 2]])
+    rows = grid.prod().item()
+
+    def request(image, video) -> MultimodalParams:
+        data = {
+            "image": {"pixel_values": image[0], "image_grid_thw": grid},
+            "video": {"pixel_values_videos": video[0], "video_grid_thw": grid},
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                [("image", 0), ("video", 0)], output_embedding_lengths=[rows, rows]
+            ),
+        }
+        for modality, (_, normalization) in (("image", image), ("video", video)):
+            if normalization is not None:
+                data[modality]["vision_normalization"] = normalization
+        return MultimodalParams(multimodal_data=data)
+
     params = [
-        MultimodalParams(
-            multimodal_data={
-                "image": {
-                    "pixel_values": raw,
-                    "image_grid_thw": grid,
-                    "vision_normalization": spec,
-                },
-                "video": {"pixel_values_videos": expected_video, "video_grid_thw": grid},
-            }
-        ),
-        MultimodalParams(
-            multimodal_data={
-                "image": {"pixel_values": expected, "image_grid_thw": grid},
-                "video": {
-                    "pixel_values_videos": raw_video,
-                    "video_grid_thw": grid,
-                    "vision_normalization": video_spec,
-                },
-            }
-        ),
+        request((raw, spec), (expected_video, None)),
+        request((expected, None), (raw_video, video_spec)),
     ]
-    batched = modeling_qwen3vl._qwen3vl_build_batched_input(params)
-    assert batched["pixel_values"].dtype == dtype
-    assert torch.equal(
-        batched["pixel_values"], torch.cat([expected, expected, expected_video, expected_video])
+    # The ViT stand-in returns its input rows, so the output shows what encode_batched normalized.
+    vision = SimpleNamespace(model_dtype=dtype, visual=lambda pixels, grid_thw: (pixels, []))
+    calls = []
+
+    def encode_batched(**inputs):
+        calls.append(inputs)
+        return Qwen3VisionModelBase.encode_batched(vision, **inputs)
+
+    groups = Qwen3VisionModelBase.mm_encoder_groups.fget(
+        SimpleNamespace(encode_batched=encode_batched)
     )
-    assert torch.equal(batched["grid_thw"], grid.repeat(4, 1))
+    batched = encode_multimodal_by_groups(groups, params)
+    # Raw pixels are encoded apart from normalized ones, and per normalization record.
+    assert [call["pixel_values"].dtype for call in calls] == [torch.uint8, dtype, torch.uint8]
+    assert [call["vision_normalization"] for call in calls] == [spec, None, video_spec]
+    assert batched.dtype == dtype
+    assert torch.equal(batched, torch.cat([expected, expected_video, expected, expected_video]))
+    calls.clear()
+    per_request = torch.cat([encode_multimodal_by_groups(groups, [param]) for param in params])
+    assert torch.equal(batched, per_request)
+    with pytest.raises(ValueError, match="require the processor's vision_normalization"):
+        Qwen3VisionModelBase.encode_batched(vision, raw, grid)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -71,13 +71,14 @@ from .modeling_multimodal_mixin import (
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
+from .modeling_multimodal_utils import VisionNormalization
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention, _prepare_qwen_vl_vision_attn_metadata
 from .modeling_qwen3vl import (
     Qwen3VLInputProcessorBase,
     Qwen3VLModelBase,
     Qwen3VLVisionMLP,
     Qwen3VLVisionPatchMerger,
-    _qwen3vl_build_batched_input,
+    normalize_qwen_vision_pixels,
 )
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
@@ -455,7 +456,14 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
         _load_weights_impl(self, combined, allow_partial_loading=allow_partial_loading)
 
     @torch.inference_mode()
-    def encode_batched(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+    def encode_batched(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        vision_normalization: Optional[VisionNormalization] = None,
+    ) -> torch.Tensor:
+        if pixel_values.dtype == torch.uint8:
+            pixel_values = normalize_qwen_vision_pixels(pixel_values, vision_normalization)
         grid_cpu = _cpu_int_rows(grid_thw)
         hidden = self.visual(pixel_values, grid_thw, grid_cpu=grid_cpu)
         merged = merge_spatial_patches(hidden, grid_cpu, merge_size=self.spatial_merge_size)
@@ -468,7 +476,15 @@ class Cosmos3EdgeVisionEncoder(nn.Module):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
+                # One ViT input carries both modalities, image rows first.
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"},
+                    "grid_thw": {"image": "image_grid_thw", "video": "video_grid_thw"},
+                    "vision_normalization": {
+                        "image": "vision_normalization",
+                        "video": "vision_normalization",
+                    },
+                },
             ),
         )
 
