@@ -3566,6 +3566,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_gpu_arena_extent", &kv::KvCacheManager::getGpuArenaExtent,
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_pool_bindings",
+            [](kv::KvCacheManager const& self, int poolGroupIndex, int poolIndex)
+            { return self.getPoolBindings(kv::PoolGroupIndex{poolGroupIndex}, kv::PoolIndex{poolIndex}); },
+            nb::arg("pool_group_index"), nb::arg("pool_index"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_index_range", &kv::KvCacheManager::getPageIndexRange, nb::arg("layer_id"), nb::arg("data_role"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_index_upper_bound", &kv::KvCacheManager::getPageIndexUpperBound, nb::arg("layer_id"),

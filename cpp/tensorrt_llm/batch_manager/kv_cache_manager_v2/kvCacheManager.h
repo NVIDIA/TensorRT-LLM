@@ -252,6 +252,11 @@ public:
     // every GPU pool, is mapped once and never moves or changes size. std::nullopt without an arena.
     std::optional<std::tuple<MemAddress, size_t, bool>> getGpuArenaExtent() const;
 
+    // Copy-based rebalancing: for a bound pool (pool > 0 of a pool group with several pools), its own
+    // slot id for each of the group's slot ids (-1 where unbound); std::nullopt for any other pool,
+    // whose ids are the group's. Changes with getPageIndexBindingVersion().
+    std::optional<std::vector<int32_t>> getPoolBindings(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;
 

@@ -2479,7 +2479,7 @@ std::optional<StorageManager::GpuArenaExtent> StorageManager::hotArenaExtent() c
     if (!mGpuArena)
         return std::nullopt;
     auto const& arena = static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage);
-    return GpuArenaExtent{arena.arenaBase(), arena.totalQuota(), arena.hasBoundPools()};
+    return GpuArenaExtent{arena.arenaBase(), arena.roundedNumBytes(CacheTier::GPU_MEM), arena.hasBoundPools()};
 }
 
 TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const

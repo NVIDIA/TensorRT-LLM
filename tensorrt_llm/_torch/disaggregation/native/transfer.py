@@ -159,10 +159,19 @@ class RecvReqInfo:
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
+    # Copy-based rebalancing with several pools in a pool group: for each of the
+    # receiver's bound pools, keyed "layer_group:pool_view", its own slots,
+    # positionally aligned with block_ids_per_layer_groups[layer_group] (the
+    # receiver's bindings at the time of the request; it does not rebalance
+    # while the receive is in flight). Pools not listed use the group's slots.
+    bound_pool_block_ids: Optional[dict[str, np.ndarray]] = None
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
             {
+                "bound_pool_block_ids": None
+                if self.bound_pool_block_ids is None
+                else {k: v.tobytes() for k, v in self.bound_pool_block_ids.items()},
                 "sender_req_id": self.sender_req_id,
                 "instance_name": self.instance_name,
                 "instance_rank": self.instance_rank,
@@ -183,6 +192,11 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
+        if d.get("bound_pool_block_ids") is not None:
+            d["bound_pool_block_ids"] = {
+                k: np.frombuffer(b, dtype=np.int64).copy()
+                for k, b in d["bound_pool_block_ids"].items()
+            }
         from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
         # The report token comes only from its own checked REQUEST_DATA frame.
@@ -191,6 +205,86 @@ class RecvReqInfo:
         if from_older_release:
             raise OlderReleaseRequestError(info)
         return info
+
+
+class ArenaPoolBindings:
+    """Slot translation for bound pools of a copy-based rebalancing arena.
+
+    Under CoReba a pool group with several pools gives each pool after the
+    first its own window and slot ids: pool p's slot for the group's slot id
+    ``i`` is ``bindings_p[i]``, at ``arena_base + bindings_p[i] * slot_bytes_p``.
+    The page table addresses every pool with the group's ids, so the transfer
+    path translates ids of bound pools through this before extracting regions.
+    Tables change when a rebalance moves a pool; they are refetched when the
+    manager's binding version changes.
+    """
+
+    def __init__(self, impl):
+        self._impl = impl
+        descs = list(impl.pool_group_descs)
+        # Page table pool group list index -> storage pool group index.
+        self._storage_pg = [int(d.pool_group_index) for d in descs]
+        self._num_pools = [len(d.pools) for d in descs]
+        self._version = None
+        self._tables: dict[tuple[int, int], Optional[np.ndarray]] = {}
+
+    def table(self, pg_list_idx: int, pool_idx: int) -> Optional[np.ndarray]:
+        """Binding table of a bound pool, or None for a pool using the group's ids."""
+        if pool_idx == 0 or pool_idx >= self._num_pools[pg_list_idx]:
+            return None
+        version = self._impl.get_page_index_binding_version()
+        if version != self._version:
+            self._tables.clear()
+            self._version = version
+        key = (pg_list_idx, pool_idx)
+        if key not in self._tables:
+            t = self._impl.get_pool_bindings(self._storage_pg[pg_list_idx], pool_idx)
+            self._tables[key] = None if t is None else np.asarray(t, dtype=np.int64)
+        return self._tables[key]
+
+    def translate(self, page_table, lg_idx: int, pv_idx: int, ids) -> Optional[np.ndarray]:
+        """The pool view's own slots for the group's slots ``ids`` (-1 kept), or
+        None when the pool uses the group's slots."""
+        lg = page_table.layer_groups[lg_idx]
+        pv = lg.pool_views[pv_idx]
+        t = self.table(lg.pool_group_idx, pv.pool_idx)
+        if t is None:
+            return None
+        ids = np.asarray(ids, dtype=np.int64)
+        out = np.full_like(ids, -1)
+        held = ids >= 0
+        if np.any(ids[held] >= t.size):
+            raise RuntimeError(
+                f"slot id beyond the binding table of pool {pv.pool_idx} of layer group {lg_idx}"
+            )
+        out[held] = t[ids[held]]
+        if np.any(out[held] < 0):
+            raise RuntimeError(
+                f"held slot without a binding in pool {pv.pool_idx} of layer group {lg_idx}"
+            )
+        return out
+
+    def translate_all(self, page_table, block_ids_per_layer_groups) -> dict[str, np.ndarray]:
+        """Translated slots of every bound pool view, keyed "layer_group:pool_view"."""
+        out = {}
+        for lg_idx, lg in enumerate(page_table.layer_groups):
+            if lg.kind == CacheKind.STATE or lg_idx >= len(block_ids_per_layer_groups):
+                continue
+            for pv_idx in range(len(lg.pool_views)):
+                ids = self.translate(page_table, lg_idx, pv_idx, block_ids_per_layer_groups[lg_idx])
+                if ids is not None:
+                    out[f"{lg_idx}:{pv_idx}"] = ids
+        return out
+
+
+def _self_pool_bindings(registrar) -> Optional[ArenaPoolBindings]:
+    """The registrar's bound-pool bindings, or None when its pools use the group's slot ids.
+
+    Only an ``ArenaPoolBindings`` counts: a registrar without the attribute (or a
+    stand-in for one) never translates.
+    """
+    bindings = getattr(registrar, "self_pool_bindings", None)
+    return bindings if isinstance(bindings, ArenaPoolBindings) else None
 
 
 @dataclass
@@ -1612,6 +1706,19 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
+                # Bound pools (copy-based rebalancing, several pools per group)
+                # have their own slot ids: ours from our bindings, the
+                # receiver's from its request.
+                self_bindings = _self_pool_bindings(self._registrar)
+                if self_bindings is not None:
+                    own = self_bindings.translate(
+                        extractor.page_table, self_lg, self_pi, src_block_ids
+                    )
+                    if own is not None:
+                        src_block_ids = own
+                peer_bound = getattr(req_info, "bound_pool_block_ids", None)
+                if peer_bound:
+                    dst_block_ids = peer_bound.get(f"{peer_lg}:{peer_pi}", dst_block_ids)
                 helix_stride = peer_ri.cp_size > 1 and self_ri.cp_size == 1
                 if helix_stride:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
@@ -3136,6 +3243,14 @@ class Receiver(ReceiverBase):
                 "both ctx_request_id and disagg_request_id are None for task "
                 f"unique_rid={task._unique_rid}"
             )
+        bindings = _self_pool_bindings(self._registrar)
+        bound = (
+            bindings.translate_all(
+                self._registrar.self_extractor.page_table, task._chunk.block_ids_per_layer_groups
+            )
+            if bindings is not None
+            else None
+        )
         # Receiver's cached prefix is implicit in block_ids size; sender derives dst_start.
         return RecvReqInfo(
             sender_req_id=sender_req_id,
@@ -3147,6 +3262,7 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
             context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
+            bound_pool_block_ids=bound or None,
         )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
@@ -4775,15 +4891,12 @@ class TransferWorker:
         arena = self._gpu_arena_extent()
         if arena is not None:
             arena_base, arena_bytes, has_bound_pools = arena
-            if has_bound_pools:
-                # The extractor addresses pool p of a group at
-                # base + slot_id * stride with the group's (pool 0's) slot
-                # ids; a bound pool has its own ids (bindings), so transfers
-                # would hit the wrong slots.
-                raise NotImplementedError(
-                    "Disaggregated serving with copy_based_rebalancing does not "
-                    "support pool groups with several pools (bound pools)"
-                )
+            # Bound pools are addressed with their own slot ids, translated in
+            # the transfer path (ArenaPoolBindings); the whole arena, bound
+            # pools' windows included, is registered here.
+            self._peer_registrar.self_pool_bindings = (
+                ArenaPoolBindings(self._config.kv_cache_manager.impl) if has_bound_pools else None
+            )
             # Every pool's base is the arena base and its page table entry
             # counts only its current window, so the per-pool regions would
             # overlap and miss windows that start further into the arena.

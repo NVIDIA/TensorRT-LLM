@@ -708,6 +708,12 @@ std::optional<std::tuple<MemAddress, size_t, bool>> KvCacheManager::getGpuArenaE
     return std::make_tuple(extent->base, extent->bytes, extent->hasBoundPools);
 }
 
+std::optional<std::vector<int32_t>> KvCacheManager::getPoolBindings(PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    auto const apiLock = lockShared();
+    return mStorage->hotPoolBindings(pgIdx, poolIdx);
+}
+
 int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
