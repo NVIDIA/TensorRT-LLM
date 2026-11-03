@@ -915,7 +915,9 @@ class MnnvlPushTarget:
     The producer stores its BF16 ``[num_tokens, hidden_dim]`` output into the Lamport slots of
     ``view`` with the ``one_shot`` (else two-shot) transport; ``AllReduce.finish_push`` then
     completes the all-reduce, bitwise like the C++ MNNVL kernel. With ``in_place`` the result
-    stays in the workspace (``MnnvlInPlaceResult``), else it goes to ``output``.
+    stays in the workspace (``MnnvlInPlaceResult``), else it goes to ``output``. With
+    ``consumer_finishes`` no finish kernel runs: the consumer finishes the call
+    (``MnnvlPendingResult``).
     """
 
     view: LamportWorkspaceView
@@ -924,10 +926,24 @@ class MnnvlPushTarget:
     one_shot: bool
     in_place: bool
     output: Optional[torch.Tensor]
+    consumer_finishes: bool = False
+
+
+class MnnvlWorkspaceResult:
+    """An MNNVL all-reduce result that lives in the all-reduce's workspace rather than in a
+    tensor (``MnnvlInPlaceResult``, ``MnnvlPendingResult``); ``materialize`` turns it into one.
+    The kernel that reads it in the workspace must lie on every dependency path from the call to
+    the next all-reduce on the workspace, which re-arms the call's buffer."""
+
+    view: LamportWorkspaceView
+    shape: Tuple[int, int]
+
+    def materialize(self) -> torch.Tensor:
+        raise NotImplementedError
 
 
 @dataclasses.dataclass
-class MnnvlInPlaceResult:
+class MnnvlInPlaceResult(MnnvlWorkspaceResult):
     """The result of a pushed two-shot MNNVL all-reduce left in its workspace
     (``AllReduce.finish_push`` of an ``in_place`` target).
 
@@ -950,6 +966,47 @@ class MnnvlInPlaceResult:
                              dtype=torch.bfloat16,
                              device=self.view.flags.device)
         return mnnvl_pushed_allreduce.run_gather(self.view, output)
+
+
+@dataclasses.dataclass
+class MnnvlPendingResult(MnnvlWorkspaceResult):
+    """A pushed MNNVL all-reduce whose finish is left to the kernel that consumes it
+    (``AllReduce.finish_push`` of a ``consumer_finishes`` target).
+
+    Every rank has stored its input into the call's slots (``one_shot`` or two-shot transport),
+    but no kernel has reduced them or advanced the workspace's rotation state. Exactly one of
+    these runs on every rank, before the next all-reduce on the workspace:
+
+    * a consumer kernel that finishes the call (``kimi_k3_attn_res`` with an
+      ``AllReduceFinish`` from ``finish_args``; the device side is
+      ``mnnvl_pushed_allreduce.reduce_slots_v4`` / ``finish_two_shot_v4`` /
+      ``clear_dirty_stages`` / ``arrive_finish``), or
+    * ``materialize``, the finish kernel into a tensor.
+
+    Either reads the rotation state before waiting for the producer, which releases its
+    dependents (PDL) only after its own ``griddepcontrol.wait``; a consumer that also polls the
+    slots before its own wait (``early_poll``) may store only after it.
+    """
+
+    view: LamportWorkspaceView
+    shape: Tuple[int, int]
+    one_shot: bool
+
+    @property
+    def finish_args(self) -> Tuple[int, int, int, bool]:
+        """``(world, rank, mc_base, two_shot)`` of the call for a consumer that finishes it."""
+        return (self.view.world, self.view.rank, self.view.mc_base,
+                not self.one_shot)
+
+    def materialize(self) -> torch.Tensor:
+        """Finish the all-reduce into a BF16 tensor (the finish kernel on the current
+        stream)."""
+        from ..kernels.blackwell import mnnvl_pushed_allreduce
+        output = torch.empty(self.shape,
+                             dtype=torch.bfloat16,
+                             device=self.view.flags.device)
+        return mnnvl_pushed_allreduce.run_finish(self.view, output,
+                                                 self.one_shot)
 
 
 class MNNVLAllReduce(nn.Module):
@@ -1382,8 +1439,13 @@ class MNNVLAllReduce(nn.Module):
                     tactic,
                     scale=params.scale if quant else None,
                     norm_out=norm_out)
-    def push_target(self, num_tokens: int, hidden_dim: int,
-                    in_place: bool) -> Optional[MnnvlPushTarget]:
+
+    def push_target(
+            self,
+            num_tokens: int,
+            hidden_dim: int,
+            in_place: bool,
+            consumer_finishes: bool = False) -> Optional[MnnvlPushTarget]:
         """See ``AllReduce.push_target``."""
         from ..kernels.blackwell import mnnvl_pushed_allreduce
         world = self.mapping.tp_size
@@ -1396,18 +1458,23 @@ class MNNVLAllReduce(nn.Module):
         workspace = get_or_scale_allreduce_mnnvl_workspace(
             self.mapping, self.dtype, buffer_size_bytes=need)
         # Only the two-shot transport leaves its result in the workspace.
-        in_place = in_place and not one_shot
-        output = None if in_place else torch.empty(
+        in_place = in_place and not one_shot and not consumer_finishes
+        output = None if in_place or consumer_finishes else torch.empty(
             (num_tokens, hidden_dim),
             dtype=self.dtype,
             device=workspace["uc_buffer"].device)
         return MnnvlPushTarget(workspace["push_view"], num_tokens, hidden_dim,
-                               one_shot, in_place, output)
+                               one_shot, in_place, output, consumer_finishes)
 
     @staticmethod
     def finish_push(
-            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+        target: MnnvlPushTarget
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult, MnnvlPendingResult]:
         from ..kernels.blackwell import mnnvl_pushed_allreduce
+        if target.consumer_finishes:
+            return MnnvlPendingResult(target.view,
+                                      (target.num_tokens, target.hidden_dim),
+                                      target.one_shot)
         if target.in_place:
             mnnvl_pushed_allreduce.run_finish_in_place(target.view,
                                                        target.num_tokens,
@@ -1595,12 +1662,14 @@ class AllReduce(nn.Module):
                                                         input_scale,
                                                         all_reduce_params,
                                                         gemm_tactic)
+
     def push_target(
         self,
         num_tokens: int,
         hidden_dim: int,
         in_place: bool = False,
-        all_reduce_params: Optional[AllReduceParams] = None
+        all_reduce_params: Optional[AllReduceParams] = None,
+        consumer_finishes: bool = False,
     ) -> Optional[MnnvlPushTarget]:
         """The MNNVL all-reduce of a BF16 ``[num_tokens, hidden_dim]`` input as a target a
         producer kernel pushes its output into (the FP8 block-scale low-M GEMM's push epilogue),
@@ -1612,6 +1681,8 @@ class AllReduce(nn.Module):
         finished in the order they were made, by every rank. The call takes the C++ kernel's
         transport; ``in_place`` asks for the result in the workspace (``MnnvlInPlaceResult``),
         which the two-shot transport (above the one-shot size threshold) leaves there.
+        ``consumer_finishes`` leaves the finish itself to the consumer of the result, with
+        either transport (``MnnvlPendingResult``).
         """
         if all_reduce_params is not None and (
                 not all_reduce_params.enable_allreduce
@@ -1623,13 +1694,21 @@ class AllReduce(nn.Module):
                 or hidden_dim % 8 or torch.compiler.is_compiling()):
             return None
         return self.mnnvl_allreduce.push_target(num_tokens, hidden_dim,
-                                                in_place)
+                                                in_place, consumer_finishes)
+
+    @staticmethod
+    def push_input(target: MnnvlPushTarget, input: torch.Tensor) -> None:
+        """Push the contiguous BF16 ``input`` into ``target`` with a copy kernel, for a producer
+        without a push epilogue; the copy kernel is then the producer ``finish_push`` follows."""
+        from ..kernels.blackwell import mnnvl_pushed_allreduce
+        mnnvl_pushed_allreduce.run_push(target.view, input, target.one_shot)
 
     def finish_push(
-            self,
-            target: MnnvlPushTarget) -> Union[torch.Tensor, MnnvlInPlaceResult]:
-        """Complete a target the producer pushed into: the reduced tensor, or for an
-        ``in_place`` target the result left in the workspace.
+        self, target: MnnvlPushTarget
+    ) -> Union[torch.Tensor, MnnvlInPlaceResult, MnnvlPendingResult]:
+        """Complete a target the producer pushed into: the reduced tensor, for an ``in_place``
+        target the result left in the workspace, for a ``consumer_finishes`` target the call
+        left pending (no launch).
 
         Must be the next launch on the stream after the producer kernel, which releases its
         dependents (PDL) only after its own ``griddepcontrol.wait``: the finish kernel reads the

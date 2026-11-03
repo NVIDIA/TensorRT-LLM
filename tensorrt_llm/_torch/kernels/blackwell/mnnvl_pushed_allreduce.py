@@ -40,6 +40,14 @@ broadcast stage, where the kernel that runs next reads them with :func:`poll_res
 :func:`run_gather` copies them into a tensor). They live until the next all-reduce on the
 workspace re-arms that buffer.
 
+A consumer kernel may also finish a call itself (its finish is then left pending): it reads the
+rotation state, sums the slots of its rows with :func:`reduce_slots_v4` (one-shot) or
+:func:`finish_two_shot_v4` (two-shot: the owner reduces and multicasts its rows, the others poll
+them), re-arms the previous call's buffer with :func:`clear_dirty_stages` and counts its CTAs with
+:func:`arrive_finish`, whose last arrival advances the state. The sums and the state are the
+finish kernel's, so the consumer reads the bits the finish kernel would have stored.
+:class:`PushedAllReduceCopyKernel` pushes a tensor for a producer without a push epilogue.
+
 Ordering: the producer reads the rotation state after its own ``griddepcontrol.wait`` and
 releases its dependent (the finish kernel) only after that wait; the finish kernel's workers then
 read the state and poll without waiting for the producer, and only its updater CTA waits for the
@@ -128,6 +136,20 @@ def ld_volatile_v4(addr, *, loc=None, ip=None):
         llvm.StructType.get_literal([T.i32()] * 4),
         [_lv(addr, loc=loc, ip=ip)],
         "ld.volatile.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return _unpack(res, T.i32(), Int32, 4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _ld_v4(addr, *, loc=None, ip=None):
+    """16 bytes of a tensor an earlier grid wrote."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [_lv(addr, loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
         "=r,=r,=r,=r,l",
         loc=loc,
         ip=ip,
@@ -283,6 +305,21 @@ def _red_release_add(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _atom_add_acq_rel_u32(addr, value, *, loc=None, ip=None):
+    """``atomicAdd`` (acquire-release, GPU scope); returns the old value."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _ld_acquire_u32(addr, *, loc=None, ip=None):
     return Int32(
         _asm(
@@ -396,6 +433,179 @@ def poll_result_v4(uc_local: Int64, flags: Int64, tok: Int32, byte_off: Int32, h
     return w
 
 
+def reduce_chunk(world: int, one_shot: bool) -> int:
+    """Ranks per partial sum of the C++ kernel of the ``one_shot`` (else two-shot) transport:
+    chunks of eight ranks for the one-shot kernel above eight ranks, up to sixteen ranks in one
+    chunk for the two-shot kernel."""
+    return (world if world <= 8 else 8) if one_shot else min(world, 16)
+
+
+@cute.jit
+def reduce_slots_v4(base: Int64, slot_bytes: int, world: int, chunk: int):
+    """Sum the ``world`` 16-byte slots at ``base + r * slot_bytes`` in the C++ order (``chunk``
+    ranks per partial sum, :func:`reduce_chunk`); returns eight FP32 values (four BF16 pairs).
+    Like the C++ kernel, each chunk of ranks is polled until every word has arrived and then
+    summed, so only one chunk's slots are live."""
+    acc = [cutlass.Float32(0.0)] * 8
+    for c0 in cutlass.range_constexpr(0, world, chunk):
+        words = cute.make_rmem_tensor((chunk * 4,), Int32)
+        ready = Int32(0)
+        while ready == 0:
+            ready = Int32(1)
+            for r in cutlass.range_constexpr(chunk):
+                w = ld_volatile_v4(base + Int64((c0 + r) * slot_bytes))
+                for e in cutlass.range_constexpr(4):
+                    words[r * 4 + e] = w[e]
+                ready = ready & arrived_v4(*w)
+        part = [cutlass.Float32(0.0)] * 8
+        for r in cutlass.range_constexpr(chunk):
+            for q in cutlass.range_constexpr(4):
+                part[2 * q], part[2 * q + 1] = _acc_bf16x2(
+                    words[r * 4 + q], part[2 * q], part[2 * q + 1]
+                )
+        for i in cutlass.range_constexpr(8):
+            acc[i] = _add_f32(acc[i], part[i])
+    return acc
+
+
+@cute.jit
+def one_shot_slots(uc_local: Int64, cur: Int32, nbytes: Int32, tok: Int32, world: int, hidden: int):
+    """Address of rank 0's slot of token ``tok`` in buffer ``cur`` of a one-shot call (the slots
+    of the other ranks follow, ``hidden * 2`` bytes apart)."""
+    return _stage_addr(uc_local, cur, Int32(0), 1, nbytes) + Int64(tok * world) * (hidden * 2)
+
+
+@cute.jit
+def clear_dirty_stages(
+    uc_local: Int64,
+    dirty: Int32,
+    nbytes: Int32,
+    dstages: Int32,
+    c0: Int32,
+    c1: Int32,
+    c2: Int32,
+    c3: Int32,
+    gtid: Int32,
+    nthreads: Int32,
+):
+    """Re-arm every stage the previous call on the workspace used (buffer ``dirty``, ``dstages``
+    stages of ``c0..c3`` bytes, from :func:`lamport_state`), grid-strided over ``nthreads``.
+    Safe as soon as every grid before the call's producer has completed."""
+    clears = (c0, c1, c2, c3)
+    for s in cutlass.range_constexpr(4):
+        if s < dstages:
+            _clear_stage(
+                uc_local + Int64(dirty * dstages + s) * Int64(nbytes // dstages),
+                clears[s],
+                gtid,
+                nthreads,
+            )
+
+
+@cute.jit
+def _write_next_state(
+    flags: Int64, cur: Int32, nbytes: Int32, m: Int32, world: int, hidden: int, one_shot: bool
+):
+    """The state after a call of ``m`` rows in buffer ``cur``: the next buffer is current, ``cur``
+    dirty with the stages and bytes the transport used (``LamportFlags::waitAndUpdate``)."""
+    row_bytes = hidden * 2
+    clear0 = m * (world * row_bytes)
+    clear1 = Int32(0)
+    if cutlass.const_expr(not one_shot):
+        clear0 = ((m + (world - 1)) // world) * (world * row_bytes)
+        clear1 = m * row_bytes
+    st_v4(flags, (cur + 1) % NUM_BUFFERS, cur, nbytes, Int32(1 if one_shot else 2))
+    st_v4(flags + Int64(16), clear0, clear1, Int32(0), Int32(0))
+
+
+@cute.jit
+def arrive_finish(
+    flags: Int64,
+    total: Int32,
+    cur: Int32,
+    nbytes: Int32,
+    m: Int32,
+    world: int,
+    hidden: int,
+    one_shot: bool,
+):
+    """Count one CTA of a consumer grid of ``total`` CTAs that finishes a call of ``m`` rows (one
+    thread per CTA, once every thread of the CTA has read the state and the call's producer has
+    completed); the last CTA writes the next call's state and resets the counter, as
+    :class:`PushedAllReduceFinishKernel`'s updater does."""
+    arrivals = flags + Int64(_FLAG_ARRIVALS * 4)
+    old = _atom_add_acq_rel_u32(arrivals, Int32(1))
+    if old == total - 1:
+        _write_next_state(flags, cur, nbytes, m, world, hidden, one_shot)
+        _st_u32(arrivals, Int32(0))
+
+
+@cute.jit
+def finish_two_shot_v4(
+    uc_local: Int64,
+    mc_base: Int64,
+    cur: Int32,
+    nbytes: Int32,
+    tok: Int32,
+    byte_off: Int32,
+    rank: Int32,
+    store: Int32,
+    world: int,
+    hidden: int,
+):
+    """16 bytes at ``byte_off`` of row ``tok`` of the two-shot call in buffer ``cur``, finished by
+    the caller: on the row's owner (``tok % world == rank``) the C++-order sum of its scatter
+    slots, rounded, ``-0`` replaced by ``+0`` and (where ``store != 0``) multicast into every
+    rank's broadcast stage; elsewhere the broadcast row, polled until it arrived. Both are the
+    bits :class:`PushedAllReduceFinishKernel` broadcasts."""
+    w0 = Int32(0)
+    w1 = Int32(0)
+    w2 = Int32(0)
+    w3 = Int32(0)
+    if tok % world == rank:
+        scatter = _stage_addr(uc_local, cur, Int32(0), 2, nbytes)
+        acc = reduce_slots_v4(
+            scatter + Int64((tok // world) * world * hidden) * 2 + Int64(byte_off),
+            hidden * 2,
+            world,
+            reduce_chunk(world, False),
+        )
+        w0 = _sanitize_bf16x2(_pack_bf16x2(acc[0], acc[1]))
+        w1 = _sanitize_bf16x2(_pack_bf16x2(acc[2], acc[3]))
+        w2 = _sanitize_bf16x2(_pack_bf16x2(acc[4], acc[5]))
+        w3 = _sanitize_bf16x2(_pack_bf16x2(acc[6], acc[7]))
+        if store != 0:
+            bcast_mc = _stage_addr(mc_base, cur, Int32(1), 2, nbytes)
+            _multimem_st_v4(bcast_mc + Int64(tok * hidden) * 2 + Int64(byte_off), w0, w1, w2, w3)
+    else:
+        src = _stage_addr(uc_local, cur, Int32(1), 2, nbytes) + Int64(tok * hidden) * 2
+        w = ld_volatile_v4(src + Int64(byte_off))
+        while arrived_v4(*w) == 0:
+            w = ld_volatile_v4(src + Int64(byte_off))
+        w0 = w[0]
+        w1 = w[1]
+        w2 = w[2]
+        w3 = w[3]
+    return w0, w1, w2, w3
+
+
+@cute.jit
+def two_shot_token(v: Int32, m: Int32, rank: Int32, world: int):
+    """Row of the ``v``-th CTA group of a grid that finishes a two-shot call of ``m`` rows on
+    ``rank``: the rows this rank owns (``rank``, ``rank + world``, ...) first, then the others
+    in order, so the owners' reductions are dispatched before the CTAs that poll for them."""
+    n_own = (m + (world - 1) - rank) // world
+    t = rank + v * world
+    if v >= n_own:
+        j = v - n_own
+        q = j // (world - 1)
+        rem = j - q * (world - 1)
+        t = q * world + rem
+        if rem >= rank:
+            t = t + 1
+    return t
+
+
 # ---------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------
@@ -441,8 +651,7 @@ class PushedAllReduceFinishKernel:
         self.use_pdl = use_pdl
         self.vecs = hidden // 8
         self.cols = _ceil_div(self.vecs, THREADS)
-        # Ranks per partial sum of the C++ kernel.
-        self.chunk = (world if world <= 8 else 8) if one_shot else min(world, 16)
+        self.chunk = reduce_chunk(world, one_shot)
 
     @cute.jit
     def __call__(
@@ -461,33 +670,6 @@ class PushedAllReduceFinishKernel:
             stream=stream,
             use_pdl=self.use_pdl,
         )
-
-    @cute.jit
-    def reduce_slots(self, base: Int64, slot_bytes: int):
-        """Sum the ``W`` 16-byte slots at ``base + r * slot_bytes`` in the C++ order; returns
-        eight FP32 values (four BF16 pairs). Like the C++ kernel, each chunk of ranks is polled
-        until every word has arrived and then summed, so only one chunk's slots are live."""
-        chunk = self.chunk
-        acc = [cutlass.Float32(0.0)] * 8
-        for c0 in cutlass.range_constexpr(0, self.W, chunk):
-            words = cute.make_rmem_tensor((chunk * 4,), Int32)
-            ready = Int32(0)
-            while ready == 0:
-                ready = Int32(1)
-                for r in cutlass.range_constexpr(chunk):
-                    w = ld_volatile_v4(base + Int64((c0 + r) * slot_bytes))
-                    for e in cutlass.range_constexpr(4):
-                        words[r * 4 + e] = w[e]
-                    ready = ready & arrived_v4(*w)
-            part = [cutlass.Float32(0.0)] * 8
-            for r in cutlass.range_constexpr(chunk):
-                for q in cutlass.range_constexpr(4):
-                    part[2 * q], part[2 * q + 1] = _acc_bf16x2(
-                        words[r * 4 + q], part[2 * q], part[2 * q + 1]
-                    )
-            for i in cutlass.range_constexpr(8):
-                acc[i] = _add_f32(acc[i], part[i])
-        return acc
 
     @cute.kernel
     def kernel(
@@ -508,14 +690,7 @@ class PushedAllReduceFinishKernel:
                 arrived = _ld_acquire_u32(arrivals)
                 while arrived < workers:
                     arrived = _ld_acquire_u32(arrivals)
-                row_bytes = H * 2
-                clear0 = m * (W * row_bytes)
-                clear1 = Int32(0)
-                if cutlass.const_expr(not self.one_shot):
-                    clear0 = ((m + (W - 1)) // W) * (W * row_bytes)
-                    clear1 = m * row_bytes
-                st_v4(flags, (cur + 1) % NUM_BUFFERS, cur, nbytes, Int32(1 if self.one_shot else 2))
-                st_v4(flags + Int64(16), clear0, clear1, Int32(0), Int32(0))
+                _write_next_state(flags, cur, nbytes, m, W, H, self.one_shot)
                 _st_u32(arrivals, Int32(0))
         else:
             tok = bidx // self.cols
@@ -533,14 +708,19 @@ class PushedAllReduceFinishKernel:
             if cutlass.const_expr(self.one_shot):
                 buf = _stage_addr(uc_local, cur, Int32(0), 1, nbytes)
                 if v < self.vecs:
-                    acc = self.reduce_slots(buf + Int64(tok * W * H + v * 8) * 2, row_bytes)
+                    acc = reduce_slots_v4(
+                        buf + Int64(tok * W * H + v * 8) * 2, row_bytes, W, self.chunk
+                    )
                     st_v4(out_v, *[_pack_bf16x2(acc[2 * q], acc[2 * q + 1]) for q in range(4)])
             else:
                 if v < self.vecs:
                     if tok % W == rank:
                         scatter = _stage_addr(uc_local, cur, Int32(0), 2, nbytes)
-                        acc = self.reduce_slots(
-                            scatter + Int64((tok // W) * W * H + v * 8) * 2, row_bytes
+                        acc = reduce_slots_v4(
+                            scatter + Int64((tok // W) * W * H + v * 8) * 2,
+                            row_bytes,
+                            W,
+                            self.chunk,
                         )
                         o = [
                             _sanitize_bf16x2(_pack_bf16x2(acc[2 * q], acc[2 * q + 1]))
@@ -549,17 +729,18 @@ class PushedAllReduceFinishKernel:
                         bcast_mc = _stage_addr(mc_base, cur, Int32(1), 2, nbytes)
                         _multimem_st_v4(bcast_mc + Int64(tok * H + v * 8) * 2, *o)
             # Re-arm the previous call's buffer (every stage it used) while the rows travel.
-            gtid = bidx * THREADS + tidx
-            nthreads = workers * THREADS
-            clears = (c0, c1, c2, c3)
-            for s in cutlass.range_constexpr(4):
-                if s < dstages:
-                    _clear_stage(
-                        uc_local + Int64(dirty * dstages + s) * Int64(nbytes // dstages),
-                        clears[s],
-                        gtid,
-                        nthreads,
-                    )
+            clear_dirty_stages(
+                uc_local,
+                dirty,
+                nbytes,
+                dstages,
+                c0,
+                c1,
+                c2,
+                c3,
+                bidx * THREADS + tidx,
+                workers * THREADS,
+            )
             if cutlass.const_expr(not self.one_shot and self.gather):
                 if v < self.vecs:
                     src = (
@@ -601,6 +782,58 @@ class PushedAllReduceGatherKernel:
         if v < self.vecs:
             w = poll_result_v4(uc_local, flags, tok, v * 16, self.H)
             st_v4(out + Int64(tok * self.H + v * 8) * 2, *w)
+
+
+class PushedAllReduceCopyKernel:
+    """Push a BF16 ``[m, hidden]`` tensor into the slots of the next call on the workspace: the
+    producer side of a pushed all-reduce for an output that no kernel epilogue pushes. Grid
+    ``(m, ceil(hidden / 8 / 128))``; like the push epilogues it waits for its predecessor (which
+    wrote the tensor), releases its dependent right after that wait and then reads the state."""
+
+    def __init__(self, world: int, hidden: int, one_shot: bool, use_pdl: bool):
+        if hidden % 8:
+            raise ValueError(f"hidden={hidden} must be a multiple of 8")
+        if world not in WORLD_SIZES:
+            raise ValueError(f"world={world} is not one of {WORLD_SIZES}")
+        self.W = world
+        self.H = hidden
+        self.one_shot = one_shot
+        self.use_pdl = use_pdl
+        self.vecs = hidden // 8
+        self.cols = _ceil_div(self.vecs, THREADS)
+
+    @cute.jit
+    def __call__(
+        self,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        inp: Int64,
+        m: Int32,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(peer_ptrs, mc_base, flags, inp, m, rank).launch(
+            grid=(m, self.cols, 1), block=(THREADS, 1, 1), stream=stream, use_pdl=self.use_pdl
+        )
+
+    @cute.kernel
+    def kernel(
+        self, peer_ptrs: Int64, mc_base: Int64, flags: Int64, inp: Int64, m: Int32, rank: Int32
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        tok, by, _ = cute.arch.block_idx()
+        v = by * THREADS + tidx
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
+            griddepcontrol_launch_dependents()
+        cur, _, nbytes, _, _, _, _, _ = lamport_state(flags)
+        if v < self.vecs:
+            w = _ld_v4(inp + Int64(tok * self.H + v * 8) * 2)
+            addr = push_slot(
+                peer_ptrs, mc_base, cur, nbytes, tok, rank, v * 8, self.W, self.H, self.one_shot
+            )
+            push_v4(addr, *w, self.one_shot)
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +880,31 @@ def _compiled_gather(hidden: int, use_pdl: bool):
     kernel = PushedAllReduceGatherKernel(hidden, use_pdl)
     a = Int64(1 << 20)
     return cute.compile(kernel, a, a, a, Int32(1), _stream())
+
+
+@functools.cache
+def _compiled_push(world: int, hidden: int, one_shot: bool, use_pdl: bool):
+    kernel = PushedAllReduceCopyKernel(world, hidden, one_shot, use_pdl)
+    a = Int64(1 << 20)
+    return cute.compile(kernel, a, a, a, a, Int32(1), Int32(0), _stream())
+
+
+def run_push(
+    view: LamportWorkspaceView, inp: torch.Tensor, one_shot: bool, use_pdl: bool = True
+) -> None:
+    """Push ``inp`` (contiguous BF16 ``[m, hidden]``) into the slots of the next call on
+    ``view`` with the ``one_shot`` (else two-shot) transport, as a push epilogue would."""
+    m, hidden = inp.shape
+    check_transport(view, m, hidden, one_shot)
+    _compiled_push(view.world, hidden, one_shot, use_pdl)(
+        Int64(view.peer_ptrs.data_ptr()),
+        Int64(view.mc_base),
+        Int64(view.flags.data_ptr()),
+        Int64(inp.data_ptr()),
+        Int32(m),
+        Int32(view.rank),
+        _stream(),
+    )
 
 
 def run_finish(
@@ -705,17 +963,26 @@ def run_gather(view: LamportWorkspaceView, out: torch.Tensor, use_pdl: bool = Tr
 __all__ = [
     "NUM_BUFFERS",
     "WORLD_SIZES",
+    "PushedAllReduceCopyKernel",
     "PushedAllReduceFinishKernel",
     "PushedAllReduceGatherKernel",
+    "arrive_finish",
     "arrived_v4",
     "check_transport",
+    "clear_dirty_stages",
+    "finish_two_shot_v4",
     "lamport_state",
     "ld_volatile_v4",
+    "one_shot_slots",
     "poll_result_v4",
     "push_slot",
     "push_v4",
+    "reduce_chunk",
+    "reduce_slots_v4",
     "run_finish",
     "run_finish_in_place",
     "run_gather",
+    "run_push",
     "st_v4",
+    "two_shot_token",
 ]

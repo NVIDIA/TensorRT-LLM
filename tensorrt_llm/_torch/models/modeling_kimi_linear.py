@@ -122,7 +122,8 @@ from ..distributed import (
     AllReduceFusionOp,
     AllReduceParams,
     AllReduceStrategy,
-    MnnvlInPlaceResult,
+    MnnvlPendingResult,
+    MnnvlWorkspaceResult,
     allgather,
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
@@ -526,10 +527,10 @@ def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResK
     The decode kernel where it serves the shape (``_attn_res_decode_max_tokens``), else the
     persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1`` and it serves the shape, else
     unfused. The fused mixes and the MoE layers' residual deferral (``_defers_moe_residual``)
-    ask here. The attention o_proj's in-place all-reduce result is sized at load time from the
-    same ``_attn_res_decode_max_tokens`` (``KimiLinearDecoderLayer.attention_output_reduction``);
-    a mix that does not pick the decode kernel for it gathers it
-    (``MnnvlInPlaceResult.materialize``).
+    ask here. The rows whose attention o_proj all-reduce the mix after attention finishes are
+    sized at load time from the same ``_attn_res_decode_max_tokens``
+    (``KimiLinearDecoderLayer.attention_output_reduction``); a mix that does not pick the decode
+    kernel for such a result finishes it into a tensor (``MnnvlPendingResult.materialize``).
     """
     if (
         not _FUSED_ATTN_RES_ENABLED
@@ -625,7 +626,7 @@ def _defers_moe_residual(prefix_sum: torch.Tensor, num_candidates: int) -> bool:
 
 def _attn_res_decode_kernel(
     layer: torch.Tensor,
-    addends: Tuple[Union[torch.Tensor, MnnvlInPlaceResult], ...],
+    addends: Tuple[Union[torch.Tensor, MnnvlWorkspaceResult], ...],
     block_residual: torch.Tensor,
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
@@ -637,7 +638,8 @@ def _attn_res_decode_kernel(
     else None.
 
     ``addends``: ``()``; ``(addend,)`` for ``layer + addend``, where ``addend`` may be an
-    all-reduce result left in its workspace (read in place); ``(routed, shared)`` for the MoE
+    all-reduce result left in its workspace (read in place) or a pushed all-reduce left pending
+    (finished by the kernel, before its grid wait where one-shot); ``(routed, shared)`` for the MoE
     residual update ``layer + bf16(routed + shared)``. With ``mxfp8`` (MoE residual update only)
     the result also holds the MXFP8 form ``(activation, scale)`` of the normed mix.
     """
@@ -645,8 +647,8 @@ def _attn_res_decode_kernel(
     if _attn_res_kernel(layer, num_candidates) is not _AttnResKernel.DECODE:
         return None
     M, H = layer.shape
-    in_place = len(addends) == 1 and isinstance(addends[0], MnnvlInPlaceResult)
-    if in_place and addends[0].shape != (M, H):
+    in_place = len(addends) == 1 and isinstance(addends[0], MnnvlWorkspaceResult)
+    if in_place and tuple(addends[0].shape) != (M, H):
         return None
     # The kernel reads dense rows; these are no-ops for the decoder's tensors.
     layer, block_residual = layer.contiguous(), block_residual.contiguous()
@@ -655,6 +657,24 @@ def _attn_res_decode_kernel(
     weights = (proj.weight.reshape(-1), norm.weight, output_norm.weight)
     _note_attn_res_fusion(f"attn_res+norm/decode/add{len(addends)}", True, M, H, num_candidates)
     eps, out_eps = float(norm.eps), _rms_norm_eps(output_norm)
+    if in_place and isinstance(addends[0], MnnvlPendingResult):
+        pending = addends[0]
+        world, rank, mc_base, two_shot = pending.finish_args
+        return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_finish_addend(
+            layer,
+            pending.view.uc_local,
+            mc_base,
+            pending.view.flags,
+            world,
+            rank,
+            two_shot,
+            # One-shot calls are finished before the grid wait (no cross-rank CTA dependency).
+            not two_shot,
+            block_residual,
+            *weights,
+            eps,
+            out_eps,
+        )
     if in_place:
         view = addends[0].view
         return torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
@@ -815,7 +835,7 @@ def _apply_attn_res_and_rmsnorm(
 
 def _apply_attn_res_add_and_rmsnorm(
     prefix_sum: torch.Tensor,
-    addend: Union[torch.Tensor, MnnvlInPlaceResult],
+    addend: Union[torch.Tensor, MnnvlWorkspaceResult],
     block_residual: torch.Tensor,
     proj: nn.Linear,
     norm: KimiK3RMSNorm,
@@ -823,10 +843,11 @@ def _apply_attn_res_add_and_rmsnorm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Add an attention output to the running residual, then select and norm.
 
-    ``addend`` may be the attention output's all-reduce result left in its workspace: the decode
-    attention-residual kernel reads it in place where it serves the mix, else it is gathered.
+    ``addend`` may be the attention output's all-reduce left in its workspace, finished or
+    pending: the decode attention-residual kernel reads (and finishes) it there where it serves
+    the mix, else it is materialized.
     """
-    if isinstance(addend, MnnvlInPlaceResult):
+    if isinstance(addend, MnnvlWorkspaceResult):
         if _FUSED_ATTN_RES_ENABLED:
             decode = _attn_res_decode_kernel(
                 prefix_sum, (addend,), block_residual, proj, norm, output_norm
@@ -999,9 +1020,11 @@ class _Fp8BlockScaleWeightReadLinear(
     serves a forward and the all-reduce runs the MNNVL kernel, the GEMM pushes
     its output straight into the all-reduce's Lamport buffers and a finish
     kernel completes it, bitwise like the GEMM followed by the all-reduce. Up
-    to ``in_place_max_rows`` rows (the consumer reads those in place), such a
-    forward returns the result the two-shot transport leaves in the workspace
-    (``MnnvlInPlaceResult``).
+    to ``in_place_max_rows`` rows the consumer reads the result in the
+    workspace and finishes the all-reduce itself: such a forward returns the
+    call left pending (``MnnvlPendingResult``), also from
+    :meth:`forward_prequantized`, whose GEMM has no push epilogue (a copy
+    kernel pushes its output).
     """
 
     def __init__(
@@ -1190,8 +1213,8 @@ class _Fp8BlockScaleWeightReadLinear(
         return self._output_all_reduce.push_target(
             num_rows,
             self.out_features,
-            in_place=num_rows <= self._in_place_max_rows,
             all_reduce_params=all_reduce_params,
+            consumer_finishes=num_rows <= self._in_place_max_rows,
         )
 
     def _push(self, x_flat: torch.Tensor, target, gate: Optional[torch.Tensor] = None):
@@ -1217,12 +1240,12 @@ class _Fp8BlockScaleWeightReadLinear(
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
-    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
         x_flat = x.reshape(-1, x.shape[-1])
         push_target = self._push_target(x_flat, all_reduce_params)
         if push_target is not None:
             out = self._push(x_flat, push_target)
-            if isinstance(out, MnnvlInPlaceResult):
+            if isinstance(out, MnnvlWorkspaceResult):
                 return out
             return out.reshape(*x.shape[:-1], self.out_features)
         out = self._apply_with_weights(x, self.weight, self.weight_scale)
@@ -1274,7 +1297,7 @@ class _Fp8BlockScaleWeightReadLinear(
 
     def forward_gated(
         self, x: torch.Tensor, gate: torch.Tensor
-    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
         """``forward(x * gate)``, bit for bit, for an output-gated projection.
 
         Where :meth:`forward` would run the low-M kernel, one gated launch multiplies inside
@@ -1289,7 +1312,7 @@ class _Fp8BlockScaleWeightReadLinear(
             push_target = self._push_target(x_flat, None)
             if push_target is not None:
                 out = self._push(x_flat, push_target, gate=gate_flat)
-                return out if isinstance(out, MnnvlInPlaceResult) else out.reshape(out_shape)
+                return out if isinstance(out, MnnvlWorkspaceResult) else out.reshape(out_shape)
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm(
                 x_flat, self.weight, self._low_m_weight_scale, gate=gate_flat
             )
@@ -1313,11 +1336,12 @@ class _Fp8BlockScaleWeightReadLinear(
         self,
         activation: torch.Tensor,
         activation_scale: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, MnnvlPendingResult]:
         """Project an FP8 activation a fused producer already quantized.
 
         Runs the low-M GEMM where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
-        other row count where :attr:`supports_prequantized_input`.
+        other row count where :attr:`supports_prequantized_input`. Up to ``in_place_max_rows``
+        rows a copy kernel pushes the output into the all-reduce, which is left pending.
 
         Args:
             activation: ``[..., in_features]`` ``float8_e4m3fn`` activation.
@@ -1346,7 +1370,20 @@ class _Fp8BlockScaleWeightReadLinear(
                 output_dtype=torch.bfloat16,
                 fine_grained_m=True,
             )
+        target = self._pending_push_target(num_rows)
+        if target is not None:
+            self._output_all_reduce.push_input(target, out)
+            return self._output_all_reduce.finish_push(target)
         return self._reduce(out, None).reshape(activation.shape[:-1] + (self.out_features,))
+
+    def _pending_push_target(self, num_rows: int):
+        """The all-reduce of a ``num_rows``-row output a copy kernel pushes, left pending for its
+        consumer, or None (no gain over the C++ all-reduce when a finish kernel would follow)."""
+        if self._output_all_reduce is None or not 1 <= num_rows <= self._in_place_max_rows:
+            return None
+        return self._output_all_reduce.push_target(
+            num_rows, self.out_features, consumer_finishes=True
+        )
 
 
 def _swap_linear_to_fp8_weight_read(
@@ -2570,9 +2607,9 @@ class KimiMLARuntime(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
-        """The attention output, reduced over the head shards; an ``MnnvlInPlaceResult`` where
-        ``o_proj`` leaves its all-reduce result in place."""
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
+        """The attention output, reduced over the head shards; an ``MnnvlWorkspaceResult`` where
+        ``o_proj`` leaves its all-reduce in the workspace."""
         # MLA.forward takes position_ids first; K3 is NoPE, so pass None.
         out = self.mixer(None, hidden_states, attn_metadata, prequantized_input=prequantized_input)
         if self._o_allreduce is not None and not reduces_output(self.mixer.o_proj):
@@ -2870,9 +2907,9 @@ class KimiLinearDecoderLayer(nn.Module):
     def attention_output_reduction(self) -> Tuple[Optional[AllReduce], int]:
         """What an FP8 weight-read attention ``o_proj`` is built with: the attention's all-reduce
         of the o_proj partial sums (it then pushes its partial sums straight into it, MNNVL), and
-        the largest row count whose result the mix after attention reads in place.
+        the largest row count whose all-reduce the mix after attention finishes itself.
 
-        That mix reads it in place where the decode attention-residual kernel serves it: never on
+        That mix finishes it where the decode attention-residual kernel serves it: never on
         snapshot layers, whose attention output becomes the running prefix sum; on the others,
         which follow ``layer_idx // attn_res_block_size + 1`` snapshots, over that many
         candidates plus the prefix sum.

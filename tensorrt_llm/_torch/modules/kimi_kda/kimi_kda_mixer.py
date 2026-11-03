@@ -31,7 +31,7 @@ from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
 from ...cute_dsl_utils import sm_reserve
-from ...distributed import AllReduce, AllReduceStrategy, MnnvlInPlaceResult
+from ...distributed import AllReduce, AllReduceStrategy, MnnvlWorkspaceResult
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import get_model_extra_attrs
@@ -500,7 +500,7 @@ class KimiKDALinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
         """Select the eager path or breakable-CUDA-graph path.
 
         ``prequantized_input``: the MXFP8 form ``(activation, scale)`` of ``hidden_states``
@@ -626,10 +626,10 @@ class KimiKDALinearAttention(nn.Module):
 
     def _project_output(
         self, core: Union[torch.Tensor, _KdaPrequantizedCore]
-    ) -> Union[torch.Tensor, MnnvlInPlaceResult]:
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
         """Project the post-o_norm KDA core and reduce TP partials (in ``o_proj`` where it was
         built with :attr:`output_all_reduce`; its result may then stay in the all-reduce's
-        workspace, ``MnnvlInPlaceResult``)."""
+        workspace, ``MnnvlWorkspaceResult``)."""
         if isinstance(core, _KdaPrequantizedCore):
             out = self.o_proj.forward_prequantized(core.activation, core.scale)
         else:

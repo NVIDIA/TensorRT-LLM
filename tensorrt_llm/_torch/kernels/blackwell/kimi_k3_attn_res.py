@@ -35,19 +35,30 @@ The addend of ``bf16(prefix + addend)`` may also be the result of a pushed two-s
 all-reduce left in its workspace (``mnnvl_pushed_allreduce.run_finish_in_place``): the kernel
 then polls each 16-byte vector from the broadcast stage of that call's buffer after
 ``griddepcontrol.wait`` (``mnnvl_pushed_allreduce.poll_result_v4``), the bits the gather would
-have stored, so the results are bitwise those of the gathered tensor.
+have stored, so the results are bitwise those of the gathered tensor. Or the kernel finishes a
+pushed call itself (``finish``, its finish left pending): one-shot transport, it sums its token's
+slots of every rank in the C++ order; two-shot, on each owned row it reduces the scatter slots and
+multicasts the row (the owned rows' CTA groups first in the grid), on the others it polls the
+broadcast row. It also re-arms the previous call's buffer and advances the rotation state
+(``mnnvl_pushed_allreduce``), so the addend has the bits of the finished all-reduce. With
+``early_poll`` (one-shot) the kernel finishes the call and computes the whole mix before its
+``griddepcontrol.wait``: it becomes resident once the pushing producer has passed its own wait,
+and only its stores and the state advance follow the wait.
 
 Optionally the kernel also stores the MXFP8 form of its normalized output: E4M3 codes and one
 UE8M0 exponent per 1x32 group in the R128c4 scale layout, the bits the FP8 low-M GEMM's
 in-kernel quantization makes of the BF16 output, so a projection can consume it instead of
 quantizing (``fp8_block_scale_low_m_gemm``).
 
-PDL contract. Before its wait the kernel reads only the weights and the snapshot rows. The
-snapshot rows are written by a copy kernel launched without PDL, which therefore completes
-before any later kernel starts, and that copy precedes this launch by at least one complete grid
-boundary. The kernel releases its dependent grid right after its own ``griddepcontrol.wait``, so
-the next kernel (the decode projection GEMM or the router) can become resident and stream its
-weights while this one finishes; that is safe for every dependent that, as PDL requires, writes
+PDL contract. Before its wait the kernel reads only the weights and the snapshot rows (with
+``early_poll`` also the prefix sum and the pushed slots). The snapshot rows are written by a copy
+kernel launched without PDL, which therefore completes before any later kernel starts, and that
+copy precedes this launch by at least one complete grid boundary. With ``early_poll`` the
+producer releases this grid only after its own wait, so every earlier grid, the prefix sum's
+writer and the previous call's readers included, has completed by then. The kernel releases
+its dependent grid right after its own ``griddepcontrol.wait``, so the next kernel (the decode
+projection GEMM or the router) can become resident and stream its weights while this one
+finishes; that is safe for every dependent that, as PDL requires, writes
 no global memory and reads no output of this kernel before its own ``griddepcontrol.wait``.
 """
 
@@ -55,6 +66,7 @@ from __future__ import annotations
 
 import functools
 import struct
+from typing import NamedTuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -540,7 +552,10 @@ class KimiK3AttnResKernel:
     Each CTA owns ``hidden / c`` contiguous elements and each thread eight of them (one 16-byte
     load per row). ``in_place_addend`` (``ADD_PREFIX``): the addend is the in-place result of a
     pushed MNNVL all-reduce, ``add_addr`` / ``add2_addr`` the workspace's local buffer and state
-    flags.
+    flags. ``finish_world > 0`` (with ``in_place_addend``): the addend is the pushed call over
+    that many ranks, which the kernel finishes (``finish_two_shot``: two-shot transport;
+    ``mc_addr`` / ``ar_rank``: the workspace's multicast base and this rank); ``early_poll``
+    (one-shot) does so before the grid wait.
     """
 
     def __init__(
@@ -551,6 +566,9 @@ class KimiK3AttnResKernel:
         hidden: int,
         mxfp8: bool = False,
         in_place_addend: bool = False,
+        finish_world: int = 0,
+        finish_two_shot: bool = False,
+        early_poll: bool = False,
     ):
         if not MIN_CANDIDATES <= num_candidates <= MAX_CANDIDATES:
             raise ValueError(f"num_candidates={num_candidates} not in [2, 12]")
@@ -560,8 +578,17 @@ class KimiK3AttnResKernel:
             raise ValueError(f"hidden={hidden} is not supported")
         if in_place_addend and add_mode != ADD_PREFIX:
             raise ValueError("the in-place all-reduce addend is an ADD_PREFIX variant")
+        if finish_world and (not in_place_addend or finish_world not in pushed_ar.WORLD_SIZES):
+            raise ValueError(f"cannot finish an in-place addend over {finish_world} ranks")
+        if (finish_two_shot or early_poll) and not finish_world:
+            raise ValueError("finish_two_shot / early_poll need finish_world")
+        if early_poll and finish_two_shot:
+            raise ValueError("early_poll finishes one-shot calls only")
         self.mxfp8 = mxfp8
         self.in_place_addend = in_place_addend
+        self.finish_world = finish_world
+        self.finish_two_shot = finish_two_shot
+        self.early_poll = early_poll
         self.n = num_candidates
         self.k = num_candidates - 1
         self.c = cluster
@@ -591,6 +618,8 @@ class KimiK3AttnResKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        mc_addr: Int64,
+        ar_rank: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -618,6 +647,8 @@ class KimiK3AttnResKernel:
             upd_addr,
             xq_addr,
             xs_addr,
+            mc_addr,
+            ar_rank,
             m,
             eps,
             out_eps,
@@ -645,6 +676,8 @@ class KimiK3AttnResKernel:
         upd_addr: Int64,
         xq_addr: Int64,
         xs_addr: Int64,
+        mc_addr: Int64,
+        ar_rank: Int32,
         m: Int32,
         eps: Float32,
         out_eps: Float32,
@@ -663,6 +696,8 @@ class KimiK3AttnResKernel:
 
         token = bidx // c
         rank = bidx - token * c
+        if cutlass.const_expr(self.finish_two_shot):
+            token = pushed_ar.two_shot_token(token, m, ar_rank, self.finish_world)
         if tidx == 0:
             for r in cutlass.range_constexpr(3):
                 _mbar_init(mbar_smem + r * 8, 1)
@@ -743,13 +778,51 @@ class KimiK3AttnResKernel:
             for e in cutlass.range_constexpr(8):
                 premix[e] = _fma(w_n, snap_f[n][e], premix[e])
 
-        # ---- wait for the previous grid, then release the dependent grid ----
-        _griddepcontrol_wait()
-        _griddepcontrol_launch_dependents()
+        # ---- wait for the previous grid, then release the dependent grid (early_poll: after
+        # the mix, before the first store) ----
+        if cutlass.const_expr(not self.early_poll):
+            _griddepcontrol_wait()
+            _griddepcontrol_launch_dependents()
 
+        state = None
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
             pre = unpack(load(layer_addr + row + col, False))
-            if cutlass.const_expr(self.in_place_addend):
+            if cutlass.const_expr(self.finish_world > 0):
+                # This kernel finishes the pushed call: the state is this call's (its producer
+                # read it after its own wait), the previous call's buffer is re-armed while the
+                # rows travel. Threads past the row work on the row's first vector, do not
+                # store and use zeros.
+                world = self.finish_world
+                state = pushed_ar.lamport_state(add2_addr)
+                cur, dirty, nbytes, dstages, c0, c1, c2, c3 = state
+                pushed_ar.clear_dirty_stages(
+                    add_addr,
+                    dirty,
+                    nbytes,
+                    dstages,
+                    c0,
+                    c1,
+                    c2,
+                    c3,
+                    bidx * self.threads + tidx,
+                    m * (c * self.threads),
+                )
+                off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
+                if cutlass.const_expr(self.finish_two_shot):
+                    words = pushed_ar.finish_two_shot_v4(
+                        add_addr, mc_addr, cur, nbytes, token, off, ar_rank, valid, world, hidden
+                    )
+                    addend = unpack([_selp_b32(valid, w, Int32(0)) for w in words])
+                else:
+                    acc = pushed_ar.reduce_slots_v4(
+                        pushed_ar.one_shot_slots(add_addr, cur, nbytes, token, world, hidden)
+                        + Int64(off),
+                        hidden * 2,
+                        world,
+                        pushed_ar.reduce_chunk(world, True),
+                    )
+                    addend = [_selp(valid, _round_bf16(a), _zero_f32()) for a in acc]
+            elif cutlass.const_expr(self.in_place_addend):
                 # Threads past the row poll the row's first vector and use zeros.
                 off = _selp_b32(valid, Int32(rank * self.vecs + tidx) * 16, Int32(0))
                 polled = pushed_ar.poll_result_v4(add_addr, add2_addr, Int32(token), off, hidden)
@@ -766,9 +839,11 @@ class KimiK3AttnResKernel:
             ]
         else:
             x = unpack(load(layer_addr + row + col, False))
+        upd_words = []
         if cutlass.const_expr(self.add_mode != ADD_NONE):
-            words = [_pack_bf16x2(x[2 * i], x[2 * i + 1]) for i in range(4)]
-            _stg_v4_if(valid, upd_addr + row + col, words)
+            upd_words = [_pack_bf16x2(x[2 * i], x[2 * i + 1]) for i in range(4)]
+            if cutlass.const_expr(not self.early_poll):
+                _stg_v4_if(valid, upd_addr + row + col, upd_words)
 
         sq = _zero_f32()
         dot = _zero_f32()
@@ -819,6 +894,11 @@ class KimiK3AttnResKernel:
         w_out = unpack(out_w)
         y = [_mul_ftz(_round_bf16(_mul_ftz(mixed[e], out_rs)), w_out[e]) for e in range(8)]
         words = [_pack_bf16x2(y[2 * i], y[2 * i + 1]) for i in range(4)]
+        if cutlass.const_expr(self.early_poll):
+            # The output buffers may reuse memory the producer, or a grid before it, still reads.
+            _griddepcontrol_wait()
+            _griddepcontrol_launch_dependents()
+            _stg_v4_if(valid, upd_addr + row + col, upd_words)
         _stg_v4_if(valid, out_addr + row + col, words)
         if cutlass.const_expr(self.mxfp8):
             # MXFP8 form of the stored BF16 row: four consecutive lanes hold one 1x32 group.
@@ -835,11 +915,39 @@ class KimiK3AttnResKernel:
             sf_off = (Int64(token >> 7) * (hidden // 128) + (group >> 2)) * 512
             sf_off = sf_off + Int64((token & 31) * 16 + ((token & 127) >> 5) * 4) + (group & 3)
             _stg_u8_if(valid & Int32((tidx & 3) == 0), xs_addr + sf_off, e_a)
+        if cutlass.const_expr(self.finish_world > 0):
+            # Every thread has read the state and the producer has completed (the wait above):
+            # the last CTA to count advances the workspace.
+            cute.arch.barrier()
+            if tidx == 0:
+                pushed_ar.arrive_finish(
+                    add2_addr,
+                    m * c,
+                    state[0],
+                    state[2],
+                    m,
+                    self.finish_world,
+                    hidden,
+                    not self.finish_two_shot,
+                )
 
 
 # ---------------------------------------------------------------------------
 # Host side
 # ---------------------------------------------------------------------------
+
+
+class AllReduceFinish(NamedTuple):
+    """A pushed MNNVL all-reduce the kernel finishes (``finish`` of :func:`run_attn_res`):
+    ``world`` ranks, this ``rank``, the workspace's multicast base ``mc_base``, the transport
+    (``two_shot``) and whether the kernel finishes it before its grid wait (``early_poll``,
+    one-shot only)."""
+
+    world: int
+    rank: int
+    mc_base: int
+    two_shot: bool
+    early_poll: bool
 
 
 def cluster_size(num_tokens: int, num_candidates: int) -> int:
@@ -856,12 +964,26 @@ def _compiled(
     hidden: int,
     mxfp8: bool,
     in_place_addend: bool,
+    finish_world: int = 0,
+    finish_two_shot: bool = False,
+    early_poll: bool = False,
 ):
-    kernel = KimiK3AttnResKernel(num_candidates, add_mode, cluster, hidden, mxfp8, in_place_addend)
+    kernel = KimiK3AttnResKernel(
+        num_candidates,
+        add_mode,
+        cluster,
+        hidden,
+        mxfp8,
+        in_place_addend,
+        finish_world,
+        finish_two_shot,
+        early_poll,
+    )
     addr = Int64(1 << 20)
     return cute.compile(
         kernel,
-        *([addr] * 11),
+        *([addr] * 12),
+        Int32(0),
         Int32(1),
         Float32(1e-6),
         Float32(1e-6),
@@ -934,6 +1056,7 @@ def run_attn_res(
     *,
     mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     in_place_addend: tuple[int, int] | None = None,
+    finish: AllReduceFinish | None = None,
 ) -> None:
     """Launch on the current stream with PDL (inputs are not re-validated; see :func:`can_run`).
 
@@ -954,9 +1077,15 @@ def run_attn_res(
             ``()``): ``bf16(layer + addend)`` with the ``[M, H]`` result of the pushed two-shot
             all-reduce finished in place last on the workspace. The next all-reduce on the
             workspace re-arms that buffer, so it must not start before this kernel completed.
+        finish: with ``in_place_addend``, the addend is instead the pushed call whose finish
+            was left to this kernel (``distributed.ops.MnnvlPendingResult``): the kernel
+            finishes it (see :class:`AllReduceFinish`). It must be the call's only finish, run
+            on every rank before the next all-reduce on the workspace.
     """
     if in_place_addend is not None and addends:
         raise ValueError("pass either addends or in_place_addend")
+    if finish is not None and in_place_addend is None:
+        raise ValueError("finish needs in_place_addend")
     add_mode = ADD_PREFIX if in_place_addend is not None else len(addends)
     num_tokens, hidden = layer.shape
     num_candidates = block.shape[0] + 1
@@ -967,6 +1096,11 @@ def run_attn_res(
         hidden,
         mxfp8_out is not None,
         in_place_addend is not None,
+        *(
+            (finish.world, finish.two_shot, finish.early_poll)
+            if finish is not None
+            else (0, False, False)
+        ),
     )
     if in_place_addend is not None:
         add_addr, add2_addr = in_place_addend
@@ -985,6 +1119,8 @@ def run_attn_res(
         Int64(updated.data_ptr() if add_mode else 0),
         Int64(mxfp8_out[0].data_ptr() if mxfp8_out is not None else 0),
         Int64(mxfp8_out[1].data_ptr() if mxfp8_out is not None else 0),
+        Int64(finish.mc_base if finish is not None else 0),
+        Int32(finish.rank if finish is not None else 0),
         Int32(layer.shape[0]),
         Float32(rms_eps),
         Float32(out_eps),
@@ -994,6 +1130,7 @@ def run_attn_res(
 
 __all__ = [
     "ADD_MOE",
+    "AllReduceFinish",
     "ADD_NONE",
     "ADD_PREFIX",
     "CLUSTER_SIZES",

@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Pushed MNNVL all-reduce (``AllReduce.push_target`` / ``finish_push``, the FP8 block-scale
-low-M GEMM's push epilogue): bitwise equal to the C++ MNNVL all-reduce, with pushed and C++
-calls interleaved on one workspace, eagerly and in CUDA graph replays."""
+low-M GEMM's push epilogue, the copy push): bitwise equal to the C++ MNNVL all-reduce, with
+pushed and C++ calls interleaved on one workspace, eagerly and in CUDA graph replays; also where
+the decode attention-residual mix finishes the call itself (``MnnvlPendingResult``)."""
 
 import os
 import pickle
@@ -96,22 +97,34 @@ def _torch_push(workspace, target, x, rank):
     torch.cuda.synchronize()
 
 
-def _stays_in_place(m, h, k, world, in_place_max_rows):
-    """Whether an o_proj ``[h, k]`` of ``m`` rows leaves its all-reduce result in place: where
-    its GEMM pushes, up to ``in_place_max_rows`` rows, where the C++ rule picks the two-shot
-    transport."""
-    from tensorrt_llm._torch.distributed.ops import mnnvl_allreduce_transport
+def _left_pending(m, h, k, world, in_place_max_rows):
+    """Whether an o_proj ``[h, k]`` of ``m`` rows leaves its all-reduce pending for the mix after
+    attention: where its GEMM pushes, up to ``in_place_max_rows`` rows (either transport)."""
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
     pushes = m <= low_m.max_m_for(h, k) and low_m.all_reduce_push_applies(m, h, k)
-    one_shot, _ = mnnvl_allreduce_transport(m, h, world, torch.bfloat16)
-    return pushes and m <= in_place_max_rows and not one_shot
+    return pushes and m <= in_place_max_rows
 
 
 def _result(out):
-    from tensorrt_llm._torch.distributed import MnnvlInPlaceResult
+    from tensorrt_llm._torch.distributed import MnnvlWorkspaceResult
 
-    return out.materialize() if isinstance(out, MnnvlInPlaceResult) else out
+    return out.materialize() if isinstance(out, MnnvlWorkspaceResult) else out
+
+
+def _mxfp8_operand(x):
+    """``(xq, xs)`` of ``x`` with the scales in the R128c4 layout (rows padded to 128), the
+    operand ``forward_prequantized`` takes."""
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
+
+    m, k = x.shape
+    xq, xs_rows = low_m.mxfp8_quantize_reference(x)
+    xs = torch.full((-(-m // 128) * 128 * (k // 32),), 0x7F, dtype=torch.uint8, device="cuda")
+    r = torch.arange(m, device="cuda").unsqueeze(1)
+    c = torch.arange(k // 32, device="cuda").unsqueeze(0)
+    offsets = ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+    xs[offsets] = xs_rows
+    return xq, xs
 
 
 def _weight(n, k, seed):
@@ -165,7 +178,9 @@ def _run_rank(world_size):
         bad = 0
 
         # A pushed input (special values) finished against the C++ all-reduce, with C++ calls
-        # in between; one-shot and two-shot sizes, in place where the transport allows it.
+        # in between; one-shot and two-shot sizes, in place where the transport allows it, and
+        # left pending (finished by the finish kernel into a tensor); pushed by a torch stand-in
+        # and by the copy kernel.
         for m, h in (
             (1, 7168),
             (9, 7168),
@@ -178,12 +193,18 @@ def _run_rank(world_size):
             for kind in (0, 1, 2):
                 x = _input(m, h, 3 * m + kind, rank, kind)
                 ref = allreduce(x)
-                for in_place in (False, True):
-                    target = allreduce.push_target(m, h, in_place=in_place)
+                for in_place, pending in ((False, False), (True, False), (False, True)):
+                    target = allreduce.push_target(
+                        m, h, in_place=in_place, consumer_finishes=pending
+                    )
+                    assert target.consumer_finishes == pending
                     workspace = get_or_scale_allreduce_mnnvl_workspace(mapping, torch.bfloat16)
                     _torch_push(workspace, target, x, rank)
                     bad += _differ(ref, _result(allreduce.finish_push(target)))
                     bad += _differ(ref, allreduce(x))
+                    target = allreduce.push_target(m, h, consumer_finishes=pending)
+                    allreduce.push_input(target, x)
+                    bad += _differ(ref, _result(allreduce.finish_push(target)))
 
         # GEMM push epilogue (plain and gated; split-K at (7168, 1536) on SM100 / SM103; the
         # mid-M kernel above the low-M kernel's range) against the GEMM followed by the C++
@@ -206,8 +227,10 @@ def _run_rank(world_size):
                         gate=g,
                     )
                     ref = allreduce(y)
-                    for in_place in (False, True):
-                        target = allreduce.push_target(m, n, in_place=in_place)
+                    for in_place, pending in ((False, False), (True, False), (False, True)):
+                        target = allreduce.push_target(
+                            m, n, in_place=in_place, consumer_finishes=pending
+                        )
                         low_m.run_low_m_gemm_all_reduce_push(
                             x, w, w_scale, target.view, target.one_shot, gate=g
                         )
@@ -263,13 +286,14 @@ def _run_rank(world_size):
 
 
 def _run_rank_o_proj(world_size):
-    """An o_proj that owns its all-reduce (pushed, result read in place by the mix after
-    attention) against the projection followed by the C++ all-reduce and the tensor mix."""
+    """An o_proj that owns its all-reduce (pushed, finished by the mix after attention) against
+    the projection followed by the C++ all-reduce and the tensor mix; also its prequantized
+    forward, whose output a copy kernel pushes."""
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
     from torch import nn
 
-    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, MnnvlInPlaceResult
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy, MnnvlPendingResult
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
     from tensorrt_llm.mapping import Mapping
@@ -313,9 +337,8 @@ def _run_rank_o_proj(world_size):
                             prefix, ref_out, block, proj, norm, out_norm
                         )
                         out = o_proj(x) if g is None else o_proj.forward_gated(x, g)
-                        # Pushed calls stay in place up to the row count asked for, where the
-                        # transport is two-shot.
-                        assert isinstance(out, MnnvlInPlaceResult) == _stays_in_place(
+                        # Pushed calls are left to the mix up to the row count asked for.
+                        assert isinstance(out, MnnvlPendingResult) == _left_pending(
                             m, hidden, k, world_size, in_place_max_rows
                         )
                         got = kimi._apply_attn_res_add_and_rmsnorm(
@@ -323,18 +346,32 @@ def _run_rank_o_proj(world_size):
                         )
                         for a, b in zip(ref, got):
                             bad += _differ(a, b)
+                    if o_proj.takes_prequantized_input(m):
+                        xq, xs = _mxfp8_operand(x)
+                        ref_out = allreduce(plain.forward_prequantized(xq, xs))
+                        ref = kimi._apply_attn_res_add_and_rmsnorm(
+                            prefix, ref_out, block, proj, norm, out_norm
+                        )
+                        out = o_proj.forward_prequantized(xq, xs)
+                        assert isinstance(out, MnnvlPendingResult) == (m <= in_place_max_rows)
+                        got = kimi._apply_attn_res_add_and_rmsnorm(
+                            prefix, out, block, proj, norm, out_norm
+                        )
+                        for a, b in zip(ref, got):
+                            bad += _differ(a, b)
 
         # One CUDA graph of two decoder layers in their production order: the o_proj pushes and
-        # leaves its result in place, the mix after attention reads it there, and the next
-        # all-reduce on the workspace (the MoE's, a C++ call) re-arms that buffer. Replayed with
-        # new inputs against the projection + C++ all-reduce + tensor mix.
+        # leaves the call pending, the mix after attention finishes it (before its grid wait
+        # where one-shot), and the next all-reduce on the workspace (the MoE's, a C++ call)
+        # re-arms that buffer. Replayed with new inputs against the projection + C++
+        # all-reduce + tensor mix.
         k = 1536
         w, w_scale = _weight(hidden, k, 31 + rank)
         plain = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden)
         plain.post_load_weights()
         o_proj = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden, allreduce, 128)
         o_proj.post_load_weights()
-        for m in (8, 64, 96):
+        for m in (1, 8, 64, 96):
             xs = [_input(m, k, 40 + i, rank) for i in range(2)]
             prefix = torch.randn(m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
             block = torch.randn(4, m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
@@ -346,7 +383,7 @@ def _run_rank_o_proj(world_size):
                     if projection is plain:
                         out = allreduce(out)
                     else:
-                        assert isinstance(out, MnnvlInPlaceResult) == _stays_in_place(
+                        assert isinstance(out, MnnvlPendingResult) == _left_pending(
                             m, hidden, k, world_size, 128
                         )
                     updated, normed = kimi._apply_attn_res_add_and_rmsnorm(
@@ -524,13 +561,12 @@ def _k3_layer(kind, layer_idx, world_size, rank):
 def _run_rank_k3_attention(world_size):
     """Kimi-K3 attention as the FP8 swap builds it: only ``o_proj`` gets the attention's
     all-reduce, the attention (KDA ``_project_output``, ``KimiMLARuntime.forward``) skips its own
-    reduction exactly when ``o_proj`` reduces, and ``o_proj`` leaves its result in place only up
-    to the rows the mix after attention reads in place (none on snapshot layers). Each output is
+    reduction exactly when ``o_proj`` reduces, and ``o_proj`` leaves the all-reduce pending only
+    up to the rows the mix after attention finishes (none on snapshot layers). Each output is
     bitwise the projection followed by one C++ all-reduce (not unreduced, not reduced twice)."""
     os.environ["TLLM_TEST_MNNVL"] = "1"
     os.environ["TRTLLM_FORCE_MNNVL_AR"] = "1"
-    from tensorrt_llm._torch.distributed import MnnvlInPlaceResult
-    from tensorrt_llm._torch.distributed.ops import mnnvl_allreduce_transport
+    from tensorrt_llm._torch.distributed import MnnvlPendingResult
     from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res as attn_res
     from tensorrt_llm._torch.models import modeling_kimi_linear as kimi
     from tensorrt_llm._torch.modules.projection_capabilities import reduces_output
@@ -541,7 +577,7 @@ def _run_rank_k3_attention(world_size):
     try:
         device = torch.cuda.current_device()
         bad = 0
-        in_place_calls = 0
+        pending_calls = 0
         # Layer 0 is a snapshot layer; layer 1 mixes over 2 candidates, layer 49 over 14 (more
         # than the decode attention-residual kernel takes).
         for kind in ("kda", "mla"):
@@ -598,11 +634,10 @@ def _run_rank_k3_attention(world_size):
                         return owner(states, None)
 
                     out = attend(o_proj)
-                    one_shot, _ = mnnvl_allreduce_transport(m, hidden, world_size, torch.bfloat16)
-                    stays = m <= expected_rows and not one_shot
-                    assert isinstance(out, MnnvlInPlaceResult) == stays, (kind, layer_idx, m)
-                    if stays:
-                        in_place_calls += 1
+                    pending = m <= expected_rows
+                    assert isinstance(out, MnnvlPendingResult) == pending, (kind, layer_idx, m)
+                    if pending:
+                        pending_calls += 1
                         prefix = torch.empty(m, hidden, device="cuda", dtype=torch.bfloat16)
                         assert (
                             kimi._attn_res_kernel(prefix, candidates) is kimi._AttnResKernel.DECODE
@@ -619,7 +654,7 @@ def _run_rank_k3_attention(world_size):
                 del layer
                 torch.cuda.synchronize()
         if kimi._decode_attn_res_on_device(device) and kimi._FUSED_ATTN_RES_ENABLED:
-            assert in_place_calls > 0
+            assert pending_calls > 0
         assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
     except Exception:
         traceback.print_exc()
@@ -675,7 +710,7 @@ def test_pushed_allreduce_matches_cpp(mpi_pool_executor):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
-def test_o_proj_pushed_allreduce_in_place_mix(mpi_pool_executor):
+def test_o_proj_pushed_allreduce_finished_by_mix(mpi_pool_executor):
     world_size = mpi_pool_executor.num_workers
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
@@ -722,6 +757,72 @@ def test_one_shot_finish_sums_rank_chunks(world):
     assert _differ(ref, out) == 0
     state = flags.cpu().long().tolist()
     assert state[:5] == [(cur + 1) % 3, cur, nbytes, 1, m * world * h * 2]
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("early_poll", [False, True])
+@pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (64, 2)])
+def test_attn_res_finishes_one_shot_call(world, m, early_poll):
+    """The decode attention-residual mix finishing a pushed one-shot call (sums in the C++ order,
+    chunks of eight ranks above eight) against the mix of the finished all-reduce, on one GPU:
+    every rank's slots are written into the local buffer, which is all a one-shot finish reads.
+    The mix also advances the rotation state like the finish kernel and re-arms the previous
+    call's buffer."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("needs the CuTe DSL")
+    from tensorrt_llm._torch.distributed.ops import mnnvl_allreduce_transport
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res as attn_res
+    from tensorrt_llm._torch.kernels.blackwell import mnnvl_pushed_allreduce as pushed
+
+    if not attn_res.is_supported_device(torch.cuda.current_device()):
+        pytest.skip("the decode attention-residual kernel does not run on this GPU")
+    h, k = 7168, 3
+    one_shot, nbytes = mnnvl_allreduce_transport(m, h, world, torch.bfloat16)
+    assert one_shot
+    nbytes = max(nbytes, 1 << 16)
+    workspace = torch.zeros(pushed.NUM_BUFFERS * nbytes, dtype=torch.uint8, device="cuda")
+    cur, dirty = 1, 0
+    # The previous call (one stage of 4 KiB in buffer ``dirty``) is re-armed by the mix.
+    flags = torch.tensor(
+        [cur, dirty, nbytes, 1, 4096, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
+    ).view(torch.uint32)
+    gen = torch.Generator(device="cuda").manual_seed(world + m)
+    slots = (torch.randn(m, world, h, device="cuda", generator=gen) * 0.25).to(torch.bfloat16)
+    bits = slots.view(torch.int16)
+    slots = torch.where(bits == -32768, torch.zeros_like(bits), bits).view(torch.bfloat16)
+    workspace[cur * nbytes : cur * nbytes + slots.numel() * 2].view(torch.bfloat16).copy_(
+        slots.flatten()
+    )
+    addend = _finish_reference(slots, pushed.reduce_chunk(world, True))
+    prefix = (torch.randn(m, h, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    block = (torch.randn(k, m, h, device="cuda", generator=gen) * 0.5).to(torch.bfloat16)
+    weights = [
+        (1 + 0.1 * torch.randn(h, device="cuda", generator=gen)).to(torch.bfloat16)
+        for _ in range(3)
+    ]
+    ref_out, ref_upd = torch.empty_like(prefix), torch.empty_like(prefix)
+    attn_res.run_attn_res(prefix, (addend,), block, *weights, 1e-6, 1e-6, ref_out, ref_upd)
+    out, upd = torch.empty_like(prefix), torch.empty_like(prefix)
+    attn_res.run_attn_res(
+        prefix,
+        (),
+        block,
+        *weights,
+        1e-6,
+        1e-6,
+        out,
+        upd,
+        in_place_addend=(workspace.data_ptr(), flags.data_ptr()),
+        finish=attn_res.AllReduceFinish(world, 0, 0, False, early_poll),
+    )
+    torch.cuda.synchronize()
+    assert _differ(ref_upd, upd) == 0 and _differ(ref_out, out) == 0
+    state = flags.cpu().long().tolist()
+    assert state == [(cur + 1) % 3, cur, nbytes, 1, m * world * h * 2, 0, 0, 0, 0]
+    rearmed = workspace[dirty * nbytes : dirty * nbytes + 4096].view(torch.int32)
+    assert bool((rearmed == -(2**31)).all())
 
 
 @skip_pre_blackwell

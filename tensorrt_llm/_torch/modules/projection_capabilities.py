@@ -30,7 +30,7 @@ class OutputAllReduceProjection(nn.Module):
     (``output_all_reduce``).
 
     One built with it returns the reduced output from every forward (or, where it was built
-    to, the result left in the all-reduce's workspace, ``MnnvlInPlaceResult``), so the module
+    to, the all-reduce left in its workspace, ``MnnvlWorkspaceResult``), so the module
     that made that all-reduce does not run it again (:func:`reduces_output`).
     """
 
