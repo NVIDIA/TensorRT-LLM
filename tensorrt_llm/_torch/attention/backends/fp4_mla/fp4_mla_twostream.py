@@ -40,15 +40,20 @@ KV_TILE = 256
 # 128-row m-tile and the request's KV.  Fixed costs are prologue/epilogue, slopes are per 256-key tile.
 T4_FIXED_US, T4_TILE_US = 13.0, 0.64
 T2_FIXED_US, T2_TILE_US = 10.0, 0.62
-# When both arms run, each slows the other (power-capped clock + memory-system contention): measured per item at
-# B128/q4/30K, 4x 95-98 us vs 84-87 alone, 2x 104-109 us vs 83 alone.  The critical-path rule uses these factors so the
-# 2x arm never becomes the longer one in practice; the gain gate keeps the standalone model (its margin covers them).
-CONTENTION_4X, CONTENTION_2X = 1.15, 1.32
+# When both arms run, each slows the other (power-capped clock + memory-system contention).  Measured through the
+# production two-stream path: the 4x arm's waves stretch by ~5 % at B128/q4 (2x arm busy for ~75 % of the call) and
+# ~3 % at B96/q4 (busy ~45 %), so the 4x factor scales with the fraction of the call during which the 2x arm runs;
+# the 2x items stretch by up to ~32 % (104-109 us vs 83 alone, single-kernel timelines).
+CONTENTION_4X_FULL_OVERLAP, CONTENTION_2X = 0.07, 1.32
+# The plain 4x path is not "ceil(waves)": above one wave its device split plan cuts the tail requests so the leftover
+# cluster slots work on the fractional wave (B128/q4/30K: 5.57 waves measured as 484 us = 5.6 x 86 us, B96: 4.17 waves
+# = 360 us), at the price of extra tasks and the reducer (~12 us).  One wave or less runs the FULL-only launch.
+SPLIT_OVERHEAD_US = 12.0
 # 4-CTA clusters the part can host at once (46 = 92 pairable TPC pairs / 2) and the 2-CTA pairs on the SMs left over.
 LANES_4X = 46
 ROWS_PER_4X_ITEM = 256
 ROWS_PER_2X_ITEM = 128
-DEFAULT_MIN_GAIN = 0.08
+DEFAULT_MIN_GAIN = 0.03
 DEFAULT_MAX_R2 = 36
 
 
@@ -111,6 +116,16 @@ def item_costs_us(kv_tiles: int) -> tuple[float, float]:
     return T4_FIXED_US + T4_TILE_US * tiles, T2_FIXED_US + T2_TILE_US * tiles
 
 
+def plain_4x_us(num_requests: int, rows_per_request: int, kv_tiles: int, *, lanes_4x: int = LANES_4X) -> tuple[float, int]:
+    """Modelled duration of the plain 4x path: one FULL wave, or the device split plan spreading the fractional wave
+    over the leftover slots (fractional waves x item + split overhead).  Returns (us, whole waves)."""
+    t4, _ = item_costs_us(kv_tiles)
+    n4 = num_requests * (rows_per_request // ROWS_PER_4X_ITEM)
+    if n4 <= lanes_4x:
+        return t4, 1 if n4 > 0 else 0
+    return n4 / lanes_4x * t4 + SPLIT_OVERHEAD_US, math.ceil(n4 / lanes_4x)
+
+
 def makespan_us(
     num_requests: int,
     r2: int,
@@ -120,7 +135,12 @@ def makespan_us(
     lanes_4x: int = LANES_4X,
     lanes_2x_pairs: int,
 ) -> tuple[float, int, int]:
-    """Modelled makespan with the last ``r2`` requests on the 2x arm: (us, 4x waves, 2x rounds)."""
+    """Modelled two-stream makespan with the last ``r2`` requests on the 2x arm: (us, 4x waves, 2x rounds).  The 4x
+    arm runs whole waves (its requests are never split), slowed by the 2x arm for the fraction of the call the 2x arm
+    is busy; the 2x arm's rounds carry their full contention factor.  ``r2 == 0`` returns the plain-path model."""
+    if r2 <= 0:
+        us, waves = plain_4x_us(num_requests, rows_per_request, kv_tiles, lanes_4x=lanes_4x)
+        return us, waves, 0
     t4, t2 = item_costs_us(kv_tiles)
     items_per_request_4x = rows_per_request // ROWS_PER_4X_ITEM
     items_per_request_2x = rows_per_request // ROWS_PER_2X_ITEM
@@ -128,7 +148,11 @@ def makespan_us(
     n2 = r2 * items_per_request_2x
     waves_4x = math.ceil(n4 / lanes_4x) if n4 > 0 else 0
     rounds_2x = math.ceil(n2 / lanes_2x_pairs) if (n2 > 0 and lanes_2x_pairs > 0) else (0 if n2 == 0 else 1 << 30)
-    return max(waves_4x * t4, rounds_2x * t2), waves_4x, rounds_2x
+    arm_4x = waves_4x * t4
+    arm_2x = rounds_2x * t2 * CONTENTION_2X
+    overlap = min(1.0, arm_2x / arm_4x) if arm_4x > 0 else 0.0
+    arm_4x *= 1.0 + CONTENTION_4X_FULL_OVERLAP * overlap
+    return max(arm_4x, arm_2x), waves_4x, rounds_2x
 
 
 def plan_two_stream(
@@ -176,9 +200,9 @@ def _plan_two_stream(
     Rules (all host arithmetic, deterministic):
       * the 2x arm must finish no later than the 4x arm even with the measured mutual slowdowns applied
         (``CONTENTION_2X`` / ``CONTENTION_4X``): its share is the free SMs, never the critical path;
-      * the modelled makespan must improve by at least ``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` over the plain 4x path
-        (the model ignores the ~10 % slowdown the 4x arm sees from the 2x arm's power/memory pressure, so a margin
-        is required: measured gains are about half the modelled ones);
+      * the modelled makespan must improve by at least ``TRTLLM_FP4_MLA_TWOSTREAM_MIN_GAIN`` (3 %) over the plain 4x
+        path, modelled WITH its device split plan (fractional waves + split overhead) and with the measured mutual
+        slowdowns (``CONTENTION_4X_FULL_OVERLAP``, ``CONTENTION_2X``);
       * the smallest r2 that reaches the best 4x wave count wins (fewest requests moved);
       * ``TRTLLM_FP4_MLA_TWOSTREAM_R2`` overrides everything (0 forces the plain path).
     """
@@ -211,7 +235,7 @@ def _plan_two_stream(
         us, w4, w2 = makespan_us(
             num_requests, r2, rows_per_request, kv_tiles, lanes_4x=lanes_4x, lanes_2x_pairs=pairs_2x
         )
-        if w2 * t2 * CONTENTION_2X > w4 * t4 * CONTENTION_4X:
+        if w2 * t2 * CONTENTION_2X > w4 * t4 * (1.0 + CONTENTION_4X_FULL_OVERLAP):
             break  # from here on the 2x arm is the critical path; more requests only make it worse
         if best is None or us < best[0] - 1e-9:
             best = (us, r2)
