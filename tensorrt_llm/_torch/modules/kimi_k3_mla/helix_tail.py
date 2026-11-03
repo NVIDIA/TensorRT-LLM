@@ -98,6 +98,7 @@ class K3HelixTail:
         *,
         fold: Optional[PackedSplitPartials],
         out: torch.Tensor,
+        mx_out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Fold, project, exchange and combine one layer's partials into ``out``.
 
@@ -109,6 +110,8 @@ class K3HelixTail:
             zero_kv_mask: Optional bool ``[T]``, True where this rank owns no KV of the token.
             fold: The decode's unreduced split state, or None.
             out: BF16 ``[T, H / P * 128]`` output of this rank's heads.
+            mx_out: Optional ``(gate, xq, xs)``: also store the MXFP8 form of
+                ``bf16(out * gate)`` (see ``k3_helix_tail``).
         """
         from ...kernels.blackwell.k3_helix_tail import k3_helix_tail
 
@@ -131,5 +134,6 @@ class K3HelixTail:
             state=self.state,
             max_ctas=self.max_ctas,
             use_pdl=self.use_pdl,
+            mx_out=mx_out,
         )
         return out

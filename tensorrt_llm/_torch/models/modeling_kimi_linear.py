@@ -1353,6 +1353,19 @@ class _Fp8BlockScaleWeightReadLinear(
             consumer_finishes=num_rows <= self._in_place_max_rows,
         )
 
+    def _prequantized_push_target(self, num_rows: int):
+        """:meth:`_push_target` of :meth:`forward_prequantized`, in the low-M kernel's range."""
+        if self._output_all_reduce is None or not 1 <= num_rows <= self._low_m.kernel_max_m:
+            return None
+        if not _low_m_gemm_push_applies(num_rows, self.out_features, self.in_features):
+            return None
+        return self._output_all_reduce.push_target(
+            num_rows,
+            self.out_features,
+            all_reduce_params=None,
+            consumer_finishes=num_rows <= self._in_place_max_rows,
+        )
+
     def _push(self, x_flat: torch.Tensor, target, gate: Optional[torch.Tensor] = None):
         """The low-M GEMM pushing into ``target``, then the all-reduce's finish."""
         from ..kernels.blackwell import fp8_block_scale_low_m_gemm
@@ -1473,12 +1486,14 @@ class _Fp8BlockScaleWeightReadLinear(
         activation: torch.Tensor,
         activation_scale: torch.Tensor,
         stage_weights: bool = False,
-    ) -> Union[torch.Tensor, MnnvlPendingResult]:
+    ) -> Union[torch.Tensor, MnnvlWorkspaceResult]:
         """Project an FP8 activation a fused producer already quantized.
 
         Runs the low-M GEMM where :meth:`takes_prequantized_input`, the CuTe MXFP8 GEMM at any
-        other row count where :attr:`supports_prequantized_input`. Up to ``in_place_max_rows``
-        rows a copy kernel pushes the output into the all-reduce, which is left pending.
+        other row count where :attr:`supports_prequantized_input`. In the low-M kernel's range
+        a projection built with ``output_all_reduce`` pushes from the GEMM like :meth:`forward`;
+        otherwise up to ``in_place_max_rows`` rows a copy kernel pushes the output. Up to
+        ``in_place_max_rows`` rows the all-reduce is left pending for its consumer.
         ``stage_weights``: the low-M GEMM holds its weights on chip before its wait where
         :meth:`stages_weights` (same bits).
 
@@ -1494,6 +1509,22 @@ class _Fp8BlockScaleWeightReadLinear(
             raise TypeError("prequantized Kimi K3 activation scale must be uint8 R128c4")
         activation_flat = activation.reshape(-1, activation.shape[-1])
         num_rows = activation_flat.shape[0]
+        push_target = self._prequantized_push_target(num_rows)
+        if push_target is not None:
+            from ..kernels.blackwell import fp8_block_scale_low_m_gemm
+
+            fp8_block_scale_low_m_gemm.run_low_m_gemm_prequantized_all_reduce_push(
+                activation_flat,
+                activation_scale,
+                self.weight,
+                self._low_m_weight_scale,
+                push_target.view,
+                push_target.one_shot,
+            )
+            out = self._output_all_reduce.finish_push(push_target)
+            if isinstance(out, MnnvlWorkspaceResult):
+                return out
+            return out.reshape(activation.shape[:-1] + (self.out_features,))
         if self.takes_prequantized_input(num_rows):
             out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(
                 activation_flat,

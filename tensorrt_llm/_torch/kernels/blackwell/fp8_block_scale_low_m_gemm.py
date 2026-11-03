@@ -4245,10 +4245,22 @@ def _compiled_push_kernel(
 
 @functools.cache
 def _compiled_mid_push_kernel(
-    n: int, k: int, tactic: MidMTactic, use_pdl: bool, world: int, one_shot: bool
+    n: int,
+    k: int,
+    tactic: MidMTactic,
+    use_pdl: bool,
+    world: int,
+    one_shot: bool,
+    fold_weight_scale: bool = False,
 ):
     kernel = Fp8BlockScaleMidMGemmKernel(
-        n, k, tactic, use_pdl, all_reduce_world=world, one_shot=one_shot
+        n,
+        k,
+        tactic,
+        use_pdl,
+        fold_weight_scale=fold_weight_scale,
+        all_reduce_world=world,
+        one_shot=one_shot,
     )
     addr = Int64(1 << 20)
     return cute.compile(
@@ -4334,6 +4346,41 @@ def run_low_m_gemm_all_reduce_push(
         _gmem_ptr(cutlass.Uint8, w_scale),
         Int32(m),
         *push_args,
+    )
+
+
+def run_low_m_gemm_prequantized_all_reduce_push(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    w: torch.Tensor,
+    w_scale: torch.Tensor,
+    view: LamportWorkspaceView,
+    one_shot: bool,
+    *,
+    use_pdl: bool = True,
+) -> None:
+    """:func:`run_low_m_gemm_prequantized` with the all-reduce push epilogue on the current
+    stream: the rows go into the Lamport slots of the next all-reduce on ``view`` as with
+    :func:`run_low_m_gemm_all_reduce_push`, which this matches bitwise on the BF16 activation
+    that ``(xq, xs)`` quantizes. ``M`` within the low-M kernel's range
+    (``1 <= M <= kernel_max_m_for(N, K)``) where :func:`all_reduce_push_applies`."""
+    m, k = xq.shape
+    n = w.shape[0]
+    if not (m <= kernel_max_m_for(n, k) and all_reduce_push_applies(m, n, k)):
+        raise ValueError(f"no prequantized all-reduce push for M={m}, N={n}, K={k}")
+    pushed_ar.check_transport(view, m, n, one_shot)
+    tactic = default_prequantized_tactic(m, n, k)
+    _compiled_mid_push_kernel(n, k, tactic, use_pdl, view.world, one_shot, True)(
+        _gmem_ptr(cutlass.Float8E4M3FN, w),
+        _gmem_ptr(cutlass.Float8E4M3FN, xq),
+        _gmem_ptr(cutlass.Uint8, xs),
+        _gmem_ptr(cutlass.Uint8, w_scale),
+        Int32(m),
+        Int64(view.peer_ptrs.data_ptr()),
+        Int64(view.mc_base),
+        Int64(view.flags.data_ptr()),
+        Int32(view.rank),
+        _current_stream(xq.device),
     )
 
 

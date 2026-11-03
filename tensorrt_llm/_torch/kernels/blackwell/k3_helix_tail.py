@@ -33,10 +33,11 @@ one head and ``tiles_per_cta`` tiles of 16 tokens; it first sends, then receives
    ``0xffffffff`` is sent (such words go as ``0x7fffffff``, also NaN).
 5. Receive. CTA ``b`` combines tokens ``b, b + CTAs, ..`` in passes of 512 columns: poll the
    token's ``P`` records, combine them bitwise like ``helix_post_process_native`` (same ``expf``,
-   reciprocal, butterflies and FMA order), store the BF16 ``[T, H / P * 128]`` output and re-arm
-   the words read. A CTA only polls after its own pushes, and the grid is at most one CTA per SM,
-   so every sender is scheduled whatever the receivers wait for. Each CTA releases the dependent
-   grid (o_proj) between its pushes and its receive loop.
+   reciprocal, butterflies and FMA order), store the BF16 ``[T, H / P * 128]`` output (optionally
+   also o_proj's MXFP8 operand of ``bf16(out * gate)``) and re-arm the words read. A CTA only
+   polls after its own pushes, and the grid is at most one CTA per SM, so every sender is
+   scheduled whatever the receivers wait for. Each CTA releases the dependent grid (o_proj)
+   between its pushes and its receive loop.
 
 Receive buffers are Lamport buffers: every word starts as the sentinel, so a word that is not the
 sentinel has arrived. A buffer has two halves used by alternate launches; a launch re-arms what it
@@ -73,6 +74,7 @@ from ...attention.backends.fp4_mla.fp4_mla_packed_reduce import (
     PackedSplitPartials,
     _reduce_packed_row,
 )
+from . import fp8_block_scale_low_m_gemm as low_m_gemm
 
 __all__ = [
     "LATENT_DIM",
@@ -639,6 +641,32 @@ def _mma_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
     return _unpack(res, T.f32(), Float32, 4, loc=loc, ip=ip)
 
 
+@dsl_user_op
+def _shfl_bfly_b32(value, offset: int, *, loc=None, ip=None):
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(value, loc=loc, ip=ip)],
+            f"shfl.sync.bfly.b32 $0, $1, {offset}, 31, -1;",
+            "=r,r",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_u8(addr, value, *, loc=None, ip=None):
+    _asm(
+        None,
+        [_lv(addr, loc=loc, ip=ip), _iv(value, loc=loc, ip=ip)],
+        "st.global.u8 [$0], $1;",
+        "l,r",
+        loc=loc,
+        ip=ip,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kernel
 # ---------------------------------------------------------------------------
@@ -748,6 +776,9 @@ class K3HelixTailKernel:
             directly as BF16 with its statistics.
         has_mask: Apply a per-token ``zero_kv_mask`` (uint8) on the sender side.
         use_pdl: Launch with programmatic dependent launch.
+        mx_out: The receivers also store the o_proj operand: the MXFP8 form (E4M3 codes and one
+            UE8M0 exponent per 1x32 group, R128c4 scale layout) of ``bf16(out * gate)``, bitwise
+            the gated low-M GEMM's in-kernel quantization of it.
     """
 
     def __init__(
@@ -757,6 +788,7 @@ class K3HelixTailKernel:
         fold: bool,
         has_mask: bool,
         use_pdl: bool,
+        mx_out: bool,
     ):
         if not can_run(cp_size, num_heads, LATENT_DIM, V_HEAD_DIM):
             raise ValueError(f"cp_size={cp_size}, num_heads={num_heads}")
@@ -766,6 +798,7 @@ class K3HelixTailKernel:
         self.fold = fold
         self.has_mask = has_mask
         self.use_pdl = use_pdl
+        self.mx_out = mx_out
         self.threads = THREADS
         # 16-byte vectors of a (token, source) record: the BF16 values of the H / P heads, then
         # their FP32 (max, sum) pairs (two heads per vector).
@@ -793,6 +826,9 @@ class K3HelixTailKernel:
         out_addr: Int64,
         ws_addr: Int64,
         state_addr: Int64,
+        gate_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         rank_stride: Int64,
         half_bytes: Int64,
         softmax_scale_log2: Float32,
@@ -802,6 +838,7 @@ class K3HelixTailKernel:
         physical_m: Int32,
         num_tasks: Int32,
         plan_len: Int32,
+        gate_ld: Int32,
         rank: Int32,
         tiles_per_cta: Int32,
         n_ctas: Int32,
@@ -847,6 +884,9 @@ class K3HelixTailKernel:
             out_addr,
             ws_addr,
             state_addr,
+            gate_addr,
+            xq_addr,
+            xs_addr,
             rank_stride,
             half_bytes,
             softmax_scale_log2,
@@ -854,6 +894,7 @@ class K3HelixTailKernel:
             num_tokens,
             query_len,
             physical_m,
+            gate_ld,
             rank,
             tiles_per_cta,
             n_ctas,
@@ -881,6 +922,9 @@ class K3HelixTailKernel:
         out_addr: Int64,
         ws_addr: Int64,
         state_addr: Int64,
+        gate_addr: Int64,
+        xq_addr: Int64,
+        xs_addr: Int64,
         rank_stride: Int64,
         half_bytes: Int64,
         softmax_scale_log2: Float32,
@@ -888,6 +932,7 @@ class K3HelixTailKernel:
         num_tokens: Int32,
         query_len: Int32,
         physical_m: Int32,
+        gate_ld: Int32,
         rank: Int32,
         tiles_per_cta: Int32,
         n_ctas: Int32,
@@ -983,6 +1028,10 @@ class K3HelixTailKernel:
             ws_addr + Int64(rank) * rank_stride + _lds_b64(half_slot),
             num_tokens,
             n_ctas,
+            gate_addr,
+            gate_ld,
+            xq_addr,
+            xs_addr,
         )
 
     @cute.jit
@@ -1153,6 +1202,10 @@ class K3HelixTailKernel:
         recv_base: Int64,
         num_tokens: Int32,
         n_recv: Int32,
+        gate_addr: Int64,
+        gate_ld: Int32,
+        xq_addr: Int64,
+        xs_addr: Int64,
     ):
         """Combine the records of this CTA's tokens over ``passes`` groups of THREADS columns,
         with the instruction sequences of ``helix_post_process_native`` (bitwise). Thread ``c``
@@ -1178,6 +1231,15 @@ class K3HelixTailKernel:
                 stats[0] = Int32(_NEG_INF_BITS)
                 stats[1] = Int32(0)
                 vals = cute.make_rmem_tensor((P * 4,), Int32)
+                g = cute.make_rmem_tensor((4,), Int32)
+                if cutlass.const_expr(self.mx_out):
+                    # The gate is ready before this grid starts: its load overlaps the polls.
+                    for e in cutlass.range_constexpr(4):
+                        g[e] = Int32(0)
+                    if valid != 0:
+                        gw = _ld_nc_v4(gate_addr + (Int64(t) * Int64(gate_ld) + Int64(c * 8)) * 2)
+                        for e in cutlass.range_constexpr(4):
+                            g[e] = gw[e]
                 if valid != 0:
                     ready = Int32(0)
                     while ready == 0:
@@ -1215,6 +1277,42 @@ class K3HelixTailKernel:
                         _st_sentinel_v4(d_addr + Int64(s * RV * 16))
                 if owns_stats != 0:
                     _st_sentinel_v2(st_addr)
+                if cutlass.const_expr(self.mx_out):
+                    self.store_mx(o, g, valid, t, c, xq_addr, xs_addr)
+
+    @cute.jit
+    def store_mx(
+        self,
+        o,
+        g: cute.Tensor,
+        valid: Int32,
+        t: Int32,
+        c: Int32,
+        xq_addr: Int64,
+        xs_addr: Int64,
+    ):
+        """MXFP8 of ``bf16(out * gate)`` for column ``c`` (8 values ``o``, gate words ``g``) of
+        token ``t``: the gate multiply, 1x32 amax (the four threads of a group, by shuffles),
+        UE8M0 exponent and E4M3 codes of the gated low-M GEMM's quantization. Every lane of the
+        warp runs the shuffles; groups are either all valid or all invalid (``DV`` is a multiple
+        of 16)."""
+        K = self.DV * 8
+        xg = low_m_gemm._gate_mul_bf16x8(o[0], o[1], o[2], o[3], g[0], g[1], g[2], g[3])
+        amax = low_m_gemm.amax_bf16x8(xg[0], xg[1], xg[2], xg[3])
+        amax = low_m_gemm.amax_pair(amax, _shfl_bfly_b32(amax, 1))
+        amax = low_m_gemm.amax_pair(amax, _shfl_bfly_b32(amax, 2))
+        e8 = low_m_gemm.ue8m0_of_amax(amax)
+        inv_scale = low_m_gemm.bf16x2_inv_scale(e8)
+        q0, q1 = low_m_gemm.quant_bf16x8_to_e4m3(xg[0], xg[1], xg[2], xg[3], inv_scale)
+        if valid != 0:
+            _st_v2(xq_addr + Int64(t) * K + Int64(c * 8), q0, q1)
+            if (c % 4) == 0:
+                # R128c4: atom (t // 128, group // 4) of 512 bytes, byte
+                # (t % 32) * 16 + (t % 128 // 32) * 4 + group % 4.
+                group = c // 4
+                sf_off = (Int64(t >> 7) * (K // 128) + Int64(group >> 2)) * 512
+                sf_off = sf_off + Int64((t & 31) * 16 + ((t & 127) >> 5) * 4 + (group & 3))
+                _st_u8(xs_addr + sf_off, e8)
 
 
 # ---------------------------------------------------------------------------
@@ -1237,8 +1335,8 @@ def record_bytes(num_heads: int, head_dim: int) -> int:
 
 
 @functools.cache
-def _kernel(cp_size: int, num_heads: int, fold: bool, has_mask: bool, use_pdl: bool):
-    return K3HelixTailKernel(cp_size, num_heads, fold, has_mask, use_pdl)
+def _kernel(cp_size: int, num_heads: int, fold: bool, has_mask: bool, use_pdl: bool, mx_out: bool):
+    return K3HelixTailKernel(cp_size, num_heads, fold, has_mask, use_pdl, mx_out)
 
 
 _COMPILED: dict = {}
@@ -1264,6 +1362,7 @@ def k3_helix_tail(
     state: torch.Tensor,
     max_ctas: int,
     use_pdl: bool = True,
+    mx_out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Launch the Helix tail of ``T`` tokens into ``out``.
 
@@ -1285,6 +1384,10 @@ def k3_helix_tail(
             all of them must be resident together). A CTA folds and sends ``tiles_per_cta`` tiles
             of 16 tokens of one head, the fewest that keep the grid within the cap.
         use_pdl: Programmatic dependent launch.
+        mx_out: Optional ``(gate, xq, xs)``: the BF16 ``[T, H / P * 128]`` gate (row stride a
+            multiple of 8), and outputs for the MXFP8 form of ``bf16(out * gate)``: E4M3 ``xq``
+            ``[T, H / P * 128]`` and UE8M0 ``xs`` (uint8, ``ceil(T / 128) * 128 * H / P * 4``
+            bytes) in the R128c4 layout of ``fp8_block_scale_low_m_gemm``'s prequantized input.
     """
     num_heads = w_uv.shape[0]
     num_tokens = rows.shape[0] // num_heads
@@ -1293,7 +1396,7 @@ def k3_helix_tail(
     if num_tokens * cp_size * record_bytes(num_heads // cp_size, V_HEAD_DIM) > half_bytes:
         raise ValueError("the Helix tail receive buffer is too small for this many tokens")
     has_mask = zero_kv_mask is not None
-    flags = (fold is not None, has_mask, use_pdl)
+    flags = (fold is not None, has_mask, use_pdl, mx_out is not None)
     kernel = _kernel(cp_size, num_heads, *flags)
     n_tiles = _ceil_div(num_tokens, ROWS)
     tiles_per_cta = _ceil_div(num_heads * n_tiles, max(max_ctas, num_heads))
@@ -1322,6 +1425,8 @@ def k3_helix_tail(
         )
         query_len, dims = 1, (1, 1, 1)
         scales = (Float32(1.0), Float32(1.0))
+    mx = (0, 0, 0) if mx_out is None else tuple(t.data_ptr() for t in mx_out)
+    gate_ld = 0 if mx_out is None else mx_out[0].stride(0)
     args = (
         *ptrs,
         Int64(rows.data_ptr()),
@@ -1331,12 +1436,14 @@ def k3_helix_tail(
         Int64(out.data_ptr()),
         Int64(ws_addr),
         Int64(state.data_ptr()),
+        *(Int64(a) for a in mx),
         Int64(rank_stride),
         Int64(half_bytes),
         *scales,
         Int32(num_tokens),
         Int32(query_len),
         *(Int32(d) for d in dims),
+        Int32(gate_ld),
         Int32(cp_rank),
         Int32(tiles_per_cta),
         Int32(n_ctas),

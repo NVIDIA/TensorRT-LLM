@@ -6,7 +6,8 @@ With a ``W_UV`` that selects 128 latent columns the V up-projection is exact, so
 bitwise ``helix_post_process_native`` of the packed split reduction's rows and statistics (the
 fold and the combine bitwise). With a random ``W_UV`` the output agrees with the production path
 (reduction, BMM, combine) to BF16 rounding of the V up-projection. Both eagerly over both buffer
-halves and replayed in a CUDA graph.
+halves and replayed in a CUDA graph. The optional MXFP8 o_proj operand is bitwise the low-M
+GEMM's quantization of ``bf16(out * gate)``.
 """
 
 import pytest
@@ -141,7 +142,7 @@ class _Workspace:
         self.buffer = torch.full((2 * half_bytes // 4,), -1, dtype=torch.int32, device="cuda")
         self.state = torch.zeros(1, dtype=torch.int64, device="cuda")
 
-    def launch(self, tail_mod, rows, stats, w_uv, out, fold):
+    def launch(self, tail_mod, rows, stats, w_uv, out, fold, mx_out=None):
         tail_mod.k3_helix_tail(
             rows,
             stats,
@@ -157,6 +158,7 @@ class _Workspace:
             state=self.state,
             max_ctas=torch.cuda.get_device_properties(0).multi_processor_count,
             use_pdl=True,
+            mx_out=mx_out,
         )
 
 
@@ -289,3 +291,36 @@ def test_helix_tail_direct_rows_and_graph_replay():
         torch.cuda.synchronize()
         check_all()
     assert bool((ws.buffer == -1).all())
+
+
+@pytest.mark.parametrize("num_tokens", [8, 37, 64, 130])
+def test_helix_tail_mxfp8_operand(num_tokens):
+    """The receivers' MXFP8 form of ``bf16(out * gate)`` (R128c4 scales) is bitwise the low-M
+    GEMM's quantization of it, with a row-strided gate."""
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
+
+    _, tail_mod = _modules()
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(num_tokens)
+    w_uv = _random_w(num_tokens)
+    rows = torch.randn((num_tokens * NUM_HEADS, 512), device="cuda", generator=gen)
+    rows = rows.to(torch.bfloat16)
+    stats = torch.empty((num_tokens * NUM_HEADS, 2), device="cuda")
+    stats[:, 0] = torch.randn(num_tokens * NUM_HEADS, device="cuda", generator=gen) * 3
+    stats[:, 1] = torch.rand(num_tokens * NUM_HEADS, device="cuda", generator=gen) * 50 + 1
+    k = NUM_HEADS * 128
+    gate_storage = torch.randn((num_tokens, k + 64), device="cuda", generator=gen).sigmoid()
+    gate = gate_storage.to(torch.bfloat16)[:, :k]
+    xq = torch.empty((num_tokens, k), dtype=torch.float8_e4m3fn, device="cuda")
+    xs = torch.empty((-(-num_tokens // 128) * 128 * (k // 32),), dtype=torch.uint8, device="cuda")
+    ws = _Workspace(half_bytes=num_tokens * tail_mod.record_bytes(NUM_HEADS, 128) + 4096)
+    out = torch.empty((num_tokens, k), dtype=torch.bfloat16, device="cuda")
+    ws.launch(tail_mod, rows, stats, w_uv, out, None, mx_out=(gate, xq, xs))
+    torch.cuda.synchronize()
+    _check_close(out, rows, stats, w_uv)
+    ref_q, ref_s = low_m.mxfp8_quantize_reference(out * gate)
+    assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
+    r = torch.arange(num_tokens, device="cuda").unsqueeze(1)
+    c = torch.arange(k // 32, device="cuda").unsqueeze(0)
+    offsets = ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
+    assert torch.equal(xs[offsets], ref_s)
