@@ -607,6 +607,23 @@ def test_k3_mla_fused_output_gate_matches_unfused(num_tokens: int) -> None:
         mixer.helix_exchange_event = None
     assert torch.equal(side, expected)
 
+    # Fused Helix tail batch: the gate forked when the forward starts, joined before o_proj.
+    mixer.helix_exchange_event = torch.cuda.Event()
+    mixer._tail_gate_fork = torch.cuda.Event()
+    try:
+        with with_multi_stream(True):
+            mixer._tail_gate_fork.record()
+            mixer._helix_tail_gate = mixer._fork_gate(hidden, mixer._tail_gate_fork)
+            mixer._helix_tail_gate_pending = True
+            first = project()
+            assert not mixer._helix_tail_gate_pending
+        torch.cuda.synchronize()
+    finally:
+        mixer.helix_exchange_event = None
+        mixer._helix_tail_gate = None
+        mixer._helix_tail_gate_pending = False
+    assert torch.equal(first, expected)
+
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
