@@ -2973,8 +2973,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 batch_size,
                 slot=spec_metadata.rng_accept_slot)
 
-            # getattr: the metadata stand-ins of the sampler tests predate
-            # these fields.
+            # Metadata without the field (the sampler tests' stand-ins) takes
+            # the default rule.
             use_block = getattr(spec_metadata, "rejection_sample_method",
                                 "standard") == "block"
             if use_block and is_ragged:

@@ -363,12 +363,20 @@ def test_legacy_host_snapshot_marker_is_rejected_before_request_updates(cpu_samp
     assert context.tokens == first.tokens == last.tokens == []
 
 
-@pytest.mark.parametrize("ragged", [False, True])
-def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ragged):
-    """Exercise packing around the backend boundary, without a CUDA kernel."""
+@pytest.mark.parametrize(
+    "ragged, method",
+    [(False, "standard"), (True, "standard"), (True, "block")],
+    ids=["uniform", "ragged", "ragged-block-falls-back"],
+)
+def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ragged, method):
+    """Exercise packing around the backend boundary, without a CUDA kernel.
+
+    Block verification has no ragged form: a confidence-scheduled step verifies
+    token-level, with a one-time warning."""
     worker = _make_worker(0.0)
     widths = [2, 4] if ragged else [4, 4]
     metadata = _penalty_mapping_meta([4, 2, 9], widths if ragged else None)
+    metadata.rejection_sample_method = method
     metadata.rng_accept_slot = 2 * worker.max_draft_len + 1
     metadata.dummy_slot_row = 9
     rows = 1 + sum(widths)
@@ -399,6 +407,8 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
     worker._compute_probs_from_logits = compute_probs
     worker._rng_state_per_request = lambda *args, slot: (None, None)
     monkeypatch.setattr(interface_ops, "rejection_sampling_one_model", rejection)
+    warnings = []
+    monkeypatch.setattr(interface_ops.logger, "warning_once", lambda msg, key: warnings.append(key))
     draft_probs = torch.full((2, 3, 8), 1 / 8)
     original_probs = draft_probs.clone()
     _, accepted = worker._sample_and_accept_draft_tokens_rejection(
@@ -410,6 +420,7 @@ def test_rejection_preserves_sampling_params_and_caps_acceptance(monkeypatch, ra
         metadata,
     )
     assert accepted.tolist() == [1, *widths]
+    assert warnings == (["block_verification_ragged_fallback"] if method == "block" else [])
     assert torch.equal(draft_probs, original_probs)
     if not ragged:
         assert calls["draft_probs"] is draft_probs
