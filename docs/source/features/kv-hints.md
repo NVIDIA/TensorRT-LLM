@@ -119,12 +119,19 @@ Rejected metadata is removed before queueing, proxy forwarding or rank
 broadcast; deserialization and rank consumers do not recount it. The metric is
 available through the server's existing Prometheus metrics configuration.
 
-Admission freezes validated JSON before queueing a generation request. Caller
-mutation cannot change queued metadata. Serialization and the Python-object
-broadcast preserve the snapshot across tensor/context and pipeline parallel
-ranks and on child requests. `LlmRequest.py_kv_hints` holds the snapshot; decoding
-returns an independent copy. Unknown action types/versions and optional JSON
-metadata remain intact.
+Admission converts validated hints once into a `KvHintsSnapshot` msgspec envelope
+before queueing a generation request. Its envelope and action fields are frozen,
+and nested dictionaries and lists are read-only. Caller or consumer mutation
+cannot change queued metadata. Request serialization and Python-object broadcast
+preserve this representation across tensor/context and pipeline parallel ranks
+and on child requests; `LlmRequest.py_kv_hints` holds the admitted envelope.
+
+Public Python and HTTP inputs still use the existing JSON/Pydantic schema.
+Unknown action types/versions and optional JSON metadata remain intact. The
+runtime keeps optional envelope/action metadata separately from the protocol
+fields. `snapshot.envelope()` returns an independent public model with that
+metadata restored; `snapshot.wire_json` renders its JSON on demand. JSON bytes
+are not stored in the queued snapshot or decoded again by request transport.
 
 HTTP request text representations omit `kv_hints`, including when a request is
 formatted in an error log. JSON serialization and proxy forwarding retain the
@@ -177,6 +184,20 @@ The helper performs no I/O and does not interpret provider payloads.
 Action-to-source integration authorizes the source and intent, then supplies
 the final immutable backend hint. The holder forwards that value unchanged.
 A provider can accept the selected one-action envelope itself as its hint.
+
+Candidate collection reads the admitted msgspec fields directly. A selected
+one-action snapshot shares read-only data with the admitted envelope, without
+another JSON conversion. After orchestration has selected and authorized a
+candidate, a compatible consumer such as KVCR can receive it directly:
+
+```python
+selected_hint = candidate.snapshot()
+kvcr.submit_hint(hints=selected_hint, request_id=request_id)
+```
+
+Creating a snapshot does not select or authorize a source. Orchestration must
+complete the eligibility, capability, binding and source checks before provider
+contact; the provider still validates its action payload.
 
 For generation-only requests, a hint opts into named fetch before the paired
 source only when the request is eligible and the selected action resolves to
