@@ -139,6 +139,11 @@ def _fp4_mla_packed_plan_geometry(
     # The kernels clamp the plan to the compiled profile (a bucket >= split_kv_len).
     module = _fp4_mla_cutedsl_kernel_module()
     profile_tiles = module._select_runtime_kv_profile(split_kv_len) // 256
+    if helix_kv_bounds is None and split_kv_len <= module.SMEM_P4_PAGE_PLAN_PROFILE_KV:
+        # Without Helix bounds the decode runs the next bucketed profile, which reads each
+        # tile's page ids from global memory instead of staging the task's page table in
+        # shared memory first; the plan keeps the page-plan profile's task-length cap.
+        split_kv_len = module.SMEM_P4_PAGE_PLAN_PROFILE_KV + 1
     if splits == 1:
         return _PackedPlanGeometry(
             num_requests,
