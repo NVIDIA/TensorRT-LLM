@@ -25,7 +25,6 @@ from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
 import aiohttp
-import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -41,7 +40,7 @@ from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve._telemetry import create_uvicorn_server
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   AnthropicResponseError,
                                                   anthropic_error_response,
@@ -290,20 +289,10 @@ class OpenAIDisaggServer:
             await self._service.teardown()
             await self._perf_metrics_writer.close()
 
-        self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
-        self.app.router.route_class = KvHintsRoute
-
-        register_middlewares(self.app,
-                             collect_perf_metrics=self._collect_perf_metrics,
-                             expose_perf_metrics=self._expose_perf_metrics,
-                             perf_metrics_writer=self._perf_metrics_writer)
-
         # Log request-body validation failures so a client/server schema mismatch
         # shows up server-side. Throttled (first, then every 1000th) to avoid
         # flooding the event loop when every request fails identically.
         self._val_err_n = 0
-        @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
             # Anthropic clients parse the error envelope, so every /v1/messages
@@ -327,6 +316,26 @@ class OpenAIDisaggServer:
                     f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
+        # KvHintsRoute: the frontend's public port strips kv_hints from request
+        # bodies unless this process trusts its ingress (TRTLLM_TRUST_KV_HINTS=1);
+        # it does not decode msgpack bodies. The middleware takes no clock.
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=KvHintsRoute,
+            dialect_error_renderers=lambda app: app.add_exception_handler(
+                RequestValidationError, validation_exception_handler),
+            routers=(self._attach_routes,),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer),
+        )
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS", "0") == "1"
+
+    def _attach_routes(self, app: FastAPI) -> None:
+        # register_routes adds its routes through self.app.
+        self.app = app
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
@@ -616,13 +625,12 @@ class OpenAIDisaggServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
-        keep_alive_timeout = self._config.server_keep_alive_timeout
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level=logger.level,
-                                timeout_keep_alive=keep_alive_timeout)
-        await create_uvicorn_server(config).serve(sockets=sockets)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level=logger.level,
+                            timeout_keep_alive=self._config.server_keep_alive_timeout)
 
     async def _sync_server_clock(self, server: str):
         """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running).

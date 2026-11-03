@@ -66,6 +66,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.app_builder import build_http_app, serve_uvicorn
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
 from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
@@ -155,7 +156,6 @@ from tensorrt_llm.version import __version__ as VERSION
 from .._utils import (AdjustedSteadyClock,
                       get_global_steady_clock_now_in_seconds, nvtx_mark,
                       set_prometheus_multiproc_dir)
-from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
 if TYPE_CHECKING:
@@ -849,12 +849,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
 
-        self.app = FastAPI(lifespan=lifespan)
-        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
-                                                  "0") == "1"
-        self.app.router.route_class = _MsgspecRoute
-
-        @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request, exc):
             if request.url.path.startswith("/v1/messages"):
                 # Anthropic clients expect a 400 with the Anthropic error
@@ -879,12 +873,31 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        self.app = build_http_app(
+            lifespan=lifespan,
+            route_class=_MsgspecRoute,
+            dialect_error_renderers=lambda app: app.add_exception_handler(
+                RequestValidationError, validation_exception_handler),
+            routers=(self._attach_role_routes, ),
+            middleware=lambda app: register_middlewares(
+                app,
+                collect_perf_metrics=self._collect_perf_metrics,
+                expose_perf_metrics=self._expose_perf_metrics,
+                perf_metrics_writer=self._perf_metrics_writer,
+                adjusted_clock=self._adjusted_steady_clock),
+        )
+        self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
+                                                  "0") == "1"
+
+    def _attach_role_routes(self, app: FastAPI) -> None:
+        # The register_* methods below add their routes through self.app.
+        self.app = app
         # /health, /version and /v1/models for every role. The health
         # probe stays here, with its private accesses, until the public
         # health API exists.
-        self.app.state.ops_serving_system = SystemServing(
+        app.state.ops_serving_system = SystemServing(
             model=self.model, health_probe=self._health_probe)
-        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+        attach_routers(app, ServerCapabilities.for_role(self.server_role))
         # Runs before the role dispatch for now. It moves after the dispatch
         # once the serving objects attach_router checks for are built per
         # role.
@@ -907,12 +920,6 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self._register_launcher_forwarding_routes()
             self.register_routes()
-
-        register_middlewares(self.app,
-                             collect_perf_metrics=self._collect_perf_metrics,
-                             expose_perf_metrics=self._expose_perf_metrics,
-                             perf_metrics_writer=self._perf_metrics_writer,
-                             adjusted_clock=self._adjusted_steady_clock)
 
     def _init_visual_gen(self):
         self.processor = None
@@ -4208,26 +4215,24 @@ class OpenAIServer(_VideoRoutesMixin):
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
-        config = uvicorn.Config(self.app,
-                                host=host,
-                                port=port,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        server = create_uvicorn_server(config)
+        await serve_uvicorn(self.app,
+                            host=host,
+                            port=port,
+                            sockets=sockets,
+                            log_level="info",
+                            timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                            after_start=self._register_after_serving)
 
-        async def _register_after_serving():
-            with _StartupTimer("http_server_start"):
-                while not server.started:
-                    await asyncio.sleep(0.1)
-            if self.disagg_cluster_worker:
-                try:
-                    with _StartupTimer(
-                            f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
-                    ):
-                        await self.disagg_cluster_worker.register_worker()
-                except Exception as e:
-                    logger.error(f"Worker registration failed: {e}")
-                    server.should_exit = True
-
-        asyncio.create_task(_register_after_serving())
-        await server.serve(sockets=sockets)
+    async def _register_after_serving(self, server: uvicorn.Server) -> None:
+        with _StartupTimer("http_server_start"):
+            while not server.started:
+                await asyncio.sleep(0.1)
+        if self.disagg_cluster_worker:
+            try:
+                with _StartupTimer(
+                        f"service_registration/{self.disagg_cluster_worker.worker_info.worker_id}"
+                ):
+                    await self.disagg_cluster_worker.register_worker()
+            except Exception as e:
+                logger.error(f"Worker registration failed: {e}")
+                server.should_exit = True
