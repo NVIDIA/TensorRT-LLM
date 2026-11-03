@@ -340,7 +340,9 @@ def test_harmony_chat_format_is_served_and_warned_about(served, format_warnings,
     assert warning.startswith("Chat Completions API: 'response_format'")
 
 
-def test_harmony_responses_format_is_served_and_warned_about(served, format_warnings):
+def test_harmony_responses_format_is_served_and_warned_about(
+    served, format_warnings, harmony_vocab
+):
     served.server.use_harmony = True
     path, body = REQUESTS["responses"]
     response = served.client.post(path, json={"model": MODEL, **body, **FORMATS["responses"]})
