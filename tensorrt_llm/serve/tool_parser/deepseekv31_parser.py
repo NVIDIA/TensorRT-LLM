@@ -57,7 +57,7 @@ class DeepSeekV31Parser(BaseToolParser):
         self.bot_token = "<｜tool▁calls▁begin｜>"  # nosec B105
         self.eot_token = "<｜tool▁calls▁end｜>"  # nosec B105
         self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*)<｜tool▁call▁end｜>"
+        self.func_detail_regex = r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*)<｜tool▁call▁end｜>"
         self._last_arguments = ""
         self.current_tool_id = -1
         # Streaming state of the current call's arguments, see _stream_arguments.
@@ -184,19 +184,15 @@ class DeepSeekV31Parser(BaseToolParser):
 
         calls: list[ToolCallItem] = []
         try:
-            # The pattern below matches only once a separator arrives, and while
-            # the arguments of a call stream, a new separator is what changes its
-            # match. Without one in the new text, the arguments are read from
-            # the new text alone, so a long tool call is not rescanned on every
-            # increment.
+            if self.current_tool_name_sent and self._args_start != -1:
+                return self._stream_arguments(current_text, normal_text)
+            # Before the name is sent, only a newly arrived separator can
+            # complete the declaration. Resume the search at the last boundary
+            # so an incomplete declaration is not rescanned on every increment.
             if current_text.find(_TOOL_SEP, self._sep_search_start) == -1:
                 self._sep_search_start = max(0, len(current_text) - len(_TOOL_SEP) + 1)
-                if self.current_tool_name_sent and self._args_start != -1:
-                    return self._stream_arguments(current_text, normal_text)
                 if not self.current_tool_name_sent:
                     return StreamingParseResult(normal_text=normal_text)
-            elif self.current_tool_name_sent:
-                self._args_start = -1
 
             # Lazy groups keep the match within the first call of the buffer; a
             # later call is matched once this one is reported and removed.

@@ -3845,14 +3845,21 @@ def test_deepseek_long_tool_call_streams_in_linear_time(
 
 
 @pytest.mark.parametrize("chunk_size", range(1, 9))
+@pytest.mark.parametrize("location", ["a  b", "a <｜tool▁sep｜> b"])
 def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
-        sample_tools: list[ChatCompletionToolsParam], chunk_size: int) -> None:
+        sample_tools: list[ChatCompletionToolsParam], chunk_size: int,
+        location: str) -> None:
     """Two V3.1 calls with whitespace in their values, cut every few characters.
 
     The cuts split the call end token, so a partial end token after complete
     JSON must stay out of the arguments and still end the call.
     """
-    calls = [("get_weather", '{"location": "a  b", "unit": "x \\n y"}'),
+    calls = [("get_weather",
+              json.dumps({
+                  "location": location,
+                  "unit": "x \n y"
+              },
+                         ensure_ascii=False)),
              ("search_web", '{"query": "  P "}')]
     text = ("<｜tool▁calls▁begin｜>" + "".join(
         f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>\n{args}\n<｜tool▁call▁end｜>"
@@ -3875,6 +3882,9 @@ def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
     assert arguments == {i: args for i, (_, args) in enumerate(calls)}
     assert [call["arguments"] for call in parser.prev_tool_call_arr
             ] == [json.loads(args) for _, args in calls]
+    whole = DeepSeekV31Parser().detect_and_parse(text, sample_tools)
+    assert [(call.name, json.loads(call.parameters)) for call in whole.calls
+            ] == [(name, json.loads(args)) for name, args in calls]
 
 
 @pytest.mark.parametrize("after_call", ["", " done"])
