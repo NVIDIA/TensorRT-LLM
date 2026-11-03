@@ -1328,7 +1328,8 @@ class TestQwen3StreamingMatchesWholeTextParse:
         """Text after the end token is not normal text, streamed or whole.
 
         ``detect_and_parse`` keeps only the text before the first call, so the
-        stream, finish() included, does not surface what follows a call.
+        stream, finish() included, does not surface what follows a call. The
+        call itself is still found.
         """
         parser = Qwen3ToolParser()
         results = [
@@ -1341,8 +1342,12 @@ class TestQwen3StreamingMatchesWholeTextParse:
         streamed_text = "".join(result.normal_text for result in results)
         whole = Qwen3ToolParser().detect_and_parse(text, sample_tools)
         assert streamed_text == whole.normal_text == ""
-        whole_calls = self._whole_text_calls(text, sample_tools)
-        assert self._streamed_calls(chunks, sample_tools) == whole_calls
+        expected = [(0, "get_weather", {
+            "location": "San Francisco, CA",
+            "unit": "celsius"
+        })]
+        assert self._whole_text_calls(text, sample_tools) == expected
+        assert self._streamed_calls(chunks, sample_tools) == expected
 
     @pytest.mark.parametrize(
         "chunks",
