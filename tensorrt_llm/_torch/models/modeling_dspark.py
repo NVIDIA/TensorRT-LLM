@@ -107,6 +107,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import LowMGemmDispatcher, prepare_low_m_gemm
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
@@ -3652,6 +3653,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # residual add and the RMSNorm after it.
     _tp_fusions = True
 
+    # The low-M BF16 GEMM race of the drafter's projections (set in __init__).
+    _low_m_gemm: Optional[LowMGemmDispatcher] = None
+
     def __init__(
         self,
         draft_config,
@@ -3716,6 +3720,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         if context_kv_only:
             self._keep_context_kv_modules()
+        # The block decode projections and the context latent GEMM run at a few
+        # rows per request: they race the low-M BF16 kernels against cuBLAS.
+        self._low_m_gemm = prepare_low_m_gemm(
+            self.model, force=True, per_rank_tuning=draft_config.mapping.enable_attention_dp
+        )
 
     def _keep_context_kv_modules(self) -> None:
         """Drop every module the context KV build does not read.
@@ -4141,7 +4150,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         if projected_hidden.dtype != weight_dtype:
             projected_hidden = projected_hidden.to(weight_dtype)
 
-        latent = F.linear(projected_hidden, self._fused_kv_weight)
+        latent = (
+            None
+            if self._low_m_gemm is None
+            else self._low_m_gemm.apply(self, projected_hidden, self._fused_kv_weight, None)
+        )
+        if latent is None:
+            latent = F.linear(projected_hidden, self._fused_kv_weight)
         latent = latent.view(n, num_layers, self._head_dim)
 
         # One fused RMSNorm+RoPE per layer, not one eager chain for all of them:

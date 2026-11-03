@@ -2109,3 +2109,31 @@ def test_fp8_block_decode_follows_bf16_at_k3_shapes(block_size):
     assert rel_l2(out_fp8, fp8_operands) < 0.01
     cosine = F.cosine_similarity(out_fp8.float().reshape(-1), out_bf16.float().reshape(-1), dim=0)
     assert cosine.item() > 0.993 and rel_l2(out_fp8, out_bf16) < 0.12
+
+
+# ---------------------------------------------------------------------------
+# Low-M BF16 GEMM race of the MLA drafter's projections.
+# ---------------------------------------------------------------------------
+
+
+@needs_cuda
+def test_mla_drafter_races_its_projections_in_the_low_m_dispatcher():
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(weights)
+    dispatcher = drafter._low_m_gemm
+    assert dispatcher is not None and dispatcher._force
+    for name, module in drafter.model.named_modules():
+        if module.__class__.__name__.endswith("Linear"):
+            assert module._low_m_gemm_dispatcher is dispatcher, name
+    # The LM head is the target's: it keeps the target's GEMM selection.
+    assert getattr(drafter.lm_head, "_low_m_gemm_dispatcher", None) is not dispatcher
+
+    # Decode-sized context latents (through the race) equal the plain GEMM's.
+    torch.manual_seed(0)
+    captured = torch.randn(14, MLA_HIDDEN * NUM_CAPTURE, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(3, 17, device="cuda")
+    projected = drafter.project_target_hidden(captured)
+    latent, _ = drafter.precompute_context_kv(projected, positions)
+    drafter._low_m_gemm = None
+    reference, _ = drafter.precompute_context_kv(projected, positions)
+    torch.testing.assert_close(latent, reference, rtol=2e-2, atol=2e-2)
