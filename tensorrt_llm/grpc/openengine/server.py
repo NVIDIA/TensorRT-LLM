@@ -22,6 +22,7 @@ import uvloop
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm.grpc._protobuf import _warn_if_python_protobuf
 from tensorrt_llm.inputs.media_io import _close_aiohttp_session
 from tensorrt_llm.logger import logger
@@ -161,6 +162,7 @@ class OpenEngineServer:
             max_media_preparations=max_media_preparations,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
+        self._inference = inference
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.
         self._control = OpenEngineControlServicer(
@@ -292,7 +294,10 @@ class OpenEngineServer:
             if self._health_task is not None:
                 self._health_task.cancel()
                 await asyncio.gather(self._health_task, return_exceptions=True)
-            await self._server.stop(grace=grace)
+            try:
+                await self._server.stop(grace=grace)
+            finally:
+                await self._inference.drain_encoder_cleanup()
         finally:
             try:
                 if self._metrics is not None:
@@ -477,7 +482,12 @@ def launch_server(
                 "host": host,
                 "port": port,
             }
-            llm = PyTorchLLM(**llm_args)
+            if llm_args.get("mm_encoder_only"):
+                if mode.num_frontends != 1:
+                    raise ValueError("OpenEngine encoder-only serving requires one frontend")
+                llm = MultimodalEncoder(**llm_args)
+            else:
+                llm = PyTorchLLM(**llm_args)
             if stop_event.is_set():
                 if failure is not None:
                     raise RuntimeError(failure)

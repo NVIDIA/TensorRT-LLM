@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
 grpc = pytest.importorskip(
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
@@ -27,9 +28,12 @@ grpc = pytest.importorskip(
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer  # noqa: E402
+from tensorrt_llm.disaggregated_params import DisaggregatedParams  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     generation_pb2,
     model_pb2,
+    openengine_pb2_grpc,
     server_pb2,
 )
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
@@ -2562,3 +2566,89 @@ async def test_raw_audio_mime_type_is_validated(image_video_audio_llm):
 
     with pytest.raises(ValueError, match="must start with audio/"):
         await request_mapping._input_from_request(request, image_video_audio_llm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.threadleak(enabled=False)  # grpc.aio owns a process-lifetime polling thread.
+async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
+    image_llm, monkeypatch, tmp_path
+):
+    capability_llm, _ = image_llm
+    processor = capability_llm.input_processor
+    processor.support_mm_disagg = True
+    processor.config.to_dict = lambda: {"model_type": processor.config.model_type}
+    encoder = _ImageLlm(processor, processor.config)
+    consumer = _ImageLlm(processor, processor.config)
+    encoder.args.mm_encoder_only = True
+    consumer.args.disable_mm_encoder = True
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    encoder.result_handle._result.disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=[SharedTensorContainer.from_tensor(expected).dump_to_dict()],
+        multimodal_hashes=[[1] * 8],
+    )
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    calls = []
+
+    class ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            calls.append(data)
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", ImageIo)
+    received = []
+
+    def consume(inputs, sampling, params):
+        assert "multi_modal_data" not in inputs
+        received.append(
+            SharedTensorContainer.from_dict(params.multimodal_embedding_handles[0])
+            .get_local_view()
+            .clone()
+        )
+        return inputs
+
+    consumer.preprocess = consume
+    servers = []
+    channels = []
+    try:
+        clients = []
+        for llm in (encoder, consumer):
+            server = grpc.aio.server()
+            openengine_pb2_grpc.add_InferenceServicer_to_server(
+                OpenEngineInferenceServicer(llm, "image-model"), server
+            )
+            port = server.add_insecure_port("127.0.0.1:0")
+            await server.start()
+            servers.append(server)
+            channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+            channels.append(channel)
+            clients.append(openengine_pb2_grpc.InferenceStub(channel))
+        request = generation_pb2.GenerateRequest(
+            request_id="e",
+            model="image-model",
+            prompt="<image_1> describe",
+            media=[
+                generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+            ],
+            encoder=generation_pb2.EncoderOptions(encode_only=True),
+        )
+        responses = [value async for value in clients[0].Generate(request, timeout=10)]
+        assert [value.WhichOneof("event") for value in responses] == ["encoder_ready"]
+        request.request_id = "pd"
+        request.encoder.CopyFrom(
+            generation_pb2.EncoderOptions(cache=responses[0].encoder_ready.cache)
+        )
+        responses = [value async for value in clients[1].Generate(request, timeout=10)]
+        assert responses[-1].WhichOneof("event") == "finished"
+        assert responses[-1].usage.completion_tokens > 0
+        assert len(calls) == 1
+        assert len(received) == 1 and torch.equal(received[0], expected)
+        assert not list(tmp_path.glob("*.safetensors"))
+    finally:
+        for channel in channels:
+            await channel.close()
+        for server in servers:
+            await server.stop(0)

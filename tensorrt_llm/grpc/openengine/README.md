@@ -336,24 +336,61 @@ Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_c
 
 For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.
 
+## Image encoder handoff (local draft)
 
-## Encoder-output transport helpers
+This branch adds an unpublished `EncoderOptions` / `EncoderReady` protocol
+extension for TP1 image E+PD with negotiated encoder-output transport. It is not in the published schema or
+nightly images. Both client and server need the matching draft bindings.
 
-`encoder.py` and `encoder_nixl.py` implement single-use image encoder-cache
-references for native multimodal disaggregation. They preserve embedding layout,
-image hashes and mRoPE tensors. Consumers validate request and model identity
-before claiming a reference.
+For the optional shared-file backend, set `TRTLLM_OPENENGINE_ENCODER_CACHE_DIR`
+to the same private directory in both
+engine processes. Start the encoder with `mm_encoder_only: true` and the combined
+prefill/decode engine with `disable_mm_encoder: true`. The model processor must
+support native multimodal disaggregation. Use the same checkpoint path and
+processor configuration in both processes. Image E+PD has been manually validated with Qwen3-VL-2B across two GPU hosts.
+CUDA IPC shutdown cleanup remains under investigation.
 
-The NIXL backend uses TRT-LLM's native transfer agent to WRITE GPU buffers across
-hosts. References contain metadata rather than source pointers. Transfers are
-limited to 64 MiB, with 256 MiB of registered storage per engine. Pending exports
-expire after five minutes when the cache is collected. An uncertain WRITE stops
-admission and retains affected buffers until process exit.
+`ModelInfo.encoder` advertises the schema version, encoder-only or cache-consumer
+role, and supported transfer backends. Encoder-only requests set
+`encoder.encode_only` and terminate with `EncoderReady`. The downstream request
+retains the original prompt and media identities and supplies `encoder.cache`;
+it does not fetch the image or run its own vision encoder. Text-only requests
+can go directly to the combined engine.
 
-The optional safetensors backend uses a private shared directory on one host.
-It applies the same single-use and request-identity checks, with a 64 MiB tensor
-limit and a 256 MiB serialized-cache limit.
+The engine materializes native encoder exports into safetensors storage; tensor
+contents never pass through Dynamo. This baseline adds CPU copies and storage I/O.
+References are single-use and expire after five minutes; expired files are
+collected on the next cache operation. Published and claimed files are limited
+to 256 MiB, with at most one additional 64 MiB publication temporary under the
+cache lock. Tensor data is limited to 64 MiB per result. The shared-file backend rejects cross-host references. Both backends reject
+video/audio inputs and E+P+D handoffs.
 
-The helpers require the matching OpenEngine encoder-handoff schema. Serving
-role discovery, request dispatch and lifecycle integration are provided by the
-stacked serving change.
+### Networked encoder handoffs (local protocol draft)
+
+Set `TRTLLM_OPENENGINE_ENCODER_TRANSFER=nixl` on encoder and consumer engines.
+Both must load the same immutable checkpoint revision and set
+`TRTLLM_OPENENGINE_ENCODER_MODEL_REVISION` to that revision. Load it with
+`--hf_revision`; this identity must not be a mutable branch name. On the encoder,
+set `TRTLLM_OPENENGINE_ENCODER_ENDPOINT` to its reachable OpenEngine `host:port`.
+The engines need compatible NIXL/UCX connectivity; no shared directory is used.
+The existing image-only E+PD and TP/PP/CP=1 restrictions still apply.
+
+The encoder imports native exports locally and registers owned GPU tensors with
+TRT-LLM's NIXL agent. Its single-use reference includes layout, dtype, shape,
+input/model identity and the producer endpoint, not source memory addresses.
+The consumer allocates/registers receive tensors and invokes
+`Control.TransferEncoderCache`; the producer writes to those buffers and returns
+only after native completion. Dynamo carries the opaque reference only. Metadata
+and mRoPE tensors are carried along with the image embeddings.
+
+Only trusted engine peers may call the transfer RPC or provide handoff metadata;
+this is not a public tensor-upload API. Deployment networking must make the
+advertised gRPC and NIXL endpoints reachable across hosts.
+
+Pending exports expire after five minutes when the cache is collected, and
+registered tensor storage is bounded to 256 MiB per engine (64 MiB per request).
+An uncertain transfer stops admission and retains affected registrations and
+buffers until process exit. A missing RPC reply does not establish that a remote
+write stopped. Restart an unhealthy engine; do not retry a consumed handoff.
+The cross-host GPU path currently requires the matching local protocol and
+serving changes; a published runtime containing them is not yet available.

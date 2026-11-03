@@ -28,6 +28,7 @@ from .bindings import (
     MINIMUM_CLIENT_REVISION,
     SCHEMA_RELEASE,
     SCHEMA_REVISION,
+    generation_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -137,6 +138,33 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 self._load_snapshot_deadline = time.monotonic() + _LOAD_SNAPSHOT_CACHE_SECONDS
         return self._load_snapshot
 
+    async def TransferEncoderCache(self, request, context):
+        cache = getattr(self._inference, "_encoder_cache", None)
+        transfer = getattr(cache, "transfer", None)
+        if not transfer or self._inference.encoder_role != "encode":
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder transfer is not enabled")
+            return
+        # Keep the task alive through cancellation: source buffers remain owned
+        # by the transfer until native completion or transport quarantine.
+        task = asyncio.create_task(asyncio.to_thread(transfer, request.cache, request.destination))
+        self._inference._encoder_cleanup_tasks.add(task)
+
+        def completed(done):
+            self._inference._encoder_cleanup_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # Observe failures even when the requesting RPC was cancelled.
+
+        task.add_done_callback(completed)
+        try:
+            await asyncio.shield(task)
+        except ValueError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+            return
+        except RuntimeError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            return
+        return generation_pb2.TransferEncoderCacheResponse()
+
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
 
@@ -145,6 +173,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         but not yet promoted is caught, and the proxy polls MPI worker liveness.
         It also covers encode-only engines, where `_executor` is None.
         """
+        if getattr(self._inference, "_encoder_cleanup_failed", False):
+            return False
+        if getattr(getattr(self._inference, "_encoder_cache", None), "failed", False):
+            return False
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
             try:
@@ -296,6 +328,16 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
+        role = getattr(self._inference, "encoder_role", "")
+        if role:
+            info.encoder.CopyFrom(
+                model_pb2.EncoderCapabilities(
+                    schema_version=1,
+                    encoder_only=role == "encode",
+                    accepts_cache=role == "consume",
+                    transfer_backends=[self._inference._encoder_cache.backend],
+                )
+            )
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 
@@ -310,6 +352,16 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         # discovery-becomes-a-per-request-failure case this service exists to
         # avoid. Unset means "unknown", which is the honest claim.
 
+        if role == "encode":
+            info.generation.CopyFrom(
+                model_pb2.GenerationCapabilities(
+                    prompt_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    output_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    guided_decoding=model_pb2.GuidedDecodingCapabilities(supported=False),
+                    max_num_sequences=1,
+                )
+            )
+            return info
         generation = model_pb2.GenerationCapabilities()
         # The bound is enforced per request, so it is known rather than unknown.
         logprobs = model_pb2.LogprobCapabilities(

@@ -235,6 +235,7 @@ l0_cpu:
   - unittest/grpc/openengine/test_preparation.py
   - unittest/grpc/openengine/test_encoder.py
   - unittest/grpc/openengine/test_encoder_nixl.py
+  - unittest/grpc/openengine/test_encoder_serving.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_metrics.py

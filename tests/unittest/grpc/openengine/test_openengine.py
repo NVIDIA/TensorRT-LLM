@@ -79,6 +79,14 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
         )
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
         server._health_task = None
+        drain_started = asyncio.Event()
+        allow_drain = asyncio.Event()
+
+        async def drain_encoder_cleanup():
+            drain_started.set()
+            await allow_drain.wait()
+
+        server._inference = SimpleNamespace(drain_encoder_cleanup=drain_encoder_cleanup)
         server._metrics = SimpleNamespace(
             stop=AsyncMock(side_effect=RuntimeError("metrics failed") if fail_metrics else None)
         )
@@ -100,6 +108,9 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
             for event in started:
                 assert await asyncio.to_thread(event.wait, 5)
             stop_task = asyncio.create_task(server.stop(grace=0))
+            await asyncio.wait_for(drain_started.wait(), 5)
+            assert not any(pool.shutdown_started.is_set() for pool in pools)
+            allow_drain.set()
             await asyncio.wait_for(
                 asyncio.gather(*(pool.shutdown_started.wait() for pool in pools)), 5
             )
@@ -121,6 +132,7 @@ def test_stop_drains_both_media_pools_even_if_shutdown_fails(
             for future in futures:
                 future.result()
         finally:
+            allow_drain.set()
             for event in release:
                 event.set()
             if stop_task is not None:
