@@ -38,6 +38,16 @@ message ModelInfo {
   // contract: clients read it opportunistically and never depend on it for
   // correctness. Carried as a Struct so JSON types survive the wire.
   google.protobuf.Struct extra = 28;
+
+  // Negotiated encoder role and supported encoder-cache transports.
+  EncoderCapabilities encoder = 29;
+}
+
+message EncoderCapabilities {
+  uint32 schema_version = 1;
+  bool encoder_only = 2;
+  bool accepts_cache = 3;
+  repeated string transfer_backends = 4;
 }
 
 message GenerationCapabilities {

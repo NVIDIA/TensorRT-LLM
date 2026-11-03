@@ -335,3 +335,25 @@ For token-only clients, send boolean `extra["detokenize"] = false`. Omitted deto
 Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_conversation_affinity: true` when using attention DP; it is disabled by default. Per-conversation cache retention requires block reuse to be enabled and `kv_cache_config.block_reuse_config.policy: per_conversation` with KV cache manager v2; the default policy is `all_reusable`. Forwarding a conversation ID does not enable either setting. These extensions do not require KV-event discovery, publication, or routing-load snapshots.
 
 For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.
+
+
+## Encoder-output transport helpers
+
+`encoder.py` and `encoder_nixl.py` implement single-use image encoder-cache
+references for native multimodal disaggregation. They preserve embedding layout,
+image hashes and mRoPE tensors. Consumers validate request and model identity
+before claiming a reference.
+
+The NIXL backend uses TRT-LLM's native transfer agent to WRITE GPU buffers across
+hosts. References contain metadata rather than source pointers. Transfers are
+limited to 64 MiB, with 256 MiB of registered storage per engine. Pending exports
+expire after five minutes when the cache is collected. An uncertain WRITE stops
+admission and retains affected buffers until process exit.
+
+The optional safetensors backend uses a private shared directory on one host.
+It applies the same single-use and request-identity checks, with a 64 MiB tensor
+limit and a 256 MiB serialized-cache limit.
+
+The helpers require the matching OpenEngine encoder-handoff schema. Serving
+role discovery, request dispatch and lifecycle integration are provided by the
+stacked serving change.
