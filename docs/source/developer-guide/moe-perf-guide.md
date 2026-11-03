@@ -151,7 +151,7 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
 | `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |
 
-The SM107 measurements here cover NVFP4 and W4A8_MXFP4_MXFP8; see the capability matrix for format-specific support.
+The SM107 branch of the decision tree below covers NVFP4 and W4A8_MXFP4_MXFP8; see the capability matrix for format-specific support.
 
 ##### How to assign a backend?
 
@@ -299,6 +299,7 @@ Communication
 > - The SM100 / SM103 branch is an empirical summary from `bench_moe` sweeps on TensorRT-LLM `v1.3.0rc26` (`21dc97fbc8`, 2026-09-13).
 > - Coverage: GB300 / B300, typical workloads of key models (DeepSeek-V4-Pro, GLM-5, Kimi-K2, Kimi-K3, Qwen3.8) on the MoE Perf Dashboard, module-level `bench_moe` with perfect routing and `--use_low_precision_moe_combine`. GB300 is covered only through `world_size <= 72`; larger GB300 deployments (EP crossing the NVLink domain) were not benchmarked.
 > - The SM107 branch is based on module-level `bench_moe` sweeps on Vera Rubin NVL72 using TensorRT-LLM `1.4.0rc2` (`b96ba434e8`): NVFP4 and W4A8_MXFP4_MXFP8, CUDA Graph on/off, and world sizes 4, 8, 16 and 32 within one NVLink domain.
+> - The SM107 attention-DP NVFP4 decode sweeps support recommending MEGAMOE_CUTEDSL at 1–4 activated tokens per rank; the lower bound of the TRTLLM range is intentional.
 > - Perfect routing assigns tokens evenly across experts. Relative rankings of backends and communication strategies hold under this configuration, but a real router can be skewed, so absolute latency can differ from what the deployment sees.
 > - The decision tree is a fit to those sweeps, and may not be optimal for a specific workload. Meanwhile, results can become outdated as kernels and autotuning change. To push performance further, test the options yourself with `bench_moe`, as described in *Tuning a Specific Workload*.
 
