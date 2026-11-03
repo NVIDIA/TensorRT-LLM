@@ -104,7 +104,7 @@ def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
         pre_quant_scale = pre_quant_scale.repeat(m, 1)
         activation = torch.mul(activation, pre_quant_scale)
 
-    output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
+    gemm_kwargs = dict(
         input=activation.to(activation_type).contiguous()
         if use_w4a8_awq else activation.contiguous(),
         weight=cuda_q_weight,
@@ -117,6 +117,10 @@ def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
         alpha=fp8_alpha.item() if use_w4a8_awq else None,
         bias=bias.contiguous() if has_bias else None,
         zeros=zero)
+    output = torch.ops.trtllm.finegrained_mixed_dtype_gemm(**gemm_kwargs)
+    torch.library.opcheck(torch.ops.trtllm.finegrained_mixed_dtype_gemm, (),
+                          gemm_kwargs,
+                          test_utils=("test_faketensor", ))
 
     if use_w4a8_awq:
         activation *= fp8_alpha
