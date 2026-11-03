@@ -132,10 +132,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void mhcBigFuseKernel(float const* __re
     // Each of the token's HC_MULT3 + 1 values (24 mixes, then the sqr-sum) is owned by one lane, which sums it over
     // the splits with coalesced loads; lanes 0..3 of warp 0 then gather the six mixes and the sqr-sum they need.
     // NUM_SPLITS == 0 serves the runtime split counts (up to the MMA ladder's 112): every warp sums a strided subset
-    // of the splits and warp 0 adds the per-warp partials in warp order. NUM_SPLITS == 16 is summed by warp 0 alone
-    // in split order. Either order is fixed, so the result is independent of how the producer's split CTAs ran.
-    // Smaller compile-time split counts are summed per lane in Phase 1a.
-    constexpr bool kLaneSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 16;
+    // of the splits and warp 0 adds the per-warp partials in warp order. NUM_SPLITS 8 and 16 are summed by warp 0
+    // alone in split order. Either order is fixed, so the result is independent of how the producer's split CTAs
+    // ran. Two and four splits are summed per lane in Phase 1a.
+    constexpr bool kLaneSplitSum = NUM_SPLITS == 0 || NUM_SPLITS >= 8;
     float r_split = 0.0f;
     float y_pre_split = 0.0f;
     float y_post_split = 0.0f;
@@ -536,10 +536,8 @@ INST_BIGFUSE(16, 512)
 INST_BIGFUSE(0, 128)
 INST_BIGFUSE(0, 256)
 INST_BIGFUSE(0, 512)
-// BS512 bulk-TMA variants (M <= 64), for every split count.
+// BS512 bulk-TMA variants (M <= 64); see mhcBigFuseDispatch for the split counts that use them.
 INST_BIGFUSE_TMA(1)
-INST_BIGFUSE_TMA(2)
-INST_BIGFUSE_TMA(4)
 INST_BIGFUSE_TMA(8)
 INST_BIGFUSE_TMA(16)
 INST_BIGFUSE_TMA(0)
@@ -997,14 +995,23 @@ static void mhcBigFuseDispatch(float const* y_acc, float const* r_acc, __nv_bflo
         // BS512 is the measured winner for the small-M one-wave regime. Bulk
         // TMA wins only through M=64; its shared-memory footprint regresses
         // M>=128, where regular LDG has enough latency hiding. The residual
-        // prefetch is independent of the split-K prologue.
-        if (M <= 64)
+        // prefetch is independent of the split-K prologue; two and four splits
+        // (the half-FMA path's) measure faster without it once the next-layer
+        // norm is fused.
+        if constexpr (NUM_SPLITS != 2 && NUM_SPLITS != 4)
         {
-            size_t const tma_smem_bytes = static_cast<size_t>(4) * hidden_size * sizeof(__nv_bfloat16);
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                reinterpret_cast<void const*>(mhcBigFuseKernel<NUM_SPLITS, 512, kFuseNorm, true, kLaggedPre>),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tma_smem_bytes)));
-            LAUNCH_BF(512, true, tma_smem_bytes);
+            if (M <= 64)
+            {
+                size_t const tma_smem_bytes = static_cast<size_t>(4) * hidden_size * sizeof(__nv_bfloat16);
+                TLLM_CUDA_CHECK(cudaFuncSetAttribute(
+                    reinterpret_cast<void const*>(mhcBigFuseKernel<NUM_SPLITS, 512, kFuseNorm, true, kLaggedPre>),
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(tma_smem_bytes)));
+                LAUNCH_BF(512, true, tma_smem_bytes);
+            }
+            else
+            {
+                LAUNCH_BF(512, false, 0);
+            }
         }
         else
         {
