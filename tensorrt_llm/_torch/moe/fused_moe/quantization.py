@@ -7611,6 +7611,7 @@ def _import_deep_gemm():
     missing = [
         name for name in (
             "fp8_fp4_mega_moe",
+            "get_block_m_for_mega_moe",
             "get_symm_buffer_for_mega_moe",
             "transform_sf_into_required_layout",
             "transform_weights_for_mega_moe",
