@@ -30,14 +30,14 @@ def get_sparse_attn_kv_cache_manager(
     from .deepseek_v4 import DeepseekV4CacheManager
     from .dsa import DSACacheManager, DSACacheManagerV2
     from .minimax_m3 import MiniMaxM3KVCacheManagerV2
-    from .rocket import RocketKVCacheManager
+    from .rocket import RocketKVCacheManager, RocketKVCacheManagerV2
 
     if sparse_attention_config.algorithm == "csa2":
         from .csa2.cache_manager import CSA2CacheManager
 
         return CSA2CacheManager
     if sparse_attention_config.algorithm == "rocket":
-        return RocketKVCacheManager
+        return RocketKVCacheManagerV2 if use_kv_cache_manager_v2 else RocketKVCacheManager
     elif sparse_attention_config.algorithm == "dsa":
         return DSACacheManagerV2 if use_kv_cache_manager_v2 else DSACacheManager
     elif sparse_attention_config.algorithm == "deepseek_v4":
