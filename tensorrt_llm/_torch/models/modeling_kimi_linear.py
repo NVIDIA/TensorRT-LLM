@@ -1529,6 +1529,26 @@ class _Fp8BlockScaleWeightReadLinear(
         )
 
 
+def _bf16_weight(linear: nn.Module) -> Optional[torch.Tensor]:
+    """The BF16 ``[out, in]`` weight of a bias-free projection: a BF16 linear's own, or an FP8
+    weight-read projection's codes times their 128x128 block scales (exact in BF16); else None."""
+    if isinstance(linear, _Fp8BlockScaleWeightReadLinear):
+        from ..kernels.blackwell import kimi_k3_moe_tail
+
+        linear.transform_weights()
+        linear._prepare_low_m_gemm()
+        packed = linear._low_m_weight_scale
+        n, k = linear.out_features, linear.in_features
+        if packed is None or n % 128 or k % 128:
+            return None
+        exps = kimi_k3_moe_tail.block_exponents(packed, n, k).float() - 127.0
+        scale = torch.exp2(exps).repeat_interleave(128, 0).repeat_interleave(128, 1)
+        return (linear.weight.float() * scale).to(torch.bfloat16).contiguous()
+    if isinstance(linear, TrtllmLinear) and linear.weight.dtype == torch.bfloat16:
+        return linear.weight.data.contiguous()
+    return None
+
+
 def _swap_linear_to_fp8_weight_read(
     parent: nn.Module,
     attr: str,
@@ -1771,9 +1791,14 @@ class KimiK3MoERuntime(nn.Module):
     _moe_front_ws = None
     _moe_front_plan = None
     # enable_min_latency on the column-parallel tail: latent_up's UE8M0 block exponents for the
-    # one-kernel MoE tail (``kimi_k3_moe_tail``); None where it does not apply.
+    # one-kernel MoE tail (``kimi_k3_moe_tail``), the shared expert's weights in the persistent
+    # kernel's order, its workspace and TP size (``kimi_k3_shared_expert``); None where they do
+    # not apply.
     _min_latency: bool = False
     _moe_tail_wexp: Optional[torch.Tensor] = None
+    _shared_frags: Optional[torch.Tensor] = None
+    _shared_ws = None
+    _shared_world: int = 0
 
     def __init__(
         self,
@@ -2142,12 +2167,13 @@ class KimiK3MoERuntime(nn.Module):
 
     def _prepare_min_latency_tail(self) -> None:
         """``enable_min_latency`` (lossy): on the column-parallel tail of at most 8 rows the MoE tail
-        is one kernel fed by the routed experts' pushed latent rows (``kimi_k3_moe_tail``). Builds
-        its operands on this rank."""
-        self._moe_tail_wexp = None
+        is one kernel fed by the routed experts' pushed latent rows (``kimi_k3_moe_tail``) and the
+        shared expert one persistent kernel beside the routed experts
+        (``kimi_k3_shared_expert``). Builds their operands on this rank."""
+        self._moe_tail_wexp = self._shared_frags = self._shared_ws = None
         if not self._min_latency or self.latent_up_rows is None:
             return
-        from ..kernels.blackwell import kimi_k3_moe_tail
+        from ..kernels.blackwell import kimi_k3_moe_tail, kimi_k3_shared_expert
 
         up = self.routed_expert_up_proj
         world = self.routed_experts.all_reduce.mapping.tp_size
@@ -2164,6 +2190,21 @@ class KimiK3MoERuntime(nn.Module):
                 )
                 if 1 <= int(wexp.min().item()) and int(wexp.max().item()) <= 254:
                     self._moe_tail_wexp = wexp
+        mlp = self.shared_experts
+        if not isinstance(mlp.activation, SituAndMul):
+            return
+        gate_up = _bf16_weight(mlp.gate_up_proj)
+        down = _bf16_weight(mlp.down_proj)
+        sms = self._shared_sms or _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
+        if gate_up is None or down is None or gate_up.shape[1] != kimi_k3_shared_expert.HIDDEN:
+            return
+        world, rem = divmod(2 * kimi_k3_shared_expert.INTER, gate_up.shape[0])
+        if rem or not kimi_k3_shared_expert.can_run(1, world, sms):
+            return
+        with torch.no_grad():
+            self._shared_frags = kimi_k3_shared_expert.persist_fragments(gate_up, down, sms)
+        self._shared_ws = kimi_k3_shared_expert.PersistWorkspace(world, gate_up.device)
+        self._shared_world = world
 
     def _min_latency_tail_applies(self, num_tokens: int) -> bool:
         """Whether this column-parallel tail forward runs the one-kernel MoE tail."""
@@ -2200,6 +2241,27 @@ class KimiK3MoERuntime(nn.Module):
         ):
             return None
         return ag, latent
+
+    def _min_latency_shared(self, identity: torch.Tensor) -> Optional[torch.Tensor]:
+        """The shared expert's partial from the persistent kernel where it applies, else None."""
+        from ..kernels.blackwell import kimi_k3_shared_expert
+
+        num_tokens = identity.shape[0]
+        sms = self._shared_sms or _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
+        if self._shared_frags is None or not 1 <= num_tokens <= kimi_k3_shared_expert.MAX_M:
+            return None
+        x = identity.reshape(num_tokens, self.hidden_size).contiguous()
+        act = self.shared_experts.activation
+        return kimi_k3_shared_expert.run_shared_expert(
+            x=x,
+            frags=self._shared_frags,
+            world=self._shared_world,
+            sms=sms,
+            ws=self._shared_ws,
+            out=torch.empty((num_tokens, self.hidden_size), dtype=x.dtype, device=x.device),
+            beta=float(act.beta),
+            linear_beta=act.linear_beta,
+        )
 
     def _moe_front_unsupported(self) -> Optional[str]:
         """Why this layer cannot run the sharded decode front (``kimi_k3_moe_front``), or
@@ -2802,6 +2864,11 @@ class KimiK3MoERuntime(nn.Module):
             return self._routed_projection(y, self.routed_expert_up_proj)
 
         def _shared_output():
+            if cp_tail and self._min_latency:
+                # The persistent shared expert (lossy), beside the routed grid.
+                partial = self._min_latency_shared(identity)
+                if partial is not None:
+                    return partial
             # Beside the routed grid (multi-stream) the shared GEMMs keep to the SMs it leaves.
             with _cublas_sm_limit(self._shared_sms if do_multi_stream() else 0):
                 shared_out = self.shared_experts(
