@@ -95,6 +95,7 @@ def test_pruning_removes_all_shorter_candidates():
     for c in candidates:
         assert len(c) >= len((4, 5, 6, 7)), (
             f"shorter candidate {c} was not pruned")
+    assert (4, 5, 6, 7) in candidates, "longer candidate was not preserved"
 
 
 @pytest.mark.cpu_only
@@ -118,8 +119,8 @@ def test_draft_returns_longest_after_pruning():
     mgr.get_draft_tokens([100, 101, 1], 0, 100)
     mgr.get_draft_tokens([100, 101, 4, 5, 6, 7], 1, 100)
     draft = mgr.get_draft_tokens([50, 100, 101], 2, 100)
-    assert len(draft) >= 4, (
-        f"draft returned {draft}, expected at least 4 tokens from the longer match")
+    assert draft == [4, 5, 6, 7], (
+        f"draft returned {draft}, expected [4, 5, 6, 7] from the longer match")
 
 
 if __name__ == "__main__":
