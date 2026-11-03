@@ -1474,9 +1474,10 @@ def _update_kv_cache_draft_token_location(
 ) -> None:
     run_kv_cache_relocation = False
     for request in scheduled_batch.generation_requests:
-        if (
-            request.state != LlmRequestState.GENERATION_COMPLETE or include_finished_requests
-        ) and request.py_num_accepted_draft_tokens > 0:
+        # Most steps accept no draft token: test that before the costlier state read.
+        if request.py_num_accepted_draft_tokens > 0 and (
+            include_finished_requests or request.state != LlmRequestState.GENERATION_COMPLETE
+        ):
             if len(request.py_num_accepted_draft_tokens_indices) > 0:
                 run_kv_cache_relocation = True
     if not run_kv_cache_relocation:

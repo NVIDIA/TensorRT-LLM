@@ -39,6 +39,7 @@ from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
+from .sampling_shared_prefix import has_active_plan
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -142,6 +143,9 @@ class _FmhaCacheKey(NamedTuple):
     output_sf_dtype: torch.dtype | None
     # The query is the raw projection of a deferred prologue (Fmha.supports_deferred_prologue).
     deferred_prologue: bool
+    # Whether the batch was planned for the shared-prefix library, which
+    # supports a batch only when it was.
+    shared_prefix_plan: bool
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -427,6 +431,7 @@ class FmhaManager:
             deferred_prologue=(
                 forward_args.kv_append is not None and forward_args.kv_append.fold is not None
             ),
+            shared_prefix_plan=has_active_plan(metadata),
         )
 
     def select(
