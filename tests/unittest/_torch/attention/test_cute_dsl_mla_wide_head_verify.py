@@ -25,6 +25,12 @@ pytestmark = pytest.mark.skipif(
     reason="CuTe DSL MLA decode runs on SM100/SM103/SM107 only (see CuteDslMlaFmha)",
 )
 
+# Largest error allowed, as a share of the token's largest reference value: FP8 Q/K/V, an FP8
+# softmax probability in the PV product and a BF16 output (measured: at most ~2% on SM103 and
+# SM107). An absolute bound would not scale with the output, which reaches ~15 on the tokens
+# that attend to the scaled-up cache rows.
+_TOL = 5e-2
+
 
 @pytest.mark.parametrize("split_kv", [1, 4])
 @pytest.mark.parametrize("seq_len_q", [6, 8])
@@ -34,7 +40,8 @@ def test_fp8_wide_head_verify_group_matches_causal_reference(seq_len_q: int, spl
 
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-    torch.manual_seed(29)
+    # A CPU generator gives the same inputs on every GPU; CUDA randn values depend on the device.
+    generator = torch.Generator().manual_seed(29)
     device = torch.device("cuda")
     num_heads = 96
     latent_dim, rope_dim, page_size = 512, 64, 64
@@ -45,12 +52,21 @@ def test_fp8_wide_head_verify_group_matches_causal_reference(seq_len_q: int, spl
     num_pages = batch_size * blocks_per_sequence
     softmax_scale = 1.0 / math.sqrt(latent_dim + rope_dim)
 
+    # Unit-scale inputs give scores of standard deviation ~1, so the attention is far from uniform.
     q_storage = (
-        torch.randn(batch_size, seq_len_q, num_heads, latent_dim + rope_dim, device=device) * 0.1
-    ).to(torch.float8_e4m3fn)
-    cache_storage = (
-        torch.randn(num_pages, page_size, latent_dim + rope_dim, device=device) * 0.1
-    ).to(torch.float8_e4m3fn)
+        torch.randn(batch_size, seq_len_q, num_heads, latent_dim + rope_dim, generator=generator)
+        .to(device)
+        .to(torch.float8_e4m3fn)
+    )
+    cache_fp32 = torch.randn(num_pages, page_size, latent_dim + rope_dim, generator=generator)
+    # Scale up the cache rows of verify tokens 1..seq_len_q-1: each is visible to its own token
+    # and the later ones only, so a kernel that lets an earlier token see it moves that token's
+    # output far beyond the tolerance (checked below). Request b's block i is page
+    # b * blocks_per_sequence + i (see page_table).
+    for b, kv_len in enumerate(kv_lens):
+        for pos in range(kv_len - seq_len_q + 1, kv_len):
+            cache_fp32[b * blocks_per_sequence + pos // page_size, pos % page_size] *= 4.0
+    cache_storage = cache_fp32.to(device).to(torch.float8_e4m3fn)
     q_latent = q_storage[..., :latent_dim].permute(2, 3, 1, 0)
     q_rope = q_storage[..., latent_dim:].permute(2, 3, 1, 0)
     c_latent = cache_storage[..., :latent_dim].permute(1, 2, 0)
@@ -107,8 +123,13 @@ def test_fp8_wide_head_verify_group_matches_causal_reference(seq_len_q: int, spl
             query_latent = q_latent[:, :, t, b].float()
             query_rope = q_rope[:, :, t, b].float()
             scores = (
-                query_latent @ key_latent[:visible].transpose(0, 1)
-                + query_rope @ key_rope[:visible].transpose(0, 1)
+                query_latent @ key_latent.transpose(0, 1) + query_rope @ key_rope.transpose(0, 1)
             ) * softmax_scale
-            expected = torch.softmax(scores, dim=-1) @ key_latent[:visible]
-            torch.testing.assert_close(output_storage[b, t].float(), expected, rtol=5e-2, atol=5e-2)
+            expected = torch.softmax(scores[:, :visible], dim=-1) @ key_latent[:visible]
+            atol = _TOL * expected.abs().max().item()
+            if t < seq_len_q - 1:
+                # The check separates the causal bound from a leak: attending to the later verify
+                # tokens as well would move this token's output by many tolerances.
+                unmasked = torch.softmax(scores, dim=-1) @ key_latent
+                assert (unmasked - expected).abs().max() > 10 * atol
+            torch.testing.assert_close(output_storage[b, t].float(), expected, rtol=0, atol=atol)
