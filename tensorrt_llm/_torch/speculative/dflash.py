@@ -1997,34 +1997,14 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
-                    )
-
-                    # DFlash 2: replace the independent per-position picks with
-                    # one coherent path through the block (absent for plain
-                    # DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["first_prev_tokens"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-
                     gen_draft_tokens, vocab_size = self._sample_block_draft_tokens(
-                        draft_model, gen_logits, inputs, spec_metadata, num_contexts, batch_size
+                        draft_model,
+                        gen_logits,
+                        gen_hidden_states,
+                        inputs,
+                        spec_metadata,
+                        num_contexts,
+                        batch_size,
                     )
 
                 # Opt-in confidence-calibration recording (env-gated). The
@@ -2137,18 +2117,42 @@ class DFlashWorker(SpecWorkerBase):
         self,
         draft_model: nn.Module,
         gen_logits: torch.Tensor,
+        gen_hidden_states: torch.Tensor,
         inputs: dict,
         spec_metadata: SpecMetadata,
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Draw the ``[num_gens, K]`` int32 draft tokens from the refined block logits.
+        """Turn the raw ``[num_gens, K, vocab]`` block logits into ``[num_gens, K]`` int32 drafts.
 
         Also returns the vocab width of the logits the stored proposals use.
-        Plain DFlash positions are independent given the block forward, so the
-        shared block sampler draws them; a family whose positions condition on
-        the previous draft overrides this (``DSparkWorker``).
+        Plain DFlash refines the logits (:meth:`_refine_block_logits`, the
+        DFlash 2 candidate scorers) and draws every position with the shared
+        block sampler; a family whose positions condition on the previous
+        draft overrides this (``DSparkWorker``).
         """
+        num_gens, K = gen_logits.shape[:2]
+        gen_logits = self._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
+
+        # DFlash 2: replace the independent per-position picks with one
+        # coherent path through the block (absent for plain DFlash).
+        if getattr(draft_model, "lilicorr", None) is not None:
+            gen_logits = self._apply_lilicorr(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["lilicorr_anchor"],
+                spec_metadata,
+            )
+        elif getattr(draft_model, "has_candidate_selector", False):
+            gen_logits = self._apply_dflash2_selector(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["first_prev_tokens"],
+                spec_metadata,
+            )
+
         tokens = self.sample_draft_tokens(
             gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
         )

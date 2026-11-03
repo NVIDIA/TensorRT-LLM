@@ -152,7 +152,7 @@ def _sample_with(
     inputs = {"first_prev_tokens": anchors}
     with patch.object(SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(sampler)):
         return worker._sample_block_draft_tokens(
-            drafter, base, inputs, meta, num_contexts, num_contexts + base.shape[0]
+            drafter, base, None, inputs, meta, num_contexts, num_contexts + base.shape[0]
         )
 
 
@@ -277,11 +277,11 @@ def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> Non
     with patch.object(
         DFlashWorker, "_sample_block_draft_tokens", return_value=("dflash", V)
     ) as base_hook:
-        assert worker._sample_block_draft_tokens(drafter, base, inputs, greedy, 0, B) == (
+        assert worker._sample_block_draft_tokens(drafter, base, None, inputs, greedy, 0, B) == (
             "dflash",
             V,
         )
-        assert worker._sample_block_draft_tokens(no_head, base, inputs, sampled, 0, B) == (
+        assert worker._sample_block_draft_tokens(no_head, base, None, inputs, sampled, 0, B) == (
             "dflash",
             V,
         )
@@ -290,8 +290,6 @@ def test_only_sampled_drafts_with_a_markov_head_take_the_ancestral_path() -> Non
             _cpu_sampler(generator), worker, drafter, base, inputs["first_prev_tokens"], sampled
         )
         assert base_hook.call_count == 2 and tokens.shape == (B, K)
-    # Sampled drafts leave the logits unbiased: the chain bias is applied per drawn token.
-    assert torch.equal(worker._refine_block_logits(drafter, base, inputs, sampled), base)
 
 
 @pytest.mark.parametrize("num_contexts", [0, 2])
@@ -318,14 +316,14 @@ def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_con
     assert (meta.draft_probs[others] == 7.0).all()  # context and spare slots untouched
 
 
-@pytest.mark.parametrize("sampler", ["ancestral", "block"])
+@pytest.mark.parametrize("sampler", ["ancestral", "block", "step"])
 @pytest.mark.parametrize("temperature_only", [False, True])
 @pytest.mark.cpu_only
 def test_sampled_drafts_use_the_draft_sampling_parameters(
     temperature_only: bool, sampler: str
 ) -> None:
-    """The ancestral hook and the shared block sampler both draw with the request's filters,
-    or with its temperature alone under draft_temperature_only."""
+    """The ancestral hook and the shared block and step samplers draw with the request's
+    filters, or with its temperature alone under draft_temperature_only."""
     generator = torch.Generator().manual_seed(5)
     worker = _worker()
     drafter = _drafter(generator)
@@ -343,8 +341,12 @@ def test_sampled_drafts_use_the_draft_sampling_parameters(
             "_sample_from_logits_with_probs",
             staticmethod(_cpu_sampler(generator, calls)),
         ):
-            worker.advanced_sample_draft_block(base, meta, 0, B)
-        rows = B * K  # one launch over the flattened block
+            if sampler == "block":
+                worker.advanced_sample_draft_block(base, meta, 0, B)
+                rows = B * K  # one launch over the flattened block
+            else:
+                worker.advanced_sample_draft(base[:, 0], meta, B, draft_step=0)
+                rows = B
 
     assert len(calls) == (K if sampler == "ancestral" else 1)
     for step, call in enumerate(calls):
@@ -418,7 +420,7 @@ def test_sampled_block_captures_in_a_cuda_graph(temperature_only: bool) -> None:
     inputs = {"first_prev_tokens": anchors}
 
     graph, (tokens, _) = _capture(
-        lambda: worker._sample_block_draft_tokens(drafter, base, inputs, meta, 0, num_gens)
+        lambda: worker._sample_block_draft_tokens(drafter, base, None, inputs, meta, 0, num_gens)
     )
     meta.draft_probs.fill_(7.0)
     graph.replay()
