@@ -297,6 +297,9 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
+    if (stageName.contains("-Ray-")) {
+        return false
+    }
     // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
     if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
@@ -439,15 +442,17 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                         def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
                         sh "mkdir -p ${cbtsLocalDir}"
                         // Pack the per-process databases on the login node.
+                        def archiveScript = "cd '${remoteWs}' && { sleep 2; " +
+                            "echo CBTS remote coverage files: && " +
+                            "find . -maxdepth 1 -type f -name '.cbtscov.${stageName}*.sqlite' | wc -l; " +
+                            "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
+                            "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }"
+                        def archiveScriptB64 = archiveScript.bytes.encodeBase64().toString()
                         def archiveStatus = Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
                                 remote,
-                                "\"cd '${remoteWs}' && { sleep 2; " +
-                                "echo CBTS remote coverage files: && " +
-                                "find . -maxdepth 1 -type f -name '.cbtscov.${stageName}*.sqlite' | wc -l; " +
-                                "if tar czf '${cbtsArchive}' .cbtscov.${stageName}*.sqlite; then " +
-                                "tar tzf '${cbtsArchive}' >/dev/null; else rm -f '${cbtsArchive}'; exit 1; fi; }\""
+                                "\"echo ${archiveScriptB64} | base64 -d | bash\""
                             ),
                             returnStatus: true,
                             numRetries: 3,
