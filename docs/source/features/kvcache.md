@@ -100,7 +100,9 @@ Models whose preference selects the V2 manager when the setting is `auto`:
 
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
-unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+unified pool, so `use_kv_cache_manager_v2` does not apply to them. Skip Softmax
+Attention is the exception: it changes only the attention kernel, keeps the
+dense KV cache layout, and follows `use_kv_cache_manager_v2` like a dense model.
 
 For a model whose `layer_types` mixes sliding-window and full-attention layers
 and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
@@ -123,8 +125,9 @@ beam width. The transceiver transfers the shared prompt KV once; the generation
 worker expands the beams after the transfer completes. Block reuse remains
 supported. The Python implementation selected by
 `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python` is separate from the Python transceiver
-and does not support beam search. Hybrid Mamba, sparse attention, KV connectors,
-and pipelined KV transfer remain unsupported with V2 beam search.
+and does not support beam search. Hybrid Mamba, sparse attention other than
+Skip Softmax Attention, KV connectors, and pipelined KV transfer remain
+unsupported with V2 beam search.
 
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).
