@@ -29,6 +29,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock)
 {
+    TLLM_CHECK_WITH_INFO(!buffer.allocationGroupId.has_value(),
+        "A buffer with allocation_group_id must resolve its declared allocation group");
     return std::visit(
         [&](auto const& cfg) -> LifeCycle
         {
@@ -46,22 +48,44 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, in
         layer);
 }
 
+LifeCycle makeLifeCycle(AllocationGroupConfig const& group, int tokensPerBlock)
+{
+    group.validate();
+    if (group.allocationUnit == AllocationUnit::kFixed)
+    {
+        return SsmLifeCycle{group.reusePolicy};
+    }
+    return AttnLifeCycle::make(group.slidingWindowSize, group.numSinkTokens, tokensPerBlock, group.reusePolicy);
+}
+
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry
 // ---------------------------------------------------------------------------
 
 LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
 {
-    auto const registerLifeCycle = [this](LifeCycle const& lc)
+    config.validateAllocationGroups();
+    std::map<AllocationGroupId, AllocationGroupConfig const*> explicitGroups;
+    for (auto const& group : config.allocationGroups)
+    {
+        explicitGroups.emplace(group.allocationGroupId, &group);
+    }
+    auto const appendLifeCycle = [this](LifeCycle const& lc)
+    {
+        LifeCycleId const id = mLifeCycleList.size();
+        mLifeCycleList.push_back(lc);
+        if (std::holds_alternative<SsmLifeCycle>(lc))
+        {
+            mSsmLifeCycleIds.push_back(id);
+        }
+        return id;
+    };
+    auto const registerLifeCycle = [this, &appendLifeCycle](LifeCycle const& lc)
     {
         if (mLifeCycleIdMap.find(lc) == mLifeCycleIdMap.end())
         {
             check();
-            LifeCycleId id = mLifeCycleList.size();
-            mLifeCycleList.push_back(lc);
-            mLifeCycleIdMap[lc] = id;
-            if (std::holds_alternative<SsmLifeCycle>(lc))
-                mSsmLifeCycleIds.push_back(id);
+            mLifeCycleIdMap[lc] = appendLifeCycle(lc);
         }
     };
     for (auto const& layer : config.layers)
@@ -69,7 +93,19 @@ LifeCycleRegistry::LifeCycleRegistry(KVCacheManagerConfig const& config)
         std::visit([](auto const& cfg) { cfg.validate(); }, layer);
         for (auto const& buffer : layerBuffers(layer))
         {
-            registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
+            if (buffer.allocationGroupId.has_value())
+            {
+                AllocationGroupId const id = *buffer.allocationGroupId;
+                if (mAllocationGroupIdMap.find(id) == mAllocationGroupIdMap.end())
+                {
+                    mAllocationGroupIdMap[id]
+                        = appendLifeCycle(makeLifeCycle(*explicitGroups.at(id), config.tokensPerBlock));
+                }
+            }
+            else
+            {
+                registerLifeCycle(makeLifeCycle(layer, buffer, config.tokensPerBlock));
+            }
         }
     }
     check();
@@ -93,6 +129,13 @@ LifeCycleId LifeCycleRegistry::getId(LifeCycle const& lc) const
         throw std::out_of_range("LifeCycleRegistry::getId: life cycle not found");
     }
     return it->second;
+}
+
+LifeCycleId LifeCycleRegistry::getId(AllocationGroupId id) const
+{
+    auto const found = mAllocationGroupIdMap.find(id);
+    TLLM_CHECK_WITH_INFO(found != mAllocationGroupIdMap.end(), "Unknown allocation_group_id %d", id.value());
+    return found->second;
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

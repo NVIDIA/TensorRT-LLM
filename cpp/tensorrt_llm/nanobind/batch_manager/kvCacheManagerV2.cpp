@@ -1790,18 +1790,62 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "layer's own id, so a layer that names nothing never shares, and no explicit id "
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
+    nb::enum_<kv::AllocationUnit>(m, "AllocationUnit")
+        .value("TOKEN_BLOCK", kv::AllocationUnit::kTokenBlock)
+        .value("FIXED", kv::AllocationUnit::kFixed);
+
+    nb::class_<kv::AllocationGroupConfig>(m, "AllocationGroupConfig")
+        .def(
+            "__init__",
+            [](kv::AllocationGroupConfig* group, int allocationGroupId, kv::AllocationUnit allocationUnit,
+                std::optional<int> slidingWindowSize, std::optional<int> numSinkTokens, kv::ReusePolicy reusePolicy)
+            {
+                new (group) kv::AllocationGroupConfig{kv::AllocationGroupId{allocationGroupId}, allocationUnit,
+                    slidingWindowSize, numSinkTokens, reusePolicy};
+            },
+            nb::arg("allocation_group_id"), nb::arg("allocation_unit"), nb::arg("sliding_window_size") = std::nullopt,
+            nb::arg("num_sink_tokens") = std::nullopt, nb::arg("reuse_policy") = kv::ReusePolicy::REQUIRED)
+        .def_prop_rw(
+            "allocation_group_id",
+            [](kv::AllocationGroupConfig const& group) { return group.allocationGroupId.value(); },
+            [](kv::AllocationGroupConfig& group, int value) { group.allocationGroupId = kv::AllocationGroupId{value}; })
+        .def_rw("allocation_unit", &kv::AllocationGroupConfig::allocationUnit)
+        .def_rw("sliding_window_size", &kv::AllocationGroupConfig::slidingWindowSize)
+        .def_rw("num_sink_tokens", &kv::AllocationGroupConfig::numSinkTokens)
+        .def_rw("reuse_policy", &kv::AllocationGroupConfig::reusePolicy) DEF_COPY(kv::AllocationGroupConfig);
+
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+        .def(
+            "__init__",
+            [](kv::BufferConfig* buffer, kv::DataRole role, size_t size, std::optional<int> tokensPerBlockOverride,
+                bool isSparse, int coalescingGroup, int sparseUnitChunks, std::optional<kv::ReusePolicy> reusePolicy,
+                std::optional<int> allocationGroupId)
+            {
+                new (buffer) kv::BufferConfig{std::move(role), size, tokensPerBlockOverride, isSparse, coalescingGroup,
+                    sparseUnitChunks, reusePolicy,
+                    allocationGroupId.has_value() ? std::optional{kv::AllocationGroupId{*allocationGroupId}}
+                                                  : std::nullopt};
+            },
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
-            nb::arg("reuse_policy") = std::nullopt)
+            nb::arg("reuse_policy") = std::nullopt, nb::arg("allocation_group_id") = std::nullopt)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
-        .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
+        .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy)
+        .def_prop_rw(
+            "allocation_group_id",
+            [](kv::BufferConfig const& buffer) -> std::optional<int> {
+                return buffer.allocationGroupId.has_value() ? std::optional{buffer.allocationGroupId->value()}
+                                                            : std::nullopt;
+            },
+            [](kv::BufferConfig& buffer, std::optional<int> value) {
+                buffer.allocationGroupId
+                    = value.has_value() ? std::optional{kv::AllocationGroupId{*value}} : std::nullopt;
+            }) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>,
@@ -1935,7 +1979,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
-                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota)
+                kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
+                std::vector<kv::AllocationGroupConfig> allocationGroups)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1962,6 +2007,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->poolRebalance = std::move(poolRebalance);
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
+                cfg->allocationGroups = std::move(allocationGroups);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1974,10 +2020,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
-            nb::arg("host_sparse_pool_quota").none() = std::nullopt)
+            nb::arg("host_sparse_pool_quota").none() = std::nullopt,
+            nb::arg("allocation_groups") = std::vector<kv::AllocationGroupConfig>{})
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
+        .def_rw("allocation_groups", &kv::KVCacheManagerConfig::allocationGroups)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)

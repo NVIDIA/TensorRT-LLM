@@ -91,6 +91,7 @@ class PageIndexMode(enum.IntEnum):
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
+AllocationGroupId = NewType("AllocationGroupId", int)
 CacheGroupId: TypeAlias = LifeCycleId
 LayerGroupId: TypeAlias = LifeCycleId
 
@@ -279,6 +280,20 @@ class DiskCacheTierConfig:
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
 
+class AllocationUnit(enum.Enum):
+    TOKEN_BLOCK = 0
+    FIXED = 1
+
+@dataclass(slots=True)
+class AllocationGroupConfig:
+    """One independently owned allocation group with an explicit lifecycle."""
+
+    allocation_group_id: AllocationGroupId
+    allocation_unit: AllocationUnit
+    sliding_window_size: int | None = None
+    num_sink_tokens: int | None = None
+    reuse_policy: ReusePolicy = ...
+
 @dataclass(slots=True, frozen=True)
 class BufferConfig:
     """One buffer of a layer's KV cache.
@@ -287,6 +302,10 @@ class BufferConfig:
     buffers can override the layer's policy; the buffer then belongs to the
     layer group for its effective policy and lifecycle properties while keeping
     its layer ID, so one layer can span several layer groups.
+
+    ``allocation_group_id`` selects an explicit group's allocation and reuse
+    policy instead of the layer's defaults. A supplied ``reuse_policy`` must
+    agree with that group's policy.
 
     ``is_sparse`` marks a buffer whose history is too large for device memory and is read
     through a per-request device cache rather than directly (see
@@ -351,6 +370,7 @@ class BufferConfig:
     expressible.
     """
     reuse_policy: ReusePolicy | None = None
+    allocation_group_id: AllocationGroupId | None = None
 
 @dataclass(slots=True)
 class SparseCacheConfig:
@@ -509,6 +529,7 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    allocation_groups: list[AllocationGroupConfig] = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

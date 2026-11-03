@@ -29,6 +29,30 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+void AllocationGroupConfig::validate() const
+{
+    TLLM_CHECK_WITH_INFO(allocationGroupId >= 0, "AllocationGroupConfig: allocation_group_id must be non-negative");
+    TLLM_CHECK_WITH_INFO(allocationUnit == AllocationUnit::kTokenBlock || allocationUnit == AllocationUnit::kFixed,
+        "AllocationGroupConfig: unknown allocation_unit");
+    TLLM_CHECK_WITH_INFO(reusePolicy == ReusePolicy::REQUIRED || reusePolicy == ReusePolicy::PRIVATE
+            || reusePolicy == ReusePolicy::OPTIONAL,
+        "AllocationGroupConfig: unknown reuse_policy");
+    if (allocationUnit == AllocationUnit::kFixed)
+    {
+        TLLM_CHECK_WITH_INFO(!slidingWindowSize.has_value() && !numSinkTokens.has_value(),
+            "AllocationGroupConfig: FIXED allocation does not accept sliding_window_size or num_sink_tokens");
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(!slidingWindowSize.has_value() || *slidingWindowSize > 0,
+            "AllocationGroupConfig: sliding_window_size must be positive when set");
+        TLLM_CHECK_WITH_INFO(!numSinkTokens.has_value() || *numSinkTokens >= 0,
+            "AllocationGroupConfig: num_sink_tokens must be non-negative");
+        TLLM_CHECK_WITH_INFO(numSinkTokens.value_or(0) == 0 || slidingWindowSize.has_value(),
+            "AllocationGroupConfig: num_sink_tokens requires sliding_window_size");
+    }
+}
+
 void SelectionUnitLayout::validate(size_t unitSize) const
 {
     TLLM_CHECK_WITH_INFO(
@@ -167,6 +191,68 @@ void _validateSelectionIds(std::vector<LayerConfig> const& layers)
 
 } // namespace
 
+void KVCacheManagerConfig::validateAllocationGroups() const
+{
+    std::map<AllocationGroupId, AllocationGroupConfig const*> groups;
+    for (auto const& group : allocationGroups)
+    {
+        group.validate();
+        TLLM_CHECK_WITH_INFO(groups.emplace(group.allocationGroupId, &group).second,
+            "KVCacheManagerConfig: duplicate allocation_group_id %d", group.allocationGroupId.value());
+    }
+
+    std::set<AllocationGroupId> referenced;
+    bool hasImplicitRequiredFixed = false;
+    for (auto const& layer : layers)
+    {
+        for (auto const& buffer : layerBuffers(layer))
+        {
+            if (!buffer.allocationGroupId.has_value())
+            {
+                if (auto const* fixed = std::get_if<SsmLayerConfig>(&layer))
+                {
+                    hasImplicitRequiredFixed
+                        |= buffer.effectiveReusePolicy(fixed->reusePolicy) == ReusePolicy::REQUIRED;
+                }
+                continue;
+            }
+            AllocationGroupId const id = *buffer.allocationGroupId;
+            auto const found = groups.find(id);
+            TLLM_CHECK_WITH_INFO(found != groups.end(),
+                "KVCacheManagerConfig: buffer '%s' references undeclared allocation_group_id %d", buffer.role.c_str(),
+                id.value());
+            auto const& group = *found->second;
+            referenced.insert(id);
+            TLLM_CHECK_WITH_INFO(!buffer.reusePolicy.has_value() || *buffer.reusePolicy == group.reusePolicy,
+                "KVCacheManagerConfig: buffer '%s' reuse_policy conflicts with allocation group %d",
+                buffer.role.c_str(), id.value());
+            if (group.allocationUnit == AllocationUnit::kFixed)
+            {
+                TLLM_CHECK_WITH_INFO(!buffer.tokensPerBlockOverride.has_value(),
+                    "KVCacheManagerConfig: FIXED allocation group %d does not support tokens_per_block_override",
+                    id.value());
+                TLLM_CHECK_WITH_INFO(!buffer.isSparse,
+                    "KVCacheManagerConfig: FIXED allocation group %d does not support sparse buffers", id.value());
+            }
+        }
+    }
+
+    int requiredFixedGroups = hasImplicitRequiredFixed ? 1 : 0;
+    for (auto const& [id, group] : groups)
+    {
+        TLLM_CHECK_WITH_INFO(
+            referenced.count(id) != 0, "KVCacheManagerConfig: allocation group %d has no buffers", id.value());
+        if (group->allocationUnit == AllocationUnit::kFixed)
+        {
+            TLLM_CHECK_WITH_INFO(commitMinSnapshot,
+                "KVCacheManagerConfig: FIXED allocation group %d requires commit_min_snapshot=True", id.value());
+            requiredFixedGroups += group->reusePolicy == ReusePolicy::REQUIRED ? 1 : 0;
+        }
+    }
+    TLLM_CHECK_WITH_INFO(requiredFixedGroups <= 1,
+        "KVCacheManagerConfig: multiple REQUIRED fixed allocation groups are not supported by prefix matching");
+}
+
 void KVCacheManagerConfig::validate() const
 {
     if (swaScratchReuse.has_value())
@@ -249,12 +335,16 @@ void KVCacheManagerConfig::validate() const
     }
 
     _validateSelectionIds(layers);
+    validateAllocationGroups();
 
     // SSM-specific validation.
     bool hasSSM = false;
     for (auto const& layer : layers)
     {
-        if (std::holds_alternative<SsmLayerConfig>(layer))
+        if (auto const* ssm = std::get_if<SsmLayerConfig>(&layer); ssm != nullptr
+            && (ssm->buffers.empty()
+                || std::any_of(ssm->buffers.begin(), ssm->buffers.end(),
+                    [](BufferConfig const& buffer) { return !buffer.allocationGroupId.has_value(); })))
         {
             hasSSM = true;
             break;

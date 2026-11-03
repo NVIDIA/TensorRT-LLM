@@ -49,7 +49,9 @@ TEST(KvCacheManagerV2ConfigTest, ExistingBufferConfigurationDefaultsToDense)
 {
     BufferConfig const buffer{"key", 4096, 2};
     EXPECT_FALSE(buffer.isSparse);
+    EXPECT_FALSE(buffer.allocationGroupId.has_value());
     EXPECT_EQ(buffer.tokensPerBlockOverride, 2);
+    EXPECT_TRUE(makeConfig().allocationGroups.empty());
     EXPECT_NO_THROW(makeConfig().validate());
 }
 
@@ -241,6 +243,190 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     EXPECT_NE(grouping[required], grouping[privateLc]);
     EXPECT_NE(grouping[required], grouping[optional]);
     EXPECT_NE(grouping[privateLc], grouping[optional]);
+}
+
+TEST(KvCacheManagerV2ConfigTest, ExplicitGroupsPreserveEquivalentImplicitStorageLayout)
+{
+    auto implicitConfig = makeTieredConfig();
+    implicitConfig.commitMinSnapshot = true;
+    implicitConfig.layers = {makeAttentionLayer(0, false), makeAttentionLayer(1, false),
+        SsmLayerConfig{2, {BufferConfig{"state", 2048}, BufferConfig{"conv", 1024}}},
+        SsmLayerConfig{3, {BufferConfig{"state", 2048}, BufferConfig{"conv", 1024}}}};
+    auto explicitConfig = implicitConfig;
+    explicitConfig.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{8}},
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{19}, .allocationUnit = AllocationUnit::kFixed}};
+    for (auto& layer : explicitConfig.layers)
+    {
+        std::visit(
+            [](auto& value)
+            {
+                for (auto& buffer : value.buffers)
+                {
+                    buffer.allocationGroupId = AllocationGroupId{value.layerId < 2 ? 8 : 19};
+                }
+            },
+            layer);
+    }
+    ASSERT_NO_THROW(implicitConfig.validate());
+    ASSERT_NO_THROW(explicitConfig.validate());
+    auto const implicitStorage = createStorageConfig(implicitConfig);
+    auto const explicitStorage = createStorageConfig(explicitConfig);
+    EXPECT_EQ(implicitStorage.slotDescList.size(), explicitStorage.slotDescList.size());
+    EXPECT_EQ(implicitStorage.lifeCycleGrouping(), explicitStorage.lifeCycleGrouping());
+    auto const expected = implicitStorage.bufferAttributes();
+    auto const actual = explicitStorage.bufferAttributes();
+    ASSERT_EQ(expected.size(), actual.size());
+    for (auto const& [buffer, before] : expected)
+    {
+        auto const& after = actual.at(buffer);
+        EXPECT_EQ(before.lifeCycleId, after.lifeCycleId);
+        EXPECT_EQ(before.poolIndex, after.poolIndex);
+        EXPECT_EQ(before.offset, after.offset);
+        EXPECT_EQ(before.size, after.size);
+        EXPECT_EQ(before.expansion, after.expansion);
+        EXPECT_EQ(before.scratchPagesPerBlock, after.scratchPagesPerBlock);
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, EqualExplicitPoliciesKeepIndependentAllocationGroups)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{10},
+                                   .allocationUnit = AllocationUnit::kFixed,
+                                   .reusePolicy = ReusePolicy::PRIVATE},
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{20},
+            .allocationUnit = AllocationUnit::kFixed,
+            .reusePolicy = ReusePolicy::PRIVATE}};
+    config.layers.emplace_back(AttentionLayerConfig{.layerId = 1,
+        .buffers = {BufferConfig{.role = "first", .size = 4096, .allocationGroupId = AllocationGroupId{10}},
+            BufferConfig{.role = "second", .size = 4096, .allocationGroupId = AllocationGroupId{20}}}});
+    config.layers.emplace_back(SsmLayerConfig{2, {BufferConfig{"implicit", 4096}}, ReusePolicy::PRIVATE});
+    ASSERT_NO_THROW(config.validate());
+    LifeCycleRegistry const registry(config);
+    auto const first = registry.getId(AllocationGroupId{10});
+    auto const second = registry.getId(AllocationGroupId{20});
+    auto const implicit = registry.getId(SsmLifeCycle{ReusePolicy::PRIVATE});
+    EXPECT_NE(first, second);
+    EXPECT_NE(first, implicit);
+    EXPECT_NE(second, implicit);
+    EXPECT_EQ(registry[first], registry[second]);
+    EXPECT_EQ(registry[first], registry[implicit]);
+    auto const storage = createStorageConfig(config);
+    EXPECT_EQ(storage.bufferAttributes().at(BufferId{1, "first"}).lifeCycleId, first);
+    EXPECT_EQ(storage.bufferAttributes().at(BufferId{1, "second"}).lifeCycleId, second);
+    EXPECT_EQ(storage.layerToLifeCycleIds().at(1), (std::vector<LifeCycleId>{first, second}));
+    auto const pools = storage.lifeCycleGrouping();
+    EXPECT_EQ(pools[first], pools[second]);
+    EXPECT_EQ(storage.slotDescList[pools[first]].variants.size(), 3U);
+    EXPECT_THROW(makeLifeCycle(config.layers[1], layerBuffers(config.layers[1]).front(), config.tokensPerBlock),
+        std::runtime_error);
+}
+
+TEST(KvCacheManagerV2ConfigTest, ExplicitBlockGroupsDoNotNeedDifferentWindows)
+{
+    auto config = makeConfig();
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1}},
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{2}}};
+    config.layers
+        = {AttentionLayerConfig{.layerId = 0,
+               .buffers = {BufferConfig{.role = "key", .size = 4096, .allocationGroupId = AllocationGroupId{1}}}},
+            AttentionLayerConfig{.layerId = 1,
+                .buffers = {BufferConfig{.role = "key", .size = 8192, .allocationGroupId = AllocationGroupId{2}}}}};
+    ASSERT_NO_THROW(config.validate());
+    LifeCycleRegistry const registry(config);
+    auto const first = registry.getId(AllocationGroupId{1});
+    auto const second = registry.getId(AllocationGroupId{2});
+    EXPECT_NE(first, second);
+    EXPECT_EQ(registry[first], registry[second]);
+    EXPECT_FALSE(std::get<AttnLifeCycle>(registry[first]).windowSize.has_value());
+    auto const storage = createStorageConfig(config);
+    EXPECT_NE(storage.lifeCycleGrouping()[first], storage.lifeCycleGrouping()[second]);
+    EXPECT_THROW(registry.getId(registry[first]), std::out_of_range);
+}
+
+TEST(KvCacheManagerV2ConfigTest, ExplicitAllocationUnitOverridesLayerKind)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1},
+                                   .allocationUnit = AllocationUnit::kFixed,
+                                   .reusePolicy = ReusePolicy::PRIVATE},
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{2}}};
+    config.layers = {
+        AttentionLayerConfig{.layerId = 0,
+            .buffers = {BufferConfig{.role = "state", .size = 4096, .allocationGroupId = AllocationGroupId{1}}}},
+        SsmLayerConfig{.layerId = 1,
+            .buffers = {BufferConfig{
+                .role = "key", .size = 2048, .tokensPerBlockOverride = 2, .allocationGroupId = AllocationGroupId{2}}}}};
+    ASSERT_NO_THROW(config.validate());
+    LifeCycleRegistry const registry(config);
+    EXPECT_TRUE(registry.isSsm(registry.getId(AllocationGroupId{1})));
+    EXPECT_FALSE(registry.isSsm(registry.getId(AllocationGroupId{2})));
+    auto const storage = createStorageConfig(config);
+    EXPECT_EQ(storage.bufferAttributes().at(BufferId{1, "key"}).expansion, config.tokensPerBlock / 2);
+
+    config.layers.erase(config.layers.begin());
+    config.allocationGroups.erase(config.allocationGroups.begin());
+    config.commitMinSnapshot = false;
+    EXPECT_NO_THROW(config.validate());
+}
+
+TEST(KvCacheManagerV2ConfigTest, ExplicitGroupReferencesAndPoliciesAreValidated)
+{
+    auto valid = makeConfig();
+    valid.commitMinSnapshot = true;
+    valid.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1},
+        .allocationUnit = AllocationUnit::kFixed,
+        .reusePolicy = ReusePolicy::PRIVATE}};
+    std::get<AttentionLayerConfig>(valid.layers[0]).buffers[0].allocationGroupId = AllocationGroupId{1};
+    auto reject = [](KVCacheManagerConfig const& config)
+    {
+        EXPECT_THROW(config.validate(), std::runtime_error);
+        EXPECT_THROW(createStorageConfig(config), std::runtime_error);
+    };
+    auto config = valid;
+    config.allocationGroups.push_back(config.allocationGroups.front());
+    reject(config);
+    config = valid;
+    config.allocationGroups.clear();
+    reject(config);
+    config = valid;
+    config.allocationGroups.push_back(AllocationGroupConfig{.allocationGroupId = AllocationGroupId{2}});
+    reject(config);
+    config = valid;
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].reusePolicy = ReusePolicy::REQUIRED;
+    reject(config);
+    config = valid;
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].tokensPerBlockOverride = 2;
+    reject(config);
+    config = valid;
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].isSparse = true;
+    reject(config);
+    config = valid;
+    config.allocationGroups[0].slidingWindowSize = 16;
+    reject(config);
+    config = valid;
+    config.commitMinSnapshot = false;
+    reject(config);
+}
+
+TEST(KvCacheManagerV2ConfigTest, MultipleRequiredFixedGroupsAreRejectedBeforeMatching)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups
+        = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1}, .allocationUnit = AllocationUnit::kFixed}};
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].allocationGroupId = AllocationGroupId{1};
+    config.layers.emplace_back(SsmLayerConfig{1, {BufferConfig{"state", 4096}}});
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    EXPECT_THROW(createStorageConfig(config), std::runtime_error);
+
+    config.allocationGroups.push_back(
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{2}, .allocationUnit = AllocationUnit::kFixed});
+    std::get<SsmLayerConfig>(config.layers[1]).buffers[0].allocationGroupId = AllocationGroupId{2};
+    EXPECT_THROW(config.validate(), std::runtime_error);
+    EXPECT_THROW(createStorageConfig(config), std::runtime_error);
 }
 
 } // namespace

@@ -55,6 +55,8 @@ _cpp = _load_cpp_module()
 DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY = _cpp.DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
 
 AggregatedPageDesc = _cpp.AggregatedPageDesc
+AllocationGroupConfig = _cpp.AllocationGroupConfig
+AllocationUnit = _cpp.AllocationUnit
 AttentionLayerConfig = _cpp.AttentionLayerConfig
 ReusePolicy = _cpp.ReusePolicy
 AttnLifeCycle = _cpp.AttnLifeCycle
@@ -139,6 +141,7 @@ class _KVCacheManagerConfigFieldSpec:
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     host_sparse_pool_quota: object = None
+    allocation_groups: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -184,6 +187,7 @@ sequence_to_blockchain_keys = _cpp.sequence_to_blockchain_keys
 take_poison = _cpp.take_poison
 
 BeamIndex = int
+AllocationGroupId = int
 CacheGroupId = int
 CacheLevel = int
 CacheTierConfig = Union[GpuCacheTierConfig, HostCacheTierConfig, DiskCacheTierConfig]
@@ -220,6 +224,9 @@ def typed_range(*args: int) -> range:
 
 __all__ = [
     "AggregatedPageDesc",
+    "AllocationGroupConfig",
+    "AllocationGroupId",
+    "AllocationUnit",
     "AttentionLayerConfig",
     "ReusePolicy",
     "BAD_PAGE_INDEX",

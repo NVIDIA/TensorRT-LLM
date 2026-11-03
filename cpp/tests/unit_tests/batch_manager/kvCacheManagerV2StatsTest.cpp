@@ -747,6 +747,102 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
     manager->shutdown();
 }
 
+TEST_F(ReplayCacheTest, ExplicitFixedGroupsUseIndependentSlotsAcrossRequests)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{10},
+                                   .allocationUnit = AllocationUnit::kFixed,
+                                   .reusePolicy = ReusePolicy::PRIVATE},
+        AllocationGroupConfig{.allocationGroupId = AllocationGroupId{20},
+            .allocationUnit = AllocationUnit::kFixed,
+            .reusePolicy = ReusePolicy::PRIVATE}};
+    config.layers = {AttentionLayerConfig{.layerId = 0,
+        .buffers = {BufferConfig{.role = "first", .size = 4096, .allocationGroupId = AllocationGroupId{10}},
+            BufferConfig{.role = "second", .size = 4096, .allocationGroupId = AllocationGroupId{20}}}}};
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const firstGroup = manager->getBufferGroupId(0, "first");
+    auto const secondGroup = manager->getBufferGroupId(0, "second");
+    ASSERT_NE(firstGroup, secondGroup);
+    EXPECT_THROW(manager->getLayerGroupId(0), std::runtime_error);
+    EXPECT_THROW(manager->layerGrouping(), std::runtime_error);
+    auto const initialFree = manager->storage().getStatistics().free;
+    auto address = [&](KvCache const& cache, DataRole const& role)
+    {
+        auto const group = manager->getBufferGroupId(0, role);
+        return manager->getMemPoolBaseAddress(0, role)
+            + static_cast<size_t>(cache.getSsmBlockBaseIndex(group)) * manager->getPageIndexScale(0, role)
+            * manager->getPageStride(0, role);
+    };
+    auto first = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(first->resume(mStream));
+    ASSERT_NE(first->getSsmBlockBaseIndex(firstGroup), first->getSsmBlockBaseIndex(secondGroup));
+    ASSERT_NE(address(*first, "first"), address(*first, "second"));
+    auto const allocatedFree = manager->storage().getStatistics().free;
+    ASSERT_TRUE(first->resize(128));
+    EXPECT_EQ(manager->storage().getStatistics().free, allocatedFree);
+    auto second = manager->createKvCache({}, {}, 2);
+    ASSERT_TRUE(second->resume(mStream));
+    for (auto const& role : {"first", "second"})
+    {
+        EXPECT_NE(address(*first, role), address(*second, role));
+    }
+    EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address(*second, "first")), 0x3A, 4096, mStream), cudaSuccess);
+    EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address(*second, "second")), 0x7C, 4096, mStream), cudaSuccess);
+    first->close();
+    second->suspend();
+    ASSERT_TRUE(second->resume(mStream));
+    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    for (auto const& [role, expected] :
+        std::array<std::pair<char const*, uint8_t>, 2>{{{"first", 0x3A}, {"second", 0x7C}}})
+    {
+        std::vector<uint8_t> data(4096);
+        EXPECT_EQ(cudaMemcpy(data.data(), reinterpret_cast<void const*>(address(*second, role)), data.size(),
+                      cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_TRUE(std::all_of(data.begin(), data.end(), [expected](uint8_t value) { return value == expected; }));
+    }
+    second->close();
+    EXPECT_EQ(manager->storage().getStatistics().free, initialFree);
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, ExplicitFixedGroupSnapshotsWithoutSsmLayer)
+{
+    auto config = makeConfig();
+    config.commitMinSnapshot = true;
+    config.allocationGroups
+        = {AllocationGroupConfig{.allocationGroupId = AllocationGroupId{1}, .allocationUnit = AllocationUnit::kFixed}};
+    std::get<AttentionLayerConfig>(config.layers[0]).buffers[0].allocationGroupId = AllocationGroupId{1};
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto const group = manager->getBufferGroupId(0, "key");
+    auto address = [&](KvCache const& cache)
+    {
+        return manager->getMemPoolBaseAddress(0, "key")
+            + static_cast<size_t>(cache.getSsmBlockBaseIndex(group)) * manager->getPageStride(0, "key");
+    };
+    auto source = manager->createKvCache({}, {}, 1);
+    ASSERT_TRUE(source->resume(mStream));
+    ASSERT_TRUE(source->resize(8));
+    EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address(*source)), 0x61, 4096, mStream), cudaSuccess);
+    auto const tokens = makeTokens(8);
+    TokenSpan const span{tokens.data(), 8};
+    source->commit(span);
+    auto reader = manager->createKvCache({}, span, 2);
+    ASSERT_EQ(reader->numCommittedTokens(), 8);
+    ASSERT_TRUE(reader->resume(mStream));
+    EXPECT_NE(address(*source), address(*reader));
+    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    std::vector<uint8_t> data(4096);
+    EXPECT_EQ(
+        cudaMemcpy(data.data(), reinterpret_cast<void const*>(address(*reader)), data.size(), cudaMemcpyDeviceToHost),
+        cudaSuccess);
+    EXPECT_TRUE(std::all_of(data.begin(), data.end(), [](uint8_t value) { return value == 0x61; }));
+    reader->close();
+    source->close();
+    manager->shutdown();
+}
+
 TEST_F(ReplayCacheTest, ClosingScratchCacheReleasesEverySlotExactlyOnce)
 {
     auto config = makeConfig();

@@ -164,6 +164,9 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
 // Factory: create the LifeCycle that holds one buffer of a layer, using the buffer's effective reuse policy.
 LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock);
 
+//! Resolve a declared group's allocation behavior without consulting the layer that addresses its buffers.
+LifeCycle makeLifeCycle(AllocationGroupConfig const& group, int tokensPerBlock);
+
 // Integer id assigned to each unique LifeCycle.
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
@@ -186,8 +189,11 @@ public:
     LifeCycle const& operator[](LifeCycleId id) const;
     LifeCycle const& getLifeCycle(LifeCycleId id) const;
 
-    // Look up the id for a LifeCycle (throws if not found).
+    // Look up an implicitly grouped LifeCycle (throws if not found).
     LifeCycleId getId(LifeCycle const& lc) const;
+
+    //! Look up an explicitly named allocation group; equal policies do not share this identity.
+    LifeCycleId getId(AllocationGroupId id) const;
 
     // Number of unique life cycles.
     [[nodiscard]] LifeCycleId size() const noexcept
@@ -302,12 +308,14 @@ private:
         if (TLLM_UNLIKELY(gDebug))
         {
             TLLM_CHECK_WITH_INFO(
-                toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
+                toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size() + mAllocationGroupIdMap.size(),
+                "corrupted life cycle registry");
         }
     }
 
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
+    std::map<AllocationGroupId, LifeCycleId> mAllocationGroupIdMap;
     std::vector<LifeCycleId> mSsmLifeCycleIds;
 };
 

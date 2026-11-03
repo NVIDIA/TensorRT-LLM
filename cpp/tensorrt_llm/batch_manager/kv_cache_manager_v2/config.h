@@ -143,6 +143,26 @@ enum class ReusePolicy
     OPTIONAL = 2,
 };
 
+//! Caller-owned identity of buffers that allocate and release their slots together.
+using AllocationGroupId = StrongIndex<int, struct AllocationGroupIdTag>;
+
+enum class AllocationUnit
+{
+    kTokenBlock,
+    kFixed,
+};
+
+struct AllocationGroupConfig
+{
+    AllocationGroupId allocationGroupId;
+    AllocationUnit allocationUnit = AllocationUnit::kTokenBlock;
+    std::optional<int> slidingWindowSize;
+    std::optional<int> numSinkTokens;
+    ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+
+    void validate() const;
+};
+
 // ---------------------------------------------------------------------------
 // Buffer configuration (one buffer inside an attention or SSM layer).
 // ---------------------------------------------------------------------------
@@ -209,6 +229,9 @@ struct BufferConfig
     //! Reuse policy of this buffer; nullopt inherits the layer's policy. Overrides can
     //! place buffers of one attention or SSM layer in different lifecycle groups.
     std::optional<ReusePolicy> reusePolicy;
+
+    //! An explicit group owns this buffer's allocation and reuse policy; the layer supplies only its address.
+    std::optional<AllocationGroupId> allocationGroupId;
 
     [[nodiscard]] ReusePolicy effectiveReusePolicy(ReusePolicy layerPolicy) const noexcept
     {
@@ -359,11 +382,11 @@ struct SsmLayerConfig
         detail::validateNoDuplicateBufferRoles(buffers);
         for (auto const& buf : buffers)
         {
-            if (buf.tokensPerBlockOverride.has_value())
+            if (!buf.allocationGroupId.has_value() && buf.tokensPerBlockOverride.has_value())
             {
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
             }
-            if (buf.isSparse)
+            if (!buf.allocationGroupId.has_value() && buf.isSparse)
             {
                 throw std::invalid_argument("Sparse buffers are only supported for attention layers");
             }
@@ -595,12 +618,18 @@ struct KVCacheManagerConfig
     // Unreferenced GPU pages below this priority are dropped instead of offloaded.
     Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority;
 
+    //! Explicit groups retain separate identities even when their allocation and reuse policies match.
+    std::vector<AllocationGroupConfig> allocationGroups;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();
     }
 
     void validate() const;
+
+    //! Validate group identities, references, and the policies of their buffers before constructing storage.
+    void validateAllocationGroups() const;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

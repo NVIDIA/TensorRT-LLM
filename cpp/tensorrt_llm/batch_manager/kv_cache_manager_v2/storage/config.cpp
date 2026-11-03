@@ -135,7 +135,9 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         LayerId const layerId = std::visit([](auto const& cfg) { return cfg.layerId; }, layer);
         for (auto const& buf : layerBuffers(layer))
         {
-            LifeCycleId const lcId = registry.getId(makeLifeCycle(layer, buf, tokensPerBlock));
+            LifeCycleId const lcId = buf.allocationGroupId.has_value()
+                ? registry.getId(*buf.allocationGroupId)
+                : registry.getId(makeLifeCycle(layer, buf, tokensPerBlock));
             int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
             int exp = exactDiv(tokensPerBlock, tpbo);
             size_t expandedSize = buf.size * static_cast<size_t>(exp);

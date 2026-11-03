@@ -809,7 +809,8 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 {
     auto const& lifeCycles = mStorage->layerToLifeCycleIds().at(layerId);
     TLLM_CHECK_WITH_INFO(lifeCycles.size() == 1,
-        "Layer %d has buffers in %zu layer groups because its buffers use different reuse policies; "
+        "Layer %d has buffers in %zu layer groups because its buffers use different allocation groups or reuse "
+        "policies; "
         "look up its layer group per buffer with get_buffer_group_id(layer_id, role) / getBufferGroupId(layerId, role)",
         layerId, lifeCycles.size());
     return lifeCycles.front();
