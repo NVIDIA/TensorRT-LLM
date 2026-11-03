@@ -255,6 +255,19 @@ public:
     //! Changes whenever hotPoolBindings() may return something different.
     [[nodiscard]] uint64_t hotPoolBindingVersion() const noexcept;
 
+    //! The GPU arena's address range (copy-based rebalancing). It is mapped once and never moves or
+    //! changes size, so memory registered over it (e.g. with NIXL for disaggregated serving) stays
+    //! valid across rebalances. hasBoundPools: some pool group has more than one pool, whose pools
+    //! after the first have their own slot ids. std::nullopt without an arena.
+    struct GpuArenaExtent
+    {
+        MemAddress base;
+        size_t bytes;
+        bool hasBoundPools;
+    };
+
+    [[nodiscard]] std::optional<GpuArenaExtent> hotArenaExtent() const;
+
     // ---- Migration ---------------------------------------------------------
 
     // Migrate pages excluded from eviction to one destination level. Locked pages cannot move.

@@ -38,12 +38,9 @@ def test_fp8_ds_mla_without_rebalance_allowed():
 
 
 @pytest.mark.parametrize("disagg", [False, True])
-def test_copy_based_rebalancing_rejected_with_disaggregated_serving(tmp_path, disagg):
-    """The arena's pools all start at its base, so per-pool NIXL registrations would overlap."""
+def test_copy_based_rebalancing_allowed_with_disaggregated_serving(tmp_path, disagg):
+    """The KV cache transceiver registers the arena as one NIXL region, so the combination is valid."""
     kwargs = dict(model=str(tmp_path), kv_cache_config=_config(rebalance=True, copy_based=True))
     if disagg:
         kwargs["cache_transceiver_config"] = CacheTransceiverConfig(backend="NIXL")
-        with pytest.raises(ValueError, match="not supported with disaggregated serving"):
-            TorchLlmArgs(**kwargs)
-    else:
-        TorchLlmArgs(**kwargs)
+    TorchLlmArgs(**kwargs)

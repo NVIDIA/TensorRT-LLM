@@ -4735,12 +4735,35 @@ class TransferWorker:
                 logger.warning(f"TransferWorker init-failure cleanup: {e}")
             raise
 
+    def _gpu_arena_extent(self) -> Optional[tuple]:
+        """(base, bytes, has_bound_pools) of the KV manager's GPU arena, or None.
+
+        Copy-based rebalancing (CoReba) keeps every GPU pool in one arena that
+        is mapped once and never moves or changes size; a rebalance only moves
+        the pools' slot windows inside it.
+        """
+        impl = getattr(self._config.kv_cache_manager, "impl", None)
+        get_extent = getattr(impl, "get_gpu_arena_extent", None)
+        return get_extent() if get_extent is not None else None
+
+    @property
+    def kv_pool_layout_fixed(self) -> bool:
+        """Whether a pool rebalance leaves every address and registration as is.
+
+        True under copy-based rebalancing: slot ``id`` of a pool is always at
+        ``arena_base + id * slot_bytes`` and the whole arena is registered once,
+        so a peer's cached page table and registration keys stay valid.
+        """
+        return self._gpu_arena_extent() is not None
+
     def _register_kv_cache(self):
         assert self._rank_info.page_table is not None
         if self._kv_segments is not None:
             self._register_kv_tails()
             return
-        if _incremental_kv_registration_enabled():
+        # An arena (copy-based rebalancing) is registered as one region below: its pools all start at the arena base
+        # and never resize, so per-pool segments would overlap and buy nothing.
+        if self._gpu_arena_extent() is None and _incremental_kv_registration_enabled():
             pools = _paged_kv_pools(self._rank_info.page_table)
             if pools is not None:
                 self._kv_segments = {base: [] for base in pools}
@@ -4749,6 +4772,26 @@ class TransferWorker:
         memory_descs = get_unique_pool_memory_descs(
             self._rank_info.page_table, self._rank_info.device_id
         )
+        arena = self._gpu_arena_extent()
+        if arena is not None:
+            arena_base, arena_bytes, has_bound_pools = arena
+            if has_bound_pools:
+                # The extractor addresses pool p of a group at
+                # base + slot_id * stride with the group's (pool 0's) slot
+                # ids; a bound pool has its own ids (bindings), so transfers
+                # would hit the wrong slots.
+                raise NotImplementedError(
+                    "Disaggregated serving with copy_based_rebalancing does not "
+                    "support pool groups with several pools (bound pools)"
+                )
+            # Every pool's base is the arena base and its page table entry
+            # counts only its current window, so the per-pool regions would
+            # overlap and miss windows that start further into the arena.
+            # Register the arena once instead; pools outside it, if any, as
+            # before.
+            memory_descs = [(arena_base, arena_bytes, self._rank_info.device_id, "kv_cache_arena")] + [
+                d for d in memory_descs if not arena_base <= d[0] < arena_base + arena_bytes
+            ]
         if memory_descs:
             reg_memory_desc = RegMemoryDescs("VRAM", memory_descs)
             self._agent.register_memory(reg_memory_desc)
@@ -4846,6 +4889,9 @@ class TransferWorker:
         With incremental registration only the segments reaching past a pool's
         planned length are dropped; without a plan, every segment is.
         """
+        if self.kv_pool_layout_fixed:
+            # Copy-based rebalancing: the registered arena is neither unmapped nor resized.
+            return
         if self._kv_segments is not None:
             planned = self._planned_kv_lengths()
             for base, segs in self._kv_segments.items():
@@ -4877,6 +4923,10 @@ class TransferWorker:
         self._rank_info.page_table = page_table
         self._kv_extractor = KVRegionExtractorV1(page_table)
         self._peer_registrar.replace_self_extractor(self._kv_extractor)
+        if self.kv_pool_layout_fixed:
+            # Copy-based rebalancing: only num_slots changed in the page
+            # table; the registration and the agent desc stay valid.
+            return
         self._register_kv_cache()
         self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
 

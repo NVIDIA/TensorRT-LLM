@@ -38,6 +38,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -246,6 +247,10 @@ public:
     // the pool; getPageIndexBindingVersion() changes with it.
     std::optional<std::vector<int32_t>> getPageIndexBindings(LayerId layerId, DataRole role) const;
     uint64_t getPageIndexBindingVersion() const;
+
+    // Copy-based rebalancing: (base address, bytes, has bound pools) of the GPU arena, which holds
+    // every GPU pool, is mapped once and never moves or changes size. std::nullopt without an arena.
+    std::optional<std::tuple<MemAddress, size_t, bool>> getGpuArenaExtent() const;
 
     // Composite converter (scale + expansion).
     PageIndexConverter getPageIndexConverter(LayerId layerId, DataRole role) const;

@@ -1282,11 +1282,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     # -- KV pool rebalance ---------------------------------------------------
     #
-    # Context-only for now. The context side is the RDMA initiator, so a
-    # resize of its pools needs only a local re-registration. Generation peers
-    # read nothing from its RankInfo that a resize changes. A rank that has
-    # sent REGISTER_RANK_INFO to a context peer is a different matter: the
+    # With VMM resizing, context-only. The context side is the RDMA initiator,
+    # so a resize of its pools needs only a local re-registration. Generation
+    # peers read nothing from its RankInfo that a resize changes. A rank that
+    # has sent REGISTER_RANK_INFO to a context peer is a different matter: the
     # peer writes into its pools from a cached extent and cached keys.
+    #
+    # With copy-based rebalancing (CoReba) the pools live in one arena that is
+    # registered once and never remapped, and slot ids keep their addresses,
+    # so a peer's cached layout and keys stay valid: generation instances may
+    # rebalance as well, once their in-flight receives have drained.
 
     def kv_pool_rebalance_unsupported_reason(self) -> Optional[str]:
         if self._enable_pipelined_transfer:
@@ -1298,13 +1303,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return None
 
     def kv_pool_layout_shared_with_peers(self) -> bool:
+        if self._transfer_worker.kv_pool_layout_fixed:
+            # Peers hold it, but a rebalance does not change it.
+            return False
         return self._transfer_worker.has_registered_with_peers
 
     def kv_pool_rebalance_veto_reason(self, allow_cross_node: bool = False) -> Optional[str]:
         reason = super().kv_pool_rebalance_veto_reason(allow_cross_node)
         if reason is not None:
             return reason
-        if self._transfer_worker.has_cross_node_peer and not allow_cross_node:
+        if (
+            self._transfer_worker.has_cross_node_peer
+            and not self._transfer_worker.kv_pool_layout_fixed
+            and not allow_cross_node
+        ):
             # A resize unmaps and remaps the pools' tails; whether RDMA
             # registrations stay coherent across that has only been checked for
             # intra-node transfers.

@@ -699,6 +699,15 @@ uint64_t KvCacheManager::getPageIndexBindingVersion() const
     return mStorage->hotPoolBindingVersion();
 }
 
+std::optional<std::tuple<MemAddress, size_t, bool>> KvCacheManager::getGpuArenaExtent() const
+{
+    auto const apiLock = lockShared();
+    auto const extent = mStorage->hotArenaExtent();
+    if (!extent)
+        return std::nullopt;
+    return std::make_tuple(extent->base, extent->bytes, extent->hasBoundPools);
+}
+
 int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);

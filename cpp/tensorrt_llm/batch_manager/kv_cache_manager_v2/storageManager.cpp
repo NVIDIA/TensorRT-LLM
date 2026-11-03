@@ -2474,6 +2474,14 @@ uint64_t StorageManager::hotPoolBindingVersion() const noexcept
     return static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage).bindingVersion();
 }
 
+std::optional<StorageManager::GpuArenaExtent> StorageManager::hotArenaExtent() const
+{
+    if (!mGpuArena)
+        return std::nullopt;
+    auto const& arena = static_cast<ArenaGpuCacheLevelStorage const&>(*mLevels.at(kHotLevel).storage);
+    return GpuArenaExtent{arena.arenaBase(), arena.totalQuota(), arena.hasBoundPools()};
+}
+
 TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const
 {
     return levelWindows(kHotLevel);

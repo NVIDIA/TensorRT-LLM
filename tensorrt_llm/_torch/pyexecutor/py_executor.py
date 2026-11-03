@@ -7073,7 +7073,8 @@ class PyExecutor:
             veto = transceiver.kv_pool_rebalance_veto_reason(
                 allow_cross_node=self._kv_pool_rebalance_allow_cross_node)
             busy = (self.async_transfer_manager.has_any_inflight_requests()
-                    or transceiver.has_inflight_transfers())
+                    or transceiver.has_inflight_transfers()
+                    or self.disagg.has_unpublished_gen_receives())
             expired = time.monotonic() >= deadline
             peer_wait = (transceiver.oldest_send_waiting_for_peer_s()
                          > KV_POOL_REBALANCE_DISAGG_PEER_WAIT_S)
@@ -7096,11 +7097,15 @@ class PyExecutor:
             if any(s[2] for s in states):
                 backoff = self._note_disagg_drain_outcome(skipped=True)
                 logger.warning(
-                    "KV pool rebalance skipped: disagg KV sends still in "
+                    "KV pool rebalance skipped: disagg KV transfers still in "
                     f"flight after {KV_POOL_REBALANCE_DISAGG_DRAIN_S}s. "
                     f"Retrying in {backoff:g}s.")
                 return False
             self.disagg.reap_context_sends(1)
+            # Receives (generation side; copy-based rebalancing only, see
+            # kv_pool_layout_shared_with_peers): rank-synchronized like the
+            # main loop's call, and every rank makes this pass.
+            self.disagg.poll_gen_transfers()
             self._flush_pending_transfer_responses()
 
     def _note_disagg_drain_outcome(self, skipped: bool) -> float:
