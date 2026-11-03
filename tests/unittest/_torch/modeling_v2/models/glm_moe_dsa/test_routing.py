@@ -173,3 +173,54 @@ def test_glm52_unsupported_kv_cache_does_not_match(_on_sm107, checkpoint_algo, d
     assert modeling_v2_resolve(config, _llm_args("auto", **args)) is None
     with pytest.raises(ValueError, match="KV cache"):
         modeling_v2_resolve(config, _llm_args("require", **args))
+
+
+_GLM52_HIGH_THROUGHPUT_TARGET = (
+    "models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__high_throughput.modeling."
+    "ModelingV2Glm52Nvfp4Sm107HighThroughput"
+)
+_DEP16 = dict(world_size=16, tp_size=16, moe_ep_size=16, moe_tp_size=1, enable_attention_dp=True)
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize("draft_len", [None, 5, 7])
+def test_glm52_high_throughput_matches(_on_sm107, mode, draft_len):
+    config = _model_config(
+        _glm52_config(index_n_heads=32),
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,
+        **_DEP16,
+    )
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args(mode, kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert _qualified(modeling_v2_resolve(config, args)) == _GLM52_HIGH_THROUGHPUT_TARGET
+
+
+@pytest.mark.parametrize(
+    "mapping_overrides, kv_dtype, backend, index_n_heads",
+    [
+        (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32),
+        (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32),
+        (dict(), "fp8", "MEGAMOE_CUTEDSL", 32),
+        (dict(), "nvfp4", "CUTLASS", 32),
+        (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64),
+    ],
+    ids=["no-attention-dp", "no-expert-parallel", "fp8-kv", "other-backend", "other-index-heads"],
+)
+def test_glm52_high_throughput_near_misses(
+    _on_sm107, mapping_overrides, kv_dtype, backend, index_n_heads
+):
+    config = _model_config(
+        _glm52_config(index_n_heads=index_n_heads), **dict(_DEP16, **mapping_overrides)
+    )
+    config.moe_backend = backend
+    kwargs = dict(kv_cache_config=KvCacheConfig(dtype=kv_dtype))
+    assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
+    with pytest.raises(ValueError, match="high-throughput"):
+        modeling_v2_resolve(config, _llm_args("require", **kwargs))
+
+
+def test_glm52_high_throughput_declines_sm103():
+    config = _model_config(_glm52_config(index_n_heads=32), **_DEP16)
+    config.moe_backend = "MEGAMOE_CUTEDSL"
+    args = _llm_args("auto", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+    assert modeling_v2_resolve(config, args) is None

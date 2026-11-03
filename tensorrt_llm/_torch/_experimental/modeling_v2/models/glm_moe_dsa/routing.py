@@ -168,6 +168,28 @@ def route(
 
         return ModelingV2Glm52Nvfp4Sm107LowLatency
 
+    dep16 = (
+        mapping.world_size == mapping.tp_size == mapping.moe_ep_size == 16
+        and mapping.moe_tp_size == 1
+        and mapping.enable_attention_dp
+        and mapping.pp_size == mapping.cp_size == 1
+    )
+    if (
+        compute_capability == (10, 7)
+        and shape == _SHAPE
+        and index_n_heads == 32
+        and dep16
+        and mtp_eagle_or_none
+        and kv_cache_quant_algo == QuantAlgo.NVFP4
+        and model_config.moe_backend == "MEGAMOE_CUTEDSL"
+    ):
+        # fmt: off
+        # isort: off
+        from .glm_5_2_nvfp4__sm_107__high_throughput.modeling import ModelingV2Glm52Nvfp4Sm107HighThroughput
+        # isort: on
+        # fmt: on
+        return ModelingV2Glm52Nvfp4Sm107HighThroughput
+
     # tep4: the attention heads and the dense MLPs sharded four ways, the experts
     # sharded four ways. Attention DP would replicate attention, which is a
     # different weight layout and so a different target.
@@ -277,4 +299,6 @@ def route(
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain at max_draft_len=5, without the suffix-automaton "
         "enhancer or relaxed acceptance, also with an fp8 latent KV cache"
+        "; the sm107 high-throughput target uses attention DP with TP16/EP16, "
+        "NVFP4 KV cache and MEGAMOE_CUTEDSL"
     )
