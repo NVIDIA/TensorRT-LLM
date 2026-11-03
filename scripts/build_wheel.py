@@ -932,6 +932,26 @@ def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
             stale.unlink()
 
 
+def install_visual_gen_libs(vg_build_dir: Path, lib_dir: Path,
+                            install_file) -> None:
+    """Install the VisualGen model libraries.
+
+    models.txt, written at configure time by
+    cpp/tensorrt_llm/visual_gen/CMakeLists.txt, lists the models this build has
+    a library for. A library installed by an earlier build of a model not
+    listed there is removed, so it is neither loaded nor shipped.
+    """
+    manifest = vg_build_dir / "models.txt"
+    installed = set()
+    for model in manifest.read_text().split() if manifest.is_file() else []:
+        name = f"libth_visual_gen_{model}.so"
+        install_file(vg_build_dir / model / name, lib_dir / name)
+        installed.add(name)
+    for stale in lib_dir.glob("libth_visual_gen_*.so"):
+        if stale.name not in installed:
+            stale.unlink()
+
+
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
     """Stage NCCL-EP namespace packages from the intermediate wheel."""
     package_root = staging_dir / "3rdparty" / "nccl_extensions"
@@ -1160,7 +1180,7 @@ def main(*,
 
     targets = [
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
-        "pg_utils", "flash_mla", "modeling_v2_libs"
+        "pg_utils", "flash_mla", "modeling_v2_libs", "visual_gen_libs"
     ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
@@ -1470,6 +1490,8 @@ def main(*,
                      lib_dir / "libth_common.so")
         install_modeling_v2_libs(build_dir / "tensorrt_llm/modeling_v2",
                                  lib_dir, install_file)
+        install_visual_gen_libs(build_dir / "tensorrt_llm/visual_gen", lib_dir,
+                                install_file)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"

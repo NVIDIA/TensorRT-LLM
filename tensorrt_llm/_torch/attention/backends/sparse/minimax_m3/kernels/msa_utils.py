@@ -50,21 +50,10 @@ def is_msa_layer(attn) -> bool:
 
 
 def _install_msa_cutlass_compatibility() -> None:
-    """Provide legacy CuTe aliases still referenced by the packaged MSA sources."""
-    try:
-        import cutlass.cute as cute
-    except ImportError:
-        return
+    """Provide legacy CuTe and QuACK names still referenced by the packaged MSA sources."""
+    from tensorrt_llm._torch.cute_dsl_utils import install_cutlass_dsl_compatibility
 
-    # MSA has not yet migrated these aliases to their newer CUTLASS DSL
-    # names. Keep this shim local to the MSA import path and remove it once the
-    # packaged sources use the top-level thread classes and
-    # cute.make_rmem_tensor directly.
-    for thread_class_name in ("ThrCopy", "ThrMma"):
-        if not hasattr(cute.core, thread_class_name):
-            setattr(cute.core, thread_class_name, getattr(cute, thread_class_name))
-    if not hasattr(cute, "make_fragment"):
-        setattr(cute, "make_fragment", cute.make_rmem_tensor)
+    install_cutlass_dsl_compatibility()
 
 
 @functools.lru_cache(maxsize=1)
