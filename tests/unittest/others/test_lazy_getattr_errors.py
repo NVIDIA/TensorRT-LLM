@@ -68,6 +68,12 @@ CASES = [
         "Attention",
         "tensorrt_llm._torch.visual_gen.attention.attention",
     ),
+    ("tensorrt_llm.serve", "OpenAIServer", "tensorrt_llm.serve.openai_server"),
+    (
+        "tensorrt_llm.serve",
+        "OpenAIDisaggServer",
+        "tensorrt_llm.serve.openai_disagg_server",
+    ),
 ]
 _IDS = [f"{pkg}.{name}" for pkg, name, _ in CASES]
 

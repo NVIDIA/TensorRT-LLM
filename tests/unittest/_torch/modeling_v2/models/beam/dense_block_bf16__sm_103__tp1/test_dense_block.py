@@ -46,7 +46,12 @@ from pathlib import Path
 import pytest
 import torch
 
-import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+try:
+    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+except ModuleNotFoundError as exc:
+    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
+        raise
+    builtin_beam = None  # The standard-serving implementation is a separate PR.
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
@@ -351,7 +356,9 @@ def source_captures(seed: int, length: int) -> dict | None:
     directory = os.environ.get("BEAM_DENSE_BLOCK_SOURCE_CAPTURES")
     if not directory:
         return None
-    captures = torch.load(Path(directory) / f"seed{seed}" / f"T{length}.pt", map_location="cuda")
+    captures = torch.load(
+        Path(directory) / f"seed{seed}" / f"T{length}.pt", map_location="cuda", weights_only=True
+    )
     x, positions = case_inputs(seed, length)
     assert torch.equal(captures["input"], x), "the generated input differs from the captured one"
     assert torch.equal(
@@ -613,6 +620,8 @@ def recording(*wrappers):
 
 def builtin_beam_forbidden():
     """The built-in Beam modeling must not run while the component does."""
+    if builtin_beam is None:
+        return support.builtin_forbidden([])
     targets = (
         builtin_beam.BeamDecoderLayer,
         builtin_beam.BeamAttention,
@@ -662,12 +671,13 @@ def test_block_constructs_alone(ieee_fp32) -> None:
         raise AssertionError(f"{type(self).__name__} constructed")
 
     with pytest.MonkeyPatch.context() as mp:
-        for cls in (
-            builtin_beam.BeamForCausalLM,
-            builtin_beam.BeamModel,
-            builtin_beam.BeamDecoderLayer,
-        ):
-            mp.setattr(cls, "__init__", refuse)
+        if builtin_beam is not None:
+            for cls in (
+                builtin_beam.BeamForCausalLM,
+                builtin_beam.BeamModel,
+                builtin_beam.BeamDecoderLayer,
+            ):
+                mp.setattr(cls, "__init__", refuse)
         blk = BeamDenseBlockBf16Sm103Tp1(block_config(), LAYER_IDX, device="cuda")
     assert isinstance(blk, torch.nn.Module) and not list(blk.children())
     assert list(blk.checkpoint_tensors()) == list(reference.param_shapes())

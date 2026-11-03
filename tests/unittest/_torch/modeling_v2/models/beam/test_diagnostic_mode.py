@@ -205,7 +205,7 @@ def test_full_model_validates_once_and_marks_every_block_call_checked(monkeypatc
         schedule=SimpleNamespace(is_sliding=lambda layer: True, is_sparse=lambda layer: True),
         window=512,
         _check_usable=lambda layer=None: None,
-        _select_rows=lambda logit_rows, spans, num_contexts: [T - 1],
+        _select_rows=lambda logit_rows, spans: [T - 1],
         embed=lambda ids: torch.zeros(T, HIDDEN),
         final_norm=lambda x: x,
         head=lambda x: x,

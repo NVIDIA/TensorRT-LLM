@@ -9,7 +9,9 @@ import torch
 
 import tensorrt_llm._torch.distributed as distributed
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 pytestmark = pytest.mark.cpu_only
@@ -53,8 +55,10 @@ def _generation_request(post_processors, tokens=(1, 2, 3)):
 
 def _engine(vocab_size=None, attention_dp=False):
     engine = object.__new__(DecoderRunner)
-    engine.mapping = SimpleNamespace(is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp)
-    engine.model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
+    engine._mapping = SimpleNamespace(
+        is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp
+    )
+    engine._model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
     return engine
 
 
@@ -89,7 +93,7 @@ def test_sharded_logits_are_gathered_for_post_processors(monkeypatch):
     )
 
     assert len(calls) == 1
-    assert calls[0][0] is shard and calls[0][1] is engine.mapping and calls[0][2] == -1
+    assert calls[0][0] is shard and calls[0][1] is engine._mapping and calls[0][2] == -1
     assert seen == [(1, 1, 32)]  # the post-processor sees the whole vocabulary
 
 
@@ -164,6 +168,7 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     model.model = lambda **kwargs: hidden
     model.layer_idx = -1
     model.spec_worker = Worker()
+    model.spec_decode_fast_paths = False
     model.lm_head, model.logits_processor, model.draft_model = "lm_head", "processor", "drafter"
     spec_metadata = SimpleNamespace(is_layer_capture=lambda layer: False, gather_ids=gather_ids)
     attn_metadata = SimpleNamespace(padded_num_tokens=None, num_tokens=4)
@@ -177,3 +182,62 @@ def test_the_spec_model_hands_the_workers_target_logits_to_its_forward():
     assert torch.equal(rows, hidden[gather_ids])
     assert rest == ["lm_head", "processor", attn_metadata, spec_metadata, "drafter"]
     assert calls["forward"]["logits"] == "worker logits"
+
+
+@pytest.mark.parametrize(
+    "greedy,temperature_only,penalty,has_exchange,rows,sharded",
+    [
+        (True, False, False, True, 4, True),
+        (False, True, False, True, 4, True),
+        (False, False, False, True, 4, False),
+        (True, False, True, True, 4, False),
+        (True, False, False, False, 4, False),
+        (True, False, False, True, 9, False),
+    ],
+)
+def test_mtp_eagle_target_logits_are_sharded_for_greedy_batches(
+    greedy, temperature_only, penalty, has_exchange, rows, sharded
+):
+    head_calls = []
+
+    class Head:
+        tp_mode, gather_output, padding_size = TensorParallelMode.COLUMN, True, 0
+
+        def __call__(self, hidden_states, gather_output=True):
+            head_calls.append(gather_output)
+            return hidden_states
+
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker.key_exchange = SimpleNamespace(MAX_ROWS=8) if has_exchange else None
+    worker._samples_sharded_target = has_exchange
+    worker.guided_decoder = worker._d2t = None
+    worker.mapping = SimpleNamespace(tp_size=8, tp_rank=0, enable_attention_dp=False)
+    metadata = SimpleNamespace(
+        is_all_greedy_sample=greedy,
+        temperature_only=temperature_only,
+        enable_penalty=penalty,
+        sharded_target_logits=None,
+    )
+    hidden = torch.zeros(rows, 2)
+    processor = _RecordingLogitsProcessor("gathered")
+
+    out = worker.target_logits(hidden, Head(), processor, None, metadata, None)
+
+    assert metadata.sharded_target_logits is sharded
+    if sharded:
+        assert out is hidden and head_calls == [False] and processor.calls == []
+    else:
+        assert out == "gathered" and head_calls == []
+
+
+@pytest.mark.parametrize("sharded", [True, False])
+def test_mtp_eagle_skipped_drafting_keeps_the_shard_marker(sharded):
+    """A dynamic draft length of 0 skips drafting; sharded target logits still carry the marker the engine
+    gathers on before a logits post-processor sees them."""
+    worker = object.__new__(Eagle3OneModelWorker)
+    worker.skip_drafting = lambda *args: {"logits": "shard"}
+    metadata = SimpleNamespace(runtime_draft_len=0, sharded_target_logits=sharded)
+
+    out = worker._forward_impl(None, None, None, "shard", None, metadata, None)
+
+    assert out.get("logits_vocab_shard", False) is sharded

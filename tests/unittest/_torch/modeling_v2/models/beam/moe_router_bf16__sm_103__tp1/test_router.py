@@ -50,7 +50,13 @@ import torch
 from torch.overrides import TorchFunctionMode, resolve_name
 
 import tensorrt_llm
-import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+
+try:
+    import tensorrt_llm._torch.models.modeling_beam as builtin_beam
+except ModuleNotFoundError as exc:
+    if exc.name != "tensorrt_llm._torch.models.modeling_beam":
+        raise
+    builtin_beam = None  # The standard-serving implementation is a separate PR.
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
     BeamGroupedTopkRouter,
     beam_grouped_topk_router,
@@ -250,6 +256,9 @@ def recording_op_calls():
 @contextlib.contextmanager
 def builtin_router_forbidden():
     """The built-in Beam router must not compute any part of this component's routing."""
+    if builtin_beam is None:
+        yield
+        return
     saved = {name: getattr(builtin_beam.BeamRouter, name) for name in ("forward", "route")}
 
     def refuse(*args, **kwargs):

@@ -106,9 +106,9 @@ enforced. Spend review attention on the rows nothing checks.
 |---|---|---|
 | Every `BACKEND_FAMILY` member is ranked in `IMPL_PRIORITY` | Import-time `RuntimeError` in `moe_resolution.py` (`_UNRANKED`) | None |
 | A family member is what the registry returns for the identity it publishes | `test_family_members_are_reachable_by_the_identity_they_publish` | None |
-| Identity and implementation sit on one concrete class | `test_the_identity_and_the_implementation_sit_on_one_class`, for the classes in `_SINGLE_FORMAT_IMPLS`; `test_cutlass_leaf_declarations` for CUTLASS | Add a new single-format implementation to `_SINGLE_FORMAT_IMPLS` |
+| Identity and implementation sit on one concrete class | `test_the_identity_and_the_implementation_sit_on_one_class`, for the classes in `_SINGLE_FORMAT_IMPLS`; `test_cutlass_leaf_declarations` and `test_cutedsl_leaf_declarations` for the CUTLASS and CuteDSL grouped-GEMM leaves, each kept complete by its `*_declarations_cover_every_leaf` | Add a new single-format implementation to `_SINGLE_FORMAT_IMPLS` |
 | `create_moe_backend` builds the class it is handed | `test_create_moe_backend_dispatches_the_impl`, over every class in `IMPL_PRIORITY` | None |
-| A model whose `quant_config_dict` / `exclude_modules` can move its experts passes `override_quant_config` | `require_layer_quant_format` in the CUTLASS, TRTLLM-Gen and B12x `create_weights`, and only when that checkpoint is loaded; other implementations are not checked | Check the model's `create_moe` call |
+| A model whose `quant_config_dict` / `exclude_modules` can move its experts passes `override_quant_config` | `require_layer_quant_format` in the CUTLASS, TRTLLM-Gen, B12x and CuteDSL grouped-GEMM `create_weights`, and only when that checkpoint is loaded; other implementations are not checked | Check the model's `create_moe` call |
 | `can_implement` is pure: no `get_sm_version()`, no `import` as a presence test, no `os.environ` | Nothing | Read every new or changed gate |
 | A routing, activation, EPLB, or LoRA constraint is declined in `can_implement` (reading `p.routing`, `activation_support`, `d.*`), not in a factory, scheduler, wrapper, or test-local branch | Nothing | Read the diff outside `can_implement` |
 | A family alias is matched with `issubclass` / `isinstance`, never `==`, `is`, or `in (...)` | Nothing | Grep the diff |

@@ -112,8 +112,6 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
@@ -144,8 +142,6 @@ public:
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mMaxSentTokenLen(mPromptLen)
-        , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
-        , mPromptVocabSize(promptVocabSize)
         , mMultimodalHashes(std::move(multimodalHashes))
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
@@ -188,8 +184,6 @@ public:
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<VecTokens> draftTokens = std::nullopt,
         bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
@@ -203,8 +197,6 @@ public:
         , mIsStreaming(isStreaming)
         , mOrigPromptLen(mPromptLen)
         , mMaxSentTokenLen(mPromptLen)
-        , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
-        , mPromptVocabSize(promptVocabSize)
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
@@ -271,21 +263,6 @@ public:
             }
         }
 
-        auto pTuningConfig = req.getPromptTuningConfig();
-        if (pTuningConfig)
-        {
-            mPromptEmbeddingTable = tensorrt_llm::runtime::ITensor::view(
-                executor::detail::toITensor(pTuningConfig.value().getEmbeddingTable()));
-            TLLM_CHECK(mPromptEmbeddingTable.value()->getShape().nbDims == 2);
-            mPromptVocabSize = mPromptEmbeddingTable.value()->getShape().d[0];
-            mPromptEmbeddingTable.value()->unsqueeze(0);
-
-            if (pTuningConfig->getInputTokenExtraIds())
-            {
-                mInputTokenExtraIds
-                    = std::make_shared<VecTokenExtraIds>(pTuningConfig->getInputTokenExtraIds().value());
-            }
-        }
         auto multimodalInput = req.getMultimodalInput();
         if (multimodalInput)
         {
@@ -776,21 +753,6 @@ public:
         mMaxSentTokenLen = maxSentLength;
     }
 
-    [[nodiscard]] std::optional<TensorPtr> getPromptEmbeddingTable() const
-    {
-        return mPromptEmbeddingTable;
-    }
-
-    [[nodiscard]] std::optional<TensorPtr>& getPromptEmbeddingTableMutable()
-    {
-        return mPromptEmbeddingTable;
-    }
-
-    [[nodiscard]] std::optional<SizeType32> getPromptVocabSize() const
-    {
-        return mPromptVocabSize;
-    }
-
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> getMultimodalHashes() const
     {
         return mMultimodalHashes;
@@ -844,11 +806,6 @@ public:
     void setLoraWeights(TensorPtr weights)
     {
         mLoraWeights = weights;
-    }
-
-    void setPromptVocabSize(SizeType32 size)
-    {
-        mPromptVocabSize = size;
     }
 
     void clearLoraWeights()
@@ -1534,8 +1491,6 @@ protected:
 
     SizeType32 mMaxSentTokenLen;
 
-    std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
-    std::optional<SizeType32> mPromptVocabSize{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashes{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
@@ -1686,16 +1641,6 @@ private:
             mEncoderUniqueTokens = encoderUniqueTokens;
         }
 
-        if ((mPromptEmbeddingTable.has_value() && !mPromptVocabSize.has_value())
-            || (!mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value()))
-        {
-            std::string errStr
-                = "Prompt embedding table and prompt vocab size tensors must both be provided for requests with "
-                  "prompt "
-                  "tuning enabled.";
-            TLLM_THROW(errStr);
-        }
-
         if (!isChild())
         {
             // Initialize result states unless it is a child and a child request should share parent's one.
@@ -1742,8 +1687,6 @@ public:
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         executor::SamplingConfig const& samplingConfig, bool isStreaming,
-        std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
-        std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
@@ -1766,7 +1709,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
-            samplingConfig, isStreaming, std::move(promptEmbeddingTable), promptVocabSize,
+            samplingConfig, isStreaming,
             multimodalHashes.has_value()
                 ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashes.value()))
                 : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),
@@ -1811,6 +1754,9 @@ public:
     LlmRequest(LlmRequest&& request) = default;
     LlmRequest(LlmRequest const& request) = default;
 
+    /// @brief Construct an unregistered child from request inputs, with fresh execution state.
+    LlmRequest(LlmRequest const& parent, RequestIdType requestId);
+
     std::optional<executor::Result> createResult();
 
     void createSerializedResult(std::vector<char>& serializedResult, bool& isFinal);
@@ -1824,6 +1770,9 @@ public:
         SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
+
+    /// @brief Retain the actual executing child and commit its sequence-group membership.
+    void registerChildRequest(std::shared_ptr<LlmRequest> const& child);
 
     // Remove LoRA weights and LoRA config tensors
     void removeLoraTensors();

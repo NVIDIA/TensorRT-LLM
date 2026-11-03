@@ -10,8 +10,8 @@ import transformers
 
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
-from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, KvCacheRetentionConfig)
+from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -465,7 +465,6 @@ __all__ = [
     'ModelLoader',
     '_ParallelConfig',
     '_ModelWrapper',
-    'BatchingType',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
     'MTPDecodingConfig',
