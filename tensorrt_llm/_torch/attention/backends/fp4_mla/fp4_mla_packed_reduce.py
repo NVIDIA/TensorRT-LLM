@@ -11,6 +11,7 @@ BF16/FP16 output and, for Helix, the per-row (max, sum) softmax stats. Global FP
 scales and KV lengths are read on the device, so CUDA graph replays follow them.
 """
 
+import dataclasses
 import heapq
 import math
 from collections.abc import Callable
@@ -1205,6 +1206,25 @@ def select_reduce_ctas(num_items: int, sm_count: int) -> int:
     return max(
         1, min((num_items + warps_per_cta - 1) // warps_per_cta, _REDUCE_CTAS_PER_SM * sm_count)
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class PackedSplitPartials:
+    """The split state of one packed decode, left unreduced for a consumer that folds it itself:
+    the arguments :func:`reduce_packed_splits` would take (see there). It stays valid until the
+    next packed decode on the stream overwrites the workspace."""
+
+    partial: torch.Tensor
+    maxima: torch.Tensor
+    sums: torch.Tensor
+    plan: torch.Tensor
+    q_scale: torch.Tensor
+    kv_scale: torch.Tensor
+    num_requests: int
+    valid_m: int
+    physical_m: int
+    sm_scale: float
+    output_scale: float
 
 
 def reduce_packed_splits(

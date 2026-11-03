@@ -1072,6 +1072,11 @@ class AttentionForwardArgs:
     output_gate_applied: bool = False
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
+    # Generation-only MLA decode: a backend that would merge split-KV partials sets split_partials
+    # to its unreduced split state instead (fp4_mla_packed_reduce.PackedSplitPartials), for a
+    # caller that folds them itself; a backend that stores the rows directly leaves it None.
+    defer_split_reduce: bool = False
+    split_partials: Optional[Any] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse

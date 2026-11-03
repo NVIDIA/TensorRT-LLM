@@ -132,6 +132,35 @@ def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> tor
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
+def _helix_gen_zero_kv_mask(attn_metadata: AttentionMetadata, num_tokens: int) -> torch.Tensor:
+    """Bool ``[num_tokens]`` mask of the generation tokens this Helix CP rank owns no KV for."""
+    # TrtllmAttentionMetadata fills helix_zero_kv_tokens once per step
+    # together with the other Helix spec buffers.
+    if (
+        isinstance(attn_metadata, TrtllmAttentionMetadata)
+        and attn_metadata._helix_spec_tokens_valid
+    ):
+        # Speculative verify groups: KV ownership is per-TOKEN. A rank
+        # owning only the tail page of a group has zero visible KV for
+        # the group's leading tokens while its per-sequence kv_len is
+        # nonzero, so the per-sequence mask below misses those rows.
+        # Their decode rows are fully masked with a finite sentinel,
+        # making partial_o an average over (possibly uninitialized)
+        # pool values; the combine multiplies by corr = 0 and
+        # 0 * NaN would poison the token on every CP rank — sanitize
+        # by the per-token bound instead.
+        return attn_metadata.helix_zero_kv_tokens[:num_tokens]
+    # MLA processes only the generation token slice here, so build
+    # the mask from [num_contexts, num_seqs). Skip this expansion
+    # when the more precise per-token bounds above are valid.
+    return _helix_zero_kv_mask(
+        attn_metadata,
+        num_tokens,
+        seq_start=attn_metadata.num_contexts,
+        num_seqs=attn_metadata.num_generations,
+    )
+
+
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
     mutates_args=("output",),
@@ -865,6 +894,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         helix_v_up: bool = False,
+        helix_output: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """Run absorbed attention; under Helix CP also exchange and combine the partials.
@@ -872,6 +902,8 @@ class MLA(nn.Module):
         With ``helix_v_up`` the V up-projection is applied to this rank's
         partial outputs before the all-to-all, so the result holds
         ``num_heads_tp_cp * v_head_dim`` values per token instead of latents.
+        ``helix_output`` is then the caller's buffer for that result, which an
+        override may write and return in place of a new tensor.
         """
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
@@ -890,32 +922,7 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            # TrtllmAttentionMetadata fills helix_zero_kv_tokens once per step
-            # together with the other Helix spec buffers.
-            if (
-                isinstance(attn_metadata, TrtllmAttentionMetadata)
-                and attn_metadata._helix_spec_tokens_valid
-            ):
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
-                zero_kv_mask = attn_metadata.helix_zero_kv_tokens[: partial_o.shape[0]]
-            else:
-                # MLA processes only the generation token slice here, so build
-                # the mask from [num_contexts, num_seqs). Skip this expansion
-                # when the more precise per-token bounds above are valid.
-                zero_kv_mask = _helix_zero_kv_mask(
-                    attn_metadata,
-                    partial_o.shape[0],
-                    seq_start=attn_metadata.num_contexts,
-                    num_seqs=attn_metadata.num_generations,
-                )
+            zero_kv_mask = _helix_gen_zero_kv_mask(attn_metadata, partial_o.shape[0])
             value_dim = kv_lora_rank
             if helix_v_up:
                 partial_o = self._helix_project_v_partials(partial_o)
@@ -2132,6 +2139,7 @@ class MLA(nn.Module):
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
             helix_v_up=helix_v_up,
+            helix_output=output if helix_v_up else None,
             **kwargs,
         )
         fused_q = None
