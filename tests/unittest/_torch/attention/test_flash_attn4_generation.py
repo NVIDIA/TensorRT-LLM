@@ -170,6 +170,28 @@ def test_fa4_paged_generation_graph_replay_matches_eager():
         assert torch.equal(pool, eager_pool)
 
 
+def _rope_reference(qkv, cos_sin, kv_lens, *, num_heads, num_kv_heads, head_dim, rotary_dim, q_len):
+    """NeoX RoPE on the Q and K heads of packed QKV, in place, in float32: token ``j`` of row ``r`` at
+    position ``kv_lens[r] - q_len + j`` (clamped at 0), ``cos_sin`` laid out [position][pair][cos, sin]."""
+    tokens = qkv.shape[0]
+    rows = tokens // q_len
+    device = qkv.device
+    pos = (
+        kv_lens.long().repeat_interleave(q_len)
+        - q_len
+        + torch.arange(q_len, device=device).repeat(rows)
+    )
+    half = rotary_dim // 2
+    table = cos_sin.view(-1, half, 2)[pos.clamp(min=0)]
+    cos, sin = table[..., 0][:, None, :], table[..., 1][:, None, :]
+    heads = qkv[:, : (num_heads + num_kv_heads) * head_dim].view(
+        tokens, num_heads + num_kv_heads, head_dim
+    )
+    x1, x2 = heads[..., :half].float(), heads[..., half:rotary_dim].float()
+    heads[..., :half] = (x1 * cos - x2 * sin).to(qkv.dtype)
+    heads[..., half:rotary_dim] = (x2 * cos + x1 * sin).to(qkv.dtype)
+
+
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,rotary_dim,q_len",
     [(28, 4, 128, 128, 4), (28, 4, 128, 128, 9), (20, 20, 128, 128, 1), (16, 2, 128, 64, 4)],
@@ -178,15 +200,12 @@ def test_fa4_paged_generation_graph_replay_matches_eager():
 def test_rope_write_kv_paged_matches_rope_then_write(
     num_heads, num_kv_heads, head_dim, rotary_dim, q_len, rope
 ):
-    """The fused launch leaves the pool as ``rope_qkv_inplace`` + ``write_kv_paged`` do and the Q heads
+    """The fused launch leaves the pool as NeoX RoPE + ``write_kv_paged`` do and the Q heads
     rotated in place the same way (partial rotary, rows whose first tokens fall before
     position 0 write nothing for them)."""
     from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
         rope_write_kv_paged,
         write_kv_paged,
-    )
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_kernels import (
-        rope_qkv_inplace,
     )
 
     device = torch.device("cuda")
@@ -207,8 +226,8 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     cos_sin = torch.randn(width * tpb, rotary_dim, generator=gen, device=device)
     ref_qkv, ref_pool = qkv.clone(), pool.clone()
     if rope:
-        rope_qkv_inplace(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
-                         head_dim=head_dim, rotary_dim=rotary_dim, q_len=q_len)  # fmt: skip
+        _rope_reference(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                        head_dim=head_dim, rotary_dim=rotary_dim, q_len=q_len)  # fmt: skip
     q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
     k = ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim)
     v = ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim)
@@ -216,11 +235,13 @@ def test_rope_write_kv_paged_matches_rope_then_write(
     rope_write_kv_paged(qkv, cos_sin if rope else None, pool, page_table, kv_lens, num_heads=num_heads,
                         num_kv_heads=num_kv_heads, head_dim=head_dim, rotary_dim=rotary_dim, q_len=q_len)  # fmt: skip
     torch.cuda.synchronize()
-    # V and the rotated Q bit for bit; the rotated K within one bf16 rounding step (the two kernels
-    # may contract the rotation's multiply-adds differently).
+    # V bit for bit; the rotated Q and K within one bf16 rounding step (the kernel may contract the
+    # rotation's multiply-adds, the reference does not), plus 1e-5 absolute for values near zero.
     assert torch.equal(pool[:, 1], ref_pool[:, 1])
-    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=0)
-    assert torch.equal(qkv[:, :q_size], ref_qkv[:, :q_size])
+    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=1e-5)
+    torch.testing.assert_close(
+        qkv[:, :q_size].float(), ref_qkv[:, :q_size].float(), rtol=2**-7, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -293,9 +314,6 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
         rope_write_kv_paged,
         write_kv_paged,
     )
-    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_kernels import (
-        rope_qkv_inplace,
-    )
 
     device = torch.device("cuda")
     num_heads, num_kv_heads, head_dim, tpb, rows, width = 28, 4, 128, 32, 7, 6
@@ -313,8 +331,8 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
     qkv = torch.randn(rows * q_len, cols, generator=gen, device=device).bfloat16()
     cos_sin = torch.randn(width * tpb + shared_tokens, head_dim, generator=gen, device=device)
     ref_qkv, ref_pool = qkv.clone(), pool.clone()
-    rope_qkv_inplace(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
-                     head_dim=head_dim, rotary_dim=head_dim, q_len=q_len)  # fmt: skip
+    _rope_reference(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                    head_dim=head_dim, rotary_dim=head_dim, q_len=q_len)  # fmt: skip
     q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
     ref_k = ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim)
     ref_v = ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim)
@@ -323,5 +341,7 @@ def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
                         head_dim=head_dim, rotary_dim=head_dim, q_len=q_len, page_lens=page_lens)  # fmt: skip
     torch.cuda.synchronize()
     assert torch.equal(pool[:, 1], ref_pool[:, 1])
-    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=0)
-    assert torch.equal(qkv[:, :q_size], ref_qkv[:, :q_size])
+    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=1e-5)
+    torch.testing.assert_close(
+        qkv[:, :q_size].float(), ref_qkv[:, :q_size].float(), rtol=2**-7, atol=1e-5
+    )
