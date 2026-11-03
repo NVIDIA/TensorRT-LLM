@@ -103,6 +103,36 @@ CONTRACTS = (
             "what they need. Move the shared helper to serve/_base/ instead."
         ),
     ),
+    Contract(
+        name="disaggregated modules do not import the Responses implementation",
+        importers=(
+            "tensorrt_llm.serve.openai_client",
+            "tensorrt_llm.serve.openai_service",
+            "tensorrt_llm.serve.openai_disagg_service",
+            "tensorrt_llm.serve.disagg_coordinator",
+            "tensorrt_llm.serve.router",
+        ),
+        forbidden=("tensorrt_llm.serve.responses_utils",),
+        # The Responses stream helper the disaggregated service still takes from the
+        # Responses implementation; the allowance goes when the shared stream code
+        # moves to tensorrt_llm/serve/_base/responses_stream.py. It only shrinks.
+        allowed=frozenset(
+            {
+                (
+                    "tensorrt_llm.serve.openai_disagg_service",
+                    "tensorrt_llm.serve.responses_utils",
+                    "responses_done_generator",
+                )
+            }
+        ),
+        fix=(
+            "Import ResponseHooks, done_generator and UCompletionResponseOrGenerator from "
+            "tensorrt_llm.serve._base.service_types, PeriodicLatencyLogger from "
+            "tensorrt_llm.serve._base.latency_logger and get_steady_clock_now_in_seconds from "
+            "tensorrt_llm._utils. Responses stream code shared with the disaggregated frontend "
+            "belongs in tensorrt_llm/serve/_base/responses_stream.py."
+        ),
+    ),
 )
 
 
