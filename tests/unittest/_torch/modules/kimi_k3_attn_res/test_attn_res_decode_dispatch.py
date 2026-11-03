@@ -71,7 +71,7 @@ def _close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None):
 # The kernel itself is compared with the C++ ops over its full range in
 # kernels/parallel/test_kimi_k3_attn_res_decode.py; this checks the model-side wrappers.
 @pytest.mark.parametrize("snapshots", [1, 4, 11])
-@pytest.mark.parametrize("m", [1, 64])
+@pytest.mark.parametrize("m", [1, 128])
 @torch.no_grad()
 def test_dispatch_matches_cpp(m: int, snapshots: int):
     proj, norm, out_norm = _modules(m + snapshots)
@@ -145,9 +145,9 @@ def _fake_layer(layer_idx: int, seed: int):
     return layer
 
 
-# 65: one row above the decode kernel's limit, where the next mix is not the decode kernel and the
+# 129: one row above the decode kernel's limit, where the next mix is not the decode kernel and the
 # MoE layer must not defer its residual update.
-@pytest.mark.parametrize("m", [7, 32, 64, 65])
+@pytest.mark.parametrize("m", [7, 32, 64, 128, 129])
 @torch.no_grad()
 def test_decoder_layers_with_deferred_moe_residual(m: int):
     """Two decoder layers: the MoE residual update folded into the next mix equals materializing

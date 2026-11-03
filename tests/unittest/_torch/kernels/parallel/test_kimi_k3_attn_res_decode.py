@@ -143,7 +143,7 @@ def assert_close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None)
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("n", [2, 3, 4, 5, 9, 12])
-@pytest.mark.parametrize("m", [1, 7, 16, 17, 32, 56, 64])
+@pytest.mark.parametrize("m", [1, 7, 16, 17, 32, 56, 64, 96, 128])
 def test_against_cpp(m: int, n: int, mode: int):
     """Both cluster sizes :func:`cluster_size` picks (eight CTAs for up to 16 tokens with four or
     more candidates, else four)."""
@@ -202,7 +202,7 @@ def r128c4_offsets(m: int, k: int) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("n", [2, 6, 12])
-@pytest.mark.parametrize("m", [1, 7, 14, 32, 64])
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64, 128])
 def test_mxfp8_side_output(m: int, n: int):
     """The MXFP8 op returns the plain op's BF16 results and the MXFP8 form of the normalized
     output that the FP8 low-M GEMM's in-kernel quantization makes of it."""
@@ -239,7 +239,7 @@ def test_mxfp8_side_output_other_hidden_sizes(hidden: int):
 
 
 @pytest.mark.parametrize("n", [2, 9])
-@pytest.mark.parametrize("m", [1, 7, 14, 64])
+@pytest.mark.parametrize("m", [1, 7, 14, 64, 128])
 def test_in_place_all_reduce_addend(m: int, n: int):
     """The addend read in place from a pushed all-reduce's workspace (a one-rank stand-in: the
     result rows in the broadcast stage of the state's dirty buffer) gives the results of the

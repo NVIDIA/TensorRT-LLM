@@ -500,7 +500,7 @@ def _decode_attn_res_on_device(device_index: int) -> bool:
 
 def _attn_res_decode_max_tokens(hidden: int, num_candidates: int, device_index: int) -> int:
     """Largest token count of a BF16 ``[M, hidden]`` mix over ``num_candidates`` on the device
-    that the decode kernel serves (``kimi_k3_attn_res.supports``: from 1 up to 64 tokens);
+    that the decode kernel serves (``kimi_k3_attn_res.supports``: from 1 up to 128 tokens);
     0 where it serves none. ``_attn_res_kernel`` picks the decode kernel exactly there."""
     if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
         return 0
