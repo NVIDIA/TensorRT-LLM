@@ -38,6 +38,10 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCuda
 from tensorrt_llm.mapping import Mapping
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0)[0] != 10,
+    reason="requires Blackwell sparse MLA",
+)
 @torch.no_grad()
 def test_registered_vlm_text_forward():
     from tensorrt_llm._torch.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
