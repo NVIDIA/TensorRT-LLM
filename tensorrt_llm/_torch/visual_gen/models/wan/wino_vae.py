@@ -474,17 +474,17 @@ _SPATIAL_KERNELS = {
     # Blackwell: the fused F(2,3)-horizontal / direct-vertical 256-output-channel conv.
     "fused": (
         lambda conv, order: sm100_spatial.fused_filters(conv._winograd_weights(order)),
-        sm100_spatial.wino_spatial_conv_fused,
+        lambda conv, d, u, h, w: sm100_spatial.wino_spatial_conv_fused(d, u, h, w, pdl=conv.pdl),
     ),
     # Blackwell: the F(4x4, 3x3) CuTe DSL pipeline.
     "sm100": (
         lambda conv, order: sm100_spatial.spatial_filters(conv._winograd_weights(order)),
-        sm100_spatial.wino_spatial_conv,
+        lambda conv, d, u, h, w: sm100_spatial.wino_spatial_conv(d, u, h, w),
     ),
     # Any GPU: CuTe DSL transform kernels and cuBLAS batched GEMMs.
     "cublas": (
         lambda conv, order: winograd_spatial_weights(conv.weight, _SPATIAL_TILE, order),
-        wino_spatial_conv_cublas,
+        lambda conv, d, u, h, w: wino_spatial_conv_cublas(d, u, h, w),
     ),
 }
 
@@ -656,6 +656,9 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         # other conv runs through torch's cuDNN path.
         self.spatial_winograd = False
         self.cudnn_frontend = False
+        # Launch the fused spatial conv with programmatic dependent launch (see
+        # WinoVae.set_pdl).
+        self.pdl = True
         # The causal history of the frame-buffer path (see _FrameBuffer).
         self.frame_buffer = _FrameBuffer(in_channels)
         # Spatial sharding: this rank's slice and the halo exchanges (None: whole frames).
@@ -779,7 +782,7 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         ``_SPATIAL_KERNELS``): ``[comps, pairs, h*w, Cin]`` -> ``[comps, pairs, h*w, Cout]``."""
         filters, conv = _SPATIAL_KERNELS[kernel]
         u = self._derived_weight((kernel, order), lambda: filters(self, order))
-        return conv(stacked, u, h, w)
+        return conv(self, stacked, u, h, w)
 
     def _winograd_weights(self, order: int) -> list[torch.Tensor]:
         """The ``order + 2`` temporal component filters, in the Winograd dtype."""
@@ -1940,6 +1943,14 @@ class WinoVae(WanVAE):
             ):
                 module.shard = shard
         self._folded_tail.clear()
+
+    def set_pdl(self, enabled: bool) -> None:
+        """Launch the kernels that support it with programmatic dependent launch (their
+        prologue overlaps the previous kernel's tail), or without it. A compile-time choice per
+        kernel: switching compiles the other variant on its next use."""
+        for module in self.modules():
+            if isinstance(module, WinoVaeCausalConv3d):
+                module.pdl = enabled
 
     def clear_cache(self) -> None:
         if self.shard is not None:

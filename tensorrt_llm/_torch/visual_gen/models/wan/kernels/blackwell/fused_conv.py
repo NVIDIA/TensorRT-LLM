@@ -248,10 +248,13 @@ class Wino23Conv:
     channels (see :func:`supports`). The grid is persistent: ``nslots`` (at most the number of
     work units) slots of 4 CTAs each walk the units ``slot, slot + nslots, ...``, one unit
     being 4 CTA blocks of 8 rows x 32 px. ``in_half`` / ``out_half``: the input / output
-    element type is fp16 instead of bf16."""
+    element type is fp16 instead of bf16. ``pdl``: launch with programmatic dependent launch
+    (the prologue overlaps the previous kernel's tail; every role that touches global memory
+    waits for the previous grid); without it the kernel has no grid-dependency waits."""
 
-    def __init__(self, n_img, h, w, cin, cout, nslots, in_half=False, out_half=False):
+    def __init__(self, n_img, h, w, cin, cout, nslots, in_half=False, out_half=False, pdl=True):
         assert supports(cin, cout, h, w)
+        self.pdl = pdl
         # trace-time constants: the input (bf16/fp16) and output element types
         self.in_dtype = cutlass.Float16 if in_half else cutlass.BFloat16
         self.out_dtype = cutlass.Float16 if out_half else cutlass.BFloat16
@@ -399,7 +402,7 @@ class Wino23Conv:
             fallback_cluster=(2, 1, 1),
             smem_merge_branch_allocs=True,
             min_blocks_per_mp=1,
-            use_pdl=True,
+            use_pdl=self.pdl,
             stream=stream,
         )
 
@@ -737,9 +740,10 @@ class Wino23Conv:
     @cute.jit
     def _u_producer(self, u_pipe, u_loads, u_half_loads, mcast_mask, slot, rot):
         cute.arch.setmaxregister_decrease(56)
-        # The kernel is launched with programmatic dependent launch: every role that touches
-        # global memory waits for the previous grid first (the wait is per thread).
-        cute.arch.griddepcontrol_wait()
+        # Under programmatic dependent launch every role that touches global memory waits for
+        # the previous grid first (the wait is per thread).
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
         state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_U_STAGE)
         unit = slot
         while unit < self.nunit:
@@ -816,7 +820,8 @@ class Wino23Conv:
     @cute.jit
     def _x_producer(self, x_pipe, tma_atom_x, mX, sRaw, slot, cta_in_slot, rot):
         cute.arch.setmaxregister_decrease(56)
-        cute.arch.griddepcontrol_wait()  # x is written by the previous grid
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()  # x is written by the previous grid
         state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, NUM_RAW_STAGE)
         unit = slot
         while unit < self.nunit:
@@ -1434,7 +1439,8 @@ class Wino23Conv:
         with cute.arch.elect_one():
             acc_b_free_pipe.producer_commit(b_free_state)
         b_free_state.advance()
-        cute.arch.griddepcontrol_wait()  # y may still be read by the previous grid
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()  # y may still be read by the previous grid
         unit = slot
         while unit < self.nunit:
             acc_state, a_final_state, lo_state, hi_state, b_free_state = self._epilogue_block(
@@ -1553,10 +1559,11 @@ def prepare(weight):
     return u.permute(2, 1, 0)
 
 
-def run_prepared(x, ut, y):
+def run_prepared(x, ut, y, *, pdl):
     """``y = conv3x3(x, weight)`` (padding 1) with ``ut`` from :func:`prepare`; x, y
     channels-last ``[N, H, W, C]`` (bf16 or fp16 x, y in its own dtype), shapes as accepted
-    by :func:`supports`; launches on the current torch stream."""
+    by :func:`supports`; launches on the current torch stream, with programmatic dependent
+    launch when ``pdl`` (a compile-time choice: one compiled kernel per value)."""
     n_img, h, w, cin = x.shape
     cout = ut.shape[0]
     assert supports(cin, cout, h, w)
@@ -1566,7 +1573,15 @@ def run_prepared(x, ut, y):
         nslots = utils.HardwareInfo().get_max_active_clusters(2) // 2
         return cute.compile(
             Wino23Conv(
-                n_img, h, w, cin, cout, nslots, x.dtype == torch.float16, y.dtype == torch.float16
+                n_img,
+                h,
+                w,
+                cin,
+                cout,
+                nslots,
+                x.dtype == torch.float16,
+                y.dtype == torch.float16,
+                pdl,
             ),
             from_dlpack(x, assumed_align=16, enable_tvm_ffi=True),
             from_dlpack(ut, assumed_align=16, enable_tvm_ffi=True),
@@ -1575,5 +1590,5 @@ def run_prepared(x, ut, y):
             options="--enable-tvm-ffi",
         )
 
-    key = ("conv", x.device, n_img, h, w, cin, cout, x.dtype, y.dtype)
+    key = ("conv", x.device, n_img, h, w, cin, cout, x.dtype, y.dtype, pdl)
     _compiled(key, compile_conv)(x, ut, y)

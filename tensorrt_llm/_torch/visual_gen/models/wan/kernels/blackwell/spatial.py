@@ -163,11 +163,12 @@ def fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
 
 
 def wino_spatial_conv_fused(
-    d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int
+    d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int, *, pdl: bool
 ) -> torch.Tensor:
     """The fused F(2,3)-horizontal / direct-vertical 3x3 conv per component: ``D [components,
     pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [components, pairs, H*W, 256]`` in ``D``'s dtype,
-    one stacked buffer (the consumer norm kernel reads the components at one stride)."""
+    one stacked buffer (the consumer norm kernel reads the components at one stride).
+    ``pdl``: launch with programmatic dependent launch."""
     from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import fused_conv
 
     comps, pairs, positions, cin = d.shape
@@ -175,5 +176,5 @@ def wino_spatial_conv_fused(
     y = torch.empty((comps, pairs, height, width, cout), dtype=d.dtype, device=d.device)
     x = d.view(comps, pairs, height, width, cin)
     for k in range(comps):
-        fused_conv.run_prepared(x[k], filters[k], y[k])
+        fused_conv.run_prepared(x[k], filters[k], y[k], pdl=pdl)
     return y.view(comps, pairs, positions, cout)

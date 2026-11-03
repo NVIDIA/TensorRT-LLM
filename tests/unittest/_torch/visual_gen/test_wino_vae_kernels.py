@@ -1278,10 +1278,13 @@ def test_spatial_winograd_fused_matches_reference(
             for k in range(comps)
         ]
     )
-    got = wino_spatial_conv_fused(d, fused_filters(winograd_weights(weight, order)), h, w)
+    filters = fused_filters(winograd_weights(weight, order))
+    got = wino_spatial_conv_fused(d, filters, h, w, pdl=True)
     assert got.dtype == dtype and got.shape == (comps, pairs, h * w, cout)
     rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
+    # The launch mode changes only the scheduling, not the arithmetic.
+    assert torch.equal(wino_spatial_conv_fused(d, filters, h, w, pdl=False), got)
 
 
 def test_sm100_fused_needs_two_cin_chunks() -> None:
