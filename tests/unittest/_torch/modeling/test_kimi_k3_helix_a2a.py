@@ -95,8 +95,9 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     )
     layer.seen_all_rank_num_tokens = []
 
-    class _MoE:
-        def forward_parts(self, x, all_rank_num_tokens):
+    class _MoE(nn.Module):
+        def forward(self, x, all_rank_num_tokens, return_parts=False):
+            assert return_parts
             layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
             return torch.tanh(x @ moe_weight), torch.zeros_like(x)
 
@@ -216,3 +217,18 @@ def test_model_marks_the_bank_written_by_the_row_scatter():
     assert seen == [
         (i, i == first_sliced, num_tokens if i < first_sliced else chunk) for i in range(num_layers)
     ]
+
+
+def test_decoder_layer_calls_the_moe_module():
+    """The MoE block runs through ``nn.Module.__call__``, so module hooks (layer-wise NVTX
+    ranges, debug hooks) see it."""
+    torch.manual_seed(1)
+    layer = _make_layer(3, torch.randn(HIDDEN, HIDDEN), torch.randn(HIDDEN, HIDDEN), 0, False)
+    calls = []
+    layer.block_sparse_moe.register_forward_hook(lambda module, args, out: calls.append(out))
+    num_tokens = 5
+    bank = torch.randn(4, num_tokens, HIDDEN)
+    md = SimpleNamespace(num_tokens=num_tokens, all_rank_num_tokens=None)
+    with patch.object(kimi, "_FUSED_ATTN_RES_ENABLED", False):
+        layer(torch.randn(num_tokens, HIDDEN), bank, 2, md)
+    assert len(calls) == 1 and len(calls[0]) == 2
