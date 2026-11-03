@@ -5996,3 +5996,26 @@ class TestDSparkConfidenceScheduling:
         TorchLlmArgs._validate_dspark_confidence_environment(
             self._environment(moe_config=SimpleNamespace(
                 load_balancer=load_balancer)))
+
+
+@pytest.mark.cpu_only
+class TestServeGracefulShutdownTimeout:
+    """serve_graceful_shutdown_timeout_s."""
+
+    def test_the_default_waits_for_every_handler(self) -> None:
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert args.serve_graceful_shutdown_timeout_s is None
+
+    @pytest.mark.parametrize("timeout,accepted", [(30, True), (0, False),
+                                                  (-1, False)])
+    def test_the_graceful_shutdown_timeout_is_positive(self, timeout: int,
+                                                       accepted: bool) -> None:
+        if accepted:
+            args = TorchLlmArgs(model="/tmp/dummy_model",
+                                serve_graceful_shutdown_timeout_s=timeout)
+            assert args.serve_graceful_shutdown_timeout_s == timeout
+            return
+        with pytest.raises(ValidationError,
+                           match="serve_graceful_shutdown_timeout_s"):
+            TorchLlmArgs(model="/tmp/dummy_model",
+                         serve_graceful_shutdown_timeout_s=timeout)

@@ -635,7 +635,7 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None):
+        runtime_control_api_key: Optional[str] = None) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -784,7 +784,9 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
-                    multi_frontend_serving=multi_frontend_serving)
+                    multi_frontend_serving=multi_frontend_serving,
+                    graceful_shutdown_timeout=llm.args.
+                    serve_graceful_shutdown_timeout_s)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -809,7 +811,7 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
-):
+) -> None:
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -820,7 +822,9 @@ def launch_mm_encoder_server(
         server_role=ServerRole.MM_ENCODER,
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        graceful_shutdown_timeout=mm_encoder.args.
+        serve_graceful_shutdown_timeout_s)
     uvloop.run(server(host, port))
 
 
@@ -905,7 +909,7 @@ def launch_embedding_server(
     max_queue_delay: float,
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
-):
+) -> None:
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -935,13 +939,15 @@ def launch_embedding_server(
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
 
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.EMBEDDING,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.EMBEDDING,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 

@@ -7780,6 +7780,21 @@
       "status": "prototype",
       "title": "Serve Frontend Affinity Port Stride"
     },
+    "serve_graceful_shutdown_timeout_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a final response that never comes cannot hold the shutdown up. None waits for every handler.",
+      "status": "prototype",
+      "title": "Serve Graceful Shutdown Timeout S"
+    },
     "skip_tokenizer_init": {
       "default": false,
       "description": "Whether to skip the tokenizer initialization.",

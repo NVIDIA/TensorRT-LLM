@@ -2995,6 +2995,21 @@
           "status": "prototype",
           "title": "Serve Frontend Affinity Port Stride"
         },
+        "serve_graceful_shutdown_timeout_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a final response that never comes cannot hold the shutdown up. None waits for every handler.",
+          "status": "prototype",
+          "title": "Serve Graceful Shutdown Timeout S"
+        },
         "skip_tokenizer_init": {
           "default": false,
           "description": "Whether to skip the tokenizer initialization.",
@@ -9534,6 +9549,21 @@
       "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
       "status": "prototype",
       "title": "Serve Frontend Affinity Port Stride"
+    },
+    "serve_graceful_shutdown_timeout_s": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an LLM, embedding or multimodal-encoder server waits after a shutdown signal for request handlers that are still running (uvicorn's timeout_graceful_shutdown), in every frontend process. Handlers still running then are cancelled and the server shuts down as usual, so a handler waiting for a final response that never comes cannot hold the shutdown up. None waits for every handler.",
+      "status": "prototype",
+      "title": "Serve Graceful Shutdown Timeout S"
     },
     "server_keep_alive_timeout": {
       "default": 10,

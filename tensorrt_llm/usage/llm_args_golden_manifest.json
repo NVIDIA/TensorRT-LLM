@@ -1480,6 +1480,11 @@
       "path": "serve_frontend_affinity_port_stride"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "skip_tokenizer_init"
