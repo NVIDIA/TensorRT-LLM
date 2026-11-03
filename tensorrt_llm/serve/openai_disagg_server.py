@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator, Awaitable, Callable, Optional, Union
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -222,7 +223,12 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
 
 
 class _MessagesStreamingResponse(ClosingStreamingResponse):
-    """Cancel the chat pipeline even when a disconnect precedes body iteration."""
+    """Release the chat pipeline however the response ends, body iterated or not.
+
+    A pipeline still running is cancelled, and the stream of one that has
+    answered is closed: the body may stop, or never start, before it has read
+    that stream to its end.
+    """
 
     def __init__(self, chat: asyncio.Future, content: AsyncIterator[str]) -> None:
         super().__init__(content=content, media_type="text/event-stream")
@@ -232,7 +238,13 @@ class _MessagesStreamingResponse(ClosingStreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            self._chat.cancel()
+            chat = self._chat
+            chat.cancel()
+            if (chat.done() and not chat.cancelled()
+                    and chat.exception() is None
+                    and isinstance(chat.result(), StreamingResponse)):
+                with anyio.CancelScope(shield=True):
+                    await chat.result().body_iterator.aclose()
 
 
 class OpenAIDisaggServer:

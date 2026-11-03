@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiohttp
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from starlette.datastructures import Headers
 
 from tensorrt_llm.executor.utils import context_length_exceeded_message
@@ -403,6 +404,8 @@ class _Workers:
         self.context_done = asyncio.Event()
         self.context_cancelled = asyncio.Event()
         self.generation_cancelled = asyncio.Event()
+        # Set once the generation worker's stream has ended, however it ended.
+        self.generation_closed = asyncio.Event()
 
     async def send_context_request(self, request, server=None, hooks=None, req_id=None):
         try:
@@ -433,14 +436,34 @@ class _Workers:
     async def send_generation_request(self, request, server=None, hooks=None, req_id=None):
         async def stream():
             try:
+                yield None
                 await self.context_done.wait()
-                for frame in _generation_frames():
+                async for frame in self.generation_stream():
                     yield frame
             except asyncio.CancelledError:
                 self.generation_cancelled.set()
                 raise
+            finally:
+                self.generation_closed.set()
 
-        return stream()
+        # Started before it is returned, as the HTTP client starts it, so that
+        # closing it ends it even before it is read.
+        response = stream()
+        await response.__anext__()
+        return response
+
+    async def generation_stream(self):
+        """The generation worker's stream once the context phase is done."""
+        for frame in _generation_frames():
+            yield frame
+
+
+class _WorkersStillGenerating(_Workers):
+    """Workers whose generation worker sends its first frame and then goes on generating."""
+
+    async def generation_stream(self):
+        yield _generation_frames()[0]
+        await asyncio.Event().wait()
 
 
 def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
@@ -799,3 +822,56 @@ async def test_disconnect_before_the_messages_body_starts_cancels_context(
         assert not workers.context_done.is_set()
     finally:
         release_context.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
+async def test_disconnect_before_the_messages_body_starts_closes_the_stream_it_answered_with(
+    monkeypatch, schedule_style, asgi_version
+) -> None:
+    """The pipeline answers with a stream after the response is returned, which no body reads."""
+    from starlette.requests import ClientDisconnect
+
+    _short_waits(monkeypatch)
+    release_context = asyncio.Event()
+    workers = _WorkersStillGenerating(_waits_for(release_context))
+    server = _messages_server(schedule_style, workers)
+    request = AnthropicMessagesRequest(
+        model=_MODEL,
+        max_tokens=16,
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    raw_request = Request({"type": "http", "headers": []})
+    raw_request.state.server_arrival_time = 0
+    response = await asyncio.wait_for(server.anthropic_messages(request, raw_request), 2)
+    chat = response._chat
+    answered = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        # The pipeline answers while the response starts, before the body does.
+        release_context.set()
+        await asyncio.wait((chat,), timeout=2)
+        answered.set()
+        if asgi_version == "2.4":
+            raise OSError("client disconnected")
+        await asyncio.Event().wait()
+
+    async def receive():
+        await answered.wait()
+        return {"type": "http.disconnect"}
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
+    if asgi_version == "2.4":
+        with pytest.raises(ClientDisconnect):
+            await response(scope, receive, send)
+    else:
+        await response(scope, receive, send)
+
+    assert [message["type"] for message in sent] == ["http.response.start"]
+    assert isinstance(chat.result(), StreamingResponse)
+    # Closed by the time the response is done, while the generation worker goes on.
+    assert workers.generation_closed.is_set()
