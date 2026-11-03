@@ -1198,7 +1198,7 @@ class TestKVCacheFailuresGen:
         mgr.free_resources.assert_called_once_with(victim)
 
     def test_recompute_pause_waits_while_generation_progresses(self):
-        """No teardown once a generation request is scheduled in the pass.
+        """No teardown while a generation request is scheduled ahead in the pass.
 
         The scheduled request releases pages as it finishes, so the blocked
         request suspends itself and waits; re-prefilling a victim instead
@@ -1239,6 +1239,86 @@ class TestKVCacheFailuresGen:
         assert ids(out.paused_requests) == [1]
         assert out.recompute_paused_requests == []
         mgr.free_resources.assert_not_called()
+
+    @staticmethod
+    def _bounded_wait_case(max_wait_iters, gpu_only=False, fits=None):
+        """Scheduler and requests [0, 1, 99] where 1 fits only once 99 is torn down.
+
+        *fits* holds the ids that fit without a teardown (default: only 0).
+        In a GPU-only pool the victim is a request suspended in an earlier
+        pass, which still holds its pages.
+        """
+        fits = {0} if fits is None else fits
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return req.request_id in fits or 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn,
+            can_evict=not gpu_only,
+            has_cache_tier_below_gpu=not gpu_only,
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        env = {"TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS": str(max_wait_iters)}
+        with patch.dict("os.environ", env):
+            sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(99)]
+        if gpu_only:
+            mgr.kv_cache_map[99].is_active = False
+        return sched, mgr, reqs
+
+    @pytest.mark.parametrize("gpu_only", [False, True])
+    def test_recompute_pause_after_bounded_wait(self, gpu_only):
+        """The wait is bounded: after TLLM_V2_RECOMPUTE_PAUSE_MAX_WAIT_ITERS
+        iterations the blocked request tears down a victim, as the first
+        generation request of a pass would."""
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=2, gpu_only=gpu_only)
+        for _ in range(2):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests) == [0]
+            assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(reqs[2])
+
+    def test_zero_wait_recompute_pauses_right_away(self):
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=0)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(reqs[2])
+
+    def test_negative_wait_lasts_while_generation_progresses(self):
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=-1)
+        for _ in range(8):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests) == [0]
+            assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_wait_restarts_after_the_request_runs(self):
+        """Only iterations waited since the request last ran count."""
+        fits = {0}
+        sched, mgr, reqs = self._bounded_wait_case(max_wait_iters=1, fits=fits)
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+
+        fits.update((1, 99))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1, 99]
+
+        fits.difference_update((1, 99))
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0]
+        assert out.recompute_paused_requests == []
+
+        out = sched.schedule_request(reqs, set())
+        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.recompute_paused_requests) == [99]
 
     def test_first_generation_request_recompute_pauses_gpu_only(self):
         """In a GPU-only pool the first generation request of a pass still tears
