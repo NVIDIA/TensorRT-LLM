@@ -61,7 +61,7 @@ def test_optimized_two_pool_prefill_and_decode(
             dtype="mixed_nvfp4_fp8" if high_dtype == DataType.FP8 else "mixed_nvfp4_bfloat16",
             mixed_precision_first_n=block,
             mixed_precision_last_n=block,
-            # Full-history (low) group, then the retained-token (high) group.
+            # Full-history (low) group, then the mixed-precision high group.
             pool_ratio=[0.75, 0.25],
         ),
         CacheType.SELF,
@@ -715,8 +715,33 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse attention"),
+        ({"sleep_config": {}}, ValueError, "sleep_config"),
+        (
+            {
+                "speculative_config": {
+                    "decoding_type": "Eagle3",
+                    "max_draft_len": 2,
+                    "speculative_model": "/tmp/mixed-precision-nonexistent-draft",
+                    "use_dynamic_tree": True,
+                    "dynamic_tree_max_topK": 2,
+                }
+            },
+            ValueError,
+            "dynamic-tree",
+        ),
     ],
-    ids=("v1", "auto_v2", "backend", "connector", "dynamic_tree", "compression", "beam", "sparse"),
+    ids=(
+        "v1",
+        "auto_v2",
+        "backend",
+        "connector",
+        "dynamic_tree",
+        "compression",
+        "beam",
+        "sparse",
+        "sleep",
+        "eagle3_dynamic_tree",
+    ),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
@@ -735,7 +760,7 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
 @pytest.mark.parametrize("is_mtp", [True, False])
 @pytest.mark.cpu_only
 def test_one_model_draft_kv_cache_dtype(is_mtp):
-    """A separate MTP draft manager goes mixed like the target; another drafter keeps a plain cache."""
+    """A separate MTP draft manager uses mixed-precision KV like the target; others do not."""
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
     target = KvCacheConfig(
@@ -750,7 +775,7 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
         )
     )
     draft = KvCacheCreator._get_one_model_draft_kv_cache_config(
-        creator, target, 1024, estimating_kv_cache=True
+        creator, target, max_seq_len=1024, estimating_kv_cache=True
     )
     assert draft.dtype == ("mixed_nvfp4_fp8" if is_mtp else "auto")
     assert (draft.mixed_precision_kv is not None) == is_mtp
@@ -758,128 +783,62 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     assert target.mixed_precision_kv is not None
 
 
-@pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
-def test_draft_forward_hides_retained_rows(backend):
-    """A draft forward on a manager without twin layers turns the retained-row hooks off."""
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
-        DeepseekV4TrtllmAttentionMetadata,
-    )
+def test_dsa_draft_forward_uses_draft_mixed_precision_high_table():
+    """A mixed DSA draft manager's MTP layers read its own mixed-precision high page table."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
 
-    cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
-        backend
-    ]
-    meta = Mock()
-    meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    meta.draft_sliding_block_tables = None
-    meta.draft_retained_block_table = None
-    meta.draft_replay_swapped_attrs = {}
-    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
-        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
-    table = torch.full((2, 4), -1, dtype=torch.int32)
-    meta.retained_block_table = table
-
-    assert cls.prepare_for_draft_forward(meta) is None
-    assert cls.has_mixed_precision_retained_rows.fget(meta) is False
-    meta.restore_draft_swaps()
-    assert meta.retained_block_table is table
-    assert cls.has_mixed_precision_retained_rows.fget(meta) is True
-
-
-@pytest.mark.cpu_only
-def test_dsa_twin_tables_refresh_full_width():
-    """An MTP draft loop reads past this step's kv lengths: no column may keep a stale page."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
-    )
-
-    num_blocks = {10: 3, 11: 1}
-
-    def fill(request_ids, layer, out):
-        # Like _fill_page_table: a request's allocated blocks only; the rest stay as given.
-        for row, request_id in enumerate(request_ids):
-            out[row, : num_blocks[request_id]] = 100 + row
-
-    def manager():
-        return SimpleNamespace(
-            high_layers={0: 1}, pp_layers=[0], fill_high_precision_page_table=fill
-        )
-
-    meta = SimpleNamespace(
-        num_seqs=2,
-        request_ids=[10, 11],
-        kv_cache_manager=manager(),
-        draft_kv_cache_manager=manager(),
-        # Stale page ids from an earlier step, page 0 included.
-        retained_block_table=torch.zeros(4, 6, dtype=torch.int32),
-        draft_retained_block_table=torch.full((4, 6), 7, dtype=torch.int32),
-    )
-    meta._fill_retained_block_table = partial(
-        DSAtrtllmAttentionMetadata._fill_retained_block_table, meta
-    )
-    DSAtrtllmAttentionMetadata._fill_retained_block_tables(meta)
-
-    expected = torch.tensor([[100] * 3 + [-1] * 3, [101] + [-1] * 5], dtype=torch.int32)
-    for table in (meta.retained_block_table, meta.draft_retained_block_table):
-        assert torch.equal(table[:2], expected)
-
-
-@pytest.mark.cpu_only
-def test_dsa_draft_forward_uses_draft_twin_table():
-    """MTP layers on a mixed DSA draft manager read its own twin table during the draft forward."""
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
-        DSAtrtllmAttentionMetadata,
-    )
-
-    meta = Mock()
-    meta.kv_cache_manager = Mock(name="draft_kv_cache_manager")
-    meta.draft_replay_swapped_attrs = {}
-    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
-        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
+    metadata = Mock()
+    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    metadata.draft_replay_swapped_attrs = {}
+    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
+    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
+    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
     target, draft = (torch.full((2, 4), -1, dtype=torch.int32) for _ in range(2))
-    meta.retained_block_table = target
-    meta.draft_retained_block_table = draft
+    metadata.mixed_precision_high_block_table = target
+    metadata.draft_mixed_precision_high_block_table = draft
 
-    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(meta)
-    assert meta.retained_block_table is draft
-    meta.restore_draft_swaps()
-    assert meta.retained_block_table is target
+    DSAtrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
+    assert metadata.mixed_precision_high_block_table is draft
+    metadata.restore_draft_swaps()
+    assert metadata.mixed_precision_high_block_table is target
 
 
 @pytest.mark.cpu_only
 def test_draft_forward_swaps_in_draft_staging():
     """A mixed MTP draft manager's layers run on its own staging copy during the draft forward."""
-    meta = Mock()
-    meta.draft_replay_swapped_attrs = {}
-    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
-        setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
+    metadata = Mock()
+    metadata.draft_replay_swapped_attrs = {}
+    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
+    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
+    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
+    metadata.sync_draft_mixed_precision_staging = partial(
+        TrtllmAttentionMetadata.sync_draft_mixed_precision_staging, metadata
+    )
     target, draft = Mock(name="target_staging"), Mock(name="draft_staging")
-    meta.mixed_precision_staging = target
-    meta.draft_mixed_precision_staging = draft
+    metadata.mixed_precision_staging = target
+    metadata.draft_mixed_precision_staging = draft
 
-    TrtllmAttentionMetadata.prepare_for_draft_forward(meta)
-    assert meta.mixed_precision_staging is draft
-    meta.restore_draft_swaps()
-    assert meta.mixed_precision_staging is target
+    TrtllmAttentionMetadata.prepare_for_draft_forward(metadata)
+    assert metadata.mixed_precision_staging is draft
+    metadata.restore_draft_swaps()
+    assert metadata.mixed_precision_staging is target
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_retained_row_indices_point_at_the_twin():
     """A plain pool reads a retained position from the twin's row; released pages keep the pool row."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
         retained_row_indices,
     )
 
     manager = SimpleNamespace(
         layer_offsets={3: 0}, tokens_per_block=4, retained_row_layer_offsets={0: 1}
     )
-    metadata = SimpleNamespace(
-        kv_cache_manager=manager,
-        retained_block_table=torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda"),
-    )
+    table = torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(kv_cache_manager=manager, mixed_precision_high_block_table=table)
     attention = SimpleNamespace(layer_idx=3)
     topk = torch.tensor([[0, 5, 9, -1]], dtype=torch.int32, device="cuda")
     pool_rows = torch.tensor([[100, 101, 102, -1]], dtype=torch.int32, device="cuda")
@@ -889,189 +848,8 @@ def test_retained_row_indices_point_at_the_twin():
     assert rows.tolist() == [[36, 101, 53, -1]]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_retained_compressed_row_mask_matches_reference():
-    """DeepSeek-V4: the twin scatter only writes rows whose page the twin holds.
-
-    Many requests with padding rows, released pages and pages past the table width.
-    """
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        _retained_compressed_row_mask,
-    )
-
-    torch.manual_seed(0)
-    batch, rows_per_page, width = 37, 4, 8
-    new_rows = torch.randint(0, 6, (batch,), dtype=torch.int32)
-    cu = torch.cat([torch.zeros(1, dtype=torch.int32), new_rows.cumsum(0).int()])
-    total = int(cu[-1])
-    num_comp = (new_rows - torch.randint(0, 2, (batch,), dtype=torch.int32)).clamp(min=0)
-    start_pos = torch.randint(0, 40, (batch,), dtype=torch.int32)
-    compressed_mask = torch.rand(total) > 0.2
-    table = torch.randint(-1, 9, (batch, width), dtype=torch.int32)
-    mask = _retained_compressed_row_mask(
-        table.cuda(),
-        rows_per_page,
-        num_comp.cuda(),
-        cu.cuda(),
-        start_pos.cuda(),
-        compressed_mask.cuda(),
-        batch,
-        total,
-    ).cpu()
-    expected = []
-    for row in range(total):
-        req = int(torch.searchsorted(cu[1:], row, right=True))
-        local = row - int(cu[req])
-        block = (int(start_pos[req]) + local) // rows_per_page
-        page = int(table[req, block]) if block < width else -1
-        expected.append(bool(compressed_mask[row]) and local < int(num_comp[req]) and page >= 0)
-    assert mask.tolist() == expected
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_store_retained_context_rows_uses_context_positions():
-    """DSA context: each row lands at its position_ids entry if the twin holds that page."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        store_retained_context_rows,
-    )
-
-    tokens_per_block, width, num_ctx = 4, 576, 10
-    pool = torch.zeros((4, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
-    # Request 0 resumes at position 6; request 1 starts at 0 and the twin released its page 0.
-    table = torch.tensor([[-1, 2, 0, -1], [-1, 3, -1, -1]], dtype=torch.int32, device="cuda")
-    ctx_positions = [6, 7, 8, 9, 0, 1, 2, 3, 4, 5]
-    # position_ids spans [ctx..., gen...]; the generation tail must not be stored here.
-    position_ids = torch.tensor([ctx_positions + [11, 12]], dtype=torch.int32, device="cuda")
-    requests = torch.tensor([0] * 4 + [1] * 6 + [0, 1], dtype=torch.int32, device="cuda")
-    latent_cache = torch.randn(12, width, dtype=torch.bfloat16, device="cuda")
-    owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=torch.ones(1, device="cuda"))
-    manager = SimpleNamespace(
-        layer_offsets={0: 0},
-        high_layers={0: 1},
-        _get_mixed_precision_buffers=lambda *args: pool,
-    )
-    meta = SimpleNamespace(
-        retained_block_table=table,
-        kv_cache_manager=manager,
-        num_ctx_tokens=num_ctx,
-        req_idx_per_token=requests,
-    )
-
-    store_retained_context_rows(owner, meta, latent_cache, position_ids)
-
-    expected = torch.zeros(4 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
-    for token, pos in enumerate(ctx_positions):
-        page = int(table[int(requests[token]), pos // tokens_per_block])
-        if page >= 0:
-            expected[page * tokens_per_block + pos % tokens_per_block] = latent_cache[token]
-    assert torch.equal(pool.view(-1, width), expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_store_retained_generation_rows_rotates_k_pe():
-    """DSA generation: the store rotates k_pe at the trailing positions, like the append kernel."""
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        store_retained_generation_rows,
-    )
-
-    tokens_per_block, nope, rope_dim, num_ctx = 4, 512, 64, 2
-    width = nope + rope_dim
-    pool = torch.zeros((2, 1, tokens_per_block, 1, width), dtype=torch.bfloat16, device="cuda")
-    table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
-    # Two context tokens, then three generation tokens (target + drafts) of request 0.
-    position_ids = torch.tensor([[0, 1, 5, 6, 7]], dtype=torch.int32, device="cuda")
-    gen_positions = [5, 6, 7]
-    rows = torch.randn(3, width, dtype=torch.bfloat16, device="cuda")
-    cos_sin = torch.rand(16, rope_dim, 2, dtype=torch.float32, device="cuda")
-    owner = SimpleNamespace(
-        layer_idx=0,
-        kv_scale_orig_quant=torch.ones(1, device="cuda"),
-        rotary_cos_sin=cos_sin,
-        mla_params=SimpleNamespace(qk_rope_head_dim=rope_dim),
-    )
-    manager = SimpleNamespace(
-        layer_offsets={0: 0},
-        high_layers={0: 1},
-        _get_mixed_precision_buffers=lambda *args: pool,
-    )
-    meta = SimpleNamespace(
-        retained_block_table=table,
-        kv_cache_manager=manager,
-        num_ctx_tokens=num_ctx,
-        req_idx_per_token=torch.zeros(5, dtype=torch.int32, device="cuda"),
-    )
-
-    store_retained_generation_rows(owner, meta, rows, position_ids)
-
-    expected = torch.zeros(2 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
-    for token, pos in enumerate(gen_positions):
-        row = rows[token].clone()
-        even, odd = row[nope::2].float(), row[nope + 1 :: 2].float()
-        cos, sin = cos_sin[pos, : rope_dim // 2, 0], cos_sin[pos, : rope_dim // 2, 1]
-        row[nope::2] = (even * cos - odd * sin).to(torch.bfloat16)
-        row[nope + 1 :: 2] = (odd * cos + even * sin).to(torch.bfloat16)
-        page = int(table[0, pos // tokens_per_block])
-        expected[page * tokens_per_block + pos % tokens_per_block] = row
-    assert torch.equal(pool.view(-1, width), expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("shared_rows", [False, True])
-def test_overlay_retained_rows_copies_held_rows(shared_rows):
-    """The overlay replaces exactly the scratch rows whose token the twin holds.
-
-    Two calls in a row: the context overlay's row records from the first call must not leak
-    into the second, which releases pages the first one held.
-    """
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        overlay_retained_rows,
-    )
-
-    torch.manual_seed(0)
-    # topk spans three overlay tiles, the last one partial.
-    tokens_per_block, width, queries, topk = 4, 656, 5, 150
-    pool = torch.randint(
-        0, 255, (6, 1, tokens_per_block, 1, width), dtype=torch.uint8, device="cuda"
-    )
-    tables = [
-        torch.tensor([[2, -1, -1, 5], [-1, 0, -1, -1]], dtype=torch.int32, device="cuda"),
-        torch.tensor([[-1, -1, -1, 5], [-1, -1, 3, -1]], dtype=torch.int32, device="cuda"),
-    ]
-    requests = torch.tensor([0, 0, 1, 1, 0], dtype=torch.int32, device="cuda")
-    topk_indices = torch.randint(-1, 16, (queries, topk), dtype=torch.int32, device="cuda")
-    if shared_rows:
-        # Context gather: one scratch row per distinct (request, position).
-        compact = (requests[:, None] * 16 + topk_indices).where(topk_indices >= 0, -1)
-        rows = 32
-    else:
-        compact = torch.arange(queries * topk, dtype=torch.int32, device="cuda").view(queries, topk)
-        rows = queries * topk
-    owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=None)
-    manager = SimpleNamespace(
-        layer_offsets={0: 0},
-        high_layers={0: 1},
-        _get_mixed_precision_buffers=lambda *args: pool,
-    )
-    flat = pool.view(-1, width)
-    for table in tables:
-        scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
-        meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
-        overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
-
-        expected = torch.zeros_like(scratch)
-        for q in range(queries):
-            for k in range(topk):
-                pos, row = int(topk_indices[q, k]), int(compact[q, k])
-                if pos < 0 or row < 0:
-                    continue
-                page = int(table[int(requests[q]), pos // tokens_per_block])
-                if page >= 0:
-                    expected[row] = flat[page * tokens_per_block + pos % tokens_per_block]
-        assert torch.equal(scratch, expected)
-
-
 @pytest.mark.cpu_only
-def test_mixed_precision_retained_dtype_must_match_model_dtype():
+def test_mixed_precision_high_dtype_must_match_model_dtype():
     from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 
     model_config = SimpleNamespace(
@@ -1084,7 +862,7 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(model_config, "mixed_nvfp4_bfloat16")
     assert model_config.quant_config.kv_cache_quant_algo is None
-    # Sparse MLA models map the pool to NVFP4, but the retained dtype still has to match.
+    # Sparse MLA models map the pool to NVFP4, but the mixed-precision high dtype must still match.
     sparse = SimpleNamespace(
         quant_config=QuantConfig(),
         quant_config_dict=None,
@@ -1098,6 +876,13 @@ def test_mixed_precision_retained_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_bfloat16")
     assert sparse.quant_config.kv_cache_quant_algo == "NVFP4"
+    # SM107 has no NVFP4 sparse MLA: mixed KV fails instead of silently falling back to FP8.
+    with (
+        patch(f"{validate_and_set_kv_cache_quant.__module__}.get_sm_version", return_value=107),
+        patch("torch.cuda.is_available", return_value=True),
+        pytest.raises(ValueError, match="SM107"),
+    ):
+        validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_bfloat16")
 
 
 @pytest.mark.cpu_only
@@ -1209,46 +994,17 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
     "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
 )
 def test_staging_lengths_follow_corrected_kv_lens(backend):
-    """Overlap speculation corrects KV lengths on the device after prepare(); staging follows."""
+    """The overlap scheduler corrects KV lengths on the device after prepare(); staging follows."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, cached = 128, 32
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    manager = KVCacheManagerV2(
-        KvCacheConfig(
-            max_tokens=65536,
-            enable_block_reuse=True,
-            dtype="mixed_nvfp4_bfloat16",
-            mixed_precision_first_n=block,
-            mixed_precision_last_n=block,
-            pool_ratio=[0.75, 0.25],
-        ),
-        CacheType.SELF,
-        num_layers=1,
-        num_kv_heads=2,
-        head_dim=64,
-        tokens_per_block=block,
-        max_seq_len=1024,
-        max_batch_size=2,
-        mapping=mapping,
-        dtype=DataType.BF16,
-    )
+    manager, draft = (_small_manager(block, mapping) for _ in range(2))
     try:
-        manager.add_dummy_requests([0], [cached + block], is_gen=False)
-        metadata = backend.Metadata(
-            seq_lens=torch.tensor([block], dtype=torch.int32),
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
-            max_num_requests=2,
-            max_num_tokens=block,
-            max_num_sequences=2,
-            kv_cache_manager=manager,
-            request_ids=[0],
-            prompt_lens=[cached + block],
-            kv_layout="NHD",
-            mapping=mapping,
-            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
-        )
+        for kv_cache in (manager, draft):
+            kv_cache.add_dummy_requests([0], [cached + block], is_gen=False)
+        # A separate MTP draft manager holding the same tokens.
+        metadata = _small_metadata(backend, manager, mapping, block, cached, draft=draft)
         metadata.prepare()
         view = metadata.mixed_precision_staging
         assert view.lengths.tolist() == [[cached], [cached + block]]
@@ -1265,7 +1021,29 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
                 )
 
         correct()
-        assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
+        corrected = [[cached - 2], [cached + block - 2]]
+        assert view.lengths.tolist() == corrected
+        # The draft forward runs on the draft staging copy with the corrected lengths.
+        if backend is TrtllmAttention:
+            metadata.prepare_for_draft_forward()
+            assert metadata.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
+            metadata.restore_draft_swaps()
+            assert metadata.mixed_precision_staging is view
+        else:
+            # The first draft view sync follows the correction; later syncs precede it.
+            draft_view = metadata.get_draft_metadata(draft)
+            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
+            metadata.prepare()
+            correct()
+            assert view.lengths.tolist() == corrected
+            # Every draft forward starts here; the view reuses the same staging copy and
+            # builds none of its own.
+            assert metadata.get_draft_metadata(draft) is draft_view
+            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert draft_view.draft_mixed_precision_staging is None
+            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
         # Draft layers run on another manager through this metadata: the view is
         # hidden and the staging lengths are left alone.
         metadata.kv_cache_manager = object()
@@ -1274,5 +1052,259 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
         metadata.kv_cache_manager = manager
         assert metadata.get_mixed_precision_kv_view(0) is view
+    finally:
+        manager.shutdown()
+        draft.shutdown()
+
+
+def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16"):
+    """A one-layer BF16 cache; mixed precision keeps one page at each end in the high pool."""
+    mixed = (
+        dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
+        if dtype.startswith("mixed_")
+        else {}
+    )
+    return KVCacheManagerV2(
+        KvCacheConfig(max_tokens=65536, enable_block_reuse=True, dtype=dtype, **mixed),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=block,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=mapping,
+        dtype=DataType.BF16,
+    )
+
+
+def _small_metadata(backend, manager, mapping: Mapping, block: int, cached: int, draft=None):
+    return backend.Metadata(
+        seq_lens=torch.tensor([block], dtype=torch.int32),
+        num_contexts=1,
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+        max_num_requests=2,
+        max_num_tokens=block,
+        max_num_sequences=2,
+        kv_cache_manager=manager,
+        draft_kv_cache_manager=draft,
+        request_ids=[0],
+        prompt_lens=[cached + block],
+        kv_layout="NHD",
+        mapping=mapping,
+        runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sparse_attention_config": {"algorithm": "dsa", "index_head_dim": 128}},
+        {
+            "sparse_attention_config": {
+                "algorithm": "deepseek_v4",
+                "index_head_dim": 128,
+                "window_size": 128,
+                "compress_ratios": [1, 4],
+            }
+        },
+        {"speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1}},
+        {
+            "speculative_config": {
+                "decoding_type": "Eagle3",
+                "max_draft_len": 1,
+                "speculative_model": "/tmp/mixed-precision-nonexistent-draft",
+            }
+        },
+    ],
+    ids=("dsa", "deepseek_v4", "mtp", "eagle3"),
+)
+@pytest.mark.cpu_only
+def test_mixed_precision_llm_args_accept_supported_features(overrides):
+    """The sparse algorithms and drafters mixed-precision KV supports pass validation."""
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    TorchLlmArgs(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
+@pytest.mark.cpu_only
+def test_draft_forward_hides_mixed_precision_high_rows(backend):
+    """A draft manager without a mixed-precision high pool skips its writes and reads."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    cls = {"dsa": DSAtrtllmAttentionMetadata, "deepseek_v4": DeepseekV4TrtllmAttentionMetadata}[
+        backend
+    ]
+    metadata = Mock()
+    metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    metadata.draft_sliding_block_tables = None
+    metadata.draft_mixed_precision_high_block_table = None
+    metadata.draft_replay_swapped_attrs = {}
+    metadata.record_draft_swap = partial(TrtllmAttentionMetadata.record_draft_swap, metadata)
+    metadata.swap_for_draft = partial(TrtllmAttentionMetadata.swap_for_draft, metadata)
+    metadata.restore_draft_swaps = partial(TrtllmAttentionMetadata.restore_draft_swaps, metadata)
+    table = torch.full((2, 4), -1, dtype=torch.int32)
+    metadata.mixed_precision_high_block_table = table
+
+    assert cls.prepare_for_draft_forward(metadata) is None
+    assert cls.has_mixed_precision_high_rows.fget(metadata) is False
+    metadata.restore_draft_swaps()
+    assert metadata.mixed_precision_high_block_table is table
+    assert cls.has_mixed_precision_high_rows.fget(metadata) is True
+
+
+@pytest.mark.cpu_only
+def test_gqa_decode_skips_the_kv_append_plan_of_a_mixed_layer():
+    """A mixed-precision layer appends into its staging copy, not through a GQA-decode plan."""
+    from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import GqaDecodeFmha
+    from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
+
+    attn = SimpleNamespace(
+        head_dim=128,
+        layer_idx=3,
+        quant_mode=int(QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.FP8)),
+    )
+    fmha = object.__new__(GqaDecodeFmha)
+    fmha._attn_ref = lambda: attn
+    metadata = Mock()
+    metadata.get_mixed_precision_kv_view.side_effect = lambda layer_idx: (
+        object() if layer_idx == 3 else None
+    )
+    assert fmha.kv_append_plan(metadata, num_tokens=4) is None
+    metadata.get_mixed_precision_kv_view.assert_called_with(3)
+
+
+def test_staging_page_tables_follow_each_layer_page_scale():
+    """Mixed layers with different KV head counts get page tables in their own pools' page space."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    import numpy as np
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_staging import (
+        MixedPrecisionKVStaging,
+    )
+
+    block = 32
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=4096,
+            enable_block_reuse=False,
+            dtype="mixed_nvfp4_bfloat16",
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
+        ),
+        CacheType.SELF,
+        num_layers=3,
+        num_kv_heads=[8, 8, 4],
+        head_dim=64,
+        tokens_per_block=block,
+        max_seq_len=512,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        dtype=DataType.BF16,
+    )
+    try:
+        manager.add_dummy_requests([0], [4 * block], is_gen=False)
+        view = MixedPrecisionKVStaging(
+            manager, Buffers(), rows=2, layout="HND", pool_layout="HND", tokens_per_block=block
+        )
+        view.update(request_ids=[0], cached_lengths=[0], seq_lens=[4 * block], capture_graph=False)
+        for layer in range(3):
+            expected = np.full(
+                tuple(view.page_tables[layer].shape), kv.BAD_PAGE_INDEX, dtype=np.int32
+            )
+            manager.fill_mixed_precision_page_tables([0], layer, expected)
+            assert view.page_tables[layer].cpu().numpy().tolist() == expected.tolist()
+    finally:
+        manager.shutdown()
+
+
+def test_draft_staging_follows_corrected_kv_lens_in_cuda_graph():
+    """Inside a CUDA graph, each draft forward's staging copy follows the corrected KV lengths."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager, draft = (_small_manager(block, mapping) for _ in range(2))
+    try:
+        for kv_cache in (manager, draft):
+            kv_cache.add_dummy_requests([0], [cached + block], is_gen=False)
+        # A separate MTP draft manager holds the same tokens; graph metadata is a one-token decode.
+        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached, draft=draft)
+        metadata = metadata.create_cuda_graph_metadata(1, buffers=Buffers())
+        metadata.prepare()
+        offsets = torch.zeros(1, dtype=torch.int32, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # The overlap scheduler corrects KV lengths on the device, then a draft forward runs.
+            metadata.kv_lens_cuda[:1] += offsets
+            metadata.on_update_kv_lens()
+            metadata.prepare_for_draft_forward()
+            metadata.restore_draft_swaps()
+        for offset in (-1, -3):
+            # Each step, prepare() writes uncorrected lengths; the replay must correct both copies.
+            metadata.prepare()
+            offsets.fill_(offset)
+            graph.replay()
+            corrected = [[cached + offset], [cached + 1 + offset]]
+            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
+            assert metadata.draft_mixed_precision_staging.lengths.tolist() == corrected
+    finally:
+        manager.shutdown()
+        draft.shutdown()
+
+
+@pytest.mark.parametrize(
+    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
+)
+def test_staging_covers_allocated_capacity(backend):
+    """Staging covers the allocated KV capacity, where MTP draft tokens go past the batch."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 128
+    # Three MTP draft tokens past the batch's 256 tokens start a new staging page:
+    # TRTLLM staging pages hold 32 tokens and FlashInfer staging pages 128.
+    capacity = cached + block + 3
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping)
+    try:
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        assert manager.kv_cache_map[0].resize(capacity)
+        metadata = _small_metadata(backend, manager, mapping, block, cached)
+        metadata.prepare()
+        view = metadata.mixed_precision_staging
+        pages = -(-capacity // view.tokens_per_block)
+        assert view.page_counts == [pages]
+        assert view.read_capacity >= capacity
+        if backend is TrtllmAttention:
+            # Every staging page up to the capacity has key and value block offsets.
+            assert -1 not in view.block_offsets[0, 0, :, :pages].flatten().tolist()
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16"])
+def test_steady_decode_step_skips_mixed_precision(dtype):
+    """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping, dtype)
+    try:
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
+        metadata.prepare()
+        assert metadata.supports_steady_decode_step == (dtype == "auto")
     finally:
         manager.shutdown()

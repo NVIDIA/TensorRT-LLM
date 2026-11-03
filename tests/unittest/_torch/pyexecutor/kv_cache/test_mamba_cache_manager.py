@@ -862,6 +862,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert captured_v2["vocab_size"] == pretrained_config.vocab_size
+    assert captured_v2["pretrained_config"] is pretrained_config
+    assert "pretrained_config" not in captured_cpp
+    assert "pretrained_config" not in captured_mixed
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
@@ -943,8 +946,11 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
 
     if manager_cls is MambaHybridCacheManagerV2:
         assert captured["vocab_size"] == 131072
+        # The manager tells its draft layers apart by the model's layer count.
+        assert captured["pretrained_config"] is config
     else:
         assert "vocab_size" not in captured
+        assert "pretrained_config" not in captured
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -4091,15 +4097,18 @@ def _mixed_precision_kv_cache_config() -> KvCacheConfig:
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-def test_v2_hybrid_mixed_precision_appends_retained_group():
-    """The retained-token twin of the attention layer sits behind the SSM and attention layers."""
+def test_v2_hybrid_mixed_precision_appends_high_group():
+    """The attention layer's mixed-precision high layer comes after the SSM and attention layers.
+
+    Disaggregated transfer gives it its own layer id.
+    """
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
     )
     try:
-        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its twin.
-        assert mgr.high_layers == {1: 2}
+        # Layer 0: recurrent state, layer 1: attention, layer 2: its mixed-precision high layer.
+        assert mgr.mixed_precision_high_layers == {1: 2}
         assert not mgr._is_local_mamba_layer(2)
         assert mgr.get_buffers(0) is None
         low = mgr.get_buffers(1, mixed_precision_pool="low")
@@ -4111,32 +4120,15 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
         low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
         assert len(low_pages[0]) == len(high_pages[0]) == 4
         assert min(low_pages[0]) >= 0
-        # The leading (sink) and trailing (window) pages are always retained.
+        # The leading (sink) and trailing (window) pages are always in the mixed-precision high pool.
         assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
         assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
-    finally:
-        mgr.shutdown()
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
-    reason="Mixed-precision NVFP4 KV requires Blackwell",
-)
-def test_v2_hybrid_mixed_precision_disagg_names_twins():
-    """Disaggregated transfer gives a hybrid manager's twins collision-free layer ids."""
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        dtype=DataType.HALF,
-        kv_cache_config=_mixed_precision_kv_cache_config(),
-    )
-    try:
-        assert mgr.high_layers == {1: 2}
-        page_table = build_page_table_from_manager(mgr)
+        # Model layer L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
         ids = {
             layer.local_layer_id: layer.global_layer_id
-            for group in page_table.layer_groups
+            for group in build_page_table_from_manager(mgr).layer_groups
             for layer in group.local_layers
         }
-        # Model layers L -> 2L, the twin of layer L -> 2L + 1.
         assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()
@@ -7962,3 +7954,51 @@ def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
         stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
     )
     assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
+    """A pipeline rank holding only recurrent layers still names model layer L as 2L."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_mamba_layers=2,
+        num_attention_layers=0,
+    )
+    try:
+        assert mgr.mixed_precision_high_layers == {}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
+    """An Eagle3 layer in the hybrid manager keeps a normal KV cache, unlike an MTP layer."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_draft_layers=1,
+        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
+        assert mgr.draft_layer_ids == (2,)
+        assert mgr.mixed_precision_high_layers == {1: 3}
+    finally:
+        mgr.shutdown()

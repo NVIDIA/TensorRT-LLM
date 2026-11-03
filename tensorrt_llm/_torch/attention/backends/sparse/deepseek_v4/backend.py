@@ -33,7 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
-from ..mixed_precision_retained_rows import overlay_retained_rows
+from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -480,8 +480,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
-            if metadata.has_mixed_precision_retained_rows:
-                overlay_retained_rows(
+            if metadata.has_mixed_precision_high_rows:
+                overlay_mixed_precision_high_rows(
                     self,
                     metadata,
                     compressed_local_indices,

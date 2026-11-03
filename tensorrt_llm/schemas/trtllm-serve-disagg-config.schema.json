@@ -4676,7 +4676,7 @@
         },
         "mixed_precision_first_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision First N",
@@ -4684,7 +4684,7 @@
         },
         "mixed_precision_last_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision Last N",

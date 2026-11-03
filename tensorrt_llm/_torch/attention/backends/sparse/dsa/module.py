@@ -20,7 +20,7 @@ from tensorrt_llm._utils import get_sm_version, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 
 from ..hooks import MLASparseHooks, register_mla_sparse_hooks
-from ..mixed_precision_retained_rows import store_retained_context_rows
+from ..mixed_precision_high_rows import store_mixed_precision_high_rows
 from .metadata import DSAtrtllmAttentionMetadata
 from .params import DSABackendForwardArgs
 
@@ -77,22 +77,21 @@ def forward_context_sparse_attn(
     position_ids: Optional[torch.Tensor] = None,
     indexer_intermediates: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
-    if (
-        getattr(self.mqa, "has_fp4_kv_cache", False)
-        or attn_metadata.has_mixed_precision_retained_rows
-    ):
+    if getattr(self.mqa, "has_fp4_kv_cache", False) or attn_metadata.has_mixed_precision_high_rows:
         if latent_cache is None:
             raise ValueError("DSA context with a separate KV append requires latent_cache")
         # Append every uncached context token before sparse prediction, while the
         # attention op skips its normal KV append. An NVFP4 pool then gathers the
         # selected TopK rows into a compact FP8 pool; a plain pool is read in place,
-        # and this separate append is what also writes its retained-token twin.
+        # and this separate append is what also writes its mixed-precision high pool.
         self.mqa.mla_rope_append_paged_kv_assign_q(
             q, latent_cache, attn_metadata, is_generation=False
         )
-        # The append kernel wrote the pool; write the retained-token twin.
-        if attn_metadata.has_mixed_precision_retained_rows:
-            store_retained_context_rows(self.mqa, attn_metadata, latent_cache, position_ids)
+        # The append kernel wrote the pool; also write the mixed-precision high pool.
+        if attn_metadata.has_mixed_precision_high_rows:
+            store_mixed_precision_high_rows(
+                self.mqa, attn_metadata, latent_cache, position_ids, is_generation=False
+            )
         return self.forward_absorption_context(
             q,
             compressed_kv,

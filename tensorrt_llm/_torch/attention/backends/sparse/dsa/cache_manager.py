@@ -390,9 +390,9 @@ class DSACacheManager(KVCacheManager):
 class DSACacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2-backed cache manager with a DSA indexer K-cache."""
 
-    # The history already lives in this manager's pool; only the twins are added.
+    # The history is already NVFP4 here; only the mixed-precision high layers are added.
     _supports_mixed_precision_kv = True
-    _mixed_precision_native_pool = True
+    _own_pool_is_mixed_precision_low = True
 
     def __init__(
         self,
@@ -485,6 +485,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            pretrained_config=pretrained_config,
             **kwargs,
         )
         if self.num_local_layers == 0:
@@ -650,7 +651,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
         # sparse attention reads a retained row by the twin's row index.
         self.retained_row_layer_offsets = {}
         if self.dtype != DataType.NVFP4:
-            for local_layer_idx, twin in self.high_layers.items():
+            for local_layer_idx, twin in self.mixed_precision_high_layers.items():
                 converter = self.impl.get_page_index_converter(twin, Role.KEY)
                 address = self.impl.get_mem_pool_base_address(twin, Role.KEY, PageIndexMode.SHARED)
                 expected_address = base_address + int(converter.layer_offset) * page_stride

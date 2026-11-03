@@ -95,9 +95,9 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
-    # Twin page tables; -1 = not retained.
-    retained_block_table = None
-    draft_retained_block_table = None
+    # Mixed-precision high page tables; -1 = not in the high pool.
+    mixed_precision_high_block_table = None
+    draft_mixed_precision_high_block_table = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -386,14 +386,14 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         return False
 
     @property
-    def has_mixed_precision_retained_rows(self) -> bool:
-        """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
-        return self.retained_block_table is not None
+    def has_mixed_precision_high_rows(self) -> bool:
+        """Whether this backend writes and reads a mixed-precision high pool."""
+        return self.mixed_precision_high_block_table is not None
 
-    def _fill_retained_block_table(
-        self, manager: "KVCacheManagerV2", layer_idx: int, high_table: torch.Tensor
+    def _fill_mixed_precision_high_block_table(
+        self, manager: "KVCacheManagerV2", high_layer: int, high_table: torch.Tensor
     ) -> None:
-        """Refresh a twin page table over its full width; the rest stay -1.
+        """Refresh a mixed-precision high page table over its full width; the rest stay -1.
 
         The MTP draft loop writes past this step's kv lengths, so every column a request
         has allocated must be current.
@@ -401,18 +401,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         table = torch.full(
             (self.num_seqs, high_table.shape[1]), -1, dtype=torch.int32, pin_memory=prefer_pinned()
         )
-        manager.fill_high_precision_page_table(self.request_ids, layer_idx, table.numpy())
+        manager._fill_page_table(high_layer, self.request_ids, table.numpy())
         high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
-    def _fill_retained_block_tables(self) -> None:
+    def _fill_mixed_precision_high_block_tables(self) -> None:
         for manager, high_table in (
-            (self.kv_cache_manager, self.retained_block_table),
-            (self.draft_kv_cache_manager, self.draft_retained_block_table),
+            (self.kv_cache_manager, self.mixed_precision_high_block_table),
+            (self.draft_kv_cache_manager, self.draft_mixed_precision_high_block_table),
         ):
             if high_table is not None:
-                # Every twin shares one pool and page scale, so one table serves all layers.
-                layer_idx = manager.pp_layers[next(iter(manager.high_layers))]
-                self._fill_retained_block_table(manager, layer_idx, high_table)
+                # All layers share one mixed-precision high pool, so one table serves them all.
+                high_layer = next(iter(manager.mixed_precision_high_layers.values()))
+                self._fill_mixed_precision_high_block_table(manager, high_layer, high_table)
 
     def prepare(self):
         self._validate_ragged_verification()
@@ -449,6 +449,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
+        self._fill_mixed_precision_high_block_tables()
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
@@ -467,8 +468,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
-        # MTP layers on the draft manager use its twin table; other drafters have none.
-        self.swap_for_draft("retained_block_table", self.draft_retained_block_table)
+        # MTP layers on the draft manager use its mixed-precision high page table.
+        self.swap_for_draft(
+            "mixed_precision_high_block_table", self.draft_mixed_precision_high_block_table
+        )
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.
@@ -1145,20 +1148,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # Twin page table; -1 = not retained.
-        if getattr(self.kv_cache_manager, "high_layers", None):
-            self.retained_block_table = self.get_empty(
+        # Mixed-precision high page table; -1 = not in the high pool.
+        if getattr(self.kv_cache_manager, "mixed_precision_high_layers", None):
+            self.mixed_precision_high_block_table = self.get_empty(
                 self.cuda_graph_buffers,
                 [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
-                cache_name="retained_block_table",
+                cache_name="mixed_precision_high_block_table",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
-        if getattr(self.draft_kv_cache_manager, "high_layers", None):
-            self.draft_retained_block_table = self.get_empty(
+        if getattr(self.draft_kv_cache_manager, "mixed_precision_high_layers", None):
+            self.draft_mixed_precision_high_block_table = self.get_empty(
                 self.cuda_graph_buffers,
                 [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
-                cache_name="draft_retained_block_table",
+                cache_name="draft_mixed_precision_high_block_table",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
@@ -2135,7 +2138,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        self._fill_retained_block_tables()
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
