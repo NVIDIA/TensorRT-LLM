@@ -46,7 +46,10 @@ LATENT = 512
 V_DIM = 128
 
 
-def _case(num_tokens, heads, seed):
+def _case(num_tokens, heads, seed, rank, world):
+    """One rank's partials, stats and zero-KV mask. Token ``t``'s KV is never empty on rank
+    ``t % world``: in the drafter every block token sees the block positions, which some rank
+    holds, so no token is masked on every rank (that would be 0 / 0)."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     rows = torch.randn((num_tokens, heads, LATENT), device="cuda", generator=gen).bfloat16()
     stats = torch.stack(
@@ -57,6 +60,7 @@ def _case(num_tokens, heads, seed):
         dim=-1,
     )
     mask = torch.rand(num_tokens, device="cuda", generator=gen) < 0.25
+    mask &= torch.arange(num_tokens, device="cuda") % world != rank
     return rows, stats, mask
 
 
@@ -110,7 +114,7 @@ def _run_rank(world_size, token_counts):
 
         # The target-shaped launches' inputs, built outside any graph capture (a generator
         # cannot be created while capturing).
-        target_cases = {n: _case(n, TARGET_HEADS, 7 + rank) for n in token_counts}
+        target_cases = {n: _case(n, TARGET_HEADS, 7 + rank, rank, world_size) for n in token_counts}
 
         def target_launch(n):
             rows, stats, mask = target_cases[n]
@@ -118,7 +122,7 @@ def _run_rank(world_size, token_counts):
             tail(rows.view(n, -1), stats, w_target, mask, fold=None, out=out)
 
         for n in token_counts:
-            rows, stats, mask = _case(n, DRAFT_HEADS, 31 * n + rank)
+            rows, stats, mask = _case(n, DRAFT_HEADS, 31 * n + rank, rank, world_size)
             for m in (mask, None):
                 got = _helix_tail_attn_out(tail, rows, stats, w_uv, m, local)
                 target_launch(n)
@@ -126,7 +130,7 @@ def _run_rank(world_size, token_counts):
                 check(f"eager n={n} mask={m is not None}", got, reference(rows, stats, m))
 
         # One graph with every size and a target-shaped launch in between, replayed with new inputs.
-        cases = [_case(n, DRAFT_HEADS, 1000 + n + rank) for n in token_counts]
+        cases = [_case(n, DRAFT_HEADS, 1000 + n + rank, rank, world_size) for n in token_counts]
         outs = []
         torch.cuda.synchronize()
         comm.Barrier()
@@ -137,7 +141,9 @@ def _run_rank(world_size, token_counts):
                 target_launch(rows.shape[0])
         for rep in range(2):
             for i, (case, n) in enumerate(zip(cases, token_counts)):
-                for dst, src in zip(case, _case(n, DRAFT_HEADS, 77 * rep + i + rank)):
+                for dst, src in zip(
+                    case, _case(n, DRAFT_HEADS, 77 * rep + i + rank, rank, world_size)
+                ):
                     dst.copy_(src)
             torch.cuda.synchronize()
             comm.Barrier()
