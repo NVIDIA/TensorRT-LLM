@@ -991,7 +991,7 @@ class _Fp8BlockScaleWeightReadLinear(
     repacked from the MXFP8 scale on SM107.
 
     A row-parallel projection built with ``output_all_reduce`` returns the
-    all-reduce of its partial sums from every forward. Where the low-M kernel
+    all-reduce of its partial sums from every forward. Where the low-M GEMM
     serves a forward and the all-reduce runs the MNNVL kernel, the GEMM pushes
     its output straight into the all-reduce's Lamport buffers and a finish
     kernel completes it, bitwise like the GEMM followed by the all-reduce. Up
@@ -1179,7 +1179,7 @@ class _Fp8BlockScaleWeightReadLinear(
         if self._output_all_reduce is None:
             return None
         num_rows = x_flat.shape[0]
-        if not self._low_m.serves(x_flat, kernel=True) or not _low_m_gemm_push_applies(
+        if not self._low_m.serves(x_flat) or not _low_m_gemm_push_applies(
             num_rows, self.out_features, self.in_features
         ):
             return None

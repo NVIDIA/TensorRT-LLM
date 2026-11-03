@@ -96,13 +96,16 @@ def _torch_push(workspace, target, x, rank):
     torch.cuda.synchronize()
 
 
-def _stays_in_place(m, h, world, in_place_max_rows):
-    """Whether a pushed o_proj of ``m`` rows leaves its all-reduce result in place: up to
-    ``in_place_max_rows`` rows, where the C++ rule picks the two-shot transport."""
+def _stays_in_place(m, h, k, world, in_place_max_rows):
+    """Whether an o_proj ``[h, k]`` of ``m`` rows leaves its all-reduce result in place: where
+    its GEMM pushes, up to ``in_place_max_rows`` rows, where the C++ rule picks the two-shot
+    transport."""
     from tensorrt_llm._torch.distributed.ops import mnnvl_allreduce_transport
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
+    pushes = m <= low_m.max_m_for(h, k) and low_m.all_reduce_push_applies(m, h, k)
     one_shot, _ = mnnvl_allreduce_transport(m, h, world, torch.bfloat16)
-    return m <= in_place_max_rows and not one_shot
+    return pushes and m <= in_place_max_rows and not one_shot
 
 
 def _result(out):
@@ -182,16 +185,18 @@ def _run_rank(world_size):
                     bad += _differ(ref, _result(allreduce.finish_push(target)))
                     bad += _differ(ref, allreduce(x))
 
-        # GEMM push epilogue (plain and gated; split-K at (7168, 1536) on SM100 / SM103)
-        # against the GEMM followed by the C++ all-reduce.
+        # GEMM push epilogue (plain and gated; split-K at (7168, 1536) on SM100 / SM103; the
+        # mid-M kernel above the low-M kernel's range) against the GEMM followed by the C++
+        # all-reduce.
         for n, k in ((7168, 768), (7168, 1536)):
             w, w_scale = _gemm_weight(n, k, 11 + rank)
-            for m in (1, 7, 14, 32, 64):
+            for m in (1, 7, 14, 32, 64, 65, 96, 128, 200):
                 if not low_m.all_reduce_push_applies(m, n, k):
                     continue
                 x = _input(m, k, 5 * m, rank)
                 gate = _input(m, k, 7 * m, rank)
-                gates = (None, gate) if low_m.gate_fits(x, gate, n) else (None,)
+                gated = low_m.all_reduce_push_applies(m, n, k, gated=True)
+                gates = (None, gate) if gated and low_m.gate_fits(x, gate, n) else (None,)
                 for g in gates:
                     y = low_m.run_low_m_gemm(
                         x,
@@ -290,12 +295,12 @@ def _run_rank_o_proj(world_size):
             w, w_scale = _weight(hidden, k, 21 + rank)
             plain = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden)
             plain.post_load_weights()
-            for in_place_max_rows in (0, 64):
+            for in_place_max_rows in (0, 64, 128):
                 o_proj = kimi._Fp8BlockScaleWeightReadLinear(
                     w, w_scale, hidden, allreduce, in_place_max_rows
                 )
                 o_proj.post_load_weights()
-                for m in (1, 8, 14, 32, 64, 65, 200):
+                for m in (1, 8, 14, 32, 64, 65, 96, 128, 200):
                     x = _input(m, k, 9 * m, rank)
                     gate = _input(m, k, 13 * m, rank)
                     prefix = torch.randn(m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
@@ -311,7 +316,7 @@ def _run_rank_o_proj(world_size):
                         # Pushed calls stay in place up to the row count asked for, where the
                         # transport is two-shot.
                         assert isinstance(out, MnnvlInPlaceResult) == _stays_in_place(
-                            m, hidden, world_size, in_place_max_rows
+                            m, hidden, k, world_size, in_place_max_rows
                         )
                         got = kimi._apply_attn_res_add_and_rmsnorm(
                             prefix, out, block, proj, norm, out_norm
@@ -327,9 +332,9 @@ def _run_rank_o_proj(world_size):
         w, w_scale = _weight(hidden, k, 31 + rank)
         plain = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden)
         plain.post_load_weights()
-        o_proj = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden, allreduce, 64)
+        o_proj = kimi._Fp8BlockScaleWeightReadLinear(w, w_scale, hidden, allreduce, 128)
         o_proj.post_load_weights()
-        for m in (8, 64):
+        for m in (8, 64, 96):
             xs = [_input(m, k, 40 + i, rank) for i in range(2)]
             prefix = torch.randn(m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
             block = torch.randn(4, m, hidden, device="cuda", generator=gen).to(torch.bfloat16)
@@ -342,7 +347,7 @@ def _run_rank_o_proj(world_size):
                         out = allreduce(out)
                     else:
                         assert isinstance(out, MnnvlInPlaceResult) == _stays_in_place(
-                            m, hidden, world_size, 64
+                            m, hidden, k, world_size, 128
                         )
                     updated, normed = kimi._apply_attn_res_add_and_rmsnorm(
                         prefix, out, block, proj, norm, out_norm

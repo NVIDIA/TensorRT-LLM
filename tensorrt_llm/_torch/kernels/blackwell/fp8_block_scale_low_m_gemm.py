@@ -69,13 +69,14 @@ input straight from the projection that feeds it. A per-architecture route
 (:func:`nvfp4_out_tactic`, :func:`nvfp4_out_max_m_for`) declares where callers select it and
 which kernel and split-K serve each M (:func:`split_tactic`).
 
-All-reduce push (:func:`run_low_m_gemm_all_reduce_push`, low-M kernel, plain or gated): instead of
-storing its BF16 output, the kernel stores it into the Lamport slots of the next MNNVL all-reduce
-on a workspace (``mnnvl_pushed_allreduce``), with the one-shot or two-shot transport and ``-0``
-sent as ``+0`` as the C++ all-reduce sends it; ``mnnvl_pushed_allreduce.run_finish`` completes the
-all-reduce, so the pair is bitwise this GEMM followed by the MNNVL all-reduce of its output. The
-tile's BF16 rows are staged token-major in a dead ring (without split-K the weight ring; with
-split-K each cluster rank stages the token rows it owns after the reduction in the quantized
+All-reduce push (:func:`run_low_m_gemm_all_reduce_push`, low-M kernel plain or gated, mid-M
+kernel plain): instead of storing its BF16 output, the kernel stores it into the Lamport slots of
+the next MNNVL all-reduce on a workspace (``mnnvl_pushed_allreduce``), with the one-shot or
+two-shot transport and ``-0`` sent as ``+0`` as the C++ all-reduce sends it;
+``mnnvl_pushed_allreduce.run_finish`` completes the all-reduce, so the pair is bitwise this GEMM
+followed by the MNNVL all-reduce of its output. The tile's BF16 rows are staged token-major in a
+dead ring (low-M kernel without split-K: the weight ring; with split-K each cluster rank stages
+the token rows it owns after the reduction in the quantized activation ring; mid-M kernel: its
 activation ring) and pushed in 16-byte vectors. The push variant releases its dependent (the
 finish kernel, which reads the workspace's rotation state as soon as it is resident) from the
 activation producer right after its ``griddepcontrol.wait`` instead of from the weight producer
@@ -904,7 +905,46 @@ class _Nvfp4OutputMixin:
                 _stg_u16(sf_base + Int64(t) * (n // 16) + Int64(col // 16), sf2)
 
 
-class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin):
+class _AllReducePushMixin:
+    """All-reduce push of BF16 token rows shared by the low-M and mid-M kernels
+    (``all_reduce_world``, ``one_shot``): both stage the BF16 result of their 128-row weight tile
+    token-major as rows of ``MMA_M`` BF16 values before :meth:`_push_vector` sends them."""
+
+    @cute.jit
+    def _push_state(self, push):
+        """``(current buffer, bytes per buffer)`` of the workspace. The epilogue has passed
+        ``griddepcontrol.wait``, so the previous call on the workspace has completed and its
+        rotation state is final."""
+        cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push[2])
+        return cur, nbytes
+
+    @cute.jit
+    def _push_vector(self, stage, j, m: Int32, n_base, push, state):
+        """Push vector ``j`` (token ``j // 16``, features ``n_base + (j % 16) * 8 + [0, 8)``) of
+        the BF16 tile staged token-major at ``stage`` into the Lamport slots of the next
+        all-reduce on the workspace (``state`` from :meth:`_push_state`)."""
+        peer_ptrs, mc_base, _, ar_rank = push
+        cur, nbytes = state
+        token = j >> 4
+        c = j & 15
+        if token < m and n_base + c * 8 < self.n:
+            w = _lds_v4_b32(stage + token * (MMA_M * 2) + c * 16)
+            dst = pushed_ar.push_slot(
+                peer_ptrs,
+                mc_base,
+                cur,
+                nbytes,
+                token,
+                ar_rank,
+                n_base + c * 8,
+                self.all_reduce_world,
+                self.n,
+                self.one_shot,
+            )
+            pushed_ar.push_v4(dst, *w, self.one_shot)
+
+
+class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
     """Swap-AB MXFP8 GEMM with in-kernel activation quantization and cluster split-K.
 
     ``gated`` builds the gated variant (:meth:`call_gated`): the activation producer also
@@ -1816,39 +1856,6 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin):
                 # The staging buffer must stay valid until the copies have read it.
                 _bulk_wait_read()
 
-    @cute.jit
-    def _push_state(self, push):
-        """``(current buffer, bytes per buffer)`` of the workspace. The epilogue has passed
-        ``griddepcontrol.wait``, so the previous call on the workspace has completed and its
-        rotation state is final."""
-        cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push[2])
-        return cur, nbytes
-
-    @cute.jit
-    def _push_vector(self, stage, j, m: Int32, n_base, push, state):
-        """Push vector ``j`` (token ``j // 16``, features ``n_base + (j % 16) * 8 + [0, 8)``) of
-        the BF16 tile staged token-major at ``stage`` into the Lamport slots of the next
-        all-reduce on the workspace (``state`` from :meth:`_push_state`)."""
-        peer_ptrs, mc_base, _, ar_rank = push
-        cur, nbytes = state
-        token = j >> 4
-        c = j & 15
-        if token < m and n_base + c * 8 < self.n:
-            w = _lds_v4_b32(stage + token * (MMA_M * 2) + c * 16)
-            dst = pushed_ar.push_slot(
-                peer_ptrs,
-                mc_base,
-                cur,
-                nbytes,
-                token,
-                ar_rank,
-                n_base + c * 8,
-                self.all_reduce_world,
-                self.n,
-                self.one_shot,
-            )
-            pushed_ar.push_v4(dst, *w, self.one_shot)
-
 
 # ---------------------------------------------------------------------------
 # Mid-M path (M up to 256): standalone MXFP8 activation quantization + GEMM with a
@@ -2200,7 +2207,7 @@ class MxFp8QuantKernel:
                     _stg_u8(sf_addr, Int32(127))
 
 
-class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
+class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin, _AllReducePushMixin):
     """Swap-AB MXFP8 GEMM fed by pre-quantized FP8 activations.
 
     Same weight path and split-K cluster as :class:`Fp8BlockScaleLowMGemmKernel`, but the
@@ -2210,6 +2217,9 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
     push partials with ``st.async`` into its weight ring once every CTA of the cluster has
     finished its mainloop. ``nvfp4_out`` builds the NVFP4-output variant (:meth:`call_nvfp4`):
     the staged BF16 output tile is stored as its NVFP4 quantization instead.
+    ``all_reduce_world > 0`` builds the all-reduce push variant (:meth:`call_push`): the staged
+    BF16 rows go into the Lamport slots of the next MNNVL all-reduce like the low-M kernel's push,
+    and the dependent is released from the activation producer after its ``griddepcontrol.wait``.
 
     The weight block scale is applied in one of two ways:
 
@@ -2238,12 +2248,18 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
         use_pdl: bool,
         nvfp4_out: bool = False,
         fold_weight_scale: bool = False,
+        all_reduce_world: int = 0,
+        one_shot: bool = False,
     ):
         validate_mid_tactic(n, k, tactic, fold_weight_scale)
         if nvfp4_out and n % MMA_M:
             raise ValueError(f"the NVFP4 output needs N={n} to be a multiple of {MMA_M}")
         if nvfp4_out and fold_weight_scale:
             raise ValueError("the NVFP4 output is not combined with fold_weight_scale")
+        if all_reduce_world and (nvfp4_out or all_reduce_world < 2):
+            raise ValueError(f"invalid all-reduce push over {all_reduce_world} ranks")
+        self.all_reduce_world = all_reduce_world
+        self.one_shot = one_shot
         self.nvfp4_out = nvfp4_out
         self.fold_weight_scale = fold_weight_scale
         self.n = n
@@ -2304,6 +2320,35 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
         self._launch(w_ptr, xq_ptr, xs_ptr, ws_ptr, codes_ptr, scales_ptr, gsf_ptr, m, stream)
 
     @cute.jit
+    def call_push(
+        self,
+        w_ptr: cute.Pointer,
+        xq_ptr: cute.Pointer,
+        xs_ptr: cute.Pointer,
+        ws_ptr: cute.Pointer,
+        m: Int32,
+        peer_ptrs: Int64,
+        mc_base: Int64,
+        flags: Int64,
+        rank: Int32,
+        stream: cuda.CUstream,
+    ):
+        """All-reduce push launch (see :meth:`Fp8BlockScaleLowMGemmKernel.call_push`). Nothing
+        is stored through the output pointer, so ``xq_ptr`` stands in for it."""
+        self._launch(
+            w_ptr,
+            xq_ptr,
+            xs_ptr,
+            ws_ptr,
+            xq_ptr,
+            None,
+            None,
+            m,
+            stream,
+            (peer_ptrs, mc_base, flags, rank),
+        )
+
+    @cute.jit
     def _launch(
         self,
         w_ptr: cute.Pointer,
@@ -2315,6 +2360,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
         gsf_ptr,
         m: Int32,
         stream: cuda.CUstream,
+        push=None,
     ):
         n, k = self.n, self.k
         mW = cute.make_tensor(w_ptr, cute.make_layout((n, k, 1), stride=(k, 1, n * k)))
@@ -2425,6 +2471,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
             sfb_layout,
             mSF,
             mGSF,
+            push,
         ).launch(
             grid=(self.n_tiles * self.split_k, 1, 1),
             block=(self._THREADS, 1, 1),
@@ -2454,6 +2501,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
         sfb_layout: cute.Layout,
         mSF: Optional[cute.Tensor],
         mGSF: Optional[cute.Tensor],
+        push,
     ):
         S = self.split_k
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -2504,8 +2552,9 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
             cute.arch.cluster_arrive_relaxed()
 
         if warp_idx == _TMA_WARP:
-            # Weight producer: never waits on the previous grid.
-            if cutlass.const_expr(self.use_pdl):
+            # Weight producer: never waits on the previous grid. The all-reduce push variant
+            # releases its dependent after the activation producer's wait instead.
+            if cutlass.const_expr(self.use_pdl and not self.all_reduce_world):
                 griddepcontrol_launch_dependents()
             sA = storage.sA.get_tensor(a_layout.outer, swizzle=a_layout.inner)
             gA = cute.local_tile(
@@ -2537,6 +2586,8 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
             # copy.
             if cutlass.const_expr(self.use_pdl):
                 griddepcontrol_wait()
+                if cutlass.const_expr(self.all_reduce_world):
+                    griddepcontrol_launch_dependents()
             sB = storage.sB.get_tensor(b_layout.outer, swizzle=b_layout.inner)
             gB = cute.local_tile(
                 mB, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
@@ -2600,6 +2651,7 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
                 tidx - 32 * self._EPI_WARP0,
                 n_tile,
                 rank,
+                push,
             )
 
     @cute.jit
@@ -2811,9 +2863,10 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
         q: Int32,
         n_tile: Int32,
         rank: Int32,
+        push,
     ):
         """TMEM -> registers (``blk``-column blocks) -> token-major SMEM tile -> 16-byte stores
-        (BF16) or :meth:`_store_nvfp4`.
+        (BF16), :meth:`_store_nvfp4` or :meth:`_push_vector` (``all_reduce_world``).
 
         With ``split_k > 1`` rank ``r`` reduces every chunk ``c`` (4 tokens) with
         ``c % split_k == r``; peers push their FP32 partials with ``st.async`` into its
@@ -2914,6 +2967,10 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
             cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
             if cutlass.const_expr(self.nvfp4_out):
                 self._store_nvfp4(out_base, m, rank, m, n_tile, q, mOut, mSF, mGSF)
+            elif cutlass.const_expr(self.all_reduce_world):
+                state = self._push_state(push)
+                for p in cutlass.range(q, m * 16, MMA_M, unroll=1):
+                    self._push_vector(out_base, p, m, n_tile * MMA_M, push, state)
             else:
                 for p in cutlass.range(q, m * store_cols, MMA_M, unroll=1):
                     t = p >> 4
@@ -2951,6 +3008,14 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
                 cute.arch.barrier(barrier_id=_EPI_BARRIER_ID, number_of_threads=MMA_M)
                 if cutlass.const_expr(self.nvfp4_out):
                     self._store_nvfp4(out_base, my_chunks * 4, rank, m, n_tile, q, mOut, mSF, mGSF)
+                elif cutlass.const_expr(self.all_reduce_world):
+                    state = self._push_state(push)
+                    for p in cutlass.range(q, my_chunks * 64, MMA_M, unroll=1):
+                        owned = p >> 4
+                        token = 4 * (rank + (owned >> 2) * S) + (owned & 3)
+                        self._push_vector(
+                            out_base, token * 16 + (p & 15), m, n_tile * MMA_M, push, state
+                        )
                 else:
                     # The r-th owned row is token 4 * (rank + (r // 4) * S) + r % 4.
                     for p in cutlass.range(q, my_chunks * 4 * store_cols, MMA_M, unroll=1):
@@ -3597,6 +3662,12 @@ def _compiled_mid_kernel(
 def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) -> None:
     """The mid-M path into ``out`` (BF16), or with ``nvfp4 = (scales, global_sf)`` its NVFP4
     output (``out`` the codes)."""
+    xq, xs = _quantize_mid_operand(x, tactic, use_pdl)
+    _run_mid_quantized(xq, xs, w, w_scale, out, tactic, use_pdl, nvfp4)
+
+
+def _quantize_mid_operand(x, tactic: MidMTactic, use_pdl: bool):
+    """The mid-M GEMM's MXFP8 operand of the BF16 rows ``x`` (:class:`MxFp8QuantKernel`)."""
     m, k = x.shape
     sf_blocks = _sf_blocks(tactic.mma_n)
     xq = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
@@ -3608,7 +3679,7 @@ def _run_mid(x, w, w_scale, out, tactic: MidMTactic, use_pdl: bool, nvfp4=None) 
         Int32(m),
         _current_stream(x.device),
     )
-    _run_mid_quantized(xq, xs, w, w_scale, out, tactic, use_pdl, nvfp4)
+    return xq, xs
 
 
 def _run_mid_quantized(
@@ -3895,13 +3966,38 @@ def _compiled_push_kernel(
     return cute.compile(kernel.call_push, w_ptr, x_ptr, *tail)
 
 
-def all_reduce_push_applies(m: int, n: int, k: int) -> bool:
+@functools.cache
+def _compiled_mid_push_kernel(
+    n: int, k: int, tactic: MidMTactic, use_pdl: bool, world: int, one_shot: bool
+):
+    kernel = Fp8BlockScaleMidMGemmKernel(
+        n, k, tactic, use_pdl, all_reduce_world=world, one_shot=one_shot
+    )
+    addr = Int64(1 << 20)
+    return cute.compile(
+        kernel.call_push,
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Float8E4M3FN),
+        _dummy_ptr(cutlass.Uint8),
+        _dummy_ptr(cutlass.Uint8),
+        Int32(1),
+        addr,
+        addr,
+        addr,
+        Int32(0),
+        _current_stream(torch.device("cuda")),
+    )
+
+
+def all_reduce_push_applies(m: int, n: int, k: int, gated: bool = False) -> bool:
     """Whether :func:`run_low_m_gemm_all_reduce_push` serves ``M`` rows of an ``[N, K]`` weight:
-    the low-M kernel's range, with its default tactic (split-K owners stage their rows in the
-    quantized activation ring, see :func:`push_stages_fit`)."""
-    if not 1 <= m <= kernel_max_m_for(n, k):
-        return False
-    return push_stages_fit(n, k, default_tactic(m, n, k))
+    where :func:`run_low_m_gemm` is selected for the weight. In the low-M kernel's range with
+    its default tactic (split-K owners stage their rows in the quantized activation ring, see
+    :func:`push_stages_fit`); above it (not ``gated``) the mid-M kernel, which stages its rows
+    in its activation ring."""
+    if 1 <= m <= kernel_max_m_for(n, k):
+        return push_stages_fit(n, k, default_tactic(m, n, k))
+    return not gated and low_m_max_for(n, k) < m <= max_m_for(n, k)
 
 
 def run_low_m_gemm_all_reduce_push(
@@ -3919,16 +4015,36 @@ def run_low_m_gemm_all_reduce_push(
     Stores ``bf16(x @ dequant(w)^T)`` (``bf16(x * gate) @ ...`` with ``gate``) into the Lamport
     slots of the next all-reduce on ``view`` with the ``one_shot`` (else two-shot) transport
     instead of an output tensor; ``mnnvl_pushed_allreduce.run_finish`` with the same transport
-    completes it. Same tactic and rounding as :func:`run_low_m_gemm`, so the pair is bitwise that
-    GEMM followed by the MNNVL all-reduce of its output. Operands as :func:`run_low_m_gemm`
-    takes them; ``M`` as :func:`all_reduce_push_applies` accepts (and :func:`gate_fits` with
-    ``gate``).
+    completes it. Same kernels, tactics and rounding as :func:`run_low_m_gemm` (above the low-M
+    kernel's range its quantization kernel, then the mid-M kernel pushing), so the pair is
+    bitwise that GEMM followed by the MNNVL all-reduce of its output. Operands as
+    :func:`run_low_m_gemm` takes them; ``M`` as :func:`all_reduce_push_applies` accepts (and
+    :func:`gate_fits` with ``gate``).
     """
     m, k = x.shape
     n = w.shape[0]
-    if not all_reduce_push_applies(m, n, k):
+    if not all_reduce_push_applies(m, n, k, gated=gate is not None):
         raise ValueError(f"no all-reduce push for M={m}, N={n}, K={k}")
     pushed_ar.check_transport(view, m, n, one_shot)
+    push_args = (
+        Int64(view.peer_ptrs.data_ptr()),
+        Int64(view.mc_base),
+        Int64(view.flags.data_ptr()),
+        Int32(view.rank),
+        _current_stream(x.device),
+    )
+    if m > low_m_max_for(n, k):
+        tactic = default_mid_tactic(m, n, k)
+        xq, xs = _quantize_mid_operand(x, tactic, use_pdl)
+        _compiled_mid_push_kernel(n, k, tactic, use_pdl, view.world, one_shot)(
+            _gmem_ptr(cutlass.Float8E4M3FN, w),
+            _gmem_ptr(cutlass.Float8E4M3FN, xq),
+            _gmem_ptr(cutlass.Uint8, xs),
+            _gmem_ptr(cutlass.Uint8, w_scale),
+            Int32(m),
+            *push_args,
+        )
+        return
     tactic = gated_tactic(m, n, k) if gate is not None else default_tactic(m, n, k)
     compiled = _compiled_push_kernel(n, k, tactic, use_pdl, gate is not None, view.world, one_shot)
     gate_args = ()
@@ -3940,11 +4056,7 @@ def run_low_m_gemm_all_reduce_push(
         *gate_args,
         _gmem_ptr(cutlass.Uint8, w_scale),
         Int32(m),
-        Int64(view.peer_ptrs.data_ptr()),
-        Int64(view.mc_base),
-        Int64(view.flags.data_ptr()),
-        Int32(view.rank),
-        _current_stream(x.device),
+        *push_args,
     )
 
 
