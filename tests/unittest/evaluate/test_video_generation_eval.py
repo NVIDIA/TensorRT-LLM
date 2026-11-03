@@ -213,8 +213,6 @@ def test_script_scoring_preserves_shorter_video_pairing(tmp_path, monkeypatch):
 
     import torch
 
-    from tensorrt_llm.evaluate.visual_gen import lpips as scoring
-
     script = (
         Path(__file__).resolve().parents[3]
         / "scripts/visualgen_eval/visual_gen_lpips_score_eval.py"
@@ -222,9 +220,13 @@ def test_script_scoring_preserves_shorter_video_pairing(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("lpips_script", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    scoring = module._scoring
     assert module._score_video_files is scoring.score_video_files
     assert module._score_images is scoring.score_images
     assert module._make_lpips_model is scoring.make_lpips_model
+    assert module._to_lpips_tensor is scoring._to_lpips_tensor
+    assert module._decode_video_to_lpips_batch is scoring._decode_video_to_lpips_batch
+    assert module._validate_paired_video_shapes is scoring._validate_paired_video_shapes
 
     monkeypatch.setattr(
         scoring,
@@ -244,3 +246,55 @@ def test_script_scoring_preserves_shorter_video_pairing(tmp_path, monkeypatch):
         )
         == 1.0
     )
+
+
+def test_script_scores_without_importing_trtllm(tmp_path):
+    import subprocess
+    import sys
+    import textwrap
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "scripts/visualgen_eval/visual_gen_lpips_score_eval.py"
+    )
+    code = textwrap.dedent("""\
+        import importlib.abc
+        import runpy
+        import sys
+        from pathlib import Path
+
+        import cv2
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        class BlockTRTLLM(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "tensorrt_llm" or fullname.startswith("tensorrt_llm."):
+                    raise AssertionError("Standalone scoring imported TRTLLM")
+
+        sys.meta_path.insert(0, BlockTRTLLM())
+        helpers = runpy.run_path(sys.argv[1])
+        image = Image.fromarray(np.full((32, 32, 3), 128, dtype=np.uint8))
+        tensor = helpers["_to_lpips_tensor"](image, "cpu")
+        assert tensor.shape == (1, 3, 32, 32)
+        helpers["_validate_paired_video_shapes"](tensor, tensor)
+        model = lambda a, b: ((a - b) ** 2).mean(dim=(1, 2, 3))
+        assert helpers["_score_images"](model, image, image, "cpu") == 0.0
+        video = Path(sys.argv[2]) / "video.avi"
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 24, (32, 32))
+        assert writer.isOpened()
+        writer.write(np.array(image))
+        writer.release()
+        assert helpers["_decode_video_to_lpips_batch"](video, "cpu").shape == (1, 3, 32, 32)
+        assert helpers["_score_video_files"](model, video, video, "cpu") == 0.0
+        assert "tensorrt_llm" not in sys.modules
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(script), str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
