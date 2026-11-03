@@ -29,7 +29,11 @@ _fp4_mla_4x_stats_path: Optional[str] = None
 
 
 def _fp4_mla_4x_record(
-    reason: Optional[str], num_requests: int, query_len: int, max_kv_len: int
+    reason: Optional[str],
+    num_requests: int,
+    query_len: int,
+    max_kv_len: int,
+    tag: Optional[str] = None,
 ) -> None:
     global _fp4_mla_4x_stats_path
     stats_dir = os.getenv(FP4_MLA_4X_STATS_DIR_ENV)
@@ -43,7 +47,7 @@ def _fp4_mla_4x_record(
         capturing = torch.cuda.is_current_stream_capturing()
         key = (
             f"{'4x' if reason is None else '2x'}|B{num_requests}|q{query_len}|kv{max_kv_len}|"
-            f"{'graph' if capturing else 'eager'}|{reason or ''}"
+            f"{'graph' if capturing else 'eager'}|{reason or ''}{('|' + tag) if tag else ''}"
         )
         new_key = key not in _fp4_mla_4x_stats
         _fp4_mla_4x_stats[key] = _fp4_mla_4x_stats.get(key, 0) + 1
