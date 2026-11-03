@@ -7,8 +7,6 @@ from typing import Protocol
 
 import click
 
-from .config import load_yaml_mapping
-
 
 class VideoEvaluator(Protocol):
     def evaluate(self, prompt_id: str, prompt: str, video: Path) -> dict[str, float]: ...
@@ -39,33 +37,42 @@ class LPIPSVideoEvaluator:
         del self.model
 
 
-def build_video_evaluator(name: str, options: str, prompt_ids: list[str]) -> VideoEvaluator:
+def resolve_video_directory(value: str, base_dir: Path, name: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise click.BadParameter(f"{name} must be a non-empty directory path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    if not path.is_dir():
+        raise click.BadParameter(f"{name} is not an existing directory: {path}")
+    return path.resolve()
+
+
+def ordered_video_paths(directory: Path, count: int) -> list[Path]:
+    """Resolve zero-padded MP4 filenames in prompt order, starting at 0000.mp4."""
+    paths = [directory / f"{index:04d}.mp4" for index in range(count)]
+    missing = [path.name for path in paths if not path.is_file()]
+    if missing:
+        raise click.BadParameter(f"Missing videos in {directory}: {', '.join(missing)}")
+    return paths
+
+
+def build_video_evaluator(
+    name: str, config: dict, base_dir: Path, prompt_ids: list[str]
+) -> VideoEvaluator:
     if name != "lpips":
         raise click.BadParameter("Supported video evaluator: lpips", param_hint="--evaluator")
-    config = load_yaml_mapping(options, param_hint="--evaluator-options")
-    unknown = set(config) - {"references", "net", "device"}
+    unknown = set(config) - {"reference_dir", "net", "device"}
     if unknown:
         raise click.BadParameter(f"Unknown LPIPS options: {sorted(unknown)}")
-    references = config.get("references")
-    if not isinstance(references, dict) or not references:
-        raise click.BadParameter("references must map prompt IDs to baseline video paths")
     if len(set(prompt_ids)) != len(prompt_ids):
         raise click.BadParameter("Prompt IDs must be unique", param_hint="--prompts")
-    resolved = {}
-    for prompt_id in prompt_ids:
-        value = references.get(prompt_id)
-        if not isinstance(value, str) or not value:
-            raise click.BadParameter(f"Missing reference video for prompt ID {prompt_id!r}")
-        path = Path(value).expanduser()
-        if not path.is_absolute():
-            path = Path(options).resolve().parent / path
-        if not path.is_file():
-            raise click.BadParameter(f"Reference video does not exist: {path}")
-        resolved[prompt_id] = path
+    directory = resolve_video_directory(config.get("reference_dir"), base_dir, "reference_dir")
+    paths = ordered_video_paths(directory, len(prompt_ids))
     net = config.get("net", "alex")
     device = config.get("device", "cpu")
     if net not in ("alex", "vgg", "squeeze"):
         raise click.BadParameter("net must be alex, vgg, or squeeze")
     if not isinstance(device, str) or not device:
         raise click.BadParameter("device must be a non-empty torch device string")
-    return LPIPSVideoEvaluator(resolved, net, device)
+    return LPIPSVideoEvaluator(dict(zip(prompt_ids, paths, strict=True)), net, device)

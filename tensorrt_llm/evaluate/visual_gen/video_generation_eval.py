@@ -7,10 +7,10 @@ from pathlib import Path
 
 import click
 
-from .config import load_prompt_records
+from .config import load_prompt_records, load_yaml_mapping
 from .generators import build_visual_generator
 from .image_generation_eval import _close_runtime
-from .video_evaluators import build_video_evaluator
+from .video_evaluators import build_video_evaluator, ordered_video_paths, resolve_video_directory
 
 
 class VideoGenerationEval:
@@ -21,7 +21,7 @@ class VideoGenerationEval:
         "--evaluator-options",
         required=True,
         type=click.Path(exists=True, dir_okay=False),
-        help="Evaluator YAML including reference baseline paths.",
+        help="Evaluator YAML: reference_dir and optional generated_dir; files use prompt order (0000.mp4, ...).",
     )
     @click.option("--prompts", required=True, type=click.Path(exists=True, dir_okay=False))
     @click.option("--output-dir", required=True, type=click.Path(file_okay=False))
@@ -36,36 +36,48 @@ class VideoGenerationEval:
         output_dir: str,
         num_samples: int | None,
     ) -> None:
-        root = ctx.obj
+        root = ctx.obj or {}
         root_config = root.get("extra_llm_api_options")
         if visual_gen_args and root_config and visual_gen_args != root_config:
             raise click.UsageError("Specify generator config only once.")
         ids, texts = load_prompt_records(prompts, num_samples)
-        output = Path(output_dir)
-        metric = build_video_evaluator(evaluator, evaluator_options, ids)
+        output = Path(output_dir).resolve()
+        config = load_yaml_mapping(evaluator_options, param_hint="--evaluator-options")
+        base_dir = Path(evaluator_options).resolve().parent
+        generated_dir = config.pop("generated_dir", None)
+        existing = generated_dir is not None
+        if existing:
+            media = resolve_video_directory(generated_dir, base_dir, "generated_dir")
+            paths = ordered_video_paths(media, len(ids))
+        else:
+            if not root.get("model"):
+                raise click.UsageError("--model is required when generated_dir is omitted.")
+            media = output / "generated_videos"
+            paths = [media / f"{index:04d}.mp4" for index in range(len(ids))]
+        metric = build_video_evaluator(evaluator, config, base_dir, ids)
         generator = None
         results = []
         try:
-            generator, params = build_visual_generator(
-                root["model"], visual_gen_args or root_config
-            )
+            if not existing:
+                generator, params = build_visual_generator(
+                    root["model"], visual_gen_args or root_config
+                )
+                media.mkdir(parents=True, exist_ok=True)
             output.mkdir(parents=True, exist_ok=True)
-            media = output / "generated_videos"
-            media.mkdir(exist_ok=True)
-            for index, (prompt_id, prompt) in enumerate(zip(ids, texts, strict=True)):
-                generated = generator.generate(inputs=[prompt], params=params)
-                if len(generated) != 1:
-                    raise ValueError("Expected one generated video per prompt")
-                item = generated[0]
-                if item.error or item.video is None:
-                    raise ValueError(item.error or "Generator returned no video")
-                path = media / f"{index:04d}.mp4"
-                item.save(path)
+            for prompt_id, prompt, path in zip(ids, texts, paths, strict=True):
+                if not existing:
+                    generated = generator.generate(inputs=[prompt], params=params)
+                    if len(generated) != 1:
+                        raise ValueError("Expected one generated video per prompt")
+                    item = generated[0]
+                    if item.error or item.video is None:
+                        raise ValueError(item.error or "Generator returned no video")
+                    item.save(path)
                 results.append(
                     {
                         "id": prompt_id,
                         "prompt": prompt,
-                        "video_path": str(path.relative_to(output)),
+                        "video_path": str(path) if existing else str(path.relative_to(output)),
                         "scores": metric.evaluate(prompt_id, prompt, path),
                     }
                 )
@@ -76,7 +88,7 @@ class VideoGenerationEval:
             payload = {
                 "evaluator": evaluator,
                 "evaluator_options": evaluator_options,
-                "generator_model": root["model"],
+                "generator_model": None if existing else root["model"],
                 "aggregation": "mean",
                 "aggregate_scores": aggregate,
                 "results": results,

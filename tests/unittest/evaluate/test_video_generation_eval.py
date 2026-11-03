@@ -14,42 +14,44 @@ pytestmark = pytest.mark.cpu_only
 
 
 def test_reference_paths_resolve_relative_to_yaml(tmp_path, monkeypatch):
-    baseline = tmp_path / "reference.mp4"
-    baseline.touch()
-    config = tmp_path / "metric.yaml"
-    config.write_text("references:\n  fox: reference.mp4\n")
+    directory = tmp_path / "baselines"
+    directory.mkdir()
+    for index in range(100):
+        (directory / f"{index:04d}.mp4").touch()
+    ids = [f"prompt-{index}" for index in range(100)]
     monkeypatch.setattr(evaluators, "LPIPSVideoEvaluator", lambda refs, net, device: refs)
-    result = evaluators.build_video_evaluator("lpips", str(config), ["fox"])
-    assert result == {"fox": baseline}
+    result = evaluators.build_video_evaluator(
+        "lpips", {"reference_dir": "baselines"}, tmp_path, ids
+    )
+    assert result == {
+        prompt_id: directory / f"{index:04d}.mp4" for index, prompt_id in enumerate(ids)
+    }
 
 
 @pytest.mark.parametrize(
-    "contents,ids",
+    "config,ids",
     [
-        ("references: []", ["fox"]),
-        ("references: {other: missing.mp4}", ["fox"]),
-        ("references: {fox: missing.mp4}", ["fox"]),
-        ("references: {fox: missing.mp4}", ["fox", "fox"]),
-        ("unknown: 1", ["fox"]),
+        ({"reference_dir": []}, ["fox"]),
+        ({"reference_dir": "missing"}, ["fox"]),
+        ({"reference_dir": "."}, ["fox"]),
+        ({"reference_dir": "."}, ["fox", "fox"]),
+        ({"unknown": 1}, ["fox"]),
     ],
 )
-def test_invalid_reference_config_fails_before_loading_model(tmp_path, contents, ids, monkeypatch):
-    config = tmp_path / "metric.yaml"
-    config.write_text(contents)
-
+def test_invalid_reference_config_fails_before_loading_model(tmp_path, config, ids, monkeypatch):
     def fail(*args):
         raise AssertionError("Must validate before loading LPIPS")
 
     monkeypatch.setattr(evaluators, "LPIPSVideoEvaluator", fail)
     with pytest.raises(click.BadParameter):
-        evaluators.build_video_evaluator("lpips", str(config), ids)
+        evaluators.build_video_evaluator("lpips", config, tmp_path, ids)
 
 
 def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
     prompts = tmp_path / "prompts.json"
     prompts.write_text(json.dumps([{"id": "fox", "prompt": "A fox"}]))
     options = tmp_path / "lpips.yaml"
-    options.write_text("references: {}")
+    options.write_text("reference_dir: baselines")
     closed = []
     metric = SimpleNamespace(
         evaluate=lambda *args: {"lpips": 0.1}, close=lambda: closed.append("metric")
@@ -77,6 +79,7 @@ def test_cli_generates_scores_and_closes_runtimes(tmp_path, monkeypatch):
     assert payload["aggregate_scores"] == {"lpips": 0.1}
     assert payload["results"][0]["id"] == "fox"
     assert closed == ["generator", "metric"]
+    assert (tmp_path / "out/generated_videos/0000.mp4").read_bytes() == b"video"
 
 
 def test_video_subcommand_does_not_construct_text_llm(monkeypatch):
@@ -298,3 +301,117 @@ def test_script_scores_without_importing_trtllm(tmp_path):
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_existing_videos_skip_generation_and_model(tmp_path, monkeypatch):
+    import tensorrt_llm.commands.eval as root
+
+    references = tmp_path / "baselines"
+    videos = tmp_path / "existing"
+    references.mkdir()
+    videos.mkdir()
+    for index in range(2):
+        (references / f"{index:04d}.mp4").write_bytes(b"reference")
+        (videos / f"{index:04d}.mp4").write_bytes(b"existing")
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text("A fox\nA cat\n")
+    options = tmp_path / "lpips.yaml"
+    options.write_text("reference_dir: baselines\ngenerated_dir: existing\n")
+    seen = []
+    closed = []
+
+    def fail(*args, **kwargs):
+        raise AssertionError("Must not construct a generator")
+
+    def evaluate(prompt_id, prompt, path):
+        seen.append(path)
+        return {"lpips": float(prompt_id)}
+
+    monkeypatch.setattr(root, "PyTorchLLM", fail)
+    monkeypatch.setattr(cli, "build_visual_generator", fail)
+    monkeypatch.setattr(
+        evaluators,
+        "LPIPSVideoEvaluator",
+        lambda *args: SimpleNamespace(evaluate=evaluate, close=lambda: closed.append(True)),
+    )
+    result = CliRunner().invoke(
+        root.main,
+        [
+            "video_generation_eval",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert seen == [videos / "0000.mp4", videos / "0001.mp4"]
+    payload = json.loads((tmp_path / "out/results.json").read_text())
+    assert payload["aggregate_scores"] == {"lpips": 0.5}
+    assert payload["generator_model"] is None
+    assert payload["results"][0]["video_path"] == str(videos / "0000.mp4")
+    assert not (tmp_path / "out/generated_videos").exists()
+    assert (videos / "0000.mp4").read_bytes() == b"existing"
+    assert closed == [True]
+
+
+@pytest.mark.parametrize("generated_dir", ["missing", "existing", ""])
+def test_missing_existing_videos_fail_before_loading_models(tmp_path, monkeypatch, generated_dir):
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox\n")
+    (tmp_path / "existing").mkdir()
+    options = tmp_path / "lpips.yaml"
+    options.write_text(f"reference_dir: baselines\ngenerated_dir: '{generated_dir}'\n")
+
+    def fail(*args):
+        raise AssertionError("Must validate before loading models")
+
+    monkeypatch.setattr(cli, "build_video_evaluator", fail)
+    monkeypatch.setattr(cli, "build_visual_generator", fail)
+    result = CliRunner().invoke(
+        cli.VideoGenerationEval.command,
+        [
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+        obj={},
+    )
+    assert result.exit_code == 2, result.output
+    assert "generated_dir" in result.output or "Missing videos" in result.output
+
+
+def test_generation_requires_model(tmp_path):
+    import tensorrt_llm.commands.eval as root
+
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("A fox\n")
+    options = tmp_path / "lpips.yaml"
+    options.write_text("reference_dir: baselines\n")
+    result = CliRunner().invoke(
+        root.main,
+        [
+            "video_generation_eval",
+            "--prompts",
+            str(prompts),
+            "--evaluator-options",
+            str(options),
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--model is required" in result.output
+
+
+def test_other_evaluators_still_require_model():
+    import tensorrt_llm.commands.eval as root
+
+    result = CliRunner().invoke(root.main, ["image_generation_eval"])
+    assert result.exit_code == 2
+    assert "--model" in result.output
