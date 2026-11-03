@@ -202,6 +202,17 @@ add_tllm_gtest(
 
 if(${BUILD_PYT})
   add_tllm_gtest(
+    mcastTensorOwnerTest
+    OWNER
+    runtime
+    SOURCES
+    mcastTensorOwnerTest.cpp
+    FULL_STACK
+    LINK_LIBRARIES
+    ${TORCH_LIBRARIES}
+    LABELS
+    "unit;runtime;full-stack;host")
+  add_tllm_gtest(
     torchTest
     OWNER
     runtime
