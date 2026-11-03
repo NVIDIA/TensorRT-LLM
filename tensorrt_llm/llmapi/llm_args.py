@@ -2221,8 +2221,11 @@ class _ParallelConfig(StrictBaseModel):
             pp_partition=self.pp_partition,
             cp_size=self.cp_size,
             # TODO: Mapping still uses cp_config as a dict; migrate to CpConfig
-            cp_config=self.cp_config.model_dump(
-                exclude_none=True) if self.cp_config else {},
+            # A cp_config takes effect only with context parallelism on: with
+            # one CP rank the Mapping carries no cp_type, so the executor
+            # (request merging, KV cache sizing, warmup) runs as without CP.
+            cp_config=self.cp_config.model_dump(exclude_none=True)
+            if self.cp_config and self.cp_size > 1 else {},
             enable_attention_dp=self.enable_attention_dp,
             enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp,
             moe_cluster_size=self.moe_cluster_size,
@@ -7313,7 +7316,7 @@ class TorchLlmArgs(BaseLlmArgs):
             return False
         if self.attn_backend == "VANILLA":
             return False
-        if self.cp_config is not None:
+        if self.context_parallel_size > 1 and self.cp_config is not None:
             return False
         return True
 

@@ -74,6 +74,7 @@ from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
 
 from .test_llm import llama_model_path
@@ -330,6 +331,35 @@ def test_context_parallelism_accepts_supported_cp_config(
                         cp_config=cp_config)
     assert args.context_parallel_size == context_parallel_size
     assert args.cp_config == cp_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cp_config",
+                         [CpConfig(), CpConfig(cp_type="RING")],
+                         ids=["default", "ring"])
+def test_single_cp_rank_mapping_carries_no_cp_config(cp_config):
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=1,
+                        cp_config=cp_config)
+    mapping = args.parallel_config.to_mapping()
+    assert mapping.cp_size == 1
+    assert mapping.cp_config == {}
+    assert args._kv_cache_estimation_runs()
+
+
+@pytest.mark.cpu_only
+def test_context_parallelism_mapping_keeps_cp_config():
+    args = TorchLlmArgs(model="/tmp/dummy_model",
+                        context_parallel_size=2,
+                        cp_config=CpConfig(cp_type="HELIX",
+                                           tokens_per_block=32),
+                        kv_cache_config=KvCacheConfig(tokens_per_block=32))
+    mapping = args.parallel_config.to_mapping()
+    assert mapping.cp_config == {
+        "cp_type": CpType.HELIX,
+        "tokens_per_block": 32
+    }
+    assert not args._kv_cache_estimation_runs()
 
 
 @pytest.mark.cpu_only
