@@ -25,6 +25,7 @@ def get_sparse_attn_kv_cache_manager(
     sparse_attention_config: "SparseAttentionConfig",
     use_kv_cache_manager_v2: bool = False,
 ) -> type:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
     from .deepseek_v4 import DeepseekV4CacheManager
@@ -43,7 +44,9 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
     elif sparse_attention_config.algorithm == "skip_softmax":
-        return KVCacheManager
+        # Skip Softmax changes only the attention kernel; the KV cache keeps
+        # the dense layout and follows the dense manager selection.
+        return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
     elif sparse_attention_config.algorithm == "qsa":

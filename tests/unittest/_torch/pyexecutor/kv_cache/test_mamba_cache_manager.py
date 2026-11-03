@@ -111,6 +111,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MambaStateConfig,
     MTPDecodingConfig,
+    SkipSoftmaxAttentionConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.llm_utils import (
@@ -737,6 +738,29 @@ def test_hybrid_cache_manager_factory_honors_v2_setting(
     )
 
     assert get_kv_cache_manager_cls(_hybrid_model_config(), kv_cache_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("use_v2", "num_mamba_layers", "expected"),
+    [
+        (True, 1, Qwen35HybridCacheManager),
+        (False, 1, CppMambaHybridCacheManager),
+        (True, 0, KVCacheManagerV2),
+        (False, 0, KVCacheManager),
+    ],
+)
+def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
+    monkeypatch, use_v2, num_mamba_layers, expected
+):
+    """Skip Softmax changes only attention kernels, not the cache manager."""
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    model_config = _hybrid_model_config()
+    model_config.get_num_mamba_layers = lambda: num_mamba_layers
+    model_config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
+
+    assert get_kv_cache_manager_cls(model_config, kv_cache_config) is expected
 
 
 def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
