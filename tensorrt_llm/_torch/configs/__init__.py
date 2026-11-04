@@ -51,6 +51,7 @@ from tensorrt_llm._torch.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
     Qwen4ExpVisionConfig,
 )
+from tensorrt_llm._torch.configs.spark import Spark2_5Config
 
 
 def _register_custom_configs_with_transformers() -> None:
@@ -118,6 +119,10 @@ def _register_custom_configs_with_transformers() -> None:
         "qwen4_exp_text": Qwen4ExpTextConfig,
         "qwen4_exp": Qwen4ExpConfig,
         "qwen4_exp_vision": Qwen4ExpVisionConfig,
+        # Spark-X2.5/X2.6 checkpoints ship an auto_map, but registering the
+        # model_type locally lets AutoConfig/AutoTokenizer resolve it without
+        # trust_remote_code.
+        "spark2_5": Spark2_5Config,
     }
     # Cosmos3Config resolves vision sub-configs via ``qwen3_vl_vision``; that
     # alias is only present in newer transformers releases.
@@ -173,4 +178,5 @@ __all__ = [
     "Qwen4ExpConfig",
     "Qwen4ExpTextConfig",
     "Qwen4ExpVisionConfig",
+    "Spark2_5Config",
 ]
