@@ -14,6 +14,7 @@
 
 """Routing observation contracts; genuine CUDA graph coverage is local/QA."""
 
+import importlib
 import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -629,3 +630,69 @@ def test_unsupported_moe_paths_warn_once(monkeypatch: pytest.MonkeyPatch, select
             profiler.warn_unsupported_moe_routing(backend)
     assert len(messages) == (3 if selected else 0)
     assert all("ConfigurableMoE scheduler" in message for message in messages)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", ["FP8", "FP8_PER_CHANNEL_PER_TOKEN"])
+@pytest.mark.parametrize("clamp", [7.0, 0.0, None], ids=["clamp", "zero-clamp", "no-clamp"])
+def test_step3p7_warns_only_for_python_expert_path(
+    monkeypatch: pytest.MonkeyPatch, quant_algo: str, clamp: float | None
+) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_step3p7 as step3p7
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    text_config = PretrainedConfig(
+        num_hidden_layers=1,
+        hidden_size=4,
+        moe_num_experts=2,
+        moe_top_k=2,
+        moe_intermediate_size=8,
+        torch_dtype=torch.float32,
+        swiglu_limits=[clamp],
+    )
+    model_config = ModelConfig(
+        pretrained_config=text_config, quant_config=QuantConfig(quant_algo=quant_algo)
+    )
+    monkeypatch.delenv("STEP3P7_PYTHON_FALLBACK_THRESHOLD", raising=False)
+    # Leave path selection and warning ownership real; avoid allocating experts.
+    monkeypatch.setattr(step3p7, "Linear", lambda **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(step3p7, "create_moe", lambda **kwargs: torch.nn.Identity())
+    allocations: list[torch.dtype] = []
+    monkeypatch.setattr(
+        step3p7.Step3p7MoE,
+        "_allocate_clamp_buffers",
+        lambda self, dtype: allocations.append(dtype),
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(step3p7, "warn_unsupported_moe_routing", warnings.append)
+
+    moe = step3p7.Step3p7MoE(model_config, layer_idx=0, aux_stream_dict={})
+
+    use_python = clamp == 7.0
+    assert moe._use_python_experts is use_python
+    assert warnings == (["Step3p7 Python clamp path"] if use_python else [])
+    assert allocations == ([torch.float32] if use_python else [])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend_name", ["VanillaMoE", "TritonFusedMoE", "CutlassFusedMoE"])
+def test_create_moe_backend_warns_for_standalone_subclasses(
+    monkeypatch: pytest.MonkeyPatch, backend_name: str
+) -> None:
+    factory = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.create_moe")
+    backend_cls = type(f"Test{backend_name}", (getattr(factory, backend_name),), {})
+    warnings: list[str] = []
+    monkeypatch.setattr(factory, "warn_unsupported_moe_routing", warnings.append)
+
+    def stop_after_warning(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("shape derivation reached")
+
+    # Backend allocation is downstream of the real factory warning gate.
+    monkeypatch.setattr(factory, "derive_moe_layer_shapes", stop_after_warning)
+    with pytest.raises(RuntimeError, match="shape derivation reached"):
+        factory.create_moe_backend(backend_cls, DefaultMoeRoutingMethod(top_k=2))
+
+    assert warnings == ([] if backend_name == "CutlassFusedMoE" else [backend_cls.__name__])
