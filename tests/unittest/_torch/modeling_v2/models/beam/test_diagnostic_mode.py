@@ -209,7 +209,7 @@ def test_full_model_validates_once_and_marks_every_block_call_checked(monkeypatc
         window=512,
         _check_usable=lambda layer=None: None,
         _select_rows=lambda logit_rows, spans, num_contexts: [T - 1],
-        embed=lambda ids: torch.zeros(T, HIDDEN),
+        embed=lambda ids, ids_admitted=False: torch.zeros(T, HIDDEN),
         final_norm=lambda x: x,
         head=lambda x: x,
     )

@@ -586,6 +586,69 @@ class _PagedAttnEnv:
         op_overrides replaces named arguments of the op call itself, for cases
         that sweep an argument this helper does not otherwise expose.
         """
+        op_kwargs, output = self.op_call_kwargs(
+            qkv,
+            seq_lens,
+            num_contexts,
+            request_ids,
+            mask_type,
+            attention_sinks=attention_sinks,
+            seq_lens_override=seq_lens_override,
+            ctx_lens_override=ctx_lens_override,
+            max_seq_len_override=max_seq_len_override,
+            use_paged_context_fmha=use_paged_context_fmha,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
+            alias_pages=alias_pages,
+            op_overrides=op_overrides,
+        )
+        with validating(op):
+            op(**op_kwargs)
+        torch.cuda.synchronize()
+
+        # Record the K/V slices just appended to the cache, per request.
+        if record:
+            self.record_history(qkv, seq_lens, request_ids)
+        return output
+
+    def record_history(
+        self, qkv: torch.Tensor, seq_lens: List[int], request_ids: List[int]
+    ) -> None:
+        """Mirror the K/V rows of ``qkv`` (``seq_lens`` rows per request) as appended."""
+        q_w = self.num_heads * self.head_dim
+        kv_w = self.num_kv_heads * self.head_dim
+        start = 0
+        for rid, sl in zip(request_ids, seq_lens):
+            rows = qkv[start : start + sl]
+            self.k_history[rid].append(
+                rows[:, q_w : q_w + kv_w].view(sl, self.num_kv_heads, self.head_dim)
+            )
+            self.v_history[rid].append(
+                rows[:, q_w + kv_w :].view(sl, self.num_kv_heads, self.head_dim)
+            )
+            start += sl
+
+    def op_call_kwargs(
+        self,
+        qkv: torch.Tensor,
+        seq_lens: List[int],
+        num_contexts: int,
+        request_ids: List[int],
+        mask_type: int,
+        attention_sinks: Optional[torch.Tensor] = None,
+        seq_lens_override: Optional[List[int]] = None,
+        ctx_lens_override: Optional[List[int]] = None,
+        max_seq_len_override: Optional[int] = None,
+        use_paged_context_fmha: bool = False,
+        predicted_tokens_per_seq: int = 1,
+        alias_pages: bool = False,
+        op_overrides: Optional[Dict] = None,
+    ) -> Tuple[Dict, torch.Tensor]:
+        """``call_op``'s op arguments and output buffer, built without calling the op.
+
+        Allocates the requests' pages and fills their block-offset rows exactly as
+        ``call_op`` does. A captured call (``_CapturedBeamStep``) keeps these tensors and
+        refreshes their device contents in place between replays.
+        """
         ns = len(request_ids)
         kv_lens = []  # cached + new, per sequence
         ctx_lens = []  # prompt length, per sequence
@@ -706,25 +769,7 @@ class _PagedAttnEnv:
             num_ctx_tokens=num_ctx_tokens,
         )
         op_kwargs.update(op_overrides or {})
-        with validating(op):
-            op(**op_kwargs)
-        torch.cuda.synchronize()
-
-        # Record the K/V slices just appended to the cache, per request.
-        if record:
-            q_w = self.num_heads * self.head_dim
-            kv_w = self.num_kv_heads * self.head_dim
-            start = 0
-            for rid, sl in zip(request_ids, seq_lens):
-                rows = qkv[start : start + sl]
-                self.k_history[rid].append(
-                    rows[:, q_w : q_w + kv_w].view(sl, self.num_kv_heads, self.head_dim)
-                )
-                self.v_history[rid].append(
-                    rows[:, q_w + kv_w :].view(sl, self.num_kv_heads, self.head_dim)
-                )
-                start += sl
-        return output
+        return op_kwargs, output
 
     def reference(
         self,
@@ -7579,3 +7624,373 @@ def test_beam_fp8_wrong_read_scale_is_detected(fault, factor):
     out = _beam_step(env, BEAM_P, read_factor=factor)
     with pytest.raises(AssertionError, match="weight off"):
         _check_block(out, 508, BEAM_WINDOW, f"{fault} read scale")
+
+
+# ---------------------------------------------------------------------------------------------
+# Beam TP4 exact FP8 read-outs, eagerly and from CUDA-graph replays
+# ---------------------------------------------------------------------------------------------
+#
+# Over the e4m3 pool: (a) a softmax peaked on one key returns that key's stored V codes times s,
+# bit for bit; (b) the one-hot read-out gives exactly zero weight outside each row's integer key
+# set; (c) poisoned stale and foreign pages contribute nothing and only the request's own pages
+# change. The engine serves generation steps from CUDA graphs: each graph is captured once with
+# a dummy request of the cache's longest length and replayed for live requests after their
+# lengths, block offsets and rows are written into the graph's buffers. `_CapturedBeamStep`
+# follows that lifecycle, so a replayed read-out is the captured kernel reading live state.
+
+#: Q and the hot K are this value in every element: the hot logit is 128 * 36 / sqrt(128) ~ 407
+#: above every zero key's, whose softmax weight underflows to exactly 0 (6 / s is an e4m3 value
+#: at every scale below).
+BEAM_HOT = 6.0
+#: Power-of-two scales, at which codes times s are exact in BF16; 1.0 is the Beam target's.
+BEAM_F4_SCALES = [1.0, 2.0, 0.5]
+#: The e4m3 code of +448, the largest finite value: a poisoned page holds it everywhere.
+E4M3_POISON = 0x7E
+
+
+def _beam_graph_env(window: Optional[int], kv_scale: float) -> _PagedAttnEnv:
+    """``_beam_env`` over an e4m3 pool, with pages for a capture's scratch request and a
+    workspace allocated once: the op grows a too-small workspace in place, while a graph keeps
+    the address it captured."""
+    env = _PagedAttnEnv(
+        num_heads=BEAM_HQ,
+        num_kv_heads=BEAM_HKV,
+        head_dim=BEAM_D,
+        tokens_per_block=32,
+        num_blocks=128,
+        max_batch=1,
+        max_blocks_per_seq=24,
+        attention_window_size=window,
+        pool_dtype=torch.float8_e4m3fn,
+        quant_mode=QUANT_MODE_FP8_KV_CACHE,
+        kv_scaling_factor=kv_scale,
+    )
+    env.workspace = torch.empty(256 << 20, dtype=torch.int8, device="cuda")
+    return env
+
+
+class _CapturedBeamStep:
+    """One Beam generation call of ``rows`` rows, captured once and replayed per live request.
+
+    As the engine does, the op is warmed up eagerly and captured on a scratch request whose KV
+    length is the cache's ``max_seq_len``, with the host lengths that request states. A replay
+    then points batch row 0's block offsets at a live request, writes its KV and prompt lengths
+    into the graph's device length tensors and the step's packed Q/K/V into the graph's input,
+    replays and mirrors the appended K/V into the request's history. Host state is not re-read.
+    """
+
+    SCRATCH = 1000
+
+    def __init__(self, env: _PagedAttnEnv, rows: int) -> None:
+        self.env, self.rows = env, rows
+        if self.SCRATCH not in env.pages:
+            env.add_request(self.SCRATCH, env.max_seq_len - rows)
+        env._ensure_pages(self.SCRATCH, env.max_seq_len)
+        width = (env.num_heads + 2 * env.num_kv_heads) * env.head_dim
+        self.qkv = torch.zeros(rows, width, dtype=torch.bfloat16, device="cuda")
+        self.kwargs, self.out = env.op_call_kwargs(
+            self.qkv,
+            [rows],
+            0,
+            [self.SCRATCH],
+            MASK_CAUSAL,
+            seq_lens_override=[env.max_seq_len],
+            ctx_lens_override=[env.prompt_lens[self.SCRATCH]],
+            use_paged_context_fmha=True,
+            predicted_tokens_per_seq=rows,
+            op_overrides=_beam_overrides(env, rows),
+        )
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.workspace_ptr = None
+
+    def warm_up(self) -> None:
+        """One eager call on the captured arguments (it appends zero rows to the scratch tail)."""
+        with validating(op):
+            op(**self.kwargs)
+        torch.cuda.synchronize()
+
+    def capture(self, stream: torch.cuda.Stream) -> None:
+        self.workspace_ptr = self.env.workspace.data_ptr()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, stream=stream, capture_error_mode="thread_local"):
+            op(**self.kwargs)
+        torch.cuda.synchronize()
+
+    def replay(
+        self, rid: int, qkv: torch.Tensor, pages: Optional[List[int]] = None
+    ) -> torch.Tensor:
+        """Serve request ``rid``'s next ``rows`` rows; ``pages`` replaces its page list (a fault)."""
+        env = self.env
+        assert self.graph is not None, "capture before replaying"
+        assert env.workspace.data_ptr() == self.workspace_ptr, "the workspace moved after capture"
+        total = env.cached_len(rid) + self.rows
+        assert total <= env.max_seq_len
+        env._ensure_pages(rid, total)
+        table = torch.tensor(env.pages[rid] if pages is None else pages, dtype=torch.int32)
+        row = env.block_offsets[0, 0]
+        row[0, : table.numel()].copy_(2 * table)
+        row[1, : table.numel()].copy_(2 * table + 1)
+        self.kwargs["sequence_length"].fill_(total)
+        self.kwargs["context_lengths"].fill_(env.prompt_lens[rid])
+        self.qkv.copy_(qkv)
+        self.graph.replay()
+        torch.cuda.synchronize()
+        env.record_history(qkv.clone(), [self.rows], [rid])
+        return self.out.clone()
+
+
+def _capture_beam_steps(env: _PagedAttnEnv, rows_list) -> Dict[int, _CapturedBeamStep]:
+    """Warm up every step shape before capturing any (the workspace settles first)."""
+    steps = {rows: _CapturedBeamStep(env, rows) for rows in rows_list}
+    for step in steps.values():
+        step.warm_up()
+    stream = torch.cuda.Stream()
+    for step in steps.values():
+        step.capture(stream)
+    return steps
+
+
+def _beam_peaked_qkv(env: _PagedAttnEnv, rows: int, hot=(), seed: int = 0) -> torch.Tensor:
+    """Packed rows of a peaked read-out: Q = 6.0, K = 6.0 on the rows in ``hot`` and 0 elsewhere,
+    V random of magnitude about s."""
+    q_w, kv_w = env.num_heads * env.head_dim, env.num_kv_heads * env.head_dim
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    qkv = torch.zeros(rows, q_w + 2 * kv_w, dtype=torch.bfloat16)
+    qkv[:, :q_w] = BEAM_HOT
+    for r in hot:
+        qkv[r, q_w : q_w + kv_w] = BEAM_HOT
+    scale = float(env.kv_scale_quant_orig[0])
+    qkv[:, q_w + kv_w :] = (torch.randn(rows, kv_w, generator=gen) * scale).to(torch.bfloat16)
+    return qkv.cuda()
+
+
+def _beam_hot_row(env: _PagedAttnEnv, qkv: torch.Tensor, row: int) -> torch.Tensor:
+    """The hot key's V row as a read-out returns it: the e4m3 codes the pool stores for it times
+    s, for each query head (head h reads KV head h // (Hq / Hkv)), in BF16."""
+    v = qkv[row, (env.num_heads + env.num_kv_heads) * env.head_dim :]
+    codes = env.expected_cache(v.view(1, env.num_kv_heads, env.head_dim))
+    value = (codes.float() * env.kv_scale_quant_orig)[0]
+    return value.repeat_interleave(env.num_heads // env.num_kv_heads, dim=0).to(torch.bfloat16)
+
+
+def _assert_peaked_rows(out: torch.Tensor, rows, expect: torch.Tensor, label: str) -> None:
+    got = out.view(-1, BEAM_HQ, BEAM_D)
+    for r in rows:
+        diff = (got[r].float() - expect.float()).abs().max().item()
+        assert torch.equal(got[r], expect), (
+            f"{label}: row {r} is not the hot V row (max |diff| {diff})"
+        )
+
+
+@pytest.mark.parametrize("execution", ["eager", "captured"])
+@pytest.mark.parametrize("kv_scale", BEAM_F4_SCALES, ids=["s1", "s2", "s0.5"])
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_fp8_peaked_readout_is_the_hot_value_row(window, kv_scale, execution):
+    """With the softmax collapsed on one hot key, every row that sees it returns that key's stored
+    V codes times s, bit for bit: in a paged-context prefill, in a context chunk over the cached
+    prefix and in P = 1 decode and P = 8 verification steps, eager or replayed from CUDA graphs.
+    Two requests with different hot keys alternate through the same graphs, so each replay must
+    read its own request's pages."""
+    torch.manual_seed(int(kv_scale * 100) + (0 if window else 1))
+    env = _beam_graph_env(window, kv_scale)
+    expect = {}
+    for rid, hot in ((0, 10), (1, 25)):
+        env.add_request(rid, 48)
+        qkv = _beam_peaked_qkv(env, 48, hot=(hot,), seed=100 + rid)
+        out = env.call_op(
+            qkv,
+            [48],
+            1,
+            [rid],
+            MASK_CAUSAL,
+            ctx_lens_override=[48],
+            use_paged_context_fmha=True,
+            op_overrides=_beam_overrides(env, 1),
+        )
+        expect[rid] = _beam_hot_row(env, qkv, hot)
+        _assert_peaked_rows(out, range(hot, 48), expect[rid], f"request {rid} paged context")
+    chunk = env.call_op(
+        _beam_peaked_qkv(env, 40, seed=7),
+        [40],
+        1,
+        [0],
+        MASK_CAUSAL,
+        ctx_lens_override=[40],
+        use_paged_context_fmha=True,
+        op_overrides=_beam_overrides(env, 1),
+    )
+    _assert_peaked_rows(chunk, range(40), expect[0], "context chunk over the cached prefix")
+    if execution == "captured":
+        steps = _capture_beam_steps(env, (1, BEAM_P))
+
+        def step(rid, rows, seed):
+            return steps[rows].replay(rid, _beam_peaked_qkv(env, rows, seed=seed))
+
+    else:
+
+        def step(rid, rows, seed):
+            return env.call_op(
+                _beam_peaked_qkv(env, rows, seed=seed),
+                [rows],
+                0,
+                [rid],
+                MASK_CAUSAL,
+                ctx_lens_override=[env.prompt_lens[rid]],
+                use_paged_context_fmha=True,
+                predicted_tokens_per_seq=rows,
+                op_overrides=_beam_overrides(env, rows),
+            )
+
+    for i, (rid, rows) in enumerate(
+        ((0, 1), (1, 1), (0, BEAM_P), (1, BEAM_P), (0, 1), (1, BEAM_P))
+    ):
+        out = step(rid, rows, seed=200 + i)
+        _assert_peaked_rows(out, range(rows), expect[rid], f"{execution} request {rid} P = {rows}")
+    env.check_cache(0)
+    env.check_cache(1)
+
+
+@pytest.mark.parametrize("kv_scale", [2.0, 0.5], ids=["s2", "s0.5"])
+@pytest.mark.parametrize("accepted", [2, 3, 4], ids=["commit511", "commit512", "commit513"])
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_captured_verify_block_straddles_the_window_and_rolls_back(window, accepted, kv_scale):
+    """``test_beam_verify_block_straddles_the_window_and_rolls_back`` over the e4m3 pool with both
+    verification blocks replayed from one captured P = 8 graph: the replay reads exactly each
+    row's key set at the 512 boundary, before and after the rollback to the committed length,
+    and the pool then holds exactly the committed history and the second block."""
+    torch.manual_seed(512 + accepted)
+    env = _beam_graph_env(window, kv_scale)
+    effective = env.attention_window_size
+    _beam_prefill(env, 508)
+    step = _capture_beam_steps(env, (BEAM_P,))[BEAM_P]
+    _check_block(
+        step.replay(0, _beam_qkv(env, 508, BEAM_P)), 508, effective, "first block replayed"
+    )
+    committed = 508 + 1 + accepted
+    _rewind(env, committed)
+    out = step.replay(0, _beam_qkv(env, committed, BEAM_P))
+    _check_block(out, committed, effective, f"after committing {committed}, replayed")
+    env.check_cache(0)
+
+
+def _poison_positions(env: _PagedAttnEnv, rid: int, start: int, stop: int, code: int) -> None:
+    """Write ``code`` into every byte of request ``rid``'s slots at positions [start, stop)."""
+    raw = env.kv_cache.view(torch.uint8)
+    for pos in range(start, stop):
+        raw[env.pages[rid][pos // env.tokens_per_block], :, :, pos % env.tokens_per_block, :] = code
+
+
+def _changed_slots(before: torch.Tensor, after: torch.Tensor) -> set:
+    """(page, slot) pairs whose bytes differ between two pool snapshots."""
+    differ = (before.view(torch.uint8) != after.view(torch.uint8)).any(dim=4).any(dim=2).any(dim=1)
+    return {(int(p), int(s)) for p, s in differ.nonzero().tolist()}
+
+
+def _slots_of(env: _PagedAttnEnv, rid: int, start: int, stop: int) -> set:
+    tpb = env.tokens_per_block
+    return {(env.pages[rid][pos // tpb], pos % tpb) for pos in range(start, stop)}
+
+
+@pytest.mark.parametrize("execution", ["eager", "captured"])
+@pytest.mark.parametrize("window", [BEAM_WINDOW, None], ids=["sliding512", "full"])
+def test_beam_fp8_stale_and_foreign_pages_contribute_nothing(window, execution):
+    """At s = 2, request 0 and a foreign request own interleaved pages of one e4m3 pool. In the
+    poisoned pool every foreign page, request 0's unwritten tail and the rejected rows of its
+    first verification block hold code 0x7E (448 x s, a key no softmax ignores); in the clean
+    pool the same bytes are zero. The same verification blocks, eager or replayed from one
+    captured graph, give bitwise equal read-outs over both pools, each row reading exactly its
+    key set. Pool snapshots around each block show that only request 0's slots at the block's
+    positions changed: no foreign, scratch or other slot was written. Pointing one of request
+    0's visible pages at a foreign page is detected by the same read-out."""
+    scale, committed = 2.0, 511
+    envs = {name: _beam_graph_env(window, scale) for name in ("clean", "poisoned")}
+    effective = envs["clean"].attention_window_size
+    tpb = envs["clean"].tokens_per_block
+    for env in envs.values():
+        env.add_request(0, 508)
+        env.add_request(1, 508)
+        for j in range(17):  # interleaved pages, positions 0..543 of each request
+            env._ensure_pages(0, (j + 1) * tpb)
+            env._ensure_pages(1, (j + 1) * tpb)
+    torch.manual_seed(5)
+    rows = {
+        "prefill": _beam_qkv(envs["clean"], 0, 508),
+        "first": _beam_qkv(envs["clean"], 508, BEAM_P),
+        "second": _beam_qkv(envs["clean"], committed, BEAM_P),
+        "fault": _beam_qkv(envs["clean"], committed + BEAM_P, BEAM_P),
+    }
+    steps = {}
+    for name, env in envs.items():
+        env.call_op(
+            rows["prefill"],
+            [508],
+            1,
+            [0],
+            MASK_CAUSAL,
+            ctx_lens_override=[508],
+            use_paged_context_fmha=True,
+            op_overrides=_beam_overrides(env, 1),
+        )
+        code = E4M3_POISON if name == "poisoned" else 0
+        raw = env.kv_cache.view(torch.uint8)
+        for page in env.pages[1]:
+            raw[page] = code
+        _poison_positions(env, 0, 508, 17 * tpb, code)
+        if execution == "captured":
+            steps[name] = _capture_beam_steps(env, (BEAM_P,))[BEAM_P]
+
+    def block(name, qkv, pages=None):
+        env = envs[name]
+        if execution == "captured":
+            return steps[name].replay(0, qkv, pages)
+        saved = list(env.pages[0])
+        if pages is not None:
+            env.pages[0][:] = pages
+        try:
+            return env.call_op(
+                qkv,
+                [BEAM_P],
+                0,
+                [0],
+                MASK_CAUSAL,
+                ctx_lens_override=[env.prompt_lens[0]],
+                use_paged_context_fmha=True,
+                predicted_tokens_per_seq=BEAM_P,
+                op_overrides=_beam_overrides(env, BEAM_P),
+            )
+        finally:
+            env.pages[0][:] = saved
+
+    outs = {}
+    for stage, start in (("first", 508), ("second", committed)):
+        for name, env in envs.items():
+            if stage == "second":
+                _rewind(env, committed)
+                _poison_positions(
+                    env, 0, committed, 508 + BEAM_P, E4M3_POISON if name == "poisoned" else 0
+                )
+            before = env.kv_cache.clone()
+            outs[stage, name] = block(name, rows[stage])
+            changed = _changed_slots(before, env.kv_cache)
+            allowed = _slots_of(env, 0, start, start + BEAM_P)
+            assert changed <= allowed, (
+                f"{name} {stage}: slots outside the block changed: {sorted(changed - allowed)[:8]}"
+            )
+            _check_block(outs[stage, name], start, effective, f"{name} {stage} block")
+        assert torch.equal(outs[stage, "clean"], outs[stage, "poisoned"]), (
+            f"{stage}: a poisoned slot reached the read"
+        )
+    for name, env in envs.items():
+        env.check_cache(0)
+        raw = env.kv_cache.view(torch.uint8)
+        code = E4M3_POISON if name == "poisoned" else 0
+        assert all(bool((raw[page] == code).all()) for page in env.pages[1]), (
+            f"{name}: a foreign page changed"
+        )
+    env = envs["poisoned"]
+    faulty = list(env.pages[0])
+    faulty[2] = env.pages[1][2]  # positions 64..95, visible to every row of the block
+    with pytest.raises(AssertionError):
+        _check_block(
+            block("poisoned", rows["fault"], faulty), committed + BEAM_P, effective, "foreign page"
+        )

@@ -294,6 +294,31 @@ def test_route_refuses_an_unsupported_token_budget_before_reading_the_checkpoint
         _router_index.modeling_v2_resolve(config, args)
 
 
+@pytest.mark.parametrize(
+    "tokens,refused",
+    [
+        ([0, 17, 151935], False),
+        ([], False),
+        ([5, 151936], True),
+        ([-1, 5], True),
+        ([200000], True),
+    ],
+)
+def test_admission_refuses_out_of_range_prompt_ids(tokens, refused):
+    """The forward never reads its ids back, so an out-of-range prompt id is refused on
+    admission, as that request's own ValueError, from the request's host-side tokens."""
+    target = routing_module("BeamForCausalLM").route(
+        _beam_config(), _mapping(), (10, 3), None, None
+    )
+    shell = SimpleNamespace(model=SimpleNamespace(vocab_size=151936))
+    request = SimpleNamespace(get_tokens=lambda beam: list(tokens) if beam == 0 else None)
+    if refused:
+        with pytest.raises(ValueError, match=r"prompt token ids must be in \[0, 151936\)"):
+            target.validate_request(shell, request)
+    else:
+        target.validate_request(shell, request)
+
+
 @pytest.mark.parametrize("max_num_tokens", [1, 8192])
 def test_route_accepts_token_budget_boundaries(max_num_tokens):
     route = routing_module("BeamForCausalLM").route
