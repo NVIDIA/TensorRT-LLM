@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
@@ -130,3 +133,9 @@ class MistralLarge3WeightMapper(MistralWeightMapper):
                 "router_biases": "mlp.gate.e_score_correction_bias",
             }
         )
+
+
+@register_mapper("mistral_large_4")
+class MistralLarge4WeightMapper(HfWeightMapper):
+    """The `mistral_large_4` format's mapper. Its modeling_v2 targets read the checkpoint's
+    Mistral-native tensor names in their own weight tables, so it renames nothing."""

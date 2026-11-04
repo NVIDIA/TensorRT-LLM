@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -110,6 +111,14 @@ class Cell:
 
     why: str
     spec: Mapping[str, Any] = field(default_factory=dict)
+    #: The base of the cell's random inputs, for an entry whose test draws them.
+    #: None derives it from `why` (`seed_base`); set it when the inputs must not
+    #: follow the wording.
+    seed: int | None = None
+
+    def seed_base(self) -> int:
+        """The base an entry's test derives this cell's random inputs from."""
+        return zlib.crc32(self.why.encode()) if self.seed is None else self.seed
 
 
 class OpWrapper(ABC):

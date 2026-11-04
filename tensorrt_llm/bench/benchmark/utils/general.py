@@ -40,6 +40,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
     enable_attention_dp = False
+    checkpoint_format = None
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
@@ -61,6 +62,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
         enable_attention_dp = llm_args_dict.get("enable_attention_dp", False)
+        checkpoint_format = llm_args_dict.get("checkpoint_format")
 
     mapping = {
         "pp_size": params.get("pp"),
@@ -80,6 +82,11 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             f"Initial settings: max_batch_size={max_batch_size} (user-provided), "
             f"max_num_tokens={max_num_tokens} (user-provided).")
     else:
+        if checkpoint_format is not None:
+            raise ValueError(
+                f"checkpoint_format={checkpoint_format}: pass --max_batch_size "
+                "and --max_num_tokens; the tuning heuristic reads HF checkpoints "
+                "only")
         model_config = get_model_config(model, model_path)
 
         if isinstance(model_config,

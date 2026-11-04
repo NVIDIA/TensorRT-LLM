@@ -24,7 +24,8 @@ _TIE_UP = (False, True, False, True, False, True, False)
 #: reciprocals, each ~2^-23 relative. A value within a few fp32 ulps of a
 #: midpoint can therefore round to either neighbour, and no reference can say
 #: which. Everything further out than this must match bit for bit. Largest
-#: deviation observed on this machine: 7.9e-8 relative, ~12x inside the window.
+#: deviation observed on this machine: 7.9e-8 relative, ~12x inside the window
+#: (5.96e-8 across Mistral Large 4's 71 static global scales x every bf16 block max).
 TIE_WINDOW = 2.0**-20
 
 
@@ -80,8 +81,91 @@ class Fp4Quantize(OpWrapper):
     )
 
     note = """
+    Metadata consumed: none. Preconditions: `input` contiguous, its last dim a
+    whole number of `sf_vec_size` blocks; with `sf_use_ue8m0=False`,
+    `global_scale` a float32 device tensor holding one element (extra elements
+    are what `is_valid` refuses).
+
+    The path the cells drive is the bf16 one of `quantize_with_block_size`
+    (`cpp/tensorrt_llm/kernels/quantization.cuh`, per block
+    `cvt_warp_fp16_to_fp4`): scale byte = e4m3 (round to nearest, saturating)
+    of `global_scale * max|x| / 6`; codes = e2m1 (round to nearest, saturating)
+    of `x * global_scale / scale`. At hidden 6144 the launcher
+    (`invokeFP4Quantization`) runs min(rows, 4 x SMs) CTAs of 512 threads, 608
+    on this GB300, each walking rows at a stride of the grid, so past
+    608 rows the launch is the same at every row count. Every row's output
+    depends on that row and `global_scale` alone: at every row count 1..32768;
+    at every dep4 gathered count 4 x T_max past it, up to 131072 (the `large`
+    cell; pre-merge drives either side of every grid wrap and rank boundary,
+    and all of the last grid period, 130465..131072); and in padded CUDA-graph
+    replays, dep4's (4 x 1..16 rows) and dep8's (8 x 1..16 rows, one live row
+    with seven ranks idle among them) with each rank's segment padded on its
+    own. A probe, not a
+    cell, drove every row count 32769..131072 (98304 calls, 51 s) against the
+    131072-row call: each was bitwise its leading rows. A zero row, dep4's
+    padding of a rank up to T_max, comes out as zero code bytes under scale
+    byte 0.
+
+    At dep8 each eager call is one chunk `o_all[lo:hi]` of the 8 x T_max
+    gathered rows, `lo` a multiple of 32768: a contiguous slice at a nonzero
+    storage offset. A probe, not a cell, quantized every chunk of a
+    262144-row gathered set (byte offsets up to 2818572288) and the 8200-row
+    last chunk of a 73736-row one: each was bitwise the op on a contiguous
+    copy of the same rows, its scale bytes equal to `reference`. It also ran
+    dep8's padding skew (rank 0 at 32768 rows, ranks 1..7 at one, T_max
+    32768), whose chunks 1..7 each hold one live row and 32767 zero rows: zero
+    codes under scale byte 0 there, the live row bitwise the op on it alone.
+
+    `global_scale` states the range of the input. The canonical 448*6/amax of
+    the input itself puts its largest block at scale 448. A static, calibrated
+    scale (Mistral Large 4: 1 / input_scale(w1), one per MoE layer) states a range
+    a live input can leave, in both directions, measured at every one of the
+    checkpoint's 71 scales:
+    - above it, a block whose `global_scale * max|x| / 6` reaches 448 gets
+      scale byte 448 (0x7E) and its codes saturate at +-6; no scale byte is
+      e4m3 NaN, even at bf16's largest finite block max;
+    - below it, a block whose product rounds under the smallest e4m3 subnormal
+      gets scale byte 0, so it dequantizes to 0 whatever its codes: at
+      Mistral Large 4's scales every block whose max|x| is at most the bf16 value
+      2.537e-4 (layer 65, 23.0112) down to 6.482e-7 (layer 3, 9039.45), the
+      largest such block maxima found. Its nonzero inputs come out +-6,
+      as in `reference`; an exact zero there makes a NaN product (0 x inf),
+      which the kernel writes as code 7 (+6) and `reference` as 0. The test
+      does not compare those codes: the block dequantizes to 0 either way.
+
+    Cost on GB300 at hidden 6144: at 1..16 rows, and at dep8's gathered 8..128
+    rows, a replay of a one-call CUDA graph is cheaper than an eager call.
+
     `sf_use_ue8m0=True` selects power-of-two scales instead of e4m3. No shipped
     target uses it and this entry does not certify it.
+
+    Hard limits (sm_103)
+      rows        the leading dims' product, passed to the launcher
+                  (`invokeFP4Quantization`) as `int m`    boundary 2^31 rows
+                  not probed: at least 2^35 elements, far past any envelope
+                  (Mistral Large 4's largest call is dep4's 131072 gathered rows;
+                  dep8's is one 32768-row chunk of its up to 262144)
+      data        per 8-element vector, (row) * (K / 8) + col formed in int64
+                  no int32 boundary below 2^31 rows    probed at 349526 x 6144 =
+                  2147487744 elements (past 2^31), linear: passed -- the rows
+                  straddling element 2^31, the middle rows and the last rows
+                  bitwise equal to the op on those rows alone, their scale
+                  bytes equal to `reference`
+      scales      linear row * (K / 16) + col in int64; swizzled 128x4 tile
+                  offsets in int64    no int32 boundary below 2^31 rows
+                  linear: same probe, passed; swizzled: not probed
+      the envelope's largest call, dep4's gathered 131072 x 6144 = 805306368
+      elements (1610612736 input bytes, 402653184 code bytes, 50331648 scale
+      bytes), is 37.5% of 2^31 elements; its input bytes would reach 2^31 at
+      174763 rows, which the data row's int64 vector offsets never form. The
+      probe above is 2.67x past it in rows, so it was not probed again.
+
+    Not certified: `sf_use_ue8m0=True`; fp16 or e4m3 input; an input holding
+    inf or NaN; a `global_scale` that is not finite and positive; Mistral Large 4's
+    linear 6144 cells above 131072 rows (save the probe above), or with the
+    swizzled layout; row counts 32769..130464 that are not multiples of 4 (no
+    dep4 gather passes one; only the probe above drove them); CUDA-graph
+    capture of any other cell; `torch.compile`.
     """
 
     def __call__(
@@ -133,11 +217,12 @@ class Fp4Quantize(OpWrapper):
 
         Inside `TIE_WINDOW` of an e2m1 midpoint the kernel's approximate
         reciprocals decide the direction, so a code that differs there is not a
-        defect. Outside it, a difference is.
+        defect. Outside it, a difference is. An infinite product is no tie: it
+        saturates at +-6 on both sides.
         """
         mid = torch.tensor(_E2M1_MIDPOINTS, device=scaled.device, dtype=torch.float32)
         a = scaled.abs().unsqueeze(-1)
-        return ((a - mid).abs() <= TIE_WINDOW * a).any(-1)
+        return ((a - mid).abs() <= TIE_WINDOW * a).any(-1) & torch.isfinite(scaled)
 
     def is_valid(
         self,

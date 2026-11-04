@@ -1,5 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import functools
+import json
 from pathlib import Path
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
 from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
@@ -10,6 +15,10 @@ from transformers.tokenization_mistral_common import (
 
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    import llguidance
+    from mistral_common.guidance.grammar_factory import GrammarFactory
 
 
 # Adapted from:
@@ -29,9 +38,10 @@ class MistralTokenizer(TransformersTokenizer):
         if not (self.is_tekken or self.is_spm):
             raise TypeError(f"Unsupported tokenizer: {type(self.tokenizer)}")
 
-        # Reverse order to ensure that the lowest token id is kept.
+        # Reverse order to ensure that the lowest token id is kept. The vocab keys each id
+        # by its piece as written (convert_ids_to_tokens may return bytes for streaming).
         self._vocab_dict = {
-            self.convert_ids_to_tokens([i], skip_special_tokens=False)[0]: i
+            self.tokenizer.id_to_piece(i): i
             for i in range(self.transformers_tokenizer.vocab_size - 1, -1, -1)
         }
         # Sort the dict for convenience
@@ -48,6 +58,13 @@ class MistralTokenizer(TransformersTokenizer):
         self._max_token_id = self.transformers_tokenizer.vocab_size - 1
 
         self._all_special_tokens_set = set(self.all_special_tokens)
+
+    def __reduce__(self):
+        # TransformersTokenizer.__reduce__ would rebuild a TransformersTokenizer
+        # around ``self.tokenizer``, which here is the raw mistral-common
+        # tokenizer. Rebuild this class from the transformers wrapper instead;
+        # mistral-common pickles the tokenizer by the path of its file.
+        return (self.__class__, (self.transformers_tokenizer,))
 
     def _get_special_tokens(self, all_special_ids: list[int]) -> list[str]:
         from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
@@ -78,6 +95,116 @@ class MistralTokenizer(TransformersTokenizer):
         else:
             tokenizer = TransformersMistralTokenizer.from_pretrained(pretrained_model_dir)
         return cls(tokenizer)
+
+    def xgrammar_tokenizer_info(self) -> dict:
+        """The vocabulary xgrammar matches grammars against, for a Tekken tokenizer.
+
+        Each token is its raw bytes, which need not be valid UTF-8. Control tokens and
+        the tokens xgrammar reserves (those starting with a NUL byte) are empty strings,
+        which xgrammar treats as special: a grammar never selects them, and the
+        end-of-sequence id is the only stop token.
+
+        Returns:
+            The ``encoded_vocab`` and ``stop_token_ids`` of a guided decoding config.
+        """
+        if not self.is_tekken:
+            raise ValueError("Guided decoding supports Tekken Mistral tokenizers only.")
+        num_special = self.tokenizer.num_special_tokens
+        encoded_vocab: list[str | bytes] = []
+        for token_id in range(self.tokenizer.n_words):
+            piece = b"" if token_id < num_special else self.tokenizer.id_to_byte_piece(token_id)
+            encoded_vocab.append("" if piece.startswith(b"\x00") or not piece else piece)
+        return {"encoded_vocab": encoded_vocab, "stop_token_ids": [self.eos_token_id]}
+
+    def llguidance_tokenizer(self, n_vocab: int) -> "llguidance.LLTokenizer":
+        """The llguidance tokenizer of a Tekken vocabulary, as mistral-common builds it.
+
+        Ordinary tokens are their raw bytes; control tokens are special, so a grammar
+        selects one only by reference (``<[9]>`` for ``[TOOL_CALLS]``, as
+        mistral-common's grammar factory writes them), never as text. Text is
+        tokenized with Tekken itself.
+
+        Args:
+            n_vocab: The vocabulary size the token bitmask covers (the model's padded
+                vocabulary size); at least the Tekken vocabulary size.
+
+        Returns:
+            The tokenizer an llguidance matcher factory compiles grammars against.
+        """
+        if not self.is_tekken:
+            raise ValueError("Guided decoding supports Tekken Mistral tokenizers only.")
+        import llguidance
+        from mistral_common.guidance.tokenizer import MistralLLGTokenizer
+
+        return llguidance.LLTokenizer(
+            llguidance.TokenizerWrapper(MistralLLGTokenizer(self.tokenizer)),
+            n_vocab=n_vocab,
+            eos_token=self.eos_token_id,
+        )
+
+    def llguidance_json_schema_lark(self, json_schema: str) -> str:
+        """The Lark grammar of a JSON response, as mistral-common's grammar factory writes it.
+
+        With the ``[THINK]`` and ``[/THINK]`` control tokens in the vocabulary, the
+        response may open with one reasoning section, ``[THINK]`` text ``[/THINK]``,
+        before the JSON: the model reasons there when the request turns reasoning on.
+        Otherwise the response is the JSON alone.
+
+        Args:
+            json_schema: The JSON schema of the response, serialized.
+
+        Returns:
+            The Lark grammar an llguidance matcher compiles against
+            `llguidance_tokenizer`, which references the control tokens by id.
+        """
+        factory, template = self._grammar_factory
+        return factory.get_lark_for_json_schema(template, json.loads(json_schema))
+
+    def llguidance_tool_grammar(
+        self, tools: list[dict], tool_choice, parallel_tool_calls=None
+    ) -> str:
+        """Render native tool calls, including their reasoning and control tokens.
+
+        A named tool choice is resolved as mistral-common's
+        `GrammarFactory.get_grammar_for_chat_request` resolves it: the grammar
+        offers that tool alone, requires a call, and pins the call to its name.
+        """
+        from mistral_common.protocol.instruct.tool_calls import (
+            NamedToolChoice,
+            Tool,
+            ToolChoiceEnum,
+        )
+
+        native_tools = [Tool.from_openai(tool) for tool in tools]
+        if isinstance(tool_choice, dict):
+            name = NamedToolChoice.model_validate(tool_choice).function.name
+            native_tools = [tool for tool in native_tools if tool.function.name == name]
+            if not native_tools:
+                raise ValueError(f"Named tool {name!r} is not declared in tools.")
+            mode, force_tool_names = ToolChoiceEnum.required, True
+        else:
+            mode, force_tool_names = ToolChoiceEnum(tool_choice), False
+        factory, template = self._grammar_factory
+        return factory.get_lark_from_jinja(
+            template=template,
+            mode=mode,
+            tools=native_tools,
+            json_schema=None,
+            parallel_tool_calls=parallel_tool_calls,
+            json_only=False,
+            force_tool_names=force_tool_names,
+        )
+
+    @functools.cached_property
+    def _grammar_factory(self) -> tuple["GrammarFactory", str]:
+        from mistral_common.guidance.grammar_factory import GrammarFactory
+
+        if not GrammarFactory.is_supported(self.mistral):
+            raise ValueError(
+                f"mistral-common renders no grammars for this tokenizer (version v{self.version})."
+            )
+        factory = GrammarFactory(self.mistral)
+        return factory, factory.select_jinja_template()
 
     def _get_special_token_ids(self) -> list[int]:
         from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
@@ -165,11 +292,14 @@ class MistralTokenizer(TransformersTokenizer):
         to_decode_special_tokens = {SpecialTokens.tool_calls}
         if self.is_tekken:
             assert isinstance(self.tokenizer, Tekkenizer), type(self.tokenizer)
-            tokens = [
-                t
-                for t in tokens
-                if (t in to_decode_special_tokens or t not in self._special_tokens_set)
-            ]
+            # Kept special tokens stay, as decode() keeps them: streamed text then
+            # carries the control tokens tool and reasoning parsers read.
+            if skip_special_tokens:
+                tokens = [
+                    t
+                    for t in tokens
+                    if (t in to_decode_special_tokens or t not in self._special_tokens_set)
+                ]
 
             if any(isinstance(t, bytes) for t in tokens):
                 # we need to encode and decode all tokens again
@@ -244,21 +374,23 @@ class MistralTokenizer(TransformersTokenizer):
         from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
         from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
 
-        if not skip_special_tokens:
-            return [self.tokenizer.id_to_piece(token_id) for token_id in ids]
+        if skip_special_tokens:
+            non_skip_special_tokens_ids = {
+                self.tokenizer.get_control_token(SpecialTokens.tool_calls),
+            }
+            if isinstance(self.instruct, InstructTokenizerV13):
+                if self.instruct.BEGIN_THINK:
+                    non_skip_special_tokens_ids.add(self.instruct.BEGIN_THINK)
+                if self.instruct.END_THINK:
+                    non_skip_special_tokens_ids.add(self.instruct.END_THINK)
 
-        non_skip_special_tokens_ids = {
-            self.tokenizer.get_control_token(SpecialTokens.tool_calls),
-        }
-        if isinstance(self.instruct, InstructTokenizerV13):
-            if self.instruct.BEGIN_THINK:
-                non_skip_special_tokens_ids.add(self.instruct.BEGIN_THINK)
-            if self.instruct.END_THINK:
-                non_skip_special_tokens_ids.add(self.instruct.END_THINK)
-
-        ids_kept = [
-            i for i in ids if i in non_skip_special_tokens_ids or not self._is_special_token_id(i)
-        ]
+            ids_kept = [
+                i
+                for i in ids
+                if i in non_skip_special_tokens_ids or not self._is_special_token_id(i)
+            ]
+        else:
+            ids_kept = list(ids)
 
         # We filtered unwanted special tokens so we can decode the rest.
         tokens = [self.tokenizer.id_to_piece(token_id) for token_id in ids_kept]

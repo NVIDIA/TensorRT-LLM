@@ -1166,6 +1166,7 @@ class ModelConfig(Generic[TConfig]):
     def from_pretrained(cls,
                         checkpoint_dir: str,
                         trust_remote_code=False,
+                        checkpoint_format: Optional[str] = None,
                         **kwargs):
 
         def update_sparse_attention_indexer_config(pretrained_config, kwargs):
@@ -1244,6 +1245,7 @@ class ModelConfig(Generic[TConfig]):
                 pretrained_config = load_pretrained_config(
                     checkpoint_dir,
                     trust_remote_code=trust_remote_code,
+                    checkpoint_format=checkpoint_format,
                     **kwargs,
                 )
                 # transformers 5 leaves `_name_or_path` empty when the config
@@ -1255,7 +1257,8 @@ class ModelConfig(Generic[TConfig]):
                 if not getattr(pretrained_config, '_name_or_path', None):
                     pretrained_config._name_or_path = str(checkpoint_dir)
                 if pretrained_config.architectures[0] in [
-                        "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM"
+                        "DeepseekV32ForCausalLM", "GlmMoeDsaForCausalLM",
+                        "MistralLarge4ForCausalLM"
                 ]:
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
