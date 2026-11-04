@@ -1666,9 +1666,14 @@ def reserve_multi_frontend_port(host: str) -> int:
     between the probe and the server's bind. So the socket stays bound instead.
     In multi-frontend mode every frontend binds with SO_REUSEPORT (see
     launch_server), and Linux lets same-uid SO_REUSEPORT sockets share a port
-    provided the *first* binder set the flag, which this one does. So the
-    reservation is transparent to the server while still refusing a plain bind()
-    from any unrelated process on the node.
+    provided the *first* binder set the flag, which this one does. Before that,
+    the launcher probes the port with a plain SO_REUSEADDR bind to refuse a port
+    another server already uses (_reserve_multi_frontend_port in serve.py). That
+    probe fails with EADDRINUSE against a bound socket that did not set
+    SO_REUSEADDR, so this one sets it too; another server still fails the probe,
+    because its sockets are listening. So the reservation is transparent to the
+    server while still refusing a plain bind() from any unrelated process on the
+    node.
 
     The socket is deliberately never listen()ed: only *listening* SO_REUSEPORT
     sockets join the kernel's accept load-balancing group, so a bound-only socket
@@ -1684,10 +1689,13 @@ def reserve_multi_frontend_port(host: str) -> int:
     )
     sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, 0))
     port = sock.getsockname()[1]
     _RESERVED_PORT_SOCKETS.append(sock)
-    print_info(f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT socket)")
+    print_info(
+        f"Reserved multi-frontend port {host}:{port} (holding SO_REUSEPORT+SO_REUSEADDR socket)"
+    )
     return port
 
 
