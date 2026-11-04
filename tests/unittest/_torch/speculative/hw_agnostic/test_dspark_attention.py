@@ -30,10 +30,10 @@ import torch.nn.functional as F
 import tensorrt_llm._torch.models.modeling_dspark as modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
     DSv4DSparkDraftModel,
+    _dspark_attention_forward_legacy,
     _output_projection,
     _qkv_projections,
     apply_dspark_rotary,
-    dspark_attention_forward,
     dspark_sparse_attn,
     get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
@@ -91,20 +91,18 @@ def test_rmsnorm_rope_skips_frequency_view_on_unsupported_arch(monkeypatch):
 def test_batched_attention_rejects_mismatched_window_size():
     import inspect
 
-    forward = modeling_dspark.dspark_attention_forward
+    forward = modeling_dspark.dspark_attention_forward_batched
     args = {
         name: None
         for name, param in inspect.signature(forward).parameters.items()
         if param.default is inspect.Parameter.empty
     }
     args.update(
+        x=torch.empty(0, 0, 0),
+        kv_cache=torch.empty(0, 128, 512),
         window_size=64,
-        rope_head_dim=64,
-        block_tables=torch.empty(0, dtype=torch.int32),
-        capacities=torch.empty(0, dtype=torch.int32),
-        valid_len=torch.empty(0, dtype=torch.int32),
     )
-    with pytest.raises(ValueError, match="128-token window"):
+    with pytest.raises(ValueError, match="does not match window_size"):
         forward(**args)
 
 
@@ -200,10 +198,11 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
 
         return call
 
+    attention_forward = Mock(return_value=attention_output)
     monkeypatch.setattr(
         modeling_dspark,
-        "dspark_attention_forward",
-        Mock(return_value=attention_output),
+        "dspark_attention_forward_batched",
+        attention_forward,
     )
 
     hc_attn = types.SimpleNamespace(
@@ -280,6 +279,7 @@ def test_forward_stage_honors_enable_fused_hc(monkeypatch, enable_fused_hc):
         hc_attn.post_mapping.assert_called_once()
         hc_ffn.pre_mapping.assert_called_once_with(mid_residual)
         post_attention_layernorm.assert_called_once_with(raw_ffn_input)
+    attention_forward.assert_called_once()
 
 
 def _ref_precompute_freqs_cis(dim, seqlen, base):
@@ -487,7 +487,7 @@ def _make_attn_inputs(seed=0):
 
 
 def _run(g):
-    return dspark_attention_forward(
+    return _dspark_attention_forward_legacy(
         g["x"],
         g["main_x"],
         g["start_pos"],
@@ -711,6 +711,7 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
         torch.ops.trtllm,
         "cute_dsl_fp8_bmm_quantize_rubin_out",
         fake_bmm_quantize,
+        raising=False,
     )
 
     output = _output_projection(
@@ -730,126 +731,6 @@ def test_output_projection_uses_fused_fp8_path(monkeypatch):
     assert fp8_output.shape == (batch * block, groups * rank)
     assert fp8_output.dtype == torch.float8_e4m3fn
     assert packed_scale.dtype == torch.uint8
-
-
-def test_fp8_output_projection_uses_prepared_attention_quantized_output(monkeypatch):
-    import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
-
-    batch, block, hidden = 1, 5, 4
-    heads, head_dim, rope_dim, groups, rank, window = 2, 64, 64, 2, 2, 128
-    x = torch.zeros(batch, block, hidden, dtype=torch.bfloat16)
-    main_x = torch.zeros(batch, 1, hidden, dtype=torch.bfloat16)
-    start_pos = torch.tensor([3], dtype=torch.long)
-    block_tables = torch.tensor([[0]], dtype=torch.int32)
-    capacities = torch.tensor([window], dtype=torch.long)
-    valid_len = torch.tensor([3], dtype=torch.long)
-    kv_cache = torch.zeros(batch, window, head_dim, dtype=torch.bfloat16)
-    q_latent = torch.zeros(batch, block, 2, dtype=torch.bfloat16)
-    block_kv = torch.zeros(batch, block, head_dim, dtype=torch.bfloat16)
-    main_kv = torch.zeros(batch, 1, head_dim, dtype=torch.bfloat16)
-    q_projected = torch.zeros(batch, block, heads * head_dim, dtype=torch.bfloat16)
-    prepared_fp8 = object()
-    prepared_scale = object()
-    expected_output = torch.zeros(batch, block, hidden, dtype=torch.bfloat16)
-    calls = []
-
-    monkeypatch.setattr(dspark_attention, "IS_CUTLASS_DSL_AVAILABLE", True)
-    monkeypatch.setattr(dspark_attention, "_get_dspark_arch_str", lambda: "sm_107")
-    monkeypatch.setattr(
-        dspark_attention,
-        "_qkv_projections",
-        lambda *args, **kwargs: (q_latent, block_kv, main_kv),
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "_q_projection",
-        lambda *args, **kwargs: q_projected,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "_rmsnorm_rope_batched",
-        lambda tensor, *args, **kwargs: tensor,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_rmsnorm_rope_page_write",
-        lambda *args: None,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "cute_dsl_dspark_rmsnorm_rope_draft_block",
-        lambda *args: torch.zeros(batch, 8, head_dim, dtype=torch.bfloat16),
-    )
-
-    def prepared_attention_fp8(*args):
-        calls.append("prepared_fp8_attention")
-        assert args[-1] == groups
-        return prepared_fp8, prepared_scale
-
-    def output_projection(grouped_o_fp8, grouped_o_scale, **kwargs):
-        calls.append("fp8_output_consumer")
-        assert grouped_o_fp8 is prepared_fp8
-        assert grouped_o_scale is prepared_scale
-        assert kwargs["batch"] == batch
-        assert kwargs["block"] == block
-        return expected_output
-
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "fused_dsv4_dspark_attention_fp8",
-        prepared_attention_fp8,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        torch.ops.trtllm,
-        "fused_dsv4_dspark_attention",
-        lambda *args: pytest.fail("BF16 prepared attention should not run"),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "_fused_fp8_output_projection_from_quantized",
-        output_projection,
-    )
-    monkeypatch.setattr(
-        dspark_attention,
-        "_output_projection",
-        lambda *args, **kwargs: pytest.fail("standalone output quantization should not run"),
-    )
-
-    actual = dspark_attention.dspark_attention_forward(
-        x,
-        main_x,
-        start_pos,
-        kv_cache,
-        block_tables,
-        capacities,
-        valid_len,
-        wq_a=None,
-        q_norm_w=torch.ones(2, dtype=torch.bfloat16),
-        wq_b=object(),
-        wkv=None,
-        kv_norm_w=torch.ones(head_dim, dtype=torch.bfloat16),
-        wo_a=None,
-        wo_b=object(),
-        attn_sink=torch.zeros(heads, dtype=torch.float32),
-        n_heads=heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_dim,
-        n_groups=groups,
-        o_lora_rank=rank,
-        window_size=window,
-        eps=1e-6,
-        softmax_scale=head_dim**-0.5,
-        freqs_cis=torch.ones(16, rope_dim // 2, dtype=torch.complex64),
-        qkv_proj=object(),
-        o_a_proj=torch.empty(groups, rank, heads * head_dim // groups, dtype=torch.float8_e4m3fn),
-        o_a_scale=torch.ones(1),
-        use_fused_output_projection=True,
-    )
-
-    assert actual is expected_output
-    assert calls == ["prepared_fp8_attention", "fp8_output_consumer"]
 
 
 def test_context_wkv_autotune_bucket_contract():
@@ -1200,6 +1081,7 @@ def test_context_wkv_fp8_quantizes_once_per_window_write(monkeypatch):
         torch.ops.trtllm,
         "cute_dsl_dspark_context_wkv_gemm_rubin",
         fake_gemm,
+        raising=False,
     )
     monkeypatch.setattr(modeling_dspark, "_rmsnorm", lambda value, *args: value)
     monkeypatch.setattr(modeling_dspark, "_rope_last_dims_batched", lambda value, *args: value)
@@ -1288,7 +1170,7 @@ def test_rolling_attention_uses_projection_modules(monkeypatch, batched):
         args = (torch.full((g["b"],), g["start_pos"]),)
         tail = (torch.arange(g["b"]),)
     else:
-        fn = dspark_attention_forward
+        fn = _dspark_attention_forward_legacy
         args = (g["start_pos"],)
         tail = ()
     expected = fn(g["x"], g["main_x"], *args, expected_cache, *tail, **weights)

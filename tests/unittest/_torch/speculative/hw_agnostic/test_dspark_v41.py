@@ -421,7 +421,7 @@ def test_v41_attention_query_has_no_per_head_rmsnorm(monkeypatch, batched):
             x, main_x, torch.tensor([1]), window, torch.tensor([0]), **kwargs
         )
     else:
-        modeling_dspark.dspark_attention_forward(x, main_x, 1, window, **kwargs)
+        modeling_dspark._dspark_attention_forward_legacy(x, main_x, 1, window, **kwargs)
     q = F.linear(x, q_a)
     q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-20) * norm_weight
     q = F.linear(q, q_b).unflatten(-1, (heads, head_dim))

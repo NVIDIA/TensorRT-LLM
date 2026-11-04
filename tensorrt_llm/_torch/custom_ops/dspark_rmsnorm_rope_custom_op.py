@@ -16,7 +16,6 @@ from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
-    DSparkRMSNormRoPEPageWriteKernel,
 )
 from ..utils import mxfp8_scale_infer_shape
 
@@ -646,131 +645,6 @@ def _validate_dspark_preparation(
             "DSpark preparation requires contiguous BF16 [batch, tokens, 512] inputs, "
             "BF16 [512] weights and FP32 [batch * tokens, 32, 2] frequencies"
         )
-
-
-@functools.cache
-def _compile_dspark_rmsnorm_rope_page_write(page_size: int, eps: float, device: int):
-    # Device identity scopes compilation to the active CUDA target.
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "DSpark RMSNorm/RoPE page-write must be warmed up before CUDA graph capture"
-        )
-    rows = cute.sym_int()
-    pages = cute.sym_int()
-    x_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (rows, _DSV4_DSPARK_HEAD_DIM), stride_order=(1, 0)
-    )
-    weight_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.BFloat16, (_DSV4_DSPARK_HEAD_DIM,), stride_order=(0,)
-    )
-    freqs_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (rows, _DSV4_DSPARK_ROPE_DIM // 2, 2),
-        stride_order=(2, 1, 0),
-    )
-    cache_fake = cute.runtime.make_fake_tensor(
-        cutlass.BFloat16,
-        (pages, page_size, _DSV4_DSPARK_HEAD_DIM),
-        stride=(cute.sym_int64(), _DSV4_DSPARK_HEAD_DIM, 1),
-    )
-    tables_fake = cute.runtime.make_fake_tensor(
-        cutlass.Int32, (rows, cute.sym_int()), stride=(cute.sym_int64(), 1)
-    )
-    start_pos_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64, (rows,), stride_order=(0,)
-    )
-    capacities_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int64, (rows,), stride_order=(0,)
-    )
-    stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    kernel = DSparkRMSNormRoPEPageWriteKernel(
-        _DSV4_DSPARK_HEAD_DIM,
-        _DSV4_DSPARK_ROPE_DIM,
-        eps,
-        page_size,
-    )
-    return cute.compile(
-        kernel,
-        x_fake,
-        weight_fake,
-        freqs_fake,
-        cache_fake,
-        tables_fake,
-        start_pos_fake,
-        capacities_fake,
-        stream_fake,
-        options="--opt-level 2 --enable-tvm-ffi",
-    )
-
-
-@torch.library.custom_op(
-    "trtllm::cute_dsl_dspark_rmsnorm_rope_page_write",
-    mutates_args=("kv_cache",),
-    device_types="cuda",
-)
-def cute_dsl_dspark_rmsnorm_rope_page_write(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    freqs: torch.Tensor,
-    kv_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    start_pos: torch.Tensor,
-    capacities: torch.Tensor,
-    eps: float,
-) -> None:
-    """Normalize/rotate [batch, 1, 512] KV into pages; zero capacities mask dummy rows."""
-    _validate_dspark_preparation(x, weight, freqs)
-    batch = x.shape[0]
-    if (
-        x.shape[1] != 1
-        or kv_cache.ndim != 3
-        or kv_cache.shape[1] not in (16, 32, 64, 128, 256)
-        or kv_cache.shape[2] != _DSV4_DSPARK_HEAD_DIM
-        or kv_cache.dtype != x.dtype
-        or kv_cache.stride(1) != _DSV4_DSPARK_HEAD_DIM
-        or kv_cache.stride(2) != 1
-        or block_tables.ndim != 2
-        or block_tables.shape[0] != batch
-        or block_tables.dtype != torch.int32
-        or block_tables.stride(1) != 1
-        or not all(
-            t.is_cuda and t.device == x.device
-            for t in (kv_cache, block_tables, start_pos, capacities)
-        )
-        or not all(
-            t.shape == (batch,) and t.dtype == torch.int64 and t.is_contiguous()
-            for t in (start_pos, capacities)
-        )
-    ):
-        raise ValueError(
-            "DSpark page write requires BF16 pages with contiguous tokens, INT32 "
-            "page-table rows and contiguous INT64 positions/capacities on x's device"
-        )
-    with torch.cuda.device(x.device):
-        compiled = _compile_dspark_rmsnorm_rope_page_write(kv_cache.shape[1], eps, x.device.index)
-        compiled(
-            x.view(batch, _DSV4_DSPARK_HEAD_DIM),
-            weight,
-            freqs,
-            kv_cache,
-            block_tables,
-            start_pos,
-            capacities,
-        )
-
-
-@torch.library.register_fake("trtllm::cute_dsl_dspark_rmsnorm_rope_page_write")
-def _(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    freqs: torch.Tensor,
-    kv_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    start_pos: torch.Tensor,
-    capacities: torch.Tensor,
-    eps: float,
-) -> None:
-    return None
 
 
 def precompile_dspark_fp8_input_fusions(
