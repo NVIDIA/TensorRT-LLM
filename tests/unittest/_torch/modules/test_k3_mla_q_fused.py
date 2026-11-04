@@ -533,6 +533,7 @@ def _k3_mla(w, md):
     q_a / kv_a norms, and random BF16 fused q_a / kv_a and gate projections."""
     import torch.nn as nn
 
+    from tensorrt_llm._torch.kernels.blackwell import k3_mla_q_fused
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.kimi_k3_mla.kimi_k3_mla_attention import KimiK3MLAAttention
     from tensorrt_llm._torch.utils import AuxStreamType
@@ -571,6 +572,8 @@ def _k3_mla(w, md):
         mla.k_b_proj_trans.copy_(w.w_uk)
     mla.q_b_proj.weight = nn.Parameter(w.w_qb, requires_grad=False)
     mla.q_b_proj.weight_scale = nn.Parameter(w.s_qb_f32, requires_grad=False)
+    # The q_b exponents cache_derived_state builds from that scale.
+    mla._q_b_block_exponents = k3_mla_q_fused.block_exponents_from_fp32(w.s_qb_f32, *w.w_qb.shape)
     # The flags cache_derived_state sets from the loaded norms.
     mla._fused_latent_row = mla._runs_flashinfer_cute_rmsnorm(mla.kv_a_layernorm)
     mla._fused_decode_query_norm = mla._runs_flashinfer_cute_rmsnorm(mla.q_a_layernorm)

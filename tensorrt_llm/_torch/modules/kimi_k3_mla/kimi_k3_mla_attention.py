@@ -148,8 +148,9 @@ class KimiK3MLAAttention(MLA):
     _fused_decode_query_norm = False
     # The KV half writes the latent row (kv_a RMSNorm + k_pe) in one launch.
     _fused_latent_row = False
-    # (q_b weight scale, its block exponents or None), cached on first use.
-    _q_b_block_exponents: Optional[tuple] = None
+    # Block exponents of the q_b weight scale the fused decode query reads; set in
+    # cache_derived_state.
+    _q_b_block_exponents: Optional[torch.Tensor] = None
     # Largest generation batch whose Helix tail runs as one kernel (helix_tail); 0: never.
     _helix_tail_max_tokens: int = 0
     # Set for one generation-only forward of a fused-tail batch: the output gate, forked when the
@@ -289,6 +290,11 @@ class KimiK3MLAAttention(MLA):
         # input (PrequantizedInputProjection); set in cache_derived_state.
         self._qkv_a_takes_prequantized = False
 
+    def transform_weights(self) -> None:
+        super().transform_weights()
+        # cache_derived_state reads q_b's final weight scale for the fused decode query.
+        self.q_b_proj.transform_weights()
+
     def cache_derived_state(self) -> None:
         super().cache_derived_state()
         self._fused_output_gate = (
@@ -300,7 +306,22 @@ class KimiK3MLAAttention(MLA):
         self._qkv_a_takes_prequantized = self.fuse_qkv_a_proj and isinstance(
             self.kv_a_proj_with_mqa, PrequantizedInputProjection
         )
-        self._fused_decode_query = self._supports_fused_decode_query()
+        self._q_b_block_exponents = None
+        if self._supports_fused_decode_query():
+            from ...kernels.blackwell import k3_mla_q_fused
+
+            if _fp8_block_scales_uses_cute_dsl_sm107(self.q_b_proj):
+                from_scale = k3_mla_q_fused.block_exponents_from_r128c4
+            else:
+                from_scale = k3_mla_q_fused.block_exponents_from_fp32
+            try:
+                self._q_b_block_exponents = from_scale(
+                    self.q_b_proj.weight_scale, *self.q_b_proj.weight.shape
+                )
+            except ValueError:
+                # A scale layout the kernel does not read.
+                pass
+        self._fused_decode_query = self._q_b_block_exponents is not None
         self._fused_decode_query_norm = (
             self._fused_decode_query
             and self._resolve_qa_fused_scale() is None
@@ -309,7 +330,6 @@ class KimiK3MLAAttention(MLA):
         self._fused_latent_row = self._fused_decode_query and self._runs_flashinfer_cute_rmsnorm(
             self.kv_a_layernorm
         )
-        self._q_b_block_exponents = None
 
         self._o_proj_takes_prequantized = isinstance(self.o_proj, PrequantizedInputProjection)
         self._helix_tail_max_tokens = 0
@@ -387,29 +407,6 @@ class KimiK3MLAAttention(MLA):
             and k3_mla_q_fused.weights_supported(self.q_b_proj.weight, w_uk)
         )
 
-    def _q_b_exponents(self) -> Optional[torch.Tensor]:
-        """Block exponents of the q_b weight from the scale layout its linear holds, cached per
-        weight scale; None for a scale the kernel does not read, or while capturing a CUDA graph
-        before the first eager step built them."""
-        scale = self.q_b_proj.weight_scale
-        cached = self._q_b_block_exponents
-        if cached is not None and cached[0] is scale:
-            return cached[1]
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        from ...kernels.blackwell import k3_mla_q_fused
-
-        if _fp8_block_scales_uses_cute_dsl_sm107(self.q_b_proj):
-            from_scale = k3_mla_q_fused.block_exponents_from_r128c4
-        else:
-            from_scale = k3_mla_q_fused.block_exponents_from_fp32
-        try:
-            exponents = from_scale(scale, *self.q_b_proj.weight.shape)
-        except ValueError:
-            exponents = None
-        self._q_b_block_exponents = (scale, exponents)
-        return exponents
-
     def _takes_fused_decode_query(
         self,
         hidden_states: torch.Tensor,
@@ -428,7 +425,6 @@ class KimiK3MLAAttention(MLA):
             and num_tokens % attn_metadata.num_generations == 0
             and attn_metadata.helix_position_offsets is not None
             and attn_metadata.helix_is_inactive_rank is not None
-            and self._q_b_exponents() is not None
         )
 
     def _forward_impl(
@@ -522,7 +518,7 @@ class KimiK3MLAAttention(MLA):
         k3_mla_q_fused.k3_mla_q_fused(
             q,
             self.q_b_proj.weight,
-            self._q_b_exponents(),
+            self._q_b_block_exponents,
             self._absorption_weight_bf16(),
             _get_fp4_mla_q_global_scale(md, device),
             self.mqa.rotary_cos_sin,

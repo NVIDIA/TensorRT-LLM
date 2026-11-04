@@ -2141,7 +2141,11 @@ def _k3_block_decoder():
     """What ``MLADSparkForCausalLM._cute_dsl_block_decode`` reads, K3 DSpark geometry."""
     import types
 
-    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM, _yarn_get_mscale
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _mla_fp8_decode_scales,
+        _yarn_get_mscale,
+    )
 
     cls = MLADSparkForCausalLM
     stub = SimpleNamespace(
@@ -2150,15 +2154,14 @@ def _k3_block_decoder():
         _num_heads=64,
         _cute_dsl_checked_shape=None,
         _mla_workspace=None,
-        _mla_fp8_scales=None,
     )
     # K3 DSpark YaRN: factor 32, mscale_all_dim 1; qk_nope 128 + rope 64.
     mscale = _yarn_get_mscale(32.0, 1.0)
     stub.softmax_scale = mscale * mscale / math.sqrt(128 + 64)
+    stub._mla_fp8_scales = _mla_fp8_decode_scales(stub.softmax_scale)
     for name in (
         "_assert_cute_dsl_can_implement",
         "_mla_decode_workspace",
-        "_mla_fp8_decode_scales",
         "_cute_dsl_block_decode",
     ):
         setattr(stub, name, types.MethodType(getattr(cls, name), stub))
@@ -2230,6 +2233,7 @@ def test_block_decode_split_plan_follows_the_planner_and_the_uniform_split(block
     import types
 
     from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import (
+        _SPLIT_PLAN_MAX_REQUESTS,
         mla_split_kv_plan_geometry,
         plan_mla_split_kv,
     )
@@ -2240,7 +2244,7 @@ def test_block_decode_split_plan_follows_the_planner_and_the_uniform_split(block
 
     heads, page, latent_dim = 64, 64, 576
     stub = _k3_block_decoder()
-    stub._mla_split_plan = None
+    stub._mla_split_plan = torch.zeros(_SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device="cuda")
     stub._mla_split_kv_plan = types.MethodType(MLADSparkForCausalLM._mla_split_kv_plan, stub)
     gen = torch.Generator(device="cuda").manual_seed(block_size)
     ctx = torch.tensor([300, 1700, 6400, 13700, 90], device="cuda")

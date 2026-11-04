@@ -3133,6 +3133,16 @@ def _helix_tail_attn_out(
     return out
 
 
+def _mla_fp8_decode_scales(softmax_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """The FP8 MLA decode's device scales at unit q / kv scales: ``bmm1 = softmax_scale *
+    dq_q * dq_kv`` and ``bmm2 = dq_kv``, both dequant scales ``DRAFT_FP8_KV_SCALE``."""
+    dq = DRAFT_FP8_KV_SCALE
+    return (
+        torch.full((1,), softmax_scale * dq * dq, dtype=torch.float32, device="cuda"),
+        torch.full((1,), dq, dtype=torch.float32, device="cuda"),
+    )
+
+
 class _PendingDown(NamedTuple):
     """A drafter MLP whose down projection runs at the all-reduce site that consumes it."""
 
@@ -3622,7 +3632,6 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._mla_workspace = None
         self._mla_freqs = None
         self._mla_freqs_cap = None
-        self._mla_fp8_scales = None
         self._cute_dsl_checked_shape = None
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
@@ -3661,6 +3670,17 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             raise ValueError(
                 "speculative_config.context_kv_dtype='fp8' is read by the CUTEDSL block decode "
                 f"only, but attention_backend resolved to {self.dflash_attention_backend!r}."
+            )
+        self._mla_fp8_scales = (
+            _mla_fp8_decode_scales(self.softmax_scale)
+            if self.context_kv_fp8 and not context_kv_only
+            else None
+        )
+        if self.dflash_attention_backend == "CUTEDSL" and not context_kv_only:
+            from ..attention.backends.fmha.cute_dsl_mla import _SPLIT_PLAN_MAX_REQUESTS
+
+            self._mla_split_plan = torch.zeros(
+                _SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device="cuda"
             )
         if context_kv_only:
             self._keep_context_kv_modules()
@@ -3801,20 +3821,6 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self._mla_workspace = torch.zeros(want, dtype=torch.uint8, device=device)
         return self._mla_workspace
 
-    def _mla_fp8_decode_scales(self, device) -> tuple[torch.Tensor, torch.Tensor]:
-        """The FP8 decode's device scales at unit q / kv scales.
-
-        ``bmm1 = softmax_scale * dq_q * dq_kv`` and ``bmm2 = dq_kv``, both
-        dequant scales ``DRAFT_FP8_KV_SCALE``. Built on the first (eager) call.
-        """
-        if self._mla_fp8_scales is None or self._mla_fp8_scales[0].device != device:
-            dq = DRAFT_FP8_KV_SCALE
-            self._mla_fp8_scales = (
-                torch.full((1,), self.softmax_scale * dq * dq, dtype=torch.float32, device=device),
-                torch.full((1,), dq, dtype=torch.float32, device=device),
-            )
-        return self._mla_fp8_scales
-
     def _assert_cute_dsl_can_implement(
         self, batch, block_size, page_size, dtype, num_heads: int
     ) -> None:
@@ -3885,28 +3891,21 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
         The planner the target's CuTe DSL MLA decode uses, from this step's
         lengths and the block decode's geometry. None (the kernel's uniform
-        split) when its buffer cannot be allocated, inside a graph capture.
+        split) for a batch the plan buffer does not hold.
         ``stream``: launch there, behind the current stream's work.
         """
         from ..attention.backends.fmha.cute_dsl_mla import (
-            _SPLIT_PLAN_MAX_REQUESTS,
             launch_mla_split_kv_plan,
             mla_split_kv_plan_geometry,
         )
 
         batch = seq_lens.numel()
         if (
-            not 0 < batch <= _SPLIT_PLAN_MAX_REQUESTS
+            not 0 < batch <= self._mla_split_plan.numel()
             or seq_lens.dtype != torch.int32
             or not seq_lens.is_contiguous()
         ):
             return None
-        if self._mla_split_plan is None or self._mla_split_plan.device != seq_lens.device:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            self._mla_split_plan = torch.empty(
-                _SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device=seq_lens.device
-            )
         rows_per_request, wave_clusters = mla_split_kv_plan_geometry(num_heads, block_size)
         if stream is not None:
             stream.wait_stream(torch.cuda.current_stream())
@@ -3985,7 +3984,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         workspace = self._mla_decode_workspace(device, workspace_numel)
         if fp8:
             decode = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
-            softmax_scale, output_scale = self._mla_fp8_decode_scales(device)
+            softmax_scale, output_scale = self._mla_fp8_scales
         else:
             decode = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
             softmax_scale, output_scale = self.softmax_scale, 1.0
@@ -4015,23 +4014,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         return out if stats is None else (out, stats)
 
     def _drafter_helix_tail(self, num_tokens: int) -> Optional[HelixTail]:
-        """The fused Helix tail for ``num_tokens`` tokens, with every head's V up-projection
-        gathered once (eagerly, on every rank); None where the tail does not fit or its operands
-        do not exist yet inside a graph capture."""
-        if not 0 < num_tokens <= self._helix_tail_max_tokens:
-            return None
-        if self._helix_tail_w_uv is None:
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            self._helix_tail_w_uv = [
-                allgather(
-                    layer.self_attn._v_b_proj.to(torch.bfloat16).contiguous(),
-                    layer.self_attn.mapping,
-                    dim=0,
-                ).contiguous()
-                for layer in self.model.layers
-            ]
-        return self._helix_tail
+        """The fused Helix tail for ``num_tokens`` tokens; None where it does not fit."""
+        return self._helix_tail if 0 < num_tokens <= self._helix_tail_max_tokens else None
 
     @staticmethod
     def _reduce_partial(all_reduce, partial, residual, norm):
@@ -4262,6 +4246,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
             a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
             a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
+        if self._helix_tail is not None:
+            # Every head's V up-projection, gathered over the CP group on every rank.
+            self._helix_tail_w_uv = [
+                allgather(
+                    a._v_b_proj.to(torch.bfloat16).contiguous(), a.mapping, dim=0
+                ).contiguous()
+                for a in layers_attn
+            ]
         if self._fused_mla_qhead:
             self._qb_folded = [
                 fold_rmsnorm_weight(a.q_b_proj.weight.detach(), a.q_a_layernorm.weight.detach())
