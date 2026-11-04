@@ -753,7 +753,7 @@ class PyExecutorProfileManager:
             with executor._profile_state_lock:
                 executor._profile_enabled = False
                 pending_start = executor._runtime_profile_pending_start_iter
-                if pending_start is not None and pending_start <= active_profile_start_iter:
+                if pending_start not in (None, 0) and pending_start <= active_profile_start_iter:
                     executor._runtime_profile_pending_start_iter = None
                 if executor._runtime_profile_pending_stop_iter == executor.iter_counter:
                     executor._runtime_profile_pending_stop_iter = None

@@ -214,6 +214,49 @@ def test_warmup_skipped_start_does_not_capture(
     assert executor._runtime_profile_pending_stop_iter is None
 
 
+@pytest.mark.parametrize("pending_start", [0, 1], ids=["queued", "warmup-skipped"])
+def test_environment_window_preserves_queued_start_and_clears_stale_start(
+    cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pending_start: int
+) -> None:
+    monkeypatch.setenv("TLLM_PROFILE_START_STOP", "3-5")
+    monkeypatch.setenv("TLLM_TORCH_PROFILE_TRACE", str(tmp_path / "chrome.json"))
+    executor = _Executor("3-5")
+    manager = profiling.PyExecutorProfileManager(executor)
+    # Leave the actual caller-thread claim queued until its broadcast is delivered.
+    monkeypatch.setattr(manager, "_prepare_and_broadcast_start", lambda *args: None)
+    manager.start_profile(output_dir=str(tmp_path), activities=["CPU"])
+    assert executor._runtime_profile_pending_start_iter == 0
+    if pending_start:
+        manager.apply_start_config(
+            {
+                "output_dir": str(tmp_path),
+                "profile_id": "warmup-skipped",
+                "activities": ["CPU"],
+                "start_iter": pending_start,
+            }
+        )
+    with manager.profile_step() as step:
+        for index in range(6):
+            executor.iter_counter = index
+            executor.is_warmup = index == 1
+            step()
+            torch.ones(2) + 1
+        assert not executor._profile_enabled
+        trace = json.loads((tmp_path / "chrome-rank-7.json").read_text())
+        assert any(event.get("name") == "aten::add" for event in trace["traceEvents"])
+        if pending_start == 0:
+            assert executor._runtime_profile_pending_start_iter == 0
+            with pytest.raises(RuntimeError, match="pending start"):
+                manager.start_profile()
+        else:
+            assert executor._runtime_profile_pending_start_iter is None
+            manager.start_profile()
+        manager.stop_profile()
+        assert executor._runtime_profile_pending_start_iter is None
+        assert executor._runtime_profile_pending_stop_iter is None
+        assert executor.iter_counter + 1 not in executor.profile_stop_iters
+
+
 @pytest.mark.parametrize("body_error", [False, True])
 def test_early_exit_flushes_and_removes_observer(
     cpu_runtime: Mock, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body_error: bool
