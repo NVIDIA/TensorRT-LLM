@@ -132,7 +132,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         return [getattr(self, method)(*args, **(kwargs or {}))]
 
     def start_thread(self, thread: ManagedThread):
-        if not self.engine.can_enqueue_requests():
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if not (self.engine.can_enqueue_requests() or
+                (isinstance(self.engine, PyExecutor)
+                 and self.engine.checkpoint is not None and self.rank == 0)):
             return
         if thread.is_alive():
             return
@@ -183,10 +186,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     getattr(self, "_engine_shutdown_completed", False))
                 if not local_safe:
                     try:
-                        if self.engine.can_enqueue_requests():
-                            if self.await_response_thread.is_alive():
-                                self.await_response_thread.stop()
-                                self.await_response_thread.join()
+                        thread = getattr(self, "await_response_thread", None)
+                        if thread is not None and thread.is_alive():
+                            thread.stop()
+                            thread.join()
 
                         self.engine.shutdown()
                         self._engine_shutdown_completed = True
@@ -306,10 +309,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.rpc_server = None
 
         if self.engine is not None:
-            if self.engine.can_enqueue_requests():
-                if self.await_response_thread.is_alive():
-                    self.await_response_thread.stop()
-                    self.await_response_thread.join()
+            thread = getattr(self, "await_response_thread", None)
+            if thread is not None and thread.is_alive():
+                thread.stop()
+                thread.join()
 
             self.engine.shutdown()
             # Call the hook without binding it to a local: a bound method

@@ -44,6 +44,7 @@ class PythonRequestInputs:
     watermarking: bool | None = None
     prompt_trimmed_prefix: int = 0
     sparse_embedding_bias: EmbeddingBias | None = None
+    checkpoint_validation_token: str | None = None
 
     @classmethod
     def from_native_request(cls, request: Request) -> "PythonRequestInputs":
@@ -75,6 +76,7 @@ class PythonRequestInputs:
             kv_hints=getattr(request, "py_kv_hints", None),
             watermarking=getattr(request, "py_watermarking", None),
             prompt_trimmed_prefix=getattr(request, "py_prompt_trimmed_prefix", 0),
+            checkpoint_validation_token=getattr(request, "py_checkpoint_validation_token", None),
         )
 
 
@@ -115,6 +117,11 @@ class ExecutorRequest:
     @property
     def py_kv_hints(self) -> KvHintsSnapshot | None:
         return self.inputs.kv_hints
+
+    @property
+    def py_checkpoint_validation_token(self) -> str | None:
+        """Return the private, single-use admission permit, if present."""
+        return self.inputs.checkpoint_validation_token
 
     @property
     def py_disaggregated_params(self) -> DisaggregatedParams | None:
