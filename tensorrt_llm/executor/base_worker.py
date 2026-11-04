@@ -1641,9 +1641,16 @@ def _compute_pytorch_prompt_logprobs(
         if cached is not None:
             return LogProbsResult(prompt=cached)
     context_logits = response.result.context_logits
-    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
+    if (context_logits is None and result.is_sequence_final
+            and result.finish_reasons
+            and all(reason == tllm.FinishReason.CANCELLED
+                    for reason in result.finish_reasons)):
+        # Cancellation before execution has no prompt logits to report. Keep
+        # cached streaming logprobs above, but do not invent them for queued work.
+        return None
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."
