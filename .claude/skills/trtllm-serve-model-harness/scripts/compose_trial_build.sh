@@ -37,8 +37,12 @@ while getopts "kr:m:p:" opt; do
 done
 shift $((OPTIND - 1))
 [ $# -ge 3 ] || usage
-wt=$1; branch=$2; base=$3; shift 3
+# Absolute paths: the worktree is added from the repository root and then entered, and the
+# provenance file is written from inside it.
+absolute() { case $1 in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac; }
+wt=$(absolute "$1"); branch=$2; base=$3; shift 3
 [ -n "$prov" ] || prov="$wt.$branch.provenance.txt"
+prov=$(absolute "$prov")
 
 repo=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "run this inside a TensorRT-LLM checkout"; exit 64; }
 base_sha=$(git -C "$repo" rev-parse --verify "$base^{commit}") || { echo "unknown base $base"; exit 64; }

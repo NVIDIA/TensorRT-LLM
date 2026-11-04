@@ -191,13 +191,18 @@ def pick(indices, k, how, rng):
 
 
 def drop_reasoning_messages(body, mode):
-    """Anthropic thinking blocks / Chat reasoning fields written by ANOTHER model."""
+    """Anthropic thinking blocks / Chat reasoning fields written by ANOTHER model.
+
+    ``drop`` removes them all. ``strip-encrypted`` keeps the visible reasoning and removes only
+    what the other model's server issued: thinking signatures and redacted thinking. Chat
+    reasoning fields are visible text, so they stay.
+    """
     changed = False
     for message in body.get("messages") or []:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
         for key in ("reasoning_content", "reasoning"):  # chat completions
-            if key in message:
+            if key in message and mode == "drop":
                 del message[key]
                 changed = True
         blocks = message.get("content")

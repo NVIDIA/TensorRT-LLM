@@ -66,6 +66,59 @@ def test_sse_frames_keep_every_frame():
     ]
 
 
+def test_sse_events_read_crlf_framing():
+    """`sse_events` (the reference checkers) frames a stream as `sse_frames` (the verdict) does."""
+    from tracelib import sse_events
+
+    body = 'event: response.created\ndata: {"type": "response.created"}\n\ndata: [DONE]\n\n'
+    crlf = body.replace("\n", "\r\n")
+    assert (
+        list(sse_events(crlf))
+        == list(sse_events(body))
+        == [("response.created", {"type": "response.created"})]
+    )
+    assert [(f.name, f.kind) for f in sse_frames(crlf)] == [
+        (f.name, f.kind) for f in sse_frames(body)
+    ]
+
+
+def test_check_stream_fails_an_unparsable_frame(tmp_path):
+    """A frame an SDK client cannot read fails the reference checker, as it fails RSP-01."""
+    import subprocess
+
+    response = {"id": "resp_1", "model": "m", "output": []}
+    frames = [("response.created", {"type": "response.created", "sequence_number": 0,
+                                    "response": dict(response, status="in_progress")}),
+              ("response.output_text.delta", "{not json"),
+              ("response.completed", {"type": "response.completed", "sequence_number": 1,
+                                      "response": dict(response, status="completed")})]  # fmt: skip
+    body = "".join(
+        f"event: {name}\ndata: {data if isinstance(data, str) else json.dumps(data)}\n\n"
+        for name, data in frames
+    )
+    shard = tmp_path / "responses-1.jsonl"
+    shard.write_text(json.dumps({"event": "response", "trace_id": "t1",
+                                 "response": {"kind": "sse_text", "body": body}}) + "\n")  # fmt: skip
+    out = tmp_path / "report.json"
+    result = subprocess.run([sys.executable, os.path.join(VALIDATE, "check_stream.py"), "--out",
+                             str(out), str(shard)], capture_output=True)  # fmt: skip
+    verdicts = json.loads(out.read_text())["verdicts"]
+    assert result.returncode == 1
+    assert {c for c, v in verdicts.items() if v != "PASS"} == {"unparsable_event"}
+
+
+def test_harness_signals_refuses_a_file_it_cannot_read(tmp_path):
+    """A shard's name says which side it holds: a file named otherwise is an error, not a crash."""
+    import harness_signals
+
+    shard, other = tmp_path / "requests-1.jsonl", tmp_path / "raw-1.jsonl"
+    shard.write_text("")
+    other.write_text("")
+    assert harness_signals.expand([str(shard), str(tmp_path)]) == [str(shard)]
+    with pytest.raises(SystemExit, match="raw-1.jsonl"):
+        harness_signals.expand([str(other)])
+
+
 def test_payload_digest_is_typed_and_order_free():
     assert payload_digest('{"a": 1, "b": [1, 2]}', "function") == payload_digest(
         '{"b":[1,2],"a":1}', "function"

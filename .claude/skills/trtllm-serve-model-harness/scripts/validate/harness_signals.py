@@ -77,8 +77,11 @@ def expand(paths):
                     for n in names
                     if SHARD.search(os.path.join(dirpath, n))
                 ]
-        else:
+        elif SHARD.search(path):
             found.append(path)
+        else:
+            # The name says which side a shard holds: a file named otherwise cannot be read.
+            raise SystemExit(f"{path}: not a requests-* or responses-* shard")
     return sorted(set(found))
 
 

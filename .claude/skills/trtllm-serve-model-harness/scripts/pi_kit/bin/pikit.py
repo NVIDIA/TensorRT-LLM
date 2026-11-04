@@ -84,6 +84,8 @@ IN_PORT = 18080  # pi's endpoint inside the container (loopback only)
 PROVIDER = "trtllm"
 POLL_S = 2.0
 STOP_GRACE_S = 20
+# The longest path a unix socket binds to on Linux: sun_path's 108 bytes, less the closing NUL.
+UNIX_PATH_MAX = 107
 
 
 def now() -> str:
@@ -129,6 +131,11 @@ def docker(*args, check=False, timeout=120) -> subprocess.CompletedProcess:
                           timeout=timeout)  # fmt: skip
 
 
+async def docker_async(*args, **kwargs) -> subprocess.CompletedProcess:
+    """``docker`` in a worker thread: the event loop also relays every running session's bytes."""
+    return await asyncio.to_thread(docker, *args, **kwargs)
+
+
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -157,6 +164,17 @@ def load_tasks(path: str) -> list:
     if not tasks:
         raise SystemExit(f"{path}: no tasks")
     return tasks
+
+
+def check_socket_paths(run_dir: str, sessions: list) -> None:
+    """Refuse a run dir so deep that a session's unix socket (io/ep.sock) cannot bind."""
+    paths = [os.path.join(os.path.abspath(run_dir), "sessions", s["id"], "io", "ep.sock")
+             for s in sessions]  # fmt: skip
+    longest = max(paths, key=lambda p: len(os.fsencode(p)), default="")
+    if len(os.fsencode(longest)) > UNIX_PATH_MAX:
+        raise SystemExit(f"--run-dir is too deep for the sessions' unix sockets: {longest} is "
+                         f"{len(os.fsencode(longest))} bytes, the limit is {UNIX_PATH_MAX}; "
+                         "use a shorter --run-dir")  # fmt: skip
 
 
 def endpoint_origin(base_url: str) -> str:
@@ -269,6 +287,7 @@ def build_config(args) -> dict:
     if args.only:
         wanted = set(args.only.split(","))
         sessions = [s for s in sessions if s["id"] in wanted]
+    check_socket_paths(args.run_dir, sessions)
     for option, value, variable in (("--image", args.image, "PIKIT_IMAGE"),
                                     ("--node-dir", args.node_dir, "PIKIT_NODE_DIR"),
                                     ("--pi-dir", args.pi_dir, "PIKIT_PI_DIR")):  # fmt: skip
@@ -351,6 +370,7 @@ class Session:
         self.recorder = None  # asyncio subprocess
         self.bridge = None  # asyncio server
         self.deadline = None
+        self.capture_read = None  # ((st_dev, st_ino), bytes read, newlines, ends mid-line)
 
     # paths
     def path(self, *parts) -> str:
@@ -507,6 +527,30 @@ class Session:
             argv += ["-e", f"{key}={value}"]
         return argv + [cfg["image_id"], "/opt/pikit/session-entry.sh"]
 
+    def requests_recorded(self) -> str:
+        """Lines of the session's request capture, or "-" before there is one.
+
+        The capture holds whole request bodies and only grows, so each call reads only what was
+        appended since the previous one. Another file (a new attempt's) is read from its start.
+        """
+        try:
+            fh = open(self.path("trace", "requests-capture.jsonl"), "rb")
+        except FileNotFoundError:
+            self.capture_read = None
+            return "-"
+        with fh:
+            st = os.fstat(fh.fileno())
+            ident, offset, lines, mid_line = self.capture_read or (None, 0, 0, False)
+            if ident != (st.st_dev, st.st_ino) or st.st_size < offset:
+                offset, lines, mid_line = 0, 0, False
+            fh.seek(offset)
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                lines += chunk.count(b"\n")
+                mid_line = not chunk.endswith(b"\n")
+                offset += len(chunk)
+            self.capture_read = ((st.st_dev, st.st_ino), offset, lines, mid_line)
+        return str(lines + mid_line)
+
     def inspect(self):
         result = docker("inspect", "--format", "{{json .State}}", self.state["container_id"])
         return json.loads(result.stdout) if result.returncode == 0 else None
@@ -567,11 +611,7 @@ class Supervisor:
         for s in self.sessions:
             st = s.state
             summary = st.get("summary") or {}
-            requests = "-"
-            trace = s.path("trace", "requests-capture.jsonl")
-            if os.path.exists(trace):
-                with open(trace, "rb") as fh:
-                    requests = str(sum(1 for _ in fh))
+            requests = s.requests_recorded()
             lines.append("\t".join(str(x) for x in (
                 s.id, st.get("task"), st.get("status"), st.get("attempt"), st.get("seconds", "-"),
                 st.get("pi_exit"), summary.get("final_stop_reason"), summary.get("turns", "-"),
@@ -622,7 +662,7 @@ class Supervisor:
             else:
                 parsed = urllib.parse.urlparse(cfg["origin"])
                 await s.start_bridge(parsed.hostname, parsed.port or 80)
-            result = docker(*s.docker_run_args())
+            result = await docker_async(*s.docker_run_args())
             with open(s.path("docker.log"), "a") as fh:
                 fh.write(f"{now()} docker run rc={result.returncode}\n{result.stderr}")
             if result.returncode:
@@ -662,30 +702,32 @@ class Supervisor:
                        pi_exit=pi_exit, container_exit=(state or {}).get("ExitCode"),
                        summary=s.summarize())  # fmt: skip
         s.save()
-        docker("rm", "-f", s.state["container_id"])
+        await docker_async("rm", "-f", s.state["container_id"])
         self.running.pop(s.id, None)
         self.log(f"{s.id}: {status} (pi exit {pi_exit}, {seconds} s"
                  + (f", {reason}" if reason else "") + ")")  # fmt: skip
 
     async def poll(self) -> None:
         for s in list(self.running.values()):
-            state = s.inspect()
+            state = await asyncio.to_thread(s.inspect)
             if state is None:
                 await self.finish(s, None, "error", "container disappeared")
             elif state.get("Status") in ("exited", "dead"):
                 await self.finish(s, state, "done")
             elif time.monotonic() > s.deadline:
                 self.log(f"{s.id}: past its time limit, stopping container")
-                docker("stop", "-t", str(STOP_GRACE_S), s.state["container_id"],
-                       timeout=STOP_GRACE_S + 60)  # fmt: skip
-                await self.finish(s, s.inspect(), "timeout", "stopped by the supervisor")
+                await docker_async("stop", "-t", str(STOP_GRACE_S), s.state["container_id"],
+                                   timeout=STOP_GRACE_S + 60)  # fmt: skip
+                await self.finish(s, await asyncio.to_thread(s.inspect), "timeout",
+                                  "stopped by the supervisor")  # fmt: skip
 
     async def shutdown(self) -> None:
         self.log("stop requested: stopping the sessions this run started")
         for s in list(self.running.values()):
-            docker("stop", "-t", str(STOP_GRACE_S), s.state["container_id"],
-                   timeout=STOP_GRACE_S + 60)  # fmt: skip
-            await self.finish(s, s.inspect(), "stopped", "stopped by pikit stop")
+            await docker_async("stop", "-t", str(STOP_GRACE_S), s.state["container_id"],
+                               timeout=STOP_GRACE_S + 60)  # fmt: skip
+            await self.finish(s, await asyncio.to_thread(s.inspect), "stopped",
+                              "stopped by pikit stop")  # fmt: skip
 
     async def main(self) -> int:
         loop = asyncio.get_running_loop()

@@ -305,3 +305,23 @@ def test_a_running_recorder_records_a_cut_when_it_happens(tmp_path):
     assert len(records) == 1, "no record while the server was still silent"
     assert records[0]["status"] == "client_disconnected"
     assert records[0]["timing"]["total_s"] < 0.6
+
+
+def test_the_capture_is_readable_by_its_owner_only(tmp_path):
+    """The capture can hold credentials and user code: 0600 files, in a 0700 directory it made."""
+    import stat
+
+    out = tmp_path / "capture"
+    out.mkdir(mode=0o755)
+    (out / "requests-capture.jsonl").write_text("")  # left by an earlier recorder, 0644
+    os.chmod(out / "requests-capture.jsonl", 0o644)
+    made = tmp_path / "made"
+
+    for out_dir in (out, made):
+        app = record_requests.build_app(str(out_dir))
+        app["req_out"].close()
+        app["resp_out"].close()
+        for name in ("requests-capture.jsonl", "responses-capture.jsonl"):
+            assert stat.S_IMODE(os.stat(out_dir / name).st_mode) == 0o600, (out_dir, name)
+    assert stat.S_IMODE(os.stat(made).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o755  # an existing directory is left as it was

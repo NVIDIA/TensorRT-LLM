@@ -141,7 +141,10 @@ def main():
             "; ".join(f"{c['reason']} {'ok' if c['ok'] else 'failed'}" for c in r["compactions"])
             or "-"
         )
-        final = r["final_stop_reason"] + (f" ({r['final_error']})" if r["final_error"] else "")
+        # A case whose pi wrote no assistant message_end (it died or timed out first) has none.
+        final = (r["final_stop_reason"] or "-") + (
+            f" ({r['final_error']})" if r["final_error"] else ""
+        )
         lines.append(f"| {r['case']} | {r['api']} | {r['mode']} | {r['requests']} | {r['identical_resends']} "
                      f"| {answers} | {retries} | {comps} | {final} |")  # fmt: skip
     lines += ["", "## Tool results pi sent back (outcome cases)", "", "| case | is_error | text (first 160 chars) |",

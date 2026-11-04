@@ -87,9 +87,9 @@ def sse_events(body: str) -> Iterator[Tuple[Optional[str], Optional[dict]]]:
     Frames are split first and only then read, so generated text that happens
     to contain ``event:`` or ``data:`` lines cannot be mistaken for a frame.
     A frame without an ``event:`` line takes its name from ``data["type"]``.
-    ``data: [DONE]`` frames are skipped.
+    ``data: [DONE]`` frames are skipped. Line ends are read as ``sse_frames`` reads them.
     """
-    for block in body.split("\n\n"):
+    for block in body.replace("\r\n", "\n").split("\n\n"):
         if not block.strip():
             continue
         name, data = None, []

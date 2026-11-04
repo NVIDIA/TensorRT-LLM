@@ -20,6 +20,7 @@ and speaks the Responses protocol, check that the stream is self-consistent and
 agrees with its own terminal snapshot:
 
   no_terminal_event         the stream never reached completed/incomplete/failed
+  unparsable_event          a frame whose data is not JSON (an SDK client fails on it)
   multiple_terminal_events  more than one terminal event
   events_after_terminal     frames after the terminal event
   sequence_not_increasing   ``sequence_number`` not strictly increasing
@@ -73,6 +74,7 @@ from tracelib import (  # noqa: E402
 
 CHECKS = (
     "no_terminal_event",
+    "unparsable_event",
     "multiple_terminal_events",
     "events_after_terminal",
     "sequence_not_increasing",

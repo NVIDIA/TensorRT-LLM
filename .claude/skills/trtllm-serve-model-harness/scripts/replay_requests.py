@@ -58,6 +58,13 @@ except ImportError:
     sys.exit("replay_requests.py needs aiohttp (pip install aiohttp)")
 
 
+def open_private(path):
+    """``path`` opened for appending and readable by its owner only, whether new or not."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "a")
+
+
 def utc_now():
     return (
         time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -114,7 +121,11 @@ async def replay_one(session, entry, args, headers):
                     except StopAsyncIteration:
                         break
                     except asyncio.TimeoutError:
-                        status = "client_first_event_timeout"
+                        # Two limits run here: --first-event-timeout (wait_for) until the first
+                        # event, and --timeout (aiohttp's total for the request) throughout.
+                        # Before the first event, the one that fired is the earlier of the two.
+                        first = first_event is None and args.first_event_timeout <= args.timeout
+                        status = "client_first_event_timeout" if first else "client_timeout"
                         break
                     if not chunk:
                         continue
@@ -175,14 +186,15 @@ async def run(args):
         routes = Counter(e.get("route") for e in entries)
         print(json.dumps({"entries": len(entries), "routes": dict(routes)}))
         return
-    os.makedirs(args.out_dir, exist_ok=True)
+    # The replies can hold credentials and user code, as the corpus can: owner only.
+    os.makedirs(args.out_dir, mode=0o700, exist_ok=True)
     req_path = os.path.join(args.out_dir, "requests-replay.jsonl")
     resp_path = os.path.join(args.out_dir, "responses-replay.jsonl")
     statuses, totals, firsts = Counter(), [], []
     semaphore = asyncio.Semaphore(args.concurrency)
     connector = aiohttp.TCPConnector(limit=args.concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
-        with open(req_path, "a") as req_out, open(resp_path, "a") as resp_out:
+        with open_private(req_path) as req_out, open_private(resp_path) as resp_out:
 
             async def worker(entry):
                 async with semaphore:

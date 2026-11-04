@@ -292,10 +292,21 @@ async def on_cleanup(app):
     app["resp_out"].close()
 
 
+def open_private(path):
+    """``path`` opened for appending and readable by its owner only, whether new or not."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "a")
+
+
 def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session=None, status=501,
               build_id=None):  # fmt: skip
-    """The recorder as an aiohttp application (``main`` serves it)."""
-    os.makedirs(out_dir, exist_ok=True)
+    """The recorder as an aiohttp application (``main`` serves it).
+
+    The capture can hold credentials and user code: its files are the owner's only, and so is
+    the directory when the recorder creates it.
+    """
+    os.makedirs(out_dir, mode=0o700, exist_ok=True)
     app = web.Application(client_max_size=1 << 30)
     app.update(
         forward=forward,
@@ -304,8 +315,8 @@ def build_app(out_dir, forward=None, forward_auth=False, overrides=None, session
         session=session,
         status=status,
         build_id=build_id,
-        req_out=open(os.path.join(out_dir, "requests-capture.jsonl"), "a"),
-        resp_out=open(os.path.join(out_dir, "responses-capture.jsonl"), "a"),
+        req_out=open_private(os.path.join(out_dir, "requests-capture.jsonl")),
+        resp_out=open_private(os.path.join(out_dir, "responses-capture.jsonl")),
     )
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
