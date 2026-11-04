@@ -166,6 +166,8 @@ class SparseRuntimeParams:
     sparse_attn_indices_block_size: int = 0
     sparse_attn_kv_lens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     aux_kv_cache_pool_ptr: Optional[int] = None
+    # Optional TRTLLM-Gen per-sequence KV split limit.
+    max_num_ctas_per_seq_kv: Optional[int] = None
 
     # SkipSoftmax prefill threshold; kernels divide it by context length.
     threshold_scale_factor_prefill: float = 0.0
