@@ -432,10 +432,11 @@ def test_preserved_failure_is_flushed_before_idle_fetch(
     for target in ("torch.cuda.set_device", "cudart.cudaSetDevice", "CUASSERT"):
         monkeypatch.setattr(f"tensorrt_llm._torch.pyexecutor.py_executor.{target}", Mock())
 
-    def stop_before_blocking(timeout: timedelta | None) -> None:
+    def stop_before_blocking(timeout: timedelta | None, *, wait_for_batch: bool = True) -> None:
         """Check publication and cleanup before the real fetch would wait forever."""
         events.append("fetch")
         assert timeout is None
+        assert wait_for_batch
         assert executor.active_requests == []
         if failure_rank == 0 and not should_flush:
             # TP consensus cannot authorize a world-wide collective. Keep the
@@ -784,8 +785,9 @@ def test_parked_native_failure_waits_for_physical_cancel_completion(
 
 @pytest.mark.parametrize("boundary", ["early", "post_batch"])
 @pytest.mark.parametrize("expires", [False, True], ids=["settles", "grace-expires"])
+@pytest.mark.parametrize("transfer_error", [False, True], ids=["in-progress", "transfer-error"])
 def test_parked_failure_closes_unpublished_receive_admission(
-    executor: PyExecutor, boundary: str, expires: bool
+    executor: PyExecutor, boundary: str, expires: bool, transfer_error: bool
 ) -> None:
     """Keep the original failure while an unpublished CUDA claim drains within its grace.
 
@@ -793,6 +795,7 @@ def test_parked_failure_closes_unpublished_receive_admission(
         executor: Real executor error and cancellation paths with controlled resources.
         boundary: Executor cancellation boundary to exercise.
         expires: Whether the local access remains unproven until its grace expires.
+        transfer_error: Whether the request has also entered the transfer-error state.
     """
     request = _request(1)
     request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -812,6 +815,9 @@ def test_parked_failure_closes_unpublished_receive_admission(
     executor._handle_errors(message, requests=[request], charge_budget=False)
     assert executor._held_transfer_failures() == {id(request): (request, message)}
 
+    if transfer_error:
+        request.state = LlmRequestState.DISAGG_TRANS_ERROR
+
     def cancel() -> None:
         """Use the selected production cancellation boundary."""
         if boundary == "early":
@@ -821,6 +827,9 @@ def test_parked_failure_closes_unpublished_receive_admission(
 
     _abort(executor, request, repeats=2)
     cancel()
+    if transfer_error:
+        assert executor.disagg._unpublished_gen_receives == {1: (request, ready)}
+        executor.disagg.poll_gen_transfers()
     assert executor.disagg._unpublished_gen_receives == {}
     assert executor.disagg._retiring_gen_receives == {}
     assert transceiver._recv_reqs == {1: request}
@@ -1223,18 +1232,29 @@ def test_cancelled_receive_shutdown_preserves_roots_until_fence_settles(
     worker._retirement_watchdog.stop()
 
 
+@pytest.mark.parametrize("shutdown", [False, True])
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished-fence", "published-session"])
 def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
-    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch, shutdown: bool, published: bool
 ) -> None:
     """The last logical result must not stop background receive retirement.
 
     Args:
-        executor: Executor retaining one real published receive session.
-        monkeypatch: Isolates the queue and CUDA control-action boundary.
+        executor: Executor retaining a receive session or an unpublished CUDA fence.
+        monkeypatch: Guards blocking queue reads and the CUDA control boundary.
+        shutdown: Whether the executor has consumed its shutdown sentinel.
+        published: Whether retirement owns a published session or a local admission fence.
     """
     request = _request(1)
     executor.active_requests = [request]
-    session, _ = _published_receive(executor, request)
+    if published:
+        session, _ = _published_receive(executor, request)
+    else:
+        request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        ready = Mock(spec=["query"])
+        ready.query.return_value = False
+        executor.disagg._defer_unready_gen_receives = True
+        executor.disagg._unpublished_gen_receives[1] = (request, ready)
     _abort(executor, request)
     executor._cancel_waiting_disagg_requests([])
     executor._flush_pending_transfer_responses()
@@ -1248,20 +1268,33 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     executor._handle_control_request()
     synchronize.assert_not_called()
     executor.control_requests.clear()
-    executor.is_shutdown = False
+    executor.is_shutdown = shutdown
     executor._disable_mpi = False
     executor.request_accumulated = []
     executor.hang_detector = MagicMock()
     executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=([], {})))
-    fetch = Mock(return_value=[])
-    monkeypatch.setattr(executor.executor_request_queue, "get_from_request_queue", fetch)
+    executor.executor_request_queue.batch_wait_timeout_ms = 1000.0
+    queue = executor.executor_request_queue.request_queue
+    original_get = queue.get
+
+    def nonblocking_get(block: bool = True, timeout: float | None = None) -> RequestQueueItem:
+        assert not block, "batch accumulation blocked receive retirement"
+        return original_get(block=block, timeout=timeout)
+
+    monkeypatch.setattr(queue, "get", nonblocking_get)
 
     executor._fetch_and_enqueue_requests(executor.waiting_queue, 0)
 
-    fetch.assert_called_once_with(timedelta(0))
+    assert queue.empty()
     executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
-    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
-    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    executor.disagg.poll_gen_transfers()
+    executor.resource_manager.free_resources.assert_not_called()
+    assert executor.disagg._retiring_gen_receives == {1: request}
+    if published:
+        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+        session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    else:
+        ready.query.return_value = True
     executor.disagg.poll_gen_transfers()
     executor.is_shutdown = True
     assert executor.should_stop_processing
