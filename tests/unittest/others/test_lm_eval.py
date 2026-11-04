@@ -298,6 +298,53 @@ def test_sampling_override_no_cli_falls_back_to_yaml():
 
 
 # ===========================================================================
+# Mistral-Large-4: scored on the response, not its reasoning
+# ===========================================================================
+
+
+def _make_native_mistral_wrapper(checkpoint_format: str | None) -> LmEvalWrapper:
+    fake_llm = MagicMock()
+    fake_llm.args.checkpoint_format = checkpoint_format
+    return LmEvalWrapper(fake_llm)
+
+
+def _output(text: str):
+    return MagicMock(outputs=[MagicMock(text=text)])
+
+
+def test_mistral_large_4_keeps_its_reasoning_delimiters_in_the_text():
+    wrapper = _make_native_mistral_wrapper("mistral_large_4")
+    out = wrapper._get_sampling_params({"max_gen_toks": 512, "until": ["</s>"]})
+    assert out.skip_special_tokens is False
+    assert (
+        _make_native_mistral_wrapper(None)
+        ._get_sampling_params({"max_gen_toks": 512})
+        .skip_special_tokens
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "text, response",
+    [
+        # The answer after the reasoning block; the end of sequence is dropped.
+        ("[THINK]Option B is wrong, so C.[/THINK]Answer: C</s>", "Answer: C"),
+        # A reasoning block cut off by max_tokens leaves no response.
+        ("[THINK]Option B is wrong, so", ""),
+        # No reasoning block: the whole text is the response.
+        ("Answer: C</s>", "Answer: C"),
+    ],
+)
+def test_mistral_large_4_is_scored_on_its_response(text, response):
+    assert _make_native_mistral_wrapper("mistral_large_4")._response_text(_output(text)) == response
+
+
+def test_other_models_are_scored_on_their_text():
+    text = "[THINK]reasoning[/THINK]Answer: C"
+    assert _make_native_mistral_wrapper(None)._response_text(_output(text)) == text
+
+
+# ===========================================================================
 # Multimodal wrapper interleave — apply_chat_template content_parts
 # ===========================================================================
 #

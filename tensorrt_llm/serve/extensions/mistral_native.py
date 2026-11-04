@@ -23,7 +23,6 @@ counts each image's tokens from the decoded image.
 
 from typing import Any
 
-from tensorrt_llm.inputs.utils import NATIVE_MISTRAL_MODEL_TYPES
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
 
@@ -37,7 +36,7 @@ def _reasoning_effort(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
-@register_serving_extension(model_types=NATIVE_MISTRAL_MODEL_TYPES)
+@register_serving_extension(model_types=("mistral_common",))
 class MistralNativeServingExtension(ServingExtension):
     """Chat-request rules for the mistral-common renderer."""
 

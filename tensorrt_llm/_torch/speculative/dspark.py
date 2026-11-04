@@ -2063,10 +2063,12 @@ class DSparkWorker(DFlashWorker):
         the sampling filters (the ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
         :func:`markov_sampled_chain`; other sampled drafts take a per-position
         sampler loop and only with ``use_ancestral_draft_sampling``. Otherwise,
-        without a Markov head, for argmax drafts, or for a drafter that also
-        carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
-        (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
-        block sampler) applies.
+        without a Markov head, for argmax drafts, for a drafter that also
+        carries a DFlash 2 candidate scorer (LiLiCorr or the selector), or for a
+        recurrent Markov head (``has_recurrent_markov_head``), which the chains
+        here do not compute, the DFlash path (greedy-chained
+        :meth:`_refine_block_logits`, then the scorer and the block sampler)
+        applies.
         """
         has_candidate_scorer = getattr(draft_model, "lilicorr", None) is not None or getattr(
             draft_model, "has_candidate_selector", False
@@ -2082,6 +2084,7 @@ class DSparkWorker(DFlashWorker):
             and getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
             and not has_candidate_scorer
+            and not getattr(draft_model, "has_recurrent_markov_head", False)
         ):
             return super()._sample_block_draft_tokens(
                 draft_model,
@@ -2182,15 +2185,24 @@ class DSparkWorker(DFlashWorker):
         gen_logits: torch.Tensor,
         inputs: dict,
         spec_metadata,
+        draft_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 
         A DSpark drafter checkpoint may omit the Markov head (``markov_rank``
         0), which loads as a drafter without one; that case falls through to
-        the unmodified backbone logits.
+        the unmodified backbone logits. A drafter with a recurrent Markov head
+        (``has_recurrent_markov_head``) chains its own bias over the full-vocab
+        block logits, conditioned on ``draft_hidden_states``.
         """
         if not getattr(draft_model, "has_markov_head", False):
             return gen_logits
+        if getattr(draft_model, "has_recurrent_markov_head", False):
+            # The recurrent head's state reads each position's draft hidden
+            # state as well, so it is not the shared vanilla chain.
+            return draft_model.apply_markov_chain_logits(
+                gen_logits, inputs["first_prev_tokens"], hidden_states=draft_hidden_states
+            )
         return self._apply_dspark_markov_bias(draft_model, gen_logits, inputs["first_prev_tokens"])
 
     def _apply_dspark_markov_bias(

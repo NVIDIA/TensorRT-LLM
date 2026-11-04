@@ -8,6 +8,7 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeight
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import MistralConfigLoader
+from tensorrt_llm._torch.models.checkpoints.mistral.weight_loader import MistralLarge4WeightLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 
@@ -95,3 +96,26 @@ class MistralLarge3CheckpointLoader(MistralCheckpointLoader):
             weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
         )
         self._checkpoint_format = CheckpointFormat.MISTRAL_LARGE_3
+
+
+@register_checkpoint_loader(CheckpointFormat.MISTRAL_LARGE_4)
+class MistralLarge4CheckpointLoader(HfCheckpointLoader):
+    """Load native metadata and preserve tensor names for the language-model weight table."""
+
+    def __init__(
+        self,
+        *,
+        weight_loader: BaseWeightLoader | None = None,
+        weight_mapper: BaseWeightMapper | None = None,
+        config_loader: BaseConfigLoader | None = None,
+    ):
+        super().__init__(
+            weight_loader=weight_loader, weight_mapper=weight_mapper, config_loader=config_loader
+        )
+        self._checkpoint_format = CheckpointFormat.MISTRAL_LARGE_4
+
+    def get_default_weight_loader(self) -> MistralLarge4WeightLoader:
+        return MistralLarge4WeightLoader()
+
+    def get_default_config_loader(self) -> MistralConfigLoader:
+        return MistralConfigLoader()
