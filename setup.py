@@ -161,6 +161,9 @@ devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
 mx_deps = ["modelexpress>=0.5.1,<0.6.0"]
+# 0.17.0 adds the tensor_names and owned arguments of SafetensorsStreamer. The
+# s3, gcs and azure extras install the readers for loading from object storage.
+runai_deps = ["runai-model-streamer[s3,gcs,azure]>=0.17.0"]
 # OpenEngine's private schema bindings ship in this wheel and use the base
 # grpcio dependency; its empty extra remains an install-compatible feature
 # marker. SMG still consumes its external generated package.
@@ -734,6 +737,7 @@ setup(
         "devel": devel_deps + grpc_smg_deps,
         "openengine": [],
         "mx": mx_deps,
+        "runai": runai_deps,
         "grpc-smg": grpc_smg_deps,
     },
     zip_safe=True,

@@ -404,6 +404,16 @@ or `az://` URI. Run:ai Model Streamer streams the weight tensors from the bucket
 into the model, and the weights are never copied to local disk. Model Streamer
 loading currently supports Kimi K3 only.
 
+Install Model Streamer with the readers for all three stores, in the runtime of
+every rank, with the `runai` extra of TensorRT-LLM:
+
+```bash
+python -m pip install "tensorrt_llm[runai]"
+```
+
+or directly with `python -m pip install "runai-model-streamer[s3,gcs,azure]>=0.17.0"`.
+Without the reader of a store, Model Streamer cannot read a URI of that store.
+
 Hugging Face loaders read the config, tokenizer and remote-code files from a
 local directory. TRT-LLM therefore copies every file except the weights
 (`*.safetensors`, `*.bin`, `*.pt`, `*.pth`, `*.tensors`) and other formats that

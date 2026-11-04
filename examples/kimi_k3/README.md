@@ -205,6 +205,13 @@ to local disk. TRT-LLM copies only the other files (config, tokenizer and remote
 code) to a cache directory on each node, because Hugging Face loaders read them
 from local disk.
 
+Install the readers for the three stores with the `runai` extra, in the runtime
+used by every serving rank:
+
+```bash
+python -m pip install "tensorrt_llm[runai]"
+```
+
 ```bash
 trtllm-serve s3://my-bucket/kimi-k3 --config config.yaml
 ```
