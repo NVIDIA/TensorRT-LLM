@@ -548,7 +548,7 @@
             }
           ],
           "default": "PYTHON",
-          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path.",
+          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path. The C++ transceiver ('CPP' and None) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "title": "Transceiver Runtime"
         }
       },
@@ -4784,7 +4784,7 @@
             }
           ],
           "default": true,
-          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one.",
+          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one. V1 is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "status": "prototype",
           "title": "Use Kv Cache Manager V2"
         },

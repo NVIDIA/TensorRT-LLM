@@ -159,6 +159,8 @@ cache_transceiver_config:
 
 ```{warning}
 The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
+
+Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep that configuration while the feature is required, or disable the flag when migrating to Python. The existing startup validation remains in effect.
 ```
 
 The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
