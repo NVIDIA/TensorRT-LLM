@@ -2374,31 +2374,3 @@ def test_helix_context_store_writes_only_owned_positions():
         # Positions 8, 9 (global page 2, rank 0's) map to local page 1 =
         # physical page 0 and leave it unchanged.
         assert pool[0].tolist() == [sentinel] * page
-
-
-# ---------------------------------------------------------------------------
-# Low-M BF16 GEMM race of the MLA drafter's projections.
-# ---------------------------------------------------------------------------
-
-
-@needs_cuda
-def test_mla_drafter_races_its_projections_in_the_low_m_dispatcher():
-    weights = _tiny_mla_weights()
-    drafter = _build_mla_drafter(weights)
-    dispatcher = drafter._low_m_gemm
-    assert dispatcher is not None and dispatcher._force
-    for name, module in drafter.model.named_modules():
-        if module.__class__.__name__.endswith("Linear"):
-            assert module._low_m_gemm_dispatcher is dispatcher, name
-    # The LM head is the target's: it keeps the target's GEMM selection.
-    assert getattr(drafter.lm_head, "_low_m_gemm_dispatcher", None) is not dispatcher
-
-    # Decode-sized context latents (through the race) equal the plain GEMM's.
-    torch.manual_seed(0)
-    captured = torch.randn(14, MLA_HIDDEN * NUM_CAPTURE, device="cuda", dtype=torch.bfloat16)
-    positions = torch.arange(3, 17, device="cuda")
-    projected = drafter.project_target_hidden(captured)
-    latent, _ = drafter.precompute_context_kv(projected, positions)
-    drafter._low_m_gemm = None
-    reference, _ = drafter.precompute_context_kv(projected, positions)
-    torch.testing.assert_close(latent, reference, rtol=2e-2, atol=2e-2)

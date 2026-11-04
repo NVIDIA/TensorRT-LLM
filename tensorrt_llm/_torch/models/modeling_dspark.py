@@ -107,7 +107,6 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
-from ..modules.low_m_gemm import LowMGemmDispatcher, prepare_low_m_gemm
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
@@ -3538,8 +3537,6 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # residual add and the RMSNorm after it.
     _tp_fusions = True
 
-    # The low-M BF16 GEMM race of the drafter's projections (set in __init__).
-    _low_m_gemm: Optional[LowMGemmDispatcher] = None
     # o_proj and down_proj push their partials into the MNNVL all-reduce that sums them
     # (residual + RMSNorm fused into its finish) when the TP fusions run on SM100f.
     _ar_push: bool = False
@@ -3662,11 +3659,6 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             )
         if context_kv_only:
             self._keep_context_kv_modules()
-        # The block decode projections and the context latent GEMM run at a few
-        # rows per request: they race the low-M BF16 kernels against cuBLAS.
-        self._low_m_gemm = prepare_low_m_gemm(
-            self.model, force=True, per_rank_tuning=draft_config.mapping.enable_attention_dp
-        )
         self._ar_push = (
             self._tp_split
             and not context_kv_only
@@ -4290,13 +4282,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         if projected_hidden.dtype != weight_dtype:
             projected_hidden = projected_hidden.to(weight_dtype)
 
-        latent = (
-            None
-            if self._low_m_gemm is None
-            else self._low_m_gemm.apply(self, projected_hidden, self._fused_kv_weight, None)
-        )
-        if latent is None:
-            latent = F.linear(projected_hidden, self._fused_kv_weight)
+        latent = F.linear(projected_hidden, self._fused_kv_weight)
         latent = latent.view(n, num_layers, self._head_dim)
         if self._fused_mla_rope:
             # Every layer in one launch, the RoPE table read by position in the
@@ -4485,11 +4471,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             if qb_folded is not None:
                 # q_b of the un-normalized q_a; draft_qhead applies the inverse RMS.
                 folded = qb_folded[layer_idx]
-                q = None
-                if self._low_m_gemm is not None:
-                    q = self._low_m_gemm.apply(attn.q_b_proj, q_a, folded, None)
-                if q is None:
-                    q = F.linear(q_a, folded)
+                q = F.linear(q_a, folded)
             else:
                 q = attn.q_b_proj(attn.q_a_layernorm(q_a))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
