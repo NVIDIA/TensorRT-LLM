@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Introduction
 
-This guide describes how to serve Kimi K3.1 Pro with TensorRT LLM on NVIDIA GB300 NVL72 systems. It covers obtaining the checkpoint and its format, the supported deployments, building the software, the configuration files, launching the disaggregated servers (context (prefill) servers, a generation (decode) server and a router), running the model through the LLM API, the model-specific API behavior, example requests, accuracy verification and the known limitations.
+This guide describes how to serve Kimi K3.1 Pro with TensorRT LLM on NVIDIA GB300 NVL72 systems. It covers obtaining the checkpoint and its format, the supported deployments, installing the software, the configuration files, launching the disaggregated servers (context (prefill) servers, a generation (decode) server and a router), running the model through the LLM API, the model-specific API behavior, example requests, accuracy verification and the known limitations.
 
 Kimi K3.1 Pro builds on Kimi K3, a hybrid Mixture-of-Experts (MoE) model with 896 routed experts. Most decoder layers use Kimi Delta Attention (KDA), a linear-attention mixer that keeps a constant-size recurrent state per sequence; every fourth layer uses Multi-head Latent Attention (MLA). In Kimi K3.1 Pro the MLA layers add a DeepSeek Sparse Attention (DSA) indexer that selects the tokens each query attends to. The routed experts are stored in MXFP4. The checkpoint also contains a vision encoder. TensorRT LLM serves it as the architecture `KimiK31ForConditionalGeneration` (`model_type: kimi_k31`).
 
@@ -15,7 +15,8 @@ Kimi K3.1 Pro builds on Kimi K3, a hybrid Mixture-of-Experts (MoE) model with 89
 
 * GPU: NVIDIA GB300 (`sm_103`) in an NVL72 rack. Each disaggregated deployment runs entirely in one rack, so that the KV cache moves between servers over NVLink. A tray has 4 GPUs.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin and PMIx (`srun --mpi=pmix`), or an equivalent MPI launcher, to start one rank per GPU, and a container runtime with NVIDIA GPU support on each tray.
-* A shared filesystem visible to all trays for the repository, the checkpoint, the DSpark draft model, and the configuration and environment files.
+* TensorRT LLM with Kimi K3.1 Pro support: the release container or a source build. See [Install TensorRT LLM](#install-tensorrt-llm).
+* A shared filesystem visible to all trays for the checkpoint, the DSpark draft model, the configuration and environment files and, for a source build, the repository.
 * Host memory: the context servers offload KV cache blocks to host memory (`kv_cache_config.host_cache_size`: 160 GiB per rank on the TEP8 context servers, 150 GiB per rank on the DEP16 context servers). Lower it if the trays have less free host memory.
 
 ## Models
@@ -26,7 +27,7 @@ Kimi K3.1 Pro builds on Kimi K3, a hybrid Mixture-of-Experts (MoE) model with 89
 | Checkpoint | Weights | Features | Deployments |
 | :-- | :-- | :-- | :-- |
 | Kimi K3.1 Pro | Routed experts pre-quantized to MXFP4; BF16 attention, shared expert and vision encoder | Text, images (DEP16 deployments), DSpark speculative decoding, contexts up to 1,048,576 tokens | All [supported configurations](#supported-configurations) |
-| Kimi K3 DSpark draft | Draft layers of the Kimi K3 DSpark model | DSpark speculative decoding | All disaggregated deployments |
+| Kimi K3 DSpark draft | Draft layers of the Kimi K3 DSpark model | DSpark speculative decoding | All [supported configurations](#supported-configurations) |
 
 ### Download the Checkpoint
 
@@ -50,6 +51,15 @@ Kimi K3.1 Pro supports:
 * **Disaggregated serving** with TEP or DEP context and generation servers.
 * **Aggregated serving** with a TEP or DEP server.
 
+Suggested configurations:
+
+| Target | Context servers | Generation server | Trays (GPUs) | KV cache | DSpark draft length | Configuration files |
+| :-- | :-- | :-- | --: | :-- | --: | :-- |
+| Low latency | 1 x TEP8 | TEP32 | 10 (40) | FP8 | 7 | `tep8_ctx.yaml` (with `speculative_config.max_draft_len: 7` and `speculative_config.block_size: 7`, as noted under it), `tep32_gen.yaml`, `router.yaml` with one context server |
+| High throughput | 2 x DEP16 | DEP16 | 12 (48) | `nvfp4_ds_mla`, FP4 indexer keys | 6 | `dep16_ctx.yaml` for both context servers, `dep16_gen.yaml`, `router.yaml` |
+
+Both are disaggregated deployments in one NVL72 rack. The files are in [Configuration Files](#configuration-files), and [Launch the Servers](#launch-the-servers) shows how to start them.
+
 The server layouts are TEP8 (`tensor_parallel_size: 8`, `moe_expert_parallel_size: 8`), TEP16 (`tensor_parallel_size: 16`, `moe_expert_parallel_size: 4`, `moe_tensor_parallel_size: 4`), TEP32 (`tensor_parallel_size: 32`, `moe_expert_parallel_size: 8`, `moe_tensor_parallel_size: 4`) and DEP16 (`tensor_parallel_size: 16`, `moe_expert_parallel_size: 16`, `enable_attention_dp: true`). The TEP servers store the KV cache and the indexer keys in FP8; the DEP16 servers use `nvfp4_ds_mla` with FP4 indexer keys.
 
 Numerics shared by all deployments: BF16 attention, shared expert and collectives; routed experts with MXFP4 weights and MXFP8 activations (W4A8) on the TRTLLM-Gen MoE backend; FP32 KDA recurrent state; FP8 storage for the DSpark draft's context KV. All servers set `max_seq_len: 1048576`.
@@ -58,16 +68,37 @@ Aggregated DEP16 runs one server on 4 trays with `kv_cache_config.free_gpu_memor
 
 ## Deployment Steps
 
-### Build from Source
+### Install TensorRT LLM
 
-Inside the TensorRT LLM development container (SBSA variant on GB300), from the repository root:
+Kimi K3.1 Pro support is released from the `feat/kimi-k3.1-pro` branch as TensorRT LLM `1.4.0a0.dev202611050000` in a release container. Use it, or build the branch from source.
+
+#### Release Container
+
+The release container has TensorRT LLM and its dependencies installed:
+
+```text
+nvcr.io/nvidia/tensorrt-llm/release:feat-kimi-k3.1-pro-1.4.0a0.dev202611050000
+```
+
+GB300 nodes use the aarch64 image. With Slurm and pyxis/enroot, import it once into a squashfs file on the shared filesystem:
+
+```bash
+enroot import -o /path/to/tensorrt-llm-kimi-k3.1-pro.sqsh \
+    "docker://nvcr.io#nvidia/tensorrt-llm/release:feat-kimi-k3.1-pro-1.4.0a0.dev202611050000"
+```
+
+The launch commands below use this file as the container image. Other container runtimes can use the tag directly.
+
+#### Build from Source
+
+Build in the TensorRT LLM development container, using the SBSA (aarch64) variant on GB300. From the repository root:
 
 ```bash
 python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the virtual environment `.venv-3.12` at the repository root (named after the container's Python version). The installation pulls in `fla-core` and `einops` from `requirements.txt`, which the KDA layers need. The launch commands below run from this in-place environment, so build with the repository at the same path the servers use. See [Building from Source](../installation/build-from-source.md) for other options.
+`build_wheel.py` creates the virtual environment `.venv-3.12` at the repository root (named after the container's Python version). The installation pulls in `fla-core` and `einops` from `requirements.txt`, which the KDA layers need. The source-build launch commands run from this in-place environment, so build with the repository at the same path the servers use. See [Building from Source](../installation/build-from-source.md) for other options.
 
 ### Configuration Files
 
@@ -355,15 +386,14 @@ The context and generation servers must be started with `--server_role context` 
 
 ### Launch the Servers
 
-Each context and generation server is started through `trtllm-llmapi-launch`, one rank per GPU; its rank 0 serves HTTP. The example below starts a TEP8 context server and a TEP16 generation server with Slurm, inside one allocation of 6 trays in one rack (on Slurm clusters with topology segments, request the trays in one segment, for example `--segment=6`):
+Each context and generation server is started through `trtllm-llmapi-launch`, one rank per GPU; its rank 0 serves HTTP. The example below starts a TEP8 context server and a TEP16 generation server with Slurm in the image from [Install TensorRT LLM](#install-tensorrt-llm), inside one allocation of 6 trays in one rack (on Slurm clusters with topology segments, request the trays in one segment, for example `--segment=6`):
 
 ```bash
 MODEL=<KIMI_K31_MODEL_DIR>
 DRAFT=<DSPARK_DRAFT_MODEL_DIR>
-REPO=/path/to/TensorRT-LLM                          # in-place build from the previous step
 CFG=/path/to/configs   # tep8_ctx.yaml, tep16_gen.yaml and router.yaml (one context server)
-IMAGE=/path/to/tensorrt-llm-container.sqsh
-MOUNTS=${REPO}:${REPO},${MODEL}:${MODEL},${DRAFT}:${DRAFT},${CFG}:${CFG}:ro
+IMAGE=/path/to/tensorrt-llm-kimi-k3.1-pro.sqsh
+MOUNTS=${MODEL}:${MODEL},${DRAFT}:${DRAFT},${CFG}:${CFG}:ro
 
 start_server() {
     local role=$1 port=$2 name=$3; shift 3
@@ -372,7 +402,6 @@ start_server() {
         bash -c "
             ulimit -n 65536
             export UCX_CUDA_IPC_ENABLE_MNNVL=y
-            export PATH=\"${REPO}/.venv-3.12/bin:\$PATH\"
             exec trtllm-llmapi-launch trtllm-serve ${MODEL} \
                 --host 0.0.0.0 --port ${port} \
                 --config ${CFG}/${name}.yaml \
@@ -391,10 +420,19 @@ For the other deployments, start one server per entry of the router configuratio
 srun -N 1 --ntasks 1 --overlap -w <CTX0_HOST> \
     --container-image=${IMAGE} --container-mounts=${MOUNTS} \
     bash -c "
-        export PATH=\"${REPO}/.venv-3.12/bin:\$PATH\"
         exec trtllm-serve disaggregated -c ${CFG}/router.yaml \
             --server_start_timeout 7200 --request_timeout 7200
     "
+```
+
+For a source build, use the development container, mount the repository and put its virtual environment first on `PATH` in each `bash -c` command:
+
+```bash
+REPO=/path/to/TensorRT-LLM   # the repository, built as in Build from Source
+IMAGE=/path/to/tensorrt-llm-devel-container.sqsh
+MOUNTS=${REPO}:${REPO},${MODEL}:${MODEL},${DRAFT}:${DRAFT},${CFG}:${CFG}:ro
+# first line inside each bash -c "...":
+export PATH=\"${REPO}/.venv-3.12/bin:\$PATH\"
 ```
 
 > [!NOTE]
@@ -450,12 +488,11 @@ WORKDIR=/path/to/workdir   # the directory that holds quickstart.py
 
 srun -N 4 --ntasks 16 --ntasks-per-node 4 --gpus-per-node 4 --mpi=pmix \
     --container-image=${IMAGE} \
-    --container-mounts=${REPO}:${REPO},${MODEL}:${MODEL},${WORKDIR}:${WORKDIR} \
-    bash -c "
-        export PATH=\"${REPO}/.venv-3.12/bin:\$PATH\"
-        exec trtllm-llmapi-launch python3 ${WORKDIR}/quickstart.py
-    "
+    --container-mounts=${MODEL}:${MODEL},${WORKDIR}:${WORKDIR} \
+    trtllm-llmapi-launch python3 ${WORKDIR}/quickstart.py
 ```
+
+For a source build, make the same changes as for the servers: the development container, the repository mount and the virtual environment on `PATH`.
 
 The same options in a YAML file passed to `trtllm-serve --config` start an aggregated DEP16 server; omit `--server_role` for it.
 
@@ -652,4 +689,4 @@ lm_eval --model local-completions \
 | CUDA out-of-memory at startup of an aggregated DEP16 server with `max_seq_len: 1048576` | Use `kv_cache_config.free_gpu_memory_fraction: 0.5` and `moe_config.max_num_tokens: 32768`; 0.7 does not fit. The KV cache then holds about 500k tokens per request, and longer prompts are rejected (HTTP 400); serve 1M-token prompts with the disaggregated deployments. |
 | Stale file handle errors during startup | Point the JIT caches (`TRITON_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`) at node-local storage. |
 | Model fails to load | Set `trust_remote_code: true`, keep `use_kv_cache_manager_v2: true`, and check that the checkpoint and the draft model are complete. |
-| Ranks cannot reach each other | Check that the repository, checkpoint, draft model and configuration files resolve to the same paths on all trays, and that the rank count equals `tensor_parallel_size`. |
+| Ranks cannot reach each other | Check that the container image, checkpoint, draft model, configuration files and, for a source build, the repository resolve to the same paths on all trays, and that the rank count equals `tensor_parallel_size`. |
