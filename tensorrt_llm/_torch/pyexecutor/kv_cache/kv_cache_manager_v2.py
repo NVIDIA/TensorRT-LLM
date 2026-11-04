@@ -1865,7 +1865,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
-    # Ownership of region buffers, set while the cache config is built; see region_layout.
+    # Declared regions and, once laid out, the ownership of their buffers; see region_layout.
     _region_layout: Optional[RegionLayout] = None
 
     def __init__(
@@ -2296,6 +2296,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+        # Costing the memory budget below already reads the declared regions.
+        self._declare_regions()
 
         # Both diagnostics below are off unless their environment variable is
         # set; with neither set nothing here changes any allocation, any page
@@ -4036,16 +4038,26 @@ class KVCacheManagerV2(BaseResourceManager):
     def _region_providers(self) -> Sequence[RegionProvider]:
         """Return the providers whose regions this manager stores.
 
-        Called once while the cache config is built, after the per-layer views
-        (``pp_layers``, ``num_local_layers``) are known.
+        Their regions are declared once the per-layer views (``pp_layers``,
+        ``layer_offsets``) are known, before the memory budget is costed.
         """
         return ()
 
+    def _declare_regions(self) -> None:
+        """Collect the providers' regions; their buffers are laid out with the cache config."""
+        self._region_layout = RegionLayout(
+            regions=tuple(
+                region
+                for provider in self._region_providers()
+                for region in provider.declare_regions()
+            )
+        )
+
     def _lay_out_regions(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Replace the base config of every layer a region covers with the regions' buffers."""
-        regions = [
-            region for provider in self._region_providers() for region in provider.declare_regions()
-        ]
+        if self._region_layout is None:
+            self._declare_regions()
+        regions = self._region_layout.regions
         layers, self._region_layout = lay_out_regions(regions, config.layers)
         if not regions:
             return config
@@ -4060,10 +4072,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @property
     def region_layout(self) -> RegionLayout:
-        """Which region owns each buffer; empty when no region is declared."""
+        """The declared regions and which region owns each buffer; empty without regions."""
         if self._region_layout is None:
             return RegionLayout()
         return self._region_layout
+
+    def get_region_group_ids(self, region: str) -> Tuple[int, ...]:
+        """Layer group ids of ``region``'s buffers, ascending; empty for an undeclared region."""
+        return self.region_layout.group_ids(region, self.impl)
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Exclude empty buffers before creating the runtime storage pools."""
@@ -4407,8 +4423,13 @@ class KVCacheManagerV2(BaseResourceManager):
         is valid only for a fixed manager/backend pair. A manager whose backend
         selects the layout at runtime must derive the mapping from that
         backend's configuration.
+
+        Declared regions add the kinds of their transferred roles.
         """
-        return {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
+        kinds = {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED}
+        for region in self.region_layout.regions:
+            kinds.update(region.transfer.mapper_kinds)
+        return kinds
 
     def get_disagg_role_layouts(self) -> dict[DataRole, RoleLayout]:
         """Resharding geometry for roles whose mapper kind needs it.
@@ -4416,10 +4437,13 @@ class KVCacheManagerV2(BaseResourceManager):
         SECTIONED roles declare ``section_bytes``; INDEXED roles whose head
         count is not derivable from the attention topology declare
         ``bytes_per_head``. Attention K/V and replicated roles need none, so
-        the base manager declares nothing. The page-table builder copies the
-        layout onto the role's ``PoolView``.
+        the base manager declares only the layouts of its regions' roles. The
+        page-table builder copies the layout onto the role's ``PoolView``.
         """
-        return {}
+        layouts = {}
+        for region in self.region_layout.regions:
+            layouts.update(region.transfer.role_layouts)
+        return layouts
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         """Return local-only buffer roles excluded from disaggregation.
@@ -4427,9 +4451,12 @@ class KVCacheManagerV2(BaseResourceManager):
         Specialized managers may register storage-only buffers to satisfy
         physical pool layout constraints. Such buffers remain part of local
         slot copies, but contain no model state that needs to be transferred
-        between disaggregated workers.
+        between disaggregated workers. Declared regions add the roles their
+        receiving worker rebuilds.
         """
-        return frozenset()
+        return frozenset(
+            role for region in self.region_layout.regions for role in region.transfer.rebuilt_roles
+        )
 
     def get_disagg_pool_view_partition(
         self, layer_id: LayerId, role: DataRole

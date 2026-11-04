@@ -18,7 +18,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     AllocationUnit,
     HandOff,
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionLayout,
     RegionLifeCycle,
     RegionProvider,
+    RegionTransfer,
     lay_out_regions,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -283,8 +285,10 @@ def test_layout_resolves_a_region_to_its_layer_groups():
 @dataclass
 class _Provider:
     regions: list
+    calls: int = 0
 
     def declare_regions(self):
+        self.calls += 1
         return self.regions
 
 
@@ -350,3 +354,65 @@ def test_dropping_an_empty_layer_keeps_region_ownership_consistent():
     assert mgr.pp_layers == [10, 12]
     assert mgr.num_local_layers == 2
     assert mgr.region_layout.owners == {(0, RING): "ring", (1, KEY): "latent"}
+
+
+def test_regions_are_declared_before_the_layout():
+    provider = _Provider(_hybrid_regions())
+    mgr = _manager_stub([provider])
+
+    # The manager costs its memory budget between declaring and laying out the
+    # regions, so the declarations are readable before any buffer exists.
+    mgr._declare_regions()
+    assert [region.name for region in mgr.region_layout.regions] == ["state", "latent", "history"]
+    assert mgr.region_layout.owners == {}
+
+    mgr._lay_out_regions(_config(_base_layers(4)))
+
+    assert provider.calls == 1
+    assert mgr.region_layout.owner(0, CONV).name == "state"
+
+
+def test_manager_resolves_a_region_to_its_layer_groups():
+    mgr = _manager_stub([_Provider(_hybrid_regions())])
+    mgr._lay_out_regions(_config(_base_layers(4)))
+    mgr.impl = _Cache()
+
+    assert mgr.get_region_group_ids("history") == (2,)
+    assert mgr.get_region_group_ids("missing") == ()
+
+
+def test_transfer_declarations_reach_the_disagg_hooks():
+    ring_layout = RoleLayout(section_bytes=(16, 16))
+    regions = [
+        Region(
+            "state",
+            SLOT_WITH_SNAPSHOTS,
+            (RegionLayer(0, (Plane(SSM, 32), Plane(HISTORY, 8))),),
+            transfer=RegionTransfer(rebuilt_roles=frozenset({HISTORY})),
+        ),
+        Region(
+            "ring",
+            RING_OF_19,
+            (RegionLayer(1, (Plane(RING, 32),)),),
+            transfer=RegionTransfer(
+                mapper_kinds={RING: MapperKind.REPLICATED}, role_layouts={RING: ring_layout}
+            ),
+        ),
+    ]
+    with_regions = _manager_stub([_Provider(regions)])
+    with_regions._declare_regions()
+    without_regions = _manager_stub([])
+
+    assert with_regions.get_disagg_ignored_roles() == {HISTORY}
+    assert with_regions.get_disagg_role_layouts() == {RING: ring_layout}
+    assert with_regions.get_disagg_role_mapper_kinds() == {
+        Role.ALL: MapperKind.INDEXED,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+        RING: MapperKind.REPLICATED,
+    }
+    assert without_regions.get_disagg_ignored_roles() == frozenset()
+    assert without_regions.get_disagg_role_layouts() == {}
+    assert without_regions.get_disagg_role_mapper_kinds() == {
+        Role.ALL: MapperKind.INDEXED,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+    }

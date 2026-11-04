@@ -41,6 +41,7 @@ from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Mapping,
@@ -52,6 +53,7 @@ from typing import (
     runtime_checkable,
 )
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -180,6 +182,23 @@ class RegionLayer:
 
 
 @dataclass(frozen=True)
+class RegionTransfer:
+    """How a region's planes move between disaggregated workers.
+
+    Attributes:
+        mapper_kinds: Layout each transferred plane role is written in, which
+            decides how it is resharded across tensor-parallel ranks.
+        role_layouts: Resharding geometry of the roles whose mapper kind needs it.
+        rebuilt_roles: Roles never transferred; the receiving worker rebuilds
+            them from the transferred planes or starts them afresh.
+    """
+
+    mapper_kinds: Mapping[DataRole, MapperKind] = field(default_factory=dict)
+    role_layouts: Mapping[DataRole, RoleLayout] = field(default_factory=dict)
+    rebuilt_roles: FrozenSet[DataRole] = frozenset()
+
+
+@dataclass(frozen=True)
 class Region:
     """A unit of persistent state with one life cycle.
 
@@ -187,11 +206,13 @@ class Region:
         name: Identifies the region in the ownership map; unique per manager.
         life_cycle: When the region's memory is allocated, released and handed off.
         layers: The model layers the region covers, each with its planes.
+        transfer: How the region's planes move between disaggregated workers.
     """
 
     name: str
     life_cycle: RegionLifeCycle
     layers: Tuple[RegionLayer, ...]
+    transfer: RegionTransfer = field(default_factory=RegionTransfer)
 
     def __post_init__(self) -> None:
         model_layers = [layer.model_layer for layer in self.layers]
@@ -204,7 +225,11 @@ class RegionProvider(Protocol):
     """Model- or backend-side code that declares persistent-state regions."""
 
     def declare_regions(self) -> Sequence[Region]:
-        """Return this provider's regions; called once while the manager is built."""
+        """Return this provider's regions.
+
+        Called once while the manager is built, after its per-layer views
+        exist and before it costs its memory budget.
+        """
         ...
 
 
@@ -401,5 +426,6 @@ __all__ = [
     "RegionLayout",
     "RegionLifeCycle",
     "RegionProvider",
+    "RegionTransfer",
     "lay_out_regions",
 ]

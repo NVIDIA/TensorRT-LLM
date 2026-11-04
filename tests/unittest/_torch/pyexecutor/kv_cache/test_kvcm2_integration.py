@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -658,6 +659,107 @@ def test_zero_size_layers_are_removed_before_pool_allocation(
             assert torch.all(buffer[0] == global_layer_id)
     finally:
         manager.shutdown()
+
+
+def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
+    """A manager's built cache config and layer-based API, with pool addresses as (pool, offset)."""
+    impl = manager.impl
+    config = manager.kv_cache_manager_py_config
+    pools = {
+        int(pool.base_address): (int(group.pool_group_index), int(pool.pool_index))
+        for group in impl.pool_group_descs
+        for pool in group.pools
+    }
+
+    def pool_offset(address: int):
+        if address == 0:
+            return None
+        base = max(base for base in pools if base <= address)
+        return pools[base], address - base
+
+    return {
+        "layers": [
+            (
+                type(layer).__name__,
+                int(layer.layer_id),
+                [
+                    (str(buffer.role), buffer.size, buffer.coalescing_group, buffer.reuse_policy)
+                    for buffer in layer.buffers
+                ],
+                getattr(layer, "sliding_window_size", None),
+                layer.reuse_policy,
+            )
+            for layer in config.layers
+        ],
+        "commit_min_snapshot": config.commit_min_snapshot,
+        "max_live_kv_caches": config.max_live_kv_caches,
+        "initial_pool_ratio": config.initial_pool_ratio,
+        "pool_groups": [
+            (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))
+            for group in impl.pool_group_descs
+        ],
+        "layer_grouping": [[int(layer_id) for layer_id in group] for group in impl.layer_grouping],
+        "layer_group_ids": [
+            int(impl.get_layer_group_id(LayerId(layer_id)))
+            for layer_id in range(manager.num_local_layers)
+        ],
+        "layer_to_pool_mapping_dict": dict(manager.layer_to_pool_mapping_dict),
+        "pool_pointers": [
+            pool_offset(int(address))
+            for address in manager.kv_cache_pool_pointers.flatten().tolist()
+        ],
+        "pool_mapping": manager.kv_cache_pool_mapping.tolist(),
+        "index_scales": manager.index_scales.tolist(),
+        "block_offsets_shape": tuple(manager.host_kv_cache_block_offsets.shape),
+    }
+
+
+@pytest.mark.parametrize("enable_block_reuse", [False, True])
+def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reuse: bool) -> None:
+    """Without regions, the region hooks change neither the built cache nor the layer-based API."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    def build() -> KVCacheManagerV2:
+        return KVCacheManagerV2(
+            KvCacheConfig(
+                max_gpu_total_bytes=16 << 20,
+                host_cache_size=0,
+                enable_block_reuse=enable_block_reuse,
+                max_attention_window=[MAX_SEQ_LEN, 8],
+                pool_ratio=[0.5, 0.5],
+            ),
+            CacheType.SELF,
+            num_layers=4,
+            num_kv_heads=2,
+            head_dim=64,
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_seq_len=MAX_SEQ_LEN,
+            max_batch_size=2,
+            mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+            dtype=DataType.HALF,
+            vocab_size=16,
+        )
+
+    manager = build()
+    try:
+        assert manager.region_layout == RegionLayout()
+        assert manager.get_region_group_ids("recurrent_state") == ()
+        with_hooks = _layer_api_snapshot(manager)
+    finally:
+        manager.shutdown()
+    with monkeypatch.context() as patch:
+        patch.setattr(KVCacheManagerV2, "_declare_regions", lambda self: None)
+        patch.setattr(KVCacheManagerV2, "_lay_out_regions", lambda self, config: config)
+        manager = build()
+        try:
+            without_hooks = _layer_api_snapshot(manager)
+        finally:
+            manager.shutdown()
+
+    assert with_hooks == without_hooks
+    assert len(with_hooks["layer_grouping"]) == 2
 
 
 @pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])
