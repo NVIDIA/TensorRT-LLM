@@ -309,6 +309,7 @@ class TestSparkModel(unittest.TestCase):
         kv_cache_manager = _get_kv_cache_manager(
             dtype, config, tokens_per_block, max_seq_len, batch_size, num_blocks
         )
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
@@ -352,8 +353,6 @@ class TestSparkModel(unittest.TestCase):
         self.assertEqual(input_ids.shape, logits.shape[:-1])
         self.assertTrue(torch.isfinite(logits.float()).all())
 
-        kv_cache_manager.shutdown()
-
     @torch.no_grad()
     def test_spark_generation_multistep(self):
         """Incremental decode must match a single full-context replay."""
@@ -373,6 +372,7 @@ class TestSparkModel(unittest.TestCase):
         kv_cache_manager = _get_kv_cache_manager(
             dtype, config, tokens_per_block, max_seq_len, 1, num_blocks
         )
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests([0], [10])
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
 
@@ -408,13 +408,13 @@ class TestSparkModel(unittest.TestCase):
                     position_ids=torch.tensor([[step]], device=device),
                     attn_metadata=md,
                 )
-        kv_cache_manager.shutdown()
 
         # Pass 2: fresh identical model replays all 10 tokens as one context.
         model2, _, config2 = _build_tiny_model(backend, device, seed=0)
         kv_cache_manager2 = _get_kv_cache_manager(
             dtype, config2, tokens_per_block, max_seq_len, 1, num_blocks
         )
+        self.addCleanup(kv_cache_manager2.shutdown)
         kv_cache_manager2.add_dummy_requests([0], [10])
         with torch.inference_mode():
             md2 = metadata_cls(
@@ -436,7 +436,6 @@ class TestSparkModel(unittest.TestCase):
                 position_ids=torch.arange(10, device=device).unsqueeze(0),
                 attn_metadata=md2,
             )
-        kv_cache_manager2.shutdown()
 
         self._assert_most_elems_close(
             gen_logits, replay_logits[-1:], atol=0.1, rtol=0.1, max_failed_fraction=0.01
@@ -458,6 +457,7 @@ class TestSparkModel(unittest.TestCase):
         # last query position (16 - 1 - 8 = 7 tokens away)
 
         kv_cache_manager = _get_kv_cache_manager(dtype, config, 64, 1024, 1, 16)
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests([0], [seq_len])
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
@@ -499,8 +499,6 @@ class TestSparkModel(unittest.TestCase):
             # Sanity: the perturbed position itself does change for sliding.
             self.assertFalse(torch.allclose(base[0], perturbed[0]))
 
-        kv_cache_manager.shutdown()
-
     @torch.no_grad()
     def test_spark_gating_effect_in_forward(self):
         """sigmoid(+60) == 1.0 must match a bypassed gate; sigmoid(-60) ~ 0
@@ -511,6 +509,7 @@ class TestSparkModel(unittest.TestCase):
 
         input_ids = torch.tensor([100, 200, 30, 40], dtype=torch.int, device=device)
         kv_cache_manager = _get_kv_cache_manager(dtype, config, 64, 1024, 1, 16)
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests([0], [4])
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
         position_ids = torch.arange(4, device=device).unsqueeze(0)
@@ -560,8 +559,6 @@ class TestSparkModel(unittest.TestCase):
         # sigmoid(-60) ~ 0 -> attention output suppressed -> different logits.
         self.assertFalse(torch.allclose(logits_gate_closed, logits_bypass, atol=1e-3, rtol=1e-3))
         self.assertTrue(torch.isfinite(logits_gate_closed.float()).all())
-
-        kv_cache_manager.shutdown()
 
     @torch.no_grad()
     def test_spark_partial_rope_numerics(self):
@@ -887,6 +884,7 @@ class TestSparkHfAlignment(unittest.TestCase):
             mapping=mapping,
             dtype=scenario.kv_dtype,
         )
+        self.addCleanup(kv_cache_manager.shutdown)
         kv_cache_manager.add_dummy_requests([0], [8])
 
         metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
@@ -920,5 +918,3 @@ class TestSparkHfAlignment(unittest.TestCase):
             rtol=scenario.rtol,
             max_failed_fraction=scenario.max_failed_fraction,
         )
-
-        kv_cache_manager.shutdown()
