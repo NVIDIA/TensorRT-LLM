@@ -84,6 +84,8 @@ def _worker():
     w._ctx_v_buf = torch.full((num_slots, LAYERS, CAPACITY, 1, 1), -1.0, device="cuda")
     w._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
     w._ctx_len_host = [0] * num_slots
+    w._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+    w._ctx_base_host = [0] * num_slots
     w._free_slots = deque(range(MAX_BATCH))
     w._req_to_slot = {}
     w._req_ctx_pos = {}
@@ -156,6 +158,8 @@ def _prepare(worker, tracker, request_ids, num_generations):
         spec_resource_manager=tracker,
         _dflash_worker=worker,
         _batch_indices_buffer=_Buffer(),
+        host_position_ids=None,
+        seq_lens=None,
     )
     DFlashSpecMetadata.prepare(meta)
     torch.cuda.synchronize()
@@ -196,6 +200,7 @@ def test_follow_up_turn_takes_over_the_kept_slot():
     assert worker._req_to_slot[2] == slot
     assert slot not in worker._free_slots and slot not in worker._kept_slots
     assert worker._ctx_len_host[slot] == 13 and int(worker._ctx_len[slot]) == 13
+    assert worker._ctx_base_host[slot] == 0 and int(worker._ctx_base_pages[slot]) == 0
     assert _columns(worker, slot, 13) == [(t, p) for p, t in enumerate(second.tokens)]
     assert worker._prefix_hits == 1 and worker._prefix_misses == 0
 

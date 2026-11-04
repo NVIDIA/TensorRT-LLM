@@ -2747,6 +2747,8 @@ def _make_adp_request(
 
 
 class _StubADPExecutor:
+    _dspark_adp_shape_cache_enabled = PyExecutor._dspark_adp_shape_cache_enabled
+
     def __init__(
         self,
         *,
@@ -2789,7 +2791,11 @@ class _StubADPExecutor:
             else enable_non_overlap_adp_forward_intent
         )
         self.add_dummy_calls = []
-        self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
+        self.model_engine = Mock(
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            _dspark_confidence_enabled=False,
+        )
 
         self.dist = Mock()
         # Peers are modeled through peer_forward_intent; tp_size only tells the
@@ -4727,6 +4733,7 @@ def _make_stream_executor(requests):
     executor.perf_manager = MagicMock()
     executor.iter_counter = 1
     executor.stream_interval = 20
+    executor.first_content_emit_iters = 1
     executor.disable_overlap_scheduler = False
     executor.dist = types.SimpleNamespace(rank=0, world_size=1)
     executor.kv_cache_transceiver = None
