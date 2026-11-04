@@ -9,6 +9,8 @@ import pytest
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("helix_spec_tokens_valid", [False, True])
 def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: bool) -> None:
@@ -39,6 +41,7 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
         kv_only=True,
         kv_done_elsewhere=False,
         quant_scale_qkv=scale,
+        q_rope_applied=True,
     )
     TrtllmAttention.mla_rope_generation(
         attention,
@@ -56,4 +59,4 @@ def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: b
     if helix_spec_tokens_valid:
         helix_tensor_params.append(metadata.helix_local_slots)
     assert dispatch.call_args.args[11] == helix_tensor_params
-    assert dispatch.call_args.args[-7:] == tuple(controls.values())
+    assert dispatch.call_args.args[-len(controls) :] == tuple(controls.values())

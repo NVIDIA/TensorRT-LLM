@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
+    is_context_only_kv_cache,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative import get_draft_kv_cache_manager, get_num_extra_kv_tokens
@@ -29,6 +30,10 @@ from .config import DecoderRunnerConfig
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
+
+# Temperature-only params (no top-k / top-p / min-p, no seed) for the capture pass of the one-engine
+# temperature-only graph variant.
+TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS = SamplingParams(temperature=0.7)
 
 
 class DummyRequestFactory:
@@ -46,13 +51,11 @@ class DummyRequestFactory:
         self,
         *,
         config: DecoderRunnerConfig,
-        kv_cache_manager_key: ResourceManagerType,
         model: torch.nn.Module,
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         release_request_state: Callable[[int], None] | None,
     ) -> None:
         self._config = config
-        self.kv_cache_manager_key = kv_cache_manager_key
         self.model = model
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self._release_request_state = release_request_state
@@ -108,8 +111,12 @@ class DummyRequestFactory:
         least_requests: bool = True,
         chunk_alignment: int | None = None,
         chunk_aligned: bool = False,
+        num_context_requests: int | None = None,
     ) -> ScheduledRequests | None:
         """Creates a generic dummy ScheduledRequests object for warmup.
+
+        ``num_context_requests``, when set, splits the context tokens evenly
+        over that many requests instead of following ``least_requests``.
 
         ``chunk_alignment``, when set, rewrites the context lengths onto one
         side of it, so a kernel specializing on chunk alignment can be primed
@@ -117,10 +124,13 @@ class DummyRequestFactory:
         Only shrinks or drops sequences, so the block estimate below stays a
         safe over-estimate.
         """
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        if num_gen_requests and getattr(kv_cache_manager, "kda_context_only", False) is True:
-            # A disaggregated KDA context server keeps no draft-verify state,
-            # so generation shapes cannot run there.
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if num_gen_requests and is_context_only_kv_cache(kv_cache_manager):
+            # A disaggregated context server keeps no generation-only cache
+            # state (KDA draft-verify buffers, FP4 MLA V scales), so
+            # generation shapes cannot run there.
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -170,7 +180,16 @@ class DummyRequestFactory:
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
+            if num_context_requests is not None:
+                if not 0 < num_context_requests <= min(num_ctx_tokens, max_context_requests):
+                    return None
+                base_length, remainder = divmod(num_ctx_tokens, num_context_requests)
+                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
+                    num_context_requests - remainder
+                )
+                if ctx_token_nums[0] > max_seq_len:
+                    return None
+            elif least_requests:
                 num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
                 ctx_token_nums = [max_seq_len] * num_full_seqs
                 if remainder:
@@ -293,19 +312,25 @@ class DummyRequestFactory:
         force_non_greedy: bool = False,
         context_token_nums: Sequence[int] = (),
         context_request_kwargs: dict[str, Any] | None = None,
+        temperature_only: bool = False,
     ) -> ScheduledRequests | None:
         """Creates a dummy ScheduledRequests tailored for CUDA graph capture.
 
         With ``context_token_nums``, the first rows are context requests of
         those lengths, created with ``context_request_kwargs``; the rest are
-        generation requests.
+        generation requests. ``temperature_only`` (with ``force_non_greedy``)
+        gives the dummies temperature-only sampling params, for the capture
+        pass of the temperature-only variant.
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        if (
-            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-            or getattr(kv_cache_manager, "kda_context_only", False) is True
-        ):
+        if force_non_greedy and temperature_only:
+            capture_sampling_params = TEMPERATURE_ONLY_CAPTURE_SAMPLING_PARAMS
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        if getattr(
+            kv_cache_manager, "context_swa_layer_limit", None
+        ) is not None or is_context_only_kv_cache(kv_cache_manager):
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -407,7 +432,9 @@ class DummyRequestFactory:
         capture_sampling_params: SamplingParams | None,
     ) -> LlmRequest | None:
         """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -509,7 +536,9 @@ class DummyRequestFactory:
                 self._free_requests(requests, resource_manager)
 
     def _free_requests(self, requests: list[LlmRequest], resource_manager: ResourceManager) -> None:
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return
         draft_kv_cache_manager = get_draft_kv_cache_manager(

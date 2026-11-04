@@ -50,6 +50,22 @@ class WaitingQueue(ABC):
         pass
 
     @abstractmethod
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in pop order without removing them.
+
+        Implementations must not copy or sort the whole queue for a small ``k``.
+        """
+        pass
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """Admission group of each request from ``peek_requests``, numbered in pop order.
+
+        Out-of-order admission must finish a group before the next one. Default:
+        one group.
+        """
+        return [0] * len(requests)
+
+    @abstractmethod
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert a request that could not be scheduled.
 
@@ -71,6 +87,9 @@ class WaitingQueue(ABC):
         first after re-insertion (i.e. original queue order is preserved).
         """
         pass
+
+    def mark_admitted(self, requests: Iterable[RequestQueueItem]) -> None:
+        """Called with the popped requests that were admitted, not put back."""
 
     @abstractmethod
     def remove_by_ids(self, request_ids: set[int]) -> None:
@@ -127,6 +146,10 @@ class FCFSWaitingQueue(deque, WaitingQueue):
             raise IndexError("peek from an empty queue")
         return self[0]
 
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests from the front of the queue, O(k)."""
+        return list(itertools.islice(self, max(k, 0)))
+
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
         self.appendleft(request)
@@ -172,6 +195,7 @@ class PriorityWaitingQueue(WaitingQueue):
     Complexity:
         - add_request / add_requests: O(log n)
         - pop_request / peek_request: O(log n) / O(1)
+        - peek_requests(k): O(n log k), without copying or sorting the heap
         - remove_by_ids: O(n) rebuild + O(n) heapify
         - __iter__: O(n log n) over a sorted copy (priority order)
     """
@@ -222,6 +246,20 @@ class PriorityWaitingQueue(WaitingQueue):
             raise IndexError("peek from an empty queue")
         return self._heap[0][2]
 
+    def peek_requests(self, k: int) -> list[RequestQueueItem]:
+        """Return up to ``k`` requests in priority order without removing them."""
+        return [e[2] for e in heapq.nsmallest(max(k, 0), self._heap)]
+
+    def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
+        """One group per priority."""
+        groups = []
+        group = 0
+        for i, request in enumerate(requests):
+            if i and self._get_priority(request) != self._get_priority(requests[i - 1]):
+                group += 1
+            groups.append(group)
+        return groups
+
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Re-insert a request ahead of all normally-added requests of the same priority.
 
@@ -265,15 +303,26 @@ class PriorityWaitingQueue(WaitingQueue):
 
 def create_waiting_queue(
     policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+    gen_admission=None,
 ) -> WaitingQueue:
     """Create a waiting queue based on the specified policy.
 
     Args:
         policy: The scheduling policy to use.
+        gen_admission: Optional ``GenAdmissionConfig``; overrides ``policy`` when enabled.
 
     Returns:
         A WaitingQueue instance.
     """
+    if gen_admission is not None and gen_admission.enabled:
+        from .gen_admission_queue import GenAdmissionWaitingQueue
+
+        if policy != WaitingQueuePolicy.FCFS:
+            logger.warning(
+                f"[gen_admission] {gen_admission.describe()} overrides "
+                f"waiting_queue_policy={policy}; request priorities are ignored."
+            )
+        return GenAdmissionWaitingQueue(gen_admission)
     if policy == WaitingQueuePolicy.FCFS:
         return FCFSWaitingQueue()
     elif policy == WaitingQueuePolicy.PRIORITY:

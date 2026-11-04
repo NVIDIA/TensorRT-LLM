@@ -6,8 +6,13 @@ The attention op addresses a layer's K/V page as ``pool + (scale * slot + 2 *
 offset) * page`` and its NVFP4 block-scale page with the same block index in
 the scale pool. These tests build the managers a Qwen3.8-Flash-Next engine
 builds -- the 48-layer trunk (12 QSA layers among 36 recurrent ones) and the
-one-layer MTP draft manager -- and check that every view the manager serves is
+one-layer MTP draft manager -- on rank 0 of each tensor, expert and
+attention-data parallel layout, and check that every view the manager serves is
 where that formula lands, for bf16, fp8 and NVFP4 pools.
+
+With 2 KV heads of 256 dims, a 128-dim bf16 index-K page is the size of a K/V
+page for FP8 at one head per rank (TP2, TEP4) and for NVFP4 at two (TP1,
+attention DP), which V2 would coalesce into the K/V pool.
 """
 
 from types import SimpleNamespace
@@ -15,10 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.qsa import QSAMambaHybridCacheManagerV2
-from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import (
+from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     QSA_INDEX_POSITION,
     QSA_SIDE_PLANES,
+    Qwen4ExpHybridCacheManager,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
@@ -41,19 +46,40 @@ _KV_HEADS, _HEAD_DIM, _TPB = 2, 256, 32
 _INDEX_PAGE = 1 * 128 * 2 * _TPB
 _POSITION_PAGE = 3 * 4 * _TPB
 
+#: (tp_size, moe_ep_size, attention_dp) of each layout. TP1 and attention DP hold both
+#: KV heads per rank, TP2 and TEP4 one.
+_LAYOUTS = {
+    "tp1": (1, 1, False),
+    "tp2": (2, 1, False),
+    "tep4": (4, 4, False),
+    "adp2": (2, 1, True),
+    "adp4": (4, 4, True),
+}
+
+
+def _kv_heads_per_rank(layout: str) -> int:
+    """KV heads a rank holds; with more TP ranks than KV heads, each head is replicated."""
+    tp_size, _, attention_dp = _LAYOUTS[layout]
+    return _KV_HEADS if attention_dp else max(1, _KV_HEADS // tp_size)
+
 
 def _manager(
-    dtype: DataType, *, draft: bool, tp_size: int = 1, attention_dp: bool = False
-) -> QSAMambaHybridCacheManagerV2:
-    """The trunk or the separate MTP draft manager, as the engine builds them (rank 0 of
-    `tp_size`, with attention data parallelism when `attention_dp`)."""
+    dtype: DataType,
+    *,
+    draft: bool,
+    layout: str = "tp1",
+    ssm_dtype: torch.dtype = torch.float32,
+) -> Qwen4ExpHybridCacheManager:
+    """The trunk or the separate MTP draft manager, as the engine builds them on rank 0
+    of `layout`."""
+    tp_size, moe_ep_size, attention_dp = _LAYOUTS[layout]
     if draft:
         attention_mask = [False] * _TRUNK_LAYERS + [True]
         mamba_mask = [False] * (_TRUNK_LAYERS + 1)
     else:
         attention_mask = [layer in _QSA_LAYERS for layer in range(_TRUNK_LAYERS)]
         mamba_mask = [not attention for attention in attention_mask]
-    return QSAMambaHybridCacheManagerV2(
+    return Qwen4ExpHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,
@@ -62,7 +88,7 @@ def _manager(
         mamba_num_layers=sum(mamba_mask),
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.bfloat16,
-        mamba_ssm_cache_dtype=torch.float32,
+        mamba_ssm_cache_dtype=ssm_dtype,
         kv_cache_config=KvCacheConfig(max_tokens=4096, enable_block_reuse=False),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=sum(attention_mask),
@@ -75,6 +101,7 @@ def _manager(
             world_size=tp_size,
             rank=0,
             tp_size=tp_size,
+            moe_ep_size=moe_ep_size,
             pp_size=1,
             enable_attention_dp=attention_dp,
         ),
@@ -92,9 +119,9 @@ def _layers(draft: bool) -> list[int]:
     return [_DRAFT_LAYER] if draft else _QSA_LAYERS
 
 
-def _kv_page_bytes(dtype: DataType) -> int:
+def _kv_page_bytes(dtype: DataType, kv_heads: int) -> int:
     element_bits = {DataType.BF16: 16, DataType.FP8: 8, DataType.NVFP4: 4}[dtype]
-    return _KV_HEADS * _TPB * _HEAD_DIM * element_bits // 8
+    return kv_heads * _TPB * _HEAD_DIM * element_bits // 8
 
 
 def _thop_addresses(cm, layer: int, slot: int, page_bytes: int, plane: int) -> tuple[int, int]:
@@ -120,19 +147,23 @@ def _require_cuda():
     assert torch.cuda.is_available(), "the managers allocate their pools on the GPU"
 
 
+@pytest.mark.parametrize("layout", list(_LAYOUTS))
 @pytest.mark.parametrize("draft", [False, True], ids=["trunk", "draft"])
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
-def test_views_are_where_the_attention_op_addresses(dtype: DataType, draft: bool) -> None:
+def test_views_are_where_the_attention_op_addresses(
+    dtype: DataType, draft: bool, layout: str
+) -> None:
     """Every K/V (and NVFP4 block-scale) view of every QSA layer starts, at
     every checked slot, at the address the attention op computes for it."""
-    cm = _manager(dtype, draft=draft)
+    cm = _manager(dtype, draft=draft, layout=layout)
     try:
-        page = _kv_page_bytes(dtype)
+        kv_heads = _kv_heads_per_rank(layout)
+        page = _kv_page_bytes(dtype, kv_heads)
         for layer in _layers(draft):
             kv = cm.get_buffers(layer, kv_layout="HND")
             assert kv.shape[1:] == (
                 2,
-                _KV_HEADS,
+                kv_heads,
                 _TPB,
                 _HEAD_DIM // (2 if dtype == DataType.NVFP4 else 1),
             )
@@ -144,7 +175,7 @@ def test_views_are_where_the_attention_op_addresses(dtype: DataType, draft: bool
                 continue
             scales = cm.get_block_scale_buffers(layer, kv_layout="HND")
             assert scales.dtype == torch.uint8
-            assert scales.shape == (kv.shape[0], 2, _KV_HEADS, _TPB, _HEAD_DIM // 16)
+            assert scales.shape == (kv.shape[0], 2, kv_heads, _TPB, _HEAD_DIM // 16)
             for slot in _slots_to_check(scales):
                 key, value = _thop_addresses(cm, layer, slot, page // 8, plane=1)
                 assert scales[slot, 0].data_ptr() == key, (layer, slot)
@@ -153,14 +184,17 @@ def test_views_are_where_the_attention_op_addresses(dtype: DataType, draft: bool
         cm.shutdown()
 
 
+@pytest.mark.parametrize("layout", list(_LAYOUTS))
 @pytest.mark.parametrize("draft", [False, True], ids=["trunk", "draft"])
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
-def test_side_planes_pack_when_a_page_could_collide(dtype: DataType, draft: bool) -> None:
+def test_side_planes_pack_when_a_page_could_collide(
+    dtype: DataType, draft: bool, layout: str
+) -> None:
     """An index page could be a K/V page here -- FP8 at one KV head a rank (1 x 256 x 32
     tokens), NVFP4 at both -- so the index and position planes are packed into a buffer
     of their own instead of landing in the K/V pool, and under NVFP4 the K/V and
     block-scale pools hold the same number of pages per slot."""
-    cm = _manager(dtype, draft=draft)
+    cm = _manager(dtype, draft=draft, layout=layout)
     try:
         layers = _layers(draft)
         assert cm.qsa_side_planes_size == len(layers) * _INDEX_PAGE + _POSITION_PAGE
@@ -206,12 +240,20 @@ def test_bf16_keeps_per_layer_side_roles(draft: bool) -> None:
         cm.shutdown()
 
 
+@pytest.mark.parametrize(
+    "ssm_dtype",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["ssm_fp32", "ssm_fp16", "ssm_bf16"],
+)
+@pytest.mark.parametrize("layout", ["tp1", "tep4"])
 @pytest.mark.parametrize("draft", [False, True], ids=["trunk", "draft"])
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
-def test_side_and_main_views_do_not_alias(dtype: DataType, draft: bool) -> None:
+def test_side_and_main_views_do_not_alias(
+    dtype: DataType, draft: bool, layout: str, ssm_dtype: torch.dtype
+) -> None:
     """One slot written through every view reads back unchanged through each:
     no K/V, scale, index or position page overlaps another."""
-    cm = _manager(dtype, draft=draft)
+    cm = _manager(dtype, draft=draft, layout=layout, ssm_dtype=ssm_dtype)
     try:
         views = []
         for layer in _layers(draft):
@@ -243,22 +285,18 @@ def _logical_page(view: torch.Tensor) -> tuple:
     return tuple(page.shape), page.dtype, page.numel() * page.element_size(), page.is_contiguous()
 
 
-#: (tp_size, attention_dp): the layouts a disaggregated pair can mix over one global
-#: geometry (2 KV heads): TP1 and ADP2 hold both heads per rank, TP2 one.
-_LAYOUTS = {"tp1": (1, False), "tp2": (2, False), "adp2": (2, True)}
-
-
 @pytest.mark.parametrize("dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
 def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> None:
     """Disaggregated peers compare the replicated side roles each layer registers and copy
     their pages byte for byte, so roles, mapper kinds and every side view's page (shape,
     dtype, bytes) must not depend on how many KV heads a rank holds; where pages sit in
-    their pools may. At TP2 an FP8 K/V page (1 head x 256 x 32 tokens) is the size of an
-    index page; under NVFP4 the same holds at TP1 and ADP2 (2 heads x 128 bytes x 32
-    tokens). Both pack on every layout; bf16, which can never collide, on none."""
+    their pools may. At TP2 and TEP4 an FP8 K/V page (1 head x 256 x 32 tokens) is the
+    size of an index page; under NVFP4 the same holds at TP1 and attention DP (2 heads x
+    128 bytes x 32 tokens). Both pack on every layout; bf16, which can never collide, on
+    none."""
     seen = {}
-    for name, (tp_size, attention_dp) in _LAYOUTS.items():
-        cm = _manager(dtype, draft=False, tp_size=tp_size, attention_dp=attention_dp)
+    for name in _LAYOUTS:
+        cm = _manager(dtype, draft=False, layout=name)
         try:
             buffers = cm._extra_buffers_per_layer(tokens_per_block=_TPB)
             roles = {
@@ -273,8 +311,9 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
             seen[name] = (roles, logical, cm.get_disagg_role_mapper_kinds())
         finally:
             cm.shutdown()
-    assert seen["tp1"] == seen["tp2"] == seen["adp2"]
-    roles = {role for layer in seen["tp1"][0].values() for role, _ in layer}
+    first, *rest = seen.values()
+    assert all(other == first for other in rest)
+    roles = {role for layer in first[0].values() for role, _ in layer}
     if dtype == DataType.BF16:
         assert roles == {str(Role.INDEX_KEY), str(QSA_INDEX_POSITION)}
     else:

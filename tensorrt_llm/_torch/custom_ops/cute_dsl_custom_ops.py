@@ -6,6 +6,7 @@ import functools
 import itertools
 import math
 import os
+from dataclasses import replace
 from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
@@ -13,6 +14,7 @@ import torch
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_PLUS_SF_VEC_SIZE
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...math_utils import ceil_div, pad_up
@@ -698,6 +700,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass
     import cutlass.cute as cute
 
+    from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -735,7 +738,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                              reserved_sms: int) -> int:
         """Return the cached full-device occupancy for a cluster shape.
 
-        ``reserved_sms`` (``TRTLLM_CUTEDSL_SM_RESERVE``, applied inside
+        ``reserved_sms`` (``cute_dsl_utils.sm_reserve()``, applied inside
         ``HardwareInfo.get_max_active_clusters``) is part of the key so a
         reserve set after the first query is not hidden by the cache.
         """
@@ -750,6 +753,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_active = node_local if node_local is not None else max(
                 1, max_active // 2)
         return max_active
+
+    def _rubin_sf_dtype_key(sf_dtype: Type[cutlass.Numeric]) -> tuple[str, ...]:
+        """The part of a Rubin MoE runner's unique_id that names its scale dtype.
+
+        E4M3 (NVFP4) adds nothing, so NVFP4 keeps the AutoTuner cache keys it
+        had before the runners took ``sf_dtype``.
+        """
+        if sf_dtype is cutlass.Float8E4M3FN:
+            return ()
+        return (sf_dtype.__name__, )
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
@@ -5605,6 +5618,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
+                                   weight_scale: torch.Tensor) -> torch.Tensor:
+        """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
+
+        Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
+        BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
+        ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
+        Returns BF16 ``[M, N]``.
+        """
+        fp8_low_m.check_inputs(input, weight, weight_scale)
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+
+    @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
+    def _(input: torch.Tensor, weight: torch.Tensor,
+          weight_scale: torch.Tensor) -> torch.Tensor:
+        return input.new_empty((input.shape[0], weight.shape[0]),
+                               dtype=torch.bfloat16)
+
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
     # =============================================================================
@@ -9419,8 +9456,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @classmethod
         def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int):
-            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+                     max_decode_query_len: int, head_dim: int, split_k: int):
+            key = (q_dtype, num_heads, max_decode_query_len, head_dim, split_k)
             if key in cls.kernel_cache:
                 return
 
@@ -9467,7 +9504,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute_dtype,
                 num_heads,
                 max_decode_query_len,
-                cls.SPLIT_K,
+                split_k,
                 head_dim,
             )
             cls.kernel_cache[key] = cute.compile(
@@ -9492,8 +9529,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             score: torch.Tensor,
             max_decode_query_len: int,
+            split_k: int = SPLIT_K,
         ) -> None:
             """Score one decode step, compiling the kernel on first use.
+
+            ``split_k`` is the number of CTAs per request; each block is scored
+            by exactly one of them, so the scores do not depend on it.
 
             The compile allocates, so it must not land inside a CUDA graph
             capture. It does not: CUDAGraphRunner.capture runs eager warmup
@@ -9501,10 +9542,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             captures will replay.
             """
             _, num_heads, head_dim = idx_q.shape
-            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim,
+                   split_k)
             if key not in cls.kernel_cache:
                 cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
-                             head_dim)
+                             head_dim, split_k)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens)
 
@@ -9518,6 +9560,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         """Write per-block max index scores for one decode step, in place.
 
@@ -9536,6 +9579,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
+            split_k: CTAs per request (compile-time); each walks blocks
+                split, split + split_k, ... The scores do not depend on it.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9560,6 +9605,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
+            split_k,
         )
 
     @torch.library.register_fake(
@@ -9571,6 +9617,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        split_k: int = 256,
     ) -> None:
         return None
 
@@ -13796,6 +13843,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mixed_scheduler_mode_candidates: ClassVar[Tuple[str,
                                                             ...]] = ("static", )
             split_k_candidates: ClassVar[Tuple[int, ...]] = (1, 2, 4, 8)
+            # Whether an output_tensor without partition_id is a plain in-place
+            # GEMM. Otherwise a missing partition_id is rejected.
+            allow_unpartitioned_output: ClassVar[bool] = False
             tuning_config: ClassVar[TuningConfig]
 
             def __init__(self,
@@ -14200,7 +14250,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     0]
 
                 partition_id = kwargs.get("partition_id", -1)
-                locality_domain_half_gemm = output_tensor is not None
+                # A caller-owned output is a locality-domain half GEMM, except on
+                # runners that opt into plain in-place output without a partition.
+                locality_domain_half_gemm = output_tensor is not None and (
+                    partition_id >= 0
+                    or not self.__class__.allow_unpartitioned_output)
                 if locality_domain_half_gemm:
                     if partition_id < 0 or partition_id >= 2:
                         raise ValueError(
@@ -14215,6 +14269,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # Kernel writes with strided layout (row stride = full width).
                     c_tensor = output_tensor[:, partition_id *
                                              n:(partition_id + 1) * n]
+                elif output_tensor is not None:
+                    if output_tensor.dim() != 2:
+                        raise ValueError("output_tensor must be 2-D")
+                    if output_tensor.dtype != self.output_dtype:
+                        raise ValueError(
+                            f"output_tensor must have dtype {self.output_dtype}, "
+                            f"got {output_tensor.dtype}")
+                    if output_tensor.shape != (m, n):
+                        raise ValueError(
+                            f"output_tensor must have shape {(m, n)}, got "
+                            f"{tuple(output_tensor.shape)}")
+                    if not output_tensor.is_contiguous():
+                        raise ValueError("output_tensor must be contiguous")
+                    c_tensor = output_tensor
                 else:
                     # Allocate output tensor from UserBuffers or regular CUDA memory
                     if self.to_userbuffers:
@@ -14586,6 +14654,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_cuda_graph=True,
             )
 
+        class CuteDSLMXFP8InplaceRubinLinear(CuteDSLMXFP8RubinLinear):
+            """SM107 MXFP8 runner that writes into a caller-owned output.
+
+            Shares the parent's compiled kernels (the plain in-place output has
+            the same leading dimension) and tuning config; only the output M
+            follows the input M.
+            """
+
+            allow_unpartitioned_output = True
+            tuning_config = replace(
+                CuteDSLMXFP8RubinLinear.tuning_config,
+                constraint_specs=(
+                    *CuteDSLMXFP8RubinLinear.tuning_config.constraint_specs,
+                    ConstraintSpec(5, 0, infer_output_m_shape)),
+            )
+
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
             kernel_cache = dict()
             tuning_config = TuningConfig(
@@ -14658,6 +14742,283 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
 
         @torch.library.custom_op(
+            "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
+            mutates_args=("output_tensor", ),
+            device_types="cuda",
+        )
+        def cute_dsl_mxfp8_gemm_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_tensor: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            """Run the SM107 dense MXFP8 GEMM directly into output_tensor."""
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
+                    f"{output_dtype}")
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL MXFP8 SM107 GEMM requires SM107, got SM{sm_version}."
+                )
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "CuteDSL MXFP8 input and weight must be FP8 E4M3")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
+            if output_tensor.shape != (input.shape[0], weight.shape[0]):
+                raise ValueError(
+                    "CuteDSL MXFP8 output shape must be [M, N], got "
+                    f"{tuple(output_tensor.shape)}")
+            if output_tensor.dtype != output_dtype:
+                raise ValueError(
+                    f"CuteDSL MXFP8 output must have dtype {output_dtype}, got "
+                    f"{output_tensor.dtype}")
+            if not output_tensor.is_contiguous():
+                raise ValueError("CuteDSL MXFP8 output must be contiguous")
+
+            alpha = _get_mxfp8_gemm_alpha(input.device)
+            runner = CuteDSLMXFP8InplaceRubinLinear(output_dtype=output_dtype,
+                                                    use_tvm_ffi=use_tvm_ffi)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output_tensor
+            ]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_tensor: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            return None
+
+        _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS = (32, 128, 192, 256)
+        _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET = 16384
+        _DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX = 5
+        _DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX = 6
+        _DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX = 7
+        # Positions come from position_ids, so the batch metadata is only
+        # staged into shared memory and does not steer tactic choice. Tune
+        # with one sequence and keep the batch size out of the cache key.
+        _DSV4_QB_FUSION_TUNING_BATCH_SIZE = 1
+
+        def _gen_dsv4_qb_fusion_tuning_buckets(
+                max_num_tokens: int) -> Tuple[int, ...]:
+            buckets = _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS
+            if max_num_tokens >= _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET:
+                buckets += (_DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET, )
+            return buckets
+
+        def _map_dsv4_qb_fusion_tuning_bucket(num_tokens: int) -> int:
+            for bucket in _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS:
+                if num_tokens <= bucket:
+                    return bucket
+            if num_tokens < _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET:
+                return _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS[-1]
+            return _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET
+
+        def _prepare_dsv4_qb_fusion_tuning_inputs(
+                inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            # Resized integer tensors are otherwise filled with arbitrary
+            # values. Keep every tuning row inside the RoPE cache, and give
+            # the single tuning sequence all M rows.
+            position_ids = inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX] = torch.zeros_like(
+                position_ids)
+            num_tokens = inputs[0].shape[0]
+            cu_q_seqlens = inputs[_DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX] = torch.tensor(
+                [0, num_tokens],
+                dtype=cu_q_seqlens.dtype,
+                device=cu_q_seqlens.device)
+            kv_cache_lengths = inputs[
+                _DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX] = torch.full(
+                (_DSV4_QB_FUSION_TUNING_BATCH_SIZE, ),
+                num_tokens,
+                dtype=kv_cache_lengths.dtype,
+                device=kv_cache_lengths.device)
+            return inputs
+
+        class CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner(TunableRunner):
+            """Tune the SM107 q_b GEMM, RMSNorm, RoPE, and FP8 fusion."""
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0,
+                    0,
+                    _gen_dsv4_qb_fusion_tuning_buckets,
+                    _map_dsv4_qb_fusion_tuning_bucket,
+                ), ),
+                constraint_specs=(
+                    ConstraintSpec(2, 0, mxfp8_scale_infer_shape),
+                    ConstraintSpec(
+                        _DSV4_QB_FUSION_CU_Q_SEQLENS_INPUT_INDEX, 0,
+                        lambda _: _DSV4_QB_FUSION_TUNING_BATCH_SIZE + 1),
+                    ConstraintSpec(_DSV4_QB_FUSION_KV_CACHE_LENGTHS_INPUT_INDEX,
+                                   0,
+                                   lambda _: _DSV4_QB_FUSION_TUNING_BATCH_SIZE),
+                    ConstraintSpec(_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX, 0,
+                                   infer_output_m_shape),
+                ),
+                inputs_pre_hook=_prepare_dsv4_qb_fusion_tuning_inputs,
+                # Do not let the generic tuner append the actual warmup M:
+                # runtime maps every 257..16383 shape back to the 256 bucket,
+                # so profiling that large output cannot affect dispatch.
+                tune_max_num_tokens=_DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS[-1],
+                use_cold_l2_cache=True,
+                use_cuda_graph=True,
+                # CuTe modules are cached in process, so every rank must tune
+                # and compile its selected tactic during warmup.
+                exclude_from_cache=True,
+                distributed_tuning_strategy=(
+                    DistributedTuningStrategy.INDEPENDENT),
+            )
+
+            large_m_tuning_config = replace(
+                tuning_config,
+                tune_max_num_tokens=_DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET)
+
+            # (name, mma_inst_tile, cluster_shape_mn, fallback_cluster_shape_mn,
+            #  store_mode, swizzle_size, raster_along_m, tma_prefetch_dist)
+            _tactics = (
+                (
+                    "1cta_cluster_1x1",
+                    (128, 256),
+                    (1, 1),
+                    None,
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+                (
+                    "2cta_cluster_2x2_fallback_2x1",
+                    (256, 256),
+                    (2, 2),
+                    (2, 1),
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+                (
+                    "2cta_cluster_2x1",
+                    (256, 256),
+                    (2, 1),
+                    None,
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+            )
+
+            def unique_id(self):
+                return ()
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple]:
+                if get_sm_version() != 107:
+                    return []
+                # M buckets define profiling shapes, not fixed dispatch rules.
+                # Let the autotuner compare every registered configuration.
+                return list(self.__class__._tactics)
+
+            @classmethod
+            def _fallback_tactic(cls, num_tokens: int) -> Tuple:
+                """Use a correctness fallback when autotuning is unavailable."""
+                return cls._tactics[0]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+                eps: float,
+            ) -> torch.Tensor:
+                (
+                    input,
+                    weight,
+                    input_scale,
+                    weight_scale,
+                    cos_sin_cache,
+                    cu_q_seqlens,
+                    kv_cache_lengths,
+                    position_ids,
+                    quant_scale_qkv,
+                ) = inputs
+                if tactic == -1:
+                    tactic = self._fallback_tactic(input.shape[0])
+                (
+                    _,
+                    mma_inst_tile,
+                    cluster_shape_mn,
+                    fallback_cluster_shape_mn,
+                    store_mode,
+                    swizzle_size,
+                    raster_along_m,
+                    tma_prefetch_dist,
+                ) = tactic
+
+                output = input.new_empty((input.shape[0], weight.shape[0]),
+                                         dtype=torch.float8_e4m3fn)
+                compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+                    mma_inst_tile=mma_inst_tile,
+                    cluster_shape_mn=cluster_shape_mn,
+                    fallback_cluster_shape_mn=fallback_cluster_shape_mn,
+                    store_mode=store_mode,
+                    swizzle_size=swizzle_size,
+                    raster_along_m=raster_along_m,
+                    with_quant_scale=True,
+                    tma_prefetch_dist=tma_prefetch_dist,
+                )
+
+                from cutlass.cute.runtime import from_dlpack
+
+                def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
+                    return from_dlpack(tensor,
+                                       assumed_align=alignment,
+                                       enable_tvm_ffi=True)
+
+                compiled(
+                    _from_dlpack(input),
+                    _from_dlpack(
+                        input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                    _from_dlpack(weight),
+                    _from_dlpack(
+                        weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                    _from_dlpack(output, 32),
+                    _from_dlpack(cos_sin_cache.reshape(1, -1)),
+                    _from_dlpack(cu_q_seqlens, 4),
+                    _from_dlpack(kv_cache_lengths, 4),
+                    _from_dlpack(position_ids.reshape(-1), 4),
+                    _from_dlpack(quant_scale_qkv.reshape(-1), 4),
+                    eps,
+                    cuda.CUstream(
+                        torch.cuda.current_stream(input.device).cuda_stream),
+                )
+                return output
+
+        @torch.library.custom_op(
             "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
             mutates_args=(),
             device_types="cuda",
@@ -14724,43 +15085,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     "quant_scale_qkv must be a non-empty FP32 tensor")
 
-            output = input.new_empty((input.shape[0], weight.shape[0]),
-                                     dtype=torch.float8_e4m3fn)
-            compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
-                mma_inst_tile=(256, 256),
-                cluster_shape_mn=(4, 2),
-                fallback_cluster_shape_mn=(2, 1),
-                store_mode="stg256",
-                swizzle_size=1,
-                raster_along_m=True,
-                with_quant_scale=True,
+            runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+            inputs = [
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                cos_sin_cache,
+                cu_q_seqlens,
+                kv_cache_lengths,
+                position_ids,
+                quant_scale_qkv,
+            ]
+            tuning_config = (runner.__class__.large_m_tuning_config
+                             if input.shape[0]
+                             >= _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET else
+                             runner.__class__.tuning_config)
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
+                [runner],
+                tuning_config,
+                inputs,
+                eps=eps,
             )
-
-            from cutlass.cute.runtime import from_dlpack
-
-            def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
-                return from_dlpack(tensor,
-                                   assumed_align=alignment,
-                                   enable_tvm_ffi=True)
-
-            compiled(
-                _from_dlpack(input),
-                _from_dlpack(
-                    input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
-                _from_dlpack(weight),
-                _from_dlpack(
-                    weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
-                _from_dlpack(output, 32),
-                _from_dlpack(cos_sin_cache.reshape(1, -1)),
-                _from_dlpack(cu_q_seqlens, 4),
-                _from_dlpack(kv_cache_lengths, 4),
-                _from_dlpack(position_ids.reshape(-1), 4),
-                _from_dlpack(quant_scale_qkv.reshape(-1), 4),
-                eps,
-                cuda.CUstream(
-                    torch.cuda.current_stream(input.device).cuda_stream),
-            )
-            return output
+            return runner(inputs, tactic=best_tactic, eps=eps)
 
         @torch.library.register_fake(
             "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant")
@@ -15444,17 +15792,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuning_config_cache = dict()
 
             def __init__(
-                self,
-                num_experts: int,
-                top_k: int,
-                num_local_experts: int,
-                local_expert_offset: int,
-                tile_size: int,
-                scaling_vector_size: int = 16,
-                activation_type: ActivationType = ActivationType.Swiglu,
-                situ_beta: Optional[float] = None,
-                situ_linear_beta: Optional[float] = None,
-                swiglu_limit_scalar: float = float("inf")):
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    scaling_vector_size: int = 16,
+                    activation_type: ActivationType = ActivationType.Swiglu,
+                    situ_beta: Optional[float] = None,
+                    situ_linear_beta: Optional[float] = None,
+                    swiglu_limit_scalar: float = float("inf"),
+                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -15462,6 +15811,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.local_expert_offset = local_expert_offset
                 self.tile_size = tile_size
                 self.scaling_vector_size = scaling_vector_size
+                # Block-scale format of A, B and the FP4 output: UE4M3 for
+                # NVFP4, UE5M3 for NVFP4_PLUS.
+                self.sf_dtype = sf_dtype
                 self.activation_type = validate_rubin_activation_type(
                     activation_type)
                 self.situ_beta = situ_beta
@@ -15495,7 +15847,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.situ_beta,
                     self.situ_linear_beta,
                     self.swiglu_limit,
-                )
+                ) + _rubin_sf_dtype_key(self.sf_dtype)
 
             def get_valid_tactics(
                 self,
@@ -15591,7 +15943,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float4E2M1FN,
                             b_dtype=cutlass.Float4E2M1FN,
-                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_dtype=self.sf_dtype,
                             sf_vec_size=self.scaling_vector_size,
                             c_dtype=cutlass.Float4E2M1FN,
                             mma_inst_shape=mma_inst_shape,
@@ -15739,11 +16091,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  b.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                a_sf_ptr = make_ptr(self.sf_dtype,
                                     a_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
-                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                b_sf_ptr = make_ptr(self.sf_dtype,
                                     b_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -15767,7 +16119,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  c.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                c_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                c_sf_ptr = make_ptr(self.sf_dtype,
                                     c_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -15793,9 +16145,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 max_active_clusters = get_max_activate_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
-                cache_key = (self.scaling_vector_size, self.tile_size,
-                             self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, raster_along_m,
+                cache_key = (self.scaling_vector_size, self.sf_dtype,
+                             self.tile_size, self.top_k, mma_tiler,
+                             mma_inst_shape, cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
                              self.situ_linear_beta, self.swiglu_limit,
@@ -15896,6 +16248,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             swiglu_limit_scalar: float,
             precomputed_tactic: Optional[str],
             tuner_key: str,
+            sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN,
         ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
             tuner = AutoTuner.get()
             if output_tensor is not None or output_sf_tensor is not None:
@@ -15924,6 +16277,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 situ_linear_beta=_canonicalize_situ_beta(situ_linear_beta),
                 swiglu_limit_scalar=_canonicalize_swiglu_limit_scalar(
                     swiglu_limit_scalar),
+                sf_dtype=sf_dtype,
             )
             inputs = [
                 input, weight, input_scale, weight_scale, alpha,
@@ -16046,6 +16400,105 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  dtype=input.dtype,
                                  device=input.device)
             output_scale = torch.empty(m * interm_size // scaling_vector_size,
+                                       dtype=input_scale.dtype,
+                                       device=input_scale.device)
+            return output, output_scale
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin",
+            mutates_args=(),
+            device_types="cuda")
+        def cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """NVFP4_PLUS FC1: E2M1 operands with one UE5M3 scale per 32 values.
+
+            ``input_scale`` is row-major [orig_m, K / 32]; ``weight_scale`` and
+            the returned output scales use the 128x4 swizzled layout.
+            NVFP4_PLUS has no global scale, so ``alpha`` (per expert) and
+            ``global_sf`` (the FC2 input normalization) are ones.
+            """
+            return _run_nvfp4_gather_grouped_gemm_act_fusion_rubin(
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                alpha,
+                tile_idx_to_group_idx,
+                tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx,
+                num_non_exiting_tiles,
+                global_sf,
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                None,
+                None,
+                NVFP4_PLUS_SF_VEC_SIZE,
+                -1,
+                ActivationType(activation_type),
+                situ_beta,
+                situ_linear_beta,
+                swiglu_limit_scalar,
+                precomputed_tactic,
+                "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin",
+                sf_dtype=cutlass.FloatNV8E5M3FNU)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_plus_gather_grouped_gemm_act_fusion_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            global_sf: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            activation_type: int = int(ActivationType.Swiglu),
+            situ_beta: float = SITU_BETA_DISABLED,
+            situ_linear_beta: float = SITU_BETA_DISABLED,
+            swiglu_limit_scalar: float = SWIGLU_LIMIT_SCALAR_DISABLED,
+            precomputed_tactic: Optional[str] = None,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            m = permuted_idx_to_expanded_idx.size(0)
+            n = weight.size(1)
+            is_gated = is_gated_activation(ActivationType(activation_type))
+            interm_size = n // 2 if is_gated else n
+            output = torch.empty(m,
+                                 interm_size // 2,
+                                 dtype=input.dtype,
+                                 device=input.device)
+            output_scale = torch.empty(m * interm_size //
+                                       NVFP4_PLUS_SF_VEC_SIZE,
                                        dtype=input_scale.dtype,
                                        device=input_scale.device)
             return output, output_scale
@@ -16844,14 +17297,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             kernel_cache = dict()
             tuning_config_cache = dict()
 
-            def __init__(self,
-                         num_experts: int,
-                         top_k: int,
-                         num_local_experts: int,
-                         local_expert_offset: int,
-                         tile_size: int,
-                         output_dtype: torch.dtype,
-                         scaling_vector_size: int = 16):
+            def __init__(
+                    self,
+                    num_experts: int,
+                    top_k: int,
+                    num_local_experts: int,
+                    local_expert_offset: int,
+                    tile_size: int,
+                    output_dtype: torch.dtype,
+                    scaling_vector_size: int = 16,
+                    sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN):
                 super().__init__()
                 self.num_experts = num_experts
                 self.top_k = top_k
@@ -16862,6 +17317,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert output_dtype == torch.bfloat16
                 self.output_dtype = output_dtype
                 self.scaling_vector_size = scaling_vector_size
+                # Block-scale format of A and B: UE4M3 for NVFP4, UE5M3 for
+                # NVFP4_PLUS.
+                self.sf_dtype = sf_dtype
 
                 if (sm_version := get_sm_version()) != 107:
                     raise ValueError(
@@ -16882,7 +17340,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
-                )
+                ) + _rubin_sf_dtype_key(self.sf_dtype)
 
             @staticmethod
             def _is_n_tiling_compatible(n: int, mma_n: int,
@@ -16951,7 +17409,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     if self.__class__.kernel_class.can_implement(
                             a_dtype=cutlass.Float4E2M1FN,
                             b_dtype=cutlass.Float4E2M1FN,
-                            sf_dtype=cutlass.Float8E4M3FN,
+                            sf_dtype=self.sf_dtype,
                             sf_vec_size=self.scaling_vector_size,
                             c_dtype=cutlass.BFloat16,
                             mma_inst_shape=mma_inst_shape,
@@ -16986,7 +17444,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             0, 0, helper.gen_tuning_buckets,
                             helper.map_to_tuning_buckets), ),
                         constraint_specs=(
-                            ConstraintSpec(2, 0, fp4_scale_infer_shape),
+                            ConstraintSpec(
+                                2, 0,
+                                functools.partial(
+                                    fp4_scale_infer_shape,
+                                    sf_vec_size=self.scaling_vector_size)),
                             ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
@@ -17082,11 +17544,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                  b.data_ptr(),
                                  cute.AddressSpace.gmem,
                                  assumed_align=32)
-                a_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                a_sf_ptr = make_ptr(self.sf_dtype,
                                     a_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
-                b_sf_ptr = make_ptr(cutlass.Float8E4M3FN,
+                b_sf_ptr = make_ptr(self.sf_dtype,
                                     b_sf.data_ptr(),
                                     cute.AddressSpace.gmem,
                                     assumed_align=16)
@@ -17121,9 +17583,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 max_active_clusters = get_max_activate_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
-                cache_key = (self.scaling_vector_size, self.tile_size,
-                             self.top_k, mma_tiler, mma_inst_shape,
-                             cluster_shape_mn, raster_along_m,
+                cache_key = (self.scaling_vector_size, self.sf_dtype,
+                             self.tile_size, self.top_k, mma_tiler,
+                             mma_inst_shape, cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, max_active_clusters)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
@@ -17309,6 +17771,89 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tile_size: int,
             output_dtype: torch.dtype,
             scaling_vector_size: int = 16,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            return
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin",
+            mutates_args=("output", ),
+            device_types="cuda")
+        def cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
+            precomputed_tactic: Optional[str] = None,
+        ) -> None:
+            """NVFP4_PLUS FC2 + finalize: UE5M3 scales per 32 values, both swizzled 128x4.
+
+            ``alpha`` is ones, because NVFP4_PLUS has no global scale.
+            """
+            tuner = AutoTuner.get()
+
+            runner = Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner(
+                num_experts,
+                top_k,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                output_dtype,
+                NVFP4_PLUS_SF_VEC_SIZE,
+                sf_dtype=cutlass.FloatNV8E5M3FNU)
+
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output,
+                tile_idx_to_group_idx, tile_idx_to_mn_limit,
+                permuted_idx_to_expanded_idx, num_non_exiting_tiles,
+                token_final_scales
+            ]
+
+            if precomputed_tactic is None:
+                _, best_tactic = tuner.choose_one(
+                    "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin",
+                    [runner],
+                    runner.get_tuning_config(),
+                    inputs,
+                )
+            else:
+                best_tactic = ast.literal_eval(precomputed_tactic)
+
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_nvfp4_plus_grouped_gemm_finalize_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            alpha: torch.Tensor,
+            output: torch.Tensor,
+            tile_idx_to_group_idx: torch.Tensor,
+            tile_idx_to_mn_limit: torch.Tensor,
+            permuted_idx_to_expanded_idx: torch.Tensor,
+            num_non_exiting_tiles: torch.Tensor,
+            token_final_scales: torch.Tensor,
+            num_experts: int,
+            top_k: int,
+            num_local_experts: int,
+            local_expert_offset: int,
+            tile_size: int,
+            output_dtype: torch.dtype,
             precomputed_tactic: Optional[str] = None,
         ) -> None:
             return

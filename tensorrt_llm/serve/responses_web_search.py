@@ -28,6 +28,7 @@ implementation for comes back as "unsupported call".
 """
 
 import json
+import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 from openai.types.responses.response_function_web_search import (
@@ -62,9 +63,24 @@ _WEB_SEARCH_TYPE_PREFIX = "web_search"
 
 _QUERY_ARG = "query"
 
+# What the endpoint does with a web_search tool it cannot honour (see
+# web_search_rejection_reason): "ignore", the default, serves the request
+# without offering the tool to the model; "reject" answers it with a 400, for
+# deployments whose clients drop the tool and retry. An unknown value rejects.
+WEB_SEARCH_UNAVAILABLE_ENV = "TRTLLM_WEB_SEARCH_UNAVAILABLE"
+_UNAVAILABLE_POLICIES = ("reject", "ignore")
+
+
+def _tool_field(tool: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a tool that may be an object or a plain dict."""
+    value = getattr(tool, name, None)
+    if value is None and isinstance(tool, dict):
+        value = tool.get(name)
+    return default if value is None else value
+
 
 def is_web_search_tool(tool: Any) -> bool:
-    tool_type = getattr(tool, "type", None)
+    tool_type = _tool_field(tool, "type")
     return bool(tool_type) and str(tool_type).startswith(_WEB_SEARCH_TYPE_PREFIX)
 
 
@@ -73,13 +89,13 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
     for tool in tools or []:
         if not is_web_search_tool(tool):
             continue
-        filters = getattr(tool, "filters", None)
-        allowed = getattr(filters, "allowed_domains", None) if filters else None
-        blocked = getattr(filters, "blocked_domains", None) if filters else None
+        filters = _tool_field(tool, "filters")
+        allowed = _tool_field(filters, "allowed_domains") if filters else None
+        blocked = _tool_field(filters, "blocked_domains") if filters else None
         return WebSearchToolSpec(
-            name=getattr(tool, "name", None) or WEB_SEARCH_PUBLIC_NAME,
-            type=str(getattr(tool, "type", "")) or None,
-            max_uses=getattr(tool, "max_uses", None),
+            name=_tool_field(tool, "name") or WEB_SEARCH_PUBLIC_NAME,
+            type=str(_tool_field(tool, "type", "")) or None,
+            max_uses=_tool_field(tool, "max_uses"),
             allowed_domains=tuple(allowed or ()),
             blocked_domains=tuple(blocked or ()),
         )
@@ -87,26 +103,68 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
 
 
 def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]:
-    """Why this request's web_search tool cannot be honoured, or None.
+    """The reason to reject this request's web_search tool, or None.
 
     web_search is a server tool: the client hands over the definition and
     expects this server to run the query and fold the results into the same
     response. When that cannot happen, answering anyway is the one outcome the
     client cannot detect - it receives a normal answer and has no way to know
     the model never searched. Rejecting is recoverable (drop the tool and
-    retry); a silently unsearched answer is not.
+    retry); a silently unsearched answer is not. Yet clients that attach the
+    tool to every request never drop it, and a rejection would make the server
+    unusable for them. So by default the reason is only logged, once, the
+    request is served and the model is not offered the tool;
+    ``TRTLLM_WEB_SEARCH_UNAVAILABLE=reject`` returns the reason, for a 400.
     """
-    if web_search_tool_spec(tools) is None:
+    spec = web_search_tool_spec(tools)
+    if spec is None:
         return None
+    tool = next(tool for tool in tools if is_web_search_tool(tool))
+    external = _tool_field(tool, "external_web_access")
+    # A client that turns external access off is not waiting on live results
+    # (Codex attaches the tool that way to models without search).
+    if external is False:
+        return None
+    seen = f" (tool type {spec.type!r}, external_web_access={external!r})"
     if load_web_search_config().enabled:
         # A provider is configured, so the operator does expect live search,
         # but the per-request search loop is not wired into this endpoint yet -
         # the pieces live here and in web_search.py without a driver.
-        return (
+        reason = (
             "a provider is configured but the per-request search loop is "
-            "not wired into this endpoint yet"
+            f"not wired into this endpoint yet{seen}"
         )
-    return "no web search provider is configured on this server"
+    else:
+        reason = f"no web search provider is configured on this server{seen}"
+    if _unavailable_policy() == "ignore":
+        # Such requests are answered without searching. The tool is not
+        # offered to the model (see _get_chat_completion_function_tools in
+        # responses_utils.py).
+        logger.warning_once(
+            f"Responses web_search cannot be honoured: {reason}. Serving such "
+            "requests without offering the tool to the model; set "
+            f"{WEB_SEARCH_UNAVAILABLE_ENV}=reject to answer them with a 400.",
+            key="responses_web_search_unavailable_ignored",
+        )
+        return None
+    return reason
+
+
+def _unavailable_policy() -> str:
+    """The ``TRTLLM_WEB_SEARCH_UNAVAILABLE`` policy.
+
+    Unset or blank reads as "ignore"; an unknown value reads as "reject".
+    """
+    value = (os.environ.get(WEB_SEARCH_UNAVAILABLE_ENV) or "").strip().lower() or "ignore"
+    if value in _UNAVAILABLE_POLICIES:
+        return value
+    logger.warning_once(
+        f"{WEB_SEARCH_UNAVAILABLE_ENV}={value!r} is not one of "
+        f"{', '.join(_UNAVAILABLE_POLICIES)}; rejecting web_search tools this "
+        "server cannot honour.",
+        key="responses_web_search_unavailable_unknown",
+    )
+    return "reject"
 
 
 def server_executes_web_search(tools: Optional[Sequence[Any]]) -> bool:
