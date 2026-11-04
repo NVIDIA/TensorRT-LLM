@@ -99,6 +99,19 @@ def _canonicalize_situ_beta(situ_beta: float) -> Optional[float]:
 # phase (the claim overhead outweighs the locality gain at a few rows).
 FC12_DIE_CLAIM_MIN_TOKENS = 24
 
+
+@functools.cache
+def _fc12_sm_domain_words(device_index: int) -> tuple:
+    """The fused FC12 kernel's per-SM locality-domain words on this device (see
+    ``pack_sm_domain_words``); empty without locality domains."""
+    if not is_locality_domain_enabled():
+        return ()
+    from ..locality_domain.placement import sm_locality_domains
+    from ..moe.kernels.rubin.rubin_small_batch_fused_moe import \
+        pack_sm_domain_words
+    return pack_sm_domain_words(sm_locality_domains(device_index))
+
+
 _KIMI_K3_MXFP8_TUNING_BUCKETS = (1, 2, 4, 8, *range(16, 193, 16))
 
 # Both dense MXFP8 wrappers pass a scalar one to the CuTe kernel. Keep one
@@ -19447,17 +19460,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                       device=fc1_sfa.device)
                 # Per-domain claiming (``die_major``): one scheduler counter per
                 # locality domain and phase.
-                die_claim = (self.die_major
-                             and tuple(cluster_shape_mn) == (1, 1)
-                             and num_tokens >= FC12_DIE_CLAIM_MIN_TOKENS
-                             and is_locality_domain_enabled())
                 sm_domain_words = ()
-                if die_claim:
-                    from ..locality_domain.placement import sm_locality_domains
-                    from ..moe.kernels.rubin.rubin_small_batch_fused_moe import \
-                        pack_sm_domain_words
-                    sm_domain_words = pack_sm_domain_words(
-                        sm_locality_domains(fc1_a.device.index))
+                if (self.die_major and tuple(cluster_shape_mn) == (1, 1)
+                        and num_tokens >= FC12_DIE_CLAIM_MIN_TOKENS):
+                    sm_domain_words = _fc12_sm_domain_words(fc1_a.device.index)
                 # Three atomic counters zeroed by one fill (they sit on the
                 # routing chain); each scheduler counter on its own 128 B line,
                 # two lines per phase (one per locality domain).
