@@ -1289,6 +1289,7 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
         instance_rank=2,
         block_ids_per_layer_groups=[],
         unique_rid=rid,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     kv_message = [MessageType.KV_AGENT_RESULT, b"kv"]
     aux_message = [MessageType.AUX_AGENT_RESULT, b"aux"]
@@ -1301,7 +1302,7 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
 
     sender._registrar.get_peer_rank_info.assert_called_once_with("gen", 2)
     make_kv_result.assert_called_once_with(
-        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=b""
+        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
     )
     make_aux_result.assert_called_once_with(5, rid, AgentResult.FAILED)
     sender._get_or_connect_dealer.assert_called_once_with("receiver")
@@ -2205,6 +2206,7 @@ def test_rejected_sender_slice_addresses_receiver_task(monkeypatch) -> None:
         block_ids_per_layer_groups=[],
         unique_rid=rid,
         slice_id=0,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     make_result = Mock(return_value=[MessageType.KV_AGENT_RESULT, b"failed"])
     monkeypatch.setattr(transfer_mod, "_make_kv_result_msg", make_result)
@@ -2212,7 +2214,7 @@ def test_rejected_sender_slice_addresses_receiver_task(monkeypatch) -> None:
     sender._send_failed_task_result_to_receiver(task, info)
 
     make_result.assert_called_once_with(
-        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=b""
+        5, rid, 0, True, AgentResult.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
     )
     assert sender._send_task_queues[0].get_nowait() == (
         "receiver",
