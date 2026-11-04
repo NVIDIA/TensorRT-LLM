@@ -975,7 +975,7 @@
     },
     "DSparkDecodingConfig": {
       "additionalProperties": false,
-      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. This configuration selects\nnative full-block drafting and does not expose confidence-scheduling or\ncalibration controls.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1044,6 +1044,42 @@
           "description": "Number of draft positions produced per block. If None, read from the draft model config (dspark_block_size). Should equal max_draft_len.",
           "title": "Block Size"
         },
+        "confidence_calibration_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a JSON file with per-position temperature-scaling values (key 'sts_temperatures' or 'temperatures') used to calibrate the confidence head. A vector longer than max_draft_len is truncated to its first max_draft_len entries, so one file serves every K. If None, the raw sigmoid is used.",
+          "status": "prototype",
+          "title": "Confidence Calibration Path"
+        },
+        "confidence_cost_table_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a DSpark cost table: measured decode step times per physical K, rank-local CUDA-graph batch size and verifier-token budget. One file may hold several K values; the entry for max_draft_len is used. Generate one with `python -m tensorrt_llm.tools.dspark_profile_costs`. Required when enable_confidence_scheduling=True.",
+          "status": "prototype",
+          "title": "Confidence Cost Table Path"
+        },
+        "confidence_min_predicted_gain": {
+          "default": 0.04,
+          "description": "Minimum predicted relative goodput gain (expected accepted tokens per millisecond) a compact verifier budget needs over native verification before it is selected. Larger values keep native verification more often.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Confidence Min Predicted Gain",
+          "type": "number"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1065,6 +1101,13 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "enable_confidence_scheduling": {
+          "default": false,
+          "description": "Enable confidence-guided selection of a measured verifier-token budget for decode-only batches. The full physical draft block is still proposed; target verification and acceptance rules are unchanged. Requires trained confidence-head weights and a cost table (confidence_cost_table_path). Native verification is kept whenever no compact budget is predicted to win by confidence_min_predicted_gain.",
+          "status": "prototype",
+          "title": "Enable Confidence Scheduling",
+          "type": "boolean"
         },
         "enable_penalty": {
           "default": false,
@@ -4660,7 +4703,7 @@
         },
         "mixed_precision_first_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision First N",
@@ -4668,7 +4711,7 @@
         },
         "mixed_precision_last_n": {
           "default": 256,
-          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept in whole cache pages.",
           "minimum": 0,
           "status": "prototype",
           "title": "Mixed Precision Last N",

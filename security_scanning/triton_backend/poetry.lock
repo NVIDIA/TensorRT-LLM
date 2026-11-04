@@ -761,15 +761,15 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "4.2.6"
+version = "4.2.7"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version >= \"3.11\""
 files = [
-    {file = "filelock-4.2.6-py3-none-any.whl", hash = "sha256:fd7d4fca497bf3e3d0945a13261f8e684f2aef12ce7cf76aef26e13bf7388b88"},
-    {file = "filelock-4.2.6.tar.gz", hash = "sha256:ee7af8ede36dcaf12e1016d9f7c3a63ecd5497d46f85dab21b8c779b8f944e97"},
+    {file = "filelock-4.2.7-py3-none-any.whl", hash = "sha256:d08972bbca2b8767ee552aff877b091dd111ffb1d22de7de885766ea7d719d5e"},
+    {file = "filelock-4.2.7.tar.gz", hash = "sha256:31f6f7e3a8b6f0bd89114d30c5d5218ea1cfb63e5c4aa695b7559314a209bc7f"},
 ]
 
 [[package]]
@@ -3086,13 +3086,13 @@ vision = ["Pillow (>=10.0.1,<=15.0)", "torchvision"]
 
 [[package]]
 name = "tritonclient"
-version = "2.73.0"
+version = "2.74.0"
 description = "Python client library and utilities for communicating with Triton Inference Server"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "tritonclient-2.73.0-py3-none-any.whl", hash = "sha256:1f5cec19b0568e037ec4d716ae702984b3ab93e35f72b8f72c5135374dd2be9a"},
+    {file = "tritonclient-2.74.0-py3-none-any.whl", hash = "sha256:0252de30581bf944ac36f12318ed2ca9d72dff9f6622afc9a37dcfd46f76f8ee"},
 ]
 
 [package.dependencies]
@@ -3459,4 +3459,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "10821ba2f93a7d779c1b83ee05753c1efb5b1261f26e60895e28a72450c366af"
+content-hash = "1df1167505c7ebe3f2e50340ad68ed6c5e35535c8c6daec01af5ffc9a1e59fe2"
