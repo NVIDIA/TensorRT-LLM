@@ -2412,7 +2412,7 @@ class KvCacheCreator:
         cls = self._kv_cache_manager_cls
         return cls is KVCacheManagerV2 or (
             issubclass(cls, MambaHybridCacheManagerV2)
-            and cls._accepts_appended_draft_layers)
+            and cls.accepts_appended_draft_layers)
 
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""

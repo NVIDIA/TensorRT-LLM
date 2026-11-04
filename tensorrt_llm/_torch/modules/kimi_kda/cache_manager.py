@@ -937,7 +937,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     # point it passes inside the forward, at the kernel's checkpoint granularity (__init__).
     inforward_snapshot_any_point = True
     # The DSpark MLA drafter keeps its context KV in this manager.
-    _accepts_appended_draft_layers = True
+    accepts_appended_draft_layers = True
 
     @override
     def __init__(

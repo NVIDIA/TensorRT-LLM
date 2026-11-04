@@ -203,7 +203,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     _supports_reuse_match_backoff = False
     # Whether the KV cache creator may append a standalone drafter's layers
     # (``layer_specs``) to this manager; set by the subclasses validated with one.
-    _accepts_appended_draft_layers = False
+    accepts_appended_draft_layers = False
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
