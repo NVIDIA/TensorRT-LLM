@@ -261,6 +261,33 @@ class KimiK3ToolParser(BaseToolParser):
             + "}"
         )
 
+    def _delivered_name(self, name: str, tool_indices: Dict[str, int]) -> str:
+        """The name a call is delivered under: the declared tool it maps onto.
+
+        ``resolve_tool_name`` maps the written name onto a declared tool: the
+        declared name itself, or a bare tail that names exactly one declared
+        tool (any qualifier the model wrote is dropped). A Codex-style client
+        declares ``functions.exec`` and the model mostly writes ``exec``, so
+        that is not an error. A name nothing answers to is delivered as
+        written with a warning, as is one whose bare tail several declared
+        tools share, which stays unresolved.
+        """
+        resolved = self.resolve_tool_name(name, tool_indices)
+        if resolved is not None:
+            return resolved
+        tail = name.rsplit(".", 1)[-1]
+        owners = sorted(
+            declared for declared in tool_indices if declared.rsplit(".", 1)[-1] == tail
+        )
+        if len(owners) > 1:
+            logger.warning(
+                f"kimi_k3 tool parser: tool name {name!r} matches {len(owners)} declared "
+                f"tools ({', '.join(owners)}); it is left unresolved"
+            )
+        else:
+            logger.warning(f"Model attempted to call undefined function: {name}")
+        return name
+
     def _emit_section(
         self,
         text: str,
@@ -289,9 +316,7 @@ class KimiK3ToolParser(BaseToolParser):
         released = 0
         for item in section.items:
             if item.deliverable:
-                name = item.attrs["tool"]
-                if name not in tool_indices:
-                    logger.warning(f"Model attempted to call undefined function: {name}")
+                name = self._delivered_name(item.attrs["tool"], tool_indices)
                 if item.recovered:
                     logger.warning(
                         f"kimi_k3 tool parser: delivering call {name!r} read without its "

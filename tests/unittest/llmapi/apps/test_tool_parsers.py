@@ -16,15 +16,17 @@
 import abc
 import functools
 import json
+import logging
 import random
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Callable, Iterator, NamedTuple
 from unittest.mock import Mock, patch
 
 import pytest
 
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.logger import logger as trtllm_logger
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
@@ -6394,13 +6396,20 @@ _K3_INPUT_SCHEMA = {
         }
     }
 }
-K3_TOOLS = [
-    ChatCompletionToolsParam(type="function",
-                             function=FunctionDefinition(
-                                 name=name, parameters=_K3_INPUT_SCHEMA))
-    for name in ("exec", "functions.exec", "functions.update_plan",
-                 "collaboration.spawn_agent")
-]
+
+
+def _k3_tools(*names):
+    """Declared tools, each taking one string argument ``input``."""
+    return [
+        ChatCompletionToolsParam(type="function",
+                                 function=FunctionDefinition(
+                                     name=name, parameters=_K3_INPUT_SCHEMA))
+        for name in names
+    ]
+
+
+K3_TOOLS = _k3_tools("exec", "functions.exec", "functions.update_plan",
+                     "collaboration.spawn_agent")
 
 # name -> (generation, thinking, reasoning, visible text, delivered calls).
 #
@@ -6869,15 +6878,15 @@ def _k3_calls(items):
     return [(item.tool_index, item.name, item.parameters) for item in items]
 
 
-def _k3_tool_stream(chunks):
+def _k3_tool_stream(chunks, tools=K3_TOOLS):
     """(text, calls) the tool parser streams for `chunks`, then `finish`."""
     parser = KimiK3ToolParser()
     text, calls = [], []
     for chunk in chunks:
-        result = parser.parse_streaming_increment(chunk, K3_TOOLS)
+        result = parser.parse_streaming_increment(chunk, tools)
         text.append(result.normal_text)
         calls.extend(result.calls)
-    result = parser.finish(K3_TOOLS)
+    result = parser.finish(tools)
     text.append(result.normal_text)
     calls.extend(result.calls)
     # Whatever the parser still holds after finish() reaches neither view.
@@ -6885,17 +6894,57 @@ def _k3_tool_stream(chunks):
     return "".join(text), _k3_calls(calls)
 
 
-def _k3_tool_whole(text):
-    result = KimiK3ToolParser().detect_and_parse(text, K3_TOOLS)
+def _k3_tool_whole(text, tools=K3_TOOLS):
+    result = KimiK3ToolParser().detect_and_parse(text, tools)
     return result.normal_text, _k3_calls(result.calls)
 
 
-def _k3_tool_parity(text, seed=0):
+def _k3_tool_parity(text, seed=0, tools=K3_TOOLS):
     """Check that every chunking streams detect_and_parse's reading; return it."""
-    whole = _k3_tool_whole(text)
+    whole = _k3_tool_whole(text, tools)
     for label, chunks in _k3_chunkings(text, seed):
-        assert _k3_tool_stream(chunks) == whole, label
+        assert _k3_tool_stream(chunks, tools) == whole, label
     return whole
+
+
+@contextmanager
+def _k3_captured_warnings():
+    """Messages the TRT-LLM logger emits at WARNING or above inside the block.
+
+    The logger drops warnings at its default level, and its ``set_level`` is
+    a no-op once ``TLLM_LOG_LEVEL`` pins the level, so both gates are opened
+    directly for the block and restored afterwards.
+    """
+    messages = []
+
+    class Capture(logging.Handler):
+
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.WARNING)
+    underlying = trtllm_logger._logger
+    saved = trtllm_logger._min_severity, underlying.level
+    trtllm_logger._min_severity = "warning"
+    underlying.setLevel(logging.WARNING)
+    underlying.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        underlying.removeHandler(handler)
+        trtllm_logger._min_severity, level = saved
+        underlying.setLevel(level)
+
+
+def _k3_tool_parity_with_warnings(text, tools):
+    """The whole reading and the warnings it logs; every chunking streams both."""
+    with _k3_captured_warnings() as logged:
+        whole = _k3_tool_whole(text, tools)
+    for label, chunks in _k3_chunkings(text, 0):
+        with _k3_captured_warnings() as streamed:
+            assert _k3_tool_stream(chunks, tools) == whole, label
+        assert streamed == logged, label
+    return whole, logged
 
 
 def _k3_reasoning_stream(chunks, thinking):
@@ -7298,6 +7347,62 @@ class TestKimiK3StreamingMatchesWholeParse:
         text = f"Messages end with {K3_MESSAGE_END} and {K3_EOM} tokens."
 
         assert _k3_tool_parity(text) == (text, [])
+
+    @pytest.mark.parametrize(
+        "written, declared, delivered",
+        [
+            # A Codex-style client declares `functions.search`; the model
+            # mostly writes the bare `search`, which names that one tool.
+            ("search",
+             ("functions.search", "functions.wait"), "functions.search"),
+            ("wait", ("functions.search", "functions.wait"), "functions.wait"),
+            ("functions.search",
+             ("functions.search", "functions.wait"), "functions.search"),
+            # A qualifier the declaration lacks, and one the model got wrong.
+            ("functions.search", ("search", ), "search"),
+            ("tools.search",
+             ("functions.search", "functions.wait"), "functions.search"),
+        ])
+    def test_a_name_that_maps_onto_one_declared_tool_is_delivered_under_it(
+            self, written, declared, delivered):
+        """Resolving is not an error: no warning, the client gets the declared name."""
+        content = _k3_section(
+            _k3_call(written, 1, _k3_argument("input", "string", "ls")))
+
+        reading, logged = _k3_tool_parity_with_warnings(content,
+                                                        _k3_tools(*declared))
+
+        assert reading == ("", [(0, delivered, '{"input": "ls"}')])
+        assert logged == []
+
+    def test_a_name_no_declared_tool_answers_to_warns_once(self):
+        """Only the call that will not resolve is reported; it is delivered as written."""
+        tools = _k3_tools("functions.search", "functions.wait")
+        content = _k3_section(
+            _k3_call("search", 1, _k3_argument("input", "string", "ls")),
+            _k3_call("apply_patch", 2, _k3_argument("input", "string", "x")))
+
+        whole, logged = _k3_tool_parity_with_warnings(content, tools)
+
+        assert whole == ("", [(0, "functions.search", '{"input": "ls"}'),
+                              (1, "apply_patch", '{"input": "x"}')])
+        assert len(logged) == 1
+        assert logged[0].endswith(
+            "Model attempted to call undefined function: apply_patch")
+
+    @pytest.mark.parametrize("written", ["spawn", "tools.spawn"])
+    def test_a_tail_shared_by_two_declared_tools_is_reported_as_ambiguous(
+            self, written):
+        """``spawn`` against ``a.spawn`` and ``b.spawn`` resolves nowhere, and says why."""
+        tools = _k3_tools("a.spawn", "b.spawn")
+        content = _k3_section(
+            _k3_call(written, 1, _k3_argument("input", "string", "x")))
+
+        whole, logged = _k3_tool_parity_with_warnings(content, tools)
+
+        assert whole == ("", [(0, written, '{"input": "x"}')])
+        assert len(logged) == 1
+        assert "matches 2 declared tools (a.spawn, b.spawn)" in logged[0]
 
 
 class TestForcedToolChoicePostprocessing:
