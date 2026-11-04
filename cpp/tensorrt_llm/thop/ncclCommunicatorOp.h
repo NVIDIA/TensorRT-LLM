@@ -30,9 +30,12 @@ namespace torch_ext
 class NcclCommunicatorOp : public th::jit::CustomClassHolder
 {
 public:
+    //! Create the pipeline communicator for rank within the worldSize participating ranks.
     NcclCommunicatorOp(int64_t worldSize, int64_t rank);
 
+    //! Submit tensor's byte payload to a pipeline peer on the current CUDA stream.
     void send(th::Tensor tensor, int64_t toRank) const;
+    //! Receive a pipeline peer's byte payload into tensor on the current CUDA stream.
     void recv(th::Tensor& tensor, int64_t fromRank) const;
 
 private:

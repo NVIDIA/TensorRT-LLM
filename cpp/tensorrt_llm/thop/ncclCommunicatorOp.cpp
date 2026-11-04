@@ -38,6 +38,7 @@ NcclCommunicatorOp::NcclCommunicatorOp(int64_t worldSize, int64_t rank)
     mPipelineComm = std::make_shared<tensorrt_llm::runtime::NcclCommunicator>(worldSize, rank);
 }
 
+//! Send tensor bytes on the current stream, lazily describing the submission when probes are enabled.
 void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
 {
 #if TRTLLM_ENABLE_NCCL_PROFILING && ENABLE_MULTI_DEVICE
@@ -64,6 +65,7 @@ void NcclCommunicatorOp::send(th::Tensor tensor, int64_t toRank) const
     mPipelineComm->send(*tr::IBuffer::wrap(ptr, size), static_cast<int>(toRank), cudaStream);
 }
 
+//! Receive into tensor on the current stream, lazily describing the submission when probes are enabled.
 void NcclCommunicatorOp::recv(th::Tensor& tensor, int64_t fromRank) const
 {
 #if TRTLLM_ENABLE_NCCL_PROFILING && ENABLE_MULTI_DEVICE
