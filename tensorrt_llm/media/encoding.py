@@ -137,7 +137,9 @@ class _FfmpegCliEncoder(_VideoEncoder):
         if video.is_cuda:
             # C-contiguous host memory, pinned where that helps: the copy runs at full bandwidth
             # and makes a strided video contiguous on the GPU.
-            host = torch.empty(video.shape, dtype=video.dtype, pin_memory=prefer_pinned())
+            host = torch.empty(
+                video.shape, dtype=video.dtype, device="cpu", pin_memory=prefer_pinned()
+            )
             host.copy_(video)
             video_np = host.numpy()
         else:

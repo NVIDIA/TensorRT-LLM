@@ -137,14 +137,17 @@ _requires_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ff
 
 @_requires_ffmpeg
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_video_to_bytes_mp4_strided_cuda_matches_cpu():
-    """A strided CUDA video encodes to the same MP4 bytes as its contiguous CPU frames."""
+@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
+def test_video_to_bytes_mp4_strided_cuda_matches_cpu(default_device):
+    """A strided CUDA video encodes to its CPU frames' MP4 bytes, whatever the default device."""
     frames = torch.randint(
         0, 256, (4, 32, 48, 3), dtype=torch.uint8, generator=torch.Generator().manual_seed(0)
     )
     video = frames.permute(0, 3, 1, 2).contiguous().cuda().permute(0, 2, 3, 1)
     assert not video.is_contiguous()
-    assert video_to_bytes(video, frame_rate=8.0) == video_to_bytes(frames, frame_rate=8.0)
+    expected = video_to_bytes(frames, frame_rate=8.0)
+    with torch.device(default_device):
+        assert video_to_bytes(video, frame_rate=8.0) == expected
 
 
 @_requires_ffmpeg
