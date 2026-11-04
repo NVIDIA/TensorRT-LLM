@@ -1182,6 +1182,7 @@ class OpenAIServer(_VideoRoutesMixin):
             iteration_stats_collector_task_getter=(
                 lambda: self._iteration_stats_collector_task),
             internal_disagg_auth_key=self._internal_disagg_auth_key,
+            server_role=self.server_role,
             per_request_spec_decode_stats=self._per_request_spec_decode_stats,
             spec_decode_num_spec_tokens=self._spec_decode_num_spec_tokens,
             input_proc_executor=self._input_proc_executor,

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, Response
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.postproc_worker import PostprocArgs
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
@@ -52,6 +53,7 @@ class GenerateBaseServing(BaseServing):
                  iteration_stats_collector_task_getter: Callable[
                      [], Optional[asyncio.Task]],
                  internal_disagg_auth_key: Optional[str],
+                 server_role: Optional[ServerRole],
                  per_request_spec_decode_stats: bool,
                  spec_decode_num_spec_tokens: Optional[int],
                  input_proc_executor: ThreadPoolExecutor,
@@ -69,6 +71,7 @@ class GenerateBaseServing(BaseServing):
         self._iteration_stats_collector_task_getter = (
             iteration_stats_collector_task_getter)
         self._internal_disagg_auth_key = internal_disagg_auth_key
+        self.server_role = server_role
         self._per_request_spec_decode_stats = per_request_spec_decode_stats
         self._spec_decode_num_spec_tokens = spec_decode_num_spec_tokens
         self._input_proc_executor = input_proc_executor
