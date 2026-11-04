@@ -918,6 +918,17 @@ class ModelEngineTestCase(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
+def test_spec_decode_fast_paths_follow_the_models_flag() -> None:
+    """A model that builds its own speculative branch, such as a Modeling V2
+    target, opts into the one-engine speculative fast paths by setting
+    `spec_decode_fast_paths`; a model that does not set it stays off."""
+    model = torch.nn.Module()
+    assert not model_engine_module._spec_decode_fast_paths(model)
+    model.spec_decode_fast_paths = True
+    assert model_engine_module._spec_decode_fast_paths(model)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("model_kind", ["default", "m3", "m3_vl", "gdn", "mamba"])
 @pytest.mark.parametrize("compile_enabled,piecewise", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("compile_only_piecewise_graphs", [False, True])

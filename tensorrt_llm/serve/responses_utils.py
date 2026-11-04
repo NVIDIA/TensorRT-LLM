@@ -662,7 +662,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -677,6 +677,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -687,7 +688,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -1393,15 +1394,14 @@ def _get_chat_completion_function_tools(
             # chat template cannot describe anything else, and the call is
             # intercepted server-side rather than returned to the client.
             #
-            # A request that reaches here still carrying web_search should
-            # already have been refused by the endpoint - see
-            # web_search_rejection_reason and its caller in openai_server.py -
-            # because answering without the search the client asked for is a
-            # wrong answer the client cannot detect. This branch is the
-            # fallback for any other caller of this function: drop the tool
-            # rather than describe it, since nothing on this path executes the
-            # call yet and the model would emit one the client has no
-            # implementation for ("unsupported call: web_search").
+            # Unless TRTLLM_WEB_SEARCH_UNAVAILABLE=reject makes the endpoint
+            # refuse it (see web_search_rejection_reason and its caller in
+            # openai_server.py), a request whose web_search the server cannot
+            # honour is served, and this is where the tool is dropped for a
+            # chat-template model; other callers of this function drop it the
+            # same way. It is dropped rather than described because nothing on
+            # this path executes the call yet, and the model would emit one the
+            # client has no implementation for ("unsupported call: web_search").
             #
             # Warn once per process rather than per request: what it reports is
             # a server-configuration fact, not a property of the request, so
@@ -1895,7 +1895,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot reports the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -1928,7 +1930,7 @@ def _create_output_content(
                         content=[
                             Content(text=reasoning_text, type="reasoning_text")
                         ],
-                        status=None,
+                        status="completed",
                     ))
                 stored_reasoning = reasoning_text
 
@@ -1955,8 +1957,12 @@ def _create_output_content(
             tool_calls_item = list(streamed_tool_calls)
         else:
             tool_resolution = _tool_resolution(tools)
+            # As streamed: the stream delivers every call it announces as
+            # completed.
             tool_calls_item = [
-                _tool_call_output_item(call, tool_resolution) for call in calls
+                _tool_call_output_item(call,
+                                       tool_resolution,
+                                       status="completed") for call in calls
             ]
         output_items.extend(tool_calls_item)
 
@@ -2160,6 +2166,9 @@ def _create_usage(
     originating request, so its prompt tokens are only reachable that way.
     """
     if num_prompt_tokens is None:
+        # Unadjusted: counts the whole rendered prompt, ignoring
+        # num_prompt_tokens_offset. Callers that want chat parity pass
+        # ResponsesAPIPostprocArgs.usage_num_prompt_tokens().
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
         if prompt_token_ids is None:
             return None
@@ -2178,6 +2187,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,

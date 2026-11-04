@@ -3793,9 +3793,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
     head). A confidence head can score each draft position for verification
-    scheduling without truncating the proposed block. This configuration selects
-    native full-block drafting and does not expose confidence-scheduling or
-    calibration controls.
+    scheduling without truncating the proposed block. Confidence scheduling is
+    opt-in; the default configuration retains native full-block verification.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
@@ -3837,6 +3836,46 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Enable confidence-guided selection of a measured verifier-token budget "
+        "for decode-only batches. The full physical draft block is still "
+        "proposed; target verification and acceptance rules are unchanged. "
+        "Requires trained confidence-head weights and a cost table "
+        "(confidence_cost_table_path). Native verification is kept whenever no "
+        "compact budget is predicted to win by confidence_min_predicted_gain.",
+        status="prototype")
+
+    confidence_cost_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a DSpark cost table: measured decode step times per physical "
+        "K, rank-local CUDA-graph batch size and verifier-token budget. One "
+        "file may hold several K values; the entry for max_draft_len is used. "
+        "Generate one with `python -m tensorrt_llm.tools.dspark_profile_costs`. "
+        "Required when enable_confidence_scheduling=True.",
+        status="prototype")
+
+    confidence_calibration_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with per-position temperature-scaling values "
+        "(key 'sts_temperatures' or 'temperatures') used to calibrate the "
+        "confidence head. A vector longer than max_draft_len is truncated to "
+        "its first max_draft_len entries, so one file serves every K. If None, "
+        "the raw sigmoid is used.",
+        status="prototype")
+
+    confidence_min_predicted_gain: NonNegativeFloat = Field(
+        default=0.04,
+        description=
+        "Minimum predicted relative goodput gain (expected accepted tokens per "
+        "millisecond) a compact verifier budget needs over native "
+        "verification before it is selected. Larger values keep native "
+        "verification more often.",
+        status="prototype")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
@@ -3852,6 +3891,32 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA "
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self):
+        if not self.enable_confidence_scheduling:
+            # A static config copied from a dynamic one may keep the
+            # confidence paths; they are simply unused.
+            return self
+
+        if self.max_draft_len == 1:
+            # Physical K1 has no smaller verifier window, so confidence
+            # scheduling can only add control-path work. Resolve it to the
+            # ordinary feature-off configuration before any runtime component
+            # observes the config.
+            logger.warning(
+                "DSpark confidence scheduling has no compact tier below the "
+                "native K1 layout; using the feature-off static K1 path.")
+            self.enable_confidence_scheduling = False
+            return self
+        if not self.confidence_cost_table_path:
+            raise ValueError(
+                "DSpark confidence scheduling requires confidence_cost_table_path. "
+                "Generate a cost table with `python -m "
+                "tensorrt_llm.tools.dspark_profile_costs` or point to an "
+                "existing one; graph coverage and K are checked at engine "
+                "start.")
+        return self
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -7449,6 +7514,122 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
+    def _validate_dspark_confidence_environment(self) -> None:
+        """Reject configurations confidence scheduling cannot honour.
+
+        Every check here guards a path that would otherwise degrade *silently*:
+        the run comes up, produces plausible text, and either never takes the
+        ragged path at all or takes it with a kernel that mis-attributes rows.
+        A hard error at construction is the only signal that survives.
+        """
+        if not self.speculative_config.draft_is_embedded_in_target:
+            raise ValueError(
+                "DSpark confidence scheduling supports only the embedded "
+                "DeepSeek-V4 draft. Standalone DSpark retains native "
+                "verification; disable confidence scheduling for that path.")
+        speculative_config = self.speculative_config
+        if (getattr(speculative_config, "acceptance_rate_window_size", None)
+                and getattr(speculative_config, "acceptance_rate_threshold",
+                            None) is not None):
+            raise ValueError(
+                "DSpark confidence scheduling does not support the acceptance-"
+                "rate gate (acceptance_rate_window_size / "
+                "acceptance_rate_threshold): once the gate disables "
+                "speculation, the last step's verify windows would remain in "
+                "use, and the gate measures acceptance over all drafted "
+                "tokens rather than the verified ones. Unset both fields or "
+                "disable confidence scheduling.")
+        cuda_graph_config = self.cuda_graph_config
+        if self.context_parallel_size > 1:
+            raise ValueError(
+                "DSpark confidence scheduling requires context_parallel_size=1; "
+                "the exact-shape policy does not coordinate CP groups.")
+        if self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support pipeline parallelism. The PP executor's pipelined "
+                "microbatches do not provide the single-iteration host-input "
+                "lifetime boundary required by ragged verification staging. "
+                "Set pipeline_parallel_size=1 or disable confidence scheduling."
+            )
+        if self.guided_decoding_backend is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support guided decoding. Guided-decoder bitmasks are laid "
+                "out with one uniform speculative stride; applying them to "
+                "packed per-request verify windows would shift every request "
+                "after the first short window. Disable guided decoding or "
+                "disable confidence scheduling.")
+        if self.enable_lora or self.lora_config is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support LoRA. LoRA metadata expands generation requests "
+                "with one uniform speculative stride, which cannot represent "
+                "packed per-request verify windows. Disable LoRA or disable "
+                "confidence scheduling.")
+        # `fit_ragged_verify_lens` plans against the padded row count and
+        # reserves tokens for the CUDA-graph padding rows, so it presumes those
+        # rows exist. With padding off, `_get_padded_batch` adds none: the batch
+        # then carries a token total that keys into a graph nobody captured and
+        # drops to eager on every ragged step -- which costs far more than the
+        # trimmed tokens save -- while real requests were still shrunk to leave
+        # room for padding that never arrived.
+        if cuda_graph_config is None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config to be set with enable_padding=True. Ragged "
+                "verification fits each step's token total onto a captured "
+                "CUDA-graph bucket; with no graphs there is no bucket to fit "
+                "and every step would silently run eager.")
+        if not cuda_graph_config.enable_padding:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config.enable_padding=True (it defaults to False). "
+                "The ragged token budget is planned against the padded batch "
+                "size and reserves tokens for the padding rows; without padding "
+                "those rows never appear, so the step's token total misses its "
+                "captured bucket and falls out of graph replay.")
+        if getattr(self.moe_config.load_balancer, "mode",
+                   None) == "per_layer_dynamic":
+            raise ValueError(
+                "DSpark confidence scheduling does not support per-layer dynamic "
+                "EPLB because it disables the required CUDA graphs.")
+
+        sparse_attention_config = self.sparse_attention_config
+        if sparse_attention_config is not None:
+            # Both recover "which request is this row" from a fixed next_n --
+            # GVR indexes its previous-step top-k hint by request and strides it
+            # by next_n, and the CuTe-DSL kernel takes next_n as a compile-time
+            # constant and JIT cache key. Neither can express per-request
+            # windows. The C++ launcher already refuses the combination
+            # (indexerTopK.cu, "ragged rowKvLens is incompatible with the GVR
+            # preIdx hint"), but that fires deep in a decode step; say so here.
+            incompatible = [
+                name for name in ("enable_heuristic_topk", "use_cute_dsl_topk")
+                if getattr(sparse_attention_config, name, False)
+            ]
+            if incompatible:
+                raise ValueError(
+                    "speculative_config.enable_confidence_scheduling=True is "
+                    "incompatible with sparse_attention_config."
+                    f"{' / '.join(incompatible)}=True: those top-k paths "
+                    "reconstruct each row's request and window position from a "
+                    "single batch-wide next_n, which a ragged batch does not "
+                    "have. Disable them, or disable confidence scheduling.")
+            # Not an error: the DSL paged-MQA-logits path is structurally
+            # uniform too, but the expanded (one row per query token) path it
+            # falls back to is numerically equivalent, and it is the default on
+            # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
+            # will read as honoured otherwise.
+            if getattr(sparse_attention_config, "use_cute_dsl_paged_mqa_logits",
+                       False):
+                logger.warning(
+                    "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
+                    "is ignored on ragged-verification steps: the DSL kernel "
+                    "broadcasts one KV length per request across a fixed next_n. "
+                    "Those steps use the expanded DeepGEMM path instead, which "
+                    "is numerically equivalent.")
+
     @model_validator(mode="after")
     def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Normalize legacy piecewise CUDA graph options into prefill fields."""
@@ -7936,6 +8117,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_confidence_scheduling:
+                    self._validate_dspark_confidence_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

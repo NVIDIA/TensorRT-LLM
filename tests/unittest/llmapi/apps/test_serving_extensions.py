@@ -448,6 +448,7 @@ class TestOpenAIChatIntegration:
 
     def test_extension_hooks_drive_tools_and_the_usage_offset(self, chat_client) -> None:
         client, _events, rendered = chat_client
+        asked = []
 
         class HookExtension(ServingExtension):
             def allows_required_tool_choice(self) -> bool:
@@ -456,7 +457,8 @@ class TestOpenAIChatIntegration:
             def serialize_tool(self, tool) -> dict:
                 return {"custom": tool.function.name}
 
-            def prompt_tokens_excluded_from_usage(self, request) -> int:
+            def prompt_tokens_excluded_from_usage(self, **facts) -> int:
+                asked.append(facts)
                 return 5
 
         serving_extensions._BY_MODEL_TYPE[self.MODEL_KEY] = HookExtension()
@@ -477,6 +479,10 @@ class TestOpenAIChatIntegration:
         # _create_chat_response(promise, postproc_params, raw_request, ...)
         postproc_params = rendered["create_chat_response"].call_args.args[1]
         assert postproc_params.postproc_args.num_prompt_tokens_offset == 5
+        # The hook is asked how the prompt is rendered, not handed the request.
+        assert asked == [
+            {"add_generation_prompt": True, "pre_tokenized": False, "request_chat_template": None}
+        ]
 
     @pytest.fixture(params=["nemotron_h_omni", "nemotron_h"])
     def required_chat_client(self, chat_client, monkeypatch, request):
@@ -783,7 +789,12 @@ class TestExtensionHooks:
         assert extension.allows_required_tool_choice() is False
         assert extension.serialize_tool(request.tools[0]) == request.tools[0].model_dump()
         assert extension.dynamic_tools(request.messages) == []
-        assert extension.prompt_tokens_excluded_from_usage(request) == 0
+        assert (
+            extension.prompt_tokens_excluded_from_usage(
+                add_generation_prompt=True, pre_tokenized=False, request_chat_template=None
+            )
+            == 0
+        )
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
         assert (
@@ -816,16 +827,20 @@ class TestExtensionHooks:
         [
             pytest.param({}, 3, id="native_template_with_generation_prompt"),
             pytest.param({"add_generation_prompt": False}, 0, id="no_generation_prompt"),
-            pytest.param({"prompt_token_ids": [1, 2, 3]}, 0, id="pre_tokenized"),
-            pytest.param({"prompt_token_ids_b64": "AQAAAA=="}, 0, id="b64_pre_tokenized"),
-            pytest.param({"chat_template": "{{ messages }}"}, 0, id="request_template"),
+            pytest.param({"pre_tokenized": True}, 0, id="pre_tokenized"),
+            pytest.param({"request_chat_template": "{{ messages }}"}, 0, id="request_template"),
         ],
     )
     def test_kimi_k3_excludes_the_generation_channel_opener(
         self, kimi, overrides, expected
     ) -> None:
-        request = _chat_request(**overrides)
-        assert kimi.prompt_tokens_excluded_from_usage(request) == expected
+        facts = {
+            "add_generation_prompt": True,
+            "pre_tokenized": False,
+            "request_chat_template": None,
+            **overrides,
+        }
+        assert kimi.prompt_tokens_excluded_from_usage(**facts) == expected
 
     def test_gpt_oss_declares_harmony_output(self) -> None:
         extension = serving_extensions.get_serving_extension("gpt_oss")

@@ -64,7 +64,8 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
 
 
-def test_decode_draft_block_table_matches_eager():
+@pytest.mark.parametrize("block_offset", [0, 3])
+def test_decode_draft_block_table_matches_eager(block_offset: int) -> None:
     num_pools, rows, n_blocks, divisor = 2, 9, 3000, 6
     gen = torch.Generator(device="cuda").manual_seed(1)
     src = torch.randint(
@@ -77,16 +78,21 @@ def test_decode_draft_block_table_matches_eager():
     view = src[1, :rows, 0]
     view[0] = -torch.randint(1, 1 << 20, (n_blocks,), device="cuda", generator=gen).to(torch.int32)
     view[1] = 0
+    view[2] = block_offset
     assert bool((view < 0).float().mean() > 0.3) and bool((view == 0).float().mean() > 0.2)
     table = torch.full((rows + 3, n_blocks), -7, dtype=torch.int32, device="cuda")
     counts = torch.full((rows + 3,), -7, dtype=torch.long, device="cuda")
-    decode_draft_block_table(view, divisor, table, counts)
-    encoded = view.to(torch.int64)
+    original = src.clone()
+    decode_draft_block_table(view, divisor, table, counts, block_offset=block_offset)
+    assert torch.equal(src, original)
+    encoded = view.to(torch.int64) - block_offset
     assert torch.equal(counts[:rows], (encoded >= 0).sum(dim=1))
     expected = encoded.clamp(min=0).div(divisor, rounding_mode="floor").to(torch.int32)
     assert torch.equal(table[:rows], expected)
     assert counts[0].item() == 0 and bool((table[0] == 0).all())
-    assert counts[1].item() == n_blocks and bool((table[1] == 0).all())
+    assert counts[1].item() == (n_blocks if block_offset == 0 else 0)
+    assert bool((table[1] == 0).all())
+    assert counts[2].item() == n_blocks and bool((table[2] == 0).all())
     assert bool((table[rows:] == -7).all()) and bool((counts[rows:] == -7).all())
 
 
