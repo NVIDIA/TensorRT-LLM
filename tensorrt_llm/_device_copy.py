@@ -20,6 +20,14 @@ class DeviceCopyBuffer:
     def tensor(self) -> torch.Tensor:
         return self._tensor
 
+    @property
+    def host_values(self) -> torch.Tensor | None:
+        """Last recorded host values, reshaped to the submitted view; callers must not mutate them."""
+        if self._last_host_values is None:
+            return None
+        count = self._last_host_shape.numel()
+        return self._last_host_values[:count].view(self._last_host_shape)
+
     def invalidate(self) -> None:
         """Forget a pending or externally overwritten copy."""
         self._last_host_values = None
