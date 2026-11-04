@@ -749,6 +749,13 @@ class Step3p7MoE(nn.Module):
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ) -> None:
+        """Construct the router, expert path, and optional TP output reduction.
+
+        Args:
+            model_config: Model, quantization, and parallelism settings.
+            layer_idx: Decoder or MTP layer index used for expert ownership.
+            aux_stream_dict: Auxiliary CUDA streams passed to the MoE backend.
+        """
         super().__init__()
         text_config = _get_text_config(model_config)
         self.layer_idx = layer_idx
