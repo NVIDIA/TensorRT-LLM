@@ -14,9 +14,6 @@
 # limitations under the License.
 """CI-routed CPU coverage for Ulysses attention with replicated K/V."""
 
-import os
-import signal
-import tempfile
 from functools import partial
 
 import pytest
@@ -31,28 +28,8 @@ from .test_ulysses_attention import (
 pytestmark = pytest.mark.cpu_only
 
 
-def _segfault_on_first_ci_attempt():
-    """Kill this process with SIGSEGV the first time it runs in a CI stage.
-
-    TEMPORARY, DO NOT MERGE: reproduces a first-run crash that passes on rerun.
-    The marker is keyed by the Jenkins build and stage, so the rerun in the same
-    stage finds it and runs the test normally. Local runs are unaffected.
-    """
-    build_tag = os.environ.get("BUILD_TAG")
-    stage_name = os.environ.get("stageName")
-    if not build_tag or not stage_name:
-        return
-    marker = os.path.join(tempfile.gettempdir(), f"segfault-once-{build_tag}-{stage_name}")
-    if os.path.exists(marker):
-        return
-    with open(marker, "w"):
-        pass
-    os.kill(os.getpid(), signal.SIGSEGV)
-
-
 def test_ulysses_replicated_kv_unequal_lengths():
     """Unequal replicated context and generated padding match unpadded SDPA."""
-    _segfault_on_first_ci_attempt()
     run_test_in_distributed(
         world_size=2,
         test_fn=_logic_ulysses_replicated_kv_unequal_lengths,
