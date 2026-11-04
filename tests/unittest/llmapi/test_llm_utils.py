@@ -31,7 +31,7 @@ from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import AsyncQueue, _SyncQueue
 
 # isort: off
-from .test_llm import llama_model_path
+from .model_paths import llama_model_path
 # isort: on
 
 

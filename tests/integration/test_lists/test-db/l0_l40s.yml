@@ -17,8 +17,8 @@ l0_l40s:
   tests:
   # ------------- PyTorch tests ---------------
   # Multimodal modeling tests
-  - unittest/_torch/modeling -k "modeling_siglip"
-  - unittest/_torch/modeling -k "modeling_nemotron_h_multimodal"
+  - unittest/_torch/modeling/test_modeling_siglip.py
+  - unittest/_torch/modeling/test_modeling_nemotron_h_multimodal.py
   - unittest/_torch/modeling/test_modeling_qwen3vl_moe.py::TestQwen3VLMoe::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::TestQwen3VL::test_all
   - unittest/_torch/modeling/test_modeling_qwen3vl.py::test_qwen3vl_init_preserves_caller_quant_config
