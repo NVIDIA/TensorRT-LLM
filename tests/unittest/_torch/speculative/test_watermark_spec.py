@@ -195,24 +195,3 @@ def test_eagle3_watermark_with_rejection_sampling(watermark_kwargs):
     # only part of the texts carry a detectable mark (a third to a half in calibration runs); require
     # a quarter.
     assert flagged >= len(outputs) // 4, f"only {flagged}/{len(outputs)} outputs carry the mark"
-
-
-@pytest.mark.high_cuda_memory
-def test_watermark_rejected_with_rejection_sampling():
-    if torch.cuda.get_device_properties(0).total_memory / 1e9 < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-    target, draft = _model_paths()
-    llm = LLM(
-        model=target,
-        watermark_config=WatermarkConfig(key=1),
-        speculative_config=Eagle3DecodingConfig(
-            max_draft_len=3, speculative_model=draft, use_rejection_sampling=True
-        ),
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.3),
-        max_batch_size=4,
-    )
-    try:
-        with pytest.raises(Exception, match="gumbel_dual_key"):
-            llm.generate(PROMPTS[:1], SamplingParams(max_tokens=8, temperature=0.8))
-    finally:
-        llm.shutdown()
