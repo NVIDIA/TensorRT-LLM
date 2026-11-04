@@ -4936,7 +4936,7 @@ class TestMiniMaxM2ToolParser:
 
     def test_detect_and_parse_parameter_value_with_angle_brackets(
             self, sample_tools, parser):
-        """Names stop at the first `>`, values keep every `>` they hold."""
+        """Parameter values retain their `>` and `->` characters."""
         text = ('<minimax:tool_call>'
                 '<invoke name="get_weather">'
                 '<parameter name="location">a > b -> c</parameter>'
