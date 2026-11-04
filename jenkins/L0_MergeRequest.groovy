@@ -1951,6 +1951,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         // _MsgspecRoute decodes the disaggregated frontend's msgpack bodies.
         "tensorrt_llm/serve/_base/",
         // Code moved out of tensorrt_llm/serve/openai_server.py keeps its trigger.
+        "tensorrt_llm/serve/api/openai/completions/",
         "tensorrt_llm/serve/api/openai/embeddings/",
         "tensorrt_llm/serve/api/openai/mm_encoder/",
         "tensorrt_llm/serve/api/openai/tokenize/",
