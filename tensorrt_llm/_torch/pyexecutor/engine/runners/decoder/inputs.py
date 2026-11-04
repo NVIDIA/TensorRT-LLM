@@ -417,16 +417,26 @@ class DecoderInputPreparer:
         self._dspark_sps_cost_table = None
         self._dspark_exact_candidate_cells = ()
         self._dspark_exact_identity_words = (0,) * 8
-        table_path = getattr(spec_config, "confidence_sps_table_path", None)
+        table_path = getattr(spec_config, "confidence_cost_table_path", None)
         if self._dspark_confidence_enabled and table_path:
-            from tensorrt_llm._torch.speculative.dspark_planner import load_runtime_sps_cost_table
+            from tensorrt_llm._torch.speculative.dspark_planner import (
+                CostTableSetup,
+                load_runtime_sps_cost_table,
+            )
+            from tensorrt_llm.version import __version__ as trtllm_version
 
-            self._dspark_sps_cost_table, _ = load_runtime_sps_cost_table(
+            self._dspark_sps_cost_table = load_runtime_sps_cost_table(
                 table_path,
                 graph_batch_sizes=self._config.cuda_graph_batch_sizes,
                 max_draft_len=int(spec_config.max_draft_len),
-                live_engine_fingerprint_path=getattr(
-                    spec_config, "confidence_sps_live_fingerprint_path", None
+                minimum_predicted_gain=float(spec_config.confidence_min_predicted_gain),
+                live_setup=CostTableSetup(
+                    gpu=torch.cuda.get_device_name(self._buffers.input_ids_cuda.device),
+                    world_size=int(self.mapping.world_size),
+                    tensor_parallel_size=int(self.mapping.tp_size),
+                    moe_expert_parallel_size=int(self.mapping.moe_ep_size),
+                    enable_attention_dp=bool(self._config.enable_attention_dp),
+                    tensorrt_llm_version=trtllm_version,
                 ),
             )
             self._dspark_exact_candidate_cells = self._dspark_sps_cost_table.candidate_cells()
@@ -2916,8 +2926,19 @@ class DecoderInputPreparer:
             if self.guided_decoder is not None:
                 self.guided_decoder.token_event.record()
             return inputs
+        # Overlap scheduling corrects kv_lens_cuda below from the runtime
+        # accepted-token counts and calls on_update_kv_lens() again after it.
+        has_kv_lens_correction = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        # With a correction, the call after it does this: every on_update_kv_lens rebuilds
+        # from the current lengths and nothing reads its outputs in between.
+        if attn_meta is not None and not has_kv_lens_correction:
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
@@ -2943,7 +2964,7 @@ class DecoderInputPreparer:
                         self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
 
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
+                if has_kv_lens_correction:
                     if (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0

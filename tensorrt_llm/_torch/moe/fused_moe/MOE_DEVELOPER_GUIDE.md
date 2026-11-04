@@ -408,7 +408,7 @@ the package.
 | File | Role |
 |------|------|
 | `identity.py` | the identity segments (`PROVIDER_TRTLLM`, `TECHNIQUE_CUTEDSL`, `KERNEL_*`), and the grouped-GEMM query and id helper |
-| `kernel_inputs.py` | what more than one kernel takes: the `NvFp4WeightView` dataclass, and free functions taking the impl, `finalize_routing_scales` and `quantize_input_nvfp4`, which every NVFP4 leaf here binds as `quantize_input` |
+| `kernel_inputs.py` | shared inputs: `NvFp4WeightView`, `finalize_routing_scales`, and `quantize_input_nvfp4`; NVFP4 leaves use the quantizer through a direct binding or a wrapper |
 | `runners.py` | the outer autotune runners: NVFP4, which the fused-FC12 runner narrows to its tiles, and BF16 |
 | `grouped_gemm/base.py` | `CuteDslFusedMoEBase`, the abstract root of the two grouped-GEMM leaves: construction, the output-memset overlap stream, the locality-domain plan, the weight lifecycle |
 | `grouped_gemm/eligibility.py` | the checks both grouped-GEMM leaves' `can_implement` compose, as free functions |
@@ -421,6 +421,19 @@ the package.
 | `grouped_gemm` / `none` | `TrtllmCutedslGroupedGemmBf16Impl` | `trtllm.cutedsl.grouped_gemm.none` |
 | `fused_fc12` / `nvfp4` | `TrtllmCutedslFusedFc12Nvfp4Impl` | `trtllm.cutedsl.fused_fc12.nvfp4` |
 | `dense_gemm` / `nvfp4` | `TrtllmCutedslDenseGemmNvfp4Impl` | `trtllm.cutedsl.dense_gemm.nvfp4` |
+
+The grouped-GEMM NVFP4 leaf wraps `quantize_input_nvfp4` to supply an
+import-time default from `TRTLLM_MOE_TRITON_FP4_QUANT` (off unless set to `1`).
+Callers can override that default with `enable_triton`. The fused-FC12 and
+dense-GEMM NVFP4 leaves bind the helper directly and do not read this switch.
+
+The opt-in Triton path requires contiguous CUDA BF16 activations `[T, H]`,
+`T > 0`, a positive `H` divisible by 1024, 16-element scaling blocks, and a
+one-element float32 global scale on the same device. The backend's device ISA
+requirements still apply. Eligibility is checked after AWQ/ARC pre-scaling;
+ineligible unquantized inputs use the CUDA quantizer. An unswizzled
+`Fp4QuantizedTensor` bypasses both quantizers when `fc31_act_scale` is `None`;
+prequantized inputs with an activation scale remain rejected.
 
 `trtllm.cutedsl.mega_moe.nvfp4` is CuteDSL too but lives in `mega_moe/`: it is a
 fused-communication kernel that shares its scheduler with the DeepGEMM MegaMoE

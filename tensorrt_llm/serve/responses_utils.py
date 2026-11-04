@@ -662,7 +662,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                 summary=[],
                 type="reasoning",
                 content=[Content(text=content.text, type="reasoning_text")],
-                status=None,
+                status="completed",
             )
             output_items.append(reasoning_item)
     elif message.channel == "commentary":
@@ -677,6 +677,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     type="function_call",
                     name=function_name,
                     id=f"fc_{_random_uuid()}",
+                    status="completed",
                 )
                 output_items.append(response_item)
         elif message.recipient.startswith(
@@ -687,7 +688,7 @@ def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
                     summary=[],
                     type="reasoning",
                     content=[Content(text=content.text, type="reasoning_text")],
-                    status=None,
+                    status="completed",
                 )
                 output_items.append(reasoning_item)
         else:
@@ -1894,7 +1895,9 @@ def _create_output_content(
                             content=[
                                 Content(text=record.text, type="reasoning_text")
                             ],
-                            status=None,
+                            # The stream closed this item as completed; the
+                            # snapshot reports the same status.
+                            status="completed",
                         ))
                 else:
                     output_items.append(
@@ -1927,7 +1930,7 @@ def _create_output_content(
                         content=[
                             Content(text=reasoning_text, type="reasoning_text")
                         ],
-                        status=None,
+                        status="completed",
                     ))
                 stored_reasoning = reasoning_text
 
@@ -1954,8 +1957,12 @@ def _create_output_content(
             tool_calls_item = list(streamed_tool_calls)
         else:
             tool_resolution = _tool_resolution(tools)
+            # As streamed: the stream delivers every call it announces as
+            # completed.
             tool_calls_item = [
-                _tool_call_output_item(call, tool_resolution) for call in calls
+                _tool_call_output_item(call,
+                                       tool_resolution,
+                                       status="completed") for call in calls
             ]
         output_items.extend(tool_calls_item)
 
@@ -2159,6 +2166,9 @@ def _create_usage(
     originating request, so its prompt tokens are only reachable that way.
     """
     if num_prompt_tokens is None:
+        # Unadjusted: counts the whole rendered prompt, ignoring
+        # num_prompt_tokens_offset. Callers that want chat parity pass
+        # ResponsesAPIPostprocArgs.usage_num_prompt_tokens().
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
         if prompt_token_ids is None:
             return None
@@ -2177,6 +2187,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,

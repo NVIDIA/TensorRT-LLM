@@ -1598,7 +1598,28 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         # The decoder publishes the fitted bucket before graph lookup.
         self.agreed_ragged_bucket: Optional[int] = None
         self.adp_shape_agreement: Optional[ADPShapeAgreement] = None
+        self._policy_iteration: Optional[int] = None
         self.secondary_padding_dummy_requests: Dict[int, LlmRequest] = {}
+
+    def set_policy_iteration(self, iteration: int) -> None:
+        """Advance the executor-owned epoch before publishing this step's vote."""
+        iteration = int(iteration)
+        if getattr(self, "_policy_iteration", None) != iteration:
+            self.adp_shape_agreement = None
+        self._policy_iteration = iteration
+
+    @contextlib.contextmanager
+    def pad_batch(self,
+                  scheduled_requests: ScheduledRequests,
+                  resource_manager: ResourceManager,
+                  runtime_draft_len: int = 0):
+        """Consume the shape vote once, including an exceptional forward exit."""
+        try:
+            with super().pad_batch(scheduled_requests, resource_manager,
+                                   runtime_draft_len) as padded_requests:
+                yield padded_requests
+        finally:
+            self.adp_shape_agreement = None
 
     def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Return the agreed token bucket only when every row has a window."""
@@ -1626,7 +1647,8 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         reuse_agreement = bool(
             agreement is not None and agreement.reuse_graph_shape
             and not self.enable_in_graph_sampling
-            and agreement.matches(batch, agreement.iteration, padded=True))
+            and getattr(self, "_policy_iteration", None) is not None
+            and agreement.matches(batch, self._policy_iteration, padded=True))
         if reuse_agreement:
             if (not can_run_cuda_graph
                     or batch.batch_size != agreement.graph_batch_size or
@@ -1675,8 +1697,9 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def _reusable_padding_agreement(
             self, batch: ScheduledRequests) -> Optional[ADPShapeAgreement]:
         agreement = self.adp_shape_agreement
-        if (agreement is not None and agreement.reuse_graph_shape and
-                agreement.matches(batch, agreement.iteration, padded=False)):
+        if (agreement is not None and agreement.reuse_graph_shape
+                and getattr(self, "_policy_iteration", None) is not None and
+                agreement.matches(batch, self._policy_iteration, padded=False)):
             return agreement
         return None
 
@@ -1760,6 +1783,7 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
         self.secondary_padding_dummy_requests = {}
         self.ragged_zero_real_high_rows = 0
         self.adp_shape_agreement = None
+        self._policy_iteration = None
 
     def _on_padding_dummy_release(self) -> None:
         # Releasing a dummy invalidates the agreement that certified it.
@@ -1768,7 +1792,7 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def _preallocate_extra_padding_dummy(self,
                                          resource_manager: ResourceManager,
                                          draft_len: int) -> None:
-        if not getattr(self.spec_config, "confidence_sps_table_path", None):
+        if not getattr(self.spec_config, "confidence_cost_table_path", None):
             return
         if self._get_or_create_padding_dummy(resource_manager,
                                              draft_len,
