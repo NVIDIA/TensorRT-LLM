@@ -16,7 +16,7 @@
 """Generated protobuf bindings used by the SMG adapter."""
 
 try:
-    from smg_grpc_proto.generated import trtllm_service_pb2, trtllm_service_pb2_grpc
+    from smg_grpc_proto.generated import common_pb2, trtllm_service_pb2, trtllm_service_pb2_grpc
 except ModuleNotFoundError as e:
     if e.name != "smg_grpc_proto":
         raise
@@ -27,4 +27,4 @@ except ModuleNotFoundError as e:
         name=e.name,
     ) from e
 
-__all__ = ["trtllm_service_pb2", "trtllm_service_pb2_grpc"]
+__all__ = ["common_pb2", "trtllm_service_pb2", "trtllm_service_pb2_grpc"]

@@ -21,9 +21,14 @@ external routers (e.g., sgl-router) using pre-tokenized input.
 
 Key optimization: Sets detokenize=False in SamplingParams to skip
 detokenization and return token IDs only.
+
+The manager also keeps the engine's load record for the router (see ``load_tracker`` for the
+rules): what it forwarded and what came back, and, while the engine emits iteration statistics
+(``enable_iter_perf_stats``), the engine's own counts and KV usage.
 """
 
 import asyncio
+import time
 import traceback
 from collections.abc import AsyncGenerator
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,6 +41,18 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from .bindings import trtllm_service_pb2 as pb2
+from .load_tracker import (
+    STATS_FRESH,
+    EngineStats,
+    EngineStatsFold,
+    LoadRecord,
+    LoadTracker,
+    compose_record,
+    prefill_sample,
+)
+
+#: How long one blocking read of the engine's iteration statistics waits for a record.
+_STATS_READ_TIMEOUT_S = 0.5
 
 
 class GrpcRequestManager:
@@ -61,6 +78,10 @@ class GrpcRequestManager:
         self.llm = llm
         # Track active requests: request_id -> GenerationResult
         self._rid_to_result: Dict[str, GenerationResult] = {}
+        # The load record's sources: the requests forwarded and the engine's iteration statistics.
+        self._loads = LoadTracker()
+        self._engine_stats = EngineStatsFold()
+        self._stats_task: Optional[asyncio.Task] = None
 
         logger.info("GrpcRequestManager initialized")
 
@@ -93,6 +114,13 @@ class GrpcRequestManager:
             GenerationResult objects containing token IDs (text will be empty
             because detokenize=False)
         """
+        generation_only = (
+            disaggregated_params is not None
+            and getattr(disaggregated_params, "request_type", None) == "generation_only"
+        )
+        started = False
+        sampled = False
+        streamed = 0
         try:
             # Submit to LLM.generate_async which returns a GenerationResult
             # that is an async iterator
@@ -100,6 +128,7 @@ class GrpcRequestManager:
             if multi_modal_data:
                 inputs["multi_modal_data"] = multi_modal_data
 
+            self._loads.forwarded(request_id, len(prompt_token_ids))
             gen_result = self.llm.generate_async(
                 inputs,
                 sampling_params,
@@ -116,6 +145,18 @@ class GrpcRequestManager:
             # Iterate over the async generator
             # GenerationResult implements __aiter__ and __anext__
             async for result in gen_result:
+                if not started:
+                    started = True
+                    self._loads.started(request_id, _cached_tokens(result))
+                total = _generated_tokens(result)
+                if total > streamed:
+                    self._loads.generated(total - streamed)
+                    streamed = total
+                if not sampled:
+                    sample = _prefill_sample_of(result, len(prompt_token_ids), generation_only)
+                    if sample is not None:
+                        sampled = True
+                        self._loads.prefill_computed(*sample)
                 yield result
 
                 if result.finished:
@@ -131,6 +172,7 @@ class GrpcRequestManager:
         finally:
             # Cleanup tracking
             self._rid_to_result.pop(request_id, None)
+            self._loads.finished(request_id)
 
     async def abort(self, request_id: str) -> bool:
         """Abort a running request.
@@ -254,6 +296,145 @@ class GrpcRequestManager:
         """
         return len(self._rid_to_result)
 
+    # ========== The load record ==========
+
+    def load_record(self) -> LoadRecord:
+        """The engine's load as the router reads it now (see ``load_tracker.compose_record``)."""
+        now = time.monotonic()
+        engine = self._engine_stats.current()
+        fresh = engine is not None and now - engine.at <= STATS_FRESH
+        estimate = self._loads.estimate(engine.waiting if fresh else None)
+        return compose_record(
+            estimate,
+            engine,
+            self._engine_stats.kv(),
+            now=now,
+            max_running_fallback=self._max_batch_size(),
+        )
+
+    def start_load_feed(self) -> None:
+        """Start reading the engine's iteration statistics for the load record.
+
+        Only when the engine emits them (``enable_iter_perf_stats``); without them the record
+        carries this manager's own counts and no KV usage. Called on the serving event loop.
+        """
+        if self._stats_task is not None:
+            return
+        if not self._engine_emits_stats():
+            logger.info(
+                "Load record: the engine emits no iteration statistics "
+                "(enable_iter_perf_stats is off); reporting the forwarded requests only"
+            )
+            return
+        self._stats_task = asyncio.get_running_loop().create_task(self._collect_engine_stats())
+        logger.info("Load record: reading the engine's iteration statistics")
+
+    def stop_load_feed(self) -> None:
+        """Stop reading the engine's iteration statistics."""
+        if self._stats_task is not None:
+            self._stats_task.cancel()
+            self._stats_task = None
+
+    def _engine_emits_stats(self) -> bool:
+        args = getattr(self.llm, "args", None)
+        return bool(getattr(args, "enable_iter_perf_stats", False)) and callable(
+            getattr(self.llm, "get_stats", None)
+        )
+
+    def _max_batch_size(self) -> int:
+        args = getattr(self.llm, "args", None)
+        window = getattr(args, "max_batch_size", 0)
+        return window if isinstance(window, int) and window > 0 else 0
+
+    async def _collect_engine_stats(self) -> None:
+        """Drain the engine's iteration-statistics queue on a worker thread.
+
+        This task is the queue's one consumer; a read blocks up to ``_STATS_READ_TIMEOUT_S`` while
+        the engine is idle.
+        """
+        failures = 0
+        while True:
+            try:
+                records = await asyncio.to_thread(self.llm.get_stats, _STATS_READ_TIMEOUT_S)
+                now = time.monotonic()
+                for record in records:
+                    stats = EngineStats.from_iteration(record, now)
+                    if stats is not None:
+                        self._engine_stats.observe(stats)
+                failures = 0
+                if not records:
+                    await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failures += 1
+                if failures == 1:
+                    logger.warning(f"Load record: reading iteration statistics failed: {e}")
+                if failures >= 3:
+                    logger.warning(
+                        "Load record: iteration statistics unavailable; "
+                        "reporting the forwarded requests only"
+                    )
+                    return
+                await asyncio.sleep(_STATS_READ_TIMEOUT_S)
+
+
+def _cached_tokens(result: Any) -> int:
+    cached = getattr(result, "cached_tokens", 0)
+    return cached if isinstance(cached, int) else 0
+
+
+def _generated_tokens(result: Any) -> int:
+    """The tokens generated so far across the result's sequences (cumulative)."""
+    total = 0
+    for completion in getattr(result, "outputs", None) or ():
+        total += len(getattr(completion, "token_ids", None) or ())
+    return total
+
+
+def _steady_seconds(value: Any) -> Optional[float]:
+    """A ``RequestPerfMetrics`` time point as seconds.
+
+    A ``timedelta`` on the engine's steady clock, or a number; ``None`` for anything else.
+    """
+    total_seconds = getattr(value, "total_seconds", None)
+    if callable(total_seconds):
+        return float(total_seconds())
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _prefill_sample_of(
+    result: Any, prompt_tokens: int, generation_only: bool
+) -> Optional[tuple[int, float, float]]:
+    """The capacity sample a result contributes (``load_tracker.prefill_sample``).
+
+    Read from the per-request performance metrics the engine attaches when
+    ``return_perf_metrics`` is set; ``None`` when the result carries none yet or must not
+    calibrate.
+    """
+    for completion in getattr(result, "outputs", None) or ():
+        metrics = getattr(completion, "request_perf_metrics", None)
+        timing = getattr(metrics, "timing_metrics", None)
+        if timing is None:
+            continue
+        aborted = getattr(result, "aborted", None)
+        cancelled = (
+            getattr(completion, "finish_reason", None) == "cancelled"
+            or bool(getattr(result, "error_msg", None))
+            or (callable(aborted) and bool(aborted()))
+        )
+        return prefill_sample(
+            prompt_tokens,
+            _cached_tokens(result),
+            _steady_seconds(getattr(timing, "first_scheduled_time", None)),
+            _steady_seconds(getattr(timing, "first_token_time", None)),
+            cancelled=cancelled,
+            generation_only=generation_only,
+        )
+    return None
+
 
 def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
@@ -375,6 +556,8 @@ def create_sampling_params_from_proto(
         kwargs["return_generation_logits"] = True
     if output_config.exclude_input_from_output:
         kwargs["exclude_input_from_output"] = True
+    if output_config.return_perf_metrics:
+        kwargs["return_perf_metrics"] = True
 
     # Embedding bias
     if embedding_bias:
