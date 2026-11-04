@@ -23,6 +23,7 @@ import re
 import statistics
 import sys
 import tempfile
+import threading
 from typing import Any, List
 
 import cloudpickle
@@ -2131,4 +2132,58 @@ def test_excluded_op_reuses_the_sweep_profiled_in_this_process(monkeypatch):
         tuner.choose_one(op, [GemmRunner()], config,
                          [torch.randn(M, 64, device="cuda"), w])
     assert counts["sweeps"] == 2
+    tuner.clear_cache()
+
+
+class ThreadRecordingRunner(TunableRunner):
+    """One tactic. Records the thread that ran each shape, as a runner whose
+    first call per shape JIT-compiles a kernel would compile it there."""
+    calls: list[tuple[int, int]] = []
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [0]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        type(self).calls.append((inputs[0].shape[0], threading.get_ident()))
+        return inputs[0] @ inputs[1]
+
+
+@pytest.mark.parametrize("threads, env, expect_pool", [
+    (0, None, False),
+    (4, None, True),
+    (4, "0", False),
+])
+def test_parallel_jit_warmup_runs_pending_profiles_on_a_thread_pool(
+        monkeypatch, threads, env, expect_pool):
+    """With parallel_jit_warmup, every not-yet-tuned profile runs once on a
+    thread pool before the profiling loop, which still profiles every profile
+    on the calling thread. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides it."""
+    if env is None:
+        monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", env)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    ThreadRecordingRunner.calls.clear()
+    buckets = (4, 8, 16, 32, 64, 128)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, buckets), ),
+                          parallel_jit_warmup=threads)
+    x = torch.randn(128, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    caller = threading.get_ident()
+    with autotune():
+        tuner.choose_one(f"autotuner_test::parallel_jit_warmup_{threads}_{env}",
+                         [ThreadRecordingRunner()], config, [x, w])
+
+    on_caller = {m for m, t in ThreadRecordingRunner.calls if t == caller}
+    on_pool = sorted(m for m, t in ThreadRecordingRunner.calls if t != caller)
+    assert on_caller == set(buckets)
+    assert on_pool == (sorted(buckets) if expect_pool else [])
     tuner.clear_cache()
