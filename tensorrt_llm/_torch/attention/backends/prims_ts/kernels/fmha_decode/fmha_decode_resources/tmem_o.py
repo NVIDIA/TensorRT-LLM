@@ -505,7 +505,9 @@ class TmemOResource(DecodeGenResourceBase):
                             )
                         else:
                             v_operand = v_operand + Int32(
-                                (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_pv else 128
+                                (min(cfg.head_dim_kv_stage, 128) * 2)
+                                if cfg.use_fp8_pv
+                                else 128
                             )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(

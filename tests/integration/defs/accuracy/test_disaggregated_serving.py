@@ -39,7 +39,8 @@ from defs.common import wait_for_reported_addr
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
-from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
+from tensorrt_llm.llmapi.llm_args import (DFlashDecodingConfig,
+                                          DSparkDecodingConfig,
                                           Eagle3DecodingConfig, LlmArgs,
                                           MTPDecodingConfig)
 from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
@@ -935,7 +936,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
-            "use_kv_cache_manager_v2": False,
+            "use_kv_cache_manager_v2": True,
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -945,16 +946,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
-            # DEFAULT drops the per-test UCX pinning but still runs UCX, since
-            # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
-            # backend but NIXL. Transport coverage is unchanged by this move.
-            # CPP is explicit: this test runs on UCX (see the DEFAULT note
-            # above), and DeepSeek's Python preference would otherwise be
-            # adopted verbatim and fail at creation on a non-NIXL backend.
+            # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+            # fallback; the Python transceiver requires NIXL.
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
         }
         gen_server_config = {
@@ -973,9 +969,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "CPP",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
             },
             "enable_attention_dp": enable_attention_dp,
         }
@@ -989,9 +984,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 "num_instances": 1
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(8)
@@ -1507,12 +1508,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
-            "use_kv_cache_manager_v2": False,
+            "use_kv_cache_manager_v2": True,
         }
+        # NIXL (not DEFAULT) skips the harness's TRTLLM_USE_UCX_KVCACHE=1
+        # fallback; the Python transceiver requires NIXL.
         cache_transceiver_config = {
-            "backend": "DEFAULT",
-            "transceiver_runtime": "CPP",
-            "max_tokens_in_buffer": 8192,
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         }
         ctx_server_config = {
             "pipeline_parallel_size": 1,
@@ -1555,9 +1557,15 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                # A helix transfer deadlock must fail the test, not hold the
+                # 8-GPU slot until the class-level pytest timeout.
+                request_timeout_s=DEFAULT_ACC_EVALUATION_TIMEOUT,
+        ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
     @skip_pre_blackwell
@@ -1639,6 +1647,96 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU"])
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+class TestQwen3_8BDFlash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen3/Qwen3-8B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+    DRAFT_PATH = f"{llm_models_root()}/Qwen3-8B-DFlash-b16"
+    MAX_DRAFT_LEN = 15
+
+    @pytest.mark.skip_less_device(2)
+    def test_gsm8k_1p1d_unified_draft_kv(self):
+        """DFlash draft KV travels with the target KV from ctx to gen.
+
+        The drafter's layers share the target's KV cache manager, so the
+        generation worker drafts from the prompt context computed on the
+        context worker. Verified speculative decoding is lossless, so the
+        GSM8K score cannot see a drafter that starts from an empty context;
+        acceptance length can, so it is gated too.
+        """
+        speculative_config = {
+            "decoding_type": "DFlash",
+            "max_draft_len": self.MAX_DRAFT_LEN,
+            "speculative_model": self.DRAFT_PATH,
+            # The unified draft KV layout requires the TRTLLM drafter backend.
+            "attention_backend": "TRTLLM",
+        }
+        # Both workers run the drafter: the context worker writes the
+        # drafter's prompt KV into the shared manager, which is then
+        # transferred with the target KV.
+        common_server_config = {
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_seq_len": 4096,
+            "max_num_tokens": 4096,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+            },
+            # KVCacheManagerV2 requires the Python transceiver.
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+            "speculative_config": speculative_config,
+        }
+        ctx_server_config = {**common_server_config, "cuda_graph_config": None}
+        gen_server_config = {
+            **common_server_config,
+            "cuda_graph_config": {
+                "max_batch_size": 16,
+                "enable_padding": True,
+            },
+            # Acceptance length is read back off this worker's /metrics.
+            "enable_iter_perf_stats": True,
+            "iter_stats_max_iterations": -1,
+            "max_stats_len": -1,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                extra_env={"TRTLLM_DISAGG_SHARED_DRAFT_KV": "1"},
+                assert_worker_log_contains=
+                "target and draft KV layers share one KV cache manager") as llm:
+            llm.args.speculative_config = DFlashDecodingConfig(
+                max_draft_len=self.MAX_DRAFT_LEN,
+                speculative_model=self.DRAFT_PATH,
+            )
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+            # Drafting from an empty prompt context costs ~17% acceptance
+            # length on this model, well below the 95% floor.
+            acceptance_length = compute_disagg_acceptance_length(llm.serve_url)
+            print(f"[AL] test_gsm8k_1p1d_unified_draft_kv "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv",
+                acceptance_length)
 
 
 @skip_pre_blackwell
@@ -2419,7 +2517,7 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
         # chunked prefill on either worker -- the same pairing the aggregate
-        # TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm uses.
+        # TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm uses.
         common_server_config = {
             "attn_backend": "TRTLLM",
             "tensor_parallel_size": 4,
@@ -2474,16 +2572,17 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
             },
         }
         # MegaMoE CuTe DSL builds its EP ProcessGroup by reusing MASTER_ADDR
-        # / MASTER_PORT when both are set (mega_moe_cute_dsl.py
-        # _pick_rendezvous), and only falls back to picking a free port when
-        # they are not. Under a launcher that exports them -- Slurm in CI --
-        # the context and generation workers are two independent 4-rank jobs
-        # on one node that both inherit the *same* endpoint, so neither group
-        # ever forms: CI showed 68 failed bootstraps against a single
-        # host:port and the generation worker never registered. Hand each
-        # worker its own port so the two rendezvous cannot collide. The
-        # DeepGEMM sibling avoids this by requiring RANK/WORLD_SIZE to be set
-        # too before trusting the launcher's endpoint.
+        # / MASTER_PORT when both are set (ensure_cutedsl_torch_distributed in
+        # tensorrt_llm/_torch/distributed/initialization.py), and only falls
+        # back to picking a free port when they are not. Under a launcher that
+        # exports them -- Slurm in CI -- the context and generation workers are
+        # two independent 4-rank jobs on one node that both inherit the *same*
+        # endpoint, so neither group ever forms: CI showed 68 failed bootstraps
+        # against a single host:port and the generation worker never
+        # registered. Hand each worker its own port so the two rendezvous
+        # cannot collide. The DeepGEMM sibling avoids this by requiring
+        # RANK/WORLD_SIZE to be set too before trusting the launcher's
+        # endpoint.
         ctx_master_port, gen_master_port = pick_distinct_free_ports(2)
 
         # Same long-init reason as TestDeepSeekV4Flash above, plus DSpark
@@ -2691,7 +2790,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "agent_bounce_buffer_enable": True,
                 "kv_cache_bounce_size_mb": 512,
                 # Relax the admission gates for this short CI workload.
                 # The production defaults remain 1024 descriptors / 16 KiB.

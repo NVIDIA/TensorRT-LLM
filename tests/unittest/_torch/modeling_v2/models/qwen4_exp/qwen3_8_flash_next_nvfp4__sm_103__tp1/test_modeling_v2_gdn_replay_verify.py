@@ -29,15 +29,15 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
 )
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
+)
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_torch
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
-)
 
 assert torch.cuda.is_available(), "the GDN verify test requires a CUDA device"
 
@@ -105,6 +105,8 @@ class _Mode:
                 history=HIST,
                 width=t,
                 all_layer_commit=True,
+                # The Triton replay and the manager's all-layer commit, as an fp32 pool runs.
+                cute=False,
             )
             self.meta = ReplayStateUpdateMetadata(self.pnat, self.buf, t, HIST)
             self.mm = SimpleNamespace(

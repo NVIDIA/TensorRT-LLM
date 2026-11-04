@@ -34,7 +34,7 @@ environment:
   model_path: "<model_path>"
   trtllm_repo: "<trtllm_repo>"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
-  cuda_architectures: ""  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
+  cuda_architectures: ""  # Optional CUDA architectures to build for (e.g. "90;100"). If empty, builds for all architectures
   trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
   work_dir: "<full_path_to_work_dir>"
   worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_GRAPH_MIXING_SUPPORT=0"

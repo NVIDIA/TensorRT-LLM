@@ -225,7 +225,11 @@ def _load(runtime: _Runtime, entrypoint: str, path: Path) -> None:
         )
     else:
         runtime.request = SimpleNamespace(
-            lora_task_id="7", py_lora_path=str(path), lora_weights=None, lora_config=None
+            lora_task_id="7",
+            py_lora_path=str(path),
+            lora_weights=None,
+            lora_config=None,
+            py_lora_ckpt_source=runtime.config.lora_ckpt_source,
         )
         runtime.cache.add_request_peft(runtime.request)
 

@@ -44,7 +44,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from .interface import AttentionBackend, AttentionTensorLayout
+from ...cache import BlockCausalKVCacheManager, ForwardPlan
+from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -183,11 +184,20 @@ class _CuDNNGraphBundle:
 
 @dataclass(frozen=True)
 class _CuDNNProblemShape:
-    """Problem geometry shared by all three quantization modes.
+    """Problem geometry of one cuDNN SDPA graph, dense or paged.
 
     Every tensor's strides are part of the geometry, and of the graph cache key:
     the FP8 and unquantized modes hand cuDNN BSHD-strided views of NHD buffers,
     and the MXFP8 mode passes Q/K as views into sequence-padded buffers.
+
+    A paged K/V cache forward (``num_pages > 0``) reads K/V through a page table. Its
+    new tokens are cut into ``b`` consecutive causal blocks of ``s_q`` tokens; each
+    causal block is one cuDNN sequence with its own K/V length, which is how "full
+    within a causal block, causal across causal blocks" is expressed. ``page_strides``
+    is the stride of one K (or V) page inside the pool, so the pool's own layout, K and
+    V pages interleaved, is described to cuDNN without a copy. A paged forward has no
+    dense K/V: ``s_kv`` is 0 and ``k_strides``/``v_strides`` are empty. A dense forward
+    leaves the paged fields at their defaults.
     """
 
     b: int
@@ -201,6 +211,10 @@ class _CuDNNProblemShape:
     k_strides: Tuple[int, ...]
     v_strides: Tuple[int, ...]
     o_strides: Tuple[int, ...]
+    num_pages: int = 0  # pages in the pool view (K/V container length)
+    table_len: int = 0  # page-list length per sequence (cuDNN's per-sequence page table)
+    tokens_per_page: int = 0
+    page_strides: Tuple[int, ...] = ()
 
 
 # ============================================================================
@@ -479,9 +493,12 @@ class CuDNNAttention(AttentionBackend):
                     f"quant_dtype={quant_dtype or ''} {shape} causal={is_causal}"
                 )
                 with torch.cuda.device(device_index):
-                    bundle = cls._build_graph(
-                        quant_dtype, shape, is_causal, sm_scale, out_dtype, with_lse
-                    )
+                    if shape.num_pages > 0:
+                        bundle = cls._build_paged_graph(shape, sm_scale, out_dtype)
+                    else:
+                        bundle = cls._build_graph(
+                            quant_dtype, shape, is_causal, sm_scale, out_dtype, with_lse
+                        )
                 cls._graph_cache[key] = bundle
             return bundle
 
@@ -498,6 +515,197 @@ class CuDNNAttention(AttentionBackend):
             cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
             workspace = torch.empty(bundle.workspace_size, dtype=torch.uint8, device=device)
             bundle.graph.execute(tensor_map, workspace, handle=handle)
+
+    # ------------------------------------------------------------------
+    # Paged K/V cache (causal video rollout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_paged_graph(
+        shape: _CuDNNProblemShape, sm_scale: float, io_dtype: torch.dtype
+    ) -> _CuDNNGraphBundle:
+        s = shape
+        io_dtype = _torch_to_cudnn_dtype(io_dtype)
+        f32, i32 = cudnn.data_type.FLOAT, cudnn.data_type.INT32
+        graph = cudnn.pygraph(
+            io_data_type=io_dtype,
+            intermediate_data_type=f32,
+            compute_data_type=f32,
+            name="visual_gen_sdpa_paged",
+        )
+        # cuDNN graph tensors are [batch, heads, seq, dim]; the batch axis here is the
+        # causal block axis, one cuDNN sequence per block.
+        q_dims = [s.b, s.h_q, s.s_q, s.d_qk]
+        kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_page, s.d_qk]
+        # One K/V length per sequence: no axis on input tensors' head, seq, or dim modes.
+        length_dims = [s.b, 1, 1, 1]
+        # One page id per (sequence, page): the same table for every K/V head.
+        table_dims = [s.b, 1, s.table_len, 1]
+
+        q_t = graph.tensor(name="q", dim=q_dims, stride=list(s.q_strides), data_type=io_dtype)
+        k_t = graph.tensor(
+            name="k", dim=kv_container_dims, stride=list(s.page_strides), data_type=io_dtype
+        )
+        v_t = graph.tensor(
+            name="v", dim=kv_container_dims, stride=list(s.page_strides), data_type=io_dtype
+        )
+        page_table_t = graph.tensor(
+            name="page_table",
+            dim=table_dims,
+            stride=_row_major_stride(*table_dims),
+            data_type=i32,
+        )
+        length_q_t = graph.tensor(
+            name="seq_len_q", dim=length_dims, stride=_row_major_stride(*length_dims), data_type=i32
+        )
+        length_kv_t = graph.tensor(
+            name="seq_len_kv",
+            dim=length_dims,
+            stride=_row_major_stride(*length_dims),
+            data_type=i32,
+        )
+        # cuDNN accepts a page table only together with the padding mask and
+        # explicit lengths; the K/V length is what bounds the read of the table.
+        o_t, _ = graph.sdpa(
+            q=q_t,
+            k=k_t,
+            v=v_t,
+            is_inference=True,
+            attn_scale=sm_scale,
+            use_padding_mask=True,
+            seq_len_q=length_q_t,
+            seq_len_kv=length_kv_t,
+            paged_attention_k_table=page_table_t,
+            paged_attention_v_table=page_table_t,
+            paged_attention_max_seq_len_kv=s.table_len * s.tokens_per_page,
+        )
+        o_t.set_output(True).set_dim(q_dims).set_stride(list(s.o_strides)).set_data_type(io_dtype)
+        graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        inputs = {
+            "q": q_t,
+            "k": k_t,
+            "v": v_t,
+            "page_table": page_table_t,
+            "seq_len_q": length_q_t,
+            "seq_len_kv": length_kv_t,
+        }
+        return _CuDNNGraphBundle(
+            graph=graph,
+            workspace_size=graph.get_workspace_size(),
+            inputs=inputs,
+            outputs={"o": o_t},
+        )
+
+    def _run_paged(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        plan: ForwardPlan,
+        attention_mask: PredefinedAttentionMask,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Write ``k``/``v`` at ``staging_offset``, then attend over the cache.
+
+        ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The
+        first ``plan.num_tokens`` rows are real; rows past that are padding and are
+        neither written nor attended. The plan cuts the real tokens into consecutive
+        causal blocks that are causal across each other. Output is ``[1, S, H, D]`` with
+        zero padding rows.
+        """
+        plan.validate()
+        kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
+        if self._resolve_mask(attention_mask, key_padding_mask):
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
+        if self.quant_dtype is not None:
+            raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
+        self._validate_inputs(q, k, v)
+        batch, num_rows, num_heads, head_dim = q.shape
+        if batch != 1 or k.shape[1] != num_rows:
+            raise ValueError(
+                "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
+            )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
+        if q.stride(3) != 1:
+            raise ValueError("q must be contiguous along head_dim.")
+        num_tokens = plan.num_tokens
+        if num_tokens > num_rows:
+            raise ValueError(
+                f"the plan's {num_tokens} tokens exceed the {num_rows} rows: it counts the real "
+                "tokens; rows past it are padding."
+            )
+        if num_tokens < num_rows:
+            q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
+        causal_block_size, num_causal_blocks = plan.causal_block_size, plan.num_causal_blocks
+        device = q.device
+        # Cut to the last layer's view, which still covers every page-list entry, so
+        # all layers share one num_pages and therefore one cuDNN graph.
+        buf = kv_cache.kv_buffer(self.layer_idx)[: kv_cache.kv_buffer(-1).shape[0]]
+        if q.dtype != buf.dtype:
+            raise TypeError(f"q is {q.dtype} but the cache holds {buf.dtype}")
+        # Write ``k``/``v`` to the KV cache at ``staging_offset``.
+        kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size)
+        # The cache keeps lengths and page lists for every causal block of its
+        # max_staged_tokens, in device tensors that commit() refreshes in place.
+        seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
+        seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
+
+        q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
+        causal_block_pages = kv_cache.causal_block_pages(causal_block_size)[:num_causal_blocks]
+        num_pages, _, h_kv, tokens_per_page, _ = buf.shape
+        shape = _CuDNNProblemShape(
+            b=num_causal_blocks,
+            h_q=num_heads,
+            h_kv=h_kv,
+            s_q=causal_block_size,
+            s_kv=0,
+            d_qk=head_dim,
+            d_v=head_dim,
+            q_strides=(q_seg.stride(0), q_seg.stride(2), q_seg.stride(1), q_seg.stride(3)),
+            k_strides=(),
+            v_strides=(),
+            # The output lands in an [S, H, D] buffer per causal block, described as
+            # [B, H, S, D].
+            o_strides=(causal_block_size * num_heads * head_dim, head_dim, num_heads * head_dim, 1),
+            num_pages=num_pages,
+            table_len=causal_block_pages.shape[1],
+            tokens_per_page=tokens_per_page,
+            page_strides=tuple(buf[:, 0].stride()),
+        )
+        bundle = self._get_or_build_graph(
+            None,
+            shape,
+            is_causal=False,
+            sm_scale=self.scale,
+            out_dtype=buf.dtype,
+            with_lse=False,
+            device=device,
+        )
+        full = torch.empty(1, num_rows, num_heads, head_dim, dtype=buf.dtype, device=device)
+        output = full[:, :num_tokens]
+        if num_tokens < num_rows:
+            full[:, num_tokens:].zero_()
+        tensor_map = {
+            bundle.inputs["q"]: q_seg,
+            bundle.inputs["k"]: buf[:, 0],
+            bundle.inputs["v"]: buf[:, 1],
+            bundle.inputs["page_table"]: causal_block_pages,
+            bundle.inputs["seq_len_q"]: seq_len_q,
+            bundle.inputs["seq_len_kv"]: seq_len_kv,
+            bundle.outputs["o"]: output.view(
+                num_causal_blocks, causal_block_size, num_heads, head_dim
+            ),
+        }
+        self._execute_graph(bundle, tensor_map, device)
+        return full
 
     # ------------------------------------------------------------------
     # Forward
@@ -527,45 +735,6 @@ class CuDNNAttention(AttentionBackend):
                     # Unquantized and MXFP8 attention don't need device-side constants.
                     pass
             return scales
-
-    @staticmethod
-    @torch.compiler.disable
-    def _is_fused_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-        """Whether Q, K, and V are gap-free slices from one fused-QKV buffer.
-
-        At TRTLLM/VisualGen, Attention.get_qkv() at QKVMode.FUSE_QKV produces this type of buffer,
-        where one qkv_proj output is split along the last dim.
-        """
-        if q.dim() != 4 or k.shape != v.shape or q.shape[3] != k.shape[3]:
-            return False
-        if q.dtype != k.dtype or q.dtype != v.dtype:
-            return False
-        storage_ptr = q.untyped_storage().data_ptr()
-        if any(x.untyped_storage().data_ptr() != storage_ptr for x in (k, v)):
-            return False
-
-        b, s, h_q, d = q.shape
-        h_kv = k.shape[2]
-        q_dim, kv_dim = h_q * d, h_kv * d
-        total = q_dim + 2 * kv_dim
-
-        # Heads packed within each slice, and one shared row pitch across all three.
-        for x, h in ((q, h_q), (k, h_kv), (v, h_kv)):
-            if x.shape[:3] != (b, s, h):
-                return False
-            if x.stride() != (s * total, total, d, 1):
-                return False
-
-        base = q.storage_offset()
-        return k.storage_offset() == base + q_dim and v.storage_offset() == base + q_dim + kv_dim
-
-    @staticmethod
-    @torch.compiler.disable
-    def _as_fused_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        """Zero-copy [B, S, q_dim + 2 * kv_dim] view of the parent QKV buffer."""
-        b, s, h_q, d = q.shape
-        total = (h_q + 2 * k.shape[2]) * d
-        return torch.as_strided(q, (b, s, total), (s * total, total, 1), q.storage_offset())
 
     def _validate_inputs(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         for name, tensor in (("q", q), ("k", k), ("v", v)):
@@ -630,10 +799,10 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and self._is_fused_qkv(q, k, v):
+            if d_qk == d_v and is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
-                qkv_q, descale = _quantize_fp8(self._as_fused_qkv(q, k, v))
+                qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
                 q_q, k_q, v_q = (
                     t.unflatten(-1, (h, d_qk))
                     for t, h in zip(
@@ -720,6 +889,7 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
+        kv: Optional[ForwardPlan] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -730,10 +900,19 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
+            kv: A ``ForwardPlan`` from a ``BlockCausalKVCacheManager``. When given,
+                ``k``/``v`` are the new tokens only: they are written at
+                ``staging_offset`` and attention runs over everything cached before them
+                plus themselves, full within a causal block and causal across causal
+                blocks. The first ``kv.num_tokens`` rows are real; rows past them are
+                padding added so the sequence splits evenly across ranks, neither written
+                to the cache nor attended, and their output rows are zero.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
+        if kv is not None:
+            return self._run_paged(q, k, v, kv, attention_mask, key_padding_mask)
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
@@ -754,6 +933,8 @@ class CuDNNAttention(AttentionBackend):
             output: ``[B, S_q, H, D_v]``
             lse: ``[B, S_q, H]`` float32
         """
+        if kwargs.get("kv") is not None:
+            raise NotImplementedError("forward_with_lse does not support a K/V cache.")
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
         )
@@ -777,6 +958,9 @@ class CuDNNAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return False
+
+    def support_kv_cache(self) -> bool:
+        return self.quant_dtype is None
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

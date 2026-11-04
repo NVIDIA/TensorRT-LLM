@@ -16,7 +16,7 @@
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import math
 import numbers
@@ -24,6 +24,8 @@ import struct
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
+
+from ._compile_cache import build_and_load_attention_kernel
 
 from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
 
@@ -694,8 +696,6 @@ def _validate_dtype_pair(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    *,
-    allow_fp8_bf16_output: bool = False,
 ) -> None:
     _dtype_key(q_dtype)
     _dtype_key(k_dtype)
@@ -723,25 +723,16 @@ def _validate_dtype_pair(
             q_dtype == torch.float8_e4m3fn
             and matching_kv
             and k_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and output_dtype
-            in (
-                (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-                if allow_fp8_bf16_output
-                else (torch.float16, torch.float8_e4m3fn)
-            )
+            and output_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
     )
     if not supported:
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
-                if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
-            )
-            + "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
-            + "and BF16 Q/K + FP8 V; got "
-            + f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
+            "FP8-E4M3->FP16/BF16/FP8-E4M3; "
+            "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
+            "and BF16 Q/K + FP8 V; got "
+            f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
         )
 
 
@@ -1357,7 +1348,7 @@ def _resolve_decode_launch_spec(
                 head_dim=head_dim,
                 page_size=page_size,
                 max_kv_len=max_kv_len,
-                seq_len_q=seq_len_q,
+                group_size=seq_len_q,
                 q_dtype_key=q_dtype_key,
                 k_dtype_key=k_dtype_key,
                 v_dtype_key=v_dtype_key,
@@ -1487,12 +1478,16 @@ def _make_decode_compile_spec(
     kv_prefix_mode: Literal["dynamic", "planned_full"],
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
+    flat_native_kv_tma: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
+    config_items = dict(launch_spec.config.compile_signature())
+    config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
+    config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
     return _DecodeCompileSpec(
         device_index=device_index,
-        config_items=launch_spec.config.compile_signature(),
+        config_items=tuple(config_items.items()),
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -1905,8 +1900,8 @@ def _get_compiled_decode(
             ),
         )
 
-    with torch.cuda.device(device_index):
-        compiled_main = cute.compile(
+    def compile_main():
+        return cute.compile(
             main_tensor_adapter,
             q_fake,
             k_fake,
@@ -1944,28 +1939,38 @@ def _get_compiled_decode(
             static_native_uniform_kv,
             options=_COMPILE_OPTIONS,
         )
+
+    def compile_reducer():
+        assert reduction_tensor_adapter is not None
+        return cute.compile(
+            reduction_tensor_adapter,
+            out_fake,
+            seq_lens_fake,
+            cu_seqlens_q_fake,
+            partial_o_fake,
+            partial_stats_fake,
+            attention_sinks_fake,
+            Float32(1.0),
+            Float32(1.0),
+            direct_q1_fake,
+            stream_fake,
+            cfg,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            max_kv_len,
+            static_full_split_prefix,
+            options=_COMPILE_OPTIONS,
+        )
+
+    with torch.cuda.device(device_index):
+        compiled_main = build_and_load_attention_kernel(
+            "decode", "main", compile_spec, _COMPILE_OPTIONS, compile_main
+        )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
-            assert reduction_tensor_adapter is not None
-            compiled_reducer = cute.compile(
-                reduction_tensor_adapter,
-                out_fake,
-                seq_lens_fake,
-                cu_seqlens_q_fake,
-                partial_o_fake,
-                partial_stats_fake,
-                attention_sinks_fake,
-                Float32(1.0),
-                Float32(1.0),
-                direct_q1_fake,
-                stream_fake,
-                cfg,
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                max_kv_len,
-                static_full_split_prefix,
-                options=_COMPILE_OPTIONS,
+            compiled_reducer = build_and_load_attention_kernel(
+                "decode", "reducer", compile_spec, _COMPILE_OPTIONS, compile_reducer
             )
 
     return compiled_main, compiled_reducer
@@ -2486,6 +2491,7 @@ class PrimsTSBatchDecodePlan:
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
     _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+    _flat_locator_heads: int = 1
 
     def run(
         self,
@@ -2854,7 +2860,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     head_dim: int,
     page_size: int,
     max_kv_len: int,
-    seq_len_q: int,
+    group_size: int,
     q_dtype_key: str,
     k_dtype_key: str,
     v_dtype_key: str,
@@ -2875,7 +2881,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
     _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
-        seq_len_q,
+        group_size,
         num_qo_heads,
         num_kv_heads,
     )
@@ -2905,7 +2911,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         )
 
     launch = _sparse_policy.select_sparse_launch(
-        group_size=seq_len_q,
+        group_size=group_size,
         heads_q_per_kv=heads_q_per_kv,
         head_dim=head_dim,
         q_dtype_key=q_dtype_key,
@@ -2935,14 +2941,14 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         "scheduler_warp_idx": 13,
         "clc_load_warp_idx": 16,
         "page_offsets_warp_idx": 14,
-        "page_offsets_num_warps": 2 if seq_len_q == 1 else 1,
+        "page_offsets_num_warps": 2 if group_size == 1 else 1,
         "load_warp_idx": 16,
         # FP8's predicated TMA helper constructs coordinates in every load
         # lane, so Q1 needs only one producer warpgroup. BF16 distributes page
         # fragments across two producer warpgroups. Grouped routes keep
         # their qualified two-warpgroup schedule for both dtypes.
         "load_num_warps": (
-            4 if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn" else 8
+            4 if group_size == 1 and q_dtype_key == "float8_e4m3fn" else 8
         ),
     }
     if launch.use_keeps_mma_ab:
@@ -2956,7 +2962,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         ),
         splits_kv=launch.splits_kv,
         max_splits_kv=launch.splits_kv,
-        min_loop_iters_per_split=(1 if seq_len_q == 1 else MIN_LOOP_ITERS_PER_SPLIT),
+        min_loop_iters_per_split=(1 if group_size == 1 else MIN_LOOP_ITERS_PER_SPLIT),
     )
 
 
@@ -3169,7 +3175,7 @@ def validate_q_token_kv_block_sparse_group_size(
     num_qo_heads: int,
     num_kv_heads: int,
     *,
-    group_size: int,
+    group_size: int = 1,
 ) -> int:
     """Validate a QToken-KvBlock-Sparse-Attention Q1--Q8 group.
 
@@ -3200,7 +3206,8 @@ def validate_q_token_kv_block_sparse_group_size(
         Number of key/value heads.
     group_size : int
         Caller-selected number of query rows per QToken-KvBlock-Sparse-Attention route. Supported values
-        are Q1--Q8, subject to the TileQ128 head-capacity bound.
+        are Q1--Q8, subject to the TileQ128 head-capacity bound. Defaults to
+        one (no grouping).
 
     Returns
     -------
@@ -3222,16 +3229,17 @@ def make_q_token_kv_block_sparse_qo_indptr(
     query_start_loc_cpu: torch.Tensor,
     num_query_tokens: int,
     *,
-    group_size: int,
+    group_size: int = 1,
     device: Optional[Union[int, str, torch.device]] = None,
 ) -> torch.Tensor:
     """Build request-safe QToken-KvBlock-Sparse-Attention route offsets.
 
     ``query_start_loc_cpu`` contains cumulative offsets for real requests.
     Every request is chunked independently, so its final route may contain
-    fewer than ``group_size`` rows. Any inert CUDA-graph padding suffix is
-    partitioned separately. The returned Int32 ``qo_indptr`` can be passed to
-    the packed-Q wrapper together with planned ``seq_len_q=group_size``.
+    fewer than ``group_size`` rows. The default is one (no query grouping).
+    Any inert CUDA-graph padding suffix is partitioned separately. Pass the
+    returned Int32 ``qo_indptr`` to a packed-Q wrapper planned with the same
+    ``group_size``.
 
     Parameters
     ----------
@@ -3243,7 +3251,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         Total flattened query-row count, including any inert CUDA-graph
         padding suffix.
     group_size : int
-        Maximum number of rows in each request-safe QToken-KvBlock-Sparse-Attention route.
+        Maximum rows per request-safe query group, default one (no grouping).
     device : int, str, torch.device, or None
         Destination device for the returned offsets. By default, PyTorch's
         default tensor device is used.
@@ -3350,6 +3358,7 @@ def _prepare_prims_ts_batch_decode_plan(
     page_size: Optional[int],
     kv_scale_factors: Optional[PagedKVScaleFactors] = None,
     q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
+    query_major_memberships: bool = False,
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
     split_kv: bool = True,
@@ -3357,6 +3366,7 @@ def _prepare_prims_ts_batch_decode_plan(
     direct_q1_max_model_len: Optional[int] = None,
     direct_q1_sparse_block_size: int = 4,
     share_pattern_across_kv_heads: bool = True,
+    allow_head_aware_locators: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3432,7 +3442,6 @@ def _prepare_prims_ts_batch_decode_plan(
         k_cache.dtype,
         v_cache.dtype,
         output_dtype,
-        allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
     )
     k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
@@ -3466,6 +3475,12 @@ def _prepare_prims_ts_batch_decode_plan(
         share_pattern_across_kv_heads,
     )
     spec = _resolve_decode_launch_spec(*policy_args)
+    if query_major_memberships:
+        if not spec.config.supports_query_major_memberships:
+            raise ValueError(
+                "query-major memberships require one G2..G8 Keeps/page-4 CTA"
+            )
+        spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
     if spec.config.uses_q_token_kv_block_sparse_page_membership:
         if q_token_kv_block_sparse_page_memberships is None:
             raise ValueError(
@@ -3525,6 +3540,16 @@ def _prepare_prims_ts_batch_decode_plan(
             kv_block_size=direct_q1_sparse_block_size,
             page_capacity=max_num_pages,
         )
+    flat_native_kv_tma = (
+        use_q_token_kv_block_sparse_route
+        and spec.config.uses_staged_one_inst_tmem_p
+        and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
+        and spec.config.has_storage_subpages
+        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and k_cache.is_contiguous()
+        and normalized_cache.v_cache.is_contiguous()
+        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+    )
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -3542,6 +3567,7 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
         direct_q1_spec=direct_q1_spec,
+        flat_native_kv_tma=flat_native_kv_tma,
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)
@@ -3572,6 +3598,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
         _direct_q1_inputs=direct_q1_inputs,
+        _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
     )
     return plan, out
 

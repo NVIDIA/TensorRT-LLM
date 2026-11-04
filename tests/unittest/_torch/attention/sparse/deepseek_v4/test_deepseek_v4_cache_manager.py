@@ -62,6 +62,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
     BufferConfig,
+    CacheTier,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -989,6 +990,15 @@ class TestDeepseekV4CacheManager:
 
                 first_cache = cache_manager.kv_cache_map[first.py_request_id]
                 cache_manager.suspend_request(first)
+
+                # The pressure request displaces the suspended one only when the GPU tier holds
+                # no slack beyond its slot floors, which depends on how the allocator packed the
+                # pools. Shrink the tier to the least the floors allow; resize refuses anything
+                # smaller.
+                gpu_quota = cache_manager.impl.get_quota(0)
+                grain = _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, gpu_quota)
+                while cache_manager.impl.resize(0, gpu_quota - grain):
+                    gpu_quota -= grain
 
                 pressure = self._create_request(request_id=1, prompt_len=pressure_len)
                 requests.append(pressure)
