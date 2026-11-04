@@ -61,7 +61,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -122,7 +121,6 @@ _PROBE_MIN_LOADS = 32
 _POLL_FLOATS = 128
 #: The tail stages its forget-gate tile in shared memory for 16-byte stores at this size.
 _STAGE_MIN_ELEMS = 4096
-_SMEM_CAPACITY = utils.get_smem_capacity_in_bytes("sm_100")
 #: L2 eviction hint for the streamed weight (CacheHintSm90::EVICT_FIRST).
 _EVICT_FIRST = 0x12F0000000000000
 #: Partial-tile workspace per device: two halves used by alternate launches.
@@ -1460,6 +1458,16 @@ class K3KdaFabUmmaKernel(_FabTail):
 # ---------------------------------------------------------------------------
 
 
+@functools.cache
+def _smem_capacity_of(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+
+
+def _smem_capacity() -> int:
+    """Shared memory one CTA may use on the current device."""
+    return _smem_capacity_of(torch.cuda.current_device())
+
+
 def _geometry(cfg: FabConfig, n_tiles: int, n2: int, k: int) -> dict:
     tg = cfg.ntg * _N_TILE
     groups = _ceil_div(n_tiles, cfg.ntg)
@@ -1489,7 +1497,7 @@ def _geometry(cfg: FabConfig, n_tiles: int, n2: int, k: int) -> dict:
         w_chunk_bytes = MAX_N1 * _ROW_BYTES
         x_chunk_bytes = _UMMA_M * _ROW_BYTES
         sw_bytes = max_chunks * w_chunk_bytes
-        budget = _SMEM_CAPACITY - sw_bytes - 4096
+        budget = _smem_capacity() - sw_bytes - 4096
         x_stages = max(1, min(max_chunks, budget // x_chunk_bytes))
         sx_bytes = x_stages * x_chunk_bytes
         alias_need = max(
@@ -1573,7 +1581,7 @@ def validate_config(cfg: FabConfig, n_tiles: int, n1: int, n2: int, k: int, num_
         raise ValueError(f"{cfg} needs {geo['num_warps']} warps")
     if geo["items"] > geo["num_ctas"]:
         raise ValueError(f"{cfg}: {geo['items']} tail items > {geo['num_ctas']} CTAs")
-    if geo["smem_bytes"] > _SMEM_CAPACITY:
+    if geo["smem_bytes"] > _smem_capacity():
         raise ValueError(f"{cfg} needs {geo['smem_bytes']} B of shared memory")
     if geo["workspace_bytes"] > _WS_HALF_BYTES:
         raise ValueError(f"{cfg} needs {geo['workspace_bytes']} B of workspace")
@@ -1595,7 +1603,7 @@ def _base_config(n_tiles: int) -> FabConfig:
 
 
 @functools.cache
-def default_config(n_tiles: int, n2: int = 768, k: int = 7168) -> FabConfig:
+def default_config(n_tiles: int, n2: int, k: int) -> FabConfig:
     """Tiling for ``ceil(M / 8) = n_tiles``, tuned on GB300 next to the concurrent ``qkvg`` GEMM.
 
     The concurrent ``qkvg`` GEMM (``k3_fp8w_lowm_gemm``, clusters of 4-5 CTAs) occupies 96-120 of
@@ -1620,7 +1628,7 @@ def default_config(n_tiles: int, n2: int = 768, k: int = 7168) -> FabConfig:
 
     def fits(cfg: FabConfig) -> bool:
         geo = _geometry(cfg, n_tiles, n2, k)
-        return geo["items"] <= geo["num_ctas"] and geo["smem_bytes"] <= _SMEM_CAPACITY
+        return geo["items"] <= geo["num_ctas"] and geo["smem_bytes"] <= _smem_capacity()
 
     cfg = with_tail(base)
     ntb = base.ntb * 2
@@ -1759,35 +1767,32 @@ def run_k3_kda_fab_fa(
     w_bfa: torch.Tensor,
     num_heads: int,
     bfa: torch.Tensor,
-    w_fb: torch.Tensor | None = None,
+    w_fb: torch.Tensor,
     *,
     config: FabConfig | None = None,
     use_pdl: bool = True,
 ) -> None:
     """f_a mode: launch into ``bfa`` (``bf16 [M, N1]`` contiguous): ``bf16(x @ W_bfa^T)``, bitwise
     the ``f_a`` and ``beta`` of :func:`run_k3_kda_fab` with the same ``config``. ``w_fb``
-    (``bf16 [N2, 128]``, optional) is only warmed in L2 for the decode that applies it; ``N2``
-    (768 without it) also selects the default tiling like in the full kernel."""
+    (``bf16 [N2, 128]``) is only warmed in L2 for the decode that applies it; ``N2`` also selects
+    the default tiling like in the full kernel."""
     m, k = x.shape
     n_tiles = _ceil_div(m, _N_TILE)
-    n2 = w_fb.shape[0] if w_fb is not None else 768
+    n2 = w_fb.shape[0]
     cfg = config if config is not None else default_config(n_tiles, n2, k)
     if not _fits_device(cfg, n_tiles, n2, k, x.device):
         raise ValueError(f"{cfg}: more CTAs than SMs")
-    compiled = _compiled(
-        cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads, use_pdl, True, w_fb is not None
-    )
+    compiled = _compiled(cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads, use_pdl, True)
     words, ws = _device_state(x.device)
     w1 = make_ptr(cutlass.BFloat16, w_bfa.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    w2_addr = w_fb.data_ptr() if w_fb is not None else w_bfa.data_ptr()
     compiled(
         w1,
         make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         # The W_fb TMA operand is unused in f_a mode: any 16-byte aligned buffer of at least
-        # N2 x 128 BF16 (W_bfa without w_fb).
+        # N2 x 128 BF16.
         w1,
         Int32(m),
-        Int64(w2_addr),
+        Int64(w_fb.data_ptr()),
         Int64(bfa.data_ptr()),
         Int64(bfa.data_ptr()),
         Int64(ws.data_ptr()),
@@ -1798,47 +1803,25 @@ def run_k3_kda_fab_fa(
 
 @torch.library.custom_op("trtllm::k3_kda_fab_fa", mutates_args=())
 def k3_kda_fab_fa(
-    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: Optional[torch.Tensor] = None
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor
 ) -> torch.Tensor:
     """``bfa = bf16(x @ w_bfa^T)`` (``bf16 [M, N1]``) by the fused fab kernel's GEMM 1 and
     reduction (f_a mode): columns ``[0, 128)`` are ``f_a``, ``[128, 128 + num_heads)`` ``beta``,
     bitwise as inside :func:`k3_kda_fab_proj` (same ``W_fb`` row count). ``w_fb`` is only warmed
     in L2. Accepts what :func:`can_use_k3_kda_fab_fa` does."""
-    _check_fa_inputs(x, w_bfa, num_heads, w_fb)
+    _check_inputs(x, w_bfa, w_fb, num_heads)
     bfa = torch.empty((x.shape[0], w_bfa.shape[0]), dtype=torch.bfloat16, device=x.device)
     run_k3_kda_fab_fa(x, w_bfa, num_heads, bfa, w_fb)
     return bfa
 
 
 @k3_kda_fab_fa.register_fake
-def _(
-    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+def _(x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor) -> torch.Tensor:
     return x.new_empty((x.shape[0], w_bfa.shape[0]))
 
 
-def _check_fa_inputs(
-    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor | None = None
-) -> None:
-    """:func:`_check_inputs` with an optional ``W_fb`` operand."""
-    if w_fb is not None:
-        _check_inputs(x, w_bfa, w_fb, num_heads)
-        return
-    for name, t in (("x", x), ("w_bfa", w_bfa)):
-        if t.dtype != torch.bfloat16 or t.dim() != 2 or not t.is_contiguous():
-            raise ValueError(f"{name} must be a contiguous 2D bfloat16 tensor")
-        if not t.is_cuda or t.device != x.device or t.data_ptr() % 16:
-            raise ValueError(f"{name} must be a 16-byte aligned tensor on x's CUDA device")
-    m, k = x.shape
-    n1 = w_bfa.shape[0]
-    if w_bfa.shape[1] != k or not 1 <= m <= MAX_M or k % _K_CHUNK:
-        raise ValueError(f"unsupported shapes: x {tuple(x.shape)}, w_bfa {tuple(w_bfa.shape)}")
-    if n1 % 8 or not FA_DIM < n1 <= MAX_N1 or not 1 <= num_heads <= n1 - FA_DIM:
-        raise ValueError(f"N1={n1} / num_heads={num_heads} unsupported")
-
-
 def can_use_k3_kda_fab_fa(
-    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor | None = None
+    x: torch.Tensor, w_bfa: torch.Tensor, num_heads: int, w_fb: torch.Tensor
 ) -> bool:
     """Whether :func:`k3_kda_fab_fa` accepts these inputs (non-raising check)."""
     if not x.is_cuda or not _is_supported_device(x.device.index):
@@ -1846,10 +1829,10 @@ def can_use_k3_kda_fab_fa(
     if torch.cuda.is_current_stream_capturing() and _device_index(x.device) not in _STATE:
         return False
     try:
-        _check_fa_inputs(x, w_bfa, num_heads, w_fb)
+        _check_inputs(x, w_bfa, w_fb, num_heads)
         n_tiles = _ceil_div(x.shape[0], _N_TILE)
         k = x.shape[1]
-        n2 = w_fb.shape[0] if w_fb is not None else 768
+        n2 = w_fb.shape[0]
         cfg = default_config(n_tiles, n2, k)
         validate_config(cfg, n_tiles, w_bfa.shape[0], n2, k, num_heads)
     except ValueError:
