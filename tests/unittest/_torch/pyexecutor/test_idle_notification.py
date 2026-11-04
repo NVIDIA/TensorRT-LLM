@@ -5,7 +5,9 @@
 
 import copy
 import datetime
+import os
 import queue
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -833,7 +835,7 @@ def test_queue_cleanup_error_does_not_skip_peers_normal_collective(monkeypatch) 
     assert executor.request_broadcaster.idle_notification is None
 
 
-def test_mismatched_rank_enablement_rejects_before_socket_or_communicator_dup(monkeypatch) -> None:
+def test_one_rank_opt_out_disables_group_before_socket_or_communicator_dup(monkeypatch) -> None:
     from tensorrt_llm import _utils
     from tensorrt_llm._torch import distributed
     from tensorrt_llm._torch.pyexecutor.idle_notification_runtime import prepare_idle_notification
@@ -846,6 +848,88 @@ def test_mismatched_rank_enablement_rejects_before_socket_or_communicator_dup(mo
     monkeypatch.setattr(_utils, "mpi_comm", lambda: comm)
     monkeypatch.setenv("TLLM_MPI_IDLE_NOTIFICATION", "0")
 
-    with pytest.raises(ValueError, match="match on every MPI rank"):
-        prepare_idle_notification(SimpleNamespace(dist=FakeMPIDist()))
+    assert prepare_idle_notification(SimpleNamespace(dist=FakeMPIDist())) is None
     comm.Dup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "unset", "auto", "alias", "mixed_alias", "opt_out", "peer_opt_out", "non_mpi",
+        "missing_map", "bad_map", "loopback", "bind_failure", "thread_capability",
+        "world_mismatch", "progress_mode", "peer_unavailable", "invalid_selection",
+    ],
+)
+def test_auto_selection_uses_capabilities_without_force(scenario) -> None:
+    from unittest.mock import MagicMock
+
+    from tensorrt_llm import _utils
+    from tensorrt_llm._torch import distributed
+    from tensorrt_llm._torch.pyexecutor import idle_notification_runtime as runtime
+
+    class FakeMPIDist(SimpleNamespace):
+        pass
+
+    executor = _ordinary_executor()
+    executor.dist = FakeMPIDist(rank=0, world_size=2, tp_size=2, cp_size=1, pp_size=1)
+    selection = "1" if scenario == "alias" else "auto"
+    if scenario == "opt_out":
+        selection = "0"
+    elif scenario == "invalid_selection":
+        selection = "invalid"
+    selections = [selection, selection]
+    if scenario == "mixed_alias":
+        selections = ["auto", "1"]
+    elif scenario == "peer_opt_out":
+        selections = ["auto", "0"]
+    mpi = SimpleNamespace(THREAD_MULTIPLE=3, Query_thread=Mock(return_value=3))
+    comm = SimpleNamespace(
+        Get_size=Mock(return_value=2), Get_rank=Mock(return_value=0), Dup=Mock()
+    )
+
+    def gather(value):
+        if value == selection:
+            return selections
+        return [value, "peer unavailable" if scenario == "peer_unavailable" else None]
+
+    comm.allgather = Mock(side_effect=gather)
+    socket_factory = MagicMock()
+    if scenario == "bind_failure":
+        socket_factory.return_value.__enter__.return_value.bind.side_effect = OSError("unavailable")
+    elif scenario == "thread_capability":
+        mpi.Query_thread.return_value = 0
+    elif scenario == "world_mismatch":
+        comm.Get_size.return_value = 3
+    elif scenario == "progress_mode":
+        executor._resource_governor_enabled = True
+    elif scenario == "non_mpi":
+        executor.dist = object()
+    with (
+        patch.object(distributed, "MPIDist", FakeMPIDist, create=True),
+        patch.object(_utils, "mpi_comm", lambda: comm, create=True),
+        patch.dict(sys.modules, {"mpi4py": SimpleNamespace(MPI=mpi)}),
+        patch.object(runtime.socket, "gethostname", return_value="worker.example"),
+        patch.object(runtime.socket, "socket", socket_factory),
+        patch.dict(os.environ),
+    ):
+        os.environ.pop("TLLM_MPI_IDLE_NOTIFICATION", None)
+        os.environ.pop("TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES", None)
+        if scenario != "unset":
+            os.environ["TLLM_MPI_IDLE_NOTIFICATION"] = selection
+        if scenario != "missing_map":
+            os.environ["TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES"] = '{"worker":"192.0.2.1"}'
+        if scenario == "bad_map":
+            os.environ["TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES"] = "not JSON"
+        elif scenario == "loopback":
+            os.environ["TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES"] = '{"worker":"127.0.0.1"}'
+        if scenario == "invalid_selection":
+            with pytest.raises(ValueError, match="selection must be"):
+                runtime.prepare_idle_notification(executor)
+            comm.Dup.assert_not_called()
+            return
+        result = runtime.prepare_idle_notification(executor)
+    expected = scenario in ("unset", "auto", "alias", "mixed_alias")
+    assert isinstance(result, IdleNotificationRuntime) is expected
+    assert comm.Dup.call_count == int(expected)
+    if scenario in ("opt_out", "peer_opt_out", "non_mpi"):
+        socket_factory.assert_not_called()

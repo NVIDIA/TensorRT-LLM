@@ -260,25 +260,28 @@ class IdleNotificationRuntime:
 
 
 def prepare_idle_notification(executor: PyExecutor) -> IdleNotificationRuntime | None:
-    """Validate all ranks and duplicate the communicator before workers start.
+    """Automatically select notification when every rank meets its prerequisites.
 
-    The feature is default-off. Its interface map is explicit so an MPI world
-    spanning hosts never silently connects followers through loopback.
+    An explicit opt-out or unavailable capability keeps the existing wait.
+    The interface map remains explicit: loopback is not a multi-host route.
     """
     from ..distributed import MPIDist
 
-    selected = os.environ.get("TLLM_MPI_IDLE_NOTIFICATION", "0")
+    selected = os.environ.get("TLLM_MPI_IDLE_NOTIFICATION", "auto")
     if not isinstance(executor.dist, MPIDist):
-        if selected != "0":
-            raise ValueError("Idle notification requires the MPI backend")
+        if selected not in ("auto", "0", "1"):
+            raise ValueError("Idle notification selection must be auto, 0 or 1")
         return None
     from tensorrt_llm._utils import mpi_comm
+    from tensorrt_llm.logger import logger
 
     comm = mpi_comm()
     selections = comm.allgather(selected)
-    if any(value != selections[0] for value in selections) or selected not in ("0", "1"):
-        raise ValueError("Idle notification selection must match on every MPI rank")
-    if selected == "0":
+    if any(value not in ("auto", "0", "1") for value in selections):
+        raise ValueError("Idle notification selection must be auto, 0 or 1 on every rank")
+    # A local opt-out applies to the entire group. "1" is a compatibility
+    # alias for auto, never an instruction to bypass missing prerequisites.
+    if "0" in selections:
         return None
     from mpi4py import MPI
 
@@ -286,22 +289,32 @@ def prepare_idle_notification(executor: PyExecutor) -> IdleNotificationRuntime |
     address = ""
     try:
         _validate_progress_modes(executor)
+    except (AttributeError, TypeError, ValueError):
+        failure = "unsupported or incomplete executor progress contract"
+    if failure is None:
         if (
             comm.Get_size() != executor.dist.world_size
             or comm.Get_rank() != executor.dist.rank
             or MPI.Query_thread() < MPI.THREAD_MULTIPLE
         ):
-            raise ValueError("Idle notification requires matching MPI ranks and THREAD_MULTIPLE")
-        addresses = json.loads(os.environ["TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES"])
-        address = addresses[socket.gethostname().split(".")[0]]
-        ip = ipaddress.IPv4Address(address)
-        if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
-            raise ValueError("Idle notification requires an explicit local IPv4 interface")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
-            check.bind((address, 0))
-    except (AttributeError, KeyError, TypeError, ValueError, OSError) as error:
-        failure = str(error)
+            failure = "MPI rank/world or thread capability unavailable"
+    if failure is None:
+        try:
+            addresses = json.loads(os.environ["TLLM_MPI_IDLE_NOTIFICATION_ADDRESSES"])
+            address = addresses[socket.gethostname().split(".")[0]]
+            ip = ipaddress.IPv4Address(address)
+            if ip.is_loopback or ip.is_unspecified or ip.is_multicast:
+                raise ValueError("Peer-reachable local IPv4 required")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
+                check.bind((address, 0))
+        except (KeyError, TypeError, ValueError, OSError):
+            failure = "peer-reachable local interface configuration unavailable"
     failures = comm.allgather(failure)
     if any(failures):
-        raise ValueError(f"Idle notification setup rejected: {failures}")
+        if executor.dist.rank == 0:
+            reason = next(value for value in failures if value is not None)
+            logger.info(f"MPI idle notification inactive (auto): {reason}; keeping existing wait")
+        return None
+    if executor.dist.rank == 0:
+        logger.info("MPI idle notification active (auto)")
     return IdleNotificationRuntime(comm.Dup(), address)
