@@ -659,6 +659,13 @@ def _compiled(dtype, tactic, use_pdl, world, hidden, one_shot, store_out, push=T
     return cute_ext.compile(_bmm_push, kernel, *tensors, a, a, a, Int32(0), Int32(1), stream)
 
 
+@functools.cache
+def _unstored_out(n: int, dtype: _torch.dtype, device: _torch.device) -> _torch.Tensor:
+    """``[MAX_M, n]`` storage for the C operand of the push variant, which never stores ``out``
+    (the operand only carries the output's shape)."""
+    return _torch.empty((MAX_M, n), dtype=dtype, device=device)
+
+
 def _swapped(x, weight, out):
     return (
         _from_dlpack_dynamic(weight.unsqueeze(0), 2),
@@ -713,7 +720,7 @@ def run_gemm_push(
     validate_push_tactic(tactic, m, n, k)
     check_transport(view, m, n, one_shot)
     ensure_cute_runtime()
-    out = _torch.empty((m, n), dtype=x.dtype, device=x.device)
+    out = _unstored_out(n, x.dtype, x.device)[:m]
     compiled = _compiled(x.dtype, tactic, pdl, view.world, n, one_shot, False)
     compiled(
         *_swapped(x, weight, out),
