@@ -1284,22 +1284,18 @@ class DSparkWorker(DFlashWorker):
         draft_tokens = super()._vocab_parallel_draft_tokens(draft_model)
         if draft_tokens is None or not getattr(draft_model, "has_markov_head", False):
             return draft_tokens
+        self._vocab_parallel.head.bind_markov_head(draft_model.markov_w1, draft_model.markov_w2)
         return self._markov_block_tokens
 
     def _markov_block_tokens(
         self, draft_model, local_block: torch.Tensor, inputs: dict
     ) -> torch.Tensor:
-        head = self._vocab_parallel.head
-        args = (
+        return self._vocab_parallel.head.markov_tokens(
             local_block,
             inputs["first_prev_tokens"],
             draft_model.markov_w1,
             draft_model.markov_w2,
         )
-        # Up to 16 requests on an MNNVL TP group: the whole chain in one launch.
-        if head.markov_v3_supported(*args):
-            return head.markov_tokens_v3(*args)
-        return head.markov_tokens(*args)
 
     def _refine_block_logits(
         self,

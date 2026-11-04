@@ -38,10 +38,10 @@ Consumers:
   block chain on shard logits: step ``i`` adds ``markov_w2 @ markov_w1[prev_i]``
   to block position ``i`` and its global argmax becomes ``prev_{i+1}`` and draft
   token ``i``. :func:`markov_chain_logits` runs the same chain on full-vocab
-  or shard logits and also returns the biased logits.
-* :meth:`VocabParallelHead.markov_tokens_v3` -- the same chain for up to 16
-  requests and 16 block positions as one CuTe DSL launch whose CTAs exchange
-  their keys through the TP group's MNNVL multicast workspace.
+  or shard logits and also returns the biased logits. With Markov weights
+  bound by :meth:`VocabParallelHead.bind_markov_head`, up to 16 requests and
+  16 block positions run as one CuTe DSL launch whose CTAs exchange their keys
+  through the TP group's MNNVL multicast workspace.
 
 The pairs travel through one all-reduce (sum) of a zero-padded float32 buffer in
 which each rank writes only its own columns; ``x + 0`` is exact and indices
@@ -403,7 +403,7 @@ class _PairExchange:
         self.tp_size = tp_size
         self.tp_rank = tp_rank
         # The TP group whose MNNVL workspace the one-launch Markov chain
-        # (VocabParallelHead.markov_tokens_v3) multicasts over.
+        # (VocabParallelHead.bind_markov_head) multicasts over.
         self.mapping = mapping
         self._markov_v3 = None
 
@@ -683,6 +683,8 @@ class VocabParallelHead:
         # This rank's rows of the Markov ``markov_w2`` (markov_w2_shard).
         self._markov_w2_shard: Optional[torch.Tensor] = None
         self._markov_w2_src_ptr: Optional[int] = None
+        # Whether markov_tokens may run the one-launch chain (bind_markov_head).
+        self._markov_one_launch = False
         logger.info(
             f"Vocab-parallel LM-head token selection: tp={mapping.tp_size}, "
             f"shard={self.shard_width}, vocab={self.vocab_size}"
@@ -763,65 +765,74 @@ class VocabParallelHead:
 
         Args:
             local_block: ``[B, K, shard]`` shard logits of the block positions.
-            first_prev_tokens: ``[B]`` anchor token ids (step 0's prev).
+            first_prev_tokens: ``[B]`` int32 or int64 anchor token ids (step
+                0's prev), unit stride.
             markov_w1, markov_w2: ``[vocab, rank]`` Markov head weights,
-                contiguous and of one dtype.
+                contiguous and of one dtype; the weights bound by
+                :meth:`bind_markov_head`, if any.
         Returns:
             ``[B, K]`` int32 draft tokens: the per-position argmax of the
             eager chain on the gathered logits (bit-identical as described in
-            :func:`markov_chain_logits`).
+            :func:`markov_chain_logits`). With bound weights, BF16 logits of at
+            most 16 requests and 16 positions take one CuTe DSL launch instead,
+            whose tokens equal these up to near-ties of its BF16 bias rounding.
         """
+        num_reqs, block_size, _ = local_block.shape
+        if (
+            self._markov_one_launch
+            and num_reqs <= 16
+            and block_size <= 16
+            and local_block.dtype == torch.bfloat16
+        ):
+            return self._markov_tokens_one_launch(
+                local_block, first_prev_tokens, markov_w1, markov_w2
+            )
         w2_rows = markov_w2[self.col_base : self.col_base + self.shard_width]
         return _markov_chain_tokens(
             local_block, first_prev_tokens, markov_w1, w2_rows, self.col_base, self._exchange
         )
 
-    def markov_v3_supported(
-        self,
-        local_block: torch.Tensor,
-        first_prev_tokens: torch.Tensor,
-        markov_w1: Optional[torch.Tensor],
-        markov_w2: Optional[torch.Tensor],
-    ) -> bool:
-        """Whether :meth:`markov_tokens_v3` serves these operands: BF16 logits
-        and Markov weights (rank a multiple of 32, at most 256), at most 16
-        requests and 16 block positions, an SM100-family device with a CTA per
-        256 shard rows resident at once, and an MNNVL exchange."""
+    def bind_markov_head(self, markov_w1: torch.Tensor, markov_w2: torch.Tensor) -> bool:
+        """Decide, once at load, whether :meth:`markov_tokens` runs the chain of
+        these Markov weights as one CuTe DSL launch, and allocate that launch's
+        key exchange. Collective over the TP group, outside graph capture.
+
+        It does for BF16 weights (rank a multiple of 32, at most 256) on an
+        SM100-family device with a CTA per 256 shard rows resident at once and
+        an MNNVL exchange. Returns the decision.
+        """
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
-        if not IS_CUTLASS_DSL_AVAILABLE or markov_w1 is None or markov_w2 is None:
+        self._markov_one_launch = False
+        if not IS_CUTLASS_DSL_AVAILABLE or not self._exchange.multicast_supported():
             return False
-        if not self._exchange.multicast_supported():
-            return False
-        num_reqs, block_size, shard = local_block.shape
         rank_dim = markov_w1.shape[1]
-        if not (1 <= num_reqs <= 16 and 1 <= block_size <= 16) or shard != self.shard_width:
-            return False
         if (
-            local_block.dtype != torch.bfloat16
-            or markov_w1.dtype != torch.bfloat16
+            markov_w1.dtype != torch.bfloat16
             or markov_w2.dtype != torch.bfloat16
-            or local_block.stride(-1) != 1
             or not markov_w1.is_contiguous()
             or not markov_w2.is_contiguous()
             or markov_w2.shape[1] != rank_dim
             or rank_dim % 32
             or rank_dim > 256
-            or first_prev_tokens.dtype not in (torch.int32, torch.int64)
-            or first_prev_tokens.stride(0) != 1
             or markov_w2.data_ptr() % 16
         ):
             return False
         from ..kernels.blackwell.dspark_markov_greedy import ctas_for, smem_bytes
 
-        props = torch.cuda.get_device_properties(local_block.device)
-        return (
+        ctas = ctas_for(self.shard_width)
+        props = torch.cuda.get_device_properties(markov_w1.device)
+        if not (
             props.major == 10
-            and ctas_for(shard) <= props.multi_processor_count
+            and ctas <= props.multi_processor_count
             and smem_bytes(rank_dim) <= props.shared_memory_per_block_optin
-        )
+        ):
+            return False
+        self._exchange.markov_v3_buffers(self._exchange.tp_size * ctas)
+        self._markov_one_launch = True
+        return True
 
-    def markov_tokens_v3(
+    def _markov_tokens_one_launch(
         self,
         local_block: torch.Tensor,
         first_prev_tokens: torch.Tensor,
@@ -834,9 +845,7 @@ class VocabParallelHead:
         the BF16-rounded bias of every request to the step's shard logits in
         FP32 and stores its own (value, global index) key into every rank's
         exchange; every CTA polls all keys of the step (``dspark_markov_greedy``).
-        The bias is an MMA over the Markov rank, so the tokens equal
-        :meth:`markov_tokens` up to near-ties of its BF16 rounding. The caller
-        checks :meth:`markov_v3_supported`.
+        The bias is an MMA over the Markov rank.
         """
         from ..kernels.blackwell.dspark_markov_greedy import ctas_for, run_dspark_markov_greedy
 

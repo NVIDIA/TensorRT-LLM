@@ -305,6 +305,7 @@ def _markov_v3_check(rank, tp, mnnvl):
     gen = torch.Generator(device="cuda").manual_seed(17)
     w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
     w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    assert head.bind_markov_head(w1, w2)
     cases = ((1, 1), (1, 7), (2, 6), (3, 7), (4, 7), (8, 7), (9, 5), (16, 7), (16, 16), (5, 16))
     for _ in range(2):
         for num_reqs, block in cases:
@@ -317,10 +318,9 @@ def _markov_v3_check(rank, tp, mnnvl):
             if num_reqs > 2:
                 anchors[-1] = vocab
             local = _shard(full, rank)
-            assert head.markov_v3_supported(local, anchors, w1, w2)
-            v3 = head.markov_tokens_v3(local, anchors, w1, w2)
+            v3 = head.markov_tokens(local, anchors, w1, w2)
             _assert_markov_near_ties(full, anchors, w1, w2, v3, atol=0.05)
-            v3_32 = head.markov_tokens_v3(local, anchors.to(torch.int32), w1, w2)
+            v3_32 = head.markov_tokens(local, anchors.to(torch.int32), w1, w2)
             assert torch.equal(v3_32, v3), (num_reqs, block)
     gathered = MPI.COMM_WORLD.allgather(v3.cpu())
     assert all(torch.equal(g, gathered[0]) for g in gathered)
@@ -336,12 +336,9 @@ def _markov_v3_check(rank, tp, mnnvl):
     anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)
     zero_w2 = torch.zeros_like(w2)
     assert torch.equal(
-        head.markov_tokens_v3(_shard(full, rank), anchors, w1, zero_w2),
+        head.markov_tokens(_shard(full, rank), anchors, w1, zero_w2),
         _markov_reference(full, anchors, w1, zero_w2),
     )
-    # Rank 16 needs two k-steps per ldmatrix load: not served.
-    w1_16 = w1[:, :16].contiguous()
-    assert not head.markov_v3_supported(_shard(full, rank), anchors, w1_16, w1_16)
     # CUDA graph replay: several launches of different widths per replay.
     cases = []
     for num_reqs in (2, 11, 2):
@@ -350,15 +347,18 @@ def _markov_v3_check(rank, tp, mnnvl):
         )
         local = _shard(full, rank)
         anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
-        cases.append((local, anchors, head.markov_tokens_v3(local, anchors, w1, w2)))
+        cases.append((local, anchors, head.markov_tokens(local, anchors, w1, w2)))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        outs = [head.markov_tokens_v3(local, anchors, w1, w2) for local, anchors, _ in cases]
+        outs = [head.markov_tokens(local, anchors, w1, w2) for local, anchors, _ in cases]
     for _ in range(5):
         graph.replay()
         torch.cuda.synchronize()
         for out, (_, _, expected) in zip(outs, cases):
             assert torch.equal(out, expected)
+    # Rank 16 needs two k-steps per ldmatrix load: not served.
+    w1_16 = w1[:, :16].contiguous()
+    assert not head.bind_markov_head(w1_16, w1_16)
 
 
 @torch.inference_mode()
