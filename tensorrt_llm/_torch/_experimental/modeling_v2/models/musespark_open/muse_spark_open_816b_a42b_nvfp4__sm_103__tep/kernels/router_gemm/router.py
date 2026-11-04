@@ -216,9 +216,12 @@ def _router_gemm_class(base: type) -> type:
     return type(f"{base.__name__}RouterGemm", (RouterGemmMoE, base), {})
 
 
-def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmCall:
+def install(
+    model: torch.nn.Module, min_rows: int = _op.MIN_ROWS, staged_epilogue: Optional[str] = None
+) -> RouterGemmCall:
     """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm
-    on decode steps of ``min_rows..MAX_ROWS`` rows.
+    on decode steps of ``min_rows..MAX_ROWS`` rows. ``staged_epilogue``
+    (``router_staged_epilogue``) is the GEMM's staged epilogue, None for the tree's kernel.
 
     Every layer is checked before any is re-classed; a layer already carrying the
     mixin is re-pointed at the returned call.
@@ -242,6 +245,7 @@ def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmC
         raise ValueError(
             f"[musespark_open] router_gemm replaces the MoE router; layers {wrong} have no MoE"
         )
+    _op.set_staged_epilogue(staged_epilogue)
     call = RouterGemmCall(min_rows)
     for layer in layers:
         moe = layer.feed_forward
@@ -251,7 +255,8 @@ def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmC
     logger.info(
         f"[musespark_open] router_gemm: router logits of decode steps of {min_rows}.."
         f"{_op.MAX_ROWS} rows on the BF16x3 split-K GEMM (one CTA per SM, K splits = SMs // "
-        f"(2 x 128-row tiles)) in {len(layers)} MoE layers; other steps keep the built-in "
-        "router"
+        f"(2 x 128-row tiles)"
+        + (f", {staged_epilogue} staged epilogue" if staged_epilogue is not None else "")
+        + f") in {len(layers)} MoE layers; other steps keep the built-in router"
     )
     return call

@@ -38,6 +38,13 @@ TF32x3 kernel also rounds every weight to 22 bits, the TF32 ``Linear`` to 11.
 Programmatic dependent launch: the GEMM waits (``griddepcontrol.wait``) before its
 first load and releases its dependents after its last MMA; the sum kernel waits
 before reading the partials and releases its dependents.
+
+With the lever ``router_staged_epilogue`` (``set_staged_epilogue``) the GEMM runs as
+``ops/moe/router_gemm_staged.Sm100BF16x3RouterGemmStaged``: the same pipeline and MMAs,
+with each CTA's partial tile written through shared memory (one bulk copy per row, or
+16-byte vector stores) instead of one 4-byte store per element; the same partials bit
+for bit. That build has no pre-wait variant: the staged epilogue is served on TEP4, the
+pre-wait build (``tep8_router_prewait``) on TEP8.
 """
 
 from __future__ import annotations
@@ -65,6 +72,32 @@ EXPERT_TILES = EXPERTS // 128
 ROW_TILE = 128
 #: Partials per program of the sum kernel (splits, padded to a power of two, x logits).
 SUM_TILE = 4096
+#: The staged GEMM's epilogues: one bulk copy per row, or 16-byte vector stores.
+STAGED_MODES = ("bulk", "v4")
+#: The epilogue every call's GEMM runs: None for the tree's kernel, else a ``STAGED_MODES``
+#: entry (``set_staged_epilogue``).
+_staged_epilogue: Optional[str] = None
+
+
+def set_staged_epilogue(mode: Optional[str]) -> None:
+    """Run every later call's GEMM with the staged epilogue ``mode`` (None: the tree's kernel).
+
+    Same partials bit for bit either way. Set by the ``router_gemm`` install, before any call.
+
+    Raises:
+        ValueError: for a mode outside ``STAGED_MODES``.
+    """
+    global _staged_epilogue
+    if mode is not None and mode not in STAGED_MODES:
+        raise ValueError(
+            f"[musespark_open] router GEMM epilogue {mode!r}: expected one of {STAGED_MODES}"
+        )
+    _staged_epilogue = mode
+
+
+def staged_epilogue() -> Optional[str]:
+    """The staged epilogue ``set_staged_epilogue`` selected, or None."""
+    return _staged_epilogue
 
 
 def row_tile(rows: int) -> int:
@@ -91,6 +124,10 @@ def splits(rows: int, sms: Optional[int] = None) -> int:
 
 
 def _gemm(tile: int):
+    if _staged_epilogue is not None:
+        from .router_gemm_staged import Sm100BF16x3RouterGemmStaged
+
+        return Sm100BF16x3RouterGemmStaged.compile(tile, HIDDEN, _staged_epilogue, False)
     # Imported at the first compile, as before the move; ``compile`` builds with the module's
     # configured pre-wait setting (``bf16x3_router_gemm.configure``).
     from .bf16x3_router_gemm import Sm100BF16x3RouterGemm

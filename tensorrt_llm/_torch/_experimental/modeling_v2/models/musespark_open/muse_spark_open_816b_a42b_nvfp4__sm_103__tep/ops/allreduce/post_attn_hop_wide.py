@@ -22,6 +22,18 @@ vector per thread -- statement for statement, at every row count. So:
   only difference is the summation order of the two variance reductions (FP32 sums of
   8192 squares); every other rounding point is the same.
 
+Row split (``cluster``). A row runs on a cluster of 4 CTAs of 256 threads (the default),
+2 of 512 or 1 of 1024. Thread ``t`` of the row (``t = cta_in_cluster * threads + tid``)
+owns column vector ``t`` in every split, and both variance reductions add the row's 32
+warp sums in warp order ``t // 32`` (over DSMEM between the cluster's CTAs, within the
+CTA when the cluster is one CTA), so the three splits compute the same bits; they differ
+in the CTAs per row (grid ``rows * cluster``). ``cluster_rows`` limits a workspace's split
+to calls of those row counts; every other call of the workspace runs the 4-CTA split.
+Every rank shares a call's row count, so every rank runs the same split for it, and the
+transport is the same for every split (thread ``t`` of a row writes and reads the slots of
+column vector ``t``, and every call adds ``GRID_STEP`` to the arrival counter), so calls
+of either split may follow each other on one workspace.
+
 Transport (Lamport). Every slot of the receive memory starts as the sentinel word
 ``0x80000000``; a 32-bit word that still holds it has not arrived. No payload word is
 the sentinel: a partial has BF16 ``-0`` cleared, and the BF16 rounding of an FP32 sum
@@ -98,7 +110,7 @@ kernel with the capacity's scatter and gather strides and grid step.
 from __future__ import annotations
 
 import functools
-from typing import Optional, Sequence, Tuple
+from typing import FrozenSet, Iterable, Optional, Sequence, Tuple
 
 import torch
 
@@ -214,6 +226,10 @@ ROW_BYTES = HIDDEN * 2
 #: The cluster boundary's split for 9..32 rows; this entry uses it at every row count.
 CLUSTER = 4
 THREADS = HIDDEN // (CLUSTER * VECTOR)
+#: The row's CTA splits a workspace may take: a cluster of 4, 2 or 1 CTAs of 256, 512 or 1024
+#: threads. Every split keeps the thread -> column-vector map and the 32 warp slots of the
+#: variance reductions in the same order, so the three give the same bits.
+CLUSTERS = (4, 2, 1)
 #: What one call adds to the arrival counter, whatever its grid (at most CLUSTER * MAX_ROWS CTAs),
 #: on the served workspace.
 GRID_SHIFT = 11
@@ -228,6 +244,26 @@ def grid_shift(max_rows: int) -> int:
 
 
 assert grid_shift(MAX_ROWS) == GRID_SHIFT
+
+
+def cluster_rows_of(ranges: Optional[Iterable[Tuple[int, int]]]) -> Optional[FrozenSet[int]]:
+    """The row counts of inclusive ``(lo, hi)`` ranges; None for none (every row count).
+
+    Raises:
+        ValueError: for a range outside ``MIN_ROWS..WIDE_MAX_ROWS`` or descending.
+    """
+    if ranges is None:
+        return None
+    rows = set()
+    for lo, hi in ranges:
+        if not MIN_ROWS <= int(lo) <= int(hi) <= WIDE_MAX_ROWS:
+            raise ValueError(
+                f"row range {lo}-{hi} outside {MIN_ROWS}..{WIDE_MAX_ROWS} or descending"
+            )
+        rows.update(range(int(lo), int(hi) + 1))
+    return frozenset(rows) if rows else None
+
+
 assert (1 << grid_shift(WIDE_MAX_ROWS)) >= CLUSTER * WIDE_MAX_ROWS
 CONTROL_WORDS = 4
 
@@ -277,9 +313,10 @@ if HAS_CUTE_DSL:
     class _WideHopKernel:
         """All-reduce + attention-side cluster boundary for 9..``max_rows`` rows.
 
-        CTA ``b`` handles row ``b // CLUSTER`` and the ``b % CLUSTER``-th quarter of the
-        8192 columns; each of its 256 threads owns one 16-byte column vector -- the
-        cluster boundary's 9..32-row map, which fixes the variance reduction order.
+        CTA ``b`` handles row ``b // cluster`` and the ``b % cluster``-th slice of the
+        8192 columns; each of its ``8192 / (8 * cluster)`` threads owns one 16-byte column
+        vector -- the cluster boundary's 9..32-row map at ``cluster = 4``, which fixes the
+        variance reduction order (the same order at every split).
         ``two_shot`` selects the transport; ``one_shot_rows`` sizes the one-shot slabs,
         which come first in the receive memory, followed by the two-shot scatter and
         gather areas. ``early_launch`` launches the grid as a programmatic dependent of
@@ -303,15 +340,21 @@ if HAS_CUTE_DSL:
             early_launch: bool,
             max_rows: int = MAX_ROWS,
             smem_pad: int = 0,
+            cluster: int = CLUSTER,
         ):
+            if cluster not in CLUSTERS:
+                raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
             self.ranks = ranks
             self.smem_pad = int(smem_pad)
             self.max_rows = max_rows
             self.grid_shift = grid_shift(max_rows)
             self.grid_step = 1 << self.grid_shift
-            self.cluster = CLUSTER
-            self.threads = THREADS
-            self.iters = HIDDEN // (CLUSTER * THREADS * VECTOR)
+            self.cluster = cluster
+            self.threads = HIDDEN // (cluster * VECTOR)
+            self.iters = HIDDEN // (cluster * self.threads * VECTOR)
+            #: Resident CTAs per SM the registers are bounded for: a 1024-thread CTA needs at
+            #: most 64 registers per thread to launch at all.
+            self.min_blocks = {4: 0, 2: 2, 1: 1}[cluster]
             self.warps = self.threads // 32
             self.slots = self.cluster * self.warps
             self.multicast = multicast
@@ -351,7 +394,7 @@ if HAS_CUTE_DSL:
             dry: Int32,
             stream: cuda.CUstream,
         ):
-            self.kernel(
+            launcher = self.kernel(
                 partial,
                 residual,
                 alpha,
@@ -373,14 +416,26 @@ if HAS_CUTE_DSL:
                 rows,
                 rank,
                 dry,
-            ).launch(
-                grid=[rows * self.cluster, 1, 1],
-                block=[self.threads, 1, 1],
-                cluster=[self.cluster, 1, 1],
-                smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
-                stream=stream,
-                use_pdl=self.pdl and self.early_launch,
             )
+            if cutlass.const_expr(self.min_blocks > 0):
+                launcher.launch(
+                    grid=[rows * self.cluster, 1, 1],
+                    block=[self.threads, 1, 1],
+                    cluster=[self.cluster, 1, 1],
+                    smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
+                    stream=stream,
+                    use_pdl=self.pdl and self.early_launch,
+                    min_blocks_per_mp=self.min_blocks,
+                )
+            else:
+                launcher.launch(
+                    grid=[rows * self.cluster, 1, 1],
+                    block=[self.threads, 1, 1],
+                    cluster=[self.cluster, 1, 1],
+                    smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
+                    stream=stream,
+                    use_pdl=self.pdl and self.early_launch,
+                )
 
         @cute.jit
         def load(self, ptr: cute.Pointer, dtype: cutlass.Constexpr):
@@ -2048,6 +2103,7 @@ if HAS_CUTE_DSL:
         max_rows: int = MAX_ROWS,
         rows_per_cta: int = 1,
         smem_pad: int = 0,
+        cluster: int = CLUSTER,
     ):
         # rows_per_cta: 1 one row per CTA (_WideHopKernel); 2 two rows per thread (_WideHop2Kernel);
         # 3 two rows per 512-thread CTA (_WideHop2wKernel, the key's third value).
@@ -2064,6 +2120,7 @@ if HAS_CUTE_DSL:
             early_launch,
             max_rows,
             smem_pad,
+            cluster,
         )
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2116,7 +2173,9 @@ class WideHopWorkspace:
     ``TWO_SHOT_ROWS``, ``SERVED_EARLY_LAUNCH``) on the served capacity ``MAX_ROWS``;
     ``max_rows=WIDE_MAX_ROWS`` builds the larger transport. A setting left None (the
     publication, the launch mode, the two-row grid and the SMEM pad) takes the module's
-    ``SERVED_*`` setting (``configure``) at construction.
+    ``SERVED_*`` setting (``configure``) at construction. ``cluster`` is the row split of the
+    one-row-per-CTA calls of ``cluster_rows`` rows (every such call when None); the others run
+    ``CLUSTER``.
     """
 
     def __init__(
@@ -2133,6 +2192,8 @@ class WideHopWorkspace:
         smem_pad: Optional[int] = None,
         r2_wide: Optional[bool] = None,
         pad_rows: Optional[Tuple[int, int]] = None,
+        cluster: int = CLUSTER,
+        cluster_rows: Optional[FrozenSet[int]] = None,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -2165,6 +2226,13 @@ class WideHopWorkspace:
             raise ValueError(f"the wide hop serves 4 or 8 ranks, got {self.ranks}")
         self.two_shot_rows = int(two_shot_rows)
         self.max_rows = int(max_rows)
+        if int(cluster) not in CLUSTERS:
+            raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
+        self.cluster = int(cluster)
+        # The row counts ``cluster`` applies to (None: every call); the others run ``CLUSTER``.
+        self.cluster_rows = (
+            None if cluster_rows is None else frozenset(int(r) for r in cluster_rows)
+        )
         self.one_shot_rows, self.workspace_bytes = receive_layout(
             self.ranks, self.two_shot_rows, self.max_rows
         )
@@ -2223,10 +2291,15 @@ class WideHopWorkspace:
         error: Optional[BaseException] = None
         try:
             low = MIN_ROWS if self.max_rows == MAX_ROWS else MAX_ROWS + 1
-            kinds = sorted({self.variant(rows) for rows in range(low, self.max_rows + 1)})
+            kinds = sorted(
+                {
+                    (*self.variant(rows), self.cluster_for(rows))
+                    for rows in range(low, self.max_rows + 1)
+                }
+            )
             for post_eps, pre_eps, norm_fp32 in variants:
-                for two_shot, rows_per_cta, pad in kinds:
-                    self._kernel(post_eps, pre_eps, norm_fp32, two_shot, rows_per_cta, pad)
+                for two_shot, rows_per_cta, pad, cluster in kinds:
+                    self._kernel(post_eps, pre_eps, norm_fp32, two_shot, rows_per_cta, pad, cluster)
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc
@@ -2236,6 +2309,22 @@ class WideHopWorkspace:
                 f"{f' (this rank: {error!r})' if error is not None else ''}"
             ) from error
 
+    def clusters(self) -> Tuple[int, ...]:
+        """The row splits this workspace's calls run: ``cluster``, and ``CLUSTER`` for the
+        row counts outside ``cluster_rows``."""
+        if self.cluster_rows is None or self.cluster == CLUSTER:
+            return (self.cluster,)
+        return (self.cluster, CLUSTER)
+
+    def cluster_for(self, rows: int) -> int:
+        """The row split of a call of ``rows`` rows (the same on every rank); a two-row call
+        (``takes_r2``) keeps ``CLUSTER``."""
+        if self.takes_r2(rows):
+            return CLUSTER
+        if self.cluster_rows is None or rows in self.cluster_rows:
+            return self.cluster
+        return CLUSTER
+
     def _kernel(
         self,
         post_eps: float,
@@ -2244,7 +2333,11 @@ class WideHopWorkspace:
         two_shot: bool,
         rows_per_cta: int = 1,
         pad: int = 0,
+        cluster: Optional[int] = None,
     ):
+        cluster = self.cluster if cluster is None else int(cluster)
+        if int(rows_per_cta) != 1 and cluster != CLUSTER:
+            raise ValueError(f"a two-row wide hop runs the {CLUSTER}-CTA split, got {cluster}")
         key = (
             float(post_eps),
             float(pre_eps),
@@ -2253,6 +2346,9 @@ class WideHopWorkspace:
             int(rows_per_cta),
             int(pad),
         )
+        if cluster != CLUSTER:
+            # The default split keeps the key of a workspace without a split.
+            key += (cluster,)
         compiled = self._kernels.get(key)
         if compiled is not None:
             return compiled
@@ -2274,6 +2370,7 @@ class WideHopWorkspace:
             self.max_rows,
             int(rows_per_cta),
             int(pad),
+            cluster,
         )
         # A dry launch loads the module now, not inside a capture (MIN_ROWS: the grid of a dry launch
         # is never run past its dry check, whatever the kernel's rows per CTA).
@@ -2318,7 +2415,9 @@ class WideHopWorkspace:
             raise ValueError(
                 f"post_attn_hop_wide: {rows} rows on a workspace of capacity {self.max_rows}"
             )
-        compiled = self._kernel(post_eps, pre_eps, norm_fp32, *self.variant(rows))
+        compiled = self._kernel(
+            post_eps, pre_eps, norm_fp32, *self.variant(rows), self.cluster_for(rows)
+        )
         updated = torch.empty_like(residual)
         normalized = torch.empty_like(partial)
         compiled(
@@ -2637,11 +2736,13 @@ def shared_wide_workspace(
     variants: Sequence[Tuple[float, float, bool]] = (),
     early_launch: Optional[bool] = None,
     max_rows: int = MAX_ROWS,
+    cluster: int = CLUSTER,
+    cluster_rows: Optional[FrozenSet[int]] = None,
 ) -> WideHopWorkspace:
-    """The one wide-hop workspace of this group, publication, launch mode and capacity, built
-    on first use. The larger capacity (``WIDE_MAX_ROWS``) takes only calls of more than
-    ``MAX_ROWS`` rows, so it is two-shot only. ``multicast`` and ``early_launch`` left None
-    take the module's settings (``SERVED_MULTICAST``, ``SERVED_EARLY_LAUNCH``).
+    """The one wide-hop workspace of this group, publication, launch mode, capacity and row
+    split, built on first use. The larger capacity (``WIDE_MAX_ROWS``) takes only calls of
+    more than ``MAX_ROWS`` rows, so it is two-shot only. ``multicast`` and ``early_launch``
+    left None take the module's settings (``SERVED_MULTICAST``, ``SERVED_EARLY_LAUNCH``).
 
     Collective on first use.
     """
@@ -2649,6 +2750,8 @@ def shared_wide_workspace(
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
     two_shot_rows = TWO_SHOT_ROWS if max_rows == MAX_ROWS else MIN_ROWS
     key = (mapping, bool(multicast), _LAUNCH_PDL, two_shot_rows, bool(early_launch), max_rows)
+    if int(cluster) != CLUSTER:
+        key += (int(cluster), None if cluster_rows is None else frozenset(cluster_rows))
     workspace = _SHARED.get(key)
     if workspace is None:
         workspace = WideHopWorkspace(
@@ -2658,6 +2761,8 @@ def shared_wide_workspace(
             two_shot_rows=two_shot_rows,
             early_launch=early_launch,
             max_rows=max_rows,
+            cluster=cluster,
+            cluster_rows=cluster_rows,
         )
         _SHARED[key] = workspace
     else:
@@ -2820,6 +2925,8 @@ def log_once_enabled(
     r2: Optional[bool] = None,
     r2_wide: Optional[bool] = None,
     smem_pad: Optional[int] = None,
+    cluster: int = CLUSTER,
+    cluster_rows: Optional[FrozenSet[int]] = None,
 ) -> None:
     # A setting left None reads the module's (``configure``).
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
@@ -2839,6 +2946,9 @@ def log_once_enabled(
         f"; two-shot AR at {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows on a second transport "
         "built on the first such eager step"
     )
+    if cluster != CLUSTER:
+        where = "" if cluster_rows is None else f" at {len(cluster_rows)} row counts"
+        transports += f"; {cluster} CTA(s) of {HIDDEN // (cluster * VECTOR)} threads per row{where}"
     launch = (
         "launched as a programmatic dependent" if early_launch else "launched after its producer"
     )

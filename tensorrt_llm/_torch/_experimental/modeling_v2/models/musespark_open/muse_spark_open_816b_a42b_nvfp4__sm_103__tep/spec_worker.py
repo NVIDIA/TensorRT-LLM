@@ -48,7 +48,10 @@ then the built-in ``hidden_norm``. The gather depends on the TP width:
   NVLink by the built-in projection-gather kernel on a workspace of their own
   (``InboxGatherColumns``) instead, larger ones by the NCCL all-gather: the
   same bytes in the same order, and no queueing behind the step's other NCCL
-  collectives on the shared communicator.
+  collectives on the shared communicator. ``drafter_fc_inbox_wide`` sizes that
+  workspace for more rows and sets its program count (``WideProjectionGather``:
+  the same kernel and inbox protocol on a larger allocation), so the decode steps
+  of up to that many rows skip the NCCL all-gather too.
 
 The rank's GEMM runs on the fixed low-M tactic listed for its shape
 (``ops/gemm/fixed_low_m_gemm.py``) whether or not ``drafter_fixed_gemms`` is
@@ -231,32 +234,123 @@ class AllGatherColumns:
 #: Rows a TP4 ``drafter_fc_inbox`` call gathers over the projection-gather workspace (its
 #: allocation's token capacity); larger calls take the NCCL all-gather.
 FC_INBOX_MAX_ROWS = 128
+#: The most rows a ``drafter_fc_inbox_wide`` workspace may hold: 64 requests at K = 7.
+FC_INBOX_WIDE_MAX_ROWS = 512
+
+
+class WideProjectionGather:
+    """The built-in projection-gather kernel and inbox protocol on a workspace of
+    ``max_rows`` rows (the built-in allocation holds 128) and ``programs`` CTAs.
+
+    The kernel (``musespark_open_projection_gather._gather_columns``) takes the inbox
+    size (``SLOT_WORDS``) and the program count as arguments: every program stores its
+    words of the rank's slice into slot ``rank`` of every peer's inbox, tagged with the
+    program's epoch, polls the same words of every peer's slot in its own inbox, writes
+    them to the output in rank order and retires them. A program waits only on the same
+    program of the peers, which publishes before it polls, so with programs dispatched in
+    grid order every call completes; the double-buffered slots alternate per program as
+    in the built-in workspace. The output is the slices joined by columns in rank order,
+    the bytes of the NCCL all-gather. Calls must form one ordered chain on every rank with
+    the same shapes, as for the built-in workspace.
+    """
+
+    def __init__(self, mapping, max_rows: int, programs: Optional[int] = None) -> None:
+        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+        from tensorrt_llm._torch.distributed.communicator import Distributed
+        from tensorrt_llm._torch.models import musespark_open_projection_gather as _pg
+
+        if mapping.tp_size != 4 or mapping.enable_attention_dp or mapping.cp_size != 1:
+            raise ValueError("WideProjectionGather serves TP4 without attention DP or CP")
+        if not all(Distributed.get(mapping).tp_allgather(MnnvlMemory.supports_mnnvl())):
+            raise ValueError("WideProjectionGather requires NVLink on every TP rank")
+        MnnvlMemory.initialize()
+        self._kernel = _pg._gather_columns
+        self.mapping = mapping
+        self.world = mapping.tp_size
+        self.max_rows = int(max_rows)
+        self.device = torch.cuda.current_device()
+        self.programs = int(programs or _pg._PROGRAMS)
+        self.slot_words = self.max_rows * (_pg._MAX_COLUMNS // self.world) // 2
+        self.data_owner = _pg._ProjectionMnnvlMemory(
+            mapping, 2 * self.world * self.slot_words * _pg._PAYLOAD_WORD_BYTES
+        )
+        record = type(self.data_owner).allocated_map[self.data_owner.ptr]
+        if record.comm_size != self.world or record.comm_rank != mapping.tp_rank:
+            raise RuntimeError("WideProjectionGather allocation does not match the TP group")
+        self.data = self.data_owner.as_torch_strided_tensor(torch.int64)
+        self.data[mapping.tp_rank].zero_()
+        self.counters = torch.zeros(self.programs, dtype=torch.uint64, device="cuda")
+        torch.cuda.synchronize()
+        Distributed.get(mapping).tp_allgather(True)
+
+    def gather(self, local: torch.Tensor) -> torch.Tensor:
+        """Gather contiguous BF16 ``[M, N / TP]`` columns (``M <= max_rows``) in rank order."""
+        if not (
+            local.is_cuda
+            and local.device.index == self.device
+            and local.dtype == torch.bfloat16
+            and local.ndim == 2
+            and local.is_contiguous()
+            and 1 <= local.shape[0] <= self.max_rows
+            and local.shape[1] in (4096 // self.world, 8192 // self.world)
+        ):
+            raise ValueError("Unsupported projection gather tensor contract")
+        output = torch.empty(
+            (local.shape[0], local.shape[1] * self.world), dtype=local.dtype, device=local.device
+        )
+        self._kernel[(self.programs,)](
+            local.view(torch.int32),
+            self.data,
+            self.counters,
+            output.view(torch.int32),
+            self.data.stride(0),
+            self.slot_words,
+            self.mapping.tp_rank,
+            self.world,
+            local.shape[1] // 2,
+            local.numel() // 2,
+            self.programs,
+            256,
+            num_warps=4,
+        )
+        return output
 
 
 class InboxGatherColumns:
     """The TP4 gather of the sharded ``fc`` over the tray's NVLink (``drafter_fc_inbox``).
 
-    Calls of 1..``FC_INBOX_MAX_ROWS`` contiguous BF16 rows go through the built-in
-    projection-gather kernel on this gather's own workspace, any other call through the
-    NCCL all-gather (``AllGatherColumns``). Both join the slices by columns in rank
-    order, so the output is the same bytes. Every rank makes the same calls with the
-    same row counts, and the drafter's calls are ordered on the CUDA streams (the
-    context-K/V fork's side chain joins the main stream before the next call), as the
-    workspace requires.
+    Calls of 1..``max_rows`` contiguous BF16 rows (``FC_INBOX_MAX_ROWS``, or
+    ``drafter_fc_inbox_wide``'s MAX_ROWS) go through the built-in projection-gather kernel
+    on this gather's own workspace, any other call through the NCCL all-gather
+    (``AllGatherColumns``). Both join the slices by columns in rank order, so the output
+    is the same bytes. Every rank makes the same calls with the same row counts, and the
+    drafter's calls are ordered on the CUDA streams (the context-K/V fork's side chain
+    joins the main stream before the next call), as the workspace requires.
     """
 
-    def __init__(self, mapping) -> None:
+    def __init__(
+        self, mapping, max_rows: Optional[int] = None, programs: Optional[int] = None
+    ) -> None:
         from tensorrt_llm._torch.models.musespark_open_projection_gather import (
             ProjectionGatherWorkspace,
         )
 
-        self.workspace = ProjectionGatherWorkspace(mapping)
+        self.max_rows = FC_INBOX_MAX_ROWS if max_rows is None else int(max_rows)
+        if not FC_INBOX_MAX_ROWS <= self.max_rows <= FC_INBOX_WIDE_MAX_ROWS:
+            raise ValueError(
+                f"[musespark_open] drafter_fc_inbox holds {FC_INBOX_MAX_ROWS}.."
+                f"{FC_INBOX_WIDE_MAX_ROWS} rows, not {self.max_rows}"
+            )
+        if self.max_rows > FC_INBOX_MAX_ROWS or programs is not None:
+            self.workspace = WideProjectionGather(mapping, self.max_rows, programs)
+        else:
+            self.workspace = ProjectionGatherWorkspace(mapping)
         self.fallback = AllGatherColumns(mapping)
 
     def gather(self, local: torch.Tensor) -> torch.Tensor:
         if (
             local.dim() == 2
-            and 1 <= local.shape[0] <= FC_INBOX_MAX_ROWS
+            and 1 <= local.shape[0] <= self.max_rows
             and local.dtype == torch.bfloat16
             and local.is_contiguous()
         ):
@@ -811,12 +905,15 @@ def install(
     fused_accept: bool,
     fixed_gemms: bool,
     fc_inbox: bool = False,
+    fc_inbox_rows: Optional[int] = None,
+    fc_inbox_programs: Optional[int] = None,
 ) -> None:
     """Install the drafter worker fast paths asked for on the drafter and the worker.
 
     ``fc_shard`` (``drafter_fc_shard``) column-shards the drafter's fc (at TP4 with
     ``fc_inbox``, ``drafter_fc_inbox``, its decode-size calls gathered over the tray's
-    NVLink: ``InboxGatherColumns``), ``fused_accept``
+    NVLink: ``InboxGatherColumns``, on ``fc_inbox_rows`` rows and ``fc_inbox_programs``
+    programs with ``drafter_fc_inbox_wide``, else the built-in workspace), ``fused_accept``
     fuses the worker's acceptance, ``fixed_gemms`` (``drafter_fixed_gemms``) puts
     the drafter's GEMM call sites on fixed low-M tactics.
 
@@ -845,7 +942,7 @@ def install(
                     "[musespark_open] drafter_fc_inbox is the TP4 gather of the sharded fc, not TP"
                     f"{getattr(mapping, 'tp_size', None)}"
                 )
-            gather = InboxGatherColumns(mapping)
+            gather = InboxGatherColumns(mapping, fc_inbox_rows, fc_inbox_programs)
         extra = {"gather": gather} if gather is not None else {}
         reason = install_sharded_fc(draft_model, mapping, enable_pdl, **extra)
         if reason is not None:
@@ -856,9 +953,11 @@ def install(
                 if TEP8_FC_GATHER_PROGRAMS > 0:
                     gather += f" ({TEP8_FC_GATHER_PROGRAMS} programs)"
             elif isinstance(draft_model._fc_shard.gather, InboxGatherColumns):
+                inbox = draft_model._fc_shard.gather
                 gather = (
-                    f"the tray's projection gather up to {FC_INBOX_MAX_ROWS} rows "
-                    "(drafter_fc_inbox), an NCCL all-gather above"
+                    f"the tray's projection gather up to {inbox.max_rows} rows "
+                    f"({inbox.workspace.programs} programs; drafter_fc_inbox), an NCCL "
+                    "all-gather above"
                 )
             else:
                 gather = "an NCCL all-gather, any row count"
