@@ -244,6 +244,11 @@ def draft_qhead(
     # 256 columns x 8 warps per program.
     block_n = 256
     warps = 8
+    # The kernel spans latent, nope and rope with tl.arange (powers of two) and gives the rope
+    # columns one column block after the latent ones.
+    for name, dim in (("kv_lora_rank", latent), ("nope", nope), ("rope", rope)):
+        assert dim > 0 and dim & (dim - 1) == 0, f"{name} {dim} is not a power of two"
+    assert latent % block_n == 0 and rope <= block_n, (latent, rope)
     block_t = 16 if num_tokens <= 16 else 32
     q_programs = triton.cdiv(num_tokens, block_t) * num_heads * (latent // block_n + 1)
     positions = positions.reshape(-1)
